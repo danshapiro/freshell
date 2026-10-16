@@ -21,7 +21,7 @@ Root-cause and fix the recurring Freshell outages on garageserver and the Window
 
 **Goal:** Prevent the identified sandbox build from creating excessive pressure by default, recover failed user managers on a watchdog tick, and let an Electron window render Freshell again after a long server outage without restarting the desktop application.
 
-**Architecture:** Bound Cargo jobs and container CPU allocation in the existing sandbox wrapper, preserving its memory/isolation boundaries. Keep the Electron recovery controller local to its logical window, turn the existing rolling circuit limit into a timed cooldown, and verify the actual native candidate document before accepting recovery. Apply the existing failed-manager recovery policy consistently to both existing UIDs in the machines repository; prove service restoration in an isolated real systemd guest and deliver deployment instructions without applying them.
+**Architecture:** Bound Cargo jobs and container CPU allocation in the existing sandbox wrapper, preserving its memory/isolation boundaries. Keep one Electron recovery owner per logical window, turn the existing rolling circuit limit into a timed cooldown, and bound the complete native action plus document verification with a cancellable attempt lifetime. A timed-out attempt retires its native authority while allowing future retries; permanent logical disposal stops all future work. Apply the existing failed-manager recovery policy consistently to both existing UIDs in the machines repository; prove service restoration in an isolated real systemd guest. Run destructive Freshell verification and the unchanged configured-cloud full gate inside a bounded private Docker-capable guest while reserving the original shared host test gate. Deliver deployment instructions without applying them.
 
 **Tech Stack:** Bash, Docker with cgroup v2, Rust/Cargo, Node 22/TypeScript ESM, Electron, Vitest, Playwright, Python 3, Ubuntu 24.04/systemd.
 
@@ -34,7 +34,7 @@ Root-cause and fix the recurring Freshell outages on garageserver and the Window
 5. Do not rerun the unlimited historical Clippy invocation, induce memory exhaustion, rewrite host oomd policy, kill broad process patterns, or delete shared caches. All deliberate process failures occur in disposable owned containers. Use exact owned container/process receipts and bounded cleanup. No live host user manager is a test fixture.
 6. Preserve the existing three-attempt/60,000 ms Electron rolling limit, `[250, 1000, 3000]` retry delays, 15,000 ms unresponsive threshold, authenticated immutable recovery URL, replacement-window preload and privileged IPC identity behavior, and close-to-tray behavior. An application root rendering an authentication or machine-selection view is sufficient; requiring an open terminal or pane is outside scope.
 7. Logs are structured JSONL with severity, cause, action and outcome. Keep Electron's established token redaction. Never log provider homes, authentication tokens or the ambient environment. Healthy watchdog ticks remain silent.
-8. Host verification removes only `FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE` and `FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE` from that test process, matching the sanitized recorded-base setup; the ambient optional files otherwise contaminate the existing fake OpenCode fixture. Do not change persistent/live environment or weaken provider assertions. Existing cloud backend choices persist. Broad gates use `GCLOUD_ROBOT_REQUIRE=1`, a meaningful `FRESHELL_TEST_SUMMARY`, and the shared coordinator. Never silently replace configured cloud verification with local verification. Electron's native suite is local by definition, inside the disposable sandbox for this outage scenario.
+8. Verification removes only `FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE` and `FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE` from that test process, matching the sanitized recorded-base setup; the ambient optional files otherwise contaminate the existing fake OpenCode fixture. Do not change persistent/live environment or weaken provider assertions. Existing cloud backend choices persist. Broad gates use `GCLOUD_ROBOT_REQUIRE=1`, a meaningful `FRESHELL_TEST_SUMMARY`, and the shared coordinator. Never silently replace configured cloud verification with local verification. Electron's native suite is local by definition, inside the disposable sandbox nested in the private guest for this outage scenario. All Docker-dependent companion and source-runtime fault tests also stay inside that guest; the configured cloud lane remains enabled.
 
 ## Evidence and acceptance map
 
@@ -51,6 +51,19 @@ The sandbox report attributes the 2026-10-16 pressure event to an exact Docker s
 
 **Load-bearing validation receipts:** The parent also executed the identified cold Clippy workload at budgets1and2 on immutable base283e4c4: both passed with zero recorded PSI/OOM/swap; peaks2.339GiB and2.213GiB. Receipt `reports/clippy-budget-prerequisite.md` establishes budget feasibility, not repaired-wrapper coverage. The parent executed a safe 128 MiB/one-CPU/64-PID/private-cgroup/network-none capability probe and demonstrated a writable child cgroup after remounting the existing namespace-rooted cgroup mount with SYS_ADMIN and guest-only seccomp/AppArmor relaxation: `reports/private-cgroup-capability-remount.json`. It then actually booted Ubuntu 24.04/systemd `255.4-1ubuntu8.18` as PID 1 in verified `system.slice` placement at one GiB/no swap/one CPU/512 PIDs, explicitly started guest D-Bus, and successfully ran a guest `systemd-run` child with `MemoryMax=32M`: `reports/systemd-prerequisite-probe-with-bus.json`. Finally, `reports/guest-manager-prerequisite.md` records real guest user-manager failure/restore feasibility and the original UID 1000 watchdog regression; the repaired script's automatic recovery remains Task 4 acceptance. Fresh cgroup2 mounts failed; use the executed remount correction. Recheck prerequisites in the actual fixture; unsafe host writable-cgroup binds/shared-host managers remain prohibited. If fixture feasibility regresses, retain a visible unresolved coverage gap rather than substituting fakes for required recovery.
 
+## Stage 2 decisions and verification ownership
+
+The evidence and remaining empirical limits are recorded outside this plan in `load-bearing-ledger.md`, `reports/load-bearing-finder.md`, `reports/load-bearing-strategist.md`, `reports/load-bearing-validator-f1.md` and `reports/load-bearing-validator-environment.md` under the run's external logs. Stage 2 accepts a guarded sequence; it does not claim a full Freshell build, RuntimeHarness run, native Electron launch or full gate passed.
+
+1. Use the retained public build-tools guest image and guarded lifecycle identified in `reports/guest-build-tools-prerequisite.md`, extending the cloud-auth and nested-Docker images. The chosen outer profile is 8 GiB, no swap, four CPUs and 4096 PIDs, with Cargo jobs two. Pin mise 2026.9.7, its actual `rust@1.96` selection 1.96.1, Buildx 0.20.1/BuildKit 0.18.2, Docker 27.5.1/API 1.47 and pnpm 10.34.5. These are qualified tools, not a completed Freshell build. Verify the actual image identity, private namespaces, exact `system.slice` placement, limits, sole allowed mounts and pre-init barrier again before any guest build or workload. The guest's source/build paths belong under `/workspace`; guest systemd may replace `/tmp` mounts during boot.
+2. Stage each required clean committed SHA as a self-contained Git bundle/standalone clone inside the guest. Do not bind the host authoring worktree, Git common directory, target/node caches, home, user/system bus or Docker socket into tests. Build artifacts from source for their actual guest/container runtime; do not copy host/trixie binaries into the glibc 2.36 guest. The existing restricted broker and guest-only dual-stack Docker bridge remain unchanged. The guest daemon owns sandbox image tags and named volumes, so dependency preparation cannot purge another agent's host cache.
+3. Reserve the original repository's normal shared host test endpoint before starting a broad guest workload. A standalone guest clone has its own coordinator identity and is insufficient by itself. Reuse the existing public endpoint/store APIs in a one-off operational owner, following `reports/host-gate-reservation-prerequisite.md`; publish a truthful reservation holder only. Do not use fake-upstream seams, disable the companion, change the production coordinator, or fabricate host suite/reusable-success records. Before first real use, qualify this owner's actual guest-action cleanup path with an ordinary owned failure or cancellation, proving the reservation remains busy through cleanup and the failed result survives. Wait for foreign holders without stopping them. Retain the host socket until exact cloud work, guest work, receipt export and temporary-token cleanup are settled; clear only the matching holder and close the owned socket last.
+4. Keep the existing configured cloud backends and local companion enabled. Use the public SDK and token-only mechanism in `reports/cloud-guest-auth-prerequisite.md`, with the existing configured Freshell project identity; no persistent credential store, long-lived key, host SDK home, IAM change, broker grant or impersonation setup is required. Bind only the owned temporary token directory read-only. Before a long cloud command, establish non-secret remaining token validity using supported existing SDK refresh/expiry behavior. A token-return timestamp is insufficient, and replacing the token file cannot refresh an already-running SDK wait. Give each such command a finite deadline shorter than demonstrated remaining validity, with a separate cleanup reserve. Reassess or fail safely if that cannot be established. Remove the exact temporary auth directory after guest cleanup; never retain token values or hashes in receipts.
+5. Prepare a clean commit-addressed cloud image serially using the existing build path when needed, under the same bounded ownership or a separately bounded owned build. Keep exact build/image identities and finite resource/time limits; do not run an unbounded host compile or race mutable/dirty tags. Run the unchanged coordinated full check inside the private guest, including its cloud client phase, local Docker companion, source-runtime, Rust and Electron phases. Export genuine inner coordinator results and every actual phase verdict, including phases not run after an earlier failure. Cloud cleanup traps suppress errors, so independently verify settlement/removal of the exact recorded per-run cloud job/execution before releasing ownership. No broad name-prefix cleanup is permitted.
+6. Task 0 is the first real full build/topology qualification and must pass with independent review before any crash implementation, including machines changes. A tool fixture, bridge probe or successful setup followed by a failing assertion proves only the setup that actually completed. Preserve all selected-case assertions and nonzero selection. Adjust only owned setup prerequisites; extend finite cold-preparation time for observed progress rather than weakening behavioral deadlines. If resources require a safer build budget, reduce Cargo jobs and requalify; never remove the enforced outer limits or use host authority as a fallback.
+7. After Task 1, Task 3 must exercise both canonical native renderer-recovery cases in the nested sandbox at the exact clean SHA. Xvfb, package metadata, a version command or a root-user launch does not prove the ordinary-user native path. Correct routine display/library/Chromium fixture setup only inside owned isolation and exercise it. If no equally isolated native or complete-gate route can satisfy acceptance, keep the run `FAILED/non-converged`; no mock-only, partial or live-host substitute qualifies. Windows installation/restart/user testing remains a separately approved rollout operation.
+8. The complete Electron native action plus readiness receives a 10,000 ms attempt budget beginning before native navigation, with 100 ms readiness polling within the remaining budget. The same owner must retire a timed-out attempt before a successor can acquire native authority. A never-settling load or evaluation cannot occupy the sole recovery slot forever; late native completion cannot activate, update privileged IPC identity, show, focus, log success or requeue retired work. Attempt timeout preserves future retries/cooldowns. Logical close, a new destination or quit permanently disposes the owner; retiring an old native window and hiding to tray do not. Implement this decision in Tasks 2/3 without adding another reconnect loop.
+
 ## File responsibilities and task interfaces
 
 Paths below are relative to the owning repository.
@@ -62,13 +75,12 @@ Paths below are relative to the owning repository.
 | Freshell `docker/sandbox/Dockerfile` | Minimal xvfb/xauth prerequisites for actual headless Electron launch. |
 | Freshell `test/unit/scripts/sandbox-test.test.ts` | Execute the real wrapper with a recording Docker executable; verify arguments, modes and exit propagation. |
 | Freshell `scripts/testing/sandbox-budget-smoke.mjs` | Tiny bounded Cargo concurrency and effective-cgroup proof inside the real wrapper. |
-| Freshell `scripts/testing/sandbox-clippy-budget-proof.py` | Rootful, barrier-gated, monitored cold proof of the identified Clippy workload; owns all proof volumes/containers. |
 | Freshell `scripts/sandbox-selftest.sh` | Existing sandbox isolation acceptance, extended with real resource proof. |
 | Freshell `docs/development/test-sandbox.md` | Agent/operator resource policy, proof instructions and explicit limits of protection. |
 | Freshell `electron/renderer-recovery.ts` | One cancellable bounded retry controller per logical window. |
 | Freshell `test/unit/electron/renderer-recovery.test.ts` | Fake-clock recovery, coalescing, cooldown, cancellation and existing crash behavior. |
 | Freshell `electron/renderer-readiness.ts` | Bounded cancellable native document/root verification. |
-| Freshell `electron/recoverable-window.ts` | Existing replacement adapter, moved for testing; candidate readiness and logical lifecycle ownership. |
+| Freshell `electron/recoverable-window.ts` | Existing replacement adapter, moved for testing; finite native-action/readiness attempts, candidate identity and permanent logical disposal. |
 | Freshell `electron/startup.ts` | Install recovery before first navigation and return explicit recovery disposal. |
 | Freshell `electron/entry.ts` | Native constructor injection, IPC identity, launch-generation and quit disposal. |
 | Freshell `electron/main.ts` | Dispose renderer recovery when quitting begins, before asynchronous server teardown. |
@@ -79,7 +91,7 @@ Paths below are relative to the owning repository.
 | Machines `tests/systemd-watchdog/Dockerfile`, `guest-smoke.sh`, `tests/smoke-oomd-watchdog.sh` | Disposable real-systemd prerequisite check, manager/service recovery and exact cleanup. |
 | Machines `garageserver/docs/sentinelx-sandbox.md`, `garageserver/sentinelx/AGENTS.md` | Current policy and narrow approved-deployment/rollback runbook; preserve historical incidents. |
 
-Task 0 must pass before any crash implementation, including the auxiliary machines task. Task 2 produces `registerRendererRecovery(options): () => void` and optional listener removal without depending on Task 3's native adapter. Task 3 consumes that disposer and produces `StartupResult` main-arm `disposeRendererRecovery(): void`; native adapter `cancelRecovery(): void` aborts candidate verification/activation. Tasks 1 and 4 are code-independent; execute their mutations only in their separate worktrees. Task 3's destructive Electron proof depends on Task 1's green bounded sandbox.
+Task 0 must pass and receive its required review before any crash implementation, including the auxiliary machines task. Task 2 produces `registerRendererRecovery(options): () => void` and optional listener removal without depending on Task 3's native adapter. Task 3 consumes that disposer and produces `StartupResult` main-arm `disposeRendererRecovery(): void`; the native adapter owns the finite complete attempt and distinguishes retryable attempt retirement from permanent `cancelRecovery(): void` disposal. Tasks 1 and 4 are code-independent; execute their mutations only in their separate worktrees. Task 3's destructive Electron proof depends on Task 1's green bounded sandbox, and Freshell's actual sandbox/runtime Docker proofs run against the private guest daemon. Task 4 retains its separately qualified rootful disposable Ubuntu/systemd guest and exact outer-driver ownership.
 
 All code below is a pre-implementation draft. Once execution begins the source tree supersedes these snippets; review corrections belong in source rather than being backported into plan code.
 
@@ -117,8 +129,7 @@ git commit -m "test: wait for durable resume before OpenCode restart"
 
 - [ ] **Step 4: Run the actual affected case in a disposable Docker-capable guest**
 
-The validated environment recipe is `reports/nested-docker-prerequisite.md`, with setup under `/tmp/freshell-nested-docker-prerequisite-20261016`. Stage a self-contained clean checkout at the committed Task 0 SHA inside the guest; do not mount the host repository/home/cache/socket. Use the guest's own Docker27.5.1/API1.47, restricted runtime broker, and validated dual-stack bridge. Verify outer placement/private namespaces/limits before releasing systemd or any build. Source-build artifacts inside this glibc2.36 guest; prebuilt host/trixie binaries are not accepted. Pin pnpm10.34.5 and Cargo jobs2; use bounded outer8GiB/no-swap/2CPU/1024PIDs and exact owned cleanup. Extend timeout for cold qualification builds rather than weakening the test. All deliberate fixture kills stay inside this outer guest. Keep the guest and its fresh owned build artifacts for the immediate affected-suite continuation if useful.
-
+Use the Stage 2 guest and ownership decisions above, with the finalized build-tools, cloud-auth and nested-Docker prerequisite reports. Stage a self-contained clean checkout at the committed Task 0 SHA under guest `/workspace`; use the guest's own Docker daemon, restricted runtime broker, validated dual-stack bridge and actual absolute mise path/Rust selection. Keep the qualified outer 8-GiB/no-swap/four-CPU/4096-PID profile and Cargo jobs two. Recheck ownership/namespace/cgroup/mount guards before releasing init or any build. Full runtime-image, test/release and qualification builds are not yet proved: let this actual selected case qualify them and then the real broker/workload/MCP/durable-recovery topology. Retain separate setup and behavioral verdicts. All deliberate fixture kills remain inside the outer guest. The already-proven shared-gate primitive still requires its actual operational cleanup qualification before broad use. Keep fresh owned guest artifacts for immediate affected-suite continuation when useful, with exact cleanup ownership.
 Inside that guest, the exact repo-owned selector is:
 
 ```bash
@@ -138,7 +149,7 @@ Fresh task review must confirm the new wait observes real supervisor state, exis
 **Files:**
 - Modify: `scripts/sandbox-test.sh:111`, `docker/sandbox/Dockerfile:34`, `scripts/sandbox-selftest.sh:270`, `docs/development/test-sandbox.md`.
 - Create/Test: `test/unit/scripts/sandbox-test.test.ts`.
-- Create: `scripts/testing/sandbox-budget-smoke.mjs`, `scripts/testing/sandbox-clippy-budget-proof.py`.
+- Create: `scripts/testing/sandbox-budget-smoke.mjs`.
 
 **Interfaces:**
 - Consumes: existing `scripts/sandbox-test.sh [--runtime-suite] "command"` and its exact workload exit status.
@@ -225,7 +236,7 @@ pnpm run test:vitest run test/unit/scripts/sandbox-test.test.ts --config config/
 
 Expected: FAIL on absent `--cpus`/Cargo environment and absent JSONL resource receipt, with fake Docker calls recorded successfully.
 
-- [ ] **Step 3: Implement bounded defaults and real proof fixtures**
+- [ ] **Step 3: Implement bounded defaults and the minimal resource fixture**
 
 Add `--cpus 2`, `--memory-swap 16g` and `-e CARGO_BUILD_JOBS=2` beside the existing shared `--memory 8g`. Explicit 16g RAM+swap preserves Docker's existing default allowance rather than silently removing swap. Before `docker "${DOCKER_ARGS[@]}"`, insert:
 
@@ -323,180 +334,13 @@ for budget in 1 2; do
 done
 ```
 
-For the actual identified workload, create the host-side Python proof script with these exact operational steps and central control loop. Its arguments are `--jobs {1,2} --evidence <existing absolute directory>`; source is resolved from the script's repository root. No production wrapper options are added for this proof.
+For the real identified cold Clippy workload, reuse the already executed external bounded recipe and retained setup referenced by `reports/clippy-budget-prerequisite.md`; keep transient proof drivers and receipts outside the repository. Do not add a permanent cold-Clippy proof framework. Preserve its safety decisions: exact source archive, cold owned target volumes, verified rootful `system.slice` placement and finite resource controls before initialization/compilation, a live cgroup until final measurements, a self-owned sentinel and independent exact-resource cleanup.
 
-```python
-#!/usr/bin/env python3
-import argparse, http.client, http.server, json, os, pathlib, re, signal, subprocess, threading, time, uuid
-
-p = argparse.ArgumentParser()
-p.add_argument('--jobs', type=int, choices=(1, 2), required=True)
-p.add_argument('--evidence', type=pathlib.Path, required=True)
-a = p.parse_args()
-root = pathlib.Path(__file__).resolve().parents[2]
-evidence = a.evidence.resolve(strict=True)
-env = dict(os.environ, DOCKER_HOST='unix:///var/run/docker.sock')
-env.pop('DOCKER_CONTEXT', None)
-prefix = 'freshell-budget-' + uuid.uuid4().hex
-cid = None
-volumes = []
-status = 0
-sentinel = None
-health = None
-def interrupted(_signal, _frame): raise KeyboardInterrupt('owned proof interrupted')
-signal.signal(signal.SIGTERM, interrupted)
-def docker(*args):
-    return subprocess.check_output(['docker', *args], env=env, text=True, timeout=60).strip()
-def record(event, severity='info', **fields):
-    with (evidence / (prefix + '.jsonl')).open('a') as out:
-        out.write(json.dumps(dict(severity=severity, event=event, **fields)) + '\n')
-def available():
-    return int(re.search(r'^MemAvailable:\s+(\d+)', pathlib.Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
-def cgroup_read(cgroup, name):
-    return (cgroup / name).read_text().strip()
-def counters(value):
-    return dict((key, int(number)) for key, number in (line.split() for line in value.splitlines()))
-class HealthSentinel(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b'freshell-budget-owned-sentinel'
-        self.send_response(200)
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def log_message(self, *_args): pass
-def assert_sentinels():
-    assert sentinel is not None and sentinel.poll() is None
-    connection = http.client.HTTPConnection('127.0.0.1', health.server_port, timeout=2)
-    try:
-        connection.request('GET', '/')
-        response = connection.getresponse()
-        assert response.status == 200 and response.read() == b'freshell-budget-owned-sentinel'
-    finally: connection.close()
-info = json.loads(docker('info', '--format', '{{json .}}'))
-assert info['CgroupVersion'] == '2' and info['CgroupDriver'] == 'systemd'
-assert not any('rootless' in entry for entry in info['SecurityOptions'])
-assert available() >= 32 * 1024**3
-try:
-    sentinel = subprocess.Popen(['sleep', '3600'])
-    health = http.server.HTTPServer(('127.0.0.1', 0), HealthSentinel)
-    threading.Thread(target=health.serve_forever, daemon=True).start()
-    assert_sentinels()
-    for suffix in ('registry', 'git', 'target', 'node', 'sidecar', 'mcp'):
-        volume = prefix + '-' + suffix
-        docker('volume', 'create', '--label', 'freshell.proof=' + prefix, volume)
-        volumes.append(volume)
-    destinations = ('/usr/local/cargo/registry', '/usr/local/cargo/git', '/workspace/target',
-      '/workspace/node_modules', '/workspace/crates/freshell-claude-sidecar/node_modules',
-      '/workspace/packages/freshell-mcp-runtime/node_modules')
-    for destination in destinations:
-        if destination.startswith('/workspace/'):
-            (root / destination.removeprefix('/workspace/')).mkdir(parents=True, exist_ok=True)
-    mounts = []
-    for volume, destination in zip(volumes, destinations): mounts.extend(('-v', volume + ':' + destination))
-    workload = 'rustup toolchain install 1.96.0 --profile minimal --component clippy && cargo +1.96.0 clippy -p freshell-session-host --all-targets -- -D warnings'
-    # Keep this owned PID 1 alive after the workload, preserving final cgroup metrics.
-    barrier = ('while [ ! -f /tmp/release-budget ]; do sleep 0.1; done; '
-      '/usr/local/bin/sandbox-entrypoint.sh "$@"; proof_code=$?; '
-      'printf "%s\\n" "$proof_code" > /tmp/budget-exit; '
-      'while :; do sleep 1; done')
-    cid = docker('create', '--name', prefix, '--label', 'freshell.proof=' + prefix,
-      '--cpus', '2', '--memory', '8g', '--memory-swap', '8g', '--pids-limit', '512',
-      '--network', 'freshell-sandbox', '-e', 'CARGO_BUILD_JOBS=' + str(a.jobs),
-      '-v', str(root) + ':/workspace', *mounts, '--entrypoint', 'bash',
-      'freshell-sandbox:latest', '-c', barrier, 'budget-barrier', 'bash', '-c', workload)
-    docker('start', cid)
-    inspected = json.loads(docker('inspect', cid))[0]
-    pid = inspected['State']['Pid']
-    placement = pathlib.Path(f'/proc/{pid}/cgroup').read_text().strip()
-    expected = '/system.slice/docker-' + cid + '.scope'
-    assert placement == '0::' + expected, placement
-    cgroup = pathlib.Path('/sys/fs/cgroup' + expected)
-    assert cgroup_read(cgroup, 'memory.max') == '8589934592'
-    assert cgroup_read(cgroup, 'memory.swap.max') == '0'
-    assert cgroup_read(cgroup, 'pids.max') == '512'
-    quota, period = map(int, cgroup_read(cgroup, 'cpu.max').split())
-    assert quota / period == 2
-    initial_events = counters(cgroup_read(cgroup, 'memory.events'))
-    record('cold_clippy_budget_verified', cid=cid, pid=pid, placement=placement,
-      jobs=a.jobs, commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
-      image=inspected['Image'], initialMemoryEvents=initial_events,
-      sentinelPid=sentinel.pid, sentinelPort=health.server_port)
-    docker('exec', cid, 'touch', '/tmp/release-budget')
-    deadline = time.monotonic() + 1800
-    pressure_samples = 0
-    max_memory = 0
-    while True:
-        assert_sentinels()
-        state = json.loads(docker('inspect', '--format', '{{json .State}}', cid))
-        assert state['Running'] and not state['OOMKilled'], state
-        current = int(cgroup_read(cgroup, 'memory.current'))
-        pressure = cgroup_read(cgroup, 'memory.pressure')
-        psi = float(re.search(r'some avg10=([0-9.]+)', pressure)[1])
-        pressure_samples = pressure_samples + 1 if psi >= 5 else 0
-        max_memory = max(max_memory, current)
-        record('cold_clippy_sample', memoryCurrent=current, memoryPeak=cgroup_read(cgroup, 'memory.peak'),
-          memoryEvents=cgroup_read(cgroup, 'memory.events'), memorySwapCurrent=cgroup_read(cgroup, 'memory.swap.current'),
-          pressure=pressure, cpuStat=cgroup_read(cgroup, 'cpu.stat'), hostAvailable=available())
-        if current >= 6 * 1024**3 or pressure_samples >= 3 or available() < 24 * 1024**3:
-            raise RuntimeError('bounded proof aborted before unsafe pressure/headroom')
-        if time.monotonic() >= deadline: raise TimeoutError('cold Clippy exceeded 30 minute deadline')
-        exit_code = docker('exec', cid, 'bash', '-c', 'if [ -f /tmp/budget-exit ]; then cat /tmp/budget-exit; fi')
-        if exit_code != '': break
-        time.sleep(1)
-    final_events = counters(cgroup_read(cgroup, 'memory.events'))
-    final_peak = int(cgroup_read(cgroup, 'memory.peak'))
-    assert int(exit_code) == 0, exit_code
-    assert final_peak < 6 * 1024**3
-    for event in ('oom', 'oom_kill'):
-        assert final_events.get(event, 0) == initial_events.get(event, 0), final_events
-    assert_sentinels()
-    record('cold_clippy_completed', jobs=a.jobs, exitCode=int(exit_code), memoryPeak=final_peak,
-      maxSampledMemory=max_memory, memoryEvents=final_events)
-except BaseException as error:
-    status = 1
-    record('cold_clippy_failed', severity='error', error=str(error), cid=cid, jobs=a.jobs)
-finally:
-    if cid:
-        try:
-            state = json.loads(docker('inspect', '--format', '{{json .State}}', cid))
-            if state['Running']: docker('stop', '--time', '10', cid)
-        except BaseException as error:
-            status = 1
-            record('cold_clippy_cleanup_stop_failed', severity='error', error=str(error), cid=cid)
-        try:
-            logs = subprocess.run(['docker', 'logs', cid], env=env, capture_output=True, text=True, timeout=60)
-            (evidence / (prefix + '.workload.log')).write_text(logs.stdout + logs.stderr)
-        except BaseException as error:
-            status = 1
-            record('cold_clippy_cleanup_log_failed', severity='error', error=str(error), cid=cid)
-        try: docker('rm', '--force', cid)
-        except BaseException as error:
-            status = 1
-            record('cold_clippy_cleanup_remove_failed', severity='error', error=str(error), cid=cid)
-    for volume in reversed(volumes):
-        try: docker('volume', 'rm', volume)
-        except BaseException as error:
-            status = 1
-            record('cold_clippy_cleanup_volume_failed', severity='error', error=str(error), volume=volume)
-    if health:
-        try: health.shutdown(); health.server_close()
-        except BaseException as error:
-            status = 1
-            record('cold_clippy_cleanup_health_failed', severity='error', error=str(error))
-    if sentinel and sentinel.poll() is None:
-        try:
-            sentinel.terminate()
-            try: sentinel.wait(timeout=5)
-            except subprocess.TimeoutExpired: sentinel.kill(); sentinel.wait(timeout=5)
-        except BaseException as error:
-            status = 1
-            record('cold_clippy_cleanup_sentinel_failed', severity='error', error=str(error), pid=sentinel.pid)
-raise SystemExit(status)
-```
-
-The owned PID 1 waits after workload completion, so final peak/events are read from a live cgroup before cleanup. The barrier does not run a dependency-preparation command until placement/controls are verified. A fresh target volume establishes cold compilation; toolchain installation modifies only the disposable container's private image layer. No host toolchain or existing cache is replaced. Cleanup independently attempts stop, log retention and exact owned removal even if one fails.
+The existing budgets-one/two results establish feasibility only. The chosen production default still needs current-branch/source and image attribution, real workload completion, matching effective Cargo/NUM_JOBS controls, measured headroom and cleanup evidence. The wrapper's actual argv/default behavior and minimal real resource smoke remain permanent behavioral coverage. Use the external recipe for the actual chosen-default workload; rerun the one-job alternative only if selecting it as a safer default, rather than repeating both already-proven budgets merely for feasibility.
 
 - [ ] **Step 4: Run focused green tests and safe real proofs**
+
+Run all real Docker/image/sandbox commands below inside the guarded private guest against its daemon and guest-owned source/caches. Recording-Docker unit tests remain ordinary non-destructive focused checks. Cloud-image preparation, if needed, follows the bounded serial ownership decision above.
 
 ```bash
 pnpm run test:vitest run test/unit/scripts/sandbox-test.test.ts --config config/vitest/vitest.config.ts
@@ -508,13 +352,11 @@ env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock scripts/sandbox-te
 Expected: wrapper tests PASS; syntax succeeds; headless image builds; tiny Cargo work completes with finite effective controls and ample memory. Rebuild only in the explicitly chosen rootful daemon, without changing the operator's Docker context. Run the actual proof one container at a time after committing its source, with an already-created external evidence directory:
 
 ```bash
-git add scripts/sandbox-test.sh docker/sandbox/Dockerfile scripts/sandbox-selftest.sh scripts/testing/sandbox-budget-smoke.mjs scripts/testing/sandbox-clippy-budget-proof.py test/unit/scripts/sandbox-test.test.ts docs/development/test-sandbox.md
+git add scripts/sandbox-test.sh docker/sandbox/Dockerfile scripts/sandbox-selftest.sh scripts/testing/sandbox-budget-smoke.mjs test/unit/scripts/sandbox-test.test.ts docs/development/test-sandbox.md
 git commit -m "fix: bound sandbox build resources and prove safe compilation"
-python3 scripts/testing/sandbox-clippy-budget-proof.py --jobs 1 --evidence /home/dan/code/freshell/.worktrees/.the-usual-logs/freshell-crash-resilience/reports
-python3 scripts/testing/sandbox-clippy-budget-proof.py --jobs 2 --evidence /home/dan/code/freshell/.worktrees/.the-usual-logs/freshell-crash-resilience/reports
 ```
 
-Expected: both identified cold workloads complete at exit 0 with actual `system.slice` controls and headroom receipts; two jobs is accepted only after its own cold proof. A one-job success cannot validate a two-job default. If two jobs fails/aborts, change production default to the demonstrated safer value and rerun tests/verification; do not increase/remove limits. Rootful placement and proof-only zero-swap are explicit safety choices, not claims about the old incident.
+After the clean checkpoint, execute the retained external recipe for the chosen two-job default with this branch/source and image attribution. Expected: the identified cold workload completes at exit 0 with actual `system.slice` controls and headroom receipts. A one-job success cannot validate a two-job default. If two jobs fails/aborts, select and prove the safer one-job default and rerun wrapper/resource verification; do not increase/remove limits. Rootful placement and proof-only zero-swap are explicit safety choices, not claims about the old incident.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -527,14 +369,14 @@ env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock CARGO_BUILD_JOBS=2
 pnpm run test:vitest run test/unit/scripts/sandbox-test.test.ts --config config/vitest/vitest.config.ts
 ```
 
-Expected: all existing isolation/dependency-preparation proofs and new resource proofs PASS; exact self-owned host sentinels survive. Existing host Cargo comparison inherits the finite job budget. Because the Docker image is shared test infrastructure, the parent also includes the full supported suite in the final gate; the new headless Electron path is actually launched in Task 3.
+Expected: all existing isolation/dependency-preparation proofs and new resource proofs PASS; exact self-owned host sentinels survive. Existing host Cargo comparison inherits the finite job budget. Because the Docker image supports shared test infrastructure, the parent also includes the full supported suite in the final guest gate. Image tags and named caches for this proof belong to the private guest daemon; the ordinary-user headless Electron path is actually launched in Task 3.
 
 - [ ] **Step 7: Commit the task**
 
 Step 4's checkpoint is the focused task commit when no source changes follow. If proof/refactor changes source, commit those named refinements and rerun the affected proof at that new SHA; do not rewrite another agent's commit. Use the following only when there are remaining task changes:
 
 ```bash
-git add scripts/sandbox-test.sh docker/sandbox/Dockerfile scripts/sandbox-selftest.sh scripts/testing/sandbox-budget-smoke.mjs scripts/testing/sandbox-clippy-budget-proof.py test/unit/scripts/sandbox-test.test.ts docs/development/test-sandbox.md
+git add scripts/sandbox-test.sh docker/sandbox/Dockerfile scripts/sandbox-selftest.sh scripts/testing/sandbox-budget-smoke.mjs test/unit/scripts/sandbox-test.test.ts docs/development/test-sandbox.md
 git commit -m "test: retain sandbox resource and workload proof refinements"
 ```
 
@@ -688,168 +530,13 @@ pnpm run test:vitest run test/unit/electron/renderer-recovery.test.ts --config c
 
 Expected: FAIL because the second attempt/window never starts autonomously, a resolving native action can falsely succeed after its failure event, and no disposer exists.
 
-- [ ] **Step 3: Replace the controller's scheduling/lifecycle implementation**
+- [ ] **Step 3: Implement the controller scheduling and logical lifecycle**
 
-Keep the file's existing request types/constants. Add the optional removal method to `RecoverableWebContents`, then replace `registerRendererRecovery` with:
+Keep the existing request types/constants and add optional listener removal. Implement one pending request, one recovery timer and one in-flight recovery action per logical window. Failure settlement schedules one successor without another external event. At the rolling limit, retain the request and schedule its next eligible time; a timer callback rechecks liveness/capacity without charging backoff twice. Preserve trigger precedence, expected self-induced renderer-gone handling, inert subframe/aborted navigation, and cancellation of only an obsolete unresponsive request when responsiveness returns.
 
-```ts
-export function registerRendererRecovery(options: RendererRecoveryOptions): () => void {
-  const { window, loadUrl, serverUrl, logger, setTimeout: later, clearTimeout: cancel } = options
-  const wc = window.webContents
-  if (!wc) return () => {}
-  const verifyRecovered = options.verifyRecovered ?? (async () => {})
-  let disposed = false
-  let inFlight = false
-  let failedDuringAttempt = false
-  let expectedRendererGone = false
-  let failures = 0
-  let attempts: number[] = []
-  let pending: RecoveryRequest | undefined
-  let retryTimer: ReturnType<typeof setTimeout> | undefined
-  let unresponsiveTimer: ReturnType<typeof setTimeout> | undefined
-  const listeners: Array<[string, (...args: any[]) => void]> = []
-  const alive = () => !disposed && !isWindowDestroyed(window)
-  const log = (entry: ElectronMainLogEntry) => {
-    let currentUrl: string | undefined
-    try { currentUrl = wc.getURL?.() } catch { /* retired native window */ }
-    logger.log({ serverUrl, loadUrl, currentUrl, ...entry })
-  }
-  const clearRetry = () => {
-    if (retryTimer !== undefined) cancel(retryTimer)
-    retryTimer = undefined
-  }
-  const clearUnresponsive = () => {
-    if (unresponsiveTimer !== undefined) cancel(unresponsiveTimer)
-    unresponsiveTimer = undefined
-  }
-  const dispose = () => {
-    if (disposed) return
-    disposed = true
-    pending = undefined
-    clearRetry()
-    clearUnresponsive()
-    for (const [event, fn] of listeners) wc.removeListener?.(event, fn)
-    log({ severity: 'info', event: 'main_window_recovery_cancelled', reason: 'disposed' })
-  }
-  const listen = (event: string, fn: (...args: any[]) => void) => {
-    listeners.push([event, fn])
-    wc.on(event, fn)
-  }
-  const merge = (request: RecoveryRequest) => {
-    // A concrete failed navigation outranks an older unresponsive request.
-    if (!pending || request.trigger === 'did-fail-load' || pending.trigger !== 'did-fail-load') pending = request
-  }
-  const drain = () => {
-    if (!alive()) { dispose(); return }
-    if (inFlight || retryTimer !== undefined || !pending) return
-    const now = Date.now()
-    attempts = attempts.filter(at => now - at < CIRCUIT_WINDOW_MS)
-    const backoff = failures ? RETRY_DELAYS_MS[Math.min(failures - 1, RETRY_DELAYS_MS.length - 1)] : 0
-    const cooldown = attempts.length >= MAX_ATTEMPTS_PER_WINDOW
-      ? Math.max(0, attempts[0] + CIRCUIT_WINDOW_MS - now) : 0
-    const delayMs = Math.max(backoff, cooldown)
-    if (delayMs > 0) {
-      log({ severity: cooldown ? 'warn' : 'info',
-        event: cooldown ? 'main_window_recovery_circuit_open' : 'main_window_recovery_scheduled',
-        trigger: pending.trigger, attemptsInWindow: attempts.length, windowMs: CIRCUIT_WINDOW_MS, retryInMs: delayMs })
-      retryTimer = later(() => {
-        retryTimer = undefined
-        // Backoff was paid; recheck the rolling limit without paying it twice.
-        startIfCapacity()
-      }, delayMs)
-      return
-    }
-    startIfCapacity()
-  }
-  const startIfCapacity = () => {
-    if (!alive()) { dispose(); return }
-    if (inFlight || !pending) return
-    const now = Date.now()
-    attempts = attempts.filter(at => now - at < CIRCUIT_WINDOW_MS)
-    if (attempts.length >= MAX_ATTEMPTS_PER_WINDOW) { drain(); return }
-    const request = pending
-    pending = undefined
-    inFlight = true
-    failedDuringAttempt = false
-    attempts.push(now)
-    const attempt = attempts.length
-    log({ severity: 'warn', event: 'main_window_recovery_started', attempt,
-      trigger: request.trigger, mode: request.mode, ...(request.metadata ?? {}) })
-    void (async () => {
-      try {
-        if (request.mode === 'load-url') {
-          await window.loadURL(loadUrl)
-        } else {
-          if (request.crashBeforeReload) {
-            expectedRendererGone = true
-            wc.forcefullyCrashRenderer?.()
-          }
-          if (!wc.reload || isWebContentsDestroyed(wc)) {
-            log({ severity: 'warn', event: 'main_window_recovery_reload_unavailable', trigger: request.trigger })
-            await window.loadURL(loadUrl)
-          } else await wc.reload()
-        }
-        if (!alive()) return
-        await verifyRecovered()
-        if (!alive()) return
-        if (failedDuringAttempt) throw new Error('main-frame failure observed during recovery')
-        failures = 0
-        window.show()
-        window.focus()
-        log({ severity: 'info', event: 'main_window_recovery_succeeded', attempt,
-          trigger: request.trigger, mode: request.mode })
-      } catch (error) {
-        if (!alive()) return
-        failures += 1
-        merge(request)
-        log({ severity: 'error', event: 'main_window_recovery_failed', attempt,
-          trigger: request.trigger, mode: request.mode, error })
-      } finally {
-        expectedRendererGone = false
-        inFlight = false
-        if (!disposed) drain()
-      }
-    })()
-  }
-  const request = (value: RecoveryRequest) => {
-    if (!alive()) { dispose(); return }
-    if (inFlight) {
-      failedDuringAttempt = true
-      log({ severity: 'info', event: 'main_window_recovery_coalesced', reason: 'recovery-in-flight', trigger: value.trigger })
-    }
-    merge(value)
-    drain()
-  }
-  listen('render-process-gone', (_event, details: { reason?: string; exitCode?: number } = {}) => {
-    if (expectedRendererGone) { expectedRendererGone = false; return }
-    const metadata = { reason: details.reason ?? 'unknown', exitCode: details.exitCode, willRecover: true }
-    log({ severity: 'warn', event: 'main_window_renderer_gone', ...metadata })
-    request({ trigger: 'render-process-gone', mode: 'reload', metadata })
-  })
-  listen('did-fail-load', (_event, errorCode: number, errorDescription: string, validatedUrl: string, isMainFrame: boolean) => {
-    const willRecover = isMainFrame && errorCode !== ABORTED_NAVIGATION_ERROR_CODE
-    const metadata = { errorCode, errorDescription, validatedUrl, isMainFrame, willRecover }
-    log({ severity: willRecover ? 'warn' : 'info', event: 'main_window_navigation_failed', ...metadata })
-    if (willRecover) request({ trigger: 'did-fail-load', mode: 'load-url', metadata })
-  })
-  listen('unresponsive', () => {
-    clearUnresponsive()
-    log({ severity: 'warn', event: 'main_window_unresponsive', willRecover: true })
-    unresponsiveTimer = later(() => {
-      unresponsiveTimer = undefined
-      request({ trigger: 'unresponsive', mode: 'reload', crashBeforeReload: true })
-    }, UNRESPONSIVE_THRESHOLD_MS)
-  })
-  listen('responsive', () => {
-    clearUnresponsive()
-    if (pending?.trigger === 'unresponsive') { pending = undefined; clearRetry() }
-    log({ severity: 'info', event: 'main_window_responsive' })
-  })
-  return dispose
-}
-```
+The disposer is idempotent, removes supported listeners, clears recovery/unresponsive timers and makes late completions inert. Emit success/show/focus only after a current live action and verifier succeed without an observed main-frame failure. Task 3 supplies the bounded native-action/readiness promise and permanent cancellation hook; a timeout rejection must follow the same retry path as other action failures. Do not assume native load completion itself has a finite duration. The invalidated draft implementation has been removed; derive code from the current source/interfaces and behavioral tests rather than copying an unexecuted replacement.
 
-Keep coalesced events from turning one failed attempt into two successors: `pending` is the only queued request and `retryTimer` the only recovery timer. Do not emit success or focus after a disposal/destruction check fails. The optional no-op verifier preserves deterministic non-native callers in this task; Task 3 supplies and exercises the real production verifier, so this fallback is never production acceptance.
+Keep coalesced events from creating overlapping attempts or multiple successors. The optional deterministic verifier used by non-native tests is not production acceptance; Task 3 must wire and exercise actual native verification. Keep the established structured events, token redaction and bounded log volume.
 
 - [ ] **Step 4: Run focused green**
 
@@ -889,9 +576,9 @@ git commit -m "fix: resume Electron recovery after bounded cooldowns"
 
 **Interfaces:**
 - Consumes: Task 2's controller disposer; Task 1's bounded headless sandbox.
-- Produces: `verifyRendererReady(window, loadUrl, {signal?, isCurrent?}): Promise<void>`, deadline 10,000 ms, polling 100 ms, no production timing override.
+- Produces: native readiness of the intended current candidate document, using the same 10,000 ms complete-attempt deadline that starts before native navigation and 100 ms polling within remaining time. Hung evaluation and native load are cancellable; no production timing override is added.
 - Produces: `createRecoverableWindow({createNativeWindow, options, onWebContentsChanged, logger}): BrowserWindowLike` with `verifyRendererReady(loadUrl)` and `cancelRecovery()` methods.
-- Produces: main `StartupResult.disposeRendererRecovery(): void`; disposal clears controller timers and aborts candidate work. Main startup installs listeners before `loadURL` and passes an actual native verifier. Logical close, new launch generation and quit dispose; hide-to-tray does not.
+- Produces: main `StartupResult.disposeRendererRecovery(): void`; permanent disposal clears controller timers and aborts current native/load/verification work. Attempt deadline retirement allows future retries. Main startup installs listeners before `loadURL` and passes an actual native verifier. Logical close, new launch generation and quit dispose; retiring old native windows and hide-to-tray do not.
 
 - [ ] **Step 1: Add failing readiness, adapter and startup behavior tests**
 
@@ -1124,6 +811,8 @@ it('disposes recovery once at quit initiation before waiting for the server', as
 })
 ```
 
+Add behavioral cases alongside these drafts for an active native load and a candidate load that never settle, and for a hung native evaluation. Advance the complete attempt deadline without manually resolving those promises: the timed-out attempt must retire, reject and release the sole slot; the controller must later retry successfully without another event. Dispose during the same hung states and prove prompt permanent cancellation with no future work. Then settle every stale native result and prove it cannot activate a candidate, update privileged IPC identity, show/focus, emit success or interfere with a newer attempt. Assert that old-native destruction cannot dispose its successful logical replacement and that hide-to-tray preserves recovery. These tests exercise actual ownership behavior, not source text or an assumed native promise guarantee.
+
 - [ ] **Step 2: Run red**
 
 ```bash
@@ -1132,277 +821,17 @@ pnpm run test:vitest run test/unit/electron/renderer-readiness.test.ts test/unit
 
 Expected: new modules are absent initially; then the meaningful startup case fails because listeners are installed after the first navigation. Confirm these intended missing behaviors, rather than counting a syntax/fixture failure as red evidence.
 
-- [ ] **Step 3: Implement actual native readiness, candidate ownership and startup wiring**
+- [ ] **Step 3: Implement actual native readiness, complete-attempt ownership and startup wiring**
 
-Create `electron/renderer-readiness.ts`:
+Extract only the existing native adapter and tiny listener types from `entry.ts` into `recoverable-window.ts`, keeping the native constructor injectable for meaningful adapter tests. Give that existing logical owner one finite cancellable attempt spanning native load/replacement and readiness. Begin its 10,000 ms deadline before awaiting any native navigation; readiness polling consumes the remaining budget rather than resetting it after navigation. A hung `loadURL` or evaluation must reject on deadline/cancellation and retire its prior native authority before a successor proceeds. Do not implement a timeout race that leaves a candidate able to activate later. Preserve future retries after attempt timeout; permanent logical disposal separately prevents all later work. The invalidated controller/adapter/readiness production-code drafts were removed; no replacement production code is presumed executed or correct.
 
-```ts
-export interface ReadinessWindow {
-  isDestroyed(): boolean
-  webContents: {
-    isDestroyed(): boolean
-    executeJavaScript(source: string): Promise<unknown>
-  }
-}
+Verify the actual native candidate: both current native URL and evaluated document must match the immutable intended origin/path, the document must be ready and Freshell's root must contain mounted content, and its navigation generation/native identity must still be current. Query equality is intentionally absent because auth bootstrap removes the URL token. Authentication, machine-selection and preparing roots are sufficient; no terminal/pane or Redux/WebSocket addition is required. Reject error pages, wrong documents, expired budgets, cancellation, destroyed objects and stale generations. Use no polling-tick logs.
 
-export async function verifyRendererReady(
-  window: ReadinessWindow,
-  loadUrl: string,
-  options: { signal?: AbortSignal; isCurrent?: () => boolean } = {},
-): Promise<void> {
-  const intended = new URL(loadUrl)
-  let poll: ReturnType<typeof setTimeout> | undefined
-  let deadline: ReturnType<typeof setTimeout> | undefined
-  let rejectStop!: (error: Error) => void
-  const stopped = new Promise<never>((_resolve, reject) => { rejectStop = reject })
-  const abort = () => rejectStop(new Error('renderer recovery cancelled'))
-  const check = () => {
-    if (options.signal?.aborted) throw new Error('renderer recovery cancelled')
-    if (window.isDestroyed() || window.webContents.isDestroyed()) throw new Error('renderer window destroyed')
-    if (options.isCurrent && !options.isCurrent()) throw new Error('renderer navigation changed')
-  }
-  options.signal?.addEventListener('abort', abort, { once: true })
-  deadline = setTimeout(() => rejectStop(new Error('renderer readiness timed out')), 10_000)
-  try {
-    for (;;) {
-      check()
-      const value = await Promise.race([window.webContents.executeJavaScript(`({
-        href: location.href,
-        documentUri: document.documentURI,
-        ready: document.readyState !== 'loading',
-        mounted: !!document.getElementById('root')?.firstElementChild
-      })`), stopped]) as { href?: string; documentUri?: string; ready?: boolean; mounted?: boolean }
-      check()
-      let matches = false
-      try {
-        const actual = new URL(value.href ?? '')
-        const documentUrl = new URL(value.documentUri ?? '')
-        matches = actual.origin === intended.origin && actual.pathname === intended.pathname
-          && documentUrl.origin === intended.origin && documentUrl.pathname === intended.pathname
-      } catch { /* Chromium's error document is never ready. */ }
-      if (matches && value.ready && value.mounted) return
-      await Promise.race([new Promise<void>(resolve => { poll = setTimeout(resolve, 100) }), stopped])
-      poll = undefined
-    }
-  } finally {
-    if (poll !== undefined) clearTimeout(poll)
-    if (deadline !== undefined) clearTimeout(deadline)
-    options.signal?.removeEventListener('abort', abort)
-  }
-}
-```
+Preserve the adapter's authenticated recovery destination, geometry/maximize/visibility/focus, preload and privileged IPC identity contract. Verify a hidden replacement before making it active or giving it privileged authority; on failure/retirement destroy only that candidate and keep the surviving active native window. Logical event delivery must distinguish the active/candidate/retired native emitters: destroying a retired native cannot close/dispose the successful logical replacement. Remove bindings for retired windows so repeated recoveries do not retain them. A late timed-out candidate cannot become active, update IPC identity or affect current visibility/focus. Keep one owner and one active recovery authority, without a second reconnect manager.
 
-Query-string equality is intentionally absent: `src/lib/auth.ts` removes the URL token after saving it. Origin, document path, readiness, mounted content, native candidate identity and unchanged navigation generation still must match.
+Update `BrowserWindowLike` and the production startup context to expose the needed actual readiness/permanent-cancellation boundary. Install recovery listeners before the initial `loadURL`, retain initial-load/unavailable diagnostics, and return `disposeRendererRecovery` on the main startup result. Production always uses the actual native verifier; deterministic test fakes must opt into an explicit verifier rather than silently inheriting a production no-op.
 
-Move only `createRecoverableEntryWindow` and its tiny listener types from `entry.ts` into `recoverable-window.ts`, rename/export it `createRecoverableWindow`, inject the native constructor/logger, and retain its geometry/visibility/preload/IPC behavior. The complete replacement/action ownership is:
-
-```ts
-import type { BrowserWindowLike } from './startup.js'
-import type { ElectronMainLogger } from './main-process-logger.js'
-import type { RecoverableWebContents } from './renderer-recovery.js'
-import { verifyRendererReady, type ReadinessWindow } from './renderer-readiness.js'
-
-interface NativeWindow extends ReadinessWindow {
-  webContents: ReadinessWindow['webContents'] & {
-    id: number; on(event: string, fn: (...args: any[]) => void): unknown
-    removeListener(event: string, fn: (...args: any[]) => void): unknown
-    getURL(): string; forcefullyCrashRenderer(): void
-  }
-  loadURL(url: string): Promise<void>
-  on(event: string, fn: (...args: any[]) => void): unknown
-  removeListener(event: string, fn: (...args: any[]) => void): unknown
-  destroy(): void; show(): void; hide(): void; focus(): void; maximize(): void; restore(): void
-  isVisible(): boolean; isFocused(): boolean; isMaximized(): boolean; isMinimized(): boolean
-  getBounds(): { x: number; y: number; width: number; height: number }
-}
-type Listener = { event: string; fn: (...args: any[]) => void; bindings: Map<NativeWindow, (...args: any[]) => void> }
-
-export function createRecoverableWindow(deps: {
-  createNativeWindow(options: Record<string, any>): NativeWindow
-  options: Record<string, any>
-  onWebContentsChanged(id: number): void
-  logger: ElectronMainLogger
-}): BrowserWindowLike {
-  const lifetime = new AbortController()
-  const windows = new Set<NativeWindow>()
-  const generations = new WeakMap<NativeWindow, number>()
-  const windowListeners: Listener[] = []
-  const contentListeners: Listener[] = []
-  let active: NativeWindow
-  let candidate: NativeWindow | undefined
-  let lastUrl: string | undefined
-  let replacing: Promise<void> | undefined
-  const bind = (win: NativeWindow, listener: Listener, contents: boolean) => {
-    const wrapped = (...args: any[]) => {
-      if (contents ? win === active || win === candidate : win === active) listener.fn(...args)
-    }
-    listener.bindings.set(win, wrapped)
-    if (contents) win.webContents.on(listener.event, wrapped)
-    else win.on(listener.event, wrapped)
-  }
-  const create = (options: Record<string, any>) => {
-    const win = deps.createNativeWindow(options)
-    windows.add(win)
-    generations.set(win, 0)
-    win.webContents.on('did-start-navigation', (_e, _url, _inPlace, isMainFrame) => {
-      if (isMainFrame) generations.set(win, (generations.get(win) ?? 0) + 1)
-    })
-    for (const listener of windowListeners) bind(win, listener, false)
-    for (const listener of contentListeners) bind(win, listener, true)
-    return win
-  }
-  const retire = (win: NativeWindow) => {
-    windows.delete(win)
-    for (const listener of [...windowListeners, ...contentListeners]) listener.bindings.delete(win)
-  }
-  const ensureLive = () => {
-    if (lifetime.signal.aborted) throw new Error('renderer recovery cancelled')
-  }
-  const verify = async (win: NativeWindow, url: string) => {
-    const generation = generations.get(win)
-    await verifyRendererReady(win, url, {
-      signal: lifetime.signal, isCurrent: () => generations.get(win) === generation,
-    })
-    ensureLive()
-  }
-  const replace = () => {
-    if (replacing) return replacing
-    replacing = (async () => {
-      ensureLive()
-      const old = active
-      const url = lastUrl ?? old.webContents.getURL()
-      if (!url) throw new Error('main window recovery URL unavailable')
-      const bounds = old.getBounds()
-      const visible = old.isVisible(), focused = old.isFocused(), maximized = old.isMaximized()
-      const next = create({ ...deps.options, ...bounds, show: false })
-      candidate = next
-      try {
-        await next.loadURL(url)
-        ensureLive()
-        await verify(next, url)
-        active = next
-        candidate = undefined
-        deps.onWebContentsChanged(next.webContents.id)
-        if (maximized) next.maximize()
-        if (visible) next.show()
-        if (focused) next.focus()
-        if (!old.isDestroyed()) old.destroy()
-        retire(old)
-      } catch (error) {
-        if (!next.isDestroyed()) next.destroy()
-        retire(next)
-        if (!lifetime.signal.aborted) deps.logger.log({ severity: 'error', event: 'main_window_replacement_failed', loadUrl: url, error })
-        throw error
-      } finally { candidate = undefined }
-    })().finally(() => { replacing = undefined })
-    return replacing
-  }
-  active = create(deps.options)
-  deps.onWebContentsChanged(active.webContents.id)
-  const contents: RecoverableWebContents = {
-    get id() { return active.webContents.id },
-    on(event, fn) {
-      const listener = { event, fn, bindings: new Map<NativeWindow, (...args: any[]) => void>() }
-      contentListeners.push(listener)
-      for (const win of windows) bind(win, listener, true)
-    },
-    removeListener(event, fn) {
-      for (let i = contentListeners.length - 1; i >= 0; i--) {
-        const listener = contentListeners[i]
-        if (listener.event !== event || listener.fn !== fn) continue
-        for (const [win, wrapped] of listener.bindings) win.webContents.removeListener(event, wrapped)
-        contentListeners.splice(i, 1)
-      }
-    },
-    getURL: () => active.webContents.getURL(), isDestroyed: () => active.webContents.isDestroyed(),
-    reload: replace, forcefullyCrashRenderer: () => active.webContents.forcefullyCrashRenderer(),
-  }
-  return {
-    webContents: contents,
-    async loadURL(url) {
-      ensureLive(); lastUrl = url
-      const target = active
-      await target.loadURL(url)
-      ensureLive()
-      if (active !== target) throw new Error('renderer native target changed')
-      await verify(target, url)
-    },
-    verifyRendererReady: url => verify(active, url),
-    cancelRecovery() {
-      if (lifetime.signal.aborted) return
-      lifetime.abort()
-      if (candidate && !candidate.isDestroyed()) candidate.destroy()
-    },
-    show: () => active.show(), hide: () => active.hide(), focus: () => active.focus(),
-    maximize: () => active.maximize(), isVisible: () => active.isVisible(), isFocused: () => active.isFocused(),
-    getBounds: () => active.getBounds(), isMaximized: () => active.isMaximized(),
-    isDestroyed: () => active.isDestroyed(), isMinimized: () => active.isMinimized(), restore: () => active.restore(),
-    on(event, fn) {
-      const listener = { event, fn, bindings: new Map<NativeWindow, (...args: any[]) => void>() }
-      windowListeners.push(listener)
-      for (const win of windows) bind(win, listener, false)
-    },
-  }
-}
-```
-
-`BrowserWindowLike` gets optional `isDestroyed`, `isMinimized`, `restore`, `verifyRendererReady(loadUrl)` and `cancelRecovery` signatures matching the object above. Keep adapter tests structural; constructor injection remains the real Electron `BrowserWindow` constructor in production.
-
-In `StartupContext`, change the injectable verifier signature to `(window: BrowserWindowLike, loadUrl: string) => Promise<void>`. In main `StartupResult`, add required `disposeRendererRecovery: () => void`. In `loadMainWindow`, move the entire recovery-registration block before the initial `void window.loadURL(loadUrl)` call and construct disposal there:
-
-```ts
-let disposedRecovery = false
-const disposeController = ctx.mainProcessLogger && window.webContents
-  ? registerRendererRecovery({
-    window, loadUrl, serverUrl, logger: ctx.mainProcessLogger, setTimeout, clearTimeout,
-    verifyRecovered: () => {
-      if (ctx.rendererRecoveryVerifier) return ctx.rendererRecoveryVerifier(window, loadUrl)
-      if (window.verifyRendererReady) return window.verifyRendererReady(loadUrl)
-      return Promise.reject(new Error('native renderer readiness verifier unavailable'))
-    },
-  })
-  : () => {}
-const disposeRendererRecovery = () => {
-  if (disposedRecovery) return
-  disposedRecovery = true
-  disposeController()
-  window.cancelRecovery?.()
-}
-window.on('closed', disposeRendererRecovery)
-```
-
-Retain the existing `main_window_recovery_unavailable` diagnostic if webContents/logger prerequisites are absent. Return `disposeRendererRecovery` with the main result. Update test fake windows to provide an explicit deterministic verifier when a test expects recovery success; production receives no no-op.
-
-In `entry.ts`, remove the old inline adapter and import `createRecoverableWindow`. Define these bindings before constructing `ctx`, then spread `...recoveryWindowBindings` into that context in place of the old `createBrowserWindow` property:
-
-```ts
-const recoveryWindowBindings: Pick<StartupContext, 'createBrowserWindow' | 'rendererRecoveryVerifier'> = {
-createBrowserWindow: options => createRecoverableWindow({
-  options,
-  createNativeWindow: nativeOptions => new BrowserWindow({
-    ...nativeOptions,
-    webPreferences: { ...nativeOptions.webPreferences, preload: path.join(__dirname, 'preload.js') },
-  }),
-  onWebContentsChanged: id => { mainWebContentsId = id },
-  logger: mainProcessLogger,
-}),
-rendererRecoveryVerifier: (window, loadUrl) => {
-  if (!window.verifyRendererReady) throw new Error('native renderer readiness verifier unavailable')
-  return window.verifyRendererReady(loadUrl)
-},
-}
-```
-
-Add module-level `let disposeActiveRecovery: (() => void) | undefined`. At the beginning of each `main()` pass call and clear the previous disposer. Immediately after a `runStartup` result is known to be `type:'main'`, assign `disposeActiveRecovery = result.disposeRendererRecovery`. Pass `disposeRendererRecovery: result.disposeRendererRecovery` to `initMainProcess`. Add optional `disposeRendererRecovery?: () => void` to `MainProcessDeps` and replace the first-quit `isQuitting = true` assignment in its before-quit handler with:
-
-```ts
-if (!isQuitting) {
-  isQuitting = true
-  deps.disposeRendererRecovery?.()
-}
-```
-
-This runs once before asynchronous `stopServer`, including repeated before-quit events. A destination choice's next `main()` also invalidates old-target work even if the old close was prevented by tray behavior. Retired-window `closed` events cannot dispose a current replacement because the adapter filters them by native identity.
+Keep the current result's disposer at entry ownership. Dispose old-target recovery at each new `main()` generation and wire the current disposer to logical close and the first quit transition before asynchronous server stopping. Hiding to tray and retiring an old native do not dispose. Constructor injection remains the real Electron `BrowserWindow` with its existing preload; update trusted `mainWebContentsId` only for the verified current candidate. Test repeated before-quit delivery, destination changes and stale completion through these real seams. Reconcile exact source interfaces during implementation rather than introducing unused lifecycle methods.
 
 - [ ] **Step 4: Add and run the real long-outage acceptance test**
 
@@ -1485,15 +914,7 @@ git add electron/renderer-readiness.ts electron/recoverable-window.ts electron/s
 git commit -m "fix: verify native Electron recovery and cancel retired work"
 ```
 
-Linked worktree `.git` files point outside the sandbox mount. Preserve exact clean-source provenance without expanding production sandbox mounts: make a test-owned standalone clone of this committed branch, with its own internal objects and `.git`, and run the canonical sandbox/runner from that clone. It is a disposable test fixture, never an authoring checkout. Record both SHAs and require equality:
-
-```bash
-set -o pipefail
-electron_proof_root="$(mktemp -d /tmp/freshell-electron-proof.XXXXXX)"
-git clone --no-hardlinks --single-branch --branch the-usual/freshell-crash-resilience /home/dan/code/freshell "${electron_proof_root}/checkout"
-test "$(git rev-parse HEAD)" = "$(git -C "${electron_proof_root}/checkout" rev-parse HEAD)"
-env -u DOCKER_CONTEXT -u FRESHELL_BUILD_COMMIT DOCKER_HOST=unix:///var/run/docker.sock "${electron_proof_root}/checkout/scripts/sandbox-test.sh" "xvfb-run -a pnpm run test:e2e:electron --grep 'Renderer crash recovery'" 2>&1 | tee /home/dan/code/freshell/.worktrees/.the-usual-logs/freshell-crash-resilience/reports/electron-outage-e2e.log
-```
+Use the clean standalone committed source checkout already staged under the private guest's `/workspace`, with internal Git objects and exact SHA equality to the reviewed authoring worktree. It is a disposable test fixture, never an authoring checkout. Execute the canonical sandbox wrapper from that checkout **inside the private outer guest**, against the guest daemon's `/var/run/docker.sock`; do not use host source paths, the host daemon or host named volumes. Its command remains `xvfb-run -a pnpm run test:e2e:electron --grep 'Renderer crash recovery'`. Keep inherited build-ID overrides absent and let the canonical runner build the exact clean source itself. Export command output, selected names/count, real timing, native JSONL, exact source/image/resource/fixture ownership and teardown receipts to this run's external evidence directory before guest cleanup. Qualify any ordinary-user Chromium/display/library setup inside that owned environment and rerun the actual canonical cases. No unexecuted host clone/socket command is supplied as an isolation recipe.
 
 Expected: actual selected tests include both healthy crash/IPC recovery and the long-outage scenario; both PASS in the bounded disposable container. No success logs occur during the outage. No client event is supplied after endpoint restoration. Keep the exact clone path as a test-owned cleanup receipt; remove it only after logs/results have been copied to the external evidence directory. Do not fall back to raw Playwright, stale dist, skipped tests or host-side process-kill execution.
 
@@ -2050,7 +1471,7 @@ The parent keeps one usual run and one plan for the explicit two-repository repa
 Reviewer-visible rollout choices are runbooks only. The sandbox change takes effect through the reviewed script/image in future test invocations. The Windows client change is delivered through the existing native-Windows NSIS build/install procedure in `docs/development/windows-electron-build.md`, followed by a separately approved desktop restart and user verification against the configured remote endpoint; preserve desktop configuration and record the previous installer for rollback. There are no Rust server behavior changes requiring a new production-server deployment in this repair. The machines rollout is the narrow script-only atomic replacement/rollback runbook in Task 4. None of these rollout operations is executed by this plan.
 
 1. Primary review endpoint: `git -C /home/dan/code/freshell/.worktrees/freshell-crash-resilience diff 283e4c4b87e58f31a048732800cefb345b799082 HEAD`; record its exact final SHA. Auxiliary endpoint: `git -C /home/dan/code/machines/.worktrees/freshell-user-manager-recovery diff 0409315b6278cf343a9c8a963b236345d28fcbc1 HEAD`; record its exact final SHA. The external evidence directory is `/home/dan/code/freshell/.worktrees/.the-usual-logs/freshell-crash-resilience/reports`.
-2. Required final Freshell gate, from the clean primary branch, is `env -u FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE -u FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE GCLOUD_ROBOT_REQUIRE=1 CARGO_BUILD_JOBS=4 FRESHELL_TEST_SUMMARY='Crash resilience final branch verification' pnpm run check`. It uses the existing configured cloud/local companion behavior. Run the canonical Electron sandbox proof at the final reviewed SHA and retain its exact selected-test count, timing and JSONL receipts. Do not restart the production server or install a Windows build as part of verification.
+2. Required final Freshell gate is the unchanged coordinated `pnpm run check` from an exact clean primary-branch checkout inside the qualified private guest, under the original host shared-gate reservation and Stage 2 operational/token/cleanup prerequisites. Remove only the two documented OpenCode optional-file environment values for that test process; require the existing robot identity, Cargo jobs two, a meaningful crash-resilience summary, both configured cloud backends and the local companion enabled. Keep all default phases, exact source/image identity and genuine inner coordinator records; a failed/partial gate remains failed/partial. Run the canonical Electron sandbox proof inside the guest at the final reviewed SHA and require both selected recovery cases with timing/native JSONL evidence. Export records, verify exact cloud and guest cleanup, remove temporary credentials, and only then release the host reservation. Do not restart production or install a Windows build as verification.
 3. Required machines endpoint is its focused policy matrix, all seven affected SentinelX suites, an honestly reported final `tests/validate.sh` result and successful real isolated-systemd smoke at the reviewed SHA. A broad pre-existing unrelated timeout requires an explicit recorded disposition; it is never green coverage. An unresolved safe-guest prerequisite keeps the overall result `FAILED/non-converged`; it cannot be turned into a platform-confidence footnote.
 4. Preserve actual workload/rootful-cgroup/headroom receipts, real >60-second Electron timing and no-false-success evidence, real manager/service-generation receipts and self-owned sentinel evidence. Parent updates the existing Kata items and usual run ledger with actual results, accepted residuals and every binding finding disposition.
 5. End with clean focused commits and branches ready for user review. Push is permitted by repository instructions when the parent reaches that workflow stage. Stop before creating either PR; ask for the user's explicit approval to land the concrete branches. Deployment and Windows user testing remain separately approved operations, described with runbooks rather than performed here.
@@ -2058,11 +1479,12 @@ Reviewer-visible rollout choices are runbooks only. The sandbox change takes eff
 ## Planner self-review
 
 - The dispatcher-authored `## User Request` block appears unchanged exactly once above; requested behavior and accepted pane-recovery residual map to explicit tasks and acceptance.
-- Runtime mocks cover scheduling/state decisions; they do not replace real workload completion, actual native-document outage recovery, or actual isolated-systemd manager/service restoration.
+- Runtime mocks cover scheduling/state decisions; they do not replace real workload completion, full private-guest RuntimeHarness qualification, actual native-document outage recovery, the exact configured-cloud full gate, or actual isolated-systemd manager/service restoration.
 - No live host policy rewrite, deployed service change, production restart, client install/restart or PR creation is included. Resource defaults remain proposed until the two-job actual-workload proof has material measured headroom.
 - The parent proved bounded private-cgroup/systemd/D-Bus and real guest manager/service restoration capability with retained receipts. Repaired-watchdog user-manager recovery remains required Task 4 acceptance, with a fail-closed fixture prerequisite recheck. No unsafe host-bound substitute is permitted.
 - The completed `reports/guest-manager-prerequisite.md` was read before handoff: the unchanged watchdog reproduced UID 1000's failure after a real guest oomd restart, direct guest start restored its enabled service, and the original UID 1001 path restored its service. Both had new manager/service PIDs and receipt counts 1→2 without an independent login. Task 4 preserves the executed setup decisions and must prove the repaired script itself restores UID 1000.
-- Self-review checked the dispatcher User Request byte-for-byte and exactly once, five coherent task boundaries, including the explicitly approved baseline readiness prerequisite, two Python blocks with AST parsing, 27 Bash blocks with `bash -n`, 18 TypeScript/JavaScript blocks with TypeScript syntax diagnostics, and in-memory TypeScript semantic diagnostics for the three central Electron production modules; all were clear. These are plan-code checks, not claimed implementation or acceptance test results.
+- Stage 2 self-review checked the unchanged dispatcher User Request byte-for-byte and exactly once; Task 0 ordering; the actual chosen guest/tool/resource profile; private source/daemon/cache ownership for Freshell proofs and the separately owned Task 4 systemd guest; host reservation through actual cleanup; measured token validity; bounded image preparation; complete native-action deadline versus permanent logical disposal; all real acceptance gates; and no live deployment/PR/Windows action. All 28 remaining Bash blocks, one Python block and 13 TypeScript/JavaScript blocks passed syntax checks; Markdown fences and the focused diff passed structural/whitespace checks. These are plan-quality checks, not implementation or acceptance test results; details are in the external Stage 2 self-review report.
+- The native-action completion premise was removed by design, with invalidated unexecuted production snippets replaced by decisions and required behavior. The new permanent cold-Clippy proof program was removed while retaining minimal wrapper/resource coverage and actual chosen-default current-source workload/headroom evidence through the executed external recipe.
 - Source snippets are draft guidance and must be reconciled with exact current interfaces during the parent's independent plan review before execution. The plan's source-tree authority rule applies after implementation begins.
 
 
