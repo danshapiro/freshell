@@ -83,7 +83,13 @@ where
             target == "freshell_server::session_directory" && level == tracing::Level::ERROR;
         let is_fresh_create_warning =
             target == "freshell_server::fresh_agent_proxy" && level == tracing::Level::WARN;
-        if !is_extension_warning && !is_session_directory_error && !is_fresh_create_warning {
+        let is_provider_discovery_warning = target == "freshell_server::managed_provider_bootstrap"
+            && level == tracing::Level::WARN;
+        if !is_extension_warning
+            && !is_session_directory_error
+            && !is_fresh_create_warning
+            && !is_provider_discovery_warning
+        {
             return;
         }
 

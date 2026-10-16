@@ -8,6 +8,10 @@ use freshell_runtime_protocol::{
 use tokio::net::UnixListener;
 
 #[cfg(feature = "managed-fresh-agent-fixtures")]
+#[path = "managed_launch_preparation_tests.rs"]
+mod launch_preparation;
+
+#[cfg(feature = "managed-fresh-agent-fixtures")]
 mod initial_grant_reference_tests {
     use super::*;
     use async_trait::async_trait;

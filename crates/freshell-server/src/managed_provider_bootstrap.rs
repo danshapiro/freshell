@@ -155,18 +155,30 @@ fn provider_launch_context_from_home_at_with_xdg(
                     .to_str()
                     .ok_or("managed config path is not UTF-8")?
                     .replace(std::path::MAIN_SEPARATOR, "/");
-                if !optional_resource_exists(&workspace.join(&relative_path))? {
+                if !optional_resource_exists(
+                    &workspace.join(&relative_path),
+                    &relative_path,
+                    "workspace",
+                )? {
                     continue;
                 }
-                let source = approved_config_path(workspace, &relative_path)?;
+                let source = approved_config_path(workspace, &relative_path, "workspace")?;
                 let mounted_workspace = std::fs::canonicalize(workspace)
                     .map_err(|_| "mounted managed workspace is unavailable")?;
                 if !source.starts_with(&mounted_workspace) {
-                    return Err(format!("selected project configuration {relative_path} is outside the mounted workspace; repair the selected link and retry"));
+                    return Err(discovery_refusal(
+                        "workspace",
+                        &relative_path,
+                        "outside_workspace",
+                        "repair the link inside the mounted workspace and retry",
+                    ));
                 }
                 if !source.is_file() {
-                    return Err(format!(
-                        "selected project configuration {relative_path} is not a regular file"
+                    return Err(discovery_refusal(
+                        "workspace",
+                        &relative_path,
+                        "not_regular_file",
+                        "select a regular configuration file and retry",
                     ));
                 }
                 project_config.push(ProviderConfigReference {
@@ -202,7 +214,7 @@ fn provider_launch_context_from_home_at_with_xdg(
         .iter()
         .map(|entry| (*entry).to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    if optional_resource_exists(&provider_root)? {
+    if optional_resource_exists(&provider_root, ".", "user_provider")? {
         for item in std::fs::read_dir(&provider_root)
             .map_err(|error| format!("inspect provider root: {:?}", error.kind()))?
         {
@@ -234,10 +246,10 @@ fn provider_launch_context_from_home_at_with_xdg(
     }
     let mut config = Vec::new();
     for entry in selected {
-        if !optional_resource_exists(&provider_root.join(&entry))? {
+        if !optional_resource_exists(&provider_root.join(&entry), &entry, "user_provider")? {
             continue;
         }
-        let path = approved_config_path(&provider_root, &entry)?;
+        let path = approved_config_path(&provider_root, &entry, "user_provider")?;
         let format = if path.is_dir() {
             "directory"
         } else if path.is_file() {
@@ -249,8 +261,11 @@ fn provider_launch_context_from_home_at_with_xdg(
                 _ => "text",
             }
         } else {
-            return Err(format!(
-                "selected provider resource {entry} is an unsupported filesystem node"
+            return Err(discovery_refusal(
+                "user_provider",
+                &entry,
+                "unsupported_node",
+                "select a regular file or directory and retry",
             ));
         };
         config.push(ProviderConfigReference {
@@ -260,8 +275,10 @@ fn provider_launch_context_from_home_at_with_xdg(
             format: format.into(),
         });
     }
-    if provider == "codex" && optional_resource_exists(&home.join(".agents/skills"))? {
-        approved_config_path(home, ".agents/skills")?;
+    if provider == "codex"
+        && optional_resource_exists(&home.join(".agents/skills"), ".agents/skills", "user_home")?
+    {
+        approved_config_path(home, ".agents/skills", "user_home")?;
         config.push(ProviderConfigReference {
             root: ProviderConfigRoot::UserProvider,
             relative_path: "freshell-discovered-agents".into(),
@@ -353,18 +370,46 @@ fn managed_codex_mcp_args() -> Option<Vec<String>> {
     Some(renderings.tui.args)
 }
 
+fn discovery_refusal(
+    resource_root: &str,
+    relative_path: &str,
+    cause: &str,
+    corrective_message: &str,
+) -> String {
+    // These fields come only from selectors and filesystem classifications:
+    // never file contents, resolved link targets, or provider error payloads.
+    tracing::warn!(
+        event = "provider.environment.discovery.failed",
+        resource_root,
+        relative_path,
+        cause,
+        corrective_message,
+    );
+    format!("selected provider resource {relative_path}: {cause}; {corrective_message}")
+}
+
 /// Absence is optional only before a provider root/resource is selected.
-fn optional_resource_exists(path: &Path) -> Result<bool, String> {
+fn optional_resource_exists(
+    path: &Path,
+    relative: &str,
+    resource_root: &str,
+) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
-            "inspect selected provider resource: {:?}; repair permissions and retry",
-            error.kind()
+        Err(error) => Err(discovery_refusal(
+            resource_root,
+            relative,
+            &format!("{:?}", error.kind()),
+            "repair permissions and retry",
         )),
     }
 }
-fn approved_config_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+fn approved_config_path(
+    root: &Path,
+    relative: &str,
+    resource_root: &str,
+) -> Result<PathBuf, String> {
     if relative.is_empty()
         || Path::new(relative)
             .components()
@@ -372,7 +417,14 @@ fn approved_config_path(root: &Path, relative: &str) -> Result<PathBuf, String> 
     {
         return Err("managed provider resource selector is unsafe".into());
     }
-    std::fs::canonicalize(root.join(relative)).map_err(|error| format!("resolve selected provider resource {relative}: {:?}; repair the selected resource or link and retry",error.kind()))
+    std::fs::canonicalize(root.join(relative)).map_err(|error| {
+        discovery_refusal(
+            resource_root,
+            relative,
+            &format!("{:?}", error.kind()),
+            "repair the selected resource or link and retry",
+        )
+    })
 }
 
 pub fn named_provider_onecli_references(
