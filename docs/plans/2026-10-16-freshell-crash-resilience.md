@@ -103,11 +103,11 @@ All code below is a pre-implementation draft. Once execution begins the source t
 
 **Intent:** Correct the demonstrated test readiness race before implementing the crash fixes. The existing test currently kills the web process and provider after observing CLI identity text; it must wait for the supervisor's durable resume evidence, preserving all replacement/config/source/MCP assertions and leaving production recovery unchanged.
 
-- [ ] **Step 1: Confirm red evidence and exact scope**
+- [x] **Step 1: Confirm red evidence and exact scope**
 
 Use the two recorded base failures in `reports/base-gate.log` and `reports/base-gate-sanitized.log`, supported by `reports/baseline-managed-restart.md`. The test consistently fails waiting for replacement, and the soul's retained lifecycle has zero recovery store probes. Record that the branch differs from that exact base only by planning until this correction. Do not rerun an unbounded or shared-host kill experiment for RED.
 
-- [ ] **Step 2: Correct the missing prerequisite**
+- [x] **Step 2: Correct the missing prerequisite**
 
 Immediately after `OpenCode native identity before web restart`, insert the same bounded readiness wait the neighboring passing replacement case already uses:
 
@@ -120,14 +120,14 @@ await waitFor('OpenCode resume evidence before web restart', async () => {
 
 Keep all existing later assertions and timeouts. Do not change supervisor/pane recovery, manufacture resume evidence, use arbitrary sleeps, or weaken assertions. Refactor only if this small test change exposes actual duplication worth removing; otherwise keep the existing idiom and confirm it remains green.
 
-- [ ] **Step 3: Commit the correction for exact-source verification**
+- [x] **Step 3: Commit the correction for exact-source verification**
 
 ```bash
 git add test/integration/server/managed-provider-parity.test.ts
 git commit -m "test: wait for durable resume before OpenCode restart"
 ```
 
-- [ ] **Step 4: Run the actual affected case in a disposable Docker-capable guest**
+- [x] **Step 4: Run the actual affected case in a disposable Docker-capable guest**
 
 Use the Stage 2 guest and ownership decisions above, with the finalized build-tools, cloud-auth and nested-Docker prerequisite reports. Stage a self-contained clean checkout at the committed Task 0 SHA under guest `/workspace`; use the guest's own Docker daemon, restricted runtime broker, validated dual-stack bridge and actual absolute mise path/Rust selection. Keep the qualified outer 8-GiB/no-swap/four-CPU/4096-PID profile and Cargo jobs two. Recheck ownership/namespace/cgroup/mount guards before releasing init or any build. Full runtime-image, test/release and qualification builds are not yet proved: let this actual selected case qualify them and then the real broker/workload/MCP/durable-recovery topology. Retain separate setup and behavioral verdicts. All deliberate fixture kills remain inside the outer guest. The already-proven shared-gate primitive still requires its actual operational cleanup qualification before broad use. Keep fresh owned guest artifacts for immediate affected-suite continuation when useful, with exact cleanup ownership.
 Inside that guest, the exact repo-owned selector is:
@@ -138,7 +138,7 @@ env -u FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE -u FRESHELL_MANAGED_OPENCODE_O
 
 Expected: exactly the selected case runs and passes with the durable barrier satisfied before the real outage, then replacement and all existing assertions pass. A filter matching zero tests is failure. Preserve full command/output/sourceSHA and guest ownership/cleanup receipts under this run's external logs. Record any safe setup refinements and rerun meaningful impacted coverage after subsequent corrections.
 
-- [ ] **Step 5: Review the committed task**
+- [x] **Step 5: Review the committed task**
 
 Fresh task review must confirm the new wait observes real supervisor state, existing assertions remain, RED/GREEN evidence is attributable, and no production or pane-recovery behavior changed. Repair any substantive findings before Task 1 starts.
 
