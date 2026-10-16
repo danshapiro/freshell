@@ -4655,25 +4655,48 @@ async fn run_task007_owned_case_child(case: Task007OwnedCase) -> bool {
         .stderr(private_output(&stderr_path))
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while child.try_wait().unwrap().is_none() {
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(60);
+    let mut limit = None;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         let output_exceeded = [&stdout_path, &stderr_path]
             .iter()
             .any(|path| fs::metadata(path).unwrap().len() > 2 * 1024 * 1024);
-        if std::time::Instant::now() >= deadline || output_exceeded {
+        let expired = std::time::Instant::now() >= deadline;
+        if expired || output_exceeded {
+            limit = Some((expired, output_exceeded));
             child.kill().unwrap();
-            let _ = child.wait();
-            panic!("owned {name} child exceeded its finite time/output limit");
+            break child.wait().unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let stdout_bytes = fs::metadata(&stdout_path).unwrap().len();
+    let stderr_bytes = fs::metadata(&stderr_path).unwrap().len();
+    if limit.is_some() || !status.success() || stdout_bytes.max(stderr_bytes) > 2 * 1024 * 1024 {
+        use std::io::{Read, Seek, SeekFrom};
+        let tail = |path: &std::path::Path| {
+            let mut file = fs::File::open(path).unwrap();
+            let start = file.metadata().unwrap().len().saturating_sub(16 * 1024);
+            file.seek(SeekFrom::Start(start)).unwrap();
+            let mut bytes = Vec::new();
+            file.take(16 * 1024).read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        // These are private synthetic fixture streams, never provider output.
+        // Read them after reaping and before TempDir removes the diagnostics.
+        let diagnostic = serde_json::json!({
+            "severity":"error", "event":"task007.owned_case_child.failed",
+            "case":name, "pid":child.id(), "elapsedMs":started.elapsed().as_millis(),
+            "deadlineExceeded":limit.is_some_and(|(expired, _)| expired),
+            "outputExceeded":stdout_bytes.max(stderr_bytes) > 2 * 1024 * 1024,
+            "stdoutBytes":stdout_bytes, "stderrBytes":stderr_bytes,
+            "status":status.to_string(), "stdoutTail":tail(&stdout_path), "stderrTail":tail(&stderr_path),
+        });
+        panic!("owned {name} child failed: {diagnostic}");
     }
-    let status = child.wait().unwrap();
-    assert!(
-        [&stdout_path, &stderr_path]
-            .iter()
-            .all(|path| fs::metadata(path).unwrap().len() <= 2 * 1024 * 1024),
-        "completed owned {name} child exceeded its output limit"
-    );
     let stdout = fs::read_to_string(stdout_path).unwrap();
     let stderr = fs::read_to_string(stderr_path).unwrap();
     assert!(status.success(), "{stdout}\n{stderr}");
@@ -4733,21 +4756,70 @@ enum StoppedRepairBaselineCase {
     StopCancellation,
 }
 
+// Setup and unused scenarios must return before polling ordinary recovery.
+// Keeping all four cases in one async body also keeps their debug poll
+// temporaries on the active stack, even when the outer future is boxed.
+struct StoppedRepairBaselineFixture {
+    dir: tempfile::TempDir,
+    registry: Registry,
+    supervisor: Supervisor,
+    workspace: std::path::PathBuf,
+    database: std::path::PathBuf,
+    source_bytes: Vec<u8>,
+    names: Vec<String>,
+    targets: Vec<freshell_runtime_protocol::LostSoulRepairTarget>,
+    scope: freshell_runtime_protocol::RepairBatchScope,
+    request: freshell_runtime_protocol::RestoreLostSoulsRequest,
+    operation: freshell_runtime_protocol::RequestId,
+    receipts: Vec<crate::registry::StoppedRepairRootReceipt>,
+    stores: Vec<(std::path::PathBuf, Vec<u8>)>,
+}
+
 async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
-    let pending_startup = matches!(case, StoppedRepairBaselineCase::PendingWithdrawal);
-    let created_preflight = matches!(case, StoppedRepairBaselineCase::CreatedPreflight);
-    let stop_cancellation = matches!(case, StoppedRepairBaselineCase::StopCancellation);
+    let mut fixture = Box::pin(prepare_stopped_repair_baseline()).await;
+    Box::pin(import_stopped_repair_baseline(&mut fixture)).await;
+    if matches!(case, StoppedRepairBaselineCase::PendingWithdrawal) {
+        fixture = Box::pin(pending_stopped_repair_baseline(fixture)).await;
+    }
+    Box::pin(finalize_stopped_repair_baseline(&fixture)).await;
+    let soul = fixture.targets[0].soul_id.clone();
+    if matches!(case, StoppedRepairBaselineCase::CreatedPreflight) {
+        crate::recovery::tests::assert_created_repaired_preflight(
+            &fixture.dir,
+            &fixture.registry,
+            &soul,
+        )
+        .await;
+    }
+    let cancelled = if matches!(case, StoppedRepairBaselineCase::StopCancellation) {
+        Some(
+            Box::pin(
+                crate::recovery::automatic_retry_tests::assert_baseline_only_stop_cancellation(
+                    &fixture.dir,
+                    &fixture.registry,
+                    &soul,
+                ),
+            )
+            .await,
+        )
+    } else {
+        Box::pin(retry_stopped_repair_baseline(&fixture)).await;
+        None
+    };
+    Box::pin(reopen_stopped_repair_baseline(fixture, cancelled)).await;
+}
+
+async fn prepare_stopped_repair_baseline() -> StoppedRepairBaselineFixture {
     use freshell_runtime_protocol::{
-        CanonicalOwnerChoice, DesiredState, PreflightLostSoulsRequest, RecoverRequest,
-        RecoveryOutcome, RecoveryState, RecoveryTrigger, RepairBatchSourceSelection, RequestId,
-        RestoreLostSoulsRequest, SoulRepairStatus,
+        CanonicalOwnerChoice, PreflightLostSoulsRequest, RepairBatchSourceSelection, RequestId,
+        RestoreLostSoulsRequest,
     };
     use freshell_sessions::opencode_transfer::{
         pinned_destination_migration_ids, pinned_destination_schema_sql, HostOpenCodeInventory,
     };
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
-    let mut registry = Registry::open(dir.path(), None).unwrap();
+    let registry = Registry::open(dir.path(), None).unwrap();
     let workspace = dir.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
     let database = dir.path().join("source.sqlite");
@@ -4799,7 +4871,7 @@ async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
             .unwrap();
         targets.push(target);
     }
-    let mut supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
     let scope = supervisor
         .preflight_lost_souls_from_inventory(
             PreflightLostSoulsRequest {
@@ -4843,14 +4915,45 @@ async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
         .prepare_stopped_repair_operation(operation.clone(), request.clone(), scope.clone())
         .await
         .unwrap();
-    let mut receipts = Vec::new();
-    let mut stores = Vec::new();
+    StoppedRepairBaselineFixture {
+        dir,
+        registry,
+        supervisor,
+        workspace,
+        database,
+        source_bytes,
+        names,
+        targets,
+        scope,
+        request,
+        operation,
+        receipts: Vec::new(),
+        stores: Vec::new(),
+    }
+}
+
+async fn import_stopped_repair_baseline(fixture: &mut StoppedRepairBaselineFixture) {
+    // Actual export/import/reader receipts exercise baseline persistence here;
+    // the authenticated Docker/helper/UI path is the stopped browser runbook.
+    let StoppedRepairBaselineFixture {
+        dir,
+        registry,
+        workspace,
+        database,
+        names,
+        targets,
+        scope,
+        operation,
+        receipts,
+        stores,
+        ..
+    } = fixture;
     for index in 0..7 {
         let receipt = import_stopped_fixture_root(
-            &registry,
+            registry,
             &targets[index],
-            &database,
-            &workspace,
+            database,
+            workspace,
             dir.path(),
             &names[index],
             &scope
@@ -4891,326 +4994,366 @@ async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
             .unwrap();
         receipts.push(receipt);
     }
-    // Actual export/import/reader receipts exercise baseline persistence here;
-    // the authenticated Docker/helper/UI path is the stopped browser runbook.
-    if pending_startup {
-        let obstruction = dir.path().join("lifecycle.jsonl.1");
-        fs::create_dir(&obstruction).unwrap();
-        let unrelated = freshell_runtime_protocol::IncidentId::new();
-        Connection::open(registry.database_path()).unwrap().execute(
-            "INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES ('startup-unrelated','loss_incident.final',?1,1)",
-            [serde_json::json!({"incidentId":unrelated,"cleanupState":"closed","event":"unrelated"}).to_string()],
-        ).unwrap();
-        let initial_pending = registry
-            .finalize_stopped_repair_batch(
-                operation.clone(),
-                targets.clone(),
-                receipts.clone(),
-                dir.path().join("incidents"),
-                dir.path().join("lifecycle.jsonl"),
-            )
-            .await;
-        drop(supervisor);
-        drop(registry);
-        registry = Registry::open(dir.path(), None).unwrap();
-        supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
-        // These are the actual calls before main binds the control socket.
-        supervisor
-            .reconcile_pending_loss_cleanup()
-            .await
-            .expect("pending withdrawal must leave startup and repair control available");
-        assert_eq!(supervisor.reconcile_startup().await.unwrap().scanned, 0);
-        let retry_request = RestoreLostSoulsRequest {
-            expected_control_epoch: Some(registry.control_epoch()),
-            ..request.clone()
-        };
-        for _ in 0..2 {
-            let pending = Box::pin(supervisor.restore_lost_souls_with_inventory(
-                operation.clone(),
-                retry_request.clone(),
-                async {
-                    panic!("post-CAS withdrawal must not inspect or reimport source inventory")
-                },
-            ))
-            .await
-            .unwrap();
-            assert_eq!(pending.status, SoulRepairStatus::Pending);
-            assert_eq!(
-                &pending,
-                initial_pending
-                    .as_ref()
-                    .expect("initial post-CAS obstruction must also return Pending")
-            );
-            assert_eq!(pending.operation_id, operation);
-            assert_eq!(pending.scope_id, scope.scope_id);
-            assert_eq!(
-                (
-                    pending.repaired_target_count,
-                    pending.total_target_count,
-                    pending.roots.len()
-                ),
-                (9, 9, 7)
-            );
-        }
-        let initial_pending = initial_pending.unwrap();
-        let conn = Connection::open(registry.database_path()).unwrap();
-        let pending: (String, String) = conn.query_row(
-            "SELECT o.status,w.status FROM stopped_repair_operations o JOIN stopped_repair_withdrawals w USING(operation_id) WHERE operation_id=?1",
-            [operation.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
-        ).unwrap();
-        assert_eq!(pending, ("withdraw_pending".into(), "files_pending".into()));
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM recovery_attempts", [], |row| row
-                .get::<_, u32>(0))
-                .unwrap(),
-            0,
-            "pending repair must not launch a recovery attempt"
-        );
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM writer_claims", [], |row| row
-                .get::<_, u32>(0))
-                .unwrap(),
-            0
-        );
-        assert!(
-            supervisor.export_pending_incidents().await.is_err(),
-            "destructive cleanup remains blocked"
-        );
-        for target in &targets {
-            assert_eq!(
-                registry
-                    .recovery_context(target.soul_id.clone())
-                    .await
-                    .unwrap()
-                    .desired_state,
-                DesiredState::Stopped
-            );
-        }
-        for (receipt, (store, bytes)) in receipts.iter().zip(&stores) {
-            assert_eq!(
-                registry
-                    .recovery_context(receipt.canonical_soul_id.clone())
-                    .await
-                    .unwrap()
-                    .opencode_adoption_baseline,
-                Some(receipt.adoption_baseline.clone())
-            );
-            assert_eq!(fs::read(store).unwrap(), *bytes);
-        }
-        let unrelated_path = dir
-            .path()
-            .join("incidents")
-            .join(format!("{unrelated}.closed.json"));
-        let unrelated_bytes = fs::read(&unrelated_path).unwrap();
-        let delivered: Option<i64> = conn
-            .query_row(
-                "SELECT delivered_at FROM outbox WHERE event_id='startup-unrelated'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(delivered.is_some());
-        // A retryable file obstruction cannot conceal invalid request authority,
-        // corrupt receipts, stale generations, or a failed registry read.
-        let mut invalid_scope = retry_request.clone();
-        invalid_scope.scope_id = "invalid-scope".into();
-        assert!(Box::pin(supervisor.restore_lost_souls_with_inventory(
+}
+
+async fn pending_stopped_repair_baseline(
+    fixture: StoppedRepairBaselineFixture,
+) -> StoppedRepairBaselineFixture {
+    use freshell_runtime_protocol::{DesiredState, RestoreLostSoulsRequest, SoulRepairStatus};
+    let StoppedRepairBaselineFixture {
+        dir,
+        mut registry,
+        mut supervisor,
+        workspace,
+        database,
+        source_bytes,
+        names,
+        targets,
+        scope,
+        request,
+        operation,
+        receipts,
+        stores,
+    } = fixture;
+    let obstruction = dir.path().join("lifecycle.jsonl.1");
+    fs::create_dir(&obstruction).unwrap();
+    let unrelated = freshell_runtime_protocol::IncidentId::new();
+    Connection::open(registry.database_path()).unwrap().execute(
+        "INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES ('startup-unrelated','loss_incident.final',?1,1)",
+        [serde_json::json!({"incidentId":unrelated,"cleanupState":"closed","event":"unrelated"}).to_string()],
+    ).unwrap();
+    let initial_pending = registry
+        .finalize_stopped_repair_batch(
             operation.clone(),
-            invalid_scope,
-            async { panic!("invalid request must fail before source inventory") }
-        ))
-        .await
-        .is_err());
-        for (table, column, replacement) in [
-            (
-                "stopped_repair_withdrawals",
-                "generation",
-                "stale-generation",
-            ),
-            (
-                "stopped_repair_root_receipts",
-                "import_receipt_json",
-                "{broken",
-            ),
-        ] {
-            let saved: Vec<(i64, String)> = conn
-                .prepare(&format!(
-                    "SELECT rowid,{column} FROM {table} WHERE operation_id=?1"
-                ))
-                .unwrap()
-                .query_map([operation.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            conn.execute(
-                &format!("UPDATE {table} SET {column}=?1 WHERE operation_id=?2"),
-                params![replacement, operation.as_str()],
-            )
-            .unwrap();
-            assert!(
-                Box::pin(supervisor.restore_lost_souls_with_inventory(
-                    operation.clone(),
-                    retry_request.clone(),
-                    async {
-                        panic!("invalid persisted authority must fail before source inventory")
-                    }
-                ))
-                .await
-                .is_err(),
-                "{column} must remain a strict failure"
-            );
-            for (rowid, value) in saved {
-                conn.execute(
-                    &format!("UPDATE {table} SET {column}=?1 WHERE rowid=?2"),
-                    params![value, rowid],
-                )
-                .unwrap();
-            }
-        }
-        conn.execute(
-            "ALTER TABLE stopped_repair_root_receipts RENAME TO unavailable_root_receipts",
-            [],
+            targets.clone(),
+            receipts.clone(),
+            dir.path().join("incidents"),
+            dir.path().join("lifecycle.jsonl"),
         )
-        .unwrap();
-        assert!(Box::pin(supervisor.restore_lost_souls_with_inventory(
+        .await;
+    drop(supervisor);
+    drop(registry);
+    registry = Registry::open(dir.path(), None).unwrap();
+    supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    // These are the actual calls before main binds the control socket.
+    supervisor
+        .reconcile_pending_loss_cleanup()
+        .await
+        .expect("pending withdrawal must leave startup and repair control available");
+    assert_eq!(supervisor.reconcile_startup().await.unwrap().scanned, 0);
+    let retry_request = RestoreLostSoulsRequest {
+        expected_control_epoch: Some(registry.control_epoch()),
+        ..request.clone()
+    };
+    for _ in 0..2 {
+        let pending = Box::pin(supervisor.restore_lost_souls_with_inventory(
             operation.clone(),
             retry_request.clone(),
-            async { panic!("failed registry read must fail before source inventory") }
-        ))
-        .await
-        .is_err());
-        conn.execute(
-            "ALTER TABLE unavailable_root_receipts RENAME TO stopped_repair_root_receipts",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        let true_context = prepared_context_in_registry(&registry, dir.path()).await;
-        let true_loss = registry
-            .prepare_loss(decision_for(&registry, &true_context).unwrap())
-            .await
-            .unwrap();
-        let true_incident = true_loss.certificate.incident_id.clone();
-        supervisor.reconcile_pending_loss_cleanup().await.unwrap();
-        let conn = Connection::open(registry.database_path()).unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
-                [true_incident.as_str()],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "cleanup_pending",
-            "pending withdrawal must gate actual certified loss cleanup"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM writer_claims WHERE soul_id=?1",
-                [true_context.soul_id.as_str()],
-                |row| row.get::<_, u32>(0)
-            )
-            .unwrap(),
-            1,
-            "retain the unrelated certified writer until cleanup is allowed"
-        );
-        let true_certificate: String = conn
-            .query_row(
-                "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
-                [true_incident.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        drop(conn);
-        fs::remove_dir(&obstruction).unwrap();
-        let first = Box::pin(supervisor.restore_lost_souls_with_inventory(
-            operation.clone(),
-            retry_request.clone(),
-            async { panic!("finishing withdrawal must not reimport source inventory") },
+            async { panic!("post-CAS withdrawal must not inspect or reimport source inventory") },
         ))
         .await
         .unwrap();
-        assert_eq!(first.status, SoulRepairStatus::Complete);
-        assert_eq!(first.roots, initial_pending.roots);
-        let again = Box::pin(supervisor.restore_lost_souls_with_inventory(
-            operation.clone(),
-            retry_request,
-            async { panic!("completed retry must not inspect source inventory") },
-        ))
-        .await
-        .unwrap();
-        assert_eq!(first, again);
-        supervisor.reconcile_pending_loss_cleanup().await.unwrap();
-        let conn = Connection::open(registry.database_path()).unwrap();
+        assert_eq!(pending.status, SoulRepairStatus::Pending);
         assert_eq!(
-            conn.query_row(
-                "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
-                [true_incident.as_str()],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "closed"
+            &pending,
+            initial_pending
+                .as_ref()
+                .expect("initial post-CAS obstruction must also return Pending")
         );
+        assert_eq!(pending.operation_id, operation);
+        assert_eq!(pending.scope_id, scope.scope_id);
         assert_eq!(
-            conn.query_row(
-                "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
-                [true_incident.as_str()],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            true_certificate
-        );
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM writer_claims", [], |row| row
-                .get::<_, u32>(0))
-                .unwrap(),
-            0
-        );
-        drop(conn);
-        let first = registry
-            .finalize_stopped_repair_batch(
-                operation.clone(),
-                targets.clone(),
-                receipts.clone(),
-                dir.path().join("incidents"),
-                dir.path().join("lifecycle.jsonl"),
-            )
-            .await
-            .unwrap();
-        let again = registry
-            .finalize_stopped_repair_batch(
-                operation.clone(),
-                targets.clone(),
-                receipts.clone(),
-                dir.path().join("incidents"),
-                dir.path().join("lifecycle.jsonl"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first, again);
-        assert_eq!(fs::read(unrelated_path).unwrap(), unrelated_bytes);
-        let conn = Connection::open(registry.database_path()).unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
-                [operation.as_str()],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-            "complete"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM stopped_repair_withdrawals WHERE operation_id=?1",
-                [operation.as_str()],
-                |row| row.get::<_, u32>(0)
-            )
-            .unwrap(),
-            0
+            (
+                pending.repaired_target_count,
+                pending.total_target_count,
+                pending.roots.len()
+            ),
+            (9, 9, 7)
         );
     }
+    let initial_pending = initial_pending.unwrap();
+    let conn = Connection::open(registry.database_path()).unwrap();
+    let pending: (String, String) = conn.query_row(
+        "SELECT o.status,w.status FROM stopped_repair_operations o JOIN stopped_repair_withdrawals w USING(operation_id) WHERE operation_id=?1",
+        [operation.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert_eq!(pending, ("withdraw_pending".into(), "files_pending".into()));
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM recovery_attempts", [], |row| row
+            .get::<_, u32>(0))
+            .unwrap(),
+        0,
+        "pending repair must not launch a recovery attempt"
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM writer_claims", [], |row| row
+            .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        supervisor.export_pending_incidents().await.is_err(),
+        "destructive cleanup remains blocked"
+    );
+    for target in &targets {
+        assert_eq!(
+            registry
+                .recovery_context(target.soul_id.clone())
+                .await
+                .unwrap()
+                .desired_state,
+            DesiredState::Stopped
+        );
+    }
+    for (receipt, (store, bytes)) in receipts.iter().zip(&stores) {
+        assert_eq!(
+            registry
+                .recovery_context(receipt.canonical_soul_id.clone())
+                .await
+                .unwrap()
+                .opencode_adoption_baseline,
+            Some(receipt.adoption_baseline.clone())
+        );
+        assert_eq!(fs::read(store).unwrap(), *bytes);
+    }
+    let unrelated_path = dir
+        .path()
+        .join("incidents")
+        .join(format!("{unrelated}.closed.json"));
+    let unrelated_bytes = fs::read(&unrelated_path).unwrap();
+    let delivered: Option<i64> = conn
+        .query_row(
+            "SELECT delivered_at FROM outbox WHERE event_id='startup-unrelated'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(delivered.is_some());
+    // A retryable file obstruction cannot conceal invalid request authority,
+    // corrupt receipts, stale generations, or a failed registry read.
+    let mut invalid_scope = retry_request.clone();
+    invalid_scope.scope_id = "invalid-scope".into();
+    assert!(Box::pin(supervisor.restore_lost_souls_with_inventory(
+        operation.clone(),
+        invalid_scope,
+        async { panic!("invalid request must fail before source inventory") }
+    ))
+    .await
+    .is_err());
+    for (table, column, replacement) in [
+        (
+            "stopped_repair_withdrawals",
+            "generation",
+            "stale-generation",
+        ),
+        (
+            "stopped_repair_root_receipts",
+            "import_receipt_json",
+            "{broken",
+        ),
+    ] {
+        let saved: Vec<(i64, String)> = conn
+            .prepare(&format!(
+                "SELECT rowid,{column} FROM {table} WHERE operation_id=?1"
+            ))
+            .unwrap()
+            .query_map([operation.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        conn.execute(
+            &format!("UPDATE {table} SET {column}=?1 WHERE operation_id=?2"),
+            params![replacement, operation.as_str()],
+        )
+        .unwrap();
+        assert!(
+            Box::pin(supervisor.restore_lost_souls_with_inventory(
+                operation.clone(),
+                retry_request.clone(),
+                async { panic!("invalid persisted authority must fail before source inventory") }
+            ))
+            .await
+            .is_err(),
+            "{column} must remain a strict failure"
+        );
+        for (rowid, value) in saved {
+            conn.execute(
+                &format!("UPDATE {table} SET {column}=?1 WHERE rowid=?2"),
+                params![value, rowid],
+            )
+            .unwrap();
+        }
+    }
+    conn.execute(
+        "ALTER TABLE stopped_repair_root_receipts RENAME TO unavailable_root_receipts",
+        [],
+    )
+    .unwrap();
+    assert!(Box::pin(supervisor.restore_lost_souls_with_inventory(
+        operation.clone(),
+        retry_request.clone(),
+        async { panic!("failed registry read must fail before source inventory") }
+    ))
+    .await
+    .is_err());
+    conn.execute(
+        "ALTER TABLE unavailable_root_receipts RENAME TO stopped_repair_root_receipts",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let true_context = prepared_context_in_registry(&registry, dir.path()).await;
+    let true_loss = registry
+        .prepare_loss(decision_for(&registry, &true_context).unwrap())
+        .await
+        .unwrap();
+    let true_incident = true_loss.certificate.incident_id.clone();
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    let conn = Connection::open(registry.database_path()).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
+            [true_incident.as_str()],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "cleanup_pending",
+        "pending withdrawal must gate actual certified loss cleanup"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM writer_claims WHERE soul_id=?1",
+            [true_context.soul_id.as_str()],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        1,
+        "retain the unrelated certified writer until cleanup is allowed"
+    );
+    let true_certificate: String = conn
+        .query_row(
+            "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+            [true_incident.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    fs::remove_dir(&obstruction).unwrap();
+    let first = Box::pin(supervisor.restore_lost_souls_with_inventory(
+        operation.clone(),
+        retry_request.clone(),
+        async { panic!("finishing withdrawal must not reimport source inventory") },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(first.status, SoulRepairStatus::Complete);
+    assert_eq!(first.roots, initial_pending.roots);
+    let again = Box::pin(supervisor.restore_lost_souls_with_inventory(
+        operation.clone(),
+        retry_request,
+        async { panic!("completed retry must not inspect source inventory") },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(first, again);
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    let conn = Connection::open(registry.database_path()).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
+            [true_incident.as_str()],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "closed"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+            [true_incident.as_str()],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        true_certificate
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM writer_claims", [], |row| row
+            .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    drop(conn);
+    let first = registry
+        .finalize_stopped_repair_batch(
+            operation.clone(),
+            targets.clone(),
+            receipts.clone(),
+            dir.path().join("incidents"),
+            dir.path().join("lifecycle.jsonl"),
+        )
+        .await
+        .unwrap();
+    let again = registry
+        .finalize_stopped_repair_batch(
+            operation.clone(),
+            targets.clone(),
+            receipts.clone(),
+            dir.path().join("incidents"),
+            dir.path().join("lifecycle.jsonl"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, again);
+    assert_eq!(fs::read(unrelated_path).unwrap(), unrelated_bytes);
+    let conn = Connection::open(registry.database_path()).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+            [operation.as_str()],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "complete"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM stopped_repair_withdrawals WHERE operation_id=?1",
+            [operation.as_str()],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        0
+    );
+    StoppedRepairBaselineFixture {
+        dir,
+        registry,
+        supervisor,
+        workspace,
+        database,
+        source_bytes,
+        names,
+        targets,
+        scope,
+        request,
+        operation,
+        receipts,
+        stores,
+    }
+}
+
+async fn finalize_stopped_repair_baseline(fixture: &StoppedRepairBaselineFixture) {
+    use freshell_runtime_protocol::{DesiredState, RecoveryState};
+    let StoppedRepairBaselineFixture {
+        registry,
+        dir,
+        operation,
+        targets,
+        receipts,
+        ..
+    } = fixture;
     let result = registry
         .finalize_stopped_repair_batch(
-            operation,
+            operation.clone(),
             targets.clone(),
             receipts.clone(),
             dir.path().join("incidents"),
@@ -5225,22 +5368,23 @@ async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
     assert_eq!(repaired.desired_state, DesiredState::Stopped);
     assert_eq!(repaired.recovery_state, RecoveryState::DataRepairComplete);
     assert_eq!(repaired.opencode_adoption_baseline, Some(baseline.clone()));
-    if created_preflight {
-        crate::recovery::tests::assert_created_repaired_preflight(&dir, &registry, &soul).await;
-    }
-    let cancelled = if stop_cancellation {
-        Some(
-            Box::pin(
-                crate::recovery::automatic_retry_tests::assert_baseline_only_stop_cancellation(
-                    &dir, &registry, &soul,
-                ),
-            )
-            .await,
-        )
-    } else {
-        None
+}
+
+async fn retry_stopped_repair_baseline(fixture: &StoppedRepairBaselineFixture) {
+    use freshell_runtime_protocol::{
+        RecoverRequest, RecoveryOutcome, RecoveryState, RecoveryTrigger,
     };
-    for _ in 0..if stop_cancellation { 0 } else { 2 } {
+    let StoppedRepairBaselineFixture {
+        registry,
+        supervisor,
+        targets,
+        receipts,
+        names,
+        ..
+    } = fixture;
+    let soul = targets[0].soul_id.clone();
+    let baseline = receipts[0].adoption_baseline.clone();
+    for _ in 0..2 {
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         let outcome = supervisor
             .recover(RecoverRequest {
@@ -5272,6 +5416,26 @@ async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
             "/home/freshell/provider/.local/share/opencode/opencode.db"
         );
     }
+}
+
+async fn reopen_stopped_repair_baseline(
+    fixture: StoppedRepairBaselineFixture,
+    cancelled: Option<RecoveryContext>,
+) {
+    use freshell_runtime_protocol::{DesiredState, RecoveryState};
+    let StoppedRepairBaselineFixture {
+        dir,
+        registry,
+        supervisor,
+        database,
+        source_bytes,
+        targets,
+        receipts,
+        stores,
+        ..
+    } = fixture;
+    let soul = targets[0].soul_id.clone();
+    let baseline = receipts[0].adoption_baseline.clone();
     drop(supervisor);
     drop(registry);
     let reopened = Registry::open(dir.path(), None).unwrap();
