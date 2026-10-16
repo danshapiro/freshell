@@ -4781,6 +4781,25 @@ function freshCodexSavedTranscript(nativeId: string): string {
   ].join('\n') + '\n'
 }
 
+function preservesFreshCodexSavedTranscript(raw: string, nativeId: string): boolean {
+  const seed = freshCodexSavedTranscript(nativeId)
+  if (raw === seed) return true
+  if (!raw.startsWith(seed)) return false
+  // This fixed fixture intentionally sends one new turn. Its original
+  // retained bytes must survive, followed only by that completed native turn.
+  try {
+    const [context, user, assistant, complete, ...extra] = raw.slice(seed.length).trimEnd().split('\n').map(line => JSON.parse(line))
+    return extra.length === 0
+      && context?.type === 'turn_context' && typeof context.payload?.turn_id === 'string' && context.payload.turn_id.length > 0
+      && user?.type === 'response_item' && user.payload?.type === 'message' && user.payload.role === 'user'
+      && assistant?.type === 'response_item' && assistant.payload?.type === 'message' && assistant.payload.role === 'assistant'
+      && complete?.type === 'event_msg' && complete.payload?.type === 'task_complete'
+      && complete.payload.turn_id === context.payload.turn_id
+  } catch {
+    return false
+  }
+}
+
 /**
  * Owned managed-runtime browser rig: restricted Docker broker + supervisor +
  * a feature-enabled Rust web server. Web restart methods touch only the web
@@ -7652,7 +7671,7 @@ export class ManagedRuntimeOwner {
     await this.assertFreshCodexSavedHistoryFixture(handle)
     const raw = await this.ownedProviderExec(handle.containerId, ['cat',
       freshCodexFixtureTranscriptPath(handle.nativeSessionId)])
-    return raw === freshCodexSavedTranscript(handle.nativeSessionId)
+    return preservesFreshCodexSavedTranscript(raw, handle.nativeSessionId)
   }
 
   private coincidentFreshCodexHistoryPath(handle: ExactRuntimeHandle): string {

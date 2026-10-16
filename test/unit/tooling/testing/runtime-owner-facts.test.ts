@@ -3149,6 +3149,23 @@ describe('fixed owned fresh Codex saved history', () => {
       expect(rows[0].payload.id).toBe(current.nativeSessionId)
       expect(rows.at(-1).payload.last_agent_message).toBe(`Managed fixture saved answer\n${'x'.repeat(20_000)}`)
       await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(true)
+      const completedAppend = [
+        { type: 'turn_context', payload: { turn_id: 'new-native-turn' } },
+        { type: 'response_item', payload: { type: 'message', id: 'new-native-user', role: 'user',
+          content: [{ type: 'input_text', text: 'Continue the saved conversation' }] } },
+        { type: 'response_item', payload: { type: 'message', id: 'new-native-answer', role: 'assistant',
+          content: [{ type: 'output_text', text: 'The original conversation continues' }] } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'new-native-turn' } },
+      ].map(row => JSON.stringify(row)).join('\n') + '\n'
+      await fsp.appendFile(file, completedAppend)
+      await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(true)
+      await fsp.writeFile(file, raw.replace('Managed prompt 0', 'Rewritten saved prompt') + completedAppend)
+      await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
+      await fsp.writeFile(file, raw + completedAppend.split('\n').slice(0, 3).join('\n') + '\n')
+      await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
+      await fsp.writeFile(file, raw + JSON.stringify({ type: 'unrelated-record' }) + '\n')
+      await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
+      await fsp.writeFile(file, raw + completedAppend)
       await fsp.appendFile(file, 'changed\n')
       await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
       Object.assign(rig, { web: { info: { homeDir: root } } })

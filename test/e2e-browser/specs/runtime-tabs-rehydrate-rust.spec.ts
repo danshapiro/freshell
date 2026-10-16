@@ -237,10 +237,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(ownedSnapshot.firstAnswerMatches).toBe(true)
       expect(ownedSnapshot.lastAnswerMatches).toBe(true)
       expect(ownedSnapshot.retentionAbsent).toBe(true)
-      const expectLargeRetainedHistory = (snapshot: any) => {
+      let retainedTurns: any[] | undefined
+      const expectLargeRetainedHistory = (snapshot: any, additionalTurns = 0) => {
         expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeGreaterThan(1024 * 1024)
         // The native projection preserves each user/assistant row independently.
-        expect(snapshot.turns).toHaveLength(160)
+        expect(snapshot.turns).toHaveLength(160 + additionalTurns)
+        if (retainedTurns) expect(snapshot.turns.slice(0, 160)).toEqual(retainedTurns)
         expect(snapshot.turns[0].turnId).toBe('retained-0:row-0')
         expect(snapshot.turns[159].turnId).toBe('retained-79:row-1')
         const first = snapshot.turns[1].items.find((item: any) => item.text?.startsWith('Managed retained answer 0'))
@@ -253,7 +255,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         headers: { 'x-auth-token': info.token },
       })
       expect(initialSnapshot.ok).toBe(true)
-      expectLargeRetainedHistory(await initialSnapshot.json())
+      const initialHistory = await initialSnapshot.json()
+      expectLargeRetainedHistory(initialHistory)
+      retainedTurns = initialHistory.turns
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
@@ -317,8 +321,13 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       releaseHeldSnapshot!()
       await expect(composer).toBeEnabled()
       await expect(composer).toHaveValue('Draft stays in this managed conversation')
+      const sentTurnBaseline = received.length
       await composer.press('Enter')
       await expect.poll(async () => (await fixtureState()).completionCount, { timeout: 30_000 }).toBe(before.completionCount + 1)
+      await waitForValue('completed native fixture turn', () => received.slice(sentTurnBaseline).find(frame => {
+        const event = frame.type === 'freshAgent.event' ? frame.event : frame
+        return event?.type === 'freshAgent.turn.complete' && frame.sessionId === view.nativeSessionId
+      }), 30_000)
       expect((await fixtureState()).dispatchCount).toBe(before.dispatchCount + 1)
       expect((await fixtureState()).nativeSessionId).toBe(view.nativeSessionId)
       const current = (await rig.inventory()).find((row) => row.soulId === view.soulId)
@@ -392,7 +401,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(history.extensions.codex.ownerKind).toBe('vacant')
       expect(history.extensions.codex.statusFromLiveState).not.toBe(true)
       expect(history.capabilities.send).toBe(false)
-      expectLargeRetainedHistory(history)
+      expectLargeRetainedHistory(history, 2)
+      expect(history.turns.slice(160).map((turn: any) => turn.role)).toEqual(['user', 'assistant'])
+      expect(history.turns[161].items).toContainEqual(expect.objectContaining({ text: 'deterministic fixture completion' }))
       expect(JSON.stringify(history)).not.toContain('Wrong web-local answer')
       expect(sent.slice(unavailableBaseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
       expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
@@ -448,6 +459,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expectOnlyCanonicalBootstrap()
       const settledLifecycleCount = bootstrapLifecycle().length
       await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible({ timeout: 60_000 })
+      await expect(pane.getByText('deterministic fixture completion', { exact: true })).toBeVisible()
       await expect(composer).toBeDisabled()
       await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
       await expect(pane.getByText('Wrong web-local answer', { exact: false })).toHaveCount(0)
