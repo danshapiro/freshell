@@ -940,10 +940,14 @@ test.describe('Fresh Agent', () => {
 
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     const creates: Array<Record<string, unknown>> = []
+    let routedSocketCount = 0
+    const sentTypes: unknown[] = []
     await page.routeWebSocket('**/ws', (socket) => {
+      routedSocketCount += 1
       const upstream = socket.connectToServer()
       socket.onMessage((data) => {
         const message = JSON.parse(String(data)) as Record<string, unknown>
+        sentTypes.push(message.type)
         if (message.type === 'freshAgent.create') {
           creates.push(message)
           return // Observe the actual client payload without launching a provider.
@@ -955,6 +959,7 @@ test.describe('Fresh Agent', () => {
     // Routing applies to new sockets; reconnect before selecting the Fresh Agent.
     await harness.forceDisconnect()
     await harness.waitForConnection()
+    await expect.poll(() => routedSocketCount, { message: 'The settings test must observe the replacement WebSocket' }).toBeGreaterThan(0)
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
     await previewFreshclaudeDefaults(page)
@@ -978,13 +983,34 @@ test.describe('Fresh Agent', () => {
     expect(thinkingOptions).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
     await expect(thinking).toHaveValue('high')
 
-    await expect.poll(() => creates[0] ?? null).toMatchObject({
-      type: 'freshAgent.create',
-      requestId: expect.any(String),
-      sessionType: 'freshclaude',
-      provider: 'claude',
-      model: 'opus[1m]',
-      effort: 'high',
+    await expect.poll(async () => ({
+      create: creates[0] ?? null,
+      sentTypes,
+      lifecycle: await page.evaluate(() => {
+        const harness = window.__FRESHELL_TEST_HARNESS__!
+        const state = harness.getState()
+        const leaves: unknown[] = []
+        const visit = (node: any) => {
+          if (node.type !== 'leaf') return node.children.forEach(visit)
+          if (node.content.kind !== 'fresh-agent') return
+          const content = node.content
+          leaves.push({ paneId: node.id, status: content.status, sessionId: content.sessionId,
+            restoreError: content.restoreError, recoverySummary: content.recoverySummary,
+            suppressed: harness.isFreshAgentNetworkEffectsSuppressed(node.id) })
+        }
+        Object.values(state.panes.layouts).forEach(visit)
+        return { leaves, allSuppressed: harness.isAllFreshAgentNetworkEffectsSuppressed(),
+          sentTypes: harness.getSentWsMessages().map((message: any) => message.type) }
+      }),
+    })).toMatchObject({
+      create: {
+        type: 'freshAgent.create',
+        requestId: expect.any(String),
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        model: 'opus[1m]',
+        effort: 'high',
+      },
     })
     expect(creates).toHaveLength(1)
   })
