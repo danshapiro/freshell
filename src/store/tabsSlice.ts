@@ -657,9 +657,16 @@ function collectPaneIds(node: PaneNode | undefined): string[] {
 }
 
 type FrozenManagedViewProjection = {
-  paneId: string
+  paneId?: string
   createRequestId?: string
+  terminalId?: string
   soulId?: string
+  incarnationId?: string
+  paneKind?: 'terminal' | 'fresh-agent'
+  localViewIntentId?: string
+  localSoulId?: string
+  localIncarnationId?: string
+  tabViewIntentId?: string
   viewId: string
   viewRevision: number
   soulRevision: number
@@ -690,17 +697,47 @@ function ownManagedViewProjection(
     ...projection,
     canRepair: () => {
       const state = getState() as RootState
+      const ownershipAllowsRepair = () => {
+        const latest = owners.get(projection.viewId)
+        // A newer pending visibility transaction decides visibility. If it
+        // fails and keeps the local representation, older late outcomes may
+        // repair it again.
+        return latest === owner || latest?.failed === true
+      }
+      if (!projection.paneId) {
+        return Boolean(
+          projection.tabViewIntentId === projection.viewId
+          && state.tabs.tabs.some((tab) => tab.id === tabId && tab.viewIntentId === projection.viewId)
+          && ownershipAllowsRepair(),
+        )
+      }
+      if (
+        projection.tabViewIntentId
+        && !state.tabs.tabs.some((tab) => tab.id === tabId && tab.viewIntentId === projection.tabViewIntentId)
+      ) return false
       const layout = state.panes.layouts[tabId]
       const content = layout ? findPaneContent(layout, projection.paneId) : undefined
       if (
         !content || (content.kind !== 'terminal' && content.kind !== 'fresh-agent')
-        || content.createRequestId !== projection.createRequestId
-        || content.viewIntentId !== projection.viewId || content.soulId !== projection.soulId
+        || (projection.paneKind && content.kind !== projection.paneKind)
+        || (projection.localViewIntentId !== undefined && content.viewIntentId !== projection.localViewIntentId)
+        || (projection.localSoulId !== undefined && content.soulId !== projection.localSoulId)
+        || (projection.localIncarnationId !== undefined && content.incarnationId !== projection.localIncarnationId)
+        || (projection.createRequestId !== undefined && content.createRequestId !== projection.createRequestId)
+        || (projection.terminalId !== undefined
+          && (content.kind !== 'terminal' || content.terminalId !== projection.terminalId))
+        || (content.viewIntentId !== undefined && content.viewIntentId !== projection.viewId)
+        || (content.soulId !== undefined && content.soulId !== projection.soulId)
+        || (content.incarnationId !== undefined && projection.incarnationId !== undefined
+          && content.incarnationId !== projection.incarnationId)
       ) return false
-      // A newer pending visibility transaction decides visibility. If it
-      // fails and keeps the pane, older late outcomes can repair it again.
-      const latest = owners.get(projection.viewId)
-      return latest === owner || latest?.failed === true
+      const hasStableIdentity = content.viewIntentId === projection.viewId
+        || (projection.localSoulId !== undefined && content.soulId === projection.localSoulId)
+        || (projection.createRequestId !== undefined && content.createRequestId === projection.createRequestId)
+        || (projection.terminalId !== undefined
+          && content.kind === 'terminal' && content.terminalId === projection.terminalId)
+      if (!hasStableIdentity) return false
+      return ownershipAllowsRepair()
     },
     allowOlderRepairs: () => { owner.failed = true },
   }
@@ -909,8 +946,14 @@ function collectManagedViewProjections(
     if (!byViewId.has(content.viewIntentId)) {
       byViewId.set(content.viewIntentId, {
         paneId: node.id,
+        paneKind: content.kind,
         createRequestId: content.createRequestId,
+        terminalId: content.kind === 'terminal' ? content.terminalId : undefined,
         soulId: content.soulId,
+        incarnationId: content.incarnationId,
+        localViewIntentId: content.viewIntentId,
+        localSoulId: content.soulId,
+        localIncarnationId: content.incarnationId,
         viewId: content.viewIntentId,
         viewRevision: content.viewIntentRevision,
         soulRevision: content.soulIntentRevision,
@@ -922,16 +965,87 @@ function collectManagedViewProjections(
 }
 
 function ownLocalManagedViewProjection(
-  viewId: string,
+  view: ManagedRuntimeViewIntent,
+  snapshot: ManagedRuntimeInventorySnapshot,
   getState: () => RootState,
-): ManagedViewCloseProjection | undefined {
+): { representedLocally: boolean; projection?: ManagedViewCloseProjection } {
   const state = getState()
+  const soul = snapshot.souls.find((candidate) => candidate.soulId === view.soulId)
+  let representedLocally = false
   for (const tab of state.tabs.tabs) {
-    const projection = collectManagedViewProjections(state.panes.layouts[tab.id])
-      .find((candidate) => candidate.viewId === viewId)
-    if (projection) return ownManagedViewProjection(projection, tab.id, getState)
+    const layout = state.panes.layouts[tab.id]
+    if (!layout) {
+      if (tab.viewIntentId !== view.viewId) continue
+      representedLocally = true
+      return {
+        representedLocally,
+        projection: ownManagedViewProjection({
+          soulId: view.soulId,
+          incarnationId: soul?.incarnationId,
+          tabViewIntentId: view.viewId,
+          viewId: view.viewId,
+          viewRevision: view.revision,
+          soulRevision: view.soulIntentRevision,
+        }, tab.id, getState),
+      }
+    }
+
+    const managedEntries = collectPaneEntries(layout)
+      .filter(({ content }) => content.kind === 'terminal' || content.kind === 'fresh-agent')
+    const tabMarkerMatches = tab.viewIntentId
+      ? snapshot.viewIntents.filter((candidate) => candidate.viewId === tab.viewIntentId)
+      : []
+    const tabMarkerView = tabMarkerMatches.length === 1 ? tabMarkerMatches[0] : undefined
+    const markedPaneId = tabMarkerView
+      ? managedEntries.find(({ paneId }) => paneId === tabMarkerView.preferredPaneId)?.paneId
+        ?? (managedEntries.length === 1 ? managedEntries[0]!.paneId : undefined)
+      : undefined
+
+    for (const { paneId, content } of managedEntries) {
+      if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') continue
+      const fallbackViewIntentId = tab.viewIntentId === view.viewId
+        && paneId === markedPaneId
+        && !content.viewIntentId
+        ? view.viewId
+        : undefined
+      const resolution = resolveManagedViewForProjection(content, snapshot, fallbackViewIntentId)
+      if (resolution.kind !== 'resolved' || !resolution.viewIntentIds.includes(view.viewId)) continue
+      representedLocally = true
+
+      // A fallback match is safe to repair only when the local pane still has
+      // a stable handle tying it to this exact inventory view. A tab marker by
+      // itself can identify a no-layout tab, but cannot fence an unmarked pane
+      // that might have been replaced while the inventory request was pending.
+      const hasStableIdentity = content.viewIntentId === view.viewId
+        || content.soulId === view.soulId
+        || (content.createRequestId !== undefined
+          && content.createRequestId === soul?.terminalCreateRequestId)
+        || (content.kind === 'terminal'
+          && content.terminalId !== undefined
+          && content.terminalId === soul?.terminalId)
+      if (!hasStableIdentity) continue
+
+      return {
+        representedLocally,
+        projection: ownManagedViewProjection({
+          paneId,
+          paneKind: content.kind,
+          createRequestId: content.createRequestId,
+          terminalId: content.kind === 'terminal' ? content.terminalId : undefined,
+          soulId: view.soulId,
+          incarnationId: content.incarnationId ?? soul?.incarnationId,
+          localViewIntentId: content.viewIntentId,
+          localSoulId: content.soulId,
+          localIncarnationId: content.incarnationId,
+          tabViewIntentId: fallbackViewIntentId,
+          viewId: view.viewId,
+          viewRevision: view.revision,
+          soulRevision: view.soulIntentRevision,
+        }, tab.id, getState),
+      }
+    }
   }
-  return undefined
+  return { representedLocally }
 }
 
 type ManagedViewRepairFence = {
@@ -2430,10 +2544,9 @@ function confirmsManagedViewVisibility(
  * rejected by the managed-runtime refresh path.
  *
  * Repeated panes may reference one view intent; mutate each intent only once.
- * A later mutation failure repairs an ambiguous committed detach and returns
- * earlier successful detaches to visible before the caller keeps the tab.
- * The confirming inventory records the resulting revisions while the local
- * panes are still present.
+ * Any unconfirmed detach transaction returns its completed detaches to visible
+ * before the caller keeps the local representation. The confirming inventory
+ * records the resulting revisions while the local panes are still present.
  */
 async function persistManagedViewVisibility(
   viewIntentIds: string[],
@@ -2462,23 +2575,64 @@ async function persistManagedViewVisibility(
     return matches[0]!
   })
 
+  const needsMutation = targetViews.some((view) => view.visibility !== visibility)
+  if (!needsMutation) return
+
   const ownedProjections = new Map<string, ManagedViewCloseProjection>()
   for (const view of targetViews) {
-    const projection = ownLocalManagedViewProjection(view.viewId, getState)
-    if (projection) ownedProjections.set(view.viewId, projection)
+    const ownership = ownLocalManagedViewProjection(view, initialSnapshot, getState)
+    if (ownership.projection) {
+      ownedProjections.set(view.viewId, ownership.projection)
+    } else if (visibility === 'detached' && ownership.representedLocally) {
+      for (const projection of ownedProjections.values()) projection.allowOlderRepairs()
+      throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    }
   }
   const completedDetaches: Array<{
     projection: ManagedViewCloseProjection
     view: ManagedRuntimeViewIntent
   }> = []
+  if (visibility === 'detached') {
+    for (const view of targetViews) {
+      const projection = ownedProjections.get(view.viewId)
+      if (projection && view.visibility === 'detached') completedDetaches.push({ projection, view })
+    }
+  }
+  const rollbackCompletedDetaches = async () => {
+    for (const completed of completedDetaches.splice(0).reverse()) {
+      if (!completed.projection.canRepair()) continue
+      try {
+        const rolledBack = await awaitBoundedManagedRuntimeRequest(
+          'managed view rollback mutation',
+          (signal) => updateManagedViewRepairWithSignal(completed.projection, {
+            viewRevision: completed.view.revision,
+            soulRevision: completed.view.soulIntentRevision,
+          }, signal),
+          managedViewTimeoutHooks(completed.projection, {
+            viewRevision: completed.view.revision,
+            soulRevision: completed.view.soulIntentRevision,
+          }, 'rollback'),
+        )
+        if (rolledBack.visibility !== 'visible') {
+          throw new Error(`managed view rollback returned ${rolledBack.visibility}`)
+        }
+      } catch (rollbackError) {
+        if (rollbackError instanceof ManagedViewRepairSupersededError || !completed.projection.canRepair()) continue
+        if (!isManagedRuntimeRequestTimeout(rollbackError)) {
+          log.error('managed view detach rollback failed after close outcome became uncertain', {
+            event: 'managed_view_visibility_rollback_failed',
+            viewId: completed.view.viewId,
+            paneId: completed.projection.paneId,
+            error: managedRuntimeErrorMessage(rollbackError),
+          })
+          await repairManagedViewAuthoritatively(completed.projection, 'rollback', rollbackError)
+        }
+      }
+    }
+  }
+
   let outcomeConfirmed = false
   try {
-    const needsMutation = targetViews.some((view) => view.visibility !== visibility)
-    if (!needsMutation) {
-      outcomeConfirmed = true
-      return
-    }
-
     let mutationError: unknown
     for (const view of targetViews) {
       if (view.visibility === visibility) continue
@@ -2523,34 +2677,9 @@ async function persistManagedViewVisibility(
 
     if (mutationError !== undefined && visibility === 'detached') {
       // A multi-view close is one local transaction. If a later view refuses,
-      // restore earlier successful detaches in reverse order using their
-      // returned revisions, then let the caller retain the source layout.
-      for (const completed of [...completedDetaches].reverse()) {
-        try {
-          await awaitBoundedManagedRuntimeRequest(
-            'managed view rollback mutation',
-            (signal) => updateManagedViewRepairWithSignal(completed.projection, {
-              viewRevision: completed.view.revision,
-              soulRevision: completed.view.soulIntentRevision,
-            }, signal),
-            managedViewTimeoutHooks(completed.projection, {
-              viewRevision: completed.view.revision,
-              soulRevision: completed.view.soulIntentRevision,
-            }, 'rollback'),
-          )
-        } catch (rollbackError) {
-          if (rollbackError instanceof ManagedViewRepairSupersededError || !completed.projection.canRepair()) continue
-          if (!isManagedRuntimeRequestTimeout(rollbackError)) {
-            log.error('managed view detach rollback failed after close refusal', {
-              event: 'managed_view_visibility_rollback_failed',
-              viewId: completed.view.viewId,
-              paneId: completed.projection.paneId,
-              error: managedRuntimeErrorMessage(rollbackError),
-            })
-            await repairManagedViewAuthoritatively(completed.projection, 'rollback', rollbackError)
-          }
-        }
-      }
+      // restore every completed detach in reverse order before retaining the
+      // source layout. Each repair uses the fences returned by that detach.
+      await rollbackCompletedDetaches()
     }
 
     let confirmedSnapshot: ManagedRuntimeInventorySnapshot
@@ -2562,6 +2691,7 @@ async function persistManagedViewVisibility(
         visibility,
         error: error instanceof Error ? error.message : String(error),
       })
+      if (visibility === 'detached') await rollbackCompletedDetaches()
       throw error
     }
     applyManagedRuntimeInventory(confirmedSnapshot, dispatch, getState)
@@ -2577,6 +2707,7 @@ async function persistManagedViewVisibility(
       return matches.length !== 1 || !confirmsManagedViewVisibility(matches[0]!, visibility, confirmedSnapshot)
     })
     if (unconfirmedIds.length > 0) {
+      if (visibility === 'detached') await rollbackCompletedDetaches()
       if (mutationError !== undefined) throw mutationError
       throw new Error(`Managed view visibility was not confirmed for ${unconfirmedIds.join(', ')}`)
     }

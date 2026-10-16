@@ -1857,6 +1857,118 @@ describe('closeTab managed runtime visibility', () => {
     expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(3)
   })
 
+  it('rolls back a successful detach when the confirming inventory read fails', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    let inventoryReads = 0
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => {
+      inventoryReads += 1
+      if (inventoryReads === 2) throw new Error('detach confirmation GET failed')
+      return serverSnapshot
+    })
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(collectContent(store.getState().panes.layouts['managed-tab']!, 'managed-pane-0')).toMatchObject({
+      kind: 'terminal',
+      viewIntentId: 'view-a',
+      closeError: 'The pane could not be closed, so it was left open. Try again.',
+    })
+    expect(serverSnapshot.viewIntents[0]?.visibility).toBe('visible')
+    expect(apiMocks.updateManagedRuntimeViewVisibility.mock.calls.map(([id, visibility, revision]) => [
+      id,
+      visibility,
+      revision,
+    ])).toEqual([
+      ['view-a', 'detached', 2],
+      ['view-a', 'visible', 3],
+    ])
+  })
+
+  it('repairs a committed detach when an unprojected pane receives an ambiguous response', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'create-soul-view-a',
+        terminalId: 'terminal-soul-view-a',
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    let inventoryReads = 0
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => {
+      inventoryReads += 1
+      if (inventoryReads === 2) throw new Error('detach confirmation GET failed')
+      return serverSnapshot
+    })
+    apiMocks.getManagedRuntimeSoul.mockImplementation(async (soulId: string) => ({
+      revision: serverSnapshot.revision,
+      readiness: serverSnapshot.readiness,
+      soul: serverSnapshot.souls.find((entry) => entry.soulId === soulId)!,
+      viewIntents: serverSnapshot.viewIntents.filter((entry) => entry.soulId === soulId),
+      actualUsage: null,
+    }))
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      if (visibility === 'detached') throw new SyntaxError('Invalid response JSON')
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(collectContent(store.getState().panes.layouts['managed-tab']!, 'managed-pane-0')).toMatchObject({
+      kind: 'terminal',
+      createRequestId: 'create-soul-view-a',
+      closeError: 'The pane could not be closed, so it was left open. Try again.',
+    })
+    expect(serverSnapshot.viewIntents[0]?.visibility).toBe('visible')
+    expect(apiMocks.updateManagedRuntimeViewVisibility.mock.calls.map(([id, visibility]) => [id, visibility])).toEqual([
+      ['view-a', 'detached'],
+      ['view-a', 'visible'],
+    ])
+  })
+
+  it('keeps an unmarked pane open when the tab marker is its only repair identity', async () => {
+    const serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockResolvedValue(serverSnapshot)
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(collectContent(store.getState().panes.layouts['managed-tab']!, 'managed-pane-0')).toMatchObject({
+      kind: 'terminal',
+      closeError: 'The pane could not be closed, so it was left open. Try again.',
+    })
+    expect(serverSnapshot.viewIntents[0]?.visibility).toBe('visible')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).not.toHaveBeenCalled()
+  })
+
   it('preserves a fresh shell when closing and reopening a tab after replacing its managed pane', async () => {
     const managedView = view('view-a', 0)
     let serverSnapshot = inventory(8, [managedView])
