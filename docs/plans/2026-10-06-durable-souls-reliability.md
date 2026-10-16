@@ -35,7 +35,7 @@ Fix all known durable-souls problems, complete ordinary use in the four selected
 ## Global Constraints
 
 1. Work in `/home/dan/code/freshell/.worktrees/durable-souls-reliability` on the recorded feature branch. Preserve existing commits, historical receipts and unrelated work. Do not merge, push, create a PR or deploy without the approvals required by repository instructions.
-2. The remaining live mode checks cover terminal Codex and OpenCode plus FreshCodex and FreshOpenCode. Skip Claude because its login is unavailable, and skip Amplifier and Kilroy live checks; leave their existing code and meaningful tests alone.
+2. The live mode checks cover terminal Codex and OpenCode plus FreshCodex and FreshOpenCode. The user accepted proceeding without Claude live verification; earlier access failures do not diagnose current account availability. Skip Amplifier and Kilroy live checks; leave their existing code and meaningful tests alone.
 3. Do not require automatic migration of existing conversations or exact provider-native session continuity across a transition. Do not touch real existing session stores. A later manual port is an accepted option if needed.
 4. Keep recovery truthful: a requested or missing identity, unreadable/partial provider storage, or stale observation cannot be treated as proof that a conversation is absent or lost. Retain the existing pristine-seed and ordinary Stop semantics.
 5. Respect the rootless runtime boundary, provider UID/GID, zero capabilities, read-only container root, private writable provider volumes and exact process/resource ownership. Destructive tests use the disposable sandbox or an isolated owned rig.
@@ -52,7 +52,7 @@ Tasks 1–7 below are completed source work; their task sections retain the spec
 
 The remaining browser verification uses the already-built external managed-runtime runner and the selected ordinary-Stop and four-mode smoke cases in the existing managed-runtime and fresh-agent specs. If a behavior regression is found, change only its owning source and tests. The four-mode smoke reuses the isolated rig, mode selection, and configured credentials. It proves an ordinary launch and one completed response per selected mode; it does not publish a qualification receipt or assert recovery after a crash.
 
-The current candidate's provider-free Fresh History browser check and selected interrupted-Stop browser case have passed. The config/legacy retry case was not admitted because its candidate-bound fixture manifest is absent; it is outside the user's accepted transition scope. Remaining work is the four-mode ordinary-use smoke (latest result 1/4), the final configured full-suite gate and independent review. No production backup, deployment packet, real-session import, transition rehearsal or all-mode campaign is part of this repair.
+All four selected ordinary-use modes passed at `3dcd7884236e4184859a2e40c7115383f5de6831`, and terminal Codex passed again after the relay repairs at `7d7a91baaf1f7cf1b99b5ee89c4ce8799b5ffce1`; each run verified owned-resource cleanup. The selected interrupted-Stop browser case also passed at `3dcd7884236e4184859a2e40c7115383f5de6831`. Earlier Fresh History passes remain historical evidence: the renewed saved-history and stale-loss browser checks have failures under investigation, as does the settings connection-interception test. The config/legacy retry case is outside the user's accepted transition scope. Remaining work is those affected browser checks, repairs identified by the complete-change review, the integrated configured full-suite gate, and final independent review. No production backup, deployment packet, real-session import, transition rehearsal or all-mode campaign is part of this repair.
 
 ## Completed source work and current remaining work
 
@@ -718,7 +718,7 @@ Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_A
 
 Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshopencode pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
 
-Latest rerun: Codex terminal failed at terminal creation with `PTY_SPAWN_FAILED`, before the Codex process started; FreshCodex sent input but its session exited without a completed turn; OpenCode produced output but no completion event; FreshOpenCode passed. No shared login was changed. Task 9 remains unaccepted until the three failures are diagnosed and repaired or explicitly dispositioned.
+Historical first rerun: Codex terminal failed at terminal creation with `PTY_SPAWN_FAILED`, before the Codex process started; FreshCodex sent input but its session exited without a completed turn; OpenCode produced output but no completion event; FreshOpenCode passed. These failures were subsequently repaired. All four modes passed at `3dcd7884236e4184859a2e40c7115383f5de6831`, and terminal Codex passed again after the relay repairs at `7d7a91baaf1f7cf1b99b5ee89c4ce8799b5ffce1`. No shared login was changed. Final Task 9 acceptance still requires the remaining affected browser checks, integrated full-suite gate, and complete-change review.
 
 Expected: all four selected browser cases pass, each records one body-free completion event, and all owned resources close cleanly. A failed case proceeds to Step 3 and is not counted as acceptance. No global campaign status or certification is produced.
 
@@ -748,7 +748,7 @@ Expected: the staged diff contains only the reviewed smoke test changes and any 
 
 - [ ] **Step 6: Run the final browser checks after the Stage 5 review loop**
 
-Run these exact selected cases on the final candidate after Stage 5 is complete:
+Assess these exact selected cases after Stage 5 is complete. Retain passing evidence when later changes do not affect the exercised path; rerun the affected case when a repair changes that path or leaves a concrete concern. A commit-ID change alone does not require repeating a paid provider call:
 
 Run: `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1 GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts --grep 'synthetic interrupted ordinary Stop preserves history$'`
 
@@ -756,7 +756,7 @@ Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MA
 
 Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshcodex,freshopencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
 
-Expected: the four selected non-Claude cases execute and pass on the final candidate; those four modes and the interrupted-Stop case retain their existing Task 8/9 evidence requirements. If Stage 5 fixes change the candidate, run these checks after the final review loop, against the resulting final candidate.
+Expected: all four selected non-Claude modes and the interrupted-Stop case have executed passing evidence that covers their resulting behavior, with their existing Task 8/9 assertions and verified cleanup. Record the tested commit and any reuse rationale; do not describe an earlier run as execution on a later commit. Any rerun required by a Stage 5 repair runs against the resulting final candidate.
 
 - [ ] **Step 7: Run the final configured full-suite gate**
 
