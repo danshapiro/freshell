@@ -162,10 +162,11 @@ type StartupFault = 'ack-request' | 'ack-mode' | 'ack-provider' | 'ack-runtime-p
 type ContinuityScenario = { advance?: boolean; split?: boolean; verified?: boolean; pendingNative?: boolean; captureNative?: boolean;
   mutate?: (state: any, item: any) => void; mutateSnapshot?: (state: any, item: any) => void }
 
-/** Execute the registered browser case, including its actual global collector and finally. */
+/** Settle the registered browser case under a controlled clock, including its collector and finally. */
 async function historyCallback(fault?: HistoryFault, startup: 'presentation' | 'native' = 'presentation', startupFault?: StartupFault,
   actualHistoryHelper?: (...args: any[]) => Promise<void>, continuity?: ContinuityScenario) {
   await import('../../../e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.js')
+  vi.useFakeTimers()
   vi.stubEnv('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST', '1')
   const definitions = [
     ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
@@ -252,8 +253,8 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
         sendCount++
         content.sessionId = item.view.nativeSessionId
         content.sessionRef = { provider: content.provider, sessionId: item.view.nativeSessionId }
-        // The real fixture waits for this presentation-id completion edge before opening History.
-        framereceived({ payload: JSON.stringify({ type: 'freshAgent.turn.complete', sessionId: item.sessionId }) })
+        // Completion follows materialization and uses the owned native identity.
+        framereceived({ payload: JSON.stringify({ type: 'freshAgent.turn.complete', sessionId: item.view.nativeSessionId }) })
       },
     } : locator }),
     evaluate: async (operation: any, argument: any) => {
@@ -300,7 +301,10 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     promotions.push(allocated.indexOf(item))
   }
   original.start.mockResolvedValue({ baseUrl: 'https://fixture.invalid', token: 'private-token' })
-  original.stop.mockClear().mockResolvedValue({ ok: true, errors: [] })
+  original.stop.mockClear().mockImplementation(async () => {
+    await new Promise<void>(resolve => setTimeout(resolve, 1))
+    return { ok: true, errors: [] }
+  })
   original.waitForHarness.mockResolvedValue(undefined)
   original.waitForConnection.mockResolvedValue(undefined)
   original.state.mockClear().mockImplementation(async () => {
@@ -392,11 +396,6 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     }
     continuity?.mutate?.(state, current())
     for (const message of messages) frame(message)
-    // Cancel only the controlled probe's original 90s boundary; no host timer wedge.
-    if (index === 1 && fault === 'missing-target') {
-      const now = Date.now()
-      vi.spyOn(Date, 'now').mockReturnValueOnce(now).mockReturnValue(now + 90_001)
-    }
   })
   if (fault === 'misbound-pane') original.state.mockImplementation(async () => {
     const snapshot = structuredClone(state)
@@ -404,16 +403,35 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     return snapshot
   })
   const run = original.cases.get('completed owned native fixture history opens its existing browser pane')!({ page })
-  void run.catch(() => {}) // Controlled clocks may settle refusal before the caller awaits it.
+  // Own the polling clock and join the actual callback, including its finally,
+  // before a caller can fail an assertion and restore shared mocks or timers.
+  // Observe rejection immediately, but keep the original promise for the caller's
+  // resolution/error assertions instead of turning refusal into success.
+  const settlement = Promise.allSettled([run])
+  await vi.runAllTimersAsync()
+  await settlement
+  expect(vi.getTimerCount()).toBe(0)
   return { run, allocated, lookups, transport, promotions, observedStartupIds, page, state, historySnapshots, sends: () => sendCount }
 }
 
 describe('managed History startup inventory binding', () => {
-  it.each(['presentation', 'native'] as const)('uses the original acknowledgement with %s startup identity through all four modes', async startup => {
+  it('joins the original polling failure and asynchronous rig cleanup before returning the fixture', async () => {
     vi.spyOn(process.stdout, 'write').mockReturnValue(true)
     vi.useFakeTimers()
+    const { run } = await historyCallback(undefined, 'native', 'ack-request')
+    try {
+      expect(original.stop).toHaveBeenCalledOnce()
+      expect(original.stop.mock.settledResults[0]?.type).toBe('fulfilled')
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      await vi.runAllTimersAsync()
+      await expect(run).rejects.toThrow(/timed out waiting for owned fixture activation/)
+    }
+  })
+
+  it.each(['presentation', 'native'] as const)('uses the original acknowledgement with %s startup identity through all four modes', async startup => {
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true)
     const { run, allocated, lookups, transport, promotions, observedStartupIds, sends } = await historyCallback(undefined, startup)
-    await vi.advanceTimersByTimeAsync(90_001)
     await expect(run).resolves.toBeUndefined()
     expect(allocated).toHaveLength(4)
     expect(promotions).toEqual([0, 1, 2, 3])
@@ -438,9 +456,7 @@ describe('managed History startup inventory binding', () => {
         }
         return true
       })
-      vi.useFakeTimers()
       const { run, allocated, lookups, sends } = await historyCallback(undefined, 'native', startupFault)
-      await vi.advanceTimersByTimeAsync(90_001)
       const cause: Record<StartupFault, RegExp> = {
         'ack-request': /timed out waiting for owned fixture activation/,
         'ack-mode': /freshopencode/, 'ack-provider': /opencode/, 'ack-runtime-provider': /opencode/,

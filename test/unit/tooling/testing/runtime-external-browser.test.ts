@@ -196,10 +196,12 @@ describe('managed browser producers', () => {
         accepted: false, live: true, requestSerial: 2, revision: 3, privateBody: 'omit owned transcript' }] }),
     } })
     const page = { routeWebSocket: async () => undefined, goto: async () => undefined,
+      unrouteAll: vi.fn(async () => undefined),
       getByRole: () => ({ click: async () => undefined }),
       evaluate: async (fn: Function, argument: unknown) => Reflect.apply(fn, undefined, [argument]) }
     try {
       await expect(Reflect.apply(callback, undefined, [{ page }])).rejects.toThrow(/early owned fixture boundary failed/)
+      expect(page.unrouteAll).toHaveBeenCalledExactlyOnceWith({ behavior: 'wait' })
       expect(publish).toHaveBeenCalledOnce()
       expect(publish.mock.calls[0][1]).toMatchObject({ audit: { requestRecordCount: 1, requestRecords: [
         { sequence: 0, stage: 'display_committed', accepted: false, live: true, requestSerial: 2, revision: 3 },
