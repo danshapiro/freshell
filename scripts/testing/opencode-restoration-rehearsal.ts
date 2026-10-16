@@ -242,8 +242,8 @@ export async function readNativeRehearsal(harness: RuntimeHarness, containerId: 
     const captureErrors: unknown[] = [], redactions = nativeDiagnosticSecrets(secrets)
     // Capture each private source independently, before the caller removes the
     // volume. A missing startup log must not hide a validator's own diagnostic.
-    for (const [source, name] of [['native-private.log', 'native-failure.log'], ['native-failure-private.json', 'native-failure-private.json']]) {
-      const destination = path.join(directory, name!)
+    for (const [source, name] of [['native-private.log', 'native-failure.log'], ['native-failure-private.json', 'native-failure-private.json']] as const) {
+      const destination = path.join(directory, name)
       try {
         await harness.captureTransferFileExact(containerId, '/scratch/' + source, destination)
         fs.chmodSync(destination, 0o600)

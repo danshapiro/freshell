@@ -34,11 +34,12 @@ export type NativeMatrixReceipt = {
 // Kept self-contained because the owned provider child embeds this function.
 export function expectedExportRefusal(label: string, result: { status: number | null; signal?: string | null; error?: unknown },
   diagnostic: unknown, receiptProduced: boolean): boolean {
+  const changedTable = /source schema relationships differ for pinned table message_seq/
   const reasons: Record<string, RegExp> = {
-    'changed-type': /source schema relationships differ for pinned table message_seq/,
-    'changed-key': /source schema relationships differ for pinned table message_seq/,
-    'changed-nullability': /source schema relationships differ for pinned table message_seq/,
-    'changed-foreign-key': /source schema relationships differ for pinned table message_seq/,
+    'changed-type': changedTable,
+    'changed-key': changedTable,
+    'changed-nullability': changedTable,
+    'changed-foreign-key': changedTable,
     'changed-index': /source schema object inventory differs from pinned OpenCode/,
     'changed-trigger': /source schema object inventory differs from pinned OpenCode/,
     'changed-migration': /source migration journal does not match OpenCode v1\.18\.21/,
