@@ -9120,6 +9120,10 @@ mod tests {
             outcome.outcome.status,
             FreshAgentCheckpointStatus::Unavailable
         );
+        assert_eq!(
+            outcome.outcome.code.as_deref(),
+            Some("capture_timeout_cooldown")
+        );
         let events = events.lock().unwrap();
         let failure = events.iter().find(|event| {
             event
