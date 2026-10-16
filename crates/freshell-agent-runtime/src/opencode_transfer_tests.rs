@@ -1464,6 +1464,131 @@ fn current_store_verification_accepts_exact_admitted_and_promoted_input_projecti
 }
 
 #[test]
+fn current_store_verification_accepts_replaced_imported_todo_list() {
+    for length in [2, 1, 0] {
+        let mut fixture = fixture_with_baseline_event();
+        let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+        source.execute_batch(
+            "INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated)
+             VALUES('ses_root','original first','pending','low',0,1,1),
+                   ('ses_root','original second','pending','low',1,1,1);",
+        ).unwrap();
+        drop(source);
+        reexport_owned_fixture(&mut fixture);
+        import_bundle(
+            &fixture.descriptor,
+            &fixture.staged_directory,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .unwrap();
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .unwrap();
+
+        let todos = [
+            serde_json::json!({"content":"replacement first","status":"completed","priority":"high"}),
+            serde_json::json!({"content":"replacement second","status":"in_progress","priority":"medium"}),
+        ][..length].to_vec();
+        let connection = Connection::open(&fixture.destination_database).unwrap();
+        // Native Todo.update deletes every old row and reinserts the new list,
+        // with fresh default timestamps even for unchanged positions.
+        connection
+            .execute("DELETE FROM todo WHERE session_id='ses_root'", [])
+            .unwrap();
+        for (position, todo) in todos.iter().enumerate() {
+            connection.execute(
+                "INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated)
+                 VALUES('ses_root',?1,?2,?3,?4,25,25)",
+                params![todo["content"].as_str().unwrap(),todo["status"].as_str().unwrap(),todo["priority"].as_str().unwrap(),position as i64],
+            ).unwrap();
+        }
+        assert!(
+            verify_current_store(
+                &fixture.descriptor,
+                &fixture.destination_database,
+                &fixture.workspace
+            )
+            .is_err(),
+            "replacement without native evidence must fail"
+        );
+        append_durable_event(
+            &connection,
+            1,
+            "evt_todo_called",
+            "session.next.tool.called.1",
+            serde_json::json!({
+                "sessionID":"ses_root","timestamp":20,"assistantMessageID":"msg_assistant","callID":"call_todo",
+                "tool":"todowrite","input":{"todos":todos},"provider":{"executed":false}
+            }),
+        );
+        assert!(
+            verify_current_store(
+                &fixture.descriptor,
+                &fixture.destination_database,
+                &fixture.workspace
+            )
+            .is_err(),
+            "an incomplete todowrite must fail"
+        );
+        append_durable_event(
+            &connection,
+            2,
+            "evt_todo_success",
+            "session.next.tool.success.1",
+            serde_json::json!({
+                "sessionID":"ses_root","timestamp":30,"assistantMessageID":"msg_assistant","callID":"call_todo",
+                "structured":{"todos":todos},"content":[{"type":"text","text":"updated todos"}],"provider":{"executed":false}
+            }),
+        );
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .unwrap_or_else(|error| {
+            panic!("native replacement with {length} todos must reopen: {error}")
+        });
+
+        if length > 0 {
+            for mutation in [
+                "time_created=19",
+                "time_updated=31",
+                "content='corrupt'",
+                "position=8",
+            ] {
+                connection
+                    .execute(&format!("UPDATE todo SET {mutation} WHERE position=0"), [])
+                    .unwrap();
+                assert!(
+                    verify_current_store(
+                        &fixture.descriptor,
+                        &fixture.destination_database,
+                        &fixture.workspace
+                    )
+                    .is_err(),
+                    "unbound todo mutation {mutation} must fail"
+                );
+                connection.execute("UPDATE todo SET content=?1,position=0,time_created=25,time_updated=25 WHERE position IN (0,8)", [todos[0]["content"].as_str().unwrap()]).unwrap();
+            }
+        }
+        connection.execute(
+            "INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated)
+             VALUES('ses_root','extra unbound todo','pending','low',9,25,25)", []
+        ).unwrap();
+        assert!(verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn current_store_verification_accepts_todowrite_projection_only_when_payload_matches() {
     let fixture = fixture_with_baseline_event();
     import_bundle(

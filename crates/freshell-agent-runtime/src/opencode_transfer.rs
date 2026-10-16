@@ -505,7 +505,7 @@ pub fn verify_current_store(
         if current_rows.contains_key(&key) {
             continue;
         }
-        if matches!(baseline.table.as_str(), "message" | "part") {
+        if matches!(baseline.table.as_str(), "message" | "part" | "todo") {
             continue;
         }
         let row = read_row_by_key(&transaction, &baseline.table, &baseline.key)?;
@@ -739,8 +739,14 @@ fn verify_typed_current_rows(
         .collect::<BTreeMap<_, _>>();
     verify_v2_session_projections(manifest, current_rows, &events)?;
     verify_context_epoch_projection(manifest, current_rows, &events)?;
+    verify_todowrite_projection(manifest, current_rows, &events)?;
     let mut changed_rows = Vec::new();
     for (key, digest) in &baseline {
+        // Todo.update replaces the entire list, including timestamps and
+        // deleted positions. Only the complete projection can authorize it.
+        if digest.table == "todo" {
+            continue;
+        }
         let Some(current) = current_rows.get(key) else {
             if verified_removals.contains(key) {
                 continue;
@@ -791,8 +797,6 @@ fn verify_typed_current_rows(
         }
         changed_rows.push(current.clone());
     }
-
-    verify_todowrite_projection(manifest, current_rows, &events)?;
 
     for (key, current) in current_rows {
         if baseline.contains_key(key) {
@@ -1150,7 +1154,14 @@ fn verify_todowrite_projection(
     let mut changed_sessions = BTreeSet::new();
     for (key, old_digest) in &baseline {
         let Some(row) = current.get(key) else {
-            changed_sessions.insert(key_text(&key.1)?);
+            let [SerializedSqlValue::Text { value: session_id }, SerializedSqlValue::Integer { .. }] =
+                key.1.as_slice()
+            else {
+                return Err(OpenCodeImportError::Blocked(
+                    "todo row has an invalid composite key".into(),
+                ));
+            };
+            changed_sessions.insert(session_id.clone());
             continue;
         };
         if digest_serialized_row(row)? != **old_digest {
@@ -2993,7 +3004,6 @@ fn allowed_scalar_column(table: &str, column: &str) -> bool {
         "message" => column == "data",
         "part" => column == "data",
         "session_input" => matches!(column, "delivery" | "promoted_seq"),
-        "todo" => matches!(column, "content" | "status" | "priority" | "time_updated"),
         _ => false,
     }
 }
