@@ -1864,10 +1864,11 @@ impl Supervisor {
             RecoveryProbe::ReattachReady { .. } | RecoveryProbe::ResumeReady { .. }
         ) && context.desired_state == DesiredState::Running
             && context.provider == "opencode"
-            // A stopped repair receipt describes the already installed store.
-            // A source census cannot replace its immutable import authority
-            // when the current host is unavailable during Resume or Retry.
-            && context.opencode_adoption_baseline.is_none()
+            // A completed receipt describes the installed destination, whether
+            // its baseline came from ordinary import or stopped repair. A new
+            // origin-source census cannot replace that import authority.
+            && !(context.native_import_state == NativeImportState::Completed
+                && context.native_import_authority == "verified_import_receipt")
             && !matches!(
                 context.native_import_state,
                 NativeImportState::NotApplicable
@@ -9451,6 +9452,152 @@ pub(crate) mod automatic_retry_tests {
             .await
             .unwrap();
         soul
+    }
+
+    async fn seed_completed_opencode_import(supervisor: &Supervisor, root: &Path) -> SoulId {
+        let soul = seed_retained_opencode(supervisor, root).await;
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let mut descriptor = resume_catalog::tests::imported_opencode_descriptor();
+        descriptor.destination_store_id = context.provider_store_id.clone();
+        descriptor.incarnation_id = context.prior_handle.incarnation_id().to_string();
+        descriptor.root_session_id = context.native_session_id.clone().unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&descriptor.manifest_json).unwrap();
+        manifest["root_session_id"] = descriptor.root_session_id.clone().into();
+        descriptor.manifest_json = serde_json::to_string(&manifest).unwrap();
+        descriptor.bundle_sha256 = freshell_runtime_protocol::opencode_transfer_bundle_digest(
+            &descriptor.manifest_json,
+            &descriptor.files,
+        );
+        descriptor.validate().unwrap();
+        let mut terminal = context.terminal.clone().unwrap();
+        terminal.opencode_transfer = Some(descriptor.clone());
+        terminal.opencode_transfer_attempt_id = Some("ordinary-import-attempt".into());
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute("UPDATE souls SET native_import_state='pending',native_import_source_store_id=?1,native_import_root_session_id=?2,native_import_source_generation=?3,native_import_schema_fingerprint=?4,native_import_migration_fingerprint=?5,native_import_authority='staged_transfer' WHERE soul_id=?6",
+            rusqlite::params![descriptor.source_store_id,descriptor.root_session_id,descriptor.source_generation,descriptor.source_schema_fingerprint,descriptor.migration_journal_fingerprint,soul.as_str()]).unwrap();
+        conn.execute("UPDATE incarnations SET terminal_spec=?1,launch_state='starting' WHERE incarnation_id=?2",
+            rusqlite::params![serde_json::to_string(&terminal).unwrap(),context.prior_handle.incarnation_id().as_str()]).unwrap();
+        drop(conn);
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let observation = serde_json::from_slice(
+            &std::fs::read(root.join("retained/retained-opencode-observation.json")).unwrap(),
+        )
+        .unwrap();
+        supervisor
+            .registry
+            .record_native_identity_observation(soul.clone(), observation, context.write_fence())
+            .await
+            .unwrap();
+        // Publish through the ordinary launch-completion path; there is no
+        // stopped-repair operation or receipt in this fixture.
+        supervisor
+            .registry
+            .mark_running(context.prior_handle.incarnation_id().clone())
+            .await
+            .unwrap();
+        std::fs::remove_file(root.join("retained/retained-store-unreadable")).unwrap();
+        soul
+    }
+
+    #[tokio::test]
+    async fn completed_import_authority_survives_transient_recovery_probe() {
+        for saved_spec in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, clock) = open(dir.path(), 0);
+            let soul = seed_completed_opencode_import(&supervisor, dir.path()).await;
+            let initial = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert!(initial.opencode_adoption_baseline.is_none());
+            assert_eq!(initial.native_import_state, NativeImportState::Completed);
+            let spec = resume_catalog::exact_resume_candidate(&initial, None)
+                .unwrap()
+                .unwrap();
+            let baseline = spec.opencode_adoption_baseline.clone().unwrap();
+            if saved_spec {
+                supervisor
+                    .registry
+                    .store_verified_resume_spec(soul.clone(), spec)
+                    .await
+                    .unwrap();
+                // Later incarnations recover from the saved spec after the
+                // first-boot transfer descriptor has been stripped.
+                let mut terminal = initial.terminal.clone().unwrap();
+                terminal.opencode_transfer = None;
+                terminal.opencode_transfer_attempt_id = None;
+                Connection::open(supervisor.registry.database_path())
+                    .unwrap()
+                    .execute(
+                        "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                        rusqlite::params![
+                            serde_json::to_string(&terminal).unwrap(),
+                            initial.prior_handle.incarnation_id().as_str()
+                        ],
+                    )
+                    .unwrap();
+            }
+            backend.unavailable(true);
+            supervisor.reconcile_startup().await.unwrap();
+            let blocked = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                blocked.native_import_state,
+                NativeImportState::Completed,
+                "an origin-source refresh cannot overwrite the completed destination import"
+            );
+            assert_eq!(blocked.native_import_authority, "verified_import_receipt");
+            assert_eq!(
+                blocked.native_import_revision,
+                initial.native_import_revision
+            );
+            assert_eq!(
+                resume_catalog::exact_resume_candidate(&blocked, None)
+                    .unwrap()
+                    .unwrap()
+                    .opencode_adoption_baseline,
+                Some(baseline.clone())
+            );
+            assert_eq!(due(dir.path()), Some(2_000));
+            assert_eq!(backend.count("creates"), 0);
+
+            backend.unavailable(false);
+            clock.store(2_000, Ordering::SeqCst);
+            let report = supervisor.reconcile_startup().await.unwrap();
+            assert!(
+                report
+                    .results
+                    .iter()
+                    .all(|r| r.outcome == Some(RecoveryOutcome::Reattached)),
+                "{report:?}"
+            );
+            let recovered = supervisor.registry.recovery_context(soul).await.unwrap();
+            assert_eq!(recovered.recovery_state, RecoveryState::Live);
+            assert_eq!(
+                recovered.prior_handle.incarnation_id(),
+                initial.prior_handle.incarnation_id()
+            );
+            assert_eq!(recovered.native_session_id, initial.native_session_id);
+            assert_eq!(
+                recovered.resume_spec.unwrap().opencode_adoption_baseline,
+                Some(baseline)
+            );
+            assert_eq!(due(dir.path()), None);
+            close_retry_hosts(&backend).await;
+        }
     }
 
     async fn retained_unreadable_no_new_attempt_case(manual: bool) {

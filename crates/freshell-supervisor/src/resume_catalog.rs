@@ -399,7 +399,7 @@ fn blocked(reason: RecoveryBlockReason, message: String) -> RecoveryProbe {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::registry::{NativeImportState, OwnedRuntimeHandle};
     use freshell_runtime_protocol::{
@@ -485,7 +485,7 @@ mod tests {
         }
     }
 
-    fn imported_opencode_descriptor() -> OpenCodeTransferDescriptor {
+    pub(crate) fn imported_opencode_descriptor() -> OpenCodeTransferDescriptor {
         let root_session_id = "ses_recovery_exact";
         let source_store_id = "b".repeat(64);
         let source_generation = "c".repeat(64);
