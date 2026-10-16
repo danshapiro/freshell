@@ -1085,6 +1085,14 @@ fn managed_provider_env(
     source: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
     let mut env = managed_env_allowlist(source);
+    // The workload has a browser PTY even when the web server was launched
+    // without a terminal. Codex otherwise waits for confirmation at startup.
+    if env
+        .get("TERM")
+        .is_none_or(|term| term.is_empty() || term == "dumb")
+    {
+        env.insert("TERM".into(), "xterm-256color".into());
+    }
     // Never persist the web host's PATH into a pinned workload image. It may
     // contain host-only homes, version-manager shims, or credential helpers.
     env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
@@ -2148,6 +2156,31 @@ mod tests {
         let mut stopped = running;
         stopped.launch_state = freshell_runtime_protocol::LaunchState::Stopped;
         assert!(reusable_running_view(&[stopped], &soul, "terminal-stable").is_err());
+    }
+
+    #[test]
+    fn managed_terminal_environment_replaces_headless_host_terminal_types() {
+        for mode in ["codex", "opencode", "claude", "amplifier"] {
+            for inherited in [None, Some(""), Some("dumb")] {
+                let source = inherited
+                    .map(|term| ("TERM".to_string(), term.to_string()))
+                    .into_iter()
+                    .collect();
+                let environment = managed_provider_env(mode, &source);
+                assert_eq!(
+                    environment.get("TERM").map(String::as_str),
+                    Some("xterm-256color"),
+                    "{mode} browser PTY must not inherit {inherited:?} from a headless host"
+                );
+            }
+            let source = [("TERM".to_string(), "screen-256color".to_string())].into();
+            assert_eq!(
+                managed_provider_env(mode, &source)
+                    .get("TERM")
+                    .map(String::as_str),
+                Some("screen-256color")
+            );
+        }
     }
 
     #[test]
