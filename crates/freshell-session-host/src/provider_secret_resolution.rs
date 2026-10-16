@@ -116,7 +116,7 @@ pub(crate) fn read_mounted_file_as_owner(
                 detail.trim()
             )));
         }
-        return Ok(output.stdout);
+        Ok(output.stdout)
     }
     #[cfg(not(unix))]
     {
