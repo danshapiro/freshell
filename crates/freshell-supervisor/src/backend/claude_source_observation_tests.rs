@@ -1169,13 +1169,18 @@ async fn qualify_candidate_helper_transport(
             }
         });
         let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
+        let budget = if mode == "projection-timeout" {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(3)
+        };
         let result = backend
             .read_claude_candidate_helper(
                 owner,
                 request,
                 stage,
                 "synthetic-source-run",
-                Duration::from_millis(250),
+                budget,
                 retained_name.as_ref().map(|_| prior_stage.as_path()),
             )
             .await;
