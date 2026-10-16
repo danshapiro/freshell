@@ -5827,7 +5827,7 @@ mod codex_pre_worker_retry_tests {
         );
         assert_eq!(
             backend.stop_targets.lock().unwrap().as_slice(),
-            &[exact_target.clone()]
+            std::slice::from_ref(&exact_target)
         );
         assert_eq!(
             backend.empty_targets.lock().unwrap().as_slice(),
@@ -7829,21 +7829,22 @@ mod interrupted_transaction_tests {
                 "RestartPolicy":{"Name":"no","MaximumRetryCount":0}
             })
         );
-        let state = fixture.state.lock().unwrap();
-        assert_eq!(
-            state.inspection["HostConfig"]["RestartPolicy"]["Name"],
-            "no"
-        );
-        let final_inspection = format!(
-            "GET /v1.47/containers/{}/json HTTP/1.1",
-            handle.container_id()
-        );
-        assert_eq!(
-            state.requests.last().map(String::as_str),
-            Some(final_inspection.as_str()),
-            "the exact owned container must be inspected after restart suppression"
-        );
-        drop(state);
+        {
+            let state = fixture.state.lock().unwrap();
+            assert_eq!(
+                state.inspection["HostConfig"]["RestartPolicy"]["Name"],
+                "no"
+            );
+            let final_inspection = format!(
+                "GET /v1.47/containers/{}/json HTTP/1.1",
+                handle.container_id()
+            );
+            assert_eq!(
+                state.requests.last().map(String::as_str),
+                Some(final_inspection.as_str()),
+                "the exact owned container must be inspected after restart suppression"
+            );
+        }
 
         assert!(supervisor
             .registry
@@ -7924,26 +7925,27 @@ mod interrupted_transaction_tests {
         let (outcome, _) = supervisor.stop(id, Some(1)).await.unwrap();
 
         assert_eq!(outcome, StopOutcome::TerminationUnconfirmed);
-        let state = fixture.state.lock().unwrap();
-        assert_eq!(
-            state.inspection["HostConfig"]["RestartPolicy"]["Name"],
-            "no"
-        );
-        assert_eq!(
-            state
-                .restart_updates
-                .first()
-                .map(|(request, _)| request.as_str()),
-            Some(
-                format!(
-                    "POST /v1.47/containers/{}/update HTTP/1.1",
-                    handle.container_id()
+        {
+            let state = fixture.state.lock().unwrap();
+            assert_eq!(
+                state.inspection["HostConfig"]["RestartPolicy"]["Name"],
+                "no"
+            );
+            assert_eq!(
+                state
+                    .restart_updates
+                    .first()
+                    .map(|(request, _)| request.as_str()),
+                Some(
+                    format!(
+                        "POST /v1.47/containers/{}/update HTTP/1.1",
+                        handle.container_id()
+                    )
+                    .as_str()
                 )
-                .as_str()
-            )
-        );
-        assert_eq!(state.inspection["State"]["Running"], true);
-        drop(state);
+            );
+            assert_eq!(state.inspection["State"]["Running"], true);
+        }
         assert_eq!(
             supervisor
                 .registry

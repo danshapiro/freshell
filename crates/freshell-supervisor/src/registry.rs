@@ -1153,12 +1153,12 @@ impl Registry {
                 current: self.control_epoch(),
             });
         }
-        if !handle
+        if handle
             .terminal()
-            .is_some_and(|terminal| terminal.mode == "codex")
-            && !handle
+            .is_none_or(|terminal| terminal.mode != "codex")
+            && handle
                 .fresh_agent()
-                .is_some_and(|agent| agent.provider == FreshProvider::Codex)
+                .is_none_or(|agent| agent.provider != FreshProvider::Codex)
         {
             return Err(RegistryError::InvalidState(
                 "pre-worker Codex failure does not own a Codex workload".into(),
