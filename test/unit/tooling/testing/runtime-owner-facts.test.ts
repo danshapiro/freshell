@@ -3128,12 +3128,15 @@ describe('fixed owned fresh Codex saved history', () => {
     vi.spyOn(rig, 'assertCurrentHandle').mockResolvedValue(undefined)
     const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'codex',
       freshAgentSessionType: 'freshcodex', launchState: 'running', intentRevision: 1 }])
-    const file = path.join(root, 'retained.jsonl')
+    const file = path.join(root, '.codex/sessions', `rollout-fixture-${current.nativeSessionId}.jsonl`)
+    await fsp.mkdir(path.dirname(file), { recursive: true })
+    await fsp.writeFile(file, JSON.stringify({ type: 'session_meta', payload: { id: current.nativeSessionId } }) + '\n')
+    const providerPath = (target: string) => path.join(root, path.relative('/home/freshell/provider', target))
     const probe = vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (container, args) => {
       expect(container).toBe(current.containerId)
-      if (args[0] === 'cat') return fsp.readFile(file, 'utf8')
+      if (args[0] === 'cat') return fsp.readFile(providerPath(args[1]), 'utf8')
       expect(args.slice(0, 3)).toEqual(['node', '--input-type=module', '-e'])
-      return execFileSync(process.execPath, [args[1], args[2], args[3], file, args[5]], { encoding: 'utf8' })
+      return execFileSync(process.execPath, [args[1], args[2], args[3], providerPath(args[4]), args[5]], { encoding: 'utf8' })
     })
     try {
       const prepared = await rig.prepareFreshCodexSavedHistory(current)
@@ -3142,6 +3145,7 @@ describe('fixed owned fresh Codex saved history', () => {
       expect(prepared.bytes).toBe(Buffer.byteLength(raw))
       expect(prepared.bytes).toBeGreaterThan(1024 * 1024)
       expect(rows).toHaveLength(241)
+      expect(await fsp.readdir(path.dirname(file))).toEqual([path.basename(file)])
       expect(rows[0].payload.id).toBe(current.nativeSessionId)
       expect(rows.at(-1).payload.last_agent_message).toBe(`Managed fixture saved answer\n${'x'.repeat(20_000)}`)
       await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(true)
