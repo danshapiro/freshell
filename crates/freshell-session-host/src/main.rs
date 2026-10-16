@@ -1,3 +1,4 @@
+mod codex_activity;
 mod command_journal;
 mod control;
 mod opencode_activity;

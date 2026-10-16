@@ -213,6 +213,12 @@ enum HubEvent {
         native_session_id: Option<String>,
         batch: freshell_activity::opencode::OpencodeActivityBatch,
     },
+    ManagedCodex {
+        terminal_id: String,
+        stream_epoch: String,
+        native_session_id: Option<String>,
+        batch: freshell_activity::codex::CodexActivityBatch,
+    },
 }
 
 pub(crate) use freshell_activity::opencode::OpencodeLaneEvent;
@@ -292,6 +298,7 @@ struct HubInner {
     opencode_lane_next_generation: u64,
     /// Managed observations have their own sequence, independent of PTY bytes.
     managed_opencode_cursors: HashMap<String, (String, u64)>,
+    managed_codex_cursors: HashMap<String, (String, u64)>,
     /// Task 9: the SSE lane's injected IO seams. `None` until installed
     /// (Task 10 wires the reqwest impls at boot); attach without deps only
     /// retires old lanes.
@@ -451,6 +458,22 @@ impl ActivityHub {
         let _ = self.tx.send(HubEvent::OpencodeBind {
             terminal_id: terminal_id.to_string(),
             session_id: session_id.to_string(),
+        });
+    }
+
+    /// Native observations transported through a managed output read.
+    pub fn note_managed_codex_activity(
+        &self,
+        terminal_id: &str,
+        stream_epoch: &str,
+        native_session_id: Option<&str>,
+        batch: freshell_activity::codex::CodexActivityBatch,
+    ) {
+        let _ = self.tx.send(HubEvent::ManagedCodex {
+            terminal_id: terminal_id.into(),
+            stream_epoch: stream_epoch.into(),
+            native_session_id: native_session_id.map(str::to_string),
+            batch,
         });
     }
 
@@ -977,6 +1000,87 @@ impl ActivityHub {
                 };
                 self.emit(frames);
             }
+            HubEvent::ManagedCodex {
+                terminal_id,
+                stream_epoch,
+                native_session_id,
+                batch,
+            } => {
+                let at = now_ms();
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    if inner.modes.get(&terminal_id).map(String::as_str) != Some("codex") {
+                        return;
+                    }
+                    let Some(session_id) = native_session_id.filter(|id| !id.is_empty()) else {
+                        return;
+                    };
+                    if stream_epoch.is_empty() || batch.validate().is_err() {
+                        tracing::warn!(
+                            terminal_id,
+                            event = "managed_codex.activity_batch_refused",
+                            reason = "invalid_source_or_sequence"
+                        );
+                        return;
+                    }
+                    let current = inner.managed_codex_cursors.get(&terminal_id).cloned();
+                    let same_epoch = current
+                        .as_ref()
+                        .is_some_and(|(epoch, _)| *epoch == stream_epoch);
+                    let mut cursor = current
+                        .as_ref()
+                        .filter(|_| same_epoch)
+                        .map_or(0, |(_, cursor)| *cursor);
+                    let gap = batch.retained_from_seq > cursor.saturating_add(1);
+                    let mut frames = Vec::new();
+                    if (current.is_some() && !same_epoch) || gap {
+                        let effects = inner.codex.note_exit(&terminal_id);
+                        frames.extend(codex_frames(&mut inner.idle, effects).0);
+                    }
+                    let effects = inner
+                        .codex
+                        .track_terminal(&terminal_id, Some(&session_id), at);
+                    frames.extend(codex_frames(&mut inner.idle, effects).0);
+                    if gap {
+                        tracing::warn!(
+                            terminal_id,
+                            event = "managed_codex.activity_gap",
+                            expected_seq = cursor.saturating_add(1),
+                            retained_from_seq = batch.retained_from_seq,
+                            head_seq = batch.head_seq
+                        );
+                        cursor = batch.retained_from_seq - 1;
+                    }
+                    for event in batch.events {
+                        if event.seq <= cursor {
+                            continue;
+                        }
+                        let effects = if event.completed {
+                            inner.codex.note_proxy_turn_completed(
+                                &terminal_id,
+                                &event.thread_id,
+                                event.turn_id.as_deref(),
+                                event.status.as_deref(),
+                                event.at,
+                            )
+                        } else {
+                            inner.codex.note_proxy_turn_started(
+                                &terminal_id,
+                                &event.thread_id,
+                                event.turn_id.as_deref(),
+                                event.at,
+                            )
+                        };
+                        frames.extend(codex_frames(&mut inner.idle, effects).0);
+                        cursor = event.seq;
+                    }
+                    inner
+                        .managed_codex_cursors
+                        .insert(terminal_id, (stream_epoch, cursor));
+                    frames
+                };
+                self.emit(frames);
+            }
             HubEvent::ManagedOpencode {
                 terminal_id,
                 stream_epoch,
@@ -1442,6 +1546,7 @@ impl ActivityHub {
                         inner.lane_retries.remove(&terminal_id);
                         inner.codex_lanes.remove(&terminal_id);
                         inner.managed_opencode_cursors.remove(&terminal_id);
+                        inner.managed_codex_cursors.remove(&terminal_id);
                         if let Some((_, lane_task, _)) = inner.opencode_lanes.remove(&terminal_id) {
                             // Stop the SSE lane with its pane; the map removal
                             // ALSO makes any already-enqueued stragglers fail
@@ -2356,6 +2461,9 @@ fn turn_complete_frame(
     })
 }
 
+#[cfg(test)]
+#[path = "managed_codex_activity_tests.rs"]
+mod managed_codex_activity_tests;
 #[cfg(test)]
 #[path = "managed_opencode_activity_tests.rs"]
 mod managed_opencode_activity_tests;

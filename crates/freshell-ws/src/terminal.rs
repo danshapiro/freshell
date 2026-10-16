@@ -8705,6 +8705,18 @@ async fn refresh_managed_output_and_associate(
     if let (Some(hub), Some(epoch), Some(native)) = (
         state.activity.as_ref(),
         read.stream_epoch.as_deref(),
+        read.codex_activity,
+    ) {
+        hub.note_managed_codex_activity(
+            terminal_id,
+            epoch,
+            read.native_session_id.as_deref(),
+            native,
+        );
+    }
+    if let (Some(hub), Some(epoch), Some(native)) = (
+        state.activity.as_ref(),
+        read.stream_epoch.as_deref(),
         read.opencode_activity,
     ) {
         hub.note_managed_opencode_activity(
@@ -12847,9 +12859,9 @@ mod managed_output_order_tests {
         ManagedTerminalDescriptor, ManagedTerminalFuture,
     };
 
-    struct ExitedOpenCodeRead;
+    struct ManagedOutputFixture(ManagedOutputRead);
 
-    impl ManagedTerminalController for ExitedOpenCodeRead {
+    impl ManagedTerminalController for ManagedOutputFixture {
         fn lookup_terminal<'a>(
             &'a self,
             _: &'a str,
@@ -12899,24 +12911,7 @@ mod managed_output_order_tests {
             _: i64,
             _: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
-            Box::pin(async {
-                Ok(ManagedOutputRead {
-                    opencode_activity: None,
-                    stream_epoch: Some("S-managed-short-lived".into()),
-                    incarnation_id: Some("incarnation-short-lived".into()),
-                    reset_required: false,
-                    truncated: false,
-                    retained_from_seq: 1,
-                    head_seq: 1,
-                    exit_code: Some(17),
-                    native_session_id: Some("ses-short-lived".into()),
-                    chunks: vec![ManagedOutputChunk {
-                        seq_start: 1,
-                        seq_end: 1,
-                        data: "last output\n".into(),
-                    }],
-                })
-            })
+            Box::pin(async { Ok(self.0.clone()) })
         }
     }
 
@@ -12936,7 +12931,23 @@ mod managed_output_order_tests {
         });
         state
             .registry
-            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead)));
+            .set_managed_controller(Some(Arc::new(ManagedOutputFixture(ManagedOutputRead {
+                codex_activity: None,
+                opencode_activity: None,
+                stream_epoch: Some("S-managed-short-lived".into()),
+                incarnation_id: Some("incarnation-short-lived".into()),
+                reset_required: false,
+                truncated: false,
+                retained_from_seq: 1,
+                head_seq: 1,
+                exit_code: Some(17),
+                native_session_id: Some("ses-short-lived".into()),
+                chunks: vec![ManagedOutputChunk {
+                    seq_start: 1,
+                    seq_end: 1,
+                    data: "last output\n".into(),
+                }],
+            }))));
 
         refresh_managed_output_and_associate(&state, terminal_id, 1024)
             .await
@@ -12959,6 +12970,105 @@ mod managed_output_order_tests {
         assert_eq!(row.status, freshell_protocol::TerminalRunStatus::Exited);
         assert_eq!(row.resume_session_id.as_deref(), Some("ses-short-lived"));
         assert_eq!(row.snapshot, "last output\n");
+    }
+
+    #[tokio::test]
+    async fn managed_codex_native_turns_reach_browser_activity_and_complete_once() {
+        use freshell_activity::codex::{CodexActivityBatch, CodexActivityEvent};
+        let mut state = super::pane_reconcile_gate_tests::state();
+        let hub = crate::activity::ActivityHub::new(state.broadcast_tx.clone(), None);
+        state
+            .registry
+            .set_activity_observer(hub.registry_observer());
+        state.activity = Some(hub);
+        let mut frames = state.broadcast_tx.subscribe();
+        let terminal_id = "T-managed-codex";
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-codex".into(),
+            incarnation_id: "incarnation-codex".into(),
+            terminal_id: terminal_id.into(),
+            stream_id: "codex-epoch".into(),
+            mode: "codex".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("thread-owned".into()),
+            create_request_id: Some("create-codex".into()),
+        });
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ManagedOutputFixture(ManagedOutputRead {
+                stream_epoch: Some("codex-epoch".into()),
+                incarnation_id: Some("incarnation-codex".into()),
+                reset_required: false,
+                truncated: false,
+                retained_from_seq: 1,
+                head_seq: 1,
+                exit_code: None,
+                native_session_id: Some("thread-owned".into()),
+                chunks: vec![ManagedOutputChunk {
+                    seq_start: 1,
+                    seq_end: 1,
+                    data: "assistant answer without a bell".into(),
+                }],
+                opencode_activity: None,
+                codex_activity: Some(CodexActivityBatch {
+                    retained_from_seq: 1,
+                    head_seq: 2,
+                    events: [false, true]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, completed)| CodexActivityEvent {
+                            seq: index as u64 + 1,
+                            at: index as i64 + 100,
+                            thread_id: "thread-owned".into(),
+                            turn_id: Some("turn-owned".into()),
+                            status: completed.then(|| "completed".into()),
+                            completed,
+                        })
+                        .collect(),
+                }),
+            }))));
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .unwrap();
+        let mut saw_busy = false;
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame: serde_json::Value =
+                    serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                if frame["type"] == "codex.activity.updated"
+                    && frame["upsert"]
+                        .as_array()
+                        .is_some_and(|rows| rows.iter().any(|row| row["phase"] == "busy"))
+                {
+                    saw_busy = true;
+                }
+                if frame["type"] == "terminal.turn.complete" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("native Codex turn completion must reach the browser without a PTY bell");
+        assert!(saw_busy);
+        assert_eq!(completion["outcome"], "completed");
+        assert_eq!(completion["sessionId"], "thread-owned");
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                    if frame["type"] == "terminal.turn.complete" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "repeated host reads must not duplicate a completion"
+        );
     }
 }
 #[cfg(test)]

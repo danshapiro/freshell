@@ -81,6 +81,43 @@ pub const BUSY_DEADMAN_MS: i64 = 120_000;
 
 pub type CodexEffect = TrackerEffect<CodexActivityRecord>;
 
+/// Ordered native turn observations from one managed Codex host. The enclosing
+/// output read supplies the terminal and source epoch; no provider bodies travel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexActivityBatch {
+    pub retained_from_seq: u64,
+    pub head_seq: u64,
+    pub events: Vec<CodexActivityEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexActivityEvent {
+    pub seq: u64,
+    pub at: i64,
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    pub status: Option<String>,
+    pub completed: bool,
+}
+
+impl CodexActivityBatch {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.retained_from_seq == 0
+            || self.retained_from_seq > self.head_seq.saturating_add(1)
+            || self.head_seq.checked_sub(self.retained_from_seq - 1)
+                != Some(self.events.len() as u64)
+            || self.events.iter().enumerate().any(|(offset, event)| {
+                event.seq != self.retained_from_seq + offset as u64 || event.thread_id.is_empty()
+            })
+        {
+            return Err("invalid native Codex activity sequence");
+        }
+        Ok(())
+    }
+}
+
 /// Latest codex rollout task-event timestamps (epoch ms), folded from
 /// `event_msg` records: `task_started` / `task_complete` / `turn_aborted`.
 /// Mirror of `freshell_sessions::CodexTaskEventSnapshot`, duplicated here so

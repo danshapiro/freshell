@@ -117,6 +117,7 @@ fn fixture() -> (TerminalRegistry, Arc<Controller>) {
         calls: AtomicUsize::new(0),
         observed: Mutex::new(Vec::new()),
         response: Mutex::new(ManagedOutputRead {
+            codex_activity: None,
             opencode_activity: None,
             stream_epoch: Some("epoch-new".into()),
             incarnation_id: Some("incarnation-new".into()),

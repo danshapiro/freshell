@@ -61,6 +61,7 @@ pub struct HostedPty {
     native_cwd: PathBuf,
     opencode_adoption: Option<Arc<Mutex<OpenCodeAdoptionGate>>>,
     opencode_activity: Option<crate::opencode_activity::OpencodeActivityRelay>,
+    codex_activity: Option<Arc<Mutex<crate::codex_activity::CodexActivityJournal>>>,
     codex: Option<CodexLifecycle>,
 }
 
@@ -375,6 +376,11 @@ impl HostedPty {
                 );
             }
         }
+        let codex_activity = prepared_codex.as_ref().map(|_| {
+            Arc::new(Mutex::new(
+                crate::codex_activity::CodexActivityJournal::default(),
+            ))
+        });
         let codex = if let Some(prepared) = prepared_codex {
             if let Err(error) = prepared.sidecar.adopt(&launch.terminal_id, 0).await {
                 pty.kill();
@@ -382,12 +388,17 @@ impl HostedPty {
                 return Err(format!("adopt managed Codex app-server: {error}"));
             }
             let sidecar = Arc::clone(&prepared.sidecar);
-            let event_task = tokio::spawn(run_codex_identity_events(
+            let event_task = tokio::spawn(run_codex_native_events(
                 prepared.events,
                 Arc::clone(&sidecar),
                 state_dir.to_path_buf(),
                 launch.resume_session_id.clone(),
                 Arc::clone(&native_session_id),
+                Arc::clone(
+                    codex_activity
+                        .as_ref()
+                        .expect("Codex launch has an activity journal"),
+                ),
             ));
             Some(CodexLifecycle {
                 sidecar,
@@ -437,6 +448,7 @@ impl HostedPty {
             native_cwd: PathBuf::from(&launch.cwd),
             opencode_adoption,
             opencode_activity,
+            codex_activity,
             codex,
         })
     }
@@ -542,6 +554,10 @@ impl HostedPty {
             self.native_session_id()
         };
         batch.opencode_activity = self.opencode_activity.as_ref().map(|relay| relay.read());
+        batch.codex_activity = self
+            .codex_activity
+            .as_ref()
+            .map(|journal| journal.lock().expect("Codex activity journal lock").read());
         Ok(batch)
     }
 
@@ -1193,14 +1209,19 @@ struct OpenCodeAdoptionExpectationFileOwned {
     incarnation_id: IncarnationId,
 }
 
-async fn run_codex_identity_events(
+async fn run_codex_native_events(
     mut events: mpsc::UnboundedReceiver<RemoteProxyEvent>,
     sidecar: Arc<CodexLaunchSidecar>,
     state_dir: PathBuf,
     expected_session_id: Option<String>,
     native_session_id: Arc<Mutex<Option<String>>>,
+    activity: Arc<Mutex<crate::codex_activity::CodexActivityJournal>>,
 ) {
     while let Some(event) = events.recv().await {
+        activity
+            .lock()
+            .expect("Codex activity journal lock")
+            .note_remote_event(&event, epoch_ms());
         let candidate = match event {
             RemoteProxyEvent::Candidate(candidate) => Some(candidate.thread),
             RemoteProxyEvent::ThreadStarted(started) => Some(started.thread),

@@ -897,6 +897,7 @@ pub struct ManagedOutputRead {
     pub native_session_id: Option<String>,
     pub chunks: Vec<ManagedOutputChunk>,
     pub opencode_activity: Option<freshell_activity::opencode::OpencodeActivityBatch>,
+    pub codex_activity: Option<freshell_activity::codex::CodexActivityBatch>,
 }
 
 /// Async control seam implemented by `freshell-server` with
@@ -4791,6 +4792,7 @@ impl TerminalRegistry {
         };
         let Some(claim) = ManagedReadClaim::acquire(flag) else {
             return Ok(ManagedOutputRead {
+                codex_activity: None,
                 opencode_activity: None,
                 stream_epoch: None,
                 incarnation_id: None,

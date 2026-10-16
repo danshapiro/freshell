@@ -40,6 +40,7 @@ mod tests {
         RuntimeOutputBatch {
             incarnation_id: IncarnationId::new(),
             terminal_id: "owned".into(),
+            codex_activity: None,
             opencode_activity: None,
             stream_epoch: "source".into(),
             retained_from_seq: 1,

@@ -2979,6 +2979,9 @@ pub struct RuntimeOutputBatch {
     /// provider events and HTTP bodies never cross this control boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_activity: Option<freshell_activity::opencode::OpencodeActivityBatch>,
+    /// Native Codex turn metadata from the host-owned app-server proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_activity: Option<freshell_activity::codex::CodexActivityBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

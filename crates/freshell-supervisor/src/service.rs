@@ -9463,6 +9463,7 @@ mod native_observation_ipc_tests {
                             incarnation_id
                         },
                         terminal_id: "terminal-old".into(),
+                        codex_activity: None,
                         opencode_activity: None,
                         stream_epoch: "epoch-old".into(),
                         retained_from_seq: 0,
@@ -9655,6 +9656,7 @@ mod native_observation_ipc_tests {
                             result: Ok(HostResult::TerminalOutput(RuntimeOutputBatch {
                                 incarnation_id,
                                 terminal_id: "terminal".into(),
+                                codex_activity: None,
                                 opencode_activity: None,
                                 stream_epoch: "epoch".into(),
                                 retained_from_seq: 0,
