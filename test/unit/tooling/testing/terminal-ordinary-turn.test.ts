@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { runInNewContext } from 'node:vm'
 
 import {
@@ -7,6 +7,7 @@ import {
   captureTerminalOrdinaryTurnBaseline,
   reduceTerminalOrdinaryTurnFrames,
   waitForTerminalOrdinaryTurnBaseline,
+  waitForTerminalOrdinaryTurn,
   type TerminalOrdinaryTurnBaseline,
   type TerminalOrdinaryTurnBrowserObservation,
 } from '../../../../scripts/testing/terminal-ordinary-turn.js'
@@ -39,6 +40,83 @@ function completeWithoutOutcome(provider: string = target.provider, terminalId: 
 }
 
 describe('body-free terminal ordinary-turn reduction', () => {
+  it('retains a targeted new failure distinctly from absent completion, without error bodies', () => {
+    const prior = baseline([complete(target.provider, target.terminalId, 7)])
+    const absent = reduceTerminalOrdinaryTurnFrames([], prior)
+    const failed = reduceTerminalOrdinaryTurnFrames([{ ...complete(), outcome: 'failed', error: 'PRIVATE_ERROR_BODY' }], prior)
+    expect(absent).toMatchObject({ completionSeen: false, completionOutcome: null, completionSeq: null })
+    expect(failed).toMatchObject({ completionSeen: false, completionOutcome: 'failed', completionSeq: 8 })
+    expect(JSON.stringify(failed)).not.toContain('PRIVATE_ERROR_BODY')
+  })
+
+  it.each([
+    { completionSeq: 7 }, { provider: 'codex' }, { terminalId: 'foreign' }, { streamId: 'foreign' },
+  ])('ignores stale or wrongly targeted failed completion %j', patch => {
+    const summary = reduceTerminalOrdinaryTurnFrames([{ ...complete(), outcome: 'failed', ...patch }],
+      baseline([complete(target.provider, target.terminalId, 7)]))
+    expect(summary).toMatchObject({ completionSeen: false, completionOutcome: null, completionSeq: null })
+  })
+
+  it('stops the production waiter at the first matching failed result, even without activity or output', async () => {
+    const read = vi.fn(async () => ({ requestInputSeen: true,
+      ...reduceTerminalOrdinaryTurnFrames([{ ...complete(), outcome: 'failed' }], baseline()) }))
+    await expect(waitForTerminalOrdinaryTurn(read, 0)).rejects.toThrow(/failed.*completion sequence 8/)
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not attribute a streamless failure after a replacement attach to the submitted stream', () => {
+    const summary = reduceTerminalOrdinaryTurnFrames([
+      { type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: 'replacement-stream', headSeq: 0 },
+      { ...complete(), outcome: 'failed' },
+    ], baseline())
+    expect(summary).toMatchObject({ completionSeen: false, completionOutcome: null, completionSeq: null })
+  })
+
+  it('retains a failed outcome through the installed browser observer when the frame buffer rolls over', () => {
+    const received: unknown[] = [{ type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 0 }]
+    const sent: unknown[] = []
+    const browserWindow: Record<string, any> = { __FRESHELL_TEST_HARNESS__: {
+      getReceivedWsMessages: () => received, clearReceivedWsMessages: () => { received.length = 0 },
+      getSentWsMessages: () => sent, clearSentWsMessages: () => { sent.length = 0 },
+    } }
+    runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL]
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    received.push({ ...complete(), outcome: 'failed' })
+    expect(observer.observeAfterSend(captured, 'request')).toMatchObject({ completionOutcome: 'failed', completionSeq: 8 })
+    received.length = 0
+    expect(observer.observeAfterSend(captured, 'request')).toMatchObject({ completionOutcome: 'failed', completionSeq: 8 })
+  })
+
+  it('remembers a replacement stream after its attach frame leaves the browser buffer', () => {
+    const received: unknown[] = [{ type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 0 }]
+    const sent: unknown[] = []
+    const browserWindow: Record<string, any> = { __FRESHELL_TEST_HARNESS__: {
+      getReceivedWsMessages: () => received, clearReceivedWsMessages: () => { received.length = 0 },
+      getSentWsMessages: () => sent, clearSentWsMessages: () => { sent.length = 0 },
+    } }
+    runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL]
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    received.push({ type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: 'replacement-stream', headSeq: 0 })
+    observer.observeAfterSend(captured, 'request')
+    received.length = 0
+    received.push({ ...complete(), outcome: 'failed' })
+    expect(observer.observeAfterSend(captured, 'request')).toMatchObject({ completionOutcome: null, completionSeq: null })
+  })
+
+  it.each(['output-first', 'completion-first'] as const)('waits for successful output and completion in %s order', async order => {
+    const events = order === 'output-first' ? [output(), complete()] : [complete(), output()]
+    const frames: unknown[] = [activity(target.provider)]
+    let reads = 0
+    const observed = await waitForTerminalOrdinaryTurn(async () => {
+      frames.push(events[reads++])
+      return { requestInputSeen: true, ...reduceTerminalOrdinaryTurnFrames(frames, baseline()) }
+    }, 1000, 0)
+    expect(reads).toBe(2)
+    expect(observed).toMatchObject({ completionSeen: true, completionOutcome: 'completed', outputSeen: true })
+  })
+
   it('waits for the attach-ready baseline before a live turn can be submitted', async () => {
     const ready = baseline([
       { type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 6 },
@@ -103,6 +181,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
       outputSeq: 11,
       completionSeen: true,
       completionSeq: 9,
+      completionOutcome: 'completed',
     })
     expect(summary).not.toHaveProperty('data')
     expect(summary).not.toHaveProperty('frames')
@@ -145,7 +224,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
       { ...complete('codex', codexTarget.terminalId, 1), outcome: 'completed' },
     ], codexBaseline)
 
-    expect(failed).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
+    expect(failed).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: 1, completionOutcome: 'failed' })
     expect(unavailable).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
     expect(completed).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
     expect(completedAfterProvisional).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
@@ -174,7 +253,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
       ], providerBaseline)
 
       expect(missing).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
-      expect(failed).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
+      expect(failed).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: 1, completionOutcome: 'failed' })
       expect(completed).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
       expect(JSON.stringify(completed)).not.toContain('data')
     },
@@ -245,6 +324,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
       outputSeq: 11,
       completionSeen: true,
       completionSeq: 8,
+      completionOutcome: 'completed',
     })
   })
 
@@ -312,6 +392,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
       outputSeq: 11,
       completionSeen: true,
       completionSeq: 8,
+      completionOutcome: 'completed',
     })
     expect(JSON.stringify(observed)).not.toContain(outputSentinel)
     expect(JSON.stringify(observed)).not.toContain(promptSentinel)

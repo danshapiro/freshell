@@ -29,6 +29,7 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 import { withOwnedCleanup } from '../../../../scripts/testing/owned-cleanup.js'
 import { projectManagedViewProbe } from '../../../../scripts/testing/managed-view-probe.js'
 import { NativeRecoveryValidationError } from '../../../../scripts/testing/qualification-observations.js'
+import { captureTerminalOrdinaryTurnBaseline, reduceTerminalOrdinaryTurnFrames } from '../../../../scripts/testing/terminal-ordinary-turn.js'
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
@@ -1122,6 +1123,19 @@ describe('candidate-bound Cloud execution events', () => {
 })
 
 describe('body-free ordinary-turn Cloud diagnostics', () => {
+  it('retains safe native failure outcome and sequence from the production reducer in forwarded diagnostics', () => {
+    const target = { provider: 'codex' as const, terminalId: 'owned-terminal', streamId: 'owned-stream' }
+    const facts = { requestInputSeen: true, ...reduceTerminalOrdinaryTurnFrames([{
+      type: 'terminal.turn.complete', ...target, completionSeq: 9, outcome: 'failed', error: 'PRIVATE_API_ERROR',
+    }], captureTerminalOrdinaryTurnBaseline([], target)) }
+    const parsed = runner.parseManagedOrdinaryTurnDiagnosticText(JSON.stringify({
+      event: 'durable_souls.ordinary_turn_failed', lane: 'terminal', provider: target.provider,
+      ordinaryTurnFailureStage: 'turn_completion', ordinaryTurnFacts: { ...facts, error: 'PRIVATE_API_ERROR' },
+    }))
+    expect(parsed).toMatchObject([{ ordinaryTurnFacts: { completionSeen: false, completionOutcome: 'failed', completionSeq: 9 } }])
+    expect(JSON.stringify(parsed)).not.toContain('PRIVATE_API_ERROR')
+  })
+
   it('forwards only the request-correlated Codex pane-creation probe for the exact terminal smoke', () => {
     for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)

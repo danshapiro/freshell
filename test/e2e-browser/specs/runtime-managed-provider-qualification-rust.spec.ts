@@ -49,6 +49,7 @@ import {
   buildTerminalOrdinaryTurnBrowserScript,
   TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL,
   waitForTerminalOrdinaryTurnBaseline,
+  waitForTerminalOrdinaryTurn,
   type TerminalOrdinaryTurnBaseline,
   type TerminalOrdinaryTurnBrowserObservation,
   type TerminalOrdinaryTurnProvider,
@@ -243,18 +244,12 @@ async function executeAndAwaitOrdinaryTurn(
   await page.keyboard.press('Enter')
   let latestFacts: TerminalOrdinaryTurnBrowserObservation | null = null
   try {
-    return await waitForValue('ordinary terminal provider turn completion', async () => {
+    return await waitForTerminalOrdinaryTurn(async () => {
       latestFacts = await page.evaluate(({ globalName, currentBaseline, expectedInput }) => {
         const observer = (window as any)[globalName]
         return observer?.observeAfterSend(currentBaseline, expectedInput) ?? null
       }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, currentBaseline: baseline, expectedInput: requestText }) as TerminalOrdinaryTurnBrowserObservation | null
       return latestFacts
-        && latestFacts.requestInputSeen
-        && latestFacts.activitySeen
-        && latestFacts.outputSeen
-        && latestFacts.completionSeen
-        ? latestFacts
-        : null
     }, 240_000)
   } catch (error) {
     throw new OrdinaryTerminalTurnError('turn_completion', latestFacts, error)
