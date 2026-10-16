@@ -428,36 +428,14 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
-      const bootstrap = await waitForValue('canonical reload reconciliation acknowledgement', () => {
-        const request = sent.slice(reloadSentBaseline).find((frame) => frame.type === 'pane.reconcile.request')
-        const result = received.slice(reloadReceivedBaseline).find((frame) => frame.type === 'pane.reconcile.result'
-          && frame.reconcileId === request?.reconcileId)
-        return request && result ? { request, result } : null
-      }, 30_000)
-      expect(bootstrap.request.panes).toEqual([expect.objectContaining({
-        paneKey: `${created.tabId}:${created.paneId}`, createRequestId: original.createRequestId,
-        sessionRef: original.sessionRef, kind: 'fresh-agent', mode: 'codex',
-      })])
-      if (bootstrap.result.verdicts.some((verdict: any) => ['fresh', 'respawn'].includes(verdict.verdict))) {
-        await waitForValue('same-request bootstrap create acknowledgement', () => received.slice(reloadReceivedBaseline)
-          .find((frame) => ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type)
-            && frame.requestId === original.createRequestId), 30_000)
-      }
-      const bootstrapLifecycle = () => sent.slice(reloadSentBaseline)
+      const reloadReady = await waitForValue('reloaded managed connection ready', () => received.slice(reloadReceivedBaseline)
+        .find((frame) => frame.type === 'ready'), 30_000)
+      expect(reloadReady.capabilities.managedRuntimeV1).toBe(true)
+      const reloadLifecycle = () => sent.slice(reloadSentBaseline)
         .filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')
-      const expectOnlyCanonicalBootstrap = () => {
-        const frames = bootstrapLifecycle()
-        expect(frames.filter((frame) => frame.type === 'pane.reconcile.request')).toEqual([bootstrap.request])
-        const creates = frames.filter((frame) => frame.type === 'freshAgent.create')
-        expect(creates.length).toBeLessThanOrEqual(1)
-        for (const frame of creates) {
-          expect(frame).toMatchObject({ requestId: original.createRequestId, tabId: created.tabId,
-            provider: 'codex', sessionType: 'freshcodex' })
-          if (frame.sessionRef) expect(frame.sessionRef).toEqual(original.sessionRef)
-        }
-      }
-      expectOnlyCanonicalBootstrap()
-      const settledLifecycleCount = bootstrapLifecycle().length
+      // Managed inventory restores this supervisor-owned pane. Legacy
+      // reconciliation and fresh allocation must remain absent on reload.
+      expect(reloadLifecycle()).toHaveLength(0)
       await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible({ timeout: 60_000 })
       await expect(pane.getByText('deterministic fixture completion', { exact: true })).toBeVisible()
       await expect(composer).toBeDisabled()
@@ -475,11 +453,11 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const launches = ownership.launches
       expect(launches).toHaveLength(1)
       expect(launches[0].data).toMatchObject({ incarnationId: view.incarnationId, containerId: view.containerId, workerLaunchCount: 1 })
-      expectOnlyCanonicalBootstrap()
-      expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
+      expect(reloadLifecycle()).toHaveLength(0)
       const historyEvidence = { source: 'owned provider-volume native history',
-        wrongSource: 'coincident web-local native history', heldHost, bootstrap: bootstrap.request,
-        bootstrapCreates: bootstrapLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
+        wrongSource: 'coincident web-local native history', heldHost,
+        bootstrap: reloadLifecycle().find((frame) => frame.type === 'pane.reconcile.request') ?? null,
+        bootstrapCreates: reloadLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
         nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: (await fixtureState()),
         originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true }
       await rig.releaseRuntimeHost(rig.exactRuntimeHandle(view))
@@ -495,8 +473,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expectOriginalConversation()
       expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expectOnlyCanonicalBootstrap()
-      expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
+      expect(reloadLifecycle()).toHaveLength(0)
       const { targetSoulRecoveries } = await rig.freshCodexSavedHistoryOwnershipFacts(rig.exactRuntimeHandle(view))
       expect(targetSoulRecoveries).toHaveLength(0)
       await rig.publishFreshCodexSavedHistoryPreservation(rig.exactRuntimeHandle(view), FreshCodexSavedHistoryPreservationSchema.parse({ ...historyEvidence,
