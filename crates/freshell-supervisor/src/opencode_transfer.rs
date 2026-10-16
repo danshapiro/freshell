@@ -1661,10 +1661,21 @@ impl OpenCodeTransferStaging {
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // A direct Begin can crash before writing the descriptor;
-                    // its caller can still recover it from the exact retry
-                    // descriptor. This state cannot come from a published
-                    // queue promotion, whose descriptor is durable first.
+                    // Direct Begin publishes the descriptor before ownership
+                    // or payloads. An empty directory (or only its interrupted
+                    // atomic metadata write) therefore holds no reservation
+                    // to preserve. Reclaim it before any quota scan so other
+                    // transfers can proceed without waiting for its retry.
+                    if is_exact_interrupted_metadata_initialization(&path, &[])? {
+                        fs::remove_dir_all(&path)?;
+                        sync_parent(&path)?;
+                        tracing::info!(
+                            event = "opencode_transfer.partial_initialization_recovered",
+                            path = %path.display(),
+                            "reclaimed unpublished transfer initialization"
+                        );
+                        recovered += 1;
+                    }
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -2187,15 +2198,22 @@ fn registry_reference_matches(
 }
 
 fn is_exact_interrupted_queue_initialization(path: &Path) -> Result<bool, StagingError> {
+    is_exact_interrupted_metadata_initialization(
+        path,
+        &["descriptor.json", PARTIAL_ATTEMPT_FILE, QUEUE_ORDER_FILE],
+    )
+}
+
+fn is_exact_interrupted_metadata_initialization(
+    path: &Path,
+    allowed_metadata: &[&str],
+) -> Result<bool, StagingError> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             return Ok(false);
         };
-        let known_metadata = matches!(
-            name.as_str(),
-            "descriptor.json" | PARTIAL_ATTEMPT_FILE | QUEUE_ORDER_FILE
-        );
+        let known_metadata = allowed_metadata.contains(&name.as_str());
         let atomic_temporary = name
             .strip_prefix(".tmp-")
             .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());

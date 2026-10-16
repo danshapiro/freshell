@@ -744,6 +744,104 @@ fn staged_transfer_resumes_after_restart_and_refuses_tampered_ready_data() {
 }
 
 #[test]
+fn empty_interrupted_partial_does_not_block_unrelated_begin_or_resume() {
+    for temporary_descriptor in [false, true] {
+        for restart in [true, false] {
+            for resume_first in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let limits = StagingLimits::for_test(8, 16);
+                let mut staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+                let existing = descriptor(b"existing", "transfer-existing");
+                staging.begin(&existing, TEST_ATTEMPT, u64::MAX).unwrap();
+                staging
+                    .write_chunk(&chunk(&existing, b"existing", 0))
+                    .unwrap();
+                let orphan = descriptor(b"orphaned", "transfer-empty-orphan");
+                let empty = staging.partial_path(&orphan.transfer_id);
+                std::fs::create_dir(&empty).unwrap();
+                std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o700)).unwrap();
+                if temporary_descriptor {
+                    std::fs::write(
+                        empty.join(format!(".tmp-{}", uuid::Uuid::new_v4())),
+                        b"interrupted descriptor write",
+                    )
+                    .unwrap();
+                }
+                if restart {
+                    drop(staging);
+                    staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+                }
+                let unrelated = descriptor(b"new data", "transfer-unrelated");
+                for resume in [resume_first, !resume_first] {
+                    let result = if resume {
+                        staging.begin(&existing, RETRY_ATTEMPT, u64::MAX)
+                    } else {
+                        staging.begin(&unrelated, TEST_ATTEMPT, u64::MAX)
+                    };
+                    assert!(matches!(result, Ok(StagingStart::Started {next_sequence, ..}) if next_sequence == u64::from(resume)),
+                    "empty interrupted initialization must not block restart={restart} resume={resume}: {result:?}");
+                }
+                assert!(
+                    !empty.exists(),
+                    "the exact empty initialization is reclaimed"
+                );
+                let partial = staging.partial_path(&existing.transfer_id);
+                assert_eq!(
+                    std::fs::read(partial.join("entry-0000.part")).unwrap(),
+                    b"existing"
+                );
+                assert_eq!(super::read_attempt_owner(&partial).unwrap(), RETRY_ATTEMPT);
+                assert!(staging
+                    .write_chunk(&chunk(&existing, b"existing", 0))
+                    .is_err());
+                staging.abort(&existing.transfer_id, TEST_ATTEMPT).unwrap();
+                assert!(
+                    partial.is_dir(),
+                    "a superseded attempt cannot erase real progress"
+                );
+                assert_eq!(staging.begin(&orphan, TEST_ATTEMPT, u64::MAX).unwrap(), StagingStart::Queued,
+                "the interrupted caller remains retryable and the real reservations still count");
+                assert!(staging.queued_path(&orphan.transfer_id).is_dir());
+            }
+        }
+    }
+}
+
+#[test]
+fn interrupted_partial_recovery_preserves_nonempty_descriptorless_entries() {
+    for (name, bytes) in [
+        ("entry-0000.part", b"retained payload".as_slice()),
+        ("entry-0001.part", b"".as_slice()),
+        (".attempt", TEST_ATTEMPT.as_bytes()),
+        ("unknown", b"retained unknown entry".as_slice()),
+        (".tmp-not-a-uuid", b"retained unknown temporary".as_slice()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let staging =
+            OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+        let partial = staging.partial_path("transfer-incomplete-nonempty");
+        std::fs::create_dir(&partial).unwrap();
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(partial.join(name), bytes).unwrap();
+        drop(staging);
+        let restarted =
+            OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+        assert!(restarted
+            .begin(
+                &descriptor(b"other", "transfer-other"),
+                TEST_ATTEMPT,
+                u64::MAX
+            )
+            .is_err());
+        assert_eq!(
+            std::fs::read(partial.join(name)).unwrap(),
+            bytes,
+            "descriptor-less entries with data or ownership are preserved"
+        );
+    }
+}
+
+#[test]
 fn staged_transfer_repairs_crash_between_partial_creation_and_descriptor_payload() {
     let dir = tempfile::tempdir().unwrap();
     let descriptor = descriptor(b"synthetic", "transfer-init-crash");
