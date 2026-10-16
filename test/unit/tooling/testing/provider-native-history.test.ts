@@ -406,6 +406,30 @@ describe('Codex native history proof', () => {
 })
 
 describe('OpenCode native history proof', () => {
+  it('retains safe failed outcomes and valid tool-only finalized history', () => {
+    const dbPath = path.join(tempRoot('opencode-outcomes'), 'opencode.db')
+    const db = new DatabaseSync(dbPath)
+    try {
+      db.exec('CREATE TABLE session(id TEXT PRIMARY KEY); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
+      db.prepare('INSERT INTO session VALUES (?)').run('ses_exact')
+      for (const [index, id] of ['failed', 'empty', 'tool-only', 'answer'].entries()) {
+        db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(id, 'ses_exact', index, JSON.stringify({ role: 'assistant',
+          parentID: 'user-' + id, providerID: 'opencode', modelID: 'big-pickle', time: { completed: index + 1 },
+          ...(id === 'failed' ? { error: { name: 'APIError', data: { message: 'PRIVATE_API_ERROR' } } } : {}) }))
+        if (id === 'tool-only' || id === 'answer') db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part-' + id, 'ses_exact', id, index,
+          JSON.stringify(id === 'tool-only' ? { type: 'tool', tool: 'read' } : { type: 'text', text: 'ready' }))
+      }
+    } finally { db.close() }
+    const history = readOpenCodeNativeHistory(dbPath, 'ses_exact')
+    expect(history.turns).toMatchObject([
+      { messageId: 'failed', outcome: 'failed', text: '' },
+      { messageId: 'empty', outcome: 'completed', text: '' },
+      { messageId: 'tool-only', outcome: 'completed', text: '', toolCalls: [{ type: 'tool', name: 'read' }] },
+      { messageId: 'answer', outcome: 'completed', text: 'ready' },
+    ])
+    expect(JSON.stringify(history)).not.toContain('PRIVATE_API_ERROR')
+  })
+
   it('retains committed WAL contents in a standalone raw database snapshot', () => {
     const root = tempRoot('opencode-live-wal'), dbPath = path.join(root, 'opencode.db')
     const db = new DatabaseSync(dbPath)

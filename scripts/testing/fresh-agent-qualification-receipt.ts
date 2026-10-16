@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { captureNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/probe-cli.js'
+import { hasSuccessfulNativeAnswer } from './provider-native-history.js'
 import { nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome } from './runtime-native-feasibility.js'
 
 import { deriveNativeRecoveryOriginals, nativeMaterial, readNativeOriginalReference, NATIVE_RECOVERY_ORIGINALS_FILE, type ObservedNativeConversation } from './qualification-observations.js'
@@ -567,7 +568,8 @@ function validateBrowserExecutions(evidenceDir: string, rows: FreshAgentQualific
       || !ui.request.requestId || !matchesFreshBrowserSendAccepted(view, ui.reply) || before.history.turns.length !== ui.beforeTurns || after.history.turns.length !== before.history.turns.length + 1
       || newInputs.length !== 1 || newInputs[0]!.text !== ui.request.text || evidence?.kind !== 'identified_message'
       || (row.provider === 'codex' ? evidence.turnId !== newInputs[0]!.id : evidence.parentMessageId !== newInputs[0]!.id)
-      || last.toolCalls.length || stableJson(after.history.turns.slice(0, before.history.turns.length)) !== stableJson(before.history.turns)) throw new Error('actual browser native no-tool completion differs')
+      || !hasSuccessfulNativeAnswer(last, row.provider) || last.toolCalls.length
+      || stableJson(after.history.turns.slice(0, before.history.turns.length)) !== stableJson(before.history.turns)) throw new Error('actual browser native no-tool completion differs')
     const derived = deriveFreshBrowserExecution(original, observed[index]!)
     for (const [field, value] of Object.entries(derived)) {
       if (stableJson(row[field]) !== stableJson(value)) throw new Error('browser execution derived ' + field + ' differs')

@@ -116,6 +116,7 @@ export function readOpenCodeNativeObservation(filename: string, exactSessionId: 
         messageId,
         parentMessageId,
         completedAt: message.time.completed,
+        outcome: message.error != null ? 'failed' : 'completed',
         text,
         toolCalls,
         resolvedProvider: requiredString(message.providerID, 'OpenCode assistant provider id'),

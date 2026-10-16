@@ -22,7 +22,7 @@ import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNati
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deferredProviders, loadCapabilityManifest } from './provider-certification.js'
 import { deriveNativeRecoveryOriginals, nativeRecoveryValidationDiagnostic, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
-import type { NativeHistory } from './provider-native-history.js'
+import { hasSuccessfulNativeAnswer, type NativeHistory } from './provider-native-history.js'
 
 import { configuredProviderOnecliGrantFiles } from './runtime-amplifier-onecli.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt, type BrokerSettlementFailure } from './runtime-test-broker.js'
@@ -6152,7 +6152,10 @@ export class ManagedRuntimeOwner {
         if (captured && captured.turns.length > challenge.beforeTurns) break
         await new Promise(resolve => setTimeout(resolve, 100))
       }
-      if (!captured || captured.turns.length !== challenge.beforeTurns + 1 || captured.turns.at(-1)!.toolCalls.length) throw new Error('actual browser no-tool native completion differs')
+      const answer = captured?.turns.at(-1)
+      if (!captured || captured.turns.length !== challenge.beforeTurns + 1
+        || !hasSuccessfulNativeAnswer(answer, challenge.provider)
+        || answer!.toolCalls.length) throw new Error('actual browser no-tool native completion differs')
       const after = await this.materializeNativeSource('fresh-browser-' + challenge.collectionId + '/ui/completed', captured)
       this.freshBrowserCollection(challenge.collectionId).browser.ui = { provider: challenge.provider, nativeRoot: handle.nativeSessionId,
         boundary: challenge.boundary, after, request, reply, view, beforeTurns: challenge.beforeTurns }
