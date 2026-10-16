@@ -16,7 +16,7 @@ fn managed() -> ActivityHub {
 fn turn(seq: u64, id: &str, status: Option<&str>) -> CodexActivityEvent {
     CodexActivityEvent {
         seq,
-        at: seq as i64 + 100,
+        at: now_ms() + seq as i64,
         thread_id: "thread-owned".into(),
         turn_id: Some(id.into()),
         status: status.map(str::to_string),
@@ -146,4 +146,133 @@ async fn managed_codex_failed_turns_remain_failed_and_human_interruptions_stay_s
             freshell_protocol::CodexPhase::Idle
         );
     }
+}
+
+fn historical_turn(seq: u64, id: &str, status: Option<&str>) -> CodexActivityEvent {
+    CodexActivityEvent {
+        at: now_ms() - 60_000 + seq as i64,
+        ..turn(seq, id, status)
+    }
+}
+
+fn drain_frames(frames: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<serde_json::Value> {
+    std::iter::from_fn(|| frames.try_recv().ok())
+        .map(|frame| serde_json::from_str(&frame).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn managed_codex_fresh_hub_seeds_completed_history_without_attention_then_completes_live_turn(
+) {
+    let hub = managed();
+    let mut frames = hub.broadcast_tx.subscribe();
+    let mut events = vec![
+        historical_turn(1, "historical", None),
+        historical_turn(2, "historical", Some("completed")),
+    ];
+    send(&hub, "surviving-host", events.clone());
+    flush(&hub).await;
+    hub.expire_due();
+    assert_eq!(
+        hub.inner.lock().unwrap().codex.list()[0].phase,
+        freshell_protocol::CodexPhase::Idle
+    );
+    assert!(
+        hub.inner
+            .lock()
+            .unwrap()
+            .codex
+            .list_latest_completions()
+            .is_empty(),
+        "historical completions must not enter a fresh hub's live completion snapshot"
+    );
+    assert!(
+        drain_frames(&mut frames)
+            .iter()
+            .all(|frame| frame["type"] != "terminal.turn.complete"
+                && frame["type"] != "terminal.idle"),
+        "restoring a completed historical turn must not replay attention"
+    );
+
+    events.extend([turn(3, "live", None), turn(4, "live", Some("completed"))]);
+    send(&hub, "surviving-host", events);
+    flush(&hub).await;
+    let live = drain_frames(&mut frames);
+    assert_eq!(
+        live.iter()
+            .filter(|frame| frame["type"] == "terminal.turn.complete")
+            .count(),
+        1
+    );
+    assert_eq!(
+        hub.inner
+            .lock()
+            .unwrap()
+            .idle
+            .expire(now_ms() + 10_000)
+            .len(),
+        1,
+        "a subsequent real completion must still arm idle attention"
+    );
+}
+
+#[tokio::test]
+async fn managed_codex_fresh_hub_seeds_in_progress_history_and_accepts_its_later_completion() {
+    let hub = managed();
+    let mut frames = hub.broadcast_tx.subscribe();
+    let start = historical_turn(1, "ongoing", None);
+    send(&hub, "surviving-host", vec![start.clone()]);
+    flush(&hub).await;
+    assert_eq!(
+        hub.inner.lock().unwrap().codex.list()[0].phase,
+        freshell_protocol::CodexPhase::Busy
+    );
+    assert!(
+        drain_frames(&mut frames)
+            .iter()
+            .all(|frame| frame["type"] != "terminal.turn.complete"
+                && frame["type"] != "terminal.idle")
+    );
+    send(
+        &hub,
+        "surviving-host",
+        vec![start, turn(2, "ongoing", Some("completed"))],
+    );
+    flush(&hub).await;
+    assert_eq!(
+        drain_frames(&mut frames)
+            .iter()
+            .filter(|frame| frame["type"] == "terminal.turn.complete")
+            .count(),
+        1
+    );
+    assert_eq!(
+        hub.inner.lock().unwrap().codex.list()[0].phase,
+        freshell_protocol::CodexPhase::Idle
+    );
+}
+
+#[tokio::test]
+async fn managed_codex_first_read_preserves_live_completion_after_historical_prefix() {
+    let hub = managed();
+    let mut frames = hub.broadcast_tx.subscribe();
+    send(
+        &hub,
+        "surviving-host",
+        vec![
+            historical_turn(1, "historical", None),
+            historical_turn(2, "historical", Some("completed")),
+            turn(3, "live", None),
+            turn(4, "live", Some("completed")),
+        ],
+    );
+    flush(&hub).await;
+    assert_eq!(
+        drain_frames(&mut frames)
+            .iter()
+            .filter(|frame| frame["type"] == "terminal.turn.complete")
+            .count(),
+        1,
+        "initial catch-up must preserve new completions in the same batch"
+    );
 }

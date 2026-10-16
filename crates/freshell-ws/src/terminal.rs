@@ -13018,7 +13018,7 @@ mod managed_output_order_tests {
                         .enumerate()
                         .map(|(index, completed)| CodexActivityEvent {
                             seq: index as u64 + 1,
-                            at: index as i64 + 100,
+                            at: now_ms() + index as i64,
                             thread_id: "thread-owned".into(),
                             turn_id: Some("turn-owned".into()),
                             status: completed.then(|| "completed".into()),

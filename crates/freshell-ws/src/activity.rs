@@ -40,7 +40,7 @@ use freshell_activity::amplifier::{
     ReducerEffect, ReducerState,
 };
 use freshell_activity::claude::ClaudeActivityTracker;
-use freshell_activity::codex::CodexActivityTracker;
+use freshell_activity::codex::{CodexActivityEvent, CodexActivityTracker};
 use freshell_activity::idle::{IdleGate, IdleGatePhase};
 use freshell_activity::opencode::OpencodeActivityTracker;
 #[cfg(test)]
@@ -333,6 +333,9 @@ struct HubInner {
 /// Cloneable handle to the hub (stored on `WsState`).
 #[derive(Clone)]
 pub struct ActivityHub {
+    /// Host receipt timestamps share this server clock; older initial records
+    /// reconstruct state, while observations since hub creation are live.
+    started_at: i64,
     inner: Arc<Mutex<HubInner>>,
     tx: tokio::sync::mpsc::UnboundedSender<HubEvent>,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
@@ -348,6 +351,7 @@ impl ActivityHub {
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let hub = Self {
+            started_at: now_ms(),
             inner: Arc::new(Mutex::new(HubInner::default())),
             tx,
             broadcast_tx,
@@ -1050,6 +1054,40 @@ impl ActivityHub {
                             head_seq = batch.head_seq
                         );
                         cursor = batch.retained_from_seq - 1;
+                    }
+                    if current.is_none() {
+                        // The host outlives this hub. Its pre-boot journal is a
+                        // state snapshot, not new attention. Seed only an
+                        // unresolved turn and consume the historical prefix;
+                        // events observed since hub construction remain live,
+                        // including a new provider's entire first turn.
+                        let mut active: Option<&CodexActivityEvent> = None;
+                        for event in batch.events.iter().take_while(|e| e.at < self.started_at) {
+                            cursor = event.seq;
+                            if event.thread_id != session_id {
+                                continue;
+                            }
+                            if !event.completed {
+                                active = Some(event);
+                            } else if event.status.as_deref() != Some("inProgress")
+                                && active.is_some_and(|start| {
+                                    start.turn_id.is_none()
+                                        || event.turn_id.is_none()
+                                        || start.turn_id == event.turn_id
+                                })
+                            {
+                                active = None;
+                            }
+                        }
+                        if let Some(start) = active {
+                            let effects = inner.codex.note_proxy_turn_started(
+                                &terminal_id,
+                                &start.thread_id,
+                                start.turn_id.as_deref(),
+                                start.at,
+                            );
+                            frames.extend(codex_frames(&mut inner.idle, effects).0);
+                        }
                     }
                     for event in batch.events {
                         if event.seq <= cursor {
