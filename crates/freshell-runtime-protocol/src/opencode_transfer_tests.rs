@@ -145,6 +145,55 @@ fn reference_only_workspace_and_git_assets_do_not_require_transferred_files() {
 }
 
 #[test]
+fn zero_byte_assets_require_an_empty_workspace_reference_and_no_transferred_file() {
+    for (kind, sha256, transferred) in [
+        ("workspace_path_reference", "a".repeat(64), false),
+        ("git_tree_reference", hex::encode(Sha256::digest([])), false),
+        (
+            "workspace_path_reference",
+            hex::encode(Sha256::digest([])),
+            true,
+        ),
+    ] {
+        let mut descriptor = descriptor();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&descriptor.manifest_json).unwrap();
+        manifest["assets"] = serde_json::json!([{
+            "kind": kind,
+            "source_relative_path": "empty.txt",
+            "target_relative_path": "empty.txt",
+            "size_bytes": 0,
+            "sha256": sha256,
+        }]);
+        descriptor.manifest_json = manifest.to_string();
+        if transferred {
+            descriptor.files.push(OpenCodeTransferFile {
+                index: 1,
+                relative_path: "empty.txt".into(),
+                size_bytes: 0,
+                sha256,
+            });
+        }
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        assert!(
+            descriptor.validate().is_err(),
+            "{kind}/transferred={transferred}"
+        );
+    }
+    let empty_chunk = OpenCodeTransferChunk {
+        transfer_id: "transfer-test-1".into(),
+        attempt_id: "a".repeat(32),
+        sequence: 0,
+        file_index: 0,
+        offset: 0,
+        data: Vec::new(),
+        sha256: hex::encode(Sha256::digest([])),
+    };
+    assert!(empty_chunk.validate().is_err());
+}
+
+#[test]
 fn opencode_session_transfer_chunk_is_bounded_and_fits_authenticated_control_frame() {
     let mut chunk = OpenCodeTransferChunk {
         transfer_id: "transfer-test-1".into(),
