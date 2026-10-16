@@ -704,7 +704,7 @@ No source/test repair was needed for Task 8, so no empty commit was made. The ru
 
 - [x] **Step 1: Add the focused behavior checks**
 
-Add one separately selectable browser case to each existing live spec. Each selected mode creates an isolated pane and sends one bounded harmless prompt. For FreshAgent, require a `freshAgent.turn.complete` event for the sent session received after that send and newly displayed nonempty assistant text in that pane; do not require exact model wording or return transcript text to the test runner. For terminal mode, capture the selected terminal's stream and sequence baseline, then reduce post-send WebSocket frames in the browser and require provider-specific activity, nonempty output on that same terminal and stream beyond the baseline, and a `terminal.turn.complete` whose completion sequence advanced beyond the baseline. Return only booleans, counts, and sequence metadata; never read or return terminal snapshot text or output bytes. This proves activity, new output, and a normal turn boundary, but not semantic answer success because the terminal completion event has no success outcome. `freshAgent.send.accepted`, pane allocation, process presence, a requested session ID, or activity without fresh output and completion do not count as completion. Do not crash/restart the host or provider, compare native session IDs across incarnations, test pending approval, or import existing sessions.
+Add one separately selectable browser case to each existing live spec. Each selected mode creates an isolated pane and sends one bounded harmless prompt. For FreshAgent, require successful completion for the sent session after that send and newly displayed nonempty assistant text in that pane. For terminal mode, ask for the lowercase form of a unique uppercase marker; the expected answer must be absent from both the literal prompt and the pre-send terminal buffer. Capture the selected terminal's stream, sequence and allocated native conversation, then require the sent request, matching provider activity, fresh output, the expected answer rendered in that terminal's xterm buffer, and an advanced `terminal.turn.complete` with explicit successful outcome for that same native conversation. Observe these signals independently of arrival order and preserve valid evidence through buffer rollover. A matching failed outcome ends the wait promptly with diagnostic outcome and sequence information; a foreign conversation's completion or failure does not satisfy or terminate this wait. Summaries return booleans, counts and identity/sequence metadata. Actual errors and owned diagnostic output may be inspected while protecting literal secrets. Prompt echo, loading output, raw answer bytes without rendering, acceptance or allocation alone do not establish success. Do not crash/restart the host or provider, compare native session IDs across incarnations, test pending approval, or import existing sessions.
 
 - [x] **Step 2: Run the four selected non-Claude cases locally**
 
@@ -718,7 +718,7 @@ Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_A
 
 Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshopencode pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
 
-Historical first rerun: Codex terminal failed at terminal creation with `PTY_SPAWN_FAILED`, before the Codex process started; FreshCodex sent input but its session exited without a completed turn; OpenCode produced output but no completion event; FreshOpenCode passed. These failures were subsequently repaired. All four modes passed at `3dcd7884236e4184859a2e40c7115383f5de6831`, and terminal Codex passed again after the relay repairs at `7d7a91baaf1f7cf1b99b5ee89c4ce8799b5ffce1`. No shared login was changed. Final Task 9 acceptance still requires the remaining affected browser checks, integrated full-suite gate, and complete-change review.
+Historical first rerun: Codex terminal failed at terminal creation with `PTY_SPAWN_FAILED`, before the Codex process started; FreshCodex sent input but its session exited without a completed turn; OpenCode produced output but no completion event; FreshOpenCode passed. These failures were subsequently repaired. All four modes passed their then-current assertions at `3dcd7884236e4184859a2e40c7115383f5de6831`, and terminal Codex passed those assertions again after relay repairs at `7d7a91baaf1f7cf1b99b5ee89c4ce8799b5ffce1`. The original terminal assertion accepted activity/output/completion without proving a rendered answer for the allocated conversation, so those receipts do not establish the strengthened Step 1 assertion. Rerun only terminal Codex and OpenCode after cumulative repair review; retain the unchanged FreshCodex/FreshOpenCode successful-answer evidence. No shared login was changed. Final Task 9 acceptance requires the affected terminal reruns, integrated full-suite gate and complete-change review; record their actual tested commits in the run ledger.
 
 Expected: all four selected browser cases pass, each records one body-free completion event, and all owned resources close cleanly. A failed case proceeds to Step 3 and is not counted as acceptance. No global campaign status or certification is produced.
 
@@ -726,7 +726,7 @@ Expected: all four selected browser cases pass, each records one body-free compl
 
 If a mode fails, inspect actual errors and owned diagnostic logs to distinguish a product failure from an unavailable provider account or transport. Fix a product defect with a meaningful regression test and rerun the affected mode. Do not refresh, replace or broaden shared credentials without explicit authorization; never expose secret material.
 
-- [ ] **Step 4: Run affected checks and refactor while green**
+- [x] **Step 4: Run affected checks and refactor while green**
 
 Run: `pnpm run typecheck:runtime`
 
@@ -734,11 +734,13 @@ Run: `pnpm run typecheck:managed-tests`
 
 Run: `pnpm run lint:managed-tests`
 
-Run: `pnpm run test:vitest run test/unit/tooling/testing/ --config config/vitest/vitest.config.ts`
+Run the affected final behavior checks through the configured Cloud backend: `GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --shards=1 test/unit/tooling/testing/terminal-ordinary-turn.test.ts test/unit/tooling/testing/runtime-external-browser.test.ts test/unit/tooling/testing/runtime-owner-facts.test.ts test/unit/tooling/testing/provider-response-sequencing.test.ts`.
 
 Expected: the new selectors and existing test callers typecheck and pass; lint has no errors. Preserve the existing broader transition specs as optional regression coverage, but do not make them a delivery gate.
 
-- [ ] **Step 5: Commit the focused smoke coverage or repair**
+The R17 follow-up at `04c75d65e6331da529567938fa7801ed7d8d9f5c` passed both typechecks, affected lint and 723 tests across these four Cloud files, with zero failures or skips. Its 18 new terminal behavior cases first failed against the earlier observer and waiter. Earlier R18 fixes passed 1195 tests in nine Cloud files; the follow-up retains those fixes and reruns their affected terminal/diagnostic neighbors. Detailed execution and cleanup receipts remain in the run ledger.
+
+- [x] **Step 5: Commit the focused smoke coverage or repair**
 
 Run: `git diff --cached --stat`
 
@@ -758,11 +760,11 @@ Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_A
 
 Expected: all four selected non-Claude modes and the interrupted-Stop case have executed passing evidence that covers their resulting behavior, with their existing Task 8/9 assertions and verified cleanup. Record the tested commit and any reuse rationale; do not describe an earlier run as execution on a later commit. Any rerun required by a Stage 5 repair runs against the resulting final candidate.
 
-- [ ] **Step 7: Run the final configured full-suite gate**
+- [ ] **Step 7: Verify the configured full-suite gate after the last behavior change**
 
-Run after Task 8 and Task 9 commits, the Stage 5 review loop, and Step 6: `pnpm run test`, using the configured `FRESHELL_VITEST_BACKEND` and `FRESHELL_E2E_BACKEND`. Agent-launched Cloud lanes must set `GCLOUD_ROBOT_REQUIRE=1` and use the configured robot identity; do not silently change backends or treat skipped/zero-match cases as coverage.
+Run `pnpm run test` on the committed integrated repairs before the Stage 4 whole-branch review, using the configured `FRESHELL_VITEST_BACKEND` and `FRESHELL_E2E_BACKEND`. Include the required local companion for Cloud-excluded server tests. Agent-launched Cloud lanes must set `GCLOUD_ROBOT_REQUIRE=1` and use the configured robot identity; do not silently change backends or treat skipped/zero-match cases as coverage. After Stage 5, reuse this passing gate if that stage made no implementation fixes. If Stage 5 produced fix commits, run the full-suite gate once on the final resulting code after its focused verification. Step 6's final browser-evidence assessment remains required in either case; a prose-only bookkeeping change does not itself require another full suite.
 
-Expected: the coordinated full suite passes on the final committed HEAD after the browser checks and Stage 5, excluding only failures recorded in the baseline ledger with reproduction evidence at `base_ref`. Record the exact command, commit, and result in the run ledger.
+Expected: the coordinated full suite and required companion have passing evidence for the final implementation, excluding only failures recorded in the baseline ledger with reproduction evidence at `base_ref`. Record the exact command, tested commit, result and any evidence-reuse rationale in the run ledger; do not describe an earlier execution as a run on a later commit.
 
 ## Acceptance and self-review map
 
