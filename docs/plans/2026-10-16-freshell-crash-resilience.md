@@ -157,7 +157,7 @@ Fresh task review must confirm the new wait observes real supervisor state, exis
 - Produces: JSONL `sandbox_resources` with `severity`, `mode`, `cargoJobs`, `cpus`, `memoryBytes`, `memorySwapBytes`, `pidsLimit`; `sandbox_completed` with `severity`, `mode`, `exitCode`. Both include controlled `cause`, `action` and `outcome` fields.
 - Produces: safe proof commands documented below; `sandbox-budget-smoke.mjs <jobs>` exits nonzero on missing limits, wrong NUM_JOBS, excess overlap, or incomplete work.
 
-- [ ] **Step 1: Write a failing behavioral wrapper test**
+- [x] **Step 1: Write a failing behavioral wrapper test**
 
 Create this test; it executes production argument construction without starting Docker or a compiler:
 
@@ -226,7 +226,7 @@ describe('sandbox execution budget', () => {
 
 The existing wrapper ownership guard requires the ordinary non-root repository test UID; do not bypass the production guard for this fixture.
 
-- [ ] **Step 2: Run the test and verify intended failure**
+- [x] **Step 2: Run the test and verify intended failure**
 
 Run from the primary worktree:
 
@@ -236,7 +236,7 @@ pnpm run test:vitest run test/unit/scripts/sandbox-test.test.ts --config config/
 
 Expected: FAIL on absent `--cpus`/Cargo environment and absent JSONL resource receipt, with fake Docker calls recorded successfully.
 
-- [ ] **Step 3: Implement bounded defaults and the minimal resource fixture**
+- [x] **Step 3: Implement bounded defaults and the minimal resource fixture**
 
 Add `--cpus 2`, `--memory-swap 16g` and `-e CARGO_BUILD_JOBS=2` beside the existing shared `--memory 8g`. Explicit 16g RAM+swap preserves Docker's existing default allowance rather than silently removing swap. Keep the resource values in one shared defaults block used by both Docker arguments and the resource receipt, rather than duplicating independent literals. Emit `sandbox_resources` before launch and `sandbox_completed` immediately after collecting `DOCKER_STATUS`, preserving its exact exit code. Include the interface fields above and Global Constraint 7's controlled cause/action/outcome fields; failed completion uses error severity. Derive the implementation from the existing wrapper and exercise/parse both receipts in the behavioral wrapper test.
 
@@ -324,7 +324,7 @@ For the real identified cold Clippy workload, reuse the already executed externa
 
 The existing budgets-one/two results establish feasibility only. The chosen production default still needs current-branch/source and image attribution, real workload completion, matching effective Cargo/NUM_JOBS controls, measured headroom and cleanup evidence. The wrapper's actual argv/default behavior and minimal real resource smoke remain permanent behavioral coverage. Use the external recipe for the actual chosen-default workload; rerun the one-job alternative only if selecting it as a safer default, rather than repeating both already-proven budgets merely for feasibility.
 
-- [ ] **Step 4: Run focused green tests and safe real proofs**
+- [x] **Step 4: Run focused green tests and safe real proofs**
 
 Run all real Docker/image/sandbox commands below inside the guarded private guest against its daemon and guest-owned source/caches. Recording-Docker unit tests remain ordinary non-destructive focused checks. Cloud-image preparation, if needed, follows the bounded serial ownership decision above.
 
@@ -345,11 +345,11 @@ git commit -m "fix: bound sandbox build resources and prove safe compilation"
 
 After the clean checkpoint, execute the retained external recipe for the chosen two-job default with this branch/source and image attribution. Expected: the identified cold workload completes at exit 0 with actual `system.slice` controls and headroom receipts. A one-job success cannot validate a two-job default. If two jobs fails/aborts, select and prove the safer one-job default and rerun wrapper/resource verification; do not increase/remove limits. Rootful placement and proof-only zero-swap are explicit safety choices, not claims about the old incident.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep shared wrapper defaults in one argument block and resource-proof ownership/cleanup in small helpers. Do not add configurable schedulers, host Cargo settings or a collection of unrelated build-tool limits. Re-run focused tests after cleanup.
 
-- [ ] **Step 6: Run impacted verification**
+- [x] **Step 6: Run impacted verification**
 
 ```bash
 env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock CARGO_BUILD_JOBS=2 scripts/sandbox-selftest.sh
@@ -358,7 +358,7 @@ pnpm run test:vitest run test/unit/scripts/sandbox-test.test.ts --config config/
 
 Expected: all existing isolation/dependency-preparation proofs and new resource proofs PASS; exact self-owned host sentinels survive. Existing host Cargo comparison inherits the finite job budget. Because the Docker image supports shared test infrastructure, the parent also includes the full supported suite in the final guest gate. Image tags and named caches for this proof belong to the private guest daemon; the ordinary-user headless Electron path is actually launched in Task 3.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Step 4's checkpoint is the focused task commit when no source changes follow. If proof/refactor changes source, commit those named refinements and rerun the affected proof at that new SHA; do not rewrite another agent's commit. Use the following only when there are remaining task changes:
 
