@@ -2000,6 +2000,7 @@ impl Supervisor {
                             .retained_store_compatibility_probe(
                                 context,
                                 "retained_host_capability_unknown",
+                                transient,
                             )
                             .await;
                     }
@@ -2021,6 +2022,7 @@ impl Supervisor {
                                 .retained_store_compatibility_probe(
                                     context,
                                     "retained_host_status_unreachable",
+                                    transient,
                                 )
                                 .await;
                         }
@@ -2152,6 +2154,7 @@ impl Supervisor {
                             .retained_store_compatibility_probe(
                                 context,
                                 "retained_native_observation_unqualified",
+                                transient,
                             )
                             .await;
                     }
@@ -2174,7 +2177,11 @@ impl Supervisor {
                         && context.native_session_id.is_some() =>
                 {
                     return self
-                        .retained_store_compatibility_probe(context, "retained_host_unreachable")
+                        .retained_store_compatibility_probe(
+                            context,
+                            "retained_host_unreachable",
+                            transient,
+                        )
                         .await;
                 }
                 Err(_) if context.resume_spec.is_some() => {
@@ -2205,7 +2212,7 @@ impl Supervisor {
                 && context.native_session_id.is_some()
             {
                 return self
-                    .retained_store_compatibility_probe(context, "retained_host_exited")
+                    .retained_store_compatibility_probe(context, "retained_host_exited", transient)
                     .await;
             }
             if context.resume_spec.is_none()
@@ -2213,7 +2220,7 @@ impl Supervisor {
                 && context.fixture.is_none()
                 && !deterministic_fresh_fixture(context)
             {
-                return self.probe_offline_store(context).await;
+                return self.probe_offline_store(context, transient).await;
             }
             return offline_probe(context);
         }
@@ -2235,6 +2242,7 @@ impl Supervisor {
     async fn probe_offline_store(
         &self,
         context: &RecoveryContext,
+        transient: &mut Option<TransientRecoveryFailure>,
     ) -> Result<RecoveryProbe, RuntimeError> {
         let spec = match resume_catalog::exact_resume_candidate(context, None) {
             Ok(Some(spec)) => spec,
@@ -2264,6 +2272,14 @@ impl Supervisor {
             Err(BackendError::Malformed(_)) => "malformed_reader_result",
             Err(_) => "reader_unavailable",
         };
+        let unverified_store = || {
+            blocked(
+                RecoveryPath::NativeResume,
+                RecoveryBlockReason::StoreUnreadable,
+                "the retained provider store has no verified durable resume evidence",
+                None,
+            )
+        };
         let probe = match store {
             Ok(freshell_agent_runtime::ProviderStoreProbe::Ready { .. }) => {
                 RecoveryProbe::ResumeReady {
@@ -2281,15 +2297,23 @@ impl Supervisor {
                 retry_hint,
                 evidence,
             },
+            Err(error) => {
+                *transient = TransientRecoveryFailure::from_backend(&error);
+                if transient.is_some() {
+                    blocked(
+                        RecoveryPath::NativeResume,
+                        RecoveryBlockReason::ProviderUnavailable,
+                        "the retained provider store reader is temporarily unavailable",
+                        Some(2_000),
+                    )
+                } else {
+                    unverified_store()
+                }
+            }
             // This capture path establishes positive durability only. Negative
             // reads and parent-backed recipes retain the existing refusal to
             // substitute an unverified spec or authorize loss.
-            Ok(_) | Err(_) => blocked(
-                RecoveryPath::NativeResume,
-                RecoveryBlockReason::StoreUnreadable,
-                "the retained provider store has no verified durable resume evidence",
-                None,
-            ),
+            Ok(_) => unverified_store(),
         };
         crate::service::append_event(
             &self.config.lifecycle_log,
@@ -2317,6 +2341,7 @@ impl Supervisor {
         &self,
         context: &RecoveryContext,
         reason: &str,
+        transient: &mut Option<TransientRecoveryFailure>,
     ) -> Result<RecoveryProbe, RuntimeError> {
         crate::service::append_event(
             &self.config.lifecycle_log,
@@ -2377,12 +2402,21 @@ impl Supervisor {
                                 evidence_revision: context.evidence_revision,
                             }
                         }
-                        Err(error) => blocked(
-                            RecoveryPath::NativeResume,
-                            RecoveryBlockReason::StoreUnreadable,
-                            &format!("current-image retained-store qualification failed: {error}"),
-                            Some(2000),
-                        ),
+                        Err(error) => {
+                            *transient = TransientRecoveryFailure::from_backend(&error);
+                            blocked(
+                                RecoveryPath::NativeResume,
+                                if transient.is_some() {
+                                    RecoveryBlockReason::ProviderUnavailable
+                                } else {
+                                    RecoveryBlockReason::StoreUnreadable
+                                },
+                                &format!(
+                                    "current-image retained-store qualification failed: {error}"
+                                ),
+                                Some(2000),
+                            )
+                        }
                     }
                 } else {
                     blocked(
@@ -8060,6 +8094,18 @@ pub(crate) mod automatic_retry_tests {
                 std::fs::remove_file(path).unwrap();
             }
         }
+        fn reader_failure(&self, name: &str) -> Option<BackendError> {
+            let value = std::fs::read_to_string(self.root.join(name)).ok()?;
+            Some(match value.as_str() {
+                "ownership" => BackendError::OwnershipMismatch("reader owner mismatch".into()),
+                "policy" => BackendError::PolicyMismatch("reader policy mismatch".into()),
+                "malformed" => BackendError::Malformed("invalid reader evidence".into()),
+                _ => BackendError::DockerHttp {
+                    status: value.parse().unwrap(),
+                    body: "fictional reader HTTP failure".into(),
+                },
+            })
+        }
         async fn host(&self, handle: &OwnedRuntimeHandle) {
             let runtime = handle.runtime_dir().to_path_buf();
             let mut hosts = self.hosts.lock().unwrap();
@@ -8096,7 +8142,16 @@ pub(crate) mod automatic_retry_tests {
             let retained_blocker = runtime.join("retained-store-unreadable");
             let retained_probe_failure = runtime.join("retained-probe-unreachable");
             let retained_post_read_failure = runtime.join("retained-fault-after-ready");
-            let native_required = native_file.exists() || retained_observation.exists();
+            let retained_provider = self.root.join("native-reader-fixture").exists()
+                && (handle
+                    .terminal()
+                    .is_some_and(|terminal| terminal.mode == "opencode")
+                    || handle.fresh_agent().is_some_and(|agent| {
+                        agent.provider == freshell_runtime_protocol::FreshProvider::Opencode
+                    }));
+            let fresh_provider = handle.fresh_agent().is_some();
+            let native_required =
+                native_file.exists() || retained_observation.exists() || retained_provider;
             let final_identity_path = runtime.join("final-wrong-identity");
             let baseline_stop = self.baseline_stop.clone();
             let terminal = handle.terminal().cloned();
@@ -8319,6 +8374,20 @@ pub(crate) mod automatic_retry_tests {
                             } else {
                                 native_required.then(|| {
                                 let launch: freshell_runtime_protocol::NativeIdentityLaunch = serde_json::from_slice(&std::fs::read(&native_launch_path).unwrap()).unwrap();
+                                if retained_provider {
+                                    return freshell_runtime_protocol::NativeIdentityObservation {
+                                        native_session_id: "retry-root".into(),
+                                        incarnation_id: launch.incarnation_id,
+                                        launch_nonce: launch.launch_nonce,
+                                        evidence_revision: launch.evidence_revision,
+                                        source: if fresh_provider {
+                                            freshell_runtime_protocol::NativeIdentitySource::FreshProviderHandshake
+                                        } else {
+                                            freshell_runtime_protocol::NativeIdentitySource::OpencodeTui
+                                        },
+                                        evidence_digest: "b".repeat(64),
+                                    };
+                                }
                                 let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&native_file).unwrap()).unwrap();
                                 freshell_runtime_protocol::NativeIdentityObservation {
                                     native_session_id: if final_identity_path.exists() { "wrong-root".into() } else if amplifier { record["session_id"].as_str().unwrap().into() } else { record["payload"]["id"].as_str().unwrap().into() },
@@ -8457,10 +8526,16 @@ pub(crate) mod automatic_retry_tests {
             assert_eq!(reader_binary, std::env::current_exe().unwrap());
             assert_eq!(image_ref, format!("sha256:{}", "a".repeat(64)));
             assert_eq!(
-                handle.terminal().map(|t| (t.run_as_uid, t.run_as_gid)),
+                handle
+                    .terminal()
+                    .map(|t| (t.run_as_uid, t.run_as_gid))
+                    .or_else(|| handle.fresh_agent().map(|a| (a.run_as_uid, a.run_as_gid))),
                 Some((65534, 0))
             );
             self.record("native-census", handle.incarnation_id().as_str());
+            if let Some(error) = self.reader_failure("native-reader-failure") {
+                return Err(error);
+            }
             if self.root.join("census-unavailable").exists() {
                 return Err(BackendError::Unavailable(
                     "fictional reader unavailable".into(),
@@ -8478,6 +8553,37 @@ pub(crate) mod automatic_retry_tests {
                     .unwrap();
             }
             Ok(result)
+        }
+        async fn qualify_retained_opencode(
+            &self,
+            handle: &OwnedRuntimeHandle,
+            request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+            _: &Path,
+        ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError>
+        {
+            if !self.root.join("native-reader-fixture").exists() {
+                return Err(BackendError::Unavailable(
+                    "current-image retained-store qualification is unavailable".into(),
+                ));
+            }
+            self.record("retained-qualifications", handle.incarnation_id().as_str());
+            assert_eq!(request.provider_store_id, handle.provider_store_id());
+            assert_eq!(request.native_session_id, "retry-root");
+            if let Some(error) = self.reader_failure("native-reader-failure") {
+                return Err(error);
+            }
+            // This backend exercises transport and supervisor scheduling, not
+            // native qualification; the real reader has separate store tests.
+            Ok(
+                freshell_runtime_protocol::RetainedStoreCompatibilityReceipt {
+                    request: request.clone(),
+                    provider_version: "1.18.21".into(),
+                    source_schema_fingerprint: "c".repeat(64),
+                    migration_journal_fingerprint: "d".repeat(64),
+                    generation: "e".repeat(64),
+                    row_count: 1,
+                },
+            )
         }
         async fn inspect(
             &self,
@@ -9597,6 +9703,230 @@ pub(crate) mod automatic_retry_tests {
             );
             assert_eq!(due(dir.path()), None);
             close_retry_hosts(&backend).await;
+        }
+    }
+
+    async fn seed_offline_native_reader(
+        supervisor: &Supervisor,
+        root: &Path,
+        opencode: bool,
+    ) -> SoulId {
+        if opencode {
+            std::fs::write(root.join("native-reader-fixture"), b"fixture").unwrap();
+            let soul = seed_retained_opencode(supervisor, root).await;
+            std::fs::write(root.join("retained/fixture-stopped"), b"stopped").unwrap();
+            std::fs::remove_file(root.join("retained/retained-store-unreadable")).unwrap();
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+                "sessionId":"retry-fresh-opencode", "provider":"opencode", "sessionType":"freshopencode", "runtimeVariant":"opencode-serve-v1",
+                "providerStoreId":context.provider_store_id, "cwd":root, "workspacePath":root,
+                "runAsUid":65534, "runAsGid":0
+            })).unwrap();
+            agent.validate().unwrap();
+            Connection::open(supervisor.registry.database_path()).unwrap().execute(
+                "UPDATE incarnations SET terminal_spec=NULL,fresh_agent_spec=?1 WHERE incarnation_id=?2",
+                rusqlite::params![serde_json::to_string(&agent).unwrap(),context.prior_handle.incarnation_id().as_str()],
+            ).unwrap();
+            soul
+        } else {
+            let soul = seed_native(supervisor, root).await;
+            Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .execute(
+                    "UPDATE souls SET resume_spec=NULL WHERE soul_id=?1",
+                    [soul.as_str()],
+                )
+                .unwrap();
+            soul
+        }
+    }
+
+    #[tokio::test]
+    async fn native_reader_transient_offline_codex_retries() {
+        Box::pin(native_reader_transient_retry_case(false, false)).await;
+    }
+
+    #[tokio::test]
+    async fn native_reader_transient_offline_codex_preserves_due_retry() {
+        Box::pin(native_reader_transient_retry_case(false, true)).await;
+    }
+
+    #[tokio::test]
+    async fn native_reader_transient_retained_opencode_retries() {
+        Box::pin(native_reader_transient_retry_case(true, false)).await;
+    }
+
+    #[tokio::test]
+    async fn native_reader_transient_retained_opencode_preserves_due_retry() {
+        Box::pin(native_reader_transient_retry_case(true, true)).await;
+    }
+
+    async fn native_reader_transient_retry_case(opencode: bool, prior_backend_attempt: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = Box::pin(seed_offline_native_reader(
+            &supervisor,
+            dir.path(),
+            opencode,
+        ))
+        .await;
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let journals = attempts(dir.path()).len();
+        if prior_backend_attempt {
+            backend.unavailable(true);
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(due(dir.path()), Some(2_000));
+            backend.unavailable(false);
+            clock.store(2_000, Ordering::SeqCst);
+        }
+        std::fs::write(dir.path().join("native-reader-failure"), b"503").unwrap();
+        let report = supervisor.reconcile_startup().await.unwrap();
+        let expected_count = 1 + u8::from(prior_backend_attempt);
+        let expected_due = if prior_backend_attempt { 12_000 } else { 2_000 };
+        let retry = supervisor
+            .registry
+            .recovery_retry(soul.clone(), before.intent_revision)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retry.attempt_count, expected_count,
+            "opencode={opencode}, prior={prior_backend_attempt}: {report:?}"
+        );
+        assert_eq!(
+            retry.next_due_at_ms,
+            Some(expected_due),
+            "typed helper HTTP failures must retain the bounded retry schedule: {report:?}"
+        );
+        assert_eq!(retry.last_reason, "backend_unavailable");
+        assert_eq!(
+            attempts(dir.path()).len(),
+            journals + usize::from(expected_count)
+        );
+        assert_eq!(
+            backend.count("creates"),
+            0,
+            "an unverified store cannot start a replacement"
+        );
+        let blocked = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert!(blocked.resume_spec.is_none());
+        assert_eq!(
+            blocked.prior_handle.incarnation_id(),
+            before.prior_handle.incarnation_id()
+        );
+        let reader_counter = if opencode {
+            "retained-qualifications"
+        } else {
+            "native-census"
+        };
+        let reads = backend.count(reader_counter);
+        assert!(
+            reads > 0,
+            "the typed failure must come from the reader after successful inspection"
+        );
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(backend.count(reader_counter), reads);
+
+        std::fs::remove_file(dir.path().join("native-reader-failure")).unwrap();
+        clock.store(expected_due, Ordering::SeqCst);
+        supervisor.observe_once().await.unwrap();
+        let recovered = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.recovery_state,
+            RecoveryState::Live,
+            "opencode={opencode}, prior={prior_backend_attempt}: {}",
+            std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap()
+        );
+        assert_eq!(recovered.native_session_id, before.native_session_id);
+        assert!(recovered.resume_spec.is_some());
+        assert_eq!(backend.count("creates"), 1);
+        assert_eq!(
+            attempts(dir.path()).len(),
+            journals + usize::from(expected_count) + 1
+        );
+        assert_eq!(due(dir.path()), None);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+        close_retry_hosts(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn native_reader_transient_failures_exhaust_the_existing_three_attempt_budget() {
+        for opencode in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (supervisor, backend, clock) = open(dir.path(), 0);
+            let soul = seed_offline_native_reader(&supervisor, dir.path(), opencode).await;
+            let before = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let journals = attempts(dir.path()).len();
+            std::fs::write(dir.path().join("native-reader-failure"), b"503").unwrap();
+            for (at, due, count) in [
+                (0, Some(2_000), 1),
+                (2_000, Some(12_000), 2),
+                (12_000, None, 3),
+            ] {
+                clock.store(at, Ordering::SeqCst);
+                supervisor.reconcile_startup().await.unwrap();
+                let retry = supervisor
+                    .registry
+                    .recovery_retry(soul.clone(), before.intent_revision)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retry.attempt_count, count);
+                assert_eq!(retry.next_due_at_ms, due);
+                assert_eq!(attempts(dir.path()).len(), journals + usize::from(count));
+            }
+            let inspections = backend.count("inspects");
+            clock.store(50_000, Ordering::SeqCst);
+            supervisor.observe_once().await.unwrap();
+            assert_eq!(backend.count("inspects"), inspections);
+            assert_eq!(backend.count("creates"), 0);
+            assert!(supervisor
+                .registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .resume_spec
+                .is_none());
+            close_retry_hosts(&backend).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_reader_permanent_failures_do_not_schedule_or_start_replacements() {
+        for opencode in [false, true] {
+            for failure in ["403", "404", "ownership", "policy", "malformed"] {
+                let dir = tempfile::tempdir().unwrap();
+                let (supervisor, backend, _) = open(dir.path(), 0);
+                let soul = seed_offline_native_reader(&supervisor, dir.path(), opencode).await;
+                std::fs::write(dir.path().join("native-reader-failure"), failure).unwrap();
+                supervisor.reconcile_startup().await.unwrap();
+                let context = supervisor.registry.recovery_context(soul).await.unwrap();
+                assert_eq!(context.recovery_state, RecoveryState::Blocked);
+                assert!(context.resume_spec.is_none());
+                assert_eq!(due(dir.path()), None, "opencode={opencode}, {failure}");
+                assert_eq!(backend.count("creates"), 0);
+                close_retry_hosts(&backend).await;
+            }
         }
     }
 
