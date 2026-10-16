@@ -4783,6 +4783,12 @@ function freshCodexSavedTranscript(nativeId: string): string {
   ].join('\n') + '\n'
 }
 
+function hasFreshCodexFixtureTextContent(content: unknown, type: 'input_text' | 'output_text'): boolean {
+  return Array.isArray(content) && content.length === 1
+    && content[0]?.type === type && typeof content[0].text === 'string'
+    && content[0].text.trim().length > 0
+}
+
 function preservesFreshCodexSavedTranscript(raw: string, nativeId: string): boolean {
   const seed = freshCodexSavedTranscript(nativeId)
   if (raw === seed) return true
@@ -4794,7 +4800,9 @@ function preservesFreshCodexSavedTranscript(raw: string, nativeId: string): bool
     return extra.length === 0
       && context?.type === 'turn_context' && typeof context.payload?.turn_id === 'string' && context.payload.turn_id.length > 0
       && user?.type === 'response_item' && user.payload?.type === 'message' && user.payload.role === 'user'
+      && hasFreshCodexFixtureTextContent(user.payload.content, 'input_text')
       && assistant?.type === 'response_item' && assistant.payload?.type === 'message' && assistant.payload.role === 'assistant'
+      && hasFreshCodexFixtureTextContent(assistant.payload.content, 'output_text')
       && complete?.type === 'event_msg' && complete.payload?.type === 'task_complete'
       && complete.payload.turn_id === context.payload.turn_id
   } catch {
