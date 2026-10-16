@@ -352,30 +352,21 @@ isolated_launch_test!(
     "terminal"
 );
 
-#[tokio::test]
-async fn fresh_opencode_discovery_diagnostics_identify_resources_without_contents() {
-    if create_failure_trace_child(
-        "discovery-diagnostics",
-        "fresh_agent_proxy::tests::launch_preparation::fresh_opencode_discovery_diagnostics_identify_resources_without_contents",
-    ) {
-        return;
-    }
+async fn assert_unconfigured_capability_diagnostic(workspace: &Path) {
     let events = crate::test_trace_capture::captured_trace_events();
-    let workspace = tempfile::tempdir().unwrap();
-    let mut unavailable_proxy = snapshot_outage_proxy(&workspace.path().join("unopened.sock"));
+    let mut unavailable_proxy = snapshot_outage_proxy(&workspace.join("unopened.sock"));
     Arc::get_mut(&mut unavailable_proxy)
         .unwrap()
         .fixture_modes
         .insert("freshopencode".into());
-    let create = |request_id: &str, cwd: &Path| {
-        serde_json::from_value(serde_json::json!({
-            "requestId":request_id, "provider":"opencode",
-            "sessionType":"freshopencode", "cwd":cwd,
-        }))
-        .unwrap()
-    };
     assert!(unavailable_proxy
-        .create(create("capability-service-unconfigured", workspace.path()))
+        .create(
+            serde_json::from_value(serde_json::json!({
+                "requestId":"capability-service-unconfigured", "provider":"opencode",
+                "sessionType":"freshopencode", "cwd":workspace,
+            }))
+            .unwrap(),
+        )
         .await
         .is_err());
     let before_discovery = events.snapshot();
@@ -386,7 +377,129 @@ async fn fresh_opencode_discovery_diagnostics_identify_resources_without_content
         event.fields.get("event").map(String::as_str)
             == Some("provider.environment.discovery.failed")
     }));
+}
 
+async fn provider_root_discovery_diagnostics(fault: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let events = crate::test_trace_capture::captured_trace_events();
+    let workspace = tempfile::tempdir().unwrap();
+    assert_unconfigured_capability_diagnostic(workspace.path()).await;
+    let harness = LaunchHarness::new(false, false).await;
+    assert_eq!(resources(), (0, 0, 0));
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let provider_root = home.join(".config/opencode");
+    // Keep the healthy fixture intact, and break only this child's owned root.
+    let private_root = home.join("private-provider-root");
+    std::fs::rename(&provider_root, &private_root).unwrap();
+    let private_target = home.join("private-missing-provider-root");
+    let cause = match fault {
+        "dangling" => {
+            std::os::unix::fs::symlink(&private_target, &provider_root).unwrap();
+            "NotFound"
+        }
+        "file" => {
+            std::fs::write(
+                &provider_root,
+                "{\"apiKey\":\"owned-private-root-sentinel\"}",
+            )
+            .unwrap();
+            "NotADirectory"
+        }
+        "unreadable" => {
+            std::fs::create_dir(&provider_root).unwrap();
+            std::fs::set_permissions(&provider_root, std::fs::Permissions::from_mode(0o0)).unwrap();
+            "PermissionDenied"
+        }
+        _ => unreachable!(),
+    };
+    let refused = attempt_launch(
+        &harness.proxy,
+        &harness.terminal,
+        "fresh",
+        workspace.path(),
+        &format!("provider-root-{fault}"),
+    )
+    .await;
+    if fault == "unreadable" {
+        std::fs::set_permissions(&provider_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let remaining_resources = resources();
+    let launches = harness.launches.load(Ordering::SeqCst);
+    harness.close().await;
+    assert!(
+        refused,
+        "broken provider root must refuse FreshOpenCode create"
+    );
+    assert_eq!(launches, 0, "root discovery refusal must precede Launch");
+    assert_eq!(remaining_resources, (0, 0, 0));
+
+    let captured = events.snapshot();
+    let diagnostic = captured
+        .iter()
+        .find(|event| {
+            event.fields.get("event").map(String::as_str)
+                == Some("provider.environment.discovery.failed")
+                && event.fields.get("resource_root").map(String::as_str) == Some("user_provider")
+                && event.fields.get("relative_path").map(String::as_str) == Some(".")
+                && event.fields.get("cause").map(String::as_str) == Some(cause)
+        })
+        .unwrap_or_else(|| {
+            panic!("missing provider-root {fault}/{cause} diagnostic: {captured:?}")
+        });
+    assert_eq!(diagnostic.level, tracing::Level::WARN);
+    let corrective = diagnostic.fields.get("corrective_message").unwrap();
+    assert!(corrective.contains("provider root"), "{corrective}");
+    assert!(corrective.contains("retry"), "{corrective}");
+    let serialized = format!("{captured:?}");
+    for private in [
+        "owned-private-root-sentinel",
+        "private-missing-provider-root",
+        private_target.to_str().unwrap(),
+        private_root.to_str().unwrap(),
+        provider_root.to_str().unwrap(),
+    ] {
+        assert!(
+            !serialized.contains(private),
+            "diagnostic disclosed {private}"
+        );
+    }
+}
+
+isolated_launch_test!(
+    fresh_opencode_provider_root_dangling_diagnostics,
+    provider_root_discovery_diagnostics,
+    "dangling"
+);
+isolated_launch_test!(
+    fresh_opencode_provider_root_file_diagnostics,
+    provider_root_discovery_diagnostics,
+    "file"
+);
+isolated_launch_test!(
+    fresh_opencode_provider_root_unreadable_diagnostics,
+    provider_root_discovery_diagnostics,
+    "unreadable"
+);
+
+#[tokio::test]
+async fn fresh_opencode_discovery_diagnostics_identify_resources_without_contents() {
+    if create_failure_trace_child(
+        "discovery-diagnostics",
+        "fresh_agent_proxy::tests::launch_preparation::fresh_opencode_discovery_diagnostics_identify_resources_without_contents",
+    ) {
+        return;
+    }
+    let events = crate::test_trace_capture::captured_trace_events();
+    let workspace = tempfile::tempdir().unwrap();
+    assert_unconfigured_capability_diagnostic(workspace.path()).await;
+    let create = |request_id: &str, cwd: &Path| {
+        serde_json::from_value(serde_json::json!({
+            "requestId":request_id, "provider":"opencode",
+            "sessionType":"freshopencode", "cwd":cwd,
+        }))
+        .unwrap()
+    };
     let harness = LaunchHarness::new(false, false).await;
     let project = harness.root.path().join("project");
     std::fs::create_dir(&project).unwrap();

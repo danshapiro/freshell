@@ -215,11 +215,16 @@ fn provider_launch_context_from_home_at_with_xdg(
         .map(|entry| (*entry).to_owned())
         .collect::<std::collections::BTreeSet<_>>();
     if optional_resource_exists(&provider_root, ".", "user_provider")? {
-        for item in std::fs::read_dir(&provider_root)
-            .map_err(|error| format!("inspect provider root: {:?}", error.kind()))?
-        {
-            let item =
-                item.map_err(|error| format!("inspect provider entry: {:?}", error.kind()))?;
+        let root_enumeration_error = |error: std::io::Error| {
+            discovery_refusal(
+                "user_provider",
+                ".",
+                &format!("{:?}", error.kind()),
+                "repair the provider root directory, its link, or permissions and retry",
+            )
+        };
+        for item in std::fs::read_dir(&provider_root).map_err(root_enumeration_error)? {
+            let item = item.map_err(root_enumeration_error)?;
             let name = item
                 .file_name()
                 .into_string()
