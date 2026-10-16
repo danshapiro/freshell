@@ -2165,13 +2165,8 @@ fn apply_v2_projection_event(
             }
         }
         "session.next.text.ended" => {
-            update_assistant_content(messages, session_id, data, |item| {
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                    && item.get("id").and_then(serde_json::Value::as_str)
-                        == data.get("textID").and_then(serde_json::Value::as_str)
-                {
-                    item.insert("text".into(), required_json(data, "text")?.clone());
-                }
+            update_assistant_item(messages, session_id, data, "text", "textID", |item| {
+                item.insert("text".into(), required_json(data, "text")?.clone());
                 Ok(())
             })?;
         }
@@ -2186,7 +2181,7 @@ fn apply_v2_projection_event(
                 "state".into(),
                 serde_json::json!({"status":"pending","input":""}),
             );
-            update_assistant_content(messages, session_id, data, |object| {
+            update_assistant(messages, session_id, data, |object| {
                 let mut content = object
                     .get("content")
                     .and_then(serde_json::Value::as_array)
@@ -2445,7 +2440,7 @@ fn apply_v2_projection_event(
                 item.insert("providerMetadata".into(), metadata.clone());
             }
             item.insert("time".into(), serde_json::json!({"created":timestamp}));
-            update_assistant_content(messages, session_id, data, |object| {
+            update_assistant(messages, session_id, data, |object| {
                 let mut content = object
                     .get("content")
                     .and_then(serde_json::Value::as_array)
@@ -2457,11 +2452,13 @@ fn apply_v2_projection_event(
             })?;
         }
         "session.next.reasoning.ended" => {
-            update_assistant_content(messages, session_id, data, |item| {
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
-                    && item.get("id").and_then(serde_json::Value::as_str)
-                        == data.get("reasoningID").and_then(serde_json::Value::as_str)
-                {
+            update_assistant_item(
+                messages,
+                session_id,
+                data,
+                "reasoning",
+                "reasoningID",
+                |item| {
                     item.insert("text".into(), required_json(data, "text")?.clone());
                     let created = item
                         .get("time")
@@ -2475,9 +2472,9 @@ fn apply_v2_projection_event(
                     if let Some(metadata) = data.get("providerMetadata") {
                         item.insert("providerMetadata".into(), metadata.clone());
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
         }
         "session.next.compaction.ended" => {
             let id = json_string(data, "messageID")?;
@@ -2672,7 +2669,7 @@ fn set_completed_fields(object: &mut serde_json::Map<String, serde_json::Value>,
     object.insert("time".into(), serde_json::Value::Object(time));
 }
 
-fn update_assistant_content(
+fn update_assistant(
     messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
     session_id: &str,
     event_data: &serde_json::Value,
@@ -2697,24 +2694,7 @@ fn update_tool(
         &mut serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), OpenCodeImportError>,
 ) -> Result<(), OpenCodeImportError> {
-    let call_id = json_string(event_data, "callID")?;
-    update_assistant_content(messages, session_id, event_data, |object| {
-        let mut content = object
-            .get("content")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(tool) = content.iter_mut().rev().find_map(|item| {
-            (item.get("type").and_then(serde_json::Value::as_str) == Some("tool")
-                && item.get("id").and_then(serde_json::Value::as_str) == Some(call_id.as_str()))
-            .then(|| item.as_object_mut())
-            .flatten()
-        }) {
-            update(tool)?;
-        }
-        object.insert("content".into(), serde_json::Value::Array(content));
-        Ok(())
-    })
+    update_assistant_item(messages, session_id, event_data, "tool", "callID", update)
 }
 
 struct TodowriteProjection {
@@ -2912,6 +2892,35 @@ fn collect_current_json_nodes(
         _ => {}
     }
     Ok(())
+}
+
+fn update_assistant_item(
+    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    event_data: &serde_json::Value,
+    item_type: &str,
+    id_field: &str,
+    update: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), OpenCodeImportError>,
+) -> Result<(), OpenCodeImportError> {
+    let id = json_string(event_data, id_field)?;
+    update_assistant(messages, session_id, event_data, |object| {
+        if let Some(item) = object
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|content| {
+                content.iter_mut().rev().find(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some(item_type)
+                        && item.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+            })
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            update(item)?;
+        }
+        Ok(())
+    })
 }
 
 fn json_column_changes_are_typed(
