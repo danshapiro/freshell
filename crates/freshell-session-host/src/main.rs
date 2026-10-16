@@ -3492,8 +3492,22 @@ fn prepare_provider_state_for_opencode_transfer_at(
             && metadata.gid() == terminal.run_as_gid
             && metadata.permissions().mode() & 0o777 == 0o700
         {
-            // A prior attempt completed the provider-state handoff. The owner
-            // is assigned last by preparation, so this is also the retry marker.
+            // A prior attempt completed the HOME handoff, but selected config
+            // publication runs afterward and may still need to be retried.
+            refresh_provider_context(
+                terminal.provider_launch_context.as_ref(),
+                &terminal.mode,
+                &terminal.workspace_path,
+                terminal.run_as_uid,
+                terminal.run_as_gid,
+                paths,
+            )
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("prepare provider config: {error}"),
+                )
+            })?;
             return Ok(false);
         }
     }

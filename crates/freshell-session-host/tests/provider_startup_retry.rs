@@ -5,7 +5,7 @@ use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, ControlRole, Envelope, FreshAgentLaunchSpec, GrantId,
     HostBootId, HostCommand, HostReply, HostResult, IncarnationId, ProviderConfigReference,
     ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation, RequestId,
-    RuntimeDiagnosticCode, RuntimeError, SoulId, CONTROL_PROTOCOL_VERSION,
+    RuntimeDiagnosticCode, RuntimeError, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
 use std::{
     fs,
@@ -248,6 +248,13 @@ fn provider_file_snapshot(path: &Path) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
+fn write_retained_provider_state(bootstrap: &Path, native: &Path) {
+    provider_command(&["/bin/sh", "-ec", &format!(
+        "printf provider-owned > '{bootstrap}'; mkdir -p '{native_parent}'; printf retained-native > '{native}'",
+        bootstrap=bootstrap.display(), native_parent=native.parent().unwrap().display(), native=native.display()
+    )]);
+}
+
 fn selected_context(provider: &str, destination: &str) -> ProviderLaunchContext {
     ProviderLaunchContext {
         preparation: if provider == "codex" {
@@ -338,10 +345,7 @@ async fn fresh_retry(provider: &str) {
     } else {
         ".local/share/opencode/opencode.db"
     });
-    provider_command(&["/bin/sh", "-ec", &format!(
-        "printf provider-owned > '{bootstrap}'; mkdir -p '{native_parent}'; printf retained-native > '{native}'",
-        bootstrap=retained.display(), native_parent=native.parent().unwrap().display(), native=native.display()
-    )]);
+    write_retained_provider_state(&retained, &native);
     let retained_before = provider_file_snapshot(&retained);
     let native_before = provider_file_snapshot(&native);
     fs::remove_file(Path::new(BOOTSTRAP_ROOT).join("provider-0")).unwrap();
@@ -392,4 +396,133 @@ async fn fresh_opencode_retries_pre_native_startup_after_home_handoff() {
     if in_disposable_container("fresh_opencode_retries_pre_native_startup_after_home_handoff") {
         fresh_retry("opencode").await;
     }
+}
+
+#[tokio::test]
+async fn opencode_transfer_retry_requires_selected_config_before_advancing_preflight() {
+    if !in_disposable_container(
+        "opencode_transfer_retry_requires_selected_config_before_advancing_preflight",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let home = Path::new(PROVIDER_HOME);
+    let config = ".config/opencode/opencode.json";
+    let bootstrap = ".config/opencode/bootstrap-marker";
+    fs::write(
+        Path::new(BOOTSTRAP_ROOT).join("provider-0"),
+        b"initial bootstrap",
+    )
+    .unwrap();
+    let host = Host::start(root.path()).await;
+    let soul = SoulId::new();
+    let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+        "terminalId":"opencode-preflight-retry", "streamId":"opencode-retry-stream",
+        "mode":"opencode", "program":"/synthetic-provider-must-never-run", "args":[],
+        "cwd":root.path(), "workspacePath":root.path(),
+        "runAsUid":PROVIDER_UID, "runAsGid":PROVIDER_GID,
+        "cols":80, "rows":24, "projectKey":"startup-retry", "resumeSessionId":"ses_synthetic",
+        "providerBootstrapFiles":[{"sourcePath":"synthetic-only", "providerRelativePath":bootstrap}],
+        "providerLaunchContext":selected_context("opencode", config),
+        // Deliberately incomplete transfer metadata stops at the real stage
+        // validator after HOME preparation. No importer, provider or PTY may run.
+        "opencodeTransfer":{
+            "transferId":"synthetic-startup-transfer", "provider":"opencode",
+            "sourceStoreId":"synthetic-source", "rootSessionId":"ses_synthetic",
+            "sourceGeneration":"synthetic-generation", "providerSchema":"opencode-1.18.21",
+            "sourceSchemaFingerprint":"synthetic-schema", "migrationJournalFingerprint":"synthetic-migrations",
+            "destinationStoreId":soul.as_str(), "destinationDatabasePath":".local/share/opencode/opencode.db",
+            "targetImageRef":format!("sha256:{}", "a".repeat(64)), "targetBuildReceipt":"synthetic-build",
+            "incarnationId":host.incarnation.as_str(), "manifestJson":"{}", "files":[],
+            "totalBytes":0, "bundleSha256":"synthetic-bundle"
+        }
+    })).unwrap();
+    let grant = HostCommand::GrantExecution {
+        incarnation_id: host.incarnation.clone(),
+        soul_id: soul,
+        host_boot_id: host.boot.clone(),
+        control_epoch: 1,
+        execution_generation: 1,
+        grant_id: GrantId::new(),
+        fixture: None,
+        terminal: Some(Box::new(terminal)),
+        fresh_agent: None,
+        resume_spec: None,
+        native_identity_launch: None,
+    };
+    let first = host.send(grant.clone()).await.unwrap_err();
+    assert!(
+        first.message.contains("prepare provider config"),
+        "{first:?}"
+    );
+    let initialized = fs::metadata(home).unwrap();
+    assert_eq!(
+        (
+            initialized.uid(),
+            initialized.gid(),
+            initialized.mode() & 0o777
+        ),
+        (PROVIDER_UID, PROVIDER_GID, 0o700)
+    );
+    let retained = home.join(bootstrap);
+    let native = home.join(".local/share/opencode/opencode.db");
+    write_retained_provider_state(&retained, &native);
+    let retained_before = provider_file_snapshot(&retained);
+    let native_before = provider_file_snapshot(&native);
+    fs::remove_file(Path::new(BOOTSTRAP_ROOT).join("provider-0")).unwrap();
+    let events_path = host.socket.parent().unwrap().join("host-lifecycle.jsonl");
+    let prepared_events = || {
+        fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                event["event"] == "host.opencode_transfer.provider_home_prepared"
+            })
+            .count()
+    };
+    assert_eq!(prepared_events(), 0);
+
+    let still_missing = host.send(grant.clone()).await.unwrap_err();
+    assert!(still_missing.message.contains("prepare provider config"),
+        "retry must remain at configuration publication while selected input is missing: {still_missing:?}");
+    assert_eq!(
+        prepared_events(),
+        0,
+        "ownership alone must not complete preparation"
+    );
+    provider_command(&["test", "!", "-e", home.join(config).to_str().unwrap()]);
+
+    let selected = br#"{"model":"selected-after-repair"}"#;
+    fs::write(root.path().join("selected-config"), selected).unwrap();
+    let repaired = host.send(grant).await.unwrap_err();
+    assert!(repaired.message.contains("OpenCode transfer descriptor is invalid"),
+        "publication must finish before the real next-phase validator refuses the synthetic transfer: {repaired:?}");
+    assert_eq!(prepared_events(), 1);
+    assert_eq!(
+        provider_command(&["cat", home.join(config).to_str().unwrap()]),
+        selected
+    );
+    assert_eq!(provider_file_snapshot(&retained), retained_before);
+    assert_eq!(provider_file_snapshot(&native), native_before);
+    let after = fs::metadata(home).unwrap();
+    assert_eq!(
+        (after.ino(), after.uid(), after.gid(), after.mode()),
+        (
+            initialized.ino(),
+            initialized.uid(),
+            initialized.gid(),
+            initialized.mode()
+        )
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(host.socket.parent().unwrap().join("host-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state["grantId"].is_null(),
+        "preflight failure must leave the grant unconsumed"
+    );
+    assert_eq!(state["workerLaunchCount"], 0);
 }
