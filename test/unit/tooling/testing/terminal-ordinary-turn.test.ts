@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { runInNewContext } from 'node:vm'
+import { Terminal } from '@xterm/xterm'
+import { terminalBufferText } from '../../../../src/lib/terminal-buffer-text.js'
 
 import {
   TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL,
@@ -8,11 +10,15 @@ import {
   reduceTerminalOrdinaryTurnFrames,
   waitForTerminalOrdinaryTurnBaseline,
   waitForTerminalOrdinaryTurn,
-  type TerminalOrdinaryTurnBaseline,
-  type TerminalOrdinaryTurnBrowserObservation,
+  terminalOrdinaryTurnRequest,
+  type TerminalOrdinaryTurnBrowserObserver,
 } from '../../../../scripts/testing/terminal-ordinary-turn.js'
 
-const target = { provider: 'claude', terminalId: 'terminal-1', streamId: 'stream-1' } as const
+const target = { provider: 'claude', terminalId: 'terminal-1', streamId: 'stream-1', nativeSessionId: 'native-allocated' } as const
+
+function terminalSnapshot() {
+  return { ...target, attachStreamId: target.streamId, text: 'Ready' }
+}
 
 function baseline(frames: readonly unknown[] = []) {
   return captureTerminalOrdinaryTurnBaseline(frames, target)
@@ -31,13 +37,147 @@ function output(terminalId: string = target.terminalId, streamId: string = targe
 }
 
 function complete(provider: string = target.provider, terminalId: string = target.terminalId, completionSeq = 8) {
-  return { type: 'terminal.turn.complete', provider, terminalId, completionSeq, at: 1, outcome: 'completed' }
+  return { type: 'terminal.turn.complete', provider, terminalId, sessionId: target.nativeSessionId, completionSeq, at: 1, outcome: 'completed' }
 }
 
 function completeWithoutOutcome(provider: string = target.provider, terminalId: string = target.terminalId, completionSeq = 8) {
   const { outcome: _outcome, ...frame } = complete(provider, terminalId, completionSeq)
   return frame
 }
+
+describe('ordinary terminal answer in the selected native conversation', () => {
+  function browser(provider: 'codex' | 'opencode' = 'codex') {
+    const nativeSessionId = 'native-allocated'
+    const { input: requestText, expectedAnswer } = terminalOrdinaryTurnRequest('FRESHELLA19B')
+    const received: unknown[] = [{ type: 'terminal.attach.ready', ...target, headSeq: 10 }]
+    const sent: unknown[] = []
+    const snapshot = { ...target, nativeSessionId, attachStreamId: target.streamId, text: 'Ready' }
+    const browserWindow: Record<string, any> = { __FRESHELL_TEST_HARNESS__: {
+      getReceivedWsMessages: () => received, clearReceivedWsMessages: () => { received.length = 0 },
+      getSentWsMessages: () => sent, clearSentWsMessages: () => { sent.length = 0 },
+      getTerminalSnapshot: (id: string) => id === target.terminalId ? snapshot : null,
+    } }
+    runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL]
+    const prepare = () => observer.prepareBeforeSend(provider, target.terminalId, nativeSessionId, expectedAnswer)
+    const captured = prepare()
+    const read = async () => observer.observeAfterSend(captured, requestText)
+    const submit = () => {
+      sent.push({ type: 'terminal.input', terminalId: target.terminalId, data: requestText + '\r' })
+      received.push(activity(provider))
+    }
+    const completion = (patch = {}) => ({ ...complete(provider), sessionId: nativeSessionId, ...patch })
+    return { nativeSessionId, expectedAnswer, requestText, received, sent, snapshot, prepare, read, submit, completion, browserWindow, observer }
+  }
+
+  it.each(['codex', 'opencode'] as const)('rejects prompt echo and loading output without a rendered %s answer', async provider => {
+    const f = browser(provider)
+    f.submit()
+    f.snapshot.text = f.requestText + '\nThinking...'
+    f.received.push(output(target.terminalId, target.streamId, 11, f.snapshot.text), f.completion())
+    await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/timed out/)
+  })
+
+  it.each(['foreign-native', undefined])('rejects completion for native session %s even with a rendered answer', async sessionId => {
+    const f = browser()
+    f.submit()
+    f.snapshot.text = f.expectedAnswer
+    f.received.push(output(), f.completion({ sessionId }))
+    await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/timed out/)
+    expect(await f.read()).toMatchObject({ completionSeen: false, completionOutcome: null })
+  })
+
+  it('does not treat raw answer bytes as proof that xterm rendered the answer', async () => {
+    const f = browser()
+    f.submit()
+    f.snapshot.text = f.requestText
+    f.received.push(output(target.terminalId, target.streamId, 11, f.expectedAnswer), f.completion())
+    await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/timed out/)
+  })
+
+  it.each([
+    ['codex', 'output-first'], ['codex', 'completion-first'],
+    ['opencode', 'output-first'], ['opencode', 'completion-first'],
+  ] as const)('accepts the fresh rendered %s answer and exact native completion in %s order across buffer rollover', async (provider, order) => {
+    const f = browser(provider)
+    expect(f.requestText).not.toContain(f.expectedAnswer)
+    f.submit()
+    const answer = () => {
+      f.snapshot.text = f.expectedAnswer.slice(0, 8) + '\n' + f.expectedAnswer.slice(8)
+      f.received.push(output(target.terminalId, target.streamId, 11, f.expectedAnswer))
+    }
+    if (order === 'output-first') answer()
+    else f.received.push(f.completion())
+    await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/timed out/)
+    f.received.length = 0
+    f.sent.length = 0
+    if (order === 'output-first') f.received.push(f.completion())
+    else answer()
+    const result = await waitForTerminalOrdinaryTurn(f.read, 0)
+    expect(result).toMatchObject({ renderedAnswerSeen: true, completionSeen: true, completionOutcome: 'completed' })
+    expect(JSON.stringify(result)).not.toContain(f.expectedAnswer)
+    expect(JSON.stringify(result)).not.toContain(f.requestText)
+  })
+
+  it('rejects a rendered answer that was already present before submission', () => {
+    const f = browser()
+    f.snapshot.text = f.expectedAnswer
+    f.received.push({ type: 'terminal.attach.ready', ...target, headSeq: 10 })
+    expect(f.prepare()).toBeNull()
+  })
+
+  it('baselines only the allocated native completion and rejects its retained replay', async () => {
+    const f = browser()
+    f.received.push({ type: 'terminal.attach.ready', ...target, headSeq: 10 },
+      f.completion({ completionSeq: 7 }), f.completion({ sessionId: 'foreign-native', completionSeq: 99 }))
+    const captured = f.prepare()
+    expect(captured).toMatchObject({ nativeSessionId: f.nativeSessionId, completionSeq: 7 })
+    const read = async () => f.observer.observeAfterSend(captured, f.requestText)
+    f.submit()
+    f.snapshot.text = f.expectedAnswer
+    f.received.push(output(), f.completion({ completionSeq: 7 }))
+    await expect(waitForTerminalOrdinaryTurn(read, 0)).rejects.toThrow(/timed out/)
+    f.received.push(f.completion())
+    await expect(waitForTerminalOrdinaryTurn(read, 0)).resolves.toMatchObject({ completionSeq: 8, renderedAnswerSeen: true })
+  })
+
+  it.each(['normal', 'alternate'])('observes the actual xterm %s buffer after writes, including wrapped styled answers', async buffer => {
+    const f = browser('opencode')
+    const terminal = new Terminal({ cols: 20, rows: 12, allowProposedApi: true })
+    const write = (text: string) => new Promise<void>(resolve => terminal.write(text, resolve))
+    f.browserWindow.__FRESHELL_TEST_HARNESS__.getTerminalSnapshot = (id: string) => id === target.terminalId
+      ? { ...f.snapshot, text: terminalBufferText(terminal.buffer.active) } : null
+    try {
+      if (buffer === 'alternate') await write('\x1b[?1049h')
+      f.submit()
+      await write(f.requestText + '\r\nThinking...')
+      f.received.push(output(target.terminalId, target.streamId, 11, f.expectedAnswer), f.completion())
+      await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/timed out/)
+      await write('\r\nResponse: \x1b[32m' + f.expectedAnswer + '\x1b[0m')
+      await expect(waitForTerminalOrdinaryTurn(f.read, 0)).resolves.toMatchObject({ renderedAnswerSeen: true, completionSeen: true })
+    } finally { terminal.dispose() }
+  })
+
+  it.each([
+    { nativeSessionId: 'foreign-native' }, { terminalId: 'foreign-terminal' },
+    { streamId: 'foreign-stream' }, { attachStreamId: 'foreign-stream' },
+  ])('rejects rendered answer from another terminal allocation %j', async patch => {
+    const f = browser()
+    f.submit()
+    Object.assign(f.snapshot, patch, { text: f.expectedAnswer })
+    f.received.push(output(), f.completion())
+    await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/timed out/)
+  })
+
+  it('ignores a foreign failure then reports the allocated conversation failure immediately', async () => {
+    const f = browser()
+    f.submit()
+    f.received.push(f.completion({ sessionId: 'foreign-native', outcome: 'failed', completionSeq: 30 }))
+    await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/timed out/)
+    f.received.push(f.completion({ outcome: 'failed' }))
+    await expect(waitForTerminalOrdinaryTurn(f.read, 0)).rejects.toThrow(/failed.*sequence 8/)
+  })
+})
 
 describe('body-free terminal ordinary-turn reduction', () => {
   it('retains a targeted new failure distinctly from absent completion, without error bodies', () => {
@@ -58,7 +198,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
   })
 
   it('stops the production waiter at the first matching failed result, even without activity or output', async () => {
-    const read = vi.fn(async () => ({ requestInputSeen: true,
+    const read = vi.fn(async () => ({ requestInputSeen: true, renderedAnswerSeen: false,
       ...reduceTerminalOrdinaryTurnFrames([{ ...complete(), outcome: 'failed' }], baseline()) }))
     await expect(waitForTerminalOrdinaryTurn(read, 0)).rejects.toThrow(/failed.*completion sequence 8/)
     expect(read).toHaveBeenCalledTimes(1)
@@ -76,12 +216,13 @@ describe('body-free terminal ordinary-turn reduction', () => {
     const received: unknown[] = [{ type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 0 }]
     const sent: unknown[] = []
     const browserWindow: Record<string, any> = { __FRESHELL_TEST_HARNESS__: {
+      getTerminalSnapshot: () => terminalSnapshot(),
       getReceivedWsMessages: () => received, clearReceivedWsMessages: () => { received.length = 0 },
       getSentWsMessages: () => sent, clearSentWsMessages: () => { sent.length = 0 },
     } }
     runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
     const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL]
-    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId, target.nativeSessionId, 'answer')
     received.push({ ...complete(), outcome: 'failed' })
     expect(observer.observeAfterSend(captured, 'request')).toMatchObject({ completionOutcome: 'failed', completionSeq: 8 })
     received.length = 0
@@ -92,12 +233,13 @@ describe('body-free terminal ordinary-turn reduction', () => {
     const received: unknown[] = [{ type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 0 }]
     const sent: unknown[] = []
     const browserWindow: Record<string, any> = { __FRESHELL_TEST_HARNESS__: {
+      getTerminalSnapshot: () => terminalSnapshot(),
       getReceivedWsMessages: () => received, clearReceivedWsMessages: () => { received.length = 0 },
       getSentWsMessages: () => sent, clearSentWsMessages: () => { sent.length = 0 },
     } }
     runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
     const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL]
-    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId, target.nativeSessionId, 'answer')
     received.push({ type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: 'replacement-stream', headSeq: 0 })
     observer.observeAfterSend(captured, 'request')
     received.length = 0
@@ -111,7 +253,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
     let reads = 0
     const observed = await waitForTerminalOrdinaryTurn(async () => {
       frames.push(events[reads++])
-      return { requestInputSeen: true, ...reduceTerminalOrdinaryTurnFrames(frames, baseline()) }
+      return { requestInputSeen: true, renderedAnswerSeen: true, ...reduceTerminalOrdinaryTurnFrames(frames, baseline()) }
     }, 1000, 0)
     expect(reads).toBe(2)
     expect(observed).toMatchObject({ completionSeen: true, completionOutcome: 'completed', outputSeen: true })
@@ -159,6 +301,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
       provider: target.provider,
       terminalId: target.terminalId,
       streamId: target.streamId,
+      nativeSessionId: target.nativeSessionId,
       outputSeq: 12,
       completionSeq: 9,
     })
@@ -188,7 +331,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
   })
 
   it('accepts a pending Codex activity update', () => {
-    const codexTarget = { provider: 'codex', terminalId: 'codex-1', streamId: 'codex-stream' } as const
+    const codexTarget = { provider: 'codex', terminalId: 'codex-1', streamId: 'codex-stream', nativeSessionId: target.nativeSessionId } as const
     const summary = reduceTerminalOrdinaryTurnFrames([
       { type: 'codex.activity.updated', upsert: [{ terminalId: codexTarget.terminalId, phase: 'pending' }] },
       output(codexTarget.terminalId, codexTarget.streamId, 4),
@@ -199,7 +342,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
   })
 
   it('accepts Codex completion only when the outcome explicitly succeeded', () => {
-    const codexTarget = { provider: 'codex', terminalId: 'codex-1', streamId: 'codex-stream' } as const
+    const codexTarget = { provider: 'codex', terminalId: 'codex-1', streamId: 'codex-stream', nativeSessionId: target.nativeSessionId } as const
     const frames = [
       { type: 'codex.activity.updated', upsert: [{ terminalId: codexTarget.terminalId, phase: 'busy' }] },
       output(codexTarget.terminalId, codexTarget.streamId, 4),
@@ -232,7 +375,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
 
   it.each(['claude', 'codex', 'opencode'] as const)(
     'requires an explicit successful outcome for %s completion', (provider) => {
-      const providerTarget = { provider, terminalId: `${provider}-1`, streamId: `${provider}-stream` } as const
+      const providerTarget = { provider, terminalId: `${provider}-1`, streamId: `${provider}-stream`, nativeSessionId: target.nativeSessionId } as const
       const shared = [
         activity(provider, providerTarget.terminalId),
         output(providerTarget.terminalId, providerTarget.streamId, 4),
@@ -349,7 +492,9 @@ describe('body-free terminal ordinary-turn reduction', () => {
       { type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 10 },
     ]
     const sent: unknown[] = [{ type: 'terminal.input', terminalId: target.terminalId, data: promptSentinel }]
+    const snapshot = terminalSnapshot()
     const harness = {
+      getTerminalSnapshot: () => snapshot,
       getReceivedWsMessages: () => received,
       clearReceivedWsMessages: () => { received.length = 0 },
       getSentWsMessages: () => sent,
@@ -357,16 +502,15 @@ describe('body-free terminal ordinary-turn reduction', () => {
     }
     const browserWindow: Record<string, unknown> = { __FRESHELL_TEST_HARNESS__: harness }
     runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
-    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as {
-      prepareBeforeSend: (provider: string, terminalId: string) => unknown
-      observeAfterSend: (baseline: unknown, expectedInput: string) => unknown
-    }
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as TerminalOrdinaryTurnBrowserObserver
 
-    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId, target.nativeSessionId, outputSentinel)
+    if (!captured) throw new Error('expected a ready terminal baseline')
     expect(captured).toEqual({
       provider: target.provider,
       terminalId: target.terminalId,
       streamId: target.streamId,
+      nativeSessionId: target.nativeSessionId,
       outputSeq: 10,
       completionSeq: 7,
     })
@@ -383,9 +527,11 @@ describe('body-free terminal ordinary-turn reduction', () => {
       { type: 'terminal.input', terminalId: 'other-terminal', data: promptSentinel },
       { type: 'terminal.input', terminalId: target.terminalId, data: promptSentinel },
     )
+    snapshot.text = outputSentinel
     const observed = observer.observeAfterSend(captured, promptSentinel)
     expect(observed).toEqual({
       requestInputSeen: true,
+      renderedAnswerSeen: true,
       activitySeen: true,
       outputSeen: true,
       outputFrameCount: 1,
@@ -403,6 +549,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
     const promptSentinel = 'PRIVATE_TERMINAL_PROMPT_SENTINEL_rolling'
     const received: unknown[] = []
     const sent: unknown[] = []
+    const snapshot = terminalSnapshot()
     const recordReceivedWsMessage = (message: unknown) => {
       received.push(message)
       if (received.length > 500) received.shift()
@@ -414,6 +561,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
       headSeq: 10,
     })
     const harness = {
+      getTerminalSnapshot: () => snapshot,
       getReceivedWsMessages: () => [...received],
       clearReceivedWsMessages: () => { received.length = 0 },
       getSentWsMessages: () => [...sent],
@@ -421,15 +569,13 @@ describe('body-free terminal ordinary-turn reduction', () => {
     }
     const browserWindow: Record<string, unknown> = { __FRESHELL_TEST_HARNESS__: harness }
     runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
-    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as {
-      prepareBeforeSend: (provider: string, terminalId: string) => TerminalOrdinaryTurnBaseline | null
-      observeAfterSend: (baseline: TerminalOrdinaryTurnBaseline, expectedInput: string) => TerminalOrdinaryTurnBrowserObservation | null
-    }
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as TerminalOrdinaryTurnBrowserObserver
 
-    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId, target.nativeSessionId, outputSentinel)
     if (!captured) throw new Error('expected a ready terminal baseline')
     recordReceivedWsMessage(activity(target.provider))
     recordReceivedWsMessage(output(target.terminalId, target.streamId, 11, outputSentinel))
+    snapshot.text = outputSentinel
     sent.push({ type: 'terminal.input', terminalId: target.terminalId, data: promptSentinel })
     const firstObservation = observer.observeAfterSend(captured, promptSentinel)
     expect(firstObservation).toMatchObject({
@@ -472,11 +618,9 @@ describe('body-free terminal ordinary-turn reduction', () => {
       },
     }
     runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
-    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as {
-      prepareBeforeSend: (provider: string, terminalId: string) => unknown
-    }
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as TerminalOrdinaryTurnBrowserObserver
 
-    expect(observer.prepareBeforeSend(target.provider, target.terminalId)).toBeNull()
+    expect(observer.prepareBeforeSend(target.provider, target.terminalId, target.nativeSessionId, 'answer')).toBeNull()
     expect(received).toHaveLength(1)
   })
 
@@ -487,6 +631,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
     const sent: unknown[] = []
     const browserWindow: Record<string, unknown> = {
       __FRESHELL_TEST_HARNESS__: {
+        getTerminalSnapshot: () => terminalSnapshot(),
         getReceivedWsMessages: () => received,
         clearReceivedWsMessages: () => { received.length = 0 },
         getSentWsMessages: () => sent,
@@ -494,13 +639,11 @@ describe('body-free terminal ordinary-turn reduction', () => {
       },
     }
     runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
-    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as {
-      prepareBeforeSend: (provider: string, terminalId: string) => unknown
-      observeAfterSend: (baseline: unknown, expectedInput: string) => unknown
-    }
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as TerminalOrdinaryTurnBrowserObserver
 
-    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId, target.nativeSessionId, 'answer')
     expect(captured).not.toBeNull()
+    if (!captured) throw new Error('expected a ready terminal baseline')
 
     const expectedInput = 'request'
     sent.push({ type: 'terminal.input', terminalId: target.terminalId, data: '\r' })
