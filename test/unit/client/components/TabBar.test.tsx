@@ -11,11 +11,14 @@ import repoIconsReducer from '@/store/repoIconsSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
+import managedRuntimeReducer, { managedRuntimeSnapshotReceived } from '@/store/managedRuntimeSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
+import type { ManagedRuntimeInventorySnapshot } from '@shared/managed-runtime'
+import { managedRuntimeInventoryFixture } from '../fixtures/managed-runtime-inventory.js'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -23,9 +26,10 @@ import {
 } from '@shared/settings'
 
 // Mock the ws-client module
-const { mockSend, wsMessageHandlers, mockManagedVisibility } = vi.hoisted(() => ({
+const { mockSend, wsMessageHandlers, mockManagedVisibility, mockManagedInventory } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockManagedVisibility: vi.fn(),
+  mockManagedInventory: vi.fn(),
   wsMessageHandlers: new Set<(msg: unknown) => void>(),
 }))
 vi.mock('@/lib/ws-client', () => ({
@@ -85,6 +89,7 @@ function ackAllPaneCloses() {
 
 // Mock the api module so the repo-icon meta probe thunk never hits the network
 vi.mock('@/lib/api', () => ({
+  getManagedRuntimeInventory: mockManagedInventory,
   updateManagedRuntimeViewVisibility: mockManagedVisibility,
   api: {
     get: vi.fn().mockRejectedValue(new Error('no server in tests')),
@@ -231,6 +236,7 @@ function createStore(
       terminalMeta: terminalMetaReducer,
       turnCompletion: turnCompletionReducer,
       freshAgent: freshAgentReducer,
+      managedRuntime: managedRuntimeReducer,
     },
     middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
     preloadedState: {
@@ -274,6 +280,7 @@ describe('TabBar', () => {
   beforeEach(() => {
     mockSend.mockClear()
     mockManagedVisibility.mockReset()
+    mockManagedInventory.mockReset()
   })
 
   afterEach(() => {
@@ -811,6 +818,37 @@ describe('TabBar', () => {
         { tabs: [createTab({ id: 'tab-1' })], activeTabId: 'tab-1' }, {},
         { layouts: { 'tab-1': node }, activePane: { 'tab-1': node.id } },
       )
+      const afterStop: ManagedRuntimeInventorySnapshot = managedRuntimeInventoryFixture({
+        soulId: 'managed-terminal-soul',
+        viewId: 'managed-terminal-view',
+        terminalId: 'managed-terminal',
+        terminalCreateRequestId: 'managed-terminal-create',
+        viewRevision: 3,
+        soulIntentRevision: 8,
+        visibility: 'hidden',
+        desiredState: 'stopped',
+      })
+      const beforeStop: ManagedRuntimeInventorySnapshot = {
+        ...afterStop,
+        revision: 2,
+        readiness: { ...afterStop.readiness, inventoryRevision: 2 },
+        souls: [{
+          ...afterStop.souls[0]!,
+          launchState: 'running',
+          cleanupState: 'none',
+          intentRevision: 7,
+          desiredState: 'running',
+          recoveryState: 'live',
+        }],
+        viewIntents: [{
+          ...afterStop.viewIntents[0]!,
+          visibility: 'visible',
+          revision: 2,
+          soulIntentRevision: 7,
+        }],
+      }
+      store.dispatch(managedRuntimeSnapshotReceived({ snapshot: beforeStop, reconstructedViewCount: 0 }))
+      mockManagedInventory.mockResolvedValueOnce(beforeStop).mockResolvedValue(afterStop)
       let stopped = false
       mockManagedVisibility.mockImplementation(async (viewId, visibility, revision, soulRevision) => {
         expect(stopped).toBe(true)

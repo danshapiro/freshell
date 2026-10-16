@@ -14,7 +14,7 @@ import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import connectionReducer, { setBootId } from '@/store/connectionSlice'
-import managedRuntimeReducer from '@/store/managedRuntimeSlice'
+import managedRuntimeReducer, { managedRuntimeSnapshotReceived } from '@/store/managedRuntimeSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
@@ -53,6 +53,7 @@ import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtim
 import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { isClientPerfLoggingEnabled, setClientPerfEnabled } from '@/lib/perf-logger'
+import { managedRuntimeInventoryFixture } from '../../fixtures/managed-runtime-inventory.js'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -1274,6 +1275,17 @@ describe('new conversation close acceptance', () => {
 describe('FreshAgentView', () => {
   it('renders and dismisses a failed close while keeping the stopped managed conversation', async () => {
     const store = createStore()
+    const managedSnapshot = managedRuntimeInventoryFixture({
+      soulId: 'close-retained-soul',
+      viewId: 'close-retained-view',
+      terminalCreateRequestId: 'close-retained-create',
+      viewRevision: 3,
+      soulIntentRevision: 8,
+      visibility: 'visible',
+      desiredState: 'stopped',
+    })
+    store.dispatch(managedRuntimeSnapshotReceived({ snapshot: managedSnapshot, reconstructedViewCount: 0 }))
+    apiMock.getManagedRuntimeInventory.mockResolvedValue(managedSnapshot)
     const handlers = new Set<(message: unknown) => void>()
     wsMock.onMessage.mockImplementation((handler) => {
       handlers.add(handler)
