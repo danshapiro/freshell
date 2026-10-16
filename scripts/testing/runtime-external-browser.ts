@@ -157,11 +157,15 @@ function processDescendants(parent: OwnedProcessIdentity): OwnedProcessIdentity[
 }
 
 const delay = (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds))
+const OWNED_CHILD_MARKER = 'FRESHELL_RUNTIME_CHILD_OWNER'
 
-/** Private owner-side process primitive. No executable, argv or PID enters the remote API. */
-class OwnedRuntimeChild {
+/** Owner-side process primitive. No executable, argv or PID enters the remote API. */
+export class OwnedRuntimeChild {
   readonly child: ChildProcess
   private recordedIdentity?: OwnedProcessIdentity
+  private readonly ownerMarker = randomUUID()
+  private readonly retainedChildren = new Map<number, OwnedProcessIdentity>()
+  private cleanupSettled = false
   private stdout = ''
   private stderr = ''
   private exited = false
@@ -169,7 +173,8 @@ class OwnedRuntimeChild {
 
   private constructor(executable: string, args: string[], cwd: string, env: NodeJS.ProcessEnv) {
     const canonical = fs.realpathSync(executable)
-    this.child = spawn(canonical, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    this.child = spawn(canonical, args, { cwd, env: { ...env, [OWNED_CHILD_MARKER]: this.ownerMarker },
+      detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     this.exit = new Promise((resolve) => {
       const finish = () => { this.exited = true; resolve() }
       this.child.once('exit', finish)
@@ -213,35 +218,91 @@ class OwnedRuntimeChild {
     return this.child.exitCode
   }
   descendants(): OwnedProcessIdentity[] {
+    return this.ownedScope().children
+  }
+
+  private ownedScope(): { children: OwnedProcessIdentity[]; groupPresent: boolean } {
+    if (this.cleanupSettled) return { children: [], groupPresent: false }
     const current = processIdentity(this.identity.pid)
-    if (!current) return []
-    if (!sameProcess(this.identity, current)) throw new Error('owned process identity was replaced')
-    return processDescendants(this.identity)
+    if (current && !sameProcess(this.identity, current)) throw new Error('owned process identity was replaced')
+    // detached:true creates a dedicated session/group. Its members remain in
+    // that group after reparenting, even if the launcher has already exited.
+    // The inherited marker distinguishes this launch if the numeric group ID
+    // is later reused. Never send an unchecked negative-PID group signal.
+    const group: OwnedProcessIdentity[] = []
+    let groupPresent = false
+    for (const entry of fs.readdirSync('/proc')) {
+      if (!/^[0-9]+$/.test(entry)) continue
+      const pid = Number(entry)
+      try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+        const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+        if (Number(fields[2]) !== this.identity.pid || Number(fields[3]) !== this.identity.pid) continue
+        groupPresent = true
+        const member = processIdentity(pid)
+        if (!member) continue // Exited (including a zombie awaiting reaping).
+        const marker = `${OWNED_CHILD_MARKER}=${this.ownerMarker}`
+        if (!fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').includes(marker)) {
+          throw new Error('owned process group identity was replaced')
+        }
+        if (pid !== this.identity.pid) group.push(member)
+      } catch (error) {
+        if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
+      }
+    }
+    // Keep the existing live-tree coverage for children that create their own
+    // groups, and retain exact identities when a cleanup attempt is interrupted.
+    for (const [pid, retained] of this.retainedChildren) {
+      const current = processIdentity(pid)
+      if (current?.startTicks === retained.startTicks) this.retainedChildren.set(pid, current)
+      else if (!ownedPidPresent(retained)) this.retainedChildren.delete(pid)
+    }
+    for (const child of [...group, ...(current ? processDescendants(this.identity) : [])]) {
+      const retained = this.retainedChildren.get(child.pid)
+      if (retained && retained.startTicks !== child.startTicks) throw new Error('owned child PID was replaced')
+      this.retainedChildren.set(child.pid, child)
+    }
+    return { children: [...this.retainedChildren.values()].filter(ownedPidPresent), groupPresent }
   }
 
   private signal(identity: OwnedProcessIdentity, signal: NodeJS.Signals): void {
     const current = processIdentity(identity.pid)
     if (!current) return
     if (!sameProcess(identity, current)) throw new Error('refused to signal a replaced owned PID')
-    process.kill(identity.pid, signal)
+    try { process.kill(identity.pid, signal) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
   }
 
   async stop(signal: NodeJS.Signals = 'SIGTERM'): Promise<void> {
-    const children = this.descendants()
+    if (this.cleanupSettled) return
+    this.descendants()
     this.signal(this.identity, signal)
     await Promise.race([this.exit, delay(5000)])
     if (ownedPidPresent(this.identity)) {
       this.signal(this.identity, 'SIGKILL')
       await Promise.race([this.exit, delay(5000)])
     }
-    for (const child of children) this.signal(child, 'SIGTERM')
-    const deadline = Date.now() + 5000
-    while (Date.now() < deadline && children.some((child) => ownedPidPresent(child))) await delay(50)
-    for (const child of children) this.signal(child, 'SIGKILL')
-    const killDeadline = Date.now() + 5000
-    while (Date.now() < killDeadline && [this.identity, ...children].some(ownedPidPresent)) await delay(50)
-    const remaining = [this.identity, ...children].filter(ownedPidPresent)
-    if (remaining.length) throw new Error('owned process cleanup could not verify absence')
+    for (const childSignal of ['SIGTERM', 'SIGKILL'] as const) {
+      const signalled = new Set<string>()
+      const deadline = Date.now() + 5000
+      do {
+        const { children, groupPresent } = this.ownedScope()
+        if (!groupPresent && !ownedPidPresent(this.identity) && children.length === 0) {
+          // Retire the numeric scope permanently once absence is established.
+          this.cleanupSettled = true
+          return
+        }
+        for (const child of children) {
+          const key = `${child.pid}:${child.startTicks}`
+          if (!signalled.has(key)) { this.signal(child, childSignal); signalled.add(key) }
+        }
+        await delay(50)
+      } while (Date.now() < deadline)
+    }
+    const { children, groupPresent } = this.ownedScope()
+    if (groupPresent || ownedPidPresent(this.identity) || children.length) throw new Error('owned process cleanup could not verify absence')
+    this.cleanupSettled = true
   }
 }
 
