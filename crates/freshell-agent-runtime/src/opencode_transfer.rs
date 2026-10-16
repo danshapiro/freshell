@@ -505,7 +505,10 @@ pub fn verify_current_store(
         if current_rows.contains_key(&key) {
             continue;
         }
-        if matches!(baseline.table.as_str(), "message" | "part" | "todo") {
+        if matches!(
+            baseline.table.as_str(),
+            "message" | "part" | "todo" | "session_message" | "session_input"
+        ) {
             continue;
         }
         let row = read_row_by_key(&transaction, &baseline.table, &baseline.key)?;
@@ -742,9 +745,12 @@ fn verify_typed_current_rows(
     verify_todowrite_projection(manifest, current_rows, &events)?;
     let mut changed_rows = Vec::new();
     for (key, digest) in &baseline {
-        // Todo.update replaces the entire list, including timestamps and
-        // deleted positions. Only the complete projection can authorize it.
-        if digest.table == "todo" {
+        if matches!(
+            digest.table.as_str(),
+            "session_message" | "session_input" | "session_context_epoch" | "todo"
+        ) {
+            // Complete projection validation above proves both current values
+            // and native removals. Per-row checks cannot authorize either.
             continue;
         }
         let Some(current) = current_rows.get(key) else {
@@ -755,14 +761,6 @@ fn verify_typed_current_rows(
                 "an imported native row or edge was deleted".into(),
             ));
         };
-        if matches!(
-            digest.table.as_str(),
-            "session_message" | "session_input" | "session_context_epoch"
-        ) {
-            // These projections are replayed/checked as complete typed shapes
-            // below. Per-row event-ID matching is insufficient for them.
-            continue;
-        }
         if digest_serialized_row(current)? == digest.sha256 {
             continue;
         }
@@ -3121,11 +3119,14 @@ fn row_has_supporting_transition(
                         && json_column(row, "revert").as_ref() == data.get("revert")
                         && v2_event_timestamp_millis(&data) == value_integer(row, "time_updated")
                 }),
-                "session.next.revert.cleared" => id.as_deref().is_some_and(|id| {
-                    value_text(row, "id").ok().flatten().as_deref() == Some(id)
-                        && json_column(row, "revert") == Some(serde_json::Value::Null)
-                        && v2_event_timestamp_millis(&data) == value_integer(row, "time_updated")
-                }),
+                "session.next.revert.cleared" | "session.next.revert.committed" => {
+                    id.as_deref().is_some_and(|id| {
+                        value_text(row, "id").ok().flatten().as_deref() == Some(id)
+                            && json_column(row, "revert") == Some(serde_json::Value::Null)
+                            && v2_event_timestamp_millis(&data)
+                                == value_integer(row, "time_updated")
+                    })
+                }
                 "session.next.agent.switched" => {
                     id.as_deref() == Some(session_id.as_str())
                         && value_text(row, "agent")?.as_deref()
