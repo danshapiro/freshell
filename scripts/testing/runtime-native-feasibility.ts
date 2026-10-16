@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from './runtime-sandbox.js'
+import { nativeExecutionDetails, redactNativeDiagnostic } from './opencode-restoration-rehearsal.js'
 import { seedManagedOpenCodeSource } from '../../test/e2e-browser/fixtures/managed-opencode-source.js'
 import { ManagedRuntimeSoulSchema } from '../../shared/managed-runtime.js'
 import { readCodexNativeHistory, readCodexNativeObservation } from '../../test/e2e-browser/helpers/provider-native-history/codex.js'
@@ -4708,10 +4709,19 @@ if native_preferences is not None:native_preferences['workspaceTrust']=preferenc
 print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativePid':int(p.name),'nativeRoot':hook['native']['session_id'] if hook else None,'hook':hook,'hookSha256':hashlib.sha256(hook_file.read_bytes()).hexdigest() if hook else None,'loaded':loaded,'hooksDisabled':settings.get('disableAllHooks'),'nativeLaunch':json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),'signalDirectory':str(signal_dir),'signalWritable':os.access(signal_dir,os.W_OK),'signalMode':oct(signal_dir.stat().st_mode&0o777) if signal_dir.exists() else None,'nativeArgv':native_argv,'nativeCwd':str((p/'cwd').resolve()),'executableSha256':expected,'version':subprocess.check_output([str(selected),'--version'],text=True).strip(),'profileFiles':profile,'nativePreferences':native_preferences,'completedTurns':len(completed_ids),'toolEvents':tool_events,'lastAssistantText':last_text,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest(),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'transcript':transcript}))
 `
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  runNativeFeasibility().catch((error: unknown) => {
-    process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'runtime.native_feasibility.failed',
-      reason: error instanceof Error ? error.message : 'unknown failure' })}\n`)
+export async function runNativeFeasibilityCli(args = process.argv.slice(2)): Promise<void> {
+  try {
+    await runNativeFeasibility(args)
+  } catch (error) {
+    const secrets = Object.entries(process.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|API_KEY|AUTHORIZATION/i.test(key))
+      .map(([, value]) => value ?? '')
+    const failure = { severity: 'error', event: 'runtime.native_feasibility.failed',
+      reason: error instanceof Error ? error.message : 'unknown failure', execution: nativeExecutionDetails(error) }
+    process.stderr.write(`${redactNativeDiagnostic(JSON.stringify(failure), secrets)}\n`)
     process.exitCode = 1
-  })
+  }
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  void runNativeFeasibilityCli()
 }
