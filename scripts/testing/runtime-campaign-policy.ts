@@ -10,6 +10,8 @@ import { loadRuntimeSoakReceipt } from './runtime-soak-evidence.js'
 import { stableJson } from './runtime-phase5-evidence-common.js'
 import { loadProviderParityLocalReceipt } from './provider-parity-receipt.js'
 import { defaultReceiptFileName } from './runtime-receipts.js'
+import { certifiedDurableProviders, releasedFreshAgentModes, loadCapabilityManifest,
+  classifyProviderCertificationCase, providerCertificationCaseId, resolveGateOutcome } from './provider-certification.js'
 
 export const TABS_CASE_TITLES = [
   'managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth',
@@ -554,7 +556,21 @@ export function validateProductionCampaignCoverage(input: {
         if (!same(summary.requiredCases, phase.cumulative_required_case_ids)
           || !same(summary.providerCertificationCases, manifest.certification_gates.provider_certification_case_ids)
           || summary.caseResults.length !== expectedCases.length
-          || expectedCases.some(id => summary.caseResults.filter((row: any) => row.caseId === id && row.status === 'PASS').length !== 1)) throw new Error('gate original required case scope is incomplete')
+          || expectedCases.some(id => summary.caseResults.filter((row: any) => row.caseId === id).length !== 1)) throw new Error('gate original required case scope is incomplete')
+        const capabilities = loadCapabilityManifest(root)
+        for (const provider of capabilities.providers) {
+          const result = summary.caseResults.find((row: any) => row.caseId === providerCertificationCaseId(provider.provider))
+          if (!result) continue
+          const classification = classifyProviderCertificationCase(mode, provider)
+          const expectedStatus = classification.status === 'REQUIRES_LIVE_RECEIPT' ? 'PASS' : classification.status
+          if (result.status !== expectedStatus || (classification.reason !== null && result.reason !== classification.reason)) {
+            throw new Error('gate original provider classification differs from declared policy')
+          }
+        }
+        const outcome = resolveGateOutcome({ mode, caseResults: summary.caseResults, expectedCaseIds: expectedCases,
+          cleanupOk: summary.cleanup.ok, unsafeBrokerAttempts: summary.unsafeDockerAttempts.length,
+          deferred: summary.deferredProviders, deferrableProviders: capabilities.certification.landingGate.deferrableProviders })
+        if (outcome.status !== 'PASS') throw new Error('gate original case outcomes differ: ' + outcome.failures.join('; '))
         if (!same(summary.candidateIntegrity.before, input.candidate.before) || !same(summary.candidateIntegrity.after, input.candidate.after)) throw new Error('gate original candidate content differs')
         const audit = auditRuntimeArtifacts(path.dirname(path.join(root, summaryPath)), [
           ...manifest.execution_contract.required_artifacts, ...phase.required_artifacts, ...manifest.certification_gates.required_artifacts,
@@ -602,11 +618,11 @@ export function validateProductionCampaignCoverage(input: {
         if (step.id === 'provider-parity-local') loadProviderParityLocalReceipt(path.join(root, expectedPath), candidateSha)
         else if (step.id === 'opencode-qualification' || step.id === 'managed-provider-qualification') {
           const validated = validateProviderQualificationReceipt({ repoRoot: root, candidateSha, expectedRuntimeImage: input.images.runtimeImage, receipt })
-          const providers = step.id === 'opencode-qualification' ? ['opencode'] : ['claude', 'codex', 'opencode', 'amplifier']
+          const providers = step.id === 'opencode-qualification' ? ['opencode'] : certifiedDurableProviders(loadCapabilityManifest(root))
           if (!same(validated.providers.map(row => row.provider), providers)) throw new Error('combined provider original rows are incomplete or reordered')
         } else if (step.id === 'fresh-agent-qualification') {
           const validated = validateFreshAgentQualificationReceipt({ repoRoot: root, candidateSha, expectedRuntimeImage: input.images.runtimeImage, receipt })
-          if (!same(validated.rows.map(row => row.mode), ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'])) throw new Error('combined fresh original rows are incomplete or reordered')
+          if (!same(validated.rows.map(row => row.mode), releasedFreshAgentModes(loadCapabilityManifest(root)).map(row => row.mode))) throw new Error('combined fresh original rows are incomplete or reordered')
         } else if (step.id === 'loss-notice') validatePhase5LossReceipt({ repoRoot: root, candidateSha, runtimeImage: input.images.runtimeImage, receipt })
         else if (step.id === 'chaos') validatePhase5ChaosReceipt({ repoRoot: root, candidateSha, runtimeImage: input.images.runtimeImage, receipt })
         else if (step.id === 'soak') loadRuntimeSoakReceipt({ repoRoot: root, candidateSha, runtimeImage: input.images.runtimeImage, receipt })
