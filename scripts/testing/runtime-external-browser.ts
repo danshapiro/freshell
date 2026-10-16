@@ -68,6 +68,7 @@ import { ownedClaudeStartupPreferences } from './runtime-native-feasibility.js'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
+type OwnedProcessScope = { children: OwnedProcessIdentity[]; groupPresent: boolean }
 
 /** Serialized by Playwright into the owned page after its matching allocation. */
 export function observeOwnedFreshBrowserPane(input: {
@@ -129,6 +130,17 @@ function ownedPidPresent(expected: OwnedProcessIdentity): boolean {
     return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] === expected.startTicks
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ESRCH') return false
+    throw error
+  }
+}
+
+function processGroupPresent(pid: number): boolean {
+  try {
+    // Signal zero only probes existence; termination still verifies each PID.
+    process.kill(-pid, 0)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
     throw error
   }
 }
@@ -221,14 +233,14 @@ export class OwnedRuntimeChild {
     return this.ownedScope().children
   }
 
-  private ownedScope(): { children: OwnedProcessIdentity[]; groupPresent: boolean } {
+  private ownedScope(): OwnedProcessScope {
     if (this.cleanupSettled) return { children: [], groupPresent: false }
     const current = processIdentity(this.identity.pid)
     if (current && !sameProcess(this.identity, current)) throw new Error('owned process identity was replaced')
     // detached:true creates a dedicated session/group. Its members remain in
     // that group after reparenting, even if the launcher has already exited.
     // The inherited marker distinguishes this launch if the numeric group ID
-    // is later reused. Never send an unchecked negative-PID group signal.
+    // is later reused. Never terminate a group with an unchecked negative-PID signal.
     const group: OwnedProcessIdentity[] = []
     let groupPresent = false
     for (const entry of fs.readdirSync('/proc')) {
@@ -265,6 +277,13 @@ export class OwnedRuntimeChild {
     return { children: [...this.retainedChildren.values()].filter(ownedPidPresent), groupPresent }
   }
 
+  private absenceVerified({ children, groupPresent }: OwnedProcessScope): boolean {
+    if (groupPresent || ownedPidPresent(this.identity) || children.length) return false
+    // A /proc enumeration can miss a child forked while its parent exits.
+    // Retire the scope only when the kernel confirms current group absence.
+    return !processGroupPresent(this.identity.pid)
+  }
+
   private signal(identity: OwnedProcessIdentity, signal: NodeJS.Signals): void {
     const current = processIdentity(identity.pid)
     if (!current) return
@@ -287,21 +306,20 @@ export class OwnedRuntimeChild {
       const signalled = new Set<string>()
       const deadline = Date.now() + 5000
       do {
-        const { children, groupPresent } = this.ownedScope()
-        if (!groupPresent && !ownedPidPresent(this.identity) && children.length === 0) {
+        const scope = this.ownedScope()
+        if (this.absenceVerified(scope)) {
           // Retire the numeric scope permanently once absence is established.
           this.cleanupSettled = true
           return
         }
-        for (const child of children) {
+        for (const child of scope.children) {
           const key = `${child.pid}:${child.startTicks}`
           if (!signalled.has(key)) { this.signal(child, childSignal); signalled.add(key) }
         }
         await delay(50)
       } while (Date.now() < deadline)
     }
-    const { children, groupPresent } = this.ownedScope()
-    if (groupPresent || ownedPidPresent(this.identity) || children.length) throw new Error('owned process cleanup could not verify absence')
+    if (!this.absenceVerified(this.ownedScope())) throw new Error('owned process cleanup could not verify absence')
     this.cleanupSettled = true
   }
 }
