@@ -897,6 +897,115 @@ fn current_store_verification_keeps_part_revert_boundary_as_current_tail() {
 }
 
 #[test]
+fn current_store_verification_replays_completed_v2_response_content() {
+    for imported_response in [true, false] {
+        for replace_metadata in [true, false] {
+            let mut fixture = fixture_with_baseline_event();
+            if !imported_response {
+                import_bundle(
+                    &fixture.descriptor,
+                    &fixture.staged_directory,
+                    &fixture.destination_database,
+                    &fixture.workspace,
+                )
+                .unwrap();
+            }
+            let database = if imported_response {
+                fixture.root.join("source.sqlite")
+            } else {
+                fixture.destination_database.clone()
+            };
+            let connection = Connection::open(database).unwrap();
+            let model = serde_json::json!({"providerID":"openai","id":"gpt-5"});
+            let metadata = serde_json::json!({"openai":{"signature":"original"}});
+            let replacement = serde_json::json!({"openai":{"signature":"completed"}});
+            let mut reasoning_end = serde_json::json!({
+                "assistantMessageID":"msg_response","reasoningID":"reason-1","text":"completed reasoning"
+            });
+            if replace_metadata {
+                reasoning_end["providerMetadata"] = replacement.clone();
+            }
+            let tokens = serde_json::json!({"input":1,"output":2,"reasoning":3,"cache":{"read":0,"write":0}});
+            for (index, (kind, mut data)) in [
+                ("step.started", serde_json::json!({"assistantMessageID":"msg_response","agent":"build","model":model})),
+                ("text.started", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1"})),
+                ("text.ended", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1","text":"first answer"})),
+                // Native lookup updates the last matching entry, even when IDs repeat.
+                ("text.started", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1"})),
+                ("text.ended", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1","text":"completed answer"})),
+                ("reasoning.started", serde_json::json!({"assistantMessageID":"msg_response","reasoningID":"reason-1","providerMetadata":metadata})),
+                ("reasoning.ended", reasoning_end),
+                ("step.ended", serde_json::json!({"assistantMessageID":"msg_response","finish":"stop","cost":0,"tokens":tokens})),
+            ].into_iter().enumerate() {
+                let seq = index as i64 + 1;
+                data["sessionID"] = "ses_root".into();
+                data["timestamp"] = (seq * 10).into();
+                let version = if kind == "step.ended" { 2 } else { 1 };
+                append_durable_event(&connection, seq, &format!("evt_response_{seq}"), &format!("session.next.{kind}.{version}"), data);
+            }
+            let response = serde_json::json!({
+                "agent":"build","model":model,"time":{"created":10,"completed":80},
+                "finish":"stop","cost":0,"tokens":tokens,
+                "content":[
+                    {"type":"text","id":"text-1","text":"first answer"},
+                    {"type":"text","id":"text-1","text":"completed answer"},
+                    {"type":"reasoning","id":"reason-1","text":"completed reasoning",
+                     "time":{"created":60,"completed":70},"providerMetadata":if replace_metadata {replacement} else {metadata}}
+                ]
+            });
+            connection.execute(
+                "INSERT INTO session_message(id,session_id,type,seq,time_created,time_updated,data)
+                 VALUES('msg_response','ses_root','assistant',1,10,10,?1)",
+                [response.to_string()],
+            ).unwrap();
+            drop(connection);
+            if imported_response {
+                reexport_owned_fixture(&mut fixture);
+                import_bundle(
+                    &fixture.descriptor,
+                    &fixture.staged_directory,
+                    &fixture.destination_database,
+                    &fixture.workspace,
+                )
+                .unwrap();
+            }
+            verify_current_store(
+                &fixture.descriptor,
+                &fixture.destination_database,
+                &fixture.workspace,
+            )
+            .expect("native completed text and reasoning match the entire event projection");
+
+            let connection = Connection::open(&fixture.destination_database).unwrap();
+            for pointer in [
+                "/content/1/text",
+                "/content/2/text",
+                "/content/2/time/completed",
+                "/content/2/providerMetadata",
+            ] {
+                let mut corrupt = response.clone();
+                *corrupt.pointer_mut(pointer).unwrap() = serde_json::json!("unbound");
+                connection
+                    .execute(
+                        "UPDATE session_message SET data=?1 WHERE id='msg_response'",
+                        [corrupt.to_string()],
+                    )
+                    .unwrap();
+                assert!(
+                    verify_current_store(
+                        &fixture.descriptor,
+                        &fixture.destination_database,
+                        &fixture.workspace
+                    )
+                    .is_err(),
+                    "corrupt {pointer} must be refused"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn current_store_verification_replays_v2_revert_and_derives_boundary_tail() {
     let fixture = fixture_with_baseline_event();
     import_bundle(
