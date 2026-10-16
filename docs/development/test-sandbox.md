@@ -37,7 +37,13 @@ scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex <destructi
 
 `--runtime-suite` is intentionally incompatible with `--corpus`. It uses `--network none`, a
 read-only container root with only explicit tmpfs/bind/volume write locations and enables
-`no-new-privileges`. The root entrypoint may initialize cache-volume ownership, but it always drops
+`no-new-privileges` for the requested command. Before that container starts, a separate disposable
+container on the dedicated bridge prepares the fingerprinted Node dependencies and runs
+`cargo fetch --locked` when `Cargo.lock` exists. Only this fixed preparation has networking and
+a writable root; it never receives the requested command or mounts provider homes or admin
+sockets. Preparation failure stops the run before the requested command starts. The command's
+container reuses those volumes with Cargo in offline mode, so a cold cache needs no manual warm-up.
+The root entrypoint may initialize cache-volume ownership, but it always drops
 to the unprivileged `sandbox` UID before test code and the self-test verifies that test code has zero
 effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
 Docker socket; this wrapper never grants it to tests.
@@ -66,7 +72,7 @@ ordinary sandbox route, and combining this command with `--corpus` remains refus
 
 | What | Guarantee |
 |---|---|
-| Network | Ordinary mode uses the dedicated `freshell-sandbox` bridge, never `--network=host`; `--runtime-suite` uses `--network none`. Binding a port inside either container namespace cannot collide with a host listener. |
+| Network | Ordinary mode and fixed dependency preparation use the dedicated `freshell-sandbox` bridge, never `--network=host`; `--runtime-suite` commands use `--network none`. Binding a port inside either container namespace cannot collide with a host listener. |
 | Host processes | Container has its own PID namespace. Killing/crashing anything inside (including something literally named `freshell-server`) cannot reach a host process. |
 | `~/.freshell`, `~/.claude`, `~/.codex`, `~/.local/share/opencode` | Not mounted by default. `--corpus` mounts only `~/.codex/sessions` and `~/.claude/projects`, and only **read-only**. |
 | Repo | Bind-mounted read-write at `/workspace` so test output/artifacts are inspectable from the host. |
@@ -121,6 +127,11 @@ of each is slower — see below):
   `packages/freshell-mcp-runtime`), which have their own dependency trees. On legacy npm-era
   branches these stay mounted but unused.
 - `freshell-sandbox-playwright-cache` — downloaded browser binaries.
+
+Set `FRESHELL_SANDBOX_CACHE_PREFIX` to a unique Docker volume name prefix to use an
+independent set of all seven caches, including when running `scripts/sandbox-selftest.sh`.
+The default prefix is `freshell-sandbox`; paths are rejected to prevent accidentally mounting
+host directories. The cold-start regression creates and removes its own volumes automatically.
 
 Reset everything (forces a clean re-warm on next run):
 
