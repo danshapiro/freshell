@@ -8380,6 +8380,312 @@ mod interrupted_transaction_tests {
     }
 
     #[tokio::test]
+    async fn due_recovery_docker_silence_settles_retry_and_releases_stop() {
+        due_recovery_silence_settlement(false).await;
+    }
+
+    #[tokio::test]
+    async fn due_recovery_docker_silence_settles_retry_after_opencode_preflight() {
+        due_recovery_silence_settlement(true).await;
+    }
+
+    async fn due_recovery_silence_settlement(preflight: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, fixture, soul) = silent_due_recovery(dir.path(), preflight).await;
+        let mut observing = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.observe_once().await })
+        };
+        wait_for_silent_recovery_request(&fixture).await;
+        let observed = tokio::time::timeout(Duration::from_secs(25), &mut observing).await;
+        if observed.is_err() {
+            observing.abort();
+        }
+        observed
+            .expect("silent Docker must release the observer through typed settlement")
+            .unwrap()
+            .unwrap();
+        let retry = supervisor
+            .registry
+            .recovery_retry(soul.clone(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.attempt_count, if preflight { 2 } else { 1 });
+        assert_eq!(
+            retry.next_due_at_ms,
+            Some(if preflight { 12_000 } else { 2_000 })
+        );
+        assert!(retry.reserved_attempt_id.is_none());
+        assert_eq!(retry.last_reason, "backend_unavailable");
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            context.recovery_state,
+            freshell_runtime_protocol::RecoveryState::Blocked
+        );
+        assert!(context.recovery_attempt_id.is_none());
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let unfinished: u64 = conn
+            .query_row(
+                "SELECT count(*) FROM recovery_attempts WHERE finished_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unfinished, 0,
+            "a timed-out dependency cannot strand its reservation"
+        );
+        let evidence: String = conn
+            .query_row(
+                "SELECT evidence_ref FROM recovery_attempts ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(evidence.contains("timed out"), "{evidence}");
+        assert_eq!(
+            fixture
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.contains("/json "))
+                .count(),
+            if preflight { 2 } else { 1 }
+        );
+        let requests = fixture.state.lock().unwrap().requests.len();
+        tokio::time::timeout(Duration::from_secs(2), supervisor.observe_once())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture.state.lock().unwrap().requests.len(),
+            requests,
+            "backoff must keep the next observer pass from repeating Docker work"
+        );
+        let (outcome, view) = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervisor.stop(soul.clone(), Some(1)),
+        )
+        .await
+        .expect("Stop can acquire the released lifecycle lock")
+        .unwrap();
+        assert_eq!(outcome, StopOutcome::BackendUnavailable);
+        assert_ne!(view.cleanup_state, CleanupState::VerifiedEmpty);
+        finish_silent_recovery_stop(&supervisor, &fixture, &soul).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn due_recovery_docker_silence_does_not_block_foreground_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, fixture, soul) = silent_due_recovery(dir.path(), false).await;
+        let mut observing = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.observe_once().await })
+        };
+        wait_for_silent_recovery_request(&fixture).await;
+        let mut stopping = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.stop(soul, Some(1)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .desired_state
+                != DesiredState::Stopped
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
+        assert!(
+            lifecycle.try_lock().is_err(),
+            "recovery owns the lock while Docker is silent"
+        );
+        assert!(!stopping.is_finished());
+        let completed = tokio::time::timeout(Duration::from_secs(20), async {
+            let observed = (&mut observing).await.unwrap();
+            let stopped = (&mut stopping).await.unwrap();
+            (observed, stopped)
+        })
+        .await;
+        if completed.is_err() {
+            observing.abort();
+            stopping.abort();
+        }
+        let (observed, stopped) =
+            completed.expect("Docker silence cannot retain recovery's lock indefinitely");
+        observed.unwrap();
+        let (outcome, view) = stopped.unwrap();
+        assert_eq!(outcome, StopOutcome::BackendUnavailable);
+        assert_ne!(view.cleanup_state, CleanupState::VerifiedEmpty);
+        assert!(lifecycle.try_lock().is_ok());
+        assert!(supervisor
+            .registry
+            .recovery_retry(soul.clone(), 1)
+            .await
+            .unwrap()
+            .is_none());
+        let verdict: String = Connection::open(supervisor.registry.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT verdict FROM recovery_attempts ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict, "cancelled");
+        finish_silent_recovery_stop(&supervisor, &fixture, &soul).await;
+        fixture.close().await;
+    }
+
+    async fn silent_due_recovery(
+        root: &Path,
+        preflight: bool,
+    ) -> (Supervisor, crate::backend::tests::StopDockerFixture, SoulId) {
+        use crate::recovery_retry::TransientRecoveryFailure;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let mut supervisor = open(root);
+        let clock = Arc::new(AtomicI64::new(0));
+        supervisor.registry.retry_clock = Some(clock.clone());
+        let soul = seed(&supervisor, root, false).await;
+        if preflight {
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let mut agent = context.fresh_agent.unwrap();
+            agent.provider = freshell_runtime_protocol::FreshProvider::Opencode;
+            agent.session_type = "freshopencode".into();
+            agent.runtime_variant = "opencode-http-v1".into();
+            let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(&agent).unwrap(),
+                    context.prior_handle.incarnation_id().as_str()
+                ],
+            )
+            .unwrap();
+        }
+        let reserved = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), 1, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        if preflight {
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            supervisor
+                .registry
+                .mark_recovery_blocked_with_retry(
+                    soul.clone(),
+                    reserved.reserved_attempt_id,
+                    freshell_runtime_protocol::RecoveryBlockReason::ProviderUnavailable,
+                    vec!["synthetic prior dependency outage".into()],
+                    context.write_fence(),
+                    Some(TransientRecoveryFailure::Backend),
+                )
+                .await
+                .unwrap();
+            clock.store(2_000, Ordering::SeqCst);
+        }
+        let fixture = docker_fixture(&mut supervisor, root, false).await;
+        fixture.state.lock().unwrap().silence = Some("initial_inspect");
+        (supervisor, fixture, soul)
+    }
+
+    async fn wait_for_silent_recovery_request(fixture: &crate::backend::tests::StopDockerFixture) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| request.contains("/json "))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery must reach the real Docker socket");
+    }
+
+    async fn finish_silent_recovery_stop(
+        supervisor: &Supervisor,
+        fixture: &crate::backend::tests::StopDockerFixture,
+        soul: &SoulId,
+    ) {
+        assert_eq!(
+            supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "silence must retain pending cleanup, never claim verified empty"
+        );
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.silence = None;
+            state.inspection["State"] = serde_json::json!({"Status":"created","Running":false,"Paused":false,"Restarting":false});
+        }
+        tokio::time::timeout(Duration::from_secs(5), supervisor.observe_once())
+            .await
+            .expect("a later observer pass can finish the same Stop intent")
+            .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(context.desired_state, DesiredState::Stopped);
+        assert_eq!(context.intent_revision, 2);
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            supervisor.registry.inventory().await.unwrap()[0].cleanup_state,
+            CleanupState::VerifiedEmpty
+        );
+        assert!(!fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| request.contains("/start ") || request.contains("/create")));
+    }
+
+    #[tokio::test]
     async fn ordinary_stop_docker_silence_releases_lock_and_retries_same_intent() {
         run_ordinary_stop_docker_silence().await;
     }

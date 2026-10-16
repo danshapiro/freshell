@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -22,6 +23,7 @@ use tokio::{
 };
 
 const DOCKER_API: &str = "/v1.47";
+const DOCKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVIDER_HOST_CAPABILITIES: [&str; 4] = ["CHOWN", "KILL", "SETGID", "SETUID"];
 
 #[derive(Debug, thiserror::Error)]
@@ -445,9 +447,30 @@ impl DockerEngineBackend {
         path: &str,
         body: Option<&Value>,
     ) -> Result<DockerResponse, BackendError> {
-        self.request_bounded(method, path, body, u64::MAX).await
+        // Cancel only the dependency exchange. Recovery still owns its future
+        // and receives a typed transient error to settle its retry reservation.
+        tokio::time::timeout(
+            DOCKER_REQUEST_TIMEOUT,
+            self.request_bounded(method, path, body, u64::MAX),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                event = "supervisor.docker.request_timeout",
+                method,
+                path,
+                timeout_ms = DOCKER_REQUEST_TIMEOUT.as_millis() as u64,
+                "Docker request timed out"
+            );
+            Err(BackendError::Unavailable(format!(
+                "Docker {method} {path} timed out after {}ms",
+                DOCKER_REQUEST_TIMEOUT.as_millis()
+            )))
+        })
     }
 
+    // Size-bounded helper requests run inside their operation's existing
+    // elapsed-time budget, including longer native history/repair waits.
     async fn request_bounded(
         &self,
         method: &str,
@@ -2509,6 +2532,44 @@ pub(crate) mod tests {
             parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn bounded_helper_exchange_retains_its_enclosing_operation_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("docker-helper.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            tokio::time::sleep(DOCKER_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        // Native history/repair wait requests already belong to a separately
+        // bounded helper operation (20s/120s), which may legitimately take
+        // longer than an ordinary Docker metadata request.
+        let result = tokio::time::timeout(
+            DOCKER_REQUEST_TIMEOUT + Duration::from_secs(5),
+            DockerEngineBackend::new(socket).request_bounded("POST", "/helper/wait", None, 1_024),
+        )
+        .await
+        .unwrap();
+        if result.is_err() {
+            peer.abort();
+        }
+        assert_eq!(
+            result
+                .expect("the helper's caller owns its longer elapsed-time budget")
+                .body,
+            b"{}"
+        );
+        peer.await.unwrap();
     }
 
     #[test]
