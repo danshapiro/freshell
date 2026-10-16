@@ -447,7 +447,6 @@ test.describe.serial('ordinary fresh-agent use', () => {
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       await new TestHarness(page).waitForConnection()
 
-      const failedModes: string[] = []
       for (const definition of definitions) {
         const createReceivedCursor = wire.received.length
         const createSentCursor = wire.sent.length
@@ -521,7 +520,6 @@ test.describe.serial('ordinary fresh-agent use', () => {
           console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
             lane: 'fresh-agent', mode: definition.mode }))
         } catch (error) {
-          failedModes.push(definition.mode)
           let assistantDom = { available: false, rows: 0, textCharacters: 0 }
           if (paneId) {
             try {
@@ -542,9 +540,9 @@ test.describe.serial('ordinary fresh-agent use', () => {
             errorName: error instanceof Error ? error.name : 'UnknownError',
             providerEvents: ordinaryFreshAgentEventFacts(wire.received.slice(createReceivedCursor)), assistantDom, readiness,
             ...progress }))
+          throw error
         }
       }
-      expect(failedModes, `ordinary fresh-agent turn failed for: ${failedModes.join(', ')}`).toEqual([])
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)

@@ -623,7 +623,6 @@ test.describe.serial('ordinary managed-provider use', () => {
       if (!tabId) throw new Error('ordinary provider smoke has no active tab')
 
       setupFailureStage = null
-      const failedProviders: string[] = []
       for (const definition of definitions) {
         let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
         let paneSetupStage: ProviderPaneSetupStage | null = null
@@ -661,7 +660,6 @@ test.describe.serial('ordinary managed-provider use', () => {
           console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
             lane: 'terminal', provider: definition.provider }))
         } catch (error) {
-          failedProviders.push(definition.provider)
           let terminalFacts: { available: false } | {
             available: true; provider: string; providerProcessPresent: boolean; nativeSessionIdPresent: boolean
           } = { available: false }
@@ -678,9 +676,9 @@ test.describe.serial('ordinary managed-provider use', () => {
             paneSetupFailureStage: created ? null : paneSetupStage,
             ordinaryTurnFailureStage: error instanceof OrdinaryTerminalTurnError ? error.stage : null,
             ordinaryTurnFacts: error instanceof OrdinaryTerminalTurnError ? error.facts : null }))
+          throw error
         }
       }
-      expect(failedProviders, `ordinary terminal turn failed for: ${failedProviders.join(', ')}`).toEqual([])
     } catch (error) {
       if (setupFailureStage !== null) {
         console.info(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_setup_failed',
