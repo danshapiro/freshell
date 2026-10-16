@@ -18,6 +18,10 @@ use std::{
 pub const DEFAULT_RING_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_TRANSPORT_CHUNK_BYTES: usize = 64 * 1024;
+// JSON encodes a control byte such as NUL as six bytes (for example, `\u0000`).
+// At the minimum 128 KiB segment size, 16 KiB of payload plus the largest
+// descriptor-bounded terminal and epoch identifiers still fits in one line.
+const MAX_SPOOL_FRAME_DATA_BYTES: usize = 16 * 1024;
 
 pub struct OutputJournal {
     incarnation_id: IncarnationId,
@@ -112,7 +116,7 @@ impl OutputJournal {
 
     pub fn append(&mut self, data: &str) -> Result<Vec<RuntimeOutputFrame>, String> {
         let mut written = Vec::new();
-        for chunk in split_utf8(data, MAX_TRANSPORT_CHUNK_BYTES) {
+        for chunk in split_utf8(data, MAX_SPOOL_FRAME_DATA_BYTES) {
             let seq = self.next_seq;
             let frame = RuntimeOutputFrame {
                 terminal_id: self.terminal_id.clone(),
@@ -188,7 +192,7 @@ impl OutputJournal {
                 self.current_path(),
                 &self.current_index,
                 self.current_torn_tail,
-                true,
+                false,
             ),
         ] {
             let file = match std::fs::File::open(path) {
@@ -209,6 +213,9 @@ impl OutputJournal {
                 checkpoints: checkpoints.clone(),
                 torn_tail,
             });
+        }
+        if segments.is_empty() {
+            return Err("retained output spool unavailable".into());
         }
         let indexed = read_indexed_spool(
             source,
@@ -248,6 +255,9 @@ impl OutputJournal {
         })
         .map_err(|e| e.to_string())?;
         let segment_limit = self.spool_limit / 2;
+        if line.len() as u64 + 1 > segment_limit {
+            return Err("retained output frame exceeds segment bound".into());
+        }
         let current = self.current_path();
         let current_len = current.metadata().map(|m| m.len()).unwrap_or(0);
         if current_len > 0 && current_len.saturating_add(line.len() as u64 + 1) > segment_limit {
@@ -356,6 +366,27 @@ fn rebuild_spool_index(
         return Err("retained spool exceeds segment bound".into());
     }
     let (checkpoints, head, summary) = build_spool_index(BufReader::new(file), source, 0)?;
+    let (file_bytes, torn_tail) = if summary.torn_tail {
+        // This segment is about to become appendable again. Drop only the
+        // uncommitted final record so the next JSONL append starts on a fresh
+        // line and preserves the complete sequence already in the file.
+        let spool = OpenOptions::new()
+            .write(true)
+            .open(spool_path)
+            .map_err(|_| "retained output spool unavailable")?;
+        spool
+            .set_len(summary.last_complete_offset)
+            .and_then(|()| spool.sync_all())
+            .map_err(|_| "retained output torn tail recovery failed")?;
+        tracing::warn!(
+            event = "runtime.output_journal.torn_tail_recovered",
+            discarded_bytes = file_bytes.saturating_sub(summary.last_complete_offset),
+            "discarded one incomplete retained-output record"
+        );
+        (summary.last_complete_offset, false)
+    } else {
+        (file_bytes, false)
+    };
     let scanned_through_offset = if checkpoints.is_empty() {
         summary.last_complete_offset
     } else {
@@ -367,9 +398,9 @@ fn rebuild_spool_index(
         &checkpoints,
         file_bytes,
         scanned_through_offset,
-        summary.torn_tail,
+        torn_tail,
     )?;
-    Ok((checkpoints, head, summary.torn_tail))
+    Ok((checkpoints, head, torn_tail))
 }
 
 fn write_index_atomic(
@@ -498,6 +529,55 @@ mod tests {
     }
 
     #[test]
+    fn reopening_truncates_a_torn_tail_before_the_next_jsonl_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let incarnation_id = IncarnationId::new();
+        let mut journal = OutputJournal::new(
+            dir.path(),
+            incarnation_id.clone(),
+            "torn-restart".into(),
+            "epoch".into(),
+        )
+        .unwrap();
+        journal.append("complete before restart").unwrap();
+        let spool_path = journal.current_path();
+        drop(journal);
+
+        let mut file = OpenOptions::new().append(true).open(&spool_path).unwrap();
+        file.write_all(b"{\"frame\":{\"data\":\"partial").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut recovered = OutputJournal::new(
+            dir.path(),
+            incarnation_id.clone(),
+            "torn-restart".into(),
+            "epoch".into(),
+        )
+        .expect("a torn final frame is recoverable on reopen");
+        assert!(
+            std::fs::read(&spool_path).unwrap().ends_with(b"\n"),
+            "reopen removes the incomplete bytes before the next append"
+        );
+        let appended = recovered.append("complete after restart").unwrap();
+        assert_eq!(appended[0].seq_start, 2);
+        drop(recovered);
+
+        let reopened = OutputJournal::new(
+            dir.path(),
+            incarnation_id,
+            "torn-restart".into(),
+            "epoch".into(),
+        )
+        .unwrap();
+        let read = reopened.read(0, 65536).unwrap();
+        assert_eq!(read.frames.len(), 2);
+        assert_eq!(read.frames[0].data, "complete before restart");
+        assert_eq!(read.frames[1].data, "complete after restart");
+        assert!(!read.truncated);
+    }
+
+    #[test]
     fn retained_output_rejects_foreign_terminal_frames_in_same_epoch() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal =
@@ -548,6 +628,84 @@ mod tests {
     }
 
     #[test]
+    fn escaped_output_frames_fit_the_minimum_spool_segment_and_remain_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = OutputJournal::with_limits(
+            dir.path(),
+            IncarnationId::new(),
+            "t".into(),
+            "epoch".into(),
+            64 * 1024,
+            256 * 1024,
+        )
+        .unwrap();
+        let segment_limit = journal.descriptor().segment_limit_bytes;
+
+        let frames = journal.append(&"\0".repeat(64 * 1024)).unwrap();
+
+        assert!(
+            frames.len() > 1,
+            "escaped data must be split before spooling"
+        );
+        assert!(
+            [journal.previous_path(), journal.current_path()]
+                .into_iter()
+                .filter_map(|path| path.metadata().ok().map(|metadata| metadata.len()))
+                .all(|length| length <= segment_limit),
+            "every retained spool segment must stay within the descriptor bound"
+        );
+        let replay = journal
+            .read(0, MAX_TRANSPORT_CHUNK_BYTES as u64)
+            .expect("valid escaped output must not be rejected as an oversized segment");
+        assert!(!replay.frames.is_empty());
+        assert!(replay
+            .frames
+            .iter()
+            .all(|frame| frame.data.chars().all(|c| c == '\0')));
+        journal
+            .complete(0)
+            .expect("completion must be able to read the retained escaped output");
+    }
+
+    #[test]
+    fn previous_only_spool_remains_readable_after_rotation_interruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = OutputJournal::with_limits(
+            dir.path(),
+            IncarnationId::new(),
+            "t".into(),
+            "epoch".into(),
+            64 * 1024,
+            256 * 1024,
+        )
+        .unwrap();
+        journal
+            .append(&"x".repeat(MAX_TRANSPORT_CHUNK_BYTES))
+            .unwrap();
+        journal
+            .append(&"y".repeat(MAX_TRANSPORT_CHUNK_BYTES))
+            .unwrap();
+        assert!(journal.previous_path().is_file());
+        std::fs::remove_file(journal.current_path()).unwrap();
+
+        let replay = journal.read(0, MAX_TRANSPORT_CHUNK_BYTES as u64).expect(
+            "a committed previous segment is valid if rotation stopped before current creation",
+        );
+
+        assert_eq!(replay.frames.len(), 4);
+        assert_eq!(replay.frames.first().unwrap().seq_start, 1);
+        assert_eq!(replay.frames.last().unwrap().seq_end, 4);
+        assert_eq!(
+            replay
+                .frames
+                .iter()
+                .map(|frame| frame.data.as_str())
+                .collect::<String>(),
+            "x".repeat(MAX_TRANSPORT_CHUNK_BYTES)
+        );
+    }
+
+    #[test]
     fn cursor_from_a_previous_host_cannot_hide_a_new_epochs_output() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = OutputJournal::new(
@@ -584,7 +742,7 @@ mod tests {
         let payload = "x".repeat(MAX_TRANSPORT_CHUNK_BYTES);
         let mut last_seq = 0;
         for _ in 0..96 {
-            last_seq = journal.append(&payload).unwrap()[0].seq_end;
+            last_seq = journal.append(&payload).unwrap().last().unwrap().seq_end;
         }
         let spool_bytes = journal.spool_bytes();
 

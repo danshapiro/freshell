@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::routing::get as get_method;
@@ -96,12 +96,14 @@ const CHECKPOINT_AUTO_BUDGET: Duration = Duration::from_secs(15);
 const CHECKPOINT_EXPLICIT_BUDGET: Duration = Duration::from_secs(120);
 const CHECKPOINT_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(60);
 const CHECKPOINT_COOLDOWN_LIMIT: usize = 128;
-const CHECKPOINT_OUTCOME_STORE_VERSION: u8 = 1;
+const CHECKPOINT_OUTCOME_STORE_VERSION: u8 = 2;
+const CHECKPOINT_OUTCOME_STORE_LEGACY_VERSION: u8 = 1;
 const CHECKPOINT_OUTCOME_STORE_LIMIT: usize = 8192;
 const CHECKPOINT_OUTCOME_REPLAY_LIMIT: usize = 8192;
 const CHECKPOINT_OUTCOME_REPLAY_PAGE_LIMIT: usize = 200;
 const CHECKPOINT_DISPATCH_FENCE_LIMIT: usize = CHECKPOINT_OUTCOME_STORE_LIMIT;
 const CHECKPOINT_VOLATILE_FENCE_LIMIT: usize = 1024;
+const CHECKPOINT_DISPATCH_FENCE_DIRECTORY: &str = "attempt-dispatch-fences-v1";
 
 #[derive(Clone, Copy)]
 struct CheckpointAttemptFence {
@@ -112,6 +114,8 @@ struct CheckpointAttemptFence {
 #[derive(Default)]
 struct CheckpointOutcomeCache {
     outcomes: HashMap<String, StoredCheckpointOutcome>,
+    dispatch_fences: BTreeSet<String>,
+    has_pruned_dispatch_fences: bool,
     snapshot_loaded: bool,
     store_file_observed: bool,
     snapshot_complete: bool,
@@ -121,7 +125,22 @@ impl CheckpointOutcomeCache {
     fn replace_from_store(&mut self, store: &CheckpointOutcomeStore) {
         self.snapshot_loaded = true;
         self.store_file_observed = true;
-        self.snapshot_complete = store.outcomes.len() <= CHECKPOINT_DISPATCH_FENCE_LIMIT;
+        let mut dispatch_fences = store.dispatch_fences.clone();
+        dispatch_fences.extend(
+            store
+                .outcomes
+                .iter()
+                .filter(|(_, record)| record.dispatch_started)
+                .map(|(key, _)| checkpoint_attempt_fence_key(key)),
+        );
+        self.snapshot_complete = store.outcomes.len() <= CHECKPOINT_DISPATCH_FENCE_LIMIT
+            && dispatch_fences.len() <= CHECKPOINT_DISPATCH_FENCE_LIMIT
+            && !store.has_pruned_dispatch_fences;
+        self.has_pruned_dispatch_fences = store.has_pruned_dispatch_fences;
+        self.dispatch_fences = dispatch_fences
+            .into_iter()
+            .take(CHECKPOINT_DISPATCH_FENCE_LIMIT)
+            .collect();
         self.outcomes = store
             .outcomes
             .iter()
@@ -136,14 +155,28 @@ impl CheckpointOutcomeCache {
     }
 
     fn known_attempt(&self, key: &str) -> Option<CheckpointAttemptFence> {
-        self.outcomes.get(key).map(|record| CheckpointAttemptFence {
-            dispatch_started: record.dispatch_started,
-            capture_settled: record.capture_settled,
-        })
+        self.outcomes
+            .get(key)
+            .map(|record| CheckpointAttemptFence {
+                dispatch_started: record.dispatch_started,
+                capture_settled: record.capture_settled,
+            })
+            .or_else(|| {
+                self.cached_dispatch_fence(key)
+                    .then_some(CheckpointAttemptFence {
+                        dispatch_started: true,
+                        capture_settled: true,
+                    })
+            })
     }
 
     fn cached_outcome(&self, key: &str) -> Option<StoredCheckpointOutcome> {
         self.outcomes.get(key).cloned()
+    }
+
+    fn cached_dispatch_fence(&self, key: &str) -> bool {
+        self.dispatch_fences
+            .contains(&checkpoint_attempt_fence_key(key))
     }
 
     fn cached_outcomes(&self) -> BTreeMap<String, StoredCheckpointOutcome> {
@@ -206,11 +239,155 @@ fn capture_settled_by_default() -> bool {
     true
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckpointOutcomeStore {
     version: u8,
     outcomes: BTreeMap<String, StoredCheckpointOutcome>,
+    #[serde(default)]
+    dispatch_fences: BTreeSet<String>,
+    #[serde(default)]
+    has_pruned_dispatch_fences: bool,
+}
+
+enum CheckpointAttemptLookup {
+    Outcome(Box<StoredCheckpointOutcome>),
+    DispatchFence,
+}
+
+async fn publish_outcome_store_file_with_parent_sync<F, Fut>(
+    temporary: &Path,
+    destination: &Path,
+    sync_parent: F,
+) -> Result<(), String>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    publish_checkpoint_file(temporary, destination)
+        .await
+        .map_err(|error| format!("failed to publish checkpoint outcomes: {error}"))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "checkpoint outcome store has no parent directory".to_string())?;
+    sync_parent(parent.to_path_buf()).await?;
+    Ok(())
+}
+
+async fn publish_checkpoint_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let source = temporary
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let target = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let result = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                    | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        tokio::fs::rename(temporary, destination).await
+    }
+}
+
+async fn sync_checkpoint_outcome_directory_chain(
+    parent: PathBuf,
+    home: PathBuf,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let directories = checkpoint_outcome_directory_chain(&parent, &home)?;
+        for directory in directories {
+            tokio::fs::File::open(&directory)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to open checkpoint outcome directory {} for flush: {error}",
+                        directory.display()
+                    )
+                })?
+                .sync_all()
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to flush checkpoint outcome directory {}: {error}",
+                        directory.display()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        // Windows publication uses MoveFileExW with MOVEFILE_WRITE_THROUGH,
+        // and each staged file is flushed before the move. Windows does not
+        // expose a portable equivalent of POSIX fsync(directory).
+        let _ = (parent, home);
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, home);
+        Err("durable checkpoint directory publication is unsupported on this platform".into())
+    }
+}
+
+#[cfg(any(unix, test))]
+fn checkpoint_outcome_directory_chain(parent: &Path, home: &Path) -> Result<Vec<PathBuf>, String> {
+    if !parent.starts_with(home) {
+        return Err("checkpoint outcome directory is outside the configured home".into());
+    }
+    let mut directories = Vec::new();
+    let mut current = parent;
+    loop {
+        directories.push(current.to_path_buf());
+        if current == home {
+            break;
+        }
+        current = current.parent().ok_or_else(|| {
+            "checkpoint outcome directory does not reach the configured home".to_string()
+        })?;
+        if !current.starts_with(home) {
+            return Err("checkpoint outcome directory does not reach the configured home".into());
+        }
+    }
+    Ok(directories)
+}
+
+async fn write_synced_checkpoint_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|error| format!("failed to create checkpoint outcome file: {error}"))?;
+    file.write_all(contents)
+        .await
+        .map_err(|error| format!("failed to write checkpoint outcome file: {error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("failed to flush checkpoint outcome file: {error}"))
 }
 
 struct CheckpointAttemptJob {
@@ -913,15 +1090,17 @@ impl CheckpointService {
     pub fn start_observer(self: &Arc<Self>) {
         let mut receiver = self.broadcast_tx.subscribe();
         let service = Arc::downgrade(self);
+        let (observer_tx, mut observer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let processing_service = service.clone();
         tokio::spawn(async move {
             loop {
                 match receiver.recv().await {
-                    Ok(frame) => {
-                        let Some(service) = service.upgrade() else {
+                    Ok(frame) if is_checkpoint_outcome_observer_frame(&frame) => {
+                        if observer_tx.send(frame).is_err() {
                             break;
-                        };
-                        service.observe_broadcast_frame(&frame).await;
+                        }
                     }
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                         tracing::warn!(
                             event = "code_checkpoint.outcome_observer_lagged",
@@ -931,6 +1110,14 @@ impl CheckpointService {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(frame) = observer_rx.recv().await {
+                let Some(service) = processing_service.upgrade() else {
+                    break;
+                };
+                service.observe_broadcast_frame(&frame).await;
             }
         });
     }
@@ -949,54 +1136,161 @@ impl CheckpointService {
             .join("attempt-outcomes-v1.initialized")
     }
 
-    async fn ensure_outcome_store_presence_marker(&self) -> Result<(), String> {
-        let path = self.outcome_store_presence_marker_path();
-        #[cfg(unix)]
-        let open_result = {
-            let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true).mode(0o600);
-            options.open(&path).await
-        };
-        #[cfg(not(unix))]
-        let open_result = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await;
+    fn dispatch_fence_root(&self) -> PathBuf {
+        self.home
+            .join(".freshell")
+            .join("checkpoints")
+            .join(CHECKPOINT_DISPATCH_FENCE_DIRECTORY)
+    }
 
-        let mut marker = match open_result {
-            Ok(marker) => marker,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(error) => {
-                return Err(format!(
-                    "failed to create checkpoint outcome presence marker: {error}"
-                ));
-            }
-        };
-        marker
-            .write_all(b"freshell checkpoint outcomes initialized v1\n")
-            .await
-            .map_err(|error| {
-                format!("failed to write checkpoint outcome presence marker: {error}")
-            })?;
-        marker.sync_all().await.map_err(|error| {
-            format!("failed to flush checkpoint outcome presence marker: {error}")
+    fn dispatch_fence_path(&self, fence: &str) -> Result<PathBuf, String> {
+        validate_checkpoint_dispatch_fence(fence)?;
+        Ok(self.dispatch_fence_root().join(&fence[..2]).join(fence))
+    }
+
+    async fn persist_dispatch_fence_hash(&self, fence: &str) -> Result<(), String> {
+        let destination = self.dispatch_fence_path(fence)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| "checkpoint dispatch fence has no parent directory".to_string())?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            format!("failed to create checkpoint dispatch fence directory: {error}")
         })?;
-        #[cfg(unix)]
-        {
-            let parent = path.parent().ok_or_else(|| {
-                "checkpoint outcome presence marker has no parent directory".to_owned()
-            })?;
-            tokio::fs::File::open(parent)
+        sync_checkpoint_outcome_directory_chain(parent.to_path_buf(), self.home.as_ref().clone())
+            .await?;
+
+        if let Ok(metadata) = tokio::fs::symlink_metadata(&destination).await {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("checkpoint dispatch fence has an unsafe file type".into());
+            }
+            let contents = tokio::fs::read(&destination)
                 .await
-                .map_err(|error| {
-                    format!("failed to open checkpoint outcome directory for flush: {error}")
-                })?
+                .map_err(|error| format!("failed to read checkpoint dispatch fence: {error}"))?;
+            if contents != fence.as_bytes() {
+                return Err("checkpoint dispatch fence contents do not match its key".into());
+            }
+            tokio::fs::File::open(&destination)
+                .await
+                .map_err(|error| format!("failed to open checkpoint dispatch fence: {error}"))?
                 .sync_all()
                 .await
-                .map_err(|error| {
-                    format!("failed to flush checkpoint outcome directory: {error}")
+                .map_err(|error| format!("failed to flush checkpoint dispatch fence: {error}"))?;
+            return sync_checkpoint_outcome_directory_chain(
+                parent.to_path_buf(),
+                self.home.as_ref().clone(),
+            )
+            .await;
+        }
+
+        let temporary = parent.join(format!("{fence}.tmp-{}", uuid::Uuid::new_v4()));
+        if let Err(error) = write_synced_checkpoint_file(&temporary, fence.as_bytes()).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        if let Err(error) = publish_checkpoint_file(&temporary, &destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(format!(
+                "failed to publish checkpoint dispatch fence: {error}"
+            ));
+        }
+        sync_checkpoint_outcome_directory_chain(parent.to_path_buf(), self.home.as_ref().clone())
+            .await
+    }
+
+    async fn dispatch_fence_exists(&self, fence: &str, expected: bool) -> Result<bool, String> {
+        let root = self.dispatch_fence_root();
+        match tokio::fs::symlink_metadata(&root).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err("checkpoint dispatch fence directory has an unsafe type".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !expected => {
+                return Ok(false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(
+                    "checkpoint dispatch fence directory is missing after initialization".into(),
+                )
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect checkpoint dispatch fence directory: {error}"
+                ))
+            }
+        }
+        let path = self.dispatch_fence_path(fence)?;
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let contents = tokio::fs::read(&path).await.map_err(|error| {
+                    format!("failed to read checkpoint dispatch fence: {error}")
                 })?;
+                if contents != fence.as_bytes() {
+                    return Err("checkpoint dispatch fence contents do not match its key".into());
+                }
+                Ok(true)
+            }
+            Ok(_) => Err("checkpoint dispatch fence has an unsafe file type".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "failed to inspect checkpoint dispatch fence: {error}"
+            )),
+        }
+    }
+
+    async fn ensure_outcome_store_presence_marker(&self) -> Result<(), String> {
+        let path = self.outcome_store_presence_marker_path();
+        let parent = path.parent().ok_or_else(|| {
+            "checkpoint outcome presence marker has no parent directory".to_owned()
+        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("failed to create checkpoint outcome directory: {error}"))?;
+        sync_checkpoint_outcome_directory_chain(parent.to_path_buf(), self.home.as_ref().clone())
+            .await?;
+
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let marker = tokio::fs::read(&path).await.map_err(|error| {
+                    format!("failed to read checkpoint outcome presence marker: {error}")
+                })?;
+                if marker == b"freshell checkpoint outcomes initialized v1\n" {
+                    return sync_checkpoint_outcome_directory_chain(
+                        parent.to_path_buf(),
+                        self.home.as_ref().clone(),
+                    )
+                    .await;
+                }
+            }
+            Ok(_) => {
+                return Err("checkpoint outcome presence marker has an unsafe file type".into())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect checkpoint outcome presence marker: {error}"
+                ))
+            }
+        }
+
+        let temporary = parent.join(format!(
+            "attempt-outcomes-v1.initialized.tmp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = write_synced_checkpoint_file(
+            &temporary,
+            b"freshell checkpoint outcomes initialized v1\n",
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        if let Err(error) =
+            publish_outcome_store_file_with_parent_sync(&temporary, &path, |parent| {
+                sync_checkpoint_outcome_directory_chain(parent, self.home.as_ref().clone())
+            })
+            .await
+        {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
         }
         Ok(())
     }
@@ -1134,6 +1428,8 @@ impl CheckpointService {
                 return Ok(CheckpointOutcomeStore {
                     version: CHECKPOINT_OUTCOME_STORE_VERSION,
                     outcomes: BTreeMap::new(),
+                    dispatch_fences: BTreeSet::new(),
+                    has_pruned_dispatch_fences: false,
                 });
             }
             Err(error) => {
@@ -1157,10 +1453,23 @@ impl CheckpointService {
                 "checkpoint outcome store was readable but its durable presence marker could not be written"
             );
         }
-        let store: CheckpointOutcomeStore = serde_json::from_slice(&raw)
+        let mut store: CheckpointOutcomeStore = serde_json::from_slice(&raw)
             .map_err(|error| format!("invalid checkpoint attempt outcome store: {error}"))?;
-        if store.version != CHECKPOINT_OUTCOME_STORE_VERSION {
+        if store.version != CHECKPOINT_OUTCOME_STORE_VERSION
+            && store.version != CHECKPOINT_OUTCOME_STORE_LEGACY_VERSION
+        {
             return Err("unsupported checkpoint attempt outcome store version".to_string());
+        }
+        if store.version == CHECKPOINT_OUTCOME_STORE_LEGACY_VERSION
+            || !store.dispatch_fences.is_empty()
+        {
+            let legacy_fences = std::mem::take(&mut store.dispatch_fences);
+            for fence in &legacy_fences {
+                self.persist_dispatch_fence_hash(fence).await?;
+            }
+            store.has_pruned_dispatch_fences |= !legacy_fences.is_empty();
+            store.version = CHECKPOINT_OUTCOME_STORE_VERSION;
+            self.write_outcome_store(&store).await?;
         }
         self.durable_outcome_cache
             .lock()
@@ -1170,6 +1479,7 @@ impl CheckpointService {
     }
 
     async fn write_outcome_store(&self, store: &CheckpointOutcomeStore) -> Result<(), String> {
+        let mut store = store.clone();
         let path = self.outcome_store_path();
         let parent = path
             .parent()
@@ -1177,44 +1487,55 @@ impl CheckpointService {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|error| format!("failed to create checkpoint outcome directory: {error}"))?;
+        sync_checkpoint_outcome_directory_chain(parent.to_path_buf(), self.home.as_ref().clone())
+            .await?;
         self.ensure_outcome_store_presence_marker().await?;
+
+        for fence in std::mem::take(&mut store.dispatch_fences) {
+            self.persist_dispatch_fence_hash(&fence).await?;
+            store.has_pruned_dispatch_fences = true;
+        }
+        while store.outcomes.len() > CHECKPOINT_OUTCOME_STORE_LIMIT {
+            let oldest = store
+                .outcomes
+                .iter()
+                .min_by_key(|(_, item)| item.created_at_ms)
+                .map(|(key, item)| (key.clone(), item.dispatch_started));
+            let Some((oldest, dispatch_started)) = oldest else {
+                break;
+            };
+            if dispatch_started {
+                self.persist_dispatch_fence_hash(&checkpoint_attempt_fence_key(&oldest))
+                    .await?;
+                store.has_pruned_dispatch_fences = true;
+            }
+            store.outcomes.remove(&oldest);
+        }
+        store.version = CHECKPOINT_OUTCOME_STORE_VERSION;
+        store.dispatch_fences.clear();
         let temporary = parent.join(format!(
             "attempt-outcomes-v1.json.tmp-{}",
             uuid::Uuid::new_v4()
         ));
-        let serialized = serde_json::to_vec_pretty(store)
+        let serialized = serde_json::to_vec_pretty(&store)
             .map_err(|error| format!("failed to serialize checkpoint outcomes: {error}"))?;
-        #[cfg(unix)]
-        let write_result = {
-            let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true).mode(0o600);
-            match options.open(&temporary).await {
-                Ok(mut file) => match file.write_all(&serialized).await {
-                    Ok(()) => file
-                        .sync_all()
-                        .await
-                        .map_err(|error| format!("failed to flush checkpoint outcomes: {error}")),
-                    Err(error) => Err(format!("failed to write checkpoint outcomes: {error}")),
-                },
-                Err(error) => Err(format!("failed to create checkpoint outcome file: {error}")),
-            }
-        };
-        #[cfg(not(unix))]
-        let write_result = tokio::fs::write(&temporary, &serialized)
-            .await
-            .map_err(|error| format!("failed to write checkpoint outcomes: {error}"));
-        if let Err(error) = write_result {
+        if let Err(error) = write_synced_checkpoint_file(&temporary, &serialized).await {
             let _ = tokio::fs::remove_file(&temporary).await;
             return Err(error);
         }
-        if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+        if let Err(error) =
+            publish_outcome_store_file_with_parent_sync(&temporary, &path, |parent| {
+                sync_checkpoint_outcome_directory_chain(parent, self.home.as_ref().clone())
+            })
+            .await
+        {
             let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(format!("failed to publish checkpoint outcomes: {error}"));
+            return Err(error);
         }
         self.durable_outcome_cache
             .lock()
             .expect("checkpoint dispatch fences mutex poisoned")
-            .replace_from_store(store);
+            .replace_from_store(&store);
         Ok(())
     }
 
@@ -1226,15 +1547,6 @@ impl CheckpointService {
         let _guard = self.outcome_gate.lock().await;
         let mut store = self.read_outcome_store().await?;
         store.outcomes.insert(key.to_string(), outcome.clone());
-        while store.outcomes.len() > CHECKPOINT_OUTCOME_STORE_LIMIT {
-            let oldest = store
-                .outcomes
-                .iter()
-                .min_by_key(|(_, item)| item.created_at_ms)
-                .map(|(key, _)| key.clone());
-            let Some(oldest) = oldest else { break };
-            store.outcomes.remove(&oldest);
-        }
         self.write_outcome_store(&store).await?;
         self.volatile_outcomes
             .lock()
@@ -1322,7 +1634,7 @@ impl CheckpointService {
         );
     }
 
-    async fn find_outcome(&self, key: &str) -> Result<Option<StoredCheckpointOutcome>, String> {
+    async fn find_attempt(&self, key: &str) -> Result<Option<CheckpointAttemptLookup>, String> {
         if let Some(outcome) = self
             .volatile_outcomes
             .lock()
@@ -1330,19 +1642,63 @@ impl CheckpointService {
             .get(key)
             .cloned()
         {
-            return Ok(Some(outcome));
+            return Ok(Some(CheckpointAttemptLookup::Outcome(Box::new(outcome))));
         }
-        if let Some(outcome) = self
-            .durable_outcome_cache
-            .lock()
-            .expect("durable checkpoint outcome cache mutex poisoned")
-            .cached_outcome(key)
         {
-            return Ok(Some(outcome));
+            let cache = self
+                .durable_outcome_cache
+                .lock()
+                .expect("durable checkpoint outcome cache mutex poisoned");
+            if let Some(outcome) = cache.cached_outcome(key) {
+                return Ok(Some(CheckpointAttemptLookup::Outcome(Box::new(outcome))));
+            }
+            if cache.cached_dispatch_fence(key) {
+                return Ok(Some(CheckpointAttemptLookup::DispatchFence));
+            }
         }
         let _guard = self.outcome_gate.lock().await;
-        let store = self.read_outcome_store().await?;
-        Ok(store.outcomes.get(key).cloned())
+        let store = match self.read_outcome_store().await {
+            Ok(store) => store,
+            Err(error) => {
+                let has_pruned_fences = self
+                    .durable_outcome_cache
+                    .lock()
+                    .expect("durable checkpoint outcome cache mutex poisoned")
+                    .has_pruned_dispatch_fences;
+                if has_pruned_fences {
+                    match self
+                        .dispatch_fence_exists(&checkpoint_attempt_fence_key(key), true)
+                        .await
+                    {
+                        Ok(true) => return Ok(Some(CheckpointAttemptLookup::DispatchFence)),
+                        Ok(false) => {}
+                        Err(fence_error) => {
+                            return Err(format!("{error}; {fence_error}"));
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if let Some(outcome) = store.outcomes.get(key).cloned() {
+            return Ok(Some(CheckpointAttemptLookup::Outcome(Box::new(outcome))));
+        }
+        let fence = checkpoint_attempt_fence_key(key);
+        if store.dispatch_fences.contains(&fence)
+            || (store.has_pruned_dispatch_fences
+                && self.dispatch_fence_exists(&fence, true).await?)
+        {
+            return Ok(Some(CheckpointAttemptLookup::DispatchFence));
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    async fn find_outcome(&self, key: &str) -> Result<Option<StoredCheckpointOutcome>, String> {
+        Ok(match self.find_attempt(key).await? {
+            Some(CheckpointAttemptLookup::Outcome(outcome)) => Some(*outcome),
+            Some(CheckpointAttemptLookup::DispatchFence) | None => None,
+        })
     }
 
     async fn replay_outcome_page(
@@ -1500,15 +1856,44 @@ impl CheckpointService {
     }
 
     async fn observe_broadcast_frame(&self, frame: &str) {
-        let Ok(message) = serde_json::from_str::<Value>(frame) else {
-            return;
-        };
+        if let Err(error) = self.persist_event_before_broadcast(frame).await {
+            tracing::error!(
+                event = "code_checkpoint.outcome_observer_persist_failed",
+                cause = %error,
+                "checkpoint outcome observer could not persist a provider event"
+            );
+        }
+    }
+
+    /// Persist checkpoint-relevant provider events before a producer forwards them
+    /// to the shared broadcast bus. `require_match` is used for frames carrying an
+    /// identity promised by a checkpointed request; returning success without an
+    /// associated outcome would falsely claim that identity is durable.
+    pub async fn persist_event_before_broadcast(&self, frame: &str) -> Result<(), String> {
+        self.persist_event_before_broadcast_with_match(frame, false)
+            .await
+    }
+
+    pub async fn persist_event_before_broadcast_with_match(
+        &self,
+        frame: &str,
+        require_match: bool,
+    ) -> Result<(), String> {
+        let message = serde_json::from_str::<Value>(frame)
+            .map_err(|error| format!("checkpoint event was not valid JSON: {error}"))?;
         match message.get("type").and_then(Value::as_str) {
-            Some("freshAgent.send.accepted") => self.observe_accepted(&message).await,
-            Some("freshAgent.session.materialized") => self.observe_materialized(&message).await,
-            Some("freshAgent.event") => self.observe_turn_identity(&message).await,
+            Some("freshAgent.send.accepted") => {
+                self.observe_accepted_with_match(&message, require_match)
+                    .await?
+            }
+            Some("freshAgent.session.materialized") => self.observe_materialized(&message).await?,
+            Some("freshAgent.event") => {
+                self.observe_turn_identity_with_match(&message, require_match)
+                    .await?
+            }
             _ => {}
         }
+        Ok(())
     }
 
     async fn update_matching_outcomes<Matches, Update>(
@@ -1535,32 +1920,54 @@ impl CheckpointService {
         Ok(changed)
     }
 
-    async fn observe_accepted(&self, message: &Value) {
+    #[cfg(test)]
+    async fn observe_accepted(&self, message: &Value) -> Result<(), String> {
+        self.observe_accepted_with_match(message, false).await
+    }
+
+    async fn observe_accepted_with_match(
+        &self,
+        message: &Value,
+        require_match: bool,
+    ) -> Result<(), String> {
+        let missing_field = |field: &str| {
+            if require_match {
+                Err(format!(
+                    "required checkpoint accepted frame is missing {field}"
+                ))
+            } else {
+                Ok(())
+            }
+        };
         let Some(request_id) = message.get("requestId").and_then(Value::as_str) else {
-            return;
+            missing_field("requestId")?;
+            return Ok(());
         };
         let Some(provider) = message
             .get("provider")
             .and_then(Value::as_str)
             .and_then(parse_agent_provider)
         else {
-            return;
+            missing_field("provider")?;
+            return Ok(());
         };
         let Some(session_type) = message
             .get("sessionType")
             .and_then(Value::as_str)
             .and_then(parse_session_type)
         else {
-            return;
+            missing_field("sessionType")?;
+            return Ok(());
         };
         let Some(session_id) = message.get("sessionId").and_then(Value::as_str) else {
-            return;
+            missing_field("sessionId")?;
+            return Ok(());
         };
         let submitted_turn_id = message
             .get("submittedTurnId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let updated = self
+        let changed = self
             .update_matching_outcomes(
                 |record| {
                     record.outcome.provider == provider
@@ -1570,6 +1977,13 @@ impl CheckpointService {
                             .session_aliases
                             .iter()
                             .any(|alias| alias == session_id)
+                        && submitted_turn_id.as_deref().is_some_and(|submitted| {
+                            record.submitted_turn_id.as_deref() != Some(submitted)
+                                || (provider == AgentProvider::Codex
+                                    && (record.outcome.native_turn_id.as_deref()
+                                        != Some(submitted)
+                                        || record.outcome.display_turn_id.is_none()))
+                        })
                         && submitted_turn_id.as_deref().is_none_or(|submitted| {
                             record
                                 .outcome
@@ -1582,88 +1996,150 @@ impl CheckpointService {
                     if submitted_turn_id.is_some() {
                         record.submitted_turn_id = submitted_turn_id.clone();
                     }
+                    if provider == AgentProvider::Codex && record.outcome.native_turn_id.is_none() {
+                        record.outcome.native_turn_id = submitted_turn_id.clone();
+                        if record.outcome.display_turn_id.is_none() {
+                            // The client explicitly treats this as the provisional id
+                            // for a Codex turn before transcript projection splits it
+                            // into the final user row `:row-0`.
+                            record.outcome.display_turn_id = submitted_turn_id.clone();
+                        }
+                    }
                 },
             )
-            .await;
-        if let Err(error) = updated {
-            tracing::error!(
-                event = "code_checkpoint.accepted_identity_persist_failed",
-                request_id,
-                cause = %error,
-                "accepted turn identity could not be persisted"
-            );
+            .await
+            .map_err(|error| format!("accepted turn identity could not be persisted: {error}"))?;
+        if require_match && changed.is_empty() {
+            let already_durable = self
+                .accepted_identity_is_durable(
+                    provider,
+                    session_type,
+                    request_id,
+                    session_id,
+                    submitted_turn_id.as_deref(),
+                )
+                .await?;
+            if !already_durable {
+                return Err("accepted turn identity did not match a checkpoint outcome".into());
+            }
         }
+        Ok(())
     }
 
-    async fn observe_materialized(&self, message: &Value) {
+    async fn accepted_identity_is_durable(
+        &self,
+        provider: AgentProvider,
+        session_type: SessionType,
+        request_id: &str,
+        session_id: &str,
+        submitted_turn_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let _guard = self.outcome_gate.lock().await;
+        let store = self.read_outcome_store().await?;
+        Ok(store.outcomes.values().any(|record| {
+            record.outcome.provider == provider
+                && record.outcome.session_type == session_type
+                && record.request_ids.iter().any(|alias| alias == request_id)
+                && record
+                    .session_aliases
+                    .iter()
+                    .any(|alias| alias == session_id)
+                && submitted_turn_id.is_none_or(|submitted| {
+                    record.submitted_turn_id.as_deref() == Some(submitted)
+                        && record.outcome.native_turn_id.as_deref() == Some(submitted)
+                })
+        }))
+    }
+
+    async fn observe_materialized(&self, message: &Value) -> Result<(), String> {
         let Some(previous) = message.get("previousSessionId").and_then(Value::as_str) else {
-            return;
+            return Ok(());
         };
         let Some(session_id) = message.get("sessionId").and_then(Value::as_str) else {
-            return;
+            return Ok(());
         };
         let Some(provider) = message
             .get("provider")
             .and_then(Value::as_str)
             .and_then(parse_agent_provider)
         else {
-            return;
+            return Ok(());
         };
         let Some(session_type) = message
             .get("sessionType")
             .and_then(Value::as_str)
             .and_then(parse_session_type)
         else {
-            return;
+            return Ok(());
         };
-        let updated = self
-            .update_matching_outcomes(
-                |record| {
-                    record.outcome.provider == provider
-                        && record.outcome.session_type == session_type
-                        && record.session_aliases.iter().any(|alias| alias == previous)
-                },
-                |record| {
-                    if !record
-                        .session_aliases
-                        .iter()
-                        .any(|alias| alias == session_id)
-                    {
-                        record.session_aliases.push(session_id.to_string());
-                    }
-                },
-            )
-            .await;
-        if let Err(error) = updated {
-            tracing::error!(
-                event = "code_checkpoint.session_alias_persist_failed",
-                cause = %error,
-                "checkpoint session materialization alias could not be persisted"
-            );
-        }
+        self.update_matching_outcomes(
+            |record| {
+                record.outcome.provider == provider
+                    && record.outcome.session_type == session_type
+                    && record.session_aliases.iter().any(|alias| alias == previous)
+            },
+            |record| {
+                if !record
+                    .session_aliases
+                    .iter()
+                    .any(|alias| alias == session_id)
+                {
+                    record.session_aliases.push(session_id.to_string());
+                }
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("checkpoint session alias could not be persisted: {error}"))
     }
 
-    async fn observe_turn_identity(&self, message: &Value) {
+    #[cfg(test)]
+    async fn observe_turn_identity(&self, message: &Value) -> Result<(), String> {
+        self.observe_turn_identity_with_match(message, false).await
+    }
+
+    async fn observe_turn_identity_with_match(
+        &self,
+        message: &Value,
+        require_match: bool,
+    ) -> Result<(), String> {
+        let missing_field = |field: &str| {
+            if require_match {
+                Err(format!(
+                    "required checkpoint identity frame is missing {field}"
+                ))
+            } else {
+                Ok(())
+            }
+        };
         let Some(event) = message.get("event") else {
-            return;
+            missing_field("event")?;
+            return Ok(());
         };
         if event.get("type").and_then(Value::as_str) != Some("checkpointTurnIdentity") {
-            return;
+            missing_field("event.type=checkpointTurnIdentity")?;
+            return Ok(());
         }
         let Some(logical_attempt_id) = event.get("logicalAttemptId").and_then(Value::as_str) else {
-            return;
+            missing_field("event.logicalAttemptId")?;
+            return Ok(());
         };
         let Some(request_id) = event.get("requestId").and_then(Value::as_str) else {
-            return;
+            missing_field("event.requestId")?;
+            return Ok(());
         };
         let Some(native_turn_id) = event.get("nativeTurnId").and_then(Value::as_str) else {
-            return;
+            missing_field("event.nativeTurnId")?;
+            return Ok(());
         };
         let session_id = event
             .get("sessionId")
             .and_then(Value::as_str)
             .or_else(|| message.get("sessionId").and_then(Value::as_str));
-        let Some(session_id) = session_id else { return };
+        let Some(session_id) = session_id else {
+            missing_field("event.sessionId")?;
+            return Ok(());
+        };
         let display_turn_id = event
             .get("displayTurnId")
             .and_then(Value::as_str)
@@ -1673,16 +2149,18 @@ impl CheckpointService {
             .and_then(Value::as_str)
             .and_then(parse_agent_provider)
         else {
-            return;
+            missing_field("provider")?;
+            return Ok(());
         };
         let Some(session_type) = message
             .get("sessionType")
             .and_then(Value::as_str)
             .and_then(parse_session_type)
         else {
-            return;
+            missing_field("sessionType")?;
+            return Ok(());
         };
-        let updated = self
+        let records = self
             .update_matching_outcomes(
                 |record| {
                     record.outcome.logical_attempt_id == logical_attempt_id
@@ -1702,36 +2180,67 @@ impl CheckpointService {
                             .native_turn_id
                             .as_deref()
                             .is_none_or(|existing| existing == native_turn_id)
+                        && (record.outcome.native_turn_id.as_deref() != Some(native_turn_id)
+                            || display_turn_id.as_deref().is_some_and(|display| {
+                                record.outcome.display_turn_id.as_deref() != Some(display)
+                            })
+                            || record.submitted_turn_id.as_deref() != Some(native_turn_id))
                 },
                 |record| {
                     record.outcome.native_turn_id = Some(native_turn_id.to_string());
+                    // The provider receipt is emitted only after the native history
+                    // row was matched to the exact turn id accepted for this request.
+                    // Persist that accepted id with the receipt so a restart does not
+                    // depend on the separately queued send.accepted frame.
+                    if record.submitted_turn_id.is_none() {
+                        record.submitted_turn_id = Some(native_turn_id.to_string());
+                    }
                     if display_turn_id.is_some() {
                         record.outcome.display_turn_id = display_turn_id.clone();
                     }
                 },
             )
-            .await;
-        match updated {
-            Ok(records) => {
-                for record in records {
-                    if record.request_ids.is_empty() {
-                        self.broadcast_outcome(record.outcome.clone());
-                    } else {
-                        for request_id in &record.request_ids {
-                            let mut outcome = record.outcome.clone();
-                            outcome.request_id = request_id.clone();
-                            self.broadcast_outcome(outcome);
-                        }
-                    }
+            .await
+            .map_err(|error| {
+                format!("provider checkpoint turn identity could not be persisted: {error}")
+            })?;
+        if require_match && records.is_empty() {
+            let _guard = self.outcome_gate.lock().await;
+            let store = self.read_outcome_store().await?;
+            let already_durable = store.outcomes.values().any(|record| {
+                record.outcome.logical_attempt_id == logical_attempt_id
+                    && record.outcome.provider == provider
+                    && record.outcome.session_type == session_type
+                    && record.request_ids.iter().any(|alias| alias == request_id)
+                    && record
+                        .session_aliases
+                        .iter()
+                        .any(|alias| alias == session_id)
+                    && record.outcome.native_turn_id.as_deref() == Some(native_turn_id)
+                    && record
+                        .submitted_turn_id
+                        .as_deref()
+                        .is_none_or(|submitted| submitted == native_turn_id)
+                    && display_turn_id.as_deref().is_none_or(|display| {
+                        record.outcome.display_turn_id.as_deref() == Some(display)
+                    })
+            });
+            if !already_durable {
+                return Err("provider turn identity did not match a checkpoint outcome".into());
+            }
+        }
+        for record in records {
+            if record.request_ids.is_empty() {
+                self.broadcast_outcome(record.outcome.clone());
+            } else {
+                for request_id in &record.request_ids {
+                    let mut outcome = record.outcome.clone();
+                    outcome.request_id = request_id.clone();
+                    self.broadcast_outcome(outcome);
                 }
             }
-            Err(error) => tracing::error!(
-                event = "code_checkpoint.turn_identity_persist_failed",
-                logical_attempt_id,
-                cause = %error,
-                "provider checkpoint turn identity could not be persisted"
-            ),
         }
+        Ok(())
     }
 
     fn active_cooldown(&self, workspace: &Path) -> Option<Duration> {
@@ -2613,6 +3122,23 @@ impl CheckpointService {
     }
 }
 
+fn is_checkpoint_outcome_observer_frame(frame: &str) -> bool {
+    let Ok(message) = serde_json::from_str::<Value>(frame) else {
+        return false;
+    };
+    match message.get("type").and_then(Value::as_str) {
+        Some("freshAgent.send.accepted") | Some("freshAgent.session.materialized") => true,
+        Some("freshAgent.event") => {
+            message
+                .get("event")
+                .and_then(|event| event.get("type"))
+                .and_then(Value::as_str)
+                == Some("checkpointTurnIdentity")
+        }
+        _ => false,
+    }
+}
+
 enum CaptureAttempt {
     Published(String),
     Failed(String),
@@ -2650,6 +3176,20 @@ fn checkpoint_attempt_key(send: &FreshAgentSend, logical_attempt_id: &str) -> St
         "{provider}:{session_type}:{}:{logical_attempt_id}",
         send.session_id
     )
+}
+
+fn checkpoint_attempt_fence_key(key: &str) -> String {
+    URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(key.as_bytes()))
+}
+
+fn validate_checkpoint_dispatch_fence(fence: &str) -> Result<(), String> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(fence)
+        .map_err(|_| "checkpoint dispatch fence key is invalid".to_string())?;
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(decoded) != fence {
+        return Err("checkpoint dispatch fence key is invalid".into());
+    }
+    Ok(())
 }
 
 fn parse_agent_provider(value: &str) -> Option<AgentProvider> {
@@ -2748,8 +3288,9 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
             }
 
             let mut volatile_fallback = false;
-            let (record, mut allow_forward) = match self.find_outcome(&key).await {
-                Ok(Some(mut record)) => {
+            let (record, mut allow_forward) = match self.find_attempt(&key).await {
+                Ok(Some(CheckpointAttemptLookup::Outcome(record))) => {
+                    let mut record = *record;
                     let added_alias = !record.request_ids.iter().any(|alias| alias == &request_id)
                         && record.request_ids.len() < 16;
                     if added_alias {
@@ -2809,6 +3350,26 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                             }
                         }
                     }
+                }
+                Ok(Some(CheckpointAttemptLookup::DispatchFence)) => {
+                    tracing::warn!(
+                        event = "code_checkpoint.pruned_attempt_retry_blocked",
+                        send_request_id = %request_id,
+                        logical_attempt_id = %logical_attempt_id,
+                        "retry was withheld because its earlier dispatch record aged out of outcome history"
+                    );
+                    let mut record = self.new_record(
+                        &send,
+                        &logical_attempt_id,
+                        &request_id,
+                        None,
+                        Err((
+                            "attempt_history_expired",
+                            "This logical attempt was already sent, but its detailed rewind result has expired. Retry with a new logical attempt ID.".into(),
+                        )),
+                    );
+                    record.dispatch_started = true;
+                    (record, false)
                 }
                 Ok(None) => {
                     let mut record = self
@@ -5638,6 +6199,58 @@ async fn post_checkpoint_restore(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn outcome_store_publish_requires_parent_directory_flush() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("attempt-outcomes.tmp");
+        let destination = directory.path().join("attempt-outcomes.json");
+        tokio::fs::write(&temporary, b"durable dispatch fence")
+            .await
+            .unwrap();
+        let sync_attempted = Arc::new(AtomicBool::new(false));
+        let sync_attempted_in_callback = Arc::clone(&sync_attempted);
+        let expected_parent = directory.path().to_path_buf();
+        let published_path = destination.clone();
+
+        let result = publish_outcome_store_file_with_parent_sync(
+            &temporary,
+            &destination,
+            move |parent| async move {
+                assert_eq!(parent, expected_parent);
+                assert_eq!(
+                    tokio::fs::read(&published_path).await.unwrap(),
+                    b"durable dispatch fence",
+                    "the directory flush must follow the atomic rename"
+                );
+                sync_attempted_in_callback.store(true, Ordering::SeqCst);
+                Err("injected parent directory sync failure".to_string())
+            },
+        )
+        .await;
+
+        assert!(sync_attempted.load(Ordering::SeqCst));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("injected parent directory sync failure"),
+            "a failed directory flush must prevent durable publication success"
+        );
+    }
+
+    #[test]
+    fn checkpoint_outcome_directory_flush_includes_new_home_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let checkpoint_directory = home.join(".freshell/checkpoints");
+
+        assert_eq!(
+            checkpoint_outcome_directory_chain(&checkpoint_directory, &home).unwrap(),
+            vec![checkpoint_directory, home.join(".freshell"), home.clone(),]
+        );
+    }
+
     #[derive(Clone)]
     struct ReviewR6CaptureLogs(
         Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
@@ -5962,7 +6575,8 @@ mod tests {
                 "sessionType": "freshopencode",
                 "submittedTurnId": "provider-turn-1"
             }))
-            .await;
+            .await
+            .unwrap();
 
         let dispatches_for_second = Arc::clone(&dispatches);
         service
@@ -5981,6 +6595,169 @@ mod tests {
         assert!(record.dispatch_started);
         assert_eq!(record.submitted_turn_id.as_deref(), Some("provider-turn-1"));
         assert!(record.request_ids.contains(&"request-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn pruned_dispatch_outcome_keeps_a_durable_retry_fence() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx.clone()),
+        ));
+        let send_for_key = |request_id: &str, logical_attempt_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-pruned-dispatch".into(),
+            session_type: SessionType::Freshopencode,
+            text: "retrying this attempt must not send it twice".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: logical_attempt_id.into(),
+                workspace: None,
+            }),
+        };
+
+        let old_logical_attempt = "attempt-pruned-before-retry";
+        let old_key = checkpoint_attempt_key(
+            &send_for_key("request-original", old_logical_attempt),
+            old_logical_attempt,
+        );
+        let mut outcomes = BTreeMap::new();
+        for index in 0..CHECKPOINT_OUTCOME_STORE_LIMIT {
+            let logical_attempt_id = if index == 0 {
+                old_logical_attempt.to_string()
+            } else {
+                format!("filler-attempt-{index}")
+            };
+            let send = send_for_key(&format!("filler-request-{index}"), &logical_attempt_id);
+            let mut record = service.new_record(
+                &send,
+                &logical_attempt_id,
+                send.request_id.as_deref().unwrap(),
+                None,
+                Err(("workspace_unavailable", "No workspace".into())),
+            );
+            record.created_at_ms = index as u64;
+            record.dispatch_started = true;
+            outcomes.insert(checkpoint_attempt_key(&send, &logical_attempt_id), record);
+        }
+        service
+            .write_outcome_store(&CheckpointOutcomeStore {
+                version: CHECKPOINT_OUTCOME_STORE_VERSION,
+                outcomes,
+                dispatch_fences: BTreeSet::new(),
+                has_pruned_dispatch_fences: false,
+            })
+            .await
+            .unwrap();
+
+        let newer_logical_attempt = "newer-attempt-after-prune";
+        let newer_send = send_for_key("newer-request", newer_logical_attempt);
+        let mut newer_record = service.new_record(
+            &newer_send,
+            newer_logical_attempt,
+            "newer-request",
+            None,
+            Err(("workspace_unavailable", "No workspace".into())),
+        );
+        newer_record.created_at_ms = u64::MAX;
+        newer_record.dispatch_started = true;
+        service
+            .persist_outcome(
+                &checkpoint_attempt_key(&newer_send, newer_logical_attempt),
+                newer_record,
+            )
+            .await
+            .unwrap();
+
+        let pruned = service.read_outcome_store().await.unwrap();
+        assert!(!pruned.outcomes.contains_key(&old_key));
+        assert!(
+            pruned.dispatch_fences.len() <= CHECKPOINT_DISPATCH_FENCE_LIMIT,
+            "the checkpoint JSON store must not retain an unbounded fence set"
+        );
+        assert!(pruned.has_pruned_dispatch_fences);
+        assert!(service
+            .dispatch_fence_path(&checkpoint_attempt_fence_key(&old_key))
+            .unwrap()
+            .exists());
+        assert!(pruned.outcomes.len() <= CHECKPOINT_OUTCOME_STORE_LIMIT);
+
+        let (retry_broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = retry_broadcast_tx.subscribe();
+        let recovered = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(retry_broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let retry_send = send_for_key("request-retry", old_logical_attempt);
+        let dispatches_for_retry = Arc::clone(&dispatches);
+        recovered
+            .clone()
+            .barrier_and_forward(
+                retry_send,
+                Box::pin(async move {
+                    dispatches_for_retry.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["status"], "unavailable");
+        assert_eq!(outcome["code"], "attempt_history_expired");
+        assert!(outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains("new logical attempt ID"));
+    }
+
+    #[tokio::test]
+    async fn legacy_dispatch_fences_migrate_to_addressable_durable_files() {
+        let home = tempfile::tempdir().unwrap();
+        let store_dir = home.path().join(".freshell/checkpoints");
+        tokio::fs::create_dir_all(&store_dir).await.unwrap();
+        let store_path = store_dir.join("attempt-outcomes-v1.json");
+        let old_key = "legacy-pruned-checkpoint-attempt";
+        let legacy_fence = checkpoint_attempt_fence_key(old_key);
+        tokio::fs::write(
+            &store_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": CHECKPOINT_OUTCOME_STORE_LEGACY_VERSION,
+                "outcomes": {},
+                "dispatchFences": [legacy_fence],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(4);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+
+        let migrated = service.read_outcome_store().await.unwrap();
+
+        assert_eq!(migrated.version, CHECKPOINT_OUTCOME_STORE_VERSION);
+        assert!(migrated.dispatch_fences.is_empty());
+        assert!(migrated.has_pruned_dispatch_fences);
+        assert!(matches!(
+            service.find_attempt(old_key).await.unwrap(),
+            Some(CheckpointAttemptLookup::DispatchFence)
+        ));
+        assert_eq!(
+            tokio::fs::read(service.dispatch_fence_path(&legacy_fence).unwrap())
+                .await
+                .unwrap(),
+            legacy_fence.as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -6484,6 +7261,8 @@ mod tests {
         let empty_store = CheckpointOutcomeStore {
             version: CHECKPOINT_OUTCOME_STORE_VERSION,
             outcomes: BTreeMap::new(),
+            dispatch_fences: BTreeSet::new(),
+            has_pruned_dispatch_fences: false,
         };
         tokio::fs::write(&store_path, serde_json::to_vec(&empty_store).unwrap())
             .await
@@ -6570,6 +7349,8 @@ mod tests {
         let empty_store = CheckpointOutcomeStore {
             version: CHECKPOINT_OUTCOME_STORE_VERSION,
             outcomes: BTreeMap::new(),
+            dispatch_fences: BTreeSet::new(),
+            has_pruned_dispatch_fences: false,
         };
         tokio::fs::write(&store_path, serde_json::to_vec(&empty_store).unwrap())
             .await
@@ -6713,6 +7494,8 @@ mod tests {
             .write_outcome_store(&CheckpointOutcomeStore {
                 version: CHECKPOINT_OUTCOME_STORE_VERSION,
                 outcomes,
+                dispatch_fences: BTreeSet::new(),
+                has_pruned_dispatch_fences: false,
             })
             .await
             .unwrap();
@@ -6724,7 +7507,8 @@ mod tests {
                 "sessionType": "freshopencode",
                 "submittedTurnId": "durable-turn-0"
             }))
-            .await;
+            .await
+            .unwrap();
 
         let durable_count = service.read_outcome_store().await.unwrap().outcomes.len();
         assert_eq!(durable_count, CHECKPOINT_VOLATILE_FENCE_LIMIT);
@@ -7016,7 +7800,8 @@ mod tests {
                     "displayTurnId": "codex-native-turn-1:row-0"
                 }
             }))
-            .await;
+            .await
+            .unwrap();
 
         let persisted = service.read_outcome_store().await.unwrap();
         let saved = persisted.outcomes.get(&key).unwrap();
@@ -7111,7 +7896,8 @@ mod tests {
                 "previousSessionId": "provisional-codex-session",
                 "sessionId": "durable-codex-session"
             }))
-            .await;
+            .await
+            .unwrap();
 
         let (replay_tx, mut replay_rx) = tokio::sync::broadcast::channel(8);
         let reloaded = Arc::new(CheckpointService::new(
@@ -7213,6 +7999,8 @@ mod tests {
             .write_outcome_store(&CheckpointOutcomeStore {
                 version: CHECKPOINT_OUTCOME_STORE_VERSION,
                 outcomes,
+                dispatch_fences: BTreeSet::new(),
+                has_pruned_dispatch_fences: false,
             })
             .await
             .unwrap();
@@ -7326,7 +8114,8 @@ mod tests {
                 "attempt-identity-first",
                 "different-turn-first",
             ))
-            .await;
+            .await
+            .unwrap();
         let persisted = service.read_outcome_store().await.unwrap();
         let first_saved = persisted.outcomes.get(&first_key).unwrap();
         assert_eq!(first_saved.outcome.native_turn_id, None);
@@ -7338,7 +8127,8 @@ mod tests {
                 "attempt-identity-first",
                 "accepted-turn-first",
             ))
-            .await;
+            .await
+            .unwrap();
         let persisted = service.read_outcome_store().await.unwrap();
         assert_eq!(
             persisted
@@ -7368,7 +8158,8 @@ mod tests {
                 "attempt-identity-second",
                 "identity-before-acceptance",
             ))
-            .await;
+            .await
+            .unwrap();
         service
             .observe_accepted(&json!({
                 "requestId": "request-identity-second",
@@ -7377,7 +8168,8 @@ mod tests {
                 "sessionType": "freshcodex",
                 "submittedTurnId": "different-accepted-turn"
             }))
-            .await;
+            .await
+            .unwrap();
 
         let persisted = service.read_outcome_store().await.unwrap();
         let second_saved = persisted.outcomes.get(&second_key).unwrap();
@@ -7386,8 +8178,9 @@ mod tests {
             Some("identity-before-acceptance")
         );
         assert_eq!(
-            second_saved.submitted_turn_id, None,
-            "a conflicting later acceptance cannot be joined to this checkpoint"
+            second_saved.submitted_turn_id.as_deref(),
+            Some("identity-before-acceptance"),
+            "the persisted identity receipt proves the submitted turn before a conflicting later acceptance"
         );
 
         let third_send = send("request-identity-third", "attempt-identity-third");
@@ -7409,7 +8202,8 @@ mod tests {
                 "sessionId": "codex-session",
                 "sessionType": "freshcodex"
             }))
-            .await;
+            .await
+            .unwrap();
 
         let persisted = service.read_outcome_store().await.unwrap();
         assert_eq!(
@@ -7422,6 +8216,308 @@ mod tests {
             Some("accepted-turn-third"),
             "an accepted event without an optional native ID must preserve exact identity already recorded"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_is_durable_for_each_provider_before_forwarding() {
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+
+        for (provider, session_type) in [
+            ("codex", "freshcodex"),
+            ("claude", "freshclaude"),
+            ("opencode", "freshopencode"),
+        ] {
+            let request_id = format!("{provider}-checkpoint-request");
+            let logical_attempt_id = format!("{provider}-checkpoint-attempt");
+            let session_id = format!("{provider}-checkpoint-session");
+            let native_turn_id = format!("{provider}-native-turn");
+            let send = FreshAgentSend {
+                provider: parse_agent_provider(provider).unwrap(),
+                session_id: session_id.clone(),
+                session_type: parse_session_type(session_type).unwrap(),
+                text: "private prompt is never stored".to_string(),
+                cwd: None,
+                images: None,
+                request_id: Some(request_id.clone()),
+                settings: None,
+                observed_epoch: None,
+                observed_generation: None,
+                checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                    logical_attempt_id: logical_attempt_id.clone(),
+                    workspace: None,
+                }),
+            };
+            let key = checkpoint_attempt_key(&send, &logical_attempt_id);
+            let mut record = service.new_record(
+                &send,
+                &logical_attempt_id,
+                &request_id,
+                None,
+                Err(("workspace_unavailable", "No workspace".into())),
+            );
+            record.dispatch_started = true;
+            service.persist_outcome(&key, record).await.unwrap();
+
+            let frame = json!({
+                "type": "freshAgent.event",
+                "provider": provider,
+                "sessionId": session_id.clone(),
+                "sessionType": session_type,
+                "event": {
+                    "type": "checkpointTurnIdentity",
+                    "logicalAttemptId": logical_attempt_id.clone(),
+                    "requestId": request_id.clone(),
+                    "sessionId": session_id.clone(),
+                    "nativeTurnId": native_turn_id.clone(),
+                    "displayTurnId": format!("{provider}-display-row")
+                }
+            })
+            .to_string();
+            service
+                .persist_event_before_broadcast_with_match(&frame, true)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{provider} identity was not durably recorded: {error}")
+                });
+
+            let store = service.read_outcome_store().await.unwrap();
+            let outcome = &store.outcomes.get(&key).unwrap().outcome;
+            assert_eq!(
+                outcome.native_turn_id.as_deref(),
+                Some(native_turn_id.as_str())
+            );
+            let expected_display_turn_id = format!("{provider}-display-row");
+            assert_eq!(
+                outcome.display_turn_id.as_deref(),
+                Some(expected_display_turn_id.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_checkpoint_identity_is_durable_before_its_event_is_forwarded() {
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let send = FreshAgentSend {
+            provider: AgentProvider::Codex,
+            session_id: "codex-placeholder-session".to_string(),
+            session_type: SessionType::Freshcodex,
+            text: "private prompt is not stored".to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some("durable-codex-request".to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "durable-codex-attempt".to_string(),
+                workspace: None,
+            }),
+        };
+        let key = checkpoint_attempt_key(&send, "durable-codex-attempt");
+        let mut record = service.new_record(
+            &send,
+            "durable-codex-attempt",
+            "durable-codex-request",
+            None,
+            Err(("workspace_unavailable", "No workspace".into())),
+        );
+        record.dispatch_started = true;
+        service.persist_outcome(&key, record).await.unwrap();
+
+        // Model the Codex respawn path while the asynchronous observer is
+        // still behind: the materialized alias must reach disk before the
+        // accepted frame for the replacement session can save its turn id.
+        service
+            .persist_event_before_broadcast_with_match(
+                &json!({
+                    "type": "freshAgent.session.materialized",
+                    "provider": "codex",
+                    "sessionType": "freshcodex",
+                    "previousSessionId": "codex-placeholder-session",
+                    "sessionId": "durable-codex-session"
+                })
+                .to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+        service
+            .persist_event_before_broadcast_with_match(
+                &json!({
+                    "type": "freshAgent.send.accepted",
+                    "provider": "codex",
+                    "sessionId": "durable-codex-session",
+                    "sessionType": "freshcodex",
+                    "requestId": "durable-codex-request",
+                    "submittedTurnId": "durable-codex-turn"
+                })
+                .to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+        let accepted_store = service.read_outcome_store().await.unwrap();
+        let accepted_outcome = &accepted_store.outcomes.get(&key).unwrap().outcome;
+        assert_eq!(
+            accepted_outcome.native_turn_id.as_deref(),
+            Some("durable-codex-turn")
+        );
+        assert_eq!(
+            accepted_outcome.display_turn_id.as_deref(),
+            Some("durable-codex-turn"),
+            "the Codex UI recognizes the submitted id as a provisional row key"
+        );
+
+        service
+            .persist_event_before_broadcast_with_match(
+                &json!({
+                    "type": "freshAgent.event",
+                    "provider": "codex",
+                    "sessionId": "durable-codex-session",
+                    "sessionType": "freshcodex",
+                    "event": {
+                        "type": "checkpointTurnIdentity",
+                        "logicalAttemptId": "durable-codex-attempt",
+                        "requestId": "durable-codex-request",
+                        "sessionId": "durable-codex-session",
+                        "nativeTurnId": "durable-codex-turn",
+                        "displayTurnId": "durable-codex-turn:row-0"
+                    }
+                })
+                .to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let reloaded = CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(tokio::sync::broadcast::channel(16).0),
+        );
+        let stored = reloaded.read_outcome_store().await.unwrap();
+        let outcome = &stored.outcomes.get(&key).unwrap().outcome;
+        assert_eq!(
+            outcome.native_turn_id.as_deref(),
+            Some("durable-codex-turn")
+        );
+        assert_eq!(
+            outcome.display_turn_id.as_deref(),
+            Some("durable-codex-turn:row-0")
+        );
+        assert_eq!(
+            stored
+                .outcomes
+                .get(&key)
+                .unwrap()
+                .submitted_turn_id
+                .as_deref(),
+            Some("durable-codex-turn"),
+            "the durable identity receipt also proves its exact accepted turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_survives_a_broadcast_burst_during_outcome_persistence() {
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx.clone()),
+        ));
+        let send = FreshAgentSend {
+            provider: AgentProvider::Codex,
+            session_id: "queued-codex-session".to_string(),
+            session_type: SessionType::Freshcodex,
+            text: "private prompt is not stored".to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some("queued-codex-request".to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "queued-codex-attempt".to_string(),
+                workspace: None,
+            }),
+        };
+        let key = checkpoint_attempt_key(&send, "queued-codex-attempt");
+        let mut record = service.new_record(
+            &send,
+            "queued-codex-attempt",
+            "queued-codex-request",
+            None,
+            Err(("workspace_unavailable", "No workspace".into())),
+        );
+        record.dispatch_started = true;
+        service.persist_outcome(&key, record).await.unwrap();
+        service.start_observer();
+
+        let outcome_gate = service.outcome_gate.lock().await;
+        broadcast_tx
+            .send(
+                json!({
+                    "type": "freshAgent.send.accepted",
+                    "requestId": "queued-codex-request",
+                    "provider": "codex",
+                    "sessionId": "queued-codex-session",
+                    "sessionType": "freshcodex",
+                    "submittedTurnId": "queued-native-turn"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        broadcast_tx
+            .send(
+                json!({
+                    "type": "freshAgent.event",
+                    "provider": "codex",
+                    "sessionId": "queued-codex-session",
+                    "sessionType": "freshcodex",
+                    "event": {
+                        "type": "checkpointTurnIdentity",
+                        "logicalAttemptId": "queued-codex-attempt",
+                        "requestId": "queued-codex-request",
+                        "sessionId": "queued-codex-session",
+                        "nativeTurnId": "queued-native-turn",
+                        "displayTurnId": "queued-native-turn:row-0"
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        for index in 0..32 {
+            broadcast_tx
+                .send(json!({"type":"terminal.output","seq":index}).to_string())
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+        drop(outcome_gate);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let stored = service.read_outcome_store().await.unwrap();
+                if stored
+                    .outcomes
+                    .get(&key)
+                    .and_then(|record| record.outcome.native_turn_id.as_deref())
+                    == Some("queued-native-turn")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued identity is persisted after unrelated broadcast traffic");
     }
 
     async fn body_json(resp: Response) -> Value {

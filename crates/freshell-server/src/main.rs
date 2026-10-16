@@ -1032,6 +1032,20 @@ async fn main() -> ExitCode {
         Arc::clone(&broadcast_tx),
         serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({})),
     );
+    let checkpoint_event_persister: freshell_freshagent::CheckpointEventPersister = {
+        let checkpoint_service = Arc::clone(&checkpoint_service);
+        Arc::new(move |frame, require_match| {
+            let service = Arc::clone(&checkpoint_service);
+            Box::pin(async move {
+                service
+                    .persist_event_before_broadcast_with_match(&frame, require_match)
+                    .await
+            })
+        })
+    };
+    fresh_codex_state
+        .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
+        .expect("Codex checkpoint event persister is installed once");
 
     // The freshclaude WS fresh-agent slice: shares the broadcast bus so its
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the
@@ -1039,6 +1053,9 @@ async fn main() -> ExitCode {
     // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
     let mut fresh_claude_state =
         freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    fresh_claude_state
+        .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
+        .expect("Claude checkpoint event persister is installed once");
 
     // Task 12 (D8 for fresh agents): the ONE server-wide per-sessionRef create/resume
     // lease map, shared by every fresh-agent runtime (keys are provider-namespaced).
@@ -1112,6 +1129,9 @@ async fn main() -> ExitCode {
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
             .with_layout(layout_store.clone())
             .with_ownership(Arc::clone(&ownership));
+    fresh_agent_state
+        .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
+        .expect("OpenCode checkpoint event persister is installed once");
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =

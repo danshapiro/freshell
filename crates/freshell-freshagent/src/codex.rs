@@ -188,11 +188,13 @@ fn locate_thread_rollout(
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
-/// Each checkpoint identity read uses the app-server's existing 30-second
-/// snapshot bound; two attempts keep delayed persistence and one transient read
-/// failure recoverable without leaving an unbounded background poller.
-const CHECKPOINT_IDENTITY_PROBE_ATTEMPTS: usize = 2;
-const CHECKPOINT_IDENTITY_PROBE_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Codex history is sometimes behind the turn-completion notification. Keep
+/// reconciling for a bounded settlement window after the target turn retires;
+/// each read is capped by the same deadline even though the app-server's normal
+/// snapshot timeout is longer.
+const CHECKPOINT_IDENTITY_SETTLE_WINDOW: Duration = Duration::from_secs(30);
+const CHECKPOINT_IDENTITY_PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const CHECKPOINT_IDENTITY_COMPLETION_POLL_DELAY: Duration = Duration::from_millis(100);
 
 enum CodexStopMode {
     Close,
@@ -367,6 +369,10 @@ pub struct FreshCodexState {
     /// post-construction by `freshell-server` (precedent:
     /// `TerminalRegistry::set_activity_observer`).
     identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
+    /// Server-owned durable path for checkpoint events. When present, accepted
+    /// turn ids and final history identities are persisted before their public
+    /// broadcast so a server exit cannot strand a one-shot receipt in memory.
+    checkpoint_event_sink: crate::CheckpointEventSink,
     /// The per-sessionRef create/resume lease (D8 for fresh agents, Task 12) —
     /// ALWAYS ON at this runtime seam (never capability-gated). `main.rs` replaces the
     /// default with the ONE server-wide shared map via [`Self::set_session_leases`].
@@ -559,6 +565,9 @@ struct CodexSession {
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946). Cleared back to `false`
     /// once a respawn succeeds.
     exited: Arc<AtomicBool>,
+    /// Cancels checkpoint identity probes when this session is explicitly stopped. A live
+    /// turn may never emit its normal completion notification after teardown.
+    checkpoint_probe_cancelled: Arc<AtomicBool>,
     /// b8ke focused round-2 review R2-1: the sidecar child's pid + `/proc`
     /// ownership tag — the recorded identity `kill_for_handoff` condemns
     /// BEFORE its first cancellable await, so the handoff watcher's
@@ -643,6 +652,17 @@ struct CodexSession {
     /// site filters hollow `Some`s away (focused-ep1-r5 Finding 2): a
     /// partially initialized client's hello never lands here.
     provenance: Option<crate::BindProvenance>,
+}
+
+struct CodexCheckpointIdentityProbe {
+    client: Arc<CodexAppServerClient>,
+    session_id: String,
+    submitted_turn_id: String,
+    request_id: String,
+    logical_attempt_id: String,
+    active_turn: Arc<StdMutex<Option<String>>>,
+    exited: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,6 +805,7 @@ impl FreshCodexState {
             dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
+            checkpoint_event_sink: crate::CheckpointEventSink::default(),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             ownership: None,
             ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -804,6 +825,15 @@ impl FreshCodexState {
     pub fn with_sidecar_launch_context(mut self, context: CodexSidecarLaunchContext) -> Self {
         self.sidecar_launch_context = context;
         self
+    }
+
+    /// Wire the server-owned durable checkpoint-event path before this state is
+    /// cloned into routers and session consumers.
+    pub fn set_checkpoint_event_persister(
+        &mut self,
+        persister: crate::CheckpointEventPersister,
+    ) -> Result<(), &'static str> {
+        self.checkpoint_event_sink.set_persister(persister)
     }
 
     /// The configured wedged-sidecar quiet window, in milliseconds.
@@ -1811,6 +1841,32 @@ impl FreshCodexState {
         if let Ok(frame) = serde_json::to_string(msg) {
             let _ = self.broadcast_tx.send(frame);
         }
+    }
+
+    async fn persist_checkpoint_frame(
+        &self,
+        msg: &ServerMessage,
+        require_match: bool,
+    ) -> Result<String, String> {
+        let Ok(frame) = serde_json::to_string(msg) else {
+            return Err("checkpoint event could not be serialized".to_string());
+        };
+        self.checkpoint_event_sink
+            .persist_before_broadcast(&frame, require_match)
+            .await?;
+        Ok(frame)
+    }
+
+    async fn broadcast_checkpoint_event(
+        &self,
+        msg: &ServerMessage,
+        require_match: bool,
+    ) -> Result<(), String> {
+        let frame = serde_json::to_string(msg)
+            .map_err(|_| "checkpoint event could not be serialized".to_string())?;
+        self.checkpoint_event_sink
+            .broadcast(&self.broadcast_tx, frame, require_match)
+            .await
     }
 
     // ── freshAgent.create (WS) ───────────────────────────────────────────────
@@ -2834,6 +2890,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -3361,6 +3418,7 @@ impl FreshCodexState {
                     s.event_emission_gate.clone(),
                     s.quiet_deadman.clone(),
                     s.exited.clone(),
+                    s.checkpoint_probe_cancelled.clone(),
                 )
             })
         };
@@ -3373,6 +3431,7 @@ impl FreshCodexState {
             event_emission_gate,
             quiet_deadman,
             exited,
+            checkpoint_probe_cancelled,
         )) = looked_up
         else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
@@ -3649,48 +3708,95 @@ impl FreshCodexState {
         );
 
         // Broadcast freshAgent.send.accepted (ws-handler.ts:3487). turnAccepted edge.
-        self.broadcast(&ServerMessage::FreshAgentSendAccepted(
-            freshell_protocol::FreshAgentSendAccepted {
+        let accepted =
+            ServerMessage::FreshAgentSendAccepted(freshell_protocol::FreshAgentSendAccepted {
                 provider: PROVIDER.to_string(),
                 request_id: request_id.clone().unwrap_or_default(),
                 session_id: session_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
                 cwd: turn_cwd,
                 submitted_turn_id: Some(submitted_turn_id.clone()),
-            },
-        ));
+            });
+        if checkpoint_identity_request.is_some() {
+            if let Err(error) = self.broadcast_checkpoint_event(&accepted, true).await {
+                tracing::error!(target: "freshell_freshagent::codex",
+                    session_id = %session_id,
+                    request_id = request_id.as_deref().unwrap_or_default(),
+                    cause = %error,
+                    "freshagent.codex.checkpoint_accepted_persist_failed"
+                );
+                // The provider accepted the turn, so keep the acknowledgement
+                // flowing, but withhold the unpersisted native ID. The exact
+                // identity probe below will publish only if its own durable
+                // write succeeds.
+                if let ServerMessage::FreshAgentSendAccepted(mut fallback) = accepted {
+                    fallback.submitted_turn_id = None;
+                    self.broadcast(&ServerMessage::FreshAgentSendAccepted(fallback));
+                }
+            }
+        } else {
+            self.broadcast(&accepted);
+        }
 
         if let Some((request_id, logical_attempt_id)) = checkpoint_identity_request {
-            self.spawn_checkpoint_identity_probe(
-                client,
-                session_id,
-                submitted_turn_id,
-                request_id,
-                logical_attempt_id,
+            drop(
+                self.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+                    client,
+                    session_id,
+                    submitted_turn_id,
+                    request_id,
+                    logical_attempt_id,
+                    active_turn,
+                    exited,
+                    cancelled: checkpoint_probe_cancelled,
+                }),
             );
         }
     }
 
     fn spawn_checkpoint_identity_probe(
         &self,
-        client: Arc<CodexAppServerClient>,
-        session_id: String,
-        submitted_turn_id: String,
-        request_id: String,
-        logical_attempt_id: String,
-    ) {
+        probe: CodexCheckpointIdentityProbe,
+    ) -> tokio::task::JoinHandle<()> {
         let state = self.clone();
         tokio::spawn(async move {
-            // `turn/start` acceptance is not itself proof that the native user row
-            // is persisted. Read the provider history and emit a receipt only when
-            // the exact submitted turn projects to one unique user row. Reads
-            // are bounded individually by the app-server client's existing
-            // 30-second snapshot timeout; the fixed attempt count bounds this
-            // service-owned probe to at most two reads.
+            let CodexCheckpointIdentityProbe {
+                client,
+                session_id,
+                submitted_turn_id,
+                request_id,
+                logical_attempt_id,
+                active_turn,
+                exited,
+                cancelled,
+            } = probe;
+            // Wait for the accepted turn to retire before treating its projected
+            // row ids as final. A live turn may contain only the user row today,
+            // then gain assistant rows that change its display id. After retirement,
+            // the bounded read/retry window covers the provider-history persistence
+            // lag without abandoning the receipt after a handful of fast empty reads.
+            while active_turn.lock().expect("active_turn mutex").as_deref()
+                == Some(submitted_turn_id.as_str())
+                && !exited.load(Ordering::SeqCst)
+                && !cancelled.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(CHECKPOINT_IDENTITY_COMPLETION_POLL_DELAY).await;
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let deadline = tokio::time::Instant::now() + CHECKPOINT_IDENTITY_SETTLE_WINDOW;
             let mut identity = None;
-            for attempt in 1..=CHECKPOINT_IDENTITY_PROBE_ATTEMPTS {
-                match client.read_thread(&session_id, true).await {
-                    Ok(raw_thread) => {
+            let mut attempt = 0;
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    return;
+                }
+                attempt += 1;
+                match tokio::time::timeout_at(deadline, client.read_thread(&session_id, true)).await
+                {
+                    Ok(Ok(raw_thread)) => {
                         identity = checkpoint_codex_turn_identity(&raw_thread, &submitted_turn_id);
                         if identity.is_some() {
                             break;
@@ -3703,7 +3809,7 @@ impl FreshCodexState {
                             "freshagent.codex.checkpoint_identity_row_not_yet_observed"
                         );
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::warn!(target: "freshell_freshagent::codex",
                             session_id = %session_id,
                             submitted_turn_id = %submitted_turn_id,
@@ -3713,34 +3819,57 @@ impl FreshCodexState {
                             "freshagent.codex.checkpoint_identity_read_failed"
                         );
                     }
+                    Err(_) => break,
                 }
-                if attempt < CHECKPOINT_IDENTITY_PROBE_ATTEMPTS {
-                    tokio::time::sleep(CHECKPOINT_IDENTITY_PROBE_RETRY_DELAY).await;
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
                 }
+                tokio::time::sleep(
+                    CHECKPOINT_IDENTITY_PROBE_RETRY_DELAY
+                        .min(deadline.saturating_duration_since(now)),
+                )
+                .await;
             }
             let Some((native_turn_id, display_turn_id)) = identity else {
                 tracing::warn!(target: "freshell_freshagent::codex",
                     session_id = %session_id,
                     submitted_turn_id = %submitted_turn_id,
                     request_id = %request_id,
-                    "freshagent.codex.checkpoint_identity_probe_exhausted"
+                    attempts = attempt,
+                    "freshagent.codex.checkpoint_identity_settlement_expired"
                 );
                 return;
             };
-            state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                event: json!({
-                    "type": "checkpointTurnIdentity",
-                    "logicalAttemptId": logical_attempt_id,
-                    "requestId": request_id,
-                    "sessionId": session_id,
-                    "nativeTurnId": native_turn_id,
-                    "displayTurnId": display_turn_id,
-                }),
-                provider: PROVIDER.to_string(),
-                session_id,
-                session_type: SESSION_TYPE.to_string(),
-            }));
-        });
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Err(error) = state
+                .broadcast_checkpoint_event(
+                    &ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: json!({
+                            "type": "checkpointTurnIdentity",
+                            "logicalAttemptId": logical_attempt_id,
+                            "requestId": request_id,
+                            "sessionId": session_id,
+                            "nativeTurnId": native_turn_id,
+                            "displayTurnId": display_turn_id,
+                        }),
+                        provider: PROVIDER.to_string(),
+                        session_id,
+                        session_type: SESSION_TYPE.to_string(),
+                    }),
+                    true,
+                )
+                .await
+            {
+                tracing::error!(target: "freshell_freshagent::codex",
+                    request_id = %request_id,
+                    cause = %error,
+                    "freshagent.codex.checkpoint_identity_persist_failed"
+                );
+            }
+        })
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
@@ -5648,6 +5777,14 @@ impl FreshCodexState {
         self.clear_controls(&session_id).await;
 
         let removed = self.sessions.lock().await.remove(&session_id);
+        if let Some(session) = removed.as_ref() {
+            // Requested teardown ends the probe's wait even when the provider never
+            // emits turn/completed. Signal before closing the client so an in-flight
+            // history read can settle and the probe exits promptly.
+            session
+                .checkpoint_probe_cancelled
+                .store(true, Ordering::SeqCst);
+        }
         let removed_ownership_id = removed
             .as_ref()
             .map(|session| session.sidecar_ownership_id.clone());
@@ -6707,6 +6844,7 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
                     sidecar_ownership_id,
                     quiet_deadman,
@@ -7007,6 +7145,7 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
                     sidecar_ownership_id,
                     quiet_deadman,
@@ -7141,8 +7280,8 @@ impl FreshCodexState {
         let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
         let session_name = naming_projection.map(|(_, record)| record);
 
-        self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
-            FreshAgentSessionMaterialized {
+        let materialized =
+            ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
                 previous_session_id: old_session_id.to_string(),
                 provider: PROVIDER.to_string(),
                 session_id: new_thread_id.clone(),
@@ -7153,8 +7292,16 @@ impl FreshCodexState {
                 }),
                 name_ref,
                 session_name,
-            },
-        ));
+            });
+        if let Err(error) = self.persist_checkpoint_frame(&materialized, false).await {
+            tracing::error!(target: "freshell_freshagent::codex",
+                old_session_id = %old_session_id,
+                new_session_id = %new_thread_id,
+                cause = %error,
+                "freshagent.codex.checkpoint_alias_persist_failed"
+            );
+        }
+        self.broadcast(&materialized);
 
         // P1.13 §2.6b (Task 6): memory loss must be user-visible, not server-log-only.
         // Emitted AFTER the materialized broadcast above -- the frozen client re-keys
@@ -8767,6 +8914,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -8860,6 +9008,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -9693,6 +9842,12 @@ fn checkpoint_codex_turn_identity(
         .filter(|turn| turn.get("id").and_then(Value::as_str) == Some(submitted_turn_id));
     let raw_turn = matching.next()?;
     if matching.next().is_some() {
+        return None;
+    }
+    if !matches!(
+        raw_turn.get("status").and_then(Value::as_str),
+        Some("completed" | "interrupted" | "failed")
+    ) {
         return None;
     }
     let projected = build_codex_turn_json(raw_turn, 0).ok()?;
@@ -11913,6 +12068,7 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -12021,6 +12177,7 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -14032,6 +14189,7 @@ pub(crate) mod tests {
                 kill_tx: None,
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 quiet_deadman: QuietDeadman::new_shared(),
                 turn_in_flight: Arc::new(AtomicBool::new(false)),
                 retired_turn_id: Arc::new(StdMutex::new(None)),
@@ -26805,6 +26963,16 @@ pub(crate) mod tests {
             None,
             "a snapshot row from another send cannot satisfy this request"
         );
+        let mut in_progress_turn = raw_turn.clone();
+        in_progress_turn["status"] = json!("inProgress");
+        assert_eq!(
+            checkpoint_codex_turn_identity(
+                &json!({"thread":{"turns":[in_progress_turn]}}),
+                "turn-native-1"
+            ),
+            None,
+            "an in-progress turn's row id can still change when Codex adds its assistant row"
+        );
 
         let ambiguous = json!({
             "id": "turn-native-ambiguous",
@@ -26836,13 +27004,27 @@ pub(crate) mod tests {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let (state, mut rx) = state_with_bus();
-        state.spawn_checkpoint_identity_probe(
-            Arc::new(client),
-            "thread-checkpoint-receipt".to_string(),
-            "turn-persisted-user".to_string(),
-            "request-checkpoint-1".to_string(),
-            "logical-checkpoint-1".to_string(),
+        let active_turn = Arc::new(StdMutex::new(Some("turn-persisted-user".to_string())));
+        drop(
+            state.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+                client: Arc::new(client),
+                session_id: "thread-checkpoint-receipt".to_string(),
+                submitted_turn_id: "turn-persisted-user".to_string(),
+                request_id: "request-checkpoint-1".to_string(),
+                logical_attempt_id: "logical-checkpoint-1".to_string(),
+                active_turn: active_turn.clone(),
+                exited: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
         );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer.expect_request())
+                .await
+                .is_err(),
+            "identity reads wait until the accepted turn has retired"
+        );
+        *active_turn.lock().expect("active turn mutex") = None;
 
         let (initialize_id, initialize_method, _) = peer.expect_request().await;
         assert_eq!(initialize_method, "initialize");
@@ -26851,27 +27033,38 @@ pub(crate) mod tests {
             json!({ "userAgent": "test", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
-        let (first_read_id, first_read_method, first_read_params) = peer.expect_request().await;
-        assert_eq!(first_read_method, "thread/read");
-        assert_eq!(first_read_params["threadId"], "thread-checkpoint-receipt");
-        assert_eq!(first_read_params["includeTurns"], true);
-        peer.respond(
-            &first_read_id,
-            json!({
-                "thread": {
-                    "id": "thread-checkpoint-receipt",
-                    "status": "running",
-                    "turns": []
-                }
-            }),
-        );
+        for attempt in 1..=12 {
+            let (read_id, read_method, read_params) =
+                tokio::time::timeout(Duration::from_secs(2), peer.expect_request())
+                    .await
+                    .expect("probe should continue while the user row is not persisted");
+            assert_eq!(read_method, "thread/read", "attempt {attempt}");
+            assert_eq!(read_params["threadId"], "thread-checkpoint-receipt");
+            assert_eq!(read_params["includeTurns"], true);
+            peer.respond(
+                &read_id,
+                json!({
+                    "thread": {
+                        "id": "thread-checkpoint-receipt",
+                        "status": "running",
+                        "turns": []
+                    }
+                }),
+            );
+        }
 
-        let (read_id, read_method, read_params) = peer.expect_request().await;
-        assert_eq!(read_method, "thread/read");
-        assert_eq!(read_params["threadId"], "thread-checkpoint-receipt");
-        assert_eq!(read_params["includeTurns"], true);
+        let (persisted_read_id, persisted_read_method, persisted_read_params) =
+            tokio::time::timeout(Duration::from_secs(2), peer.expect_request())
+                .await
+                .expect("probe should continue after twelve empty history reads");
+        assert_eq!(persisted_read_method, "thread/read");
+        assert_eq!(
+            persisted_read_params["threadId"],
+            "thread-checkpoint-receipt"
+        );
+        assert_eq!(persisted_read_params["includeTurns"], true);
         peer.respond(
-            &read_id,
+            &persisted_read_id,
             json!({
                 "thread": {
                     "id": "thread-checkpoint-receipt",
@@ -26914,12 +27107,17 @@ pub(crate) mod tests {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let (state, mut rx) = state_with_bus();
-        state.spawn_checkpoint_identity_probe(
-            Arc::new(client),
-            "thread-checkpoint-read-retry".to_string(),
-            "turn-persisted-after-retry".to_string(),
-            "request-checkpoint-retry".to_string(),
-            "logical-checkpoint-retry".to_string(),
+        drop(
+            state.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+                client: Arc::new(client),
+                session_id: "thread-checkpoint-read-retry".to_string(),
+                submitted_turn_id: "turn-persisted-after-retry".to_string(),
+                request_id: "request-checkpoint-retry".to_string(),
+                logical_attempt_id: "logical-checkpoint-retry".to_string(),
+                active_turn: Arc::new(StdMutex::new(None)),
+                exited: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
         );
 
         let (initialize_id, initialize_method, _) = peer.expect_request().await;
@@ -26967,6 +27165,83 @@ pub(crate) mod tests {
             "logical-checkpoint-retry"
         );
         assert_eq!(frame["event"]["nativeTurnId"], "turn-persisted-after-retry");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_probe_stops_when_its_session_is_killed_mid_turn() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (state, _rx) = state_with_bus();
+        let active_turn = Arc::new(StdMutex::new(Some("turn-stopped".to_string())));
+        insert_fake_session(
+            &state,
+            "thread-stopped-checkpoint",
+            client.clone(),
+            active_turn.clone(),
+            spawn_sleeper(),
+            "codex-sidecar-checkpoint-stop",
+        )
+        .await;
+        let (cancelled, exited) = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get("thread-stopped-checkpoint")
+                .expect("fixture session inserted");
+            (
+                session.checkpoint_probe_cancelled.clone(),
+                session.exited.clone(),
+            )
+        };
+        let mut probe = state.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+            client,
+            session_id: "thread-stopped-checkpoint".to_string(),
+            submitted_turn_id: "turn-stopped".to_string(),
+            request_id: "request-stopped".to_string(),
+            logical_attempt_id: "logical-stopped".to_string(),
+            active_turn,
+            exited,
+            cancelled: cancelled.clone(),
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer.expect_request())
+                .await
+                .is_err(),
+            "the probe should wait for the in-flight turn before reading history"
+        );
+        // Closing the client drains its reader task; dropping the fake provider lets its
+        // receive future finish so the fixture's transport close can complete.
+        drop(peer);
+
+        state
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "thread-stopped-checkpoint".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+
+        let probe_stopped = tokio::time::timeout(Duration::from_secs(1), &mut probe)
+            .await
+            .is_ok();
+        if !probe_stopped {
+            // Keep this regression leak-free while it is red: the pre-fix kill path
+            // leaves the probe polling, so explicitly release it after the assertion
+            // window and then verify that it settles.
+            cancelled.store(true, Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(1), &mut probe)
+                .await
+                .expect("test cleanup releases the probe")
+                .expect("probe task joins");
+        }
+        assert!(
+            probe_stopped,
+            "killing a session must cancel its checkpoint probe instead of retaining it forever"
+        );
     }
 
     #[test]

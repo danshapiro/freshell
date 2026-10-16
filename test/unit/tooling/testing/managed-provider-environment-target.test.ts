@@ -10,6 +10,7 @@ import {
 } from '../../../../scripts/testing/managed-environment-create.js'
 import {
   checkpointTcpForwarderSource,
+  committedAcceptanceSha,
   directHomeAppendMcpServerSource,
   externalTargetRead,
   managedHomeAppendFixturePaths,
@@ -32,6 +33,24 @@ async function listenOnLoopback(server: ReturnType<typeof createServer>): Promis
 }
 
 describe('managed provider environment target mode', () => {
+  it('rejects acceptance evidence from a dirty worktree', async () => {
+    const repository = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-acceptance-provenance-'))
+    try {
+      await fs.writeFile(path.join(repository, 'source.txt'), 'committed candidate\n')
+      execFileSync('git', ['init', '-q'], { cwd: repository })
+      execFileSync('git', ['add', 'source.txt'], { cwd: repository })
+      execFileSync('git', ['-c', 'user.name=Acceptance Test', '-c', 'user.email=acceptance@example.invalid',
+        'commit', '-q', '-m', 'candidate'], { cwd: repository })
+
+      const candidate = committedAcceptanceSha(repository)
+      expect(candidate).toMatch(/^[a-f0-9]{40}$/)
+      await fs.writeFile(path.join(repository, 'uncommitted.txt'), 'not part of HEAD\n')
+      expect(() => committedAcceptanceSha(repository)).toThrow(/exact committed candidate/)
+    } finally {
+      await fs.rm(repository, { recursive: true, force: true })
+    }
+  })
+
   it('records typed provider preparation causes without persisting paths', () => {
     const incidents: unknown[] = []
     const owner = {

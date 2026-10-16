@@ -220,7 +220,7 @@ fn read_indexed(
     let mut segments = Vec::with_capacity(2);
     for (spool_name, index_name, required) in [
         (SPOOL_PREVIOUS_FILE, SPOOL_PREVIOUS_INDEX_FILE, false),
-        (SPOOL_CURRENT_FILE, SPOOL_CURRENT_INDEX_FILE, true),
+        (SPOOL_CURRENT_FILE, SPOOL_CURRENT_INDEX_FILE, false),
     ] {
         let spool_path = source.runtime_dir.join(spool_name);
         let file = match File::open(&spool_path) {
@@ -306,6 +306,9 @@ fn read_indexed(
             checkpoints: indexed.checkpoints,
             torn_tail: indexed.torn_tail,
         });
+    }
+    if segments.is_empty() {
+        return Err("retained output spool unavailable".into());
     }
     read_indexed_spool(descriptor.clone(), segments, after, budget, completion)
 }
@@ -644,6 +647,76 @@ mod tests {
             "supervisor replay scanned {} of {} spool bytes after indexing",
             second.bytes_scanned,
             spool_bytes
+        );
+    }
+
+    #[test]
+    fn supervisor_reads_previous_only_spool_after_rotation_interruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let incarnation_id = IncarnationId::new();
+        let terminal_id = "retained-terminal";
+        let stream_epoch = "launch-prefix-hostboot-previous-only";
+        let descriptor = TerminalSpoolDescriptor {
+            schema_version: 1,
+            incarnation_id,
+            terminal_id: terminal_id.into(),
+            stream_epoch: stream_epoch.into(),
+            segment_limit_bytes: 128 * 1024,
+        };
+        let source = RetainedOutputSource {
+            incarnation_id: descriptor.incarnation_id.clone(),
+            runtime_dir: directory.path().to_path_buf(),
+            terminal: serde_json::from_value::<TerminalLaunchSpec>(serde_json::json!({
+                "terminalId":terminal_id,"streamId":"launch-prefix","mode":"shell",
+                "program":"/bin/sh","cwd":"/workspace","runAsUid":65534,
+                "runAsGid":0,"cols":120,"rows":30,"projectKey":"fixture",
+                "workspacePath":"/workspace"
+            }))
+            .unwrap(),
+            native_session_id: None,
+        };
+        let frame = freshell_runtime_protocol::RuntimeOutputFrame {
+            terminal_id: terminal_id.into(),
+            stream_epoch: stream_epoch.into(),
+            seq_start: 7,
+            seq_end: 7,
+            data: "committed before interrupted rotation".into(),
+        };
+        let mut previous = File::create(directory.path().join(SPOOL_PREVIOUS_FILE)).unwrap();
+        serde_json::to_writer(&mut previous, &TerminalSpoolFrame { frame }).unwrap();
+        previous.write_all(b"\n").unwrap();
+        previous.sync_all().unwrap();
+
+        let replay = read_indexed(
+            &source,
+            &descriptor,
+            0,
+            MAX_OUTPUT_FRAME_BYTES as u64,
+            None,
+            false,
+        )
+        .expect("previous-only spool is recoverable when current creation was interrupted");
+
+        assert_eq!(replay.batch.frames.len(), 1);
+        assert_eq!(replay.batch.frames[0].seq_start, 7);
+        assert_eq!(
+            replay.batch.frames[0].data,
+            "committed before interrupted rotation"
+        );
+        assert!(directory.path().join(SPOOL_PREVIOUS_INDEX_FILE).is_file());
+
+        std::fs::remove_file(directory.path().join(SPOOL_PREVIOUS_FILE)).unwrap();
+        assert!(
+            read_indexed(
+                &source,
+                &descriptor,
+                0,
+                MAX_OUTPUT_FRAME_BYTES as u64,
+                None,
+                false
+            )
+            .is_err(),
+            "missing both spool segments must not masquerade as empty retained output"
         );
     }
 

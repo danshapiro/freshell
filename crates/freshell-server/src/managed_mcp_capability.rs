@@ -1549,6 +1549,26 @@ fn cleanup_orphaned_provider_roots(directory: &Path) -> Result<(), String> {
         let Some(grant_id) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
+        if let Some((staged_grant_id, temporary_id_str)) = grant_id.split_once(".tmp-") {
+            let valid_stage = grant_path(directory, staged_grant_id).is_ok()
+                && uuid::Uuid::parse_str(temporary_id_str).is_ok_and(|temporary_id| {
+                    temporary_id.get_version_num() == 4
+                        && temporary_id.to_string() == temporary_id_str
+                });
+            if valid_stage
+                && !protected.contains(staged_grant_id)
+                && !grant_path(directory, staged_grant_id)?.exists()
+            {
+                let metadata =
+                    std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
+                } else {
+                    return Err("managed provider staging path has an unsafe type".into());
+                }
+                continue;
+            }
+        }
         let Ok(grant_file) = grant_path(directory, &grant_id) else {
             continue;
         };
@@ -6054,8 +6074,14 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::fs::create_dir(&capabilities).unwrap();
         let active = staged_provider_root_path(&capabilities, "grant-active").unwrap();
         let orphan = staged_provider_root_path(&capabilities, "grant-orphan").unwrap();
+        let interrupted_copy = control
+            .path()
+            .join("provider-roots")
+            .join(format!("grant-interrupted.tmp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&active).unwrap();
         std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::create_dir_all(&interrupted_copy).unwrap();
+        std::fs::write(interrupted_copy.join("private-config.json"), "partial copy").unwrap();
         let path = grant_path(&capabilities, "grant-active").unwrap();
         write_capability(
             &path,
@@ -6076,6 +6102,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         cleanup_orphaned_provider_roots(&capabilities).unwrap();
         assert!(active.is_dir());
         assert!(!orphan.exists());
+        assert!(
+            !interrupted_copy.exists(),
+            "restart removes an incomplete private provider copy"
+        );
     }
 
     #[test]

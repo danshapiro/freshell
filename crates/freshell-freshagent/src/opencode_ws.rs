@@ -1224,6 +1224,41 @@ impl FreshOpencodeState {
         self.fresh_agent.broadcast(msg);
     }
 
+    async fn broadcast_materialized(&self, msg: &ServerMessage) {
+        if let Ok(frame) = serde_json::to_string(msg) {
+            if let Err(error) = self
+                .fresh_agent
+                .persist_checkpoint_frame(&frame, false)
+                .await
+            {
+                tracing::error!(target: "freshell_freshagent::opencode",
+                    cause = %error,
+                    "freshagent.opencode.checkpoint_alias_persist_failed"
+                );
+            }
+        }
+        self.broadcast(msg);
+    }
+
+    async fn broadcast_checkpoint_frame(&self, msg: &ServerMessage) {
+        let Ok(frame) = serde_json::to_string(msg) else {
+            tracing::error!(target: "freshell_freshagent::opencode",
+                "freshagent.opencode.checkpoint_identity_serialize_failed"
+            );
+            return;
+        };
+        if let Err(error) = self
+            .fresh_agent
+            .broadcast_checkpoint_frame(frame, true)
+            .await
+        {
+            tracing::error!(target: "freshell_freshagent::opencode",
+                cause = %error,
+                "freshagent.opencode.checkpoint_identity_persist_failed"
+            );
+        }
+    }
+
     /// The shared P1.13 binding-row write (materialization row, settings refresh,
     /// resume refresh, forked child): AWAITED (durable-before-answer), and a write
     /// failure surfaces as a user-visible `LEDGER_WRITE_FAILED` `freshAgent.error`
@@ -2548,12 +2583,13 @@ impl FreshOpencodeState {
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&materialized_frame(
+            self.broadcast_materialized(&materialized_frame(
                 &session.placeholder_id,
                 &durable_id,
                 name_ref,
                 session_name,
-            ));
+            ))
+            .await;
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
@@ -2803,7 +2839,7 @@ impl FreshOpencodeState {
                     if let Some(native_id) =
                         observe_checkpoint_turn_identity(&manager, &real_id, &route, identity).await
                     {
-                        this.broadcast(&event_frame(
+                        this.broadcast_checkpoint_frame(&event_frame(
                             &real_id,
                             json!({
                                 "type": "checkpointTurnIdentity",
@@ -2813,7 +2849,8 @@ impl FreshOpencodeState {
                                 "nativeTurnId": native_id,
                                 "displayTurnId": identity.native_message_id,
                             }),
-                        ));
+                        ))
+                        .await;
                     }
                 }
             }
@@ -7106,12 +7143,13 @@ impl FreshOpencodeState {
                 let projection = self.created_projection_for(real_id).await;
                 let name_ref = projection.as_ref().map(|(r, _)| r.clone());
                 let session_name = projection.map(|(_, record)| record);
-                self.broadcast(&materialized_frame(
+                self.broadcast_materialized(&materialized_frame(
                     &msg.session_id,
                     real_id,
                     name_ref,
                     session_name,
-                ));
+                ))
+                .await;
             }
         }
 

@@ -2928,9 +2928,843 @@ fn private_bound_destinations(
 }
 
 const PROVIDER_PROJECTION_MANIFEST: &str = ".freshell-config-projection.json";
+const PROVIDER_PROJECTION_TRANSACTION_PREFIX: &str = ".freshell-provider-transaction-";
+const PROVIDER_PROJECTION_TRANSACTION_JOURNAL: &str = "transaction.json";
+const PROVIDER_PROJECTION_TRANSACTION_JOURNAL_TEMP: &str = "transaction.json.tmp";
+const PROVIDER_PROJECTION_TRANSACTION_MANIFEST_BACKUP: &str = "manifest.backup";
 // Ordinary disk metadata shares the resource-manifest profile. The control
 // pipe's 1 MiB limit does not reduce these provider-filesystem views.
 const MAX_PROJECTION_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderProjectionTransactionPhase {
+    Preparing,
+    Publishing,
+    Committed,
+    RolledBack,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ProviderProjectionOriginalNode {
+    Missing,
+    File { in_place: bool },
+    Directory { mode: u32 },
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProjectionTransactionEntry {
+    relative: String,
+    original: ProviderProjectionOriginalNode,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProjectionTransactionJournal {
+    version: u32,
+    phase: ProviderProjectionTransactionPhase,
+    manifest_existed: bool,
+    entries: Vec<ProviderProjectionTransactionEntry>,
+}
+
+fn lock_provider_projection(provider_home: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let metadata = std::fs::symlink_metadata(provider_home)
+        .map_err(|_| "provider projection HOME unavailable; retain inputs and repair")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("provider projection HOME must be a physical directory".into());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(provider_home)
+        .map_err(|_| "provider projection lock unavailable; retain inputs and repair")?;
+    loop {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!(
+                "provider projection lock unavailable; retain inputs and repair: {error}"
+            ));
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ProviderProjectionJournalWriteError {
+    BeforePublish(String),
+    PublishedButUnconfirmed(String),
+}
+
+impl std::fmt::Display for ProviderProjectionJournalWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforePublish(cause) | Self::PublishedButUnconfirmed(cause) => {
+                formatter.write_str(cause)
+            }
+        }
+    }
+}
+
+fn write_provider_projection_transaction_journal(
+    transaction: &Path,
+    journal: &ProviderProjectionTransactionJournal,
+) -> Result<(), ProviderProjectionJournalWriteError> {
+    write_provider_projection_transaction_journal_with_sync(transaction, journal, |path| {
+        std::fs::File::open(path)?.sync_all()
+    })
+}
+
+fn write_provider_projection_transaction_journal_with_sync(
+    transaction: &Path,
+    journal: &ProviderProjectionTransactionJournal,
+    sync_transaction_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), ProviderProjectionJournalWriteError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let bytes =
+        freshell_runtime_protocol::bounded_json_bytes(journal, MAX_PROJECTION_METADATA_BYTES)
+            .map_err(|_| {
+                ProviderProjectionJournalWriteError::BeforePublish(
+                    "provider transaction journal exceeds 64 MiB".into(),
+                )
+            })?;
+    let temporary = transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL_TEMP);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| {
+            ProviderProjectionJournalWriteError::BeforePublish(format!(
+                "provider transaction journal stage unavailable: {error}"
+            ))
+        })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            ProviderProjectionJournalWriteError::BeforePublish(format!(
+                "provider transaction journal write unavailable: {error}"
+            ))
+        })?;
+    std::fs::rename(
+        &temporary,
+        transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL),
+    )
+    .map_err(|error| {
+        ProviderProjectionJournalWriteError::BeforePublish(format!(
+            "provider transaction journal publish unavailable: {error}"
+        ))
+    })?;
+    sync_transaction_directory(transaction).map_err(|error| {
+        ProviderProjectionJournalWriteError::PublishedButUnconfirmed(format!(
+            "provider transaction journal was published but its directory sync failed: {error}"
+        ))
+    })
+}
+
+fn provider_projection_relative_path(relative: &str) -> Result<&Path, String> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("provider transaction contains an unsafe destination".into());
+    }
+    Ok(path)
+}
+
+fn provider_projection_original_node(
+    home: &Path,
+    relative: &str,
+    in_place: bool,
+) -> Result<ProviderProjectionOriginalNode, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = provider_projection_relative_path(relative)?;
+    match std::fs::symlink_metadata(home.join(path)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ProviderProjectionOriginalNode::Missing)
+        }
+        Err(_) => Err(format!(
+            "provider transaction destination {relative} could not be inspected"
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(ProviderProjectionOriginalNode::Symlink)
+        }
+        Ok(metadata) if metadata.is_file() => Ok(ProviderProjectionOriginalNode::File { in_place }),
+        Ok(metadata) if metadata.is_dir() => Ok(ProviderProjectionOriginalNode::Directory {
+            mode: metadata.permissions().mode() & 0o7777,
+        }),
+        Ok(_) => Ok(ProviderProjectionOriginalNode::Other),
+    }
+}
+
+fn projection_transaction_path(transaction: &Path, relative: &str) -> Result<PathBuf, String> {
+    Ok(transaction
+        .join("backup")
+        .join(provider_projection_relative_path(relative)?))
+}
+
+fn projection_path_parent_is_physical(home: &Path, relative: &Path) -> Result<(), String> {
+    let mut parent = home.to_path_buf();
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        parent.push(component.as_os_str());
+        match std::fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err("provider transaction destination parent is not a physical directory; retain inputs and repair".into())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => {
+                return Err("provider transaction destination parent unavailable; retain inputs and repair".into())
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_provider_projection_node(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("provider transaction recovery destination unavailable".into()),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir(path).map_err(|error| {
+                format!("provider transaction recovery directory is not empty: {error}")
+            })
+        }
+        Ok(_) => std::fs::remove_file(path)
+            .map_err(|_| "provider transaction recovery destination could not be removed".into()),
+    }
+}
+
+fn provider_projection_backup_exists(transaction: &Path, relative: &str) -> Result<bool, String> {
+    let backup = projection_transaction_path(transaction, relative)?;
+    match std::fs::symlink_metadata(&backup) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("provider transaction backup unavailable; retain inputs and repair".into()),
+    }
+}
+
+fn sync_provider_projection_directory(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "provider projection directory flush failed for {}: {error}",
+                path.display()
+            )
+        })
+}
+
+fn sync_provider_projection_tree(root: &Path) -> Result<(), String> {
+    sync_provider_projection_tree_with(root, &mut |path| std::fs::File::open(path)?.sync_all())
+}
+
+fn sync_provider_projection_tree_with(
+    root: &Path,
+    sync_node: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|error| {
+        format!(
+            "provider projection sync inspect {}: {error}",
+            root.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(root)
+            .map_err(|error| format!("provider projection sync read {}: {error}", root.display()))?
+        {
+            let entry = entry.map_err(|error| {
+                format!("provider projection sync read {}: {error}", root.display())
+            })?;
+            sync_provider_projection_tree_with(&entry.path(), sync_node)?;
+        }
+    }
+    sync_node(root).map_err(|error| {
+        format!(
+            "provider projection flush failed for {}: {error}",
+            root.display()
+        )
+    })
+}
+
+fn sync_provider_projection_file(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "provider projection sync inspect {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.is_file() && !metadata.file_type().is_symlink() {
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "provider projection file flush failed for {}: {error}",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn sync_provider_projection_directories(
+    home: &Path,
+    entries: &[ProviderProjectionTransactionEntry],
+) -> Result<(), String> {
+    use std::collections::BTreeSet;
+
+    let mut directories = BTreeSet::new();
+    directories.insert(home.to_path_buf());
+    for entry in entries {
+        let relative = provider_projection_relative_path(&entry.relative)?;
+        let mut candidate = home.join(relative);
+        loop {
+            if let Ok(metadata) = std::fs::symlink_metadata(&candidate) {
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    directories.insert(candidate.clone());
+                }
+            }
+            if candidate == home {
+                break;
+            }
+            let Some(parent) = candidate.parent() else {
+                break;
+            };
+            if !parent.starts_with(home) {
+                break;
+            }
+            candidate = parent.to_path_buf();
+        }
+    }
+    for directory in directories {
+        sync_provider_projection_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn restore_provider_projection_manifest(
+    transaction: &Path,
+    home: &Path,
+    manifest_existed: bool,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let destination = home.join(PROVIDER_PROJECTION_MANIFEST);
+    if !manifest_existed {
+        match std::fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                std::fs::remove_file(destination)
+                    .map_err(|_| "provider projection manifest rollback failed; retain inputs and repair".to_owned())?;
+                sync_provider_projection_directory(home)
+                    .map_err(|_| "provider projection manifest rollback sync unavailable".to_owned())?;
+                return Ok(());
+            }
+            _ => return Err("provider projection manifest rollback found an unsafe path; retain inputs and repair".into()),
+        }
+    }
+    let bytes = crate::provider_input_preparation::read_private(
+        transaction,
+        PROVIDER_PROJECTION_TRANSACTION_MANIFEST_BACKUP,
+        MAX_PROJECTION_METADATA_BYTES,
+    )
+    .map_err(|_| "provider projection manifest backup unavailable; retain inputs and repair")?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("provider projection manifest rollback found an unsafe path; retain inputs and repair".into());
+        }
+    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".freshell-provider-manifest-restore-")
+        .tempfile_in(home)
+        .map_err(|_| "provider projection manifest rollback stage unavailable")?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|_| "provider projection manifest rollback write unavailable")?;
+    temporary
+        .persist(&destination)
+        .map_err(|_| "provider projection manifest rollback publish unavailable")?;
+    sync_provider_projection_directory(home)
+        .map_err(|_| "provider projection manifest rollback sync unavailable")?;
+    Ok(())
+}
+
+fn recover_provider_projection_transaction(
+    transaction: &Path,
+    home: &Path,
+    journal: &ProviderProjectionTransactionJournal,
+) -> Result<(), String> {
+    use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt};
+
+    if journal.version != 1 {
+        return Err(
+            "provider transaction journal version is unsupported; retain inputs and repair".into(),
+        );
+    }
+    let mut seen = BTreeSet::new();
+    for entry in &journal.entries {
+        provider_projection_relative_path(&entry.relative)?;
+        if !seen.insert(entry.relative.as_str()) {
+            return Err(
+                "provider transaction journal has duplicate destinations; retain inputs and repair"
+                    .into(),
+            );
+        }
+    }
+    let mut entries = journal.entries.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| {
+        std::cmp::Reverse(
+            provider_projection_relative_path(&entry.relative)
+                .map(|path| path.components().count())
+                .unwrap_or(0),
+        )
+    });
+
+    // A prior directory can now be an installed file. Remove those replacement
+    // leaves before walking deeper entries, since their former children have a
+    // non-directory parent until the old directory is rebuilt below.
+    let mut replaced_directories = journal
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.original,
+                ProviderProjectionOriginalNode::Directory { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    replaced_directories.sort_by_key(|entry| {
+        provider_projection_relative_path(&entry.relative)
+            .map(|path| path.components().count())
+            .unwrap_or(usize::MAX)
+    });
+    for entry in replaced_directories {
+        let relative = provider_projection_relative_path(&entry.relative)?;
+        projection_path_parent_is_physical(home, relative)?;
+        let destination = home.join(relative);
+        if let Ok(metadata) = fs::symlink_metadata(&destination) {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                remove_provider_projection_node(&destination)?;
+            }
+        }
+    }
+
+    // Remove paths that did not exist before publication and clear new file
+    // nodes that replaced old directories. Only empty directories are removed;
+    // an unexpected provider-created descendant leaves recovery fail-closed.
+    for entry in &entries {
+        let relative = provider_projection_relative_path(&entry.relative)?;
+        projection_path_parent_is_physical(home, relative)?;
+        let path = home.join(relative);
+        match entry.original {
+            ProviderProjectionOriginalNode::Missing => remove_provider_projection_node(&path)?,
+            ProviderProjectionOriginalNode::Directory { .. } => {}
+            ProviderProjectionOriginalNode::File { .. }
+            | ProviderProjectionOriginalNode::Symlink
+            | ProviderProjectionOriginalNode::Other => {
+                if provider_projection_backup_exists(transaction, &entry.relative)?
+                    && fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                        metadata.is_dir() && !metadata.file_type().is_symlink()
+                    })
+                {
+                    remove_provider_projection_node(&path)?;
+                }
+            }
+        }
+    }
+
+    // Parent directories must exist before backed-up files are restored. Their
+    // recorded modes also undo the publication's temporary 0700 directory mode.
+    let mut directories = journal
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            if let ProviderProjectionOriginalNode::Directory { mode } = entry.original {
+                Some((entry, mode))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|(entry, _)| {
+        provider_projection_relative_path(&entry.relative)
+            .map(|path| path.components().count())
+            .unwrap_or(usize::MAX)
+    });
+    for (entry, mode) in directories {
+        let relative = provider_projection_relative_path(&entry.relative)?;
+        projection_path_parent_is_physical(home, relative)?;
+        let destination = home.join(relative);
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&destination)
+                    .map_err(|_| "provider transaction recovery directory could not be restored")?;
+            }
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            _ => return Err("provider transaction recovery directory has an unsafe type; retain inputs and repair".into()),
+        }
+        fs::set_permissions(destination, fs::Permissions::from_mode(mode))
+            .map_err(|_| "provider transaction recovery directory mode could not be restored")?;
+    }
+
+    for entry in &journal.entries {
+        let relative = provider_projection_relative_path(&entry.relative)?;
+        projection_path_parent_is_physical(home, relative)?;
+        let destination = home.join(relative);
+        let backup = projection_transaction_path(transaction, &entry.relative)?;
+        let has_backup = provider_projection_backup_exists(transaction, &entry.relative)?;
+        match entry.original {
+            ProviderProjectionOriginalNode::Missing => {}
+            ProviderProjectionOriginalNode::Directory { .. } => {}
+            ProviderProjectionOriginalNode::File { in_place } if has_backup => {
+                if in_place {
+                    let metadata = fs::symlink_metadata(&destination).map_err(|_| {
+                        "provider mounted projection file disappeared during recovery"
+                    })?;
+                    if !metadata.is_file() || metadata.file_type().is_symlink() {
+                        return Err(
+                            "provider mounted projection file has an unsafe type during recovery"
+                                .into(),
+                        );
+                    }
+                    replace_mounted_projection_file(&backup, &destination)?;
+                } else {
+                    if fs::symlink_metadata(&destination).is_ok_and(|metadata| {
+                        metadata.is_dir() && !metadata.file_type().is_symlink()
+                    }) {
+                        remove_provider_projection_node(&destination)?;
+                    }
+                    fs::rename(&backup, &destination)
+                        .map_err(|_| "provider transaction file backup could not be restored; retain inputs and repair")?;
+                }
+            }
+            ProviderProjectionOriginalNode::File { in_place: true } => {
+                return Err(
+                    "provider mounted projection backup is missing; retain inputs and repair"
+                        .into(),
+                )
+            }
+            ProviderProjectionOriginalNode::File { in_place: false } => {
+                let metadata = fs::symlink_metadata(&destination).map_err(|_| {
+                    "provider transaction original file is missing; retain inputs and repair"
+                })?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err("provider transaction original file has an unsafe type; retain inputs and repair".into());
+                }
+            }
+            ProviderProjectionOriginalNode::Symlink if has_backup => {
+                fs::rename(&backup, &destination)
+                    .map_err(|_| "provider transaction link backup could not be restored; retain inputs and repair")?;
+            }
+            ProviderProjectionOriginalNode::Symlink => {
+                if !fs::symlink_metadata(&destination)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(
+                        "provider transaction original link is missing; retain inputs and repair"
+                            .into(),
+                    );
+                }
+            }
+            ProviderProjectionOriginalNode::Other if has_backup => {
+                fs::rename(&backup, &destination)
+                    .map_err(|_| "provider transaction node backup could not be restored; retain inputs and repair")?;
+            }
+            ProviderProjectionOriginalNode::Other => {
+                if fs::symlink_metadata(&destination).is_err() {
+                    return Err(
+                        "provider transaction original node is missing; retain inputs and repair"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    restore_provider_projection_manifest(transaction, home, journal.manifest_existed)?;
+    sync_provider_projection_directories(home, &journal.entries)?;
+    sync_provider_projection_tree(&transaction.join("backup"))?;
+    let mut rolled_back = journal.clone();
+    rolled_back.phase = ProviderProjectionTransactionPhase::RolledBack;
+    write_provider_projection_transaction_journal(transaction, &rolled_back)
+        .map_err(|error| format!("provider rollback completion could not be recorded: {error}"))?;
+    Ok(())
+}
+
+fn cleanup_provider_projection_transaction(
+    transaction: &Path,
+    provider_home: &Path,
+    expected_phase: ProviderProjectionTransactionPhase,
+) -> Result<(), String> {
+    use std::fs;
+
+    let journal_path = transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL);
+    let bytes = crate::provider_input_preparation::read_private(
+        transaction,
+        PROVIDER_PROJECTION_TRANSACTION_JOURNAL,
+        MAX_PROJECTION_METADATA_BYTES,
+    )
+    .map_err(|_| "provider transaction cleanup journal unavailable; retain inputs and repair")?;
+    let journal: ProviderProjectionTransactionJournal = serde_json::from_slice(&bytes)
+        .map_err(|_| "provider transaction cleanup journal invalid; retain inputs and repair")?;
+    if journal.phase != expected_phase
+        || !matches!(
+            journal.phase,
+            ProviderProjectionTransactionPhase::Preparing
+                | ProviderProjectionTransactionPhase::Committed
+                | ProviderProjectionTransactionPhase::RolledBack
+        )
+    {
+        return Err(
+            "provider transaction cleanup phase is not durable; retain inputs and repair".into(),
+        );
+    }
+
+    for entry in fs::read_dir(transaction).map_err(|_| {
+        "provider transaction cleanup inventory unavailable; retain inputs and repair"
+    })? {
+        let entry = entry.map_err(|_| {
+            "provider transaction cleanup inventory unavailable; retain inputs and repair"
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == PROVIDER_PROJECTION_TRANSACTION_JOURNAL {
+            continue;
+        }
+        if name != "desired"
+            && name != "backup"
+            && name != PROVIDER_PROJECTION_TRANSACTION_MANIFEST_BACKUP
+            && name != PROVIDER_PROJECTION_MANIFEST
+            && name != PROVIDER_PROJECTION_TRANSACTION_JOURNAL_TEMP
+            && !name.starts_with(".freshell-config-projection-")
+        {
+            return Err(format!(
+                "unexpected provider transaction cleanup entry {}; retain inputs and repair",
+                entry.path().display()
+            ));
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| {
+            "provider transaction cleanup entry could not be inspected; retain inputs and repair"
+        })?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path).map_err(|_| {
+                "provider transaction payload cleanup failed; retain inputs and repair"
+            })?;
+        } else {
+            fs::remove_file(&path).map_err(|_| {
+                "provider transaction payload cleanup failed; retain inputs and repair"
+            })?;
+        }
+    }
+
+    // Keep the phase record until every backup and staged input deletion is
+    // durable. Recovery can then repeat cleanup without trying to replay it.
+    sync_provider_projection_directory(transaction)?;
+    fs::remove_file(&journal_path)
+        .map_err(|_| "provider transaction journal cleanup failed; retain inputs and repair")?;
+    sync_provider_projection_directory(transaction)?;
+    fs::remove_dir(transaction)
+        .map_err(|_| "provider transaction directory cleanup failed; retain inputs and repair")?;
+    sync_provider_projection_directory(provider_home)?;
+    Ok(())
+}
+
+fn cleanup_orphaned_provider_refresh_stages(
+    provider_home: &Path,
+    preserved_stage: Option<&Path>,
+) -> Result<(), String> {
+    use std::fs;
+
+    let mut removed = false;
+    for entry in fs::read_dir(provider_home)
+        .map_err(|_| "provider refresh stage inventory unavailable; retain inputs and repair")?
+    {
+        let entry = entry.map_err(|_| {
+            "provider refresh stage inventory unavailable; retain inputs and repair"
+        })?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".freshell-provider-refresh-")
+            || preserved_stage.is_some_and(|stage| stage == entry.path())
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| {
+            "provider refresh stage could not be inspected; retain inputs and repair"
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(
+                "provider refresh stage has an unsafe type; retain inputs and repair".into(),
+            );
+        }
+        fs::remove_dir_all(entry.path()).map_err(|_| {
+            "orphaned provider refresh stage cleanup failed; retain inputs and repair"
+        })?;
+        removed = true;
+    }
+    if removed {
+        sync_provider_projection_directory(provider_home)?;
+    }
+    Ok(())
+}
+
+fn recover_provider_projection_transactions(provider_home: &Path) -> Result<(), String> {
+    let result = recover_provider_projection_transactions_inner(provider_home);
+    if let Err(cause) = &result {
+        emit_environment_event(serde_json::json!({
+            "severity": "error",
+            "event": "provider.projection.transaction.recovery_failed",
+            "stage": "recovery",
+            "cause": cause,
+        }));
+    }
+    result
+}
+
+fn recover_provider_projection_transactions_inner(provider_home: &Path) -> Result<(), String> {
+    let mut transactions = Vec::new();
+    for entry in std::fs::read_dir(provider_home).map_err(|_| {
+        "provider projection HOME unavailable during recovery; retain inputs and repair"
+    })? {
+        let entry = entry
+            .map_err(|_| "provider transaction inventory unavailable; retain inputs and repair")?;
+        let name = entry.file_name();
+        if !name
+            .to_string_lossy()
+            .starts_with(PROVIDER_PROJECTION_TRANSACTION_PREFIX)
+        {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())
+            .map_err(|_| "provider transaction could not be inspected; retain inputs and repair")?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(
+                "provider transaction path has an unsafe type; retain inputs and repair".into(),
+            );
+        }
+        transactions.push(entry.path());
+    }
+    transactions.sort();
+
+    let mut publishing = Vec::new();
+    for transaction in &transactions {
+        let journal_path = transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL);
+        let bytes = match crate::provider_input_preparation::read_private(
+            transaction,
+            PROVIDER_PROJECTION_TRANSACTION_JOURNAL,
+            MAX_PROJECTION_METADATA_BYTES,
+        ) {
+            Ok(bytes) => Some(bytes),
+            Err(_) if !journal_path.exists() => None,
+            Err(_) => {
+                return Err("provider transaction journal invalid; retain inputs and repair".into())
+            }
+        };
+        let Some(bytes) = bytes else {
+            let mut contents = std::fs::read_dir(transaction).map_err(|_| {
+                "provider transaction inventory unavailable; retain inputs and repair"
+            })?;
+            let safe_initial_stage = contents.by_ref().all(|entry| {
+                let Ok(entry) = entry else { return false };
+                if entry.file_name() != PROVIDER_PROJECTION_TRANSACTION_JOURNAL_TEMP {
+                    return false;
+                }
+                std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            });
+            if !safe_initial_stage {
+                return Err(
+                    "unrecognized provider transaction remains; retain inputs and repair".into(),
+                );
+            }
+            if transaction
+                .join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL_TEMP)
+                .exists()
+            {
+                std::fs::remove_file(
+                    transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL_TEMP),
+                )
+                .map_err(|_| {
+                    "provider initial transaction stage cleanup failed; retain inputs and repair"
+                })?;
+            }
+            std::fs::remove_dir(transaction).map_err(|_| {
+                "provider initial transaction stage cleanup failed; retain inputs and repair"
+            })?;
+            sync_provider_projection_directory(provider_home)?;
+            continue;
+        };
+        let journal: ProviderProjectionTransactionJournal = serde_json::from_slice(&bytes)
+            .map_err(|_| "provider transaction journal invalid; retain inputs and repair")?;
+        if journal.version != 1 {
+            return Err(
+                "provider transaction journal version is unsupported; retain inputs and repair"
+                    .into(),
+            );
+        }
+        match journal.phase {
+            ProviderProjectionTransactionPhase::Preparing => {
+                cleanup_provider_projection_transaction(
+                    transaction,
+                    provider_home,
+                    ProviderProjectionTransactionPhase::Preparing,
+                )?;
+            }
+            ProviderProjectionTransactionPhase::Committed
+            | ProviderProjectionTransactionPhase::RolledBack => {
+                // A visible commit/rollback journal is not a confirmed state
+                // until its containing directory flush succeeds. Retry that
+                // flush before deleting the backups that make the phase safe.
+                sync_provider_projection_directory(transaction)?;
+                cleanup_provider_projection_transaction(transaction, provider_home, journal.phase)?;
+            }
+            ProviderProjectionTransactionPhase::Publishing => {
+                publishing.push((transaction, journal))
+            }
+        }
+    }
+    if publishing.len() > 1 {
+        return Err(
+            "multiple interrupted provider publications require repair; retain inputs".into(),
+        );
+    }
+    if let Some((transaction, journal)) = publishing.pop() {
+        emit_environment_event(
+            serde_json::json!({"severity":"warn","event":"provider.projection.transaction.recovery_started","stage":"recovery","transaction":transaction.file_name().and_then(|name| name.to_str())}),
+        );
+        recover_provider_projection_transaction(transaction, provider_home, &journal)?;
+        cleanup_provider_projection_transaction(
+            transaction,
+            provider_home,
+            ProviderProjectionTransactionPhase::RolledBack,
+        )?;
+        emit_environment_event(
+            serde_json::json!({"severity":"info","event":"provider.projection.transaction.recovered","stage":"recovery"}),
+        );
+    }
+    Ok(())
+}
 
 fn read_projection_metadata(root: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
     match std::fs::symlink_metadata(root.join(relative)) {
@@ -3063,11 +3897,14 @@ fn refresh_provider_config_references(
             run_as_gid,
         );
     }
+    let _projection_lock = lock_provider_projection(provider_home)?;
+    recover_provider_projection_transactions(provider_home)?;
+    cleanup_orphaned_provider_refresh_stages(provider_home, None)?;
     let stage = tempfile::Builder::new()
         .prefix(".freshell-provider-refresh-")
         .tempdir_in(provider_home)
         .map_err(|error| error.to_string())?;
-    refresh_provider_config_in_stage(
+    refresh_provider_config_in_stage_locked(
         context,
         provider,
         workspace,
@@ -3077,7 +3914,29 @@ fn refresh_provider_config_references(
     )
 }
 
+#[cfg(test)]
 fn refresh_provider_config_in_stage(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    provider: &str,
+    workspace: &Path,
+    user_provider_root: &Path,
+    provider_home: &Path,
+    stage: tempfile::TempDir,
+) -> Result<(), String> {
+    let _projection_lock = lock_provider_projection(provider_home)?;
+    recover_provider_projection_transactions(provider_home)?;
+    cleanup_orphaned_provider_refresh_stages(provider_home, Some(stage.path()))?;
+    refresh_provider_config_in_stage_locked(
+        context,
+        provider,
+        workspace,
+        user_provider_root,
+        provider_home,
+        stage,
+    )
+}
+
+fn refresh_provider_config_in_stage_locked(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
     workspace: &Path,
@@ -3174,7 +4033,7 @@ fn refresh_provider_config_in_stage(
     )
     .map_err(|_| "provider reference alias metadata write failed")?;
     allow_provider_read_stage(stage.path(), unsafe { libc::getegid() })?;
-    apply_staged_provider_config(stage.path(), provider_home)
+    apply_staged_provider_config_locked(stage.path(), provider_home)
 }
 
 #[cfg(test)]
@@ -3251,12 +4110,56 @@ fn refresh_provider_config_as_provider(
         gid,
         std::time::Duration::from_secs(25),
         &stage,
-    )?;
+    );
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            let cause = format!("provider-owned config refresh failed with status {status}");
+            recover_provider_projection_as_provider(provider_home, uid, gid).map_err(
+                |recovery| format!("{cause}; interrupted projection recovery failed: {recovery}"),
+            )?;
+            Err(cause)
+        }
+        Err(cause) if cause.contains("provider-owned config refresh timed out") => {
+            recover_provider_projection_as_provider(provider_home, uid, gid).map_err(
+                |recovery| format!("{cause}; interrupted projection recovery failed: {recovery}"),
+            )?;
+            Err(cause)
+        }
+        Err(cause) => Err(cause),
+    }
+}
+
+fn recover_provider_projection_as_provider(
+    provider_home: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|_| "provider projection recovery executable unavailable")?;
+    let status = std::process::Command::new("/usr/bin/setpriv")
+        .args(provider_identity_args(uid, gid))
+        .args(["/usr/bin/timeout", "--kill-after=2s", "30s"])
+        .arg(executable)
+        .args(["refresh-provider-config", "--recover"])
+        .arg(provider_home)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| "provider projection recovery failed to start")?;
     if status.success() {
+        emit_environment_event(
+            serde_json::json!({"severity":"info","event":"provider.projection.transaction.timeout_recovered","stage":"recovery"}),
+        );
         Ok(())
     } else {
+        emit_environment_event(
+            serde_json::json!({"severity":"error","event":"provider.projection.transaction.timeout_recovery_failed","stage":"recovery","status":status.to_string()}),
+        );
         Err(format!(
-            "provider-owned config refresh failed with status {status}"
+            "provider projection recovery exited with status {status}"
         ))
     }
 }
@@ -3394,6 +4297,12 @@ fn allow_provider_read_stage(path: &Path, gid: u32) -> Result<(), String> {
 }
 
 fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
+    if args.len() == 2 && args[0] == "--recover" {
+        let provider_home = Path::new(&args[1]);
+        let _projection_lock = lock_provider_projection(provider_home)?;
+        recover_provider_projection_transactions(provider_home)?;
+        return cleanup_orphaned_provider_refresh_stages(provider_home, None);
+    }
     if args.len() == 6 && args[0] == "--prepare" {
         use std::io::Read;
         let mut input = std::io::stdin().lock();
@@ -3430,15 +4339,19 @@ fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
         if transaction.get_version_num() != 4 || transaction.to_string() != args[5] {
             return Err("provider refresh transaction invalid".into());
         }
+        let provider_home = Path::new(&args[4]);
+        let _projection_lock = lock_provider_projection(provider_home)?;
+        recover_provider_projection_transactions(provider_home)?;
+        cleanup_orphaned_provider_refresh_stages(provider_home, None)?;
         let name = format!(".freshell-provider-refresh-{transaction}");
         let stage = tempfile::Builder::new()
             .prefix(&name)
             .rand_bytes(0)
-            .tempdir_in(&args[4])
+            .tempdir_in(provider_home)
             .map_err(|error| {
                 format!("provider refresh transaction creation unavailable: {error}")
             })?;
-        return refresh_provider_config_in_stage(
+        return refresh_provider_config_in_stage_locked(
             &context,
             &args[1],
             Path::new(&args[2]),
@@ -3454,6 +4367,13 @@ fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
 }
 
 fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<(), String> {
+    let _projection_lock = lock_provider_projection(provider_home)?;
+    recover_provider_projection_transactions(provider_home)?;
+    cleanup_orphaned_provider_refresh_stages(provider_home, None)?;
+    apply_staged_provider_config_locked(stage, provider_home)
+}
+
+fn apply_staged_provider_config_locked(stage: &Path, provider_home: &Path) -> Result<(), String> {
     let destinations: Vec<String> = serde_json::from_slice(
         &read_projection_metadata(stage, "manifest.json")?
             .ok_or("provider projection destinations unavailable")?,
@@ -3678,12 +4598,23 @@ fn publish_provider_projection_with_manifest(
     emit_environment_event(
         serde_json::json!({"severity":"info","event":"provider.projection.transaction.started","provider":provider,"stage":"stage","previous_entries":previous.len(),"desired_entries":manifest_current.len()}),
     );
+    let previous_manifest = read_projection_metadata(home, PROVIDER_PROJECTION_MANIFEST)?;
     let transaction = tempfile::Builder::new()
-        .prefix(".freshell-provider-transaction-")
+        .prefix(PROVIDER_PROJECTION_TRANSACTION_PREFIX)
         .tempdir_in(home)
         .map_err(|error| format!("provider transaction stage: {error}"))?;
-    let desired = transaction.path().join("desired");
-    let backup = transaction.path().join("backup");
+    let transaction_path = transaction.keep();
+    sync_provider_projection_directory(home)?;
+    let mut journal = ProviderProjectionTransactionJournal {
+        version: 1,
+        phase: ProviderProjectionTransactionPhase::Preparing,
+        manifest_existed: previous_manifest.is_some(),
+        entries: Vec::new(),
+    };
+    write_provider_projection_transaction_journal(&transaction_path, &journal)
+        .map_err(|error| error.to_string())?;
+    let desired = transaction_path.join("desired");
+    let backup = transaction_path.join("backup");
     fs::create_dir(&backup).map_err(|error| error.to_string())?;
     let staged = (|| {
         let report = copy_environment_with_events(
@@ -3706,7 +4637,7 @@ fn publish_provider_projection_with_manifest(
             );
         }
         // Serialize, write and sync the complete manifest before changing HOME.
-        let manifest = write_projection_manifest(transaction.path(), &manifest_current)?;
+        let manifest = write_projection_manifest(&transaction_path, &manifest_current)?;
         // Links crossing mounted resource boundaries must still resolve in the
         // final HOME graph, not relative to the independent alias mount.
         for relative in current {
@@ -3742,6 +4673,16 @@ fn publish_provider_projection_with_manifest(
             emit_environment_event(
                 serde_json::json!({"severity":"error","event":"provider.projection.transaction.failed","provider":provider,"stage":"stage","cause":cause}),
             );
+            if let Err(cleanup_cause) = cleanup_provider_projection_transaction(
+                &transaction_path,
+                home,
+                ProviderProjectionTransactionPhase::Preparing,
+            ) {
+                return Err(format!(
+                    "{cause}; staged transaction cleanup failed: {cleanup_cause}; retain backup {}",
+                    transaction_path.display()
+                ));
+            }
             return Err(cause);
         }
     };
@@ -3781,6 +4722,11 @@ fn publish_provider_projection_with_manifest(
         }
         // Mounted files keep their inode. Back up their complete prior contents
         // before any mutation, with the same shared copy byte profile.
+        for (relative, metadata) in &old {
+            if metadata.is_file() {
+                sync_provider_projection_file(&home.join(relative))?;
+            }
+        }
         let limits = freshell_platform::provider_environment::CopyLimits::default();
         let mut bytes = 0u64;
         for (relative, metadata) in &old {
@@ -3801,6 +4747,11 @@ fn publish_provider_projection_with_manifest(
                     .map_err(|error| error.to_string())?;
                 fs::copy(home.join(relative), &saved)
                     .map_err(|error| format!("provider transaction backup {relative}: {error}"))?;
+                fs::File::open(&saved)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|error| {
+                        format!("provider transaction backup sync {relative}: {error}")
+                    })?;
             }
         }
         Ok(())
@@ -3809,13 +4760,67 @@ fn publish_provider_projection_with_manifest(
         emit_environment_event(
             serde_json::json!({"severity":"error","event":"provider.projection.transaction.failed","provider":provider,"stage":"validate","cause":cause}),
         );
+        if let Err(cleanup_cause) = cleanup_provider_projection_transaction(
+            &transaction_path,
+            home,
+            ProviderProjectionTransactionPhase::Preparing,
+        ) {
+            return Err(format!(
+                "{cause}; staged transaction cleanup failed: {cleanup_cause}; retain backup {}",
+                transaction_path.display()
+            ));
+        }
         return Err(cause);
     }
+    if let Some(bytes) = previous_manifest.as_deref() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let saved_manifest = transaction_path.join(PROVIDER_PROJECTION_TRANSACTION_MANIFEST_BACKUP);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(saved_manifest)
+            .map_err(|_| "provider transaction manifest backup unavailable")?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "provider transaction manifest backup write unavailable")?;
+    }
+    let mut touched_paths = std::collections::BTreeSet::new();
+    touched_paths.extend(
+        previous
+            .union(current)
+            .filter(|relative| {
+                !protected.contains(*relative) && !transactional_alias_paths.contains(*relative)
+            })
+            .cloned(),
+    );
+    touched_paths.extend(transactional_alias_paths.iter().cloned());
+    journal.entries = touched_paths
+        .into_iter()
+        .map(|relative| {
+            let in_place = mounted.contains(&PathBuf::from(&relative))
+                && incoming
+                    .get(&relative)
+                    .is_some_and(|metadata| metadata.is_file())
+                && old
+                    .get(&relative)
+                    .is_some_and(|metadata| metadata.is_file())
+                && !(preserve_existing_mounted_files.contains(&PathBuf::from(&relative))
+                    && previous.contains(&relative));
+            Ok(ProviderProjectionTransactionEntry {
+                original: provider_projection_original_node(home, &relative, in_place)?,
+                relative,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    sync_provider_projection_tree(&transaction_path)?;
+    sync_provider_projection_directory(home)?;
+    journal.phase = ProviderProjectionTransactionPhase::Publishing;
+    write_provider_projection_transaction_journal(&transaction_path, &journal)
+        .map_err(|error| error.to_string())?;
     let mut moved = Vec::<String>::new();
     let mut installed = Vec::<String>::new();
-    let mut created = Vec::<String>::new();
-    let mut removed = Vec::<(String, u32)>::new();
-    let mut touched_mounts = Vec::<String>::new();
     let publication: Result<(), String> = (|| {
         for (relative, metadata) in &old {
             if metadata.is_dir() || !previous.contains(relative) || protected.contains(relative) {
@@ -3831,13 +4836,19 @@ fn publish_provider_projection_with_manifest(
                 .map_err(|error| format!("provider transaction backup {relative}: {error}"))?;
             moved.push(relative.clone());
         }
+        backup_provider_reference_aliases(home, current, &reference_aliases, &backup, &mut moved)?;
+        // The old nodes and their backups must be durable before any new node
+        // is installed. Recovery can then restore the prior projection even
+        // after a machine crash during publication.
+        sync_provider_projection_tree(&backup)?;
+        sync_provider_projection_directories(home, &journal.entries)?;
         let mut directories = old
             .iter()
             .filter(|(_, metadata)| metadata.is_dir())
             .collect::<Vec<_>>();
         directories
             .sort_by_key(|(path, _)| std::cmp::Reverse(Path::new(path).components().count()));
-        for (relative, metadata) in directories {
+        for (relative, _) in directories {
             if !previous.contains(relative)
                 || protected.contains(relative)
                 || incoming
@@ -3848,7 +4859,7 @@ fn publish_provider_projection_with_manifest(
                 continue;
             }
             match fs::remove_dir(home.join(relative)) {
-                Ok(()) => removed.push((relative.clone(), metadata.permissions().mode())),
+                Ok(()) => {}
                 Err(error)
                     if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
                         && !incoming.contains_key(relative) => {}
@@ -3868,7 +4879,6 @@ fn publish_provider_projection_with_manifest(
                     fs::create_dir(&destination).map_err(|error| {
                         format!("provider transaction create {relative}: {error}")
                     })?;
-                    created.push(relative.clone());
                     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
                         .map_err(|error| error.to_string())?;
                 }
@@ -3885,7 +4895,6 @@ fn publish_provider_projection_with_manifest(
                 {
                     continue;
                 }
-                touched_mounts.push(relative.clone());
                 replace_mounted_projection_file(&desired.join(relative), &destination)?;
             } else {
                 fs::rename(desired.join(relative), &destination)
@@ -3903,30 +4912,12 @@ fn publish_provider_projection_with_manifest(
         )?;
         publish_manifest(&manifest, &home.join(PROVIDER_PROJECTION_MANIFEST))
             .map_err(|error| format!("provider transaction publish manifest: {error}"))?;
+        sync_provider_projection_directories(home, &journal.entries)?;
+        sync_provider_projection_tree(&backup)?;
         Ok(())
     })();
     if let Err(cause) = publication {
-        let rollback: Result<(), String> = (|| {
-            for relative in installed.iter().rev() {
-                fs::remove_file(home.join(relative)).map_err(|error| error.to_string())?;
-            }
-            for relative in created.iter().rev() {
-                fs::remove_dir(home.join(relative)).map_err(|error| error.to_string())?;
-            }
-            for (relative, mode) in removed.iter().rev() {
-                fs::create_dir(home.join(relative)).map_err(|error| error.to_string())?;
-                fs::set_permissions(home.join(relative), fs::Permissions::from_mode(*mode))
-                    .map_err(|error| error.to_string())?;
-            }
-            for relative in moved.iter().rev() {
-                fs::rename(backup.join(relative), home.join(relative))
-                    .map_err(|error| error.to_string())?;
-            }
-            for relative in touched_mounts.iter().rev() {
-                replace_mounted_projection_file(&backup.join(relative), &home.join(relative))?;
-            }
-            Ok(())
-        })();
+        let rollback = recover_provider_projection_transaction(&transaction_path, home, &journal);
         emit_environment_event(
             serde_json::json!({"severity":if rollback.is_ok(){"info"}else{"error"},"event":"provider.projection.transaction.rollback","provider":provider,"stage":"rollback","restored":moved.len(),"removed":installed.len(),"successful":rollback.is_ok()}),
         );
@@ -3934,18 +4925,72 @@ fn publish_provider_projection_with_manifest(
             serde_json::json!({"severity":"error","event":"provider.projection.transaction.failed","provider":provider,"stage":"publish","cause":cause}),
         );
         if let Err(rollback_cause) = rollback {
-            let retained = transaction.keep();
             return Err(format!(
                 "{cause}; rollback failed: {rollback_cause}; retain backup {} and repair",
-                retained.display()
+                transaction_path.display()
+            ));
+        }
+        if let Err(cleanup_cause) = cleanup_provider_projection_transaction(
+            &transaction_path,
+            home,
+            ProviderProjectionTransactionPhase::RolledBack,
+        ) {
+            return Err(format!(
+                "{cause}; prior projection restored but backup cleanup failed: {cleanup_cause}; retain backup {}",
+                transaction_path.display()
             ));
         }
         return Err(cause);
     }
+    journal.phase = ProviderProjectionTransactionPhase::Committed;
+    match write_provider_projection_transaction_journal(&transaction_path, &journal) {
+        Ok(()) => {}
+        Err(ProviderProjectionJournalWriteError::PublishedButUnconfirmed(cause)) => {
+            emit_environment_event(serde_json::json!({
+                "severity": "error",
+                "event": "provider.projection.transaction.commit_uncertain",
+                "provider": provider,
+                "stage": "commit",
+                "cause": cause,
+                "transaction": transaction_path.display().to_string(),
+            }));
+            return Err(format!(
+                "{cause}; provider projection is installed but commit durability is unconfirmed; retain backup {} and repair",
+                transaction_path.display()
+            ));
+        }
+        Err(ProviderProjectionJournalWriteError::BeforePublish(cause)) => {
+            let rollback =
+                recover_provider_projection_transaction(&transaction_path, home, &journal);
+            if let Err(rollback_cause) = rollback {
+                return Err(format!(
+                    "{cause}; provider projection recovery failed: {rollback_cause}; retain backup {} and repair",
+                    transaction_path.display()
+                ));
+            }
+            if let Err(cleanup_cause) = cleanup_provider_projection_transaction(
+                &transaction_path,
+                home,
+                ProviderProjectionTransactionPhase::RolledBack,
+            ) {
+                return Err(format!(
+                    "{cause}; prior projection restored but backup cleanup failed: {cleanup_cause}; retain backup {}",
+                    transaction_path.display()
+                ));
+            }
+            return Err(format!(
+                "{cause}; prior provider projection restored; retain inputs and retry"
+            ));
+        }
+    }
     emit_environment_event(
         serde_json::json!({"severity":"info","event":"provider.projection.transaction.committed","provider":provider,"stage":"commit","installed":installed.len(),"retired":moved.len()}),
     );
-    if let Err(error) = transaction.close() {
+    if let Err(error) = cleanup_provider_projection_transaction(
+        &transaction_path,
+        home,
+        ProviderProjectionTransactionPhase::Committed,
+    ) {
         emit_environment_event(
             serde_json::json!({"severity":"error","event":"provider.projection.transaction.cleanup_failed","provider":provider,"stage":"cleanup","cause":error.to_string()}),
         );
@@ -4036,6 +5081,92 @@ fn provider_reference_alias_parent_available(
         }
     }
     Ok(true)
+}
+
+fn backup_provider_reference_aliases(
+    home: &Path,
+    current: &std::collections::BTreeSet<String>,
+    plan: &ProviderResourceReferenceAliasPlan,
+    backup: &Path,
+    moved: &mut Vec<String>,
+) -> Result<(), String> {
+    for alias in &plan.active {
+        let relative = alias.provider_path();
+        if !provider_reference_alias_parent_available(home, &relative, current)? {
+            continue;
+        }
+        let destination = home.join(&relative);
+        let existing = match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Some(std::fs::read_link(&destination).map_err(|_| {
+                    "provider reference alias could not be inspected"
+                })?)
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "provider-created resource blocks provider reference alias {}; retain it and repair the selected path",
+                    relative.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("provider reference alias path could not be inspected".into()),
+        };
+        let Some(link) = existing else { continue };
+        let target = PathBuf::from(format!(
+            "/home/freshell/provider/.freshell/references/{}",
+            alias.reference_index
+        ));
+        if link == target {
+            continue;
+        }
+        if managed_provider_reference_alias_index(&link, &destination, home).is_none() {
+            return Err("provider reference alias conflicts with an existing link".into());
+        }
+        let relative_string = relative
+            .to_str()
+            .ok_or("provider reference alias path is not UTF-8")?
+            .to_owned();
+        let saved = backup.join(&relative);
+        std::fs::create_dir_all(saved.parent().ok_or("backup parent unavailable")?)
+            .map_err(|error| error.to_string())?;
+        std::fs::rename(&destination, saved)
+            .map_err(|error| format!("provider reference alias backup: {error}"))?;
+        moved.push(relative_string);
+    }
+    for alias in &plan.retired {
+        let relative = alias.provider_path();
+        let relative_string = relative
+            .to_str()
+            .ok_or("provider reference alias path is not UTF-8")?
+            .to_owned();
+        if current.contains(&relative_string)
+            || !provider_reference_alias_parent_available(home, &relative, current)?
+        {
+            continue;
+        }
+        let destination = home.join(&relative);
+        let link = match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                std::fs::read_link(&destination)
+                    .map_err(|_| "retired provider reference alias could not be inspected")?
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err("retired provider reference alias path could not be inspected".into())
+            }
+        };
+        if managed_provider_reference_alias_index(&link, &destination, home).is_none() {
+            continue;
+        }
+        let saved = backup.join(&relative);
+        std::fs::create_dir_all(saved.parent().ok_or("backup parent unavailable")?)
+            .map_err(|error| error.to_string())?;
+        std::fs::rename(&destination, saved)
+            .map_err(|error| format!("retired provider reference alias backup: {error}"))?;
+        moved.push(relative_string);
+    }
+    Ok(())
 }
 
 fn publish_provider_reference_aliases(
@@ -4152,6 +5283,14 @@ fn validate_owned_projection_descendants(
 }
 
 fn replace_mounted_projection_file(source: &Path, destination: &Path) -> Result<(), String> {
+    replace_mounted_projection_file_with_sync(source, destination, |file| file.sync_all())
+}
+
+fn replace_mounted_projection_file_with_sync(
+    source: &Path,
+    destination: &Path,
+    mut sync_file: impl FnMut(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), String> {
     use std::{fs, io::Write};
     let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
     let mut output = fs::OpenOptions::new()
@@ -4161,14 +5300,15 @@ fn replace_mounted_projection_file(source: &Path, destination: &Path) -> Result<
         .map_err(|error| error.to_string())?;
     std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
     output.flush().map_err(|error| error.to_string())?;
-    output.sync_all().map_err(|error| error.to_string())?;
+    sync_file(&output).map_err(|error| error.to_string())?;
     fs::set_permissions(
         destination,
         fs::metadata(source)
             .map_err(|error| error.to_string())?
             .permissions(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    sync_file(&output).map_err(|error| format!("failed to flush mounted projection mode: {error}"))
 }
 
 fn prepare_provider_context(
@@ -5205,6 +6345,103 @@ fn now_millis() -> i64 {
 mod tests {
     #[path = "probe_recovery_tests.rs"]
     mod probe_recovery;
+
+    #[test]
+    fn committed_journal_directory_sync_failure_is_not_treated_as_pre_publish() {
+        use super::*;
+        use std::io;
+
+        let transaction = tempfile::tempdir().unwrap();
+        let journal = ProviderProjectionTransactionJournal {
+            version: 1,
+            phase: ProviderProjectionTransactionPhase::Committed,
+            manifest_existed: false,
+            entries: Vec::new(),
+        };
+
+        let error = write_provider_projection_transaction_journal_with_sync(
+            transaction.path(),
+            &journal,
+            |_| Err(io::Error::other("injected directory flush failure")),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderProjectionJournalWriteError::PublishedButUnconfirmed(_)
+        ));
+        let published: ProviderProjectionTransactionJournal = serde_json::from_slice(
+            &std::fs::read(
+                transaction
+                    .path()
+                    .join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            published.phase,
+            ProviderProjectionTransactionPhase::Committed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_projection_mode_is_flushed_after_permissions_change() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("mounted");
+        std::fs::write(&source, b"provider state").unwrap();
+        std::fs::write(&destination, b"old state").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut observed_modes = Vec::new();
+
+        replace_mounted_projection_file_with_sync(&source, &destination, |file| {
+            file.sync_all()?;
+            observed_modes.push(std::fs::metadata(&destination)?.permissions().mode() & 0o777);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"provider state");
+        assert_eq!(observed_modes, vec![0o644, 0o600]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_projection_sync_walk_flushes_files_and_directories_without_following_links() {
+        use std::os::unix::fs::symlink;
+
+        let tree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let nested = tree.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let file = nested.join("provider.json");
+        std::fs::write(&file, "projected provider state").unwrap();
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(&outside_file, "outside state").unwrap();
+        symlink(&outside_file, nested.join("outside-link.json")).unwrap();
+
+        let mut synced = Vec::new();
+        super::sync_provider_projection_tree_with(tree.path(), &mut |path| {
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(synced.contains(&file));
+        assert!(synced.contains(&nested));
+        assert!(synced.contains(&tree.path().to_path_buf()));
+        assert!(
+            !synced.contains(&outside_file),
+            "sync traversal must not follow provider-controlled symlinks"
+        );
+    }
+
     fn copy_provider_config_references(
         context: &freshell_runtime_protocol::ProviderLaunchContext,
         provider: &str,
@@ -5878,6 +7115,350 @@ mod tests {
     }
 
     #[test]
+    fn provider_config_refresh_recovers_interrupted_projection_before_next_refresh() {
+        use super::*;
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let transaction = home.join(".freshell-provider-transaction-interrupted");
+        let backup = transaction.join("backup");
+        let stage = root.path().join("stage");
+        fs::create_dir_all(home.join("skills")).unwrap();
+        fs::create_dir_all(backup.join("skills")).unwrap();
+        fs::create_dir_all(stage.join("projection/skills")).unwrap();
+        fs::set_permissions(home.join("skills"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(home.join("skills/command"), b"new-resource").unwrap();
+        fs::write(home.join("skills/new"), b"new-owned").unwrap();
+        fs::write(home.join("skills/provider-created"), b"native-state").unwrap();
+        fs::write(backup.join("skills/command"), b"old-resource").unwrap();
+        fs::write(backup.join("skills/stale"), b"prior-owned").unwrap();
+        let previous = std::collections::BTreeSet::from([
+            "skills".to_owned(),
+            "skills/command".to_owned(),
+            "skills/stale".to_owned(),
+        ]);
+        let current = std::collections::BTreeSet::from([
+            "skills".to_owned(),
+            "skills/command".to_owned(),
+            "skills/new".to_owned(),
+        ]);
+        let previous_manifest =
+            freshell_runtime_protocol::bounded_json_bytes(&previous, MAX_PROJECTION_METADATA_BYTES)
+                .unwrap();
+        let current_manifest =
+            freshell_runtime_protocol::bounded_json_bytes(&current, MAX_PROJECTION_METADATA_BYTES)
+                .unwrap();
+        fs::write(transaction.join("manifest.backup"), &previous_manifest).unwrap();
+        fs::write(home.join(PROVIDER_PROJECTION_MANIFEST), &current_manifest).unwrap();
+        let entries = serde_json::json!([
+            { "relative": "skills", "original": { "kind": "directory", "mode": 0o751 } },
+            { "relative": "skills/command", "original": { "kind": "file", "in_place": false } },
+            { "relative": "skills/stale", "original": { "kind": "file", "in_place": false } },
+            { "relative": "skills/new", "original": { "kind": "missing" } }
+        ]);
+        fs::write(
+            transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "phase": "publishing",
+                "manifestExisted": true,
+                "entries": entries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(stage.join("projection/skills/command"), b"latest-resource").unwrap();
+        fs::write(stage.join("projection/skills/new"), b"latest-new-owned").unwrap();
+        write_projection_manifest(&stage.join("projection"), &current).unwrap();
+        fs::write(
+            stage.join("manifest.json"),
+            serde_json::to_vec(&["skills"]).unwrap(),
+        )
+        .unwrap();
+
+        apply_staged_provider_config(&stage, &home).unwrap();
+
+        assert_eq!(
+            fs::read(home.join("skills/command")).unwrap(),
+            b"latest-resource"
+        );
+        assert!(!home.join("skills/stale").exists());
+        assert_eq!(
+            fs::read(home.join("skills/provider-created")).unwrap(),
+            b"native-state"
+        );
+        assert_eq!(
+            fs::read(home.join("skills/new")).unwrap(),
+            b"latest-new-owned"
+        );
+        assert_eq!(
+            fs::metadata(home.join("skills"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert_eq!(
+            fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+            current_manifest
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_refresh_recovery_restores_mounted_inode_and_reference_alias() {
+        use super::*;
+        use std::{
+            fs,
+            os::unix::fs::{symlink, MetadataExt},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let transaction = home.join(".freshell-provider-transaction-mounted");
+        let backup = transaction.join("backup/.freshell/provider-roots/mcp-project");
+        let resource = home.join(".freshell/provider-roots/mcp-project");
+        let references = home.join(".freshell/references");
+        fs::create_dir_all(&resource).unwrap();
+        fs::create_dir_all(&references).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(references.join("0"), b"new reference").unwrap();
+        fs::write(references.join("1"), b"old reference").unwrap();
+        let mounted_file = resource.join("state.json");
+        fs::write(&mounted_file, b"new mounted state").unwrap();
+        let original_inode = fs::metadata(&mounted_file).unwrap().ino();
+        fs::write(backup.join("state.json"), b"old mounted state").unwrap();
+        symlink(
+            "/home/freshell/provider/.freshell/references/0",
+            resource.join(".env"),
+        )
+        .unwrap();
+        symlink(
+            "/home/freshell/provider/.freshell/references/1",
+            backup.join(".env"),
+        )
+        .unwrap();
+        fs::write(resource.join("new-file"), b"uncommitted").unwrap();
+        let previous = std::collections::BTreeSet::from([
+            ".freshell".to_owned(),
+            ".freshell/provider-roots".to_owned(),
+            ".freshell/provider-roots/mcp-project".to_owned(),
+            ".freshell/provider-roots/mcp-project/state.json".to_owned(),
+            ".freshell/provider-roots/mcp-project/.env".to_owned(),
+        ]);
+        let current = std::collections::BTreeSet::from([
+            ".freshell".to_owned(),
+            ".freshell/provider-roots".to_owned(),
+            ".freshell/provider-roots/mcp-project".to_owned(),
+            ".freshell/provider-roots/mcp-project/state.json".to_owned(),
+            ".freshell/provider-roots/mcp-project/.env".to_owned(),
+            ".freshell/provider-roots/mcp-project/new-file".to_owned(),
+        ]);
+        let previous_manifest =
+            freshell_runtime_protocol::bounded_json_bytes(&previous, MAX_PROJECTION_METADATA_BYTES)
+                .unwrap();
+        let current_manifest =
+            freshell_runtime_protocol::bounded_json_bytes(&current, MAX_PROJECTION_METADATA_BYTES)
+                .unwrap();
+        fs::write(
+            transaction.join(PROVIDER_PROJECTION_TRANSACTION_MANIFEST_BACKUP),
+            &previous_manifest,
+        )
+        .unwrap();
+        fs::write(home.join(PROVIDER_PROJECTION_MANIFEST), current_manifest).unwrap();
+        let entries = serde_json::json!([
+            { "relative": ".freshell", "original": { "kind": "directory", "mode": 0o700 } },
+            { "relative": ".freshell/provider-roots", "original": { "kind": "directory", "mode": 0o700 } },
+            { "relative": ".freshell/provider-roots/mcp-project", "original": { "kind": "directory", "mode": 0o700 } },
+            { "relative": ".freshell/provider-roots/mcp-project/state.json", "original": { "kind": "file", "in_place": true } },
+            { "relative": ".freshell/provider-roots/mcp-project/.env", "original": { "kind": "symlink" } },
+            { "relative": ".freshell/provider-roots/mcp-project/new-file", "original": { "kind": "missing" } }
+        ]);
+        fs::write(
+            transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "phase": "publishing",
+                "manifestExisted": true,
+                "entries": entries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        recover_provider_projection_transactions(&home).unwrap();
+
+        assert_eq!(fs::read(&mounted_file).unwrap(), b"old mounted state");
+        assert_eq!(fs::metadata(&mounted_file).unwrap().ino(), original_inode);
+        assert_eq!(
+            fs::read_link(resource.join(".env")).unwrap(),
+            Path::new("/home/freshell/provider/.freshell/references/1")
+        );
+        assert!(!resource.join("new-file").exists());
+        assert_eq!(
+            fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+            previous_manifest
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn provider_projection_recovery_cleans_a_rolled_back_transaction_without_replaying_it() {
+        use super::*;
+        use std::fs;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let transaction = home.join(format!(
+            "{PROVIDER_PROJECTION_TRANSACTION_PREFIX}rolled-back"
+        ));
+        fs::create_dir_all(transaction.join("desired/partial")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(transaction.join("desired/partial/file"), b"staged residue").unwrap();
+        fs::write(
+            transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "phase": "rolled_back",
+                "manifestExisted": false,
+                "entries": [
+                    { "relative": "mounted/state.json", "original": { "kind": "file", "in_place": true } }
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        recover_provider_projection_transactions(&home).unwrap();
+
+        assert!(
+            !transaction.exists(),
+            "a rollback-complete journal makes leftover stage data safe to remove"
+        );
+    }
+
+    #[test]
+    fn provider_refresh_recovery_removes_an_interrupted_private_stage() {
+        use super::*;
+        use std::fs;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let abandoned = home.join(".freshell-provider-refresh-interrupted");
+        fs::create_dir_all(&abandoned).unwrap();
+        fs::write(
+            abandoned.join("private-config.json"),
+            b"partial selected config",
+        )
+        .unwrap();
+        fs::create_dir_all(home.join("unrelated-state")).unwrap();
+
+        let _projection_lock = lock_provider_projection(&home).unwrap();
+        recover_provider_projection_transactions(&home).unwrap();
+        cleanup_orphaned_provider_refresh_stages(&home, None).unwrap();
+
+        assert!(
+            !abandoned.exists(),
+            "a later refresh removes private staging data left by a killed worker"
+        );
+        assert!(home.join("unrelated-state").is_dir());
+    }
+
+    #[test]
+    fn provider_projection_recovery_restores_children_after_directory_becomes_file() {
+        use super::*;
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let transaction = home.join(".freshell-provider-transaction-directory-change");
+        let backup = transaction.join("backup/skills");
+        fs::create_dir_all(home.join("skills")).unwrap();
+        fs::create_dir_all(&backup).unwrap();
+        fs::set_permissions(home.join("skills"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(backup.join("command"), b"prior executable").unwrap();
+        fs::remove_dir(home.join("skills")).unwrap();
+        fs::write(home.join("skills"), b"replacement file").unwrap();
+        let previous =
+            std::collections::BTreeSet::from(["skills".to_owned(), "skills/command".to_owned()]);
+        let previous_manifest =
+            freshell_runtime_protocol::bounded_json_bytes(&previous, MAX_PROJECTION_METADATA_BYTES)
+                .unwrap();
+        fs::write(
+            transaction.join(PROVIDER_PROJECTION_TRANSACTION_MANIFEST_BACKUP),
+            &previous_manifest,
+        )
+        .unwrap();
+        fs::write(home.join(PROVIDER_PROJECTION_MANIFEST), b"[\"skills\"]").unwrap();
+        fs::write(
+            transaction.join(PROVIDER_PROJECTION_TRANSACTION_JOURNAL),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "phase": "publishing",
+                "manifestExisted": true,
+                "entries": [
+                    { "relative": "skills", "original": { "kind": "directory", "mode": 0o751 } },
+                    { "relative": "skills/command", "original": { "kind": "file", "in_place": false } }
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        recover_provider_projection_transactions(&home).unwrap();
+
+        assert_eq!(
+            fs::read(home.join("skills/command")).unwrap(),
+            b"prior executable"
+        );
+        assert_eq!(
+            fs::metadata(home.join("skills"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert_eq!(
+            fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+            previous_manifest
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn provider_projection_lock_serializes_refreshes_for_one_home() {
+        use super::*;
+        use std::sync::mpsc;
+
+        let home = tempfile::tempdir().unwrap();
+        let first = lock_provider_projection(home.path()).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let second_home = home.path().to_path_buf();
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = lock_provider_projection(&second_home).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second refresh attempted to acquire the shared lock");
+        assert!(acquired_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second refresh proceeds after the first releases the lock");
+        second.join().unwrap();
+    }
+
+    #[test]
     fn provider_config_manifest_rename_failure_restores_every_published_leaf() {
         use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt};
         let root = tempfile::tempdir().unwrap();
@@ -5942,7 +7523,8 @@ mod tests {
                 fs::rename(source, &occupied)
             },
         );
-        assert!(result.unwrap_err().contains("publish manifest"));
+        let error = result.unwrap_err();
+        assert!(error.contains("publish manifest"), "{error}");
         assert_eq!(
             fs::read(home.join("skills/command")).unwrap(),
             b"#!/bin/sh\nprintf old-resource"

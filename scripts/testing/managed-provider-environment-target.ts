@@ -37,6 +37,18 @@ export type ManagedProviderEnvironmentTargetMode = 'managed-environment' | 'code
 const delay = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds))
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
 
+export function committedAcceptanceSha(repoRoot: string): string {
+  const candidateSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], timeout: 5_000,
+  }).trim()
+  assert.match(candidateSha, /^[a-f0-9]{40}$/, 'Cloud acceptance requires a known worktree commit')
+  const dirty = execFileSync('git', ['status', '--porcelain'], {
+    cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], timeout: 5_000,
+  }).trim()
+  assert.equal(dirty, '', 'Cloud acceptance must build an exact committed candidate')
+  return candidateSha
+}
+
 export const checkpointTcpForwarderSource = String.raw`
 const net = require('node:net')
 const listenHost = process.env.FRESHELL_CHECKPOINT_FORWARDER_HOST
@@ -1070,10 +1082,7 @@ export async function runCodeCheckpointTarget() {
   assert.equal(process.env.GCLOUD_ROBOT_REQUIRE, '1', 'Checkpoint acceptance requires the robot identity')
   assert.equal(process.env.GCLOUD_ROBOT_ACCOUNT, 'gcloud-robot@misc-puttering-project.iam.gserviceaccount.com')
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-  const candidateSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8', timeout: 5_000 }).trim()
-  assert.match(candidateSha, /^[a-f0-9]{40}$/)
-  const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8', timeout: 5_000 }).trim()
-  assert.equal(dirty, '', 'Checkpoint Cloud acceptance must build an exact committed candidate')
+  const candidateSha = committedAcceptanceSha(repoRoot)
   execFileSync('mise', ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-server',
     '--features', 'managed-runtime-v1', '--locked'], {
     cwd: repoRoot, env: { ...process.env, FRESHELL_BUILD_COMMIT: candidateSha }, stdio: 'inherit',
@@ -1442,12 +1451,7 @@ export async function runManagedEnvironmentTarget() {
   assert.equal(process.env.GCLOUD_ROBOT_REQUIRE, '1', 'Managed acceptance requires the robot identity')
   assert.equal(process.env.GCLOUD_ROBOT_ACCOUNT, 'gcloud-robot@misc-puttering-project.iam.gserviceaccount.com')
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-  const candidateSha = execFileSync('git', ['rev-parse', 'HEAD'], {
-    cwd: repoRoot,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'inherit'],
-    timeout: 5_000,
-  }).trim()
+  const candidateSha = committedAcceptanceSha(repoRoot)
   buildManagedEnvironmentClient(repoRoot, candidateSha)
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-managed-environment-'))
   const grants = fakeOnecliGrants(['opencode'])
@@ -1813,7 +1817,6 @@ export async function runManagedEnvironmentTarget() {
     const replacementChild = await poll('replacement Bun child', async () => readJson(path.join(selected.workspace, 'healthy/.managed-fixture/child-receipt.json')))
     const replacementCwdAliasMcp = await poll('replacement OpenCode starts the workspace-CWD MCP alias', async () =>
       readJson(cwdAliasReceiptPath))
-    const replacementStage = await stageProof(rig, replacement, nonce)
     assert.equal(replacement.nativeSessionId, original.nativeSessionId)
     assert.equal(replacementChild.bun, true)
     assert.equal(replacementChild.terminalId, replacement.terminalId)
@@ -1843,6 +1846,10 @@ export async function runManagedEnvironmentTarget() {
       exists: true, isNode: true, envFileOperand: true, fixtureArguments: true, cwdMatches: true,
       processStartTicksMatches: true,
     }, 'the .env MCP receipt must belong to a live process in the replacement container')
+    // Probe the receipt as soon as it appears. The provider-stage walk below can
+    // be sizeable, and the MCP child is owned by OpenCode; delaying this check
+    // until after that unrelated scan can observe a child that has since exited.
+    const replacementStage = await stageProof(rig, replacement, nonce)
     proof.nativeReplacement = { priorIncarnationId: original.incarnationId, incarnationId: replacement.incarnationId,
       soulId: replacement.soulId, nativeSessionId: replacement.nativeSessionId, stage: replacementStage,
       child: replacementChild, workspaceCwdAliasMcp: { ...replacementCwdAliasMcp,

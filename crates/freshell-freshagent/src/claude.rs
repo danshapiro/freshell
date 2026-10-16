@@ -120,6 +120,8 @@ pub struct FreshClaudeState {
     /// `freshell-ws` connection so the oracle's capture socket records
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`.
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// Server-owned durability edge for checkpoint-related provider frames.
+    checkpoint_event_sink: crate::CheckpointEventSink,
     /// placeholder-nanoid → live claude session (sidecar stdin + owned child + consumer).
     sessions: Arc<TokioMutex<HashMap<String, ClaudeSession>>>,
     /// durable Claude UUID (`cliSessionId` from `sdk.session.init`) -> sessions-map key.
@@ -781,6 +783,7 @@ impl FreshClaudeState {
         Self {
             hosted_mcp: false,
             broadcast_tx,
+            checkpoint_event_sink: crate::CheckpointEventSink::default(),
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
@@ -816,6 +819,13 @@ impl FreshClaudeState {
     pub fn with_hosted_mcp(mut self, selected: bool) -> Self {
         self.hosted_mcp = selected;
         self
+    }
+
+    pub fn set_checkpoint_event_persister(
+        &self,
+        persister: crate::CheckpointEventPersister,
+    ) -> Result<(), &'static str> {
+        self.checkpoint_event_sink.set_persister(persister)
     }
 
     /// b8ke focused episode-2 round-3 F3: crate-visible session-key resolver
@@ -1841,6 +1851,16 @@ impl FreshClaudeState {
         if let Ok(frame) = serde_json::to_string(msg) {
             let _ = self.broadcast_tx.send(frame);
         }
+    }
+
+    async fn broadcast_checkpoint_frame(
+        &self,
+        frame: String,
+        require_match: bool,
+    ) -> Result<(), String> {
+        self.checkpoint_event_sink
+            .broadcast(&self.broadcast_tx, frame, require_match)
+            .await
     }
 
     // ── freshAgent.create (WS) ───────────────────────────────────────────────────────
@@ -5258,20 +5278,31 @@ impl FreshClaudeState {
         };
         let name_ref = projection.as_ref().map(|(r, _)| r.clone());
         let session_name = projection.map(|(_, record)| record);
-        self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
-            FreshAgentSessionMaterialized {
-                previous_session_id: old_id.to_string(),
+        let message = ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
+            previous_session_id: old_id.to_string(),
+            provider: PROVIDER.to_string(),
+            session_id: new_id.to_string(),
+            session_type: session_type.to_string(),
+            session_ref: Some(freshell_protocol::SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: new_id.to_string(),
-                session_type: session_type.to_string(),
-                session_ref: Some(freshell_protocol::SessionLocator {
-                    provider: PROVIDER.to_string(),
-                    session_id: new_id.to_string(),
-                }),
-                name_ref,
-                session_name,
-            },
-        ));
+            }),
+            name_ref,
+            session_name,
+        });
+        if let Ok(frame) = serde_json::to_string(&message) {
+            if let Err(error) = self
+                .checkpoint_event_sink
+                .persist_before_broadcast(&frame, false)
+                .await
+            {
+                tracing::error!(target: "freshell_freshagent::claude",
+                    cause = %error,
+                    "freshagent.claude.checkpoint_alias_persist_failed"
+                );
+            }
+        }
+        self.broadcast(&message);
     }
 
     /// Handle a `freshAgent.undo` / `freshAgent.redo` for claude/kilroy (kata 1wxv
@@ -8636,7 +8667,19 @@ impl FreshClaudeState {
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                 if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
-                    let _ = broadcast_tx.send(frame);
+                    if value.get("type").and_then(Value::as_str)
+                        == Some("sdk.checkpointTurnIdentity")
+                    {
+                        if let Err(error) = state.broadcast_checkpoint_frame(frame, true).await {
+                            tracing::error!(target: "freshell_freshagent::claude",
+                                session_id = %stamp,
+                                cause = %error,
+                                "freshagent.claude.checkpoint_identity_persist_failed"
+                            );
+                        }
+                    } else {
+                        let _ = broadcast_tx.send(frame);
+                    }
                 }
             }
             // Task 5 (unified needs-attention signal): capture the armed state
