@@ -562,7 +562,7 @@ fn assemble_workload_binds(
         }
         if let Some(source) = &mounts.mcp_capability_file {
             binds.push(format!(
-                "{}:/run/freshell/mcp-capability.json:ro",
+                "{}:/run/freshell-mcp-capability.json:ro",
                 source.display()
             ));
         }
@@ -1423,7 +1423,7 @@ fn verify_workload_mounts(
         let found = mounts.iter().any(|mount| {
             mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
                 && mount.get("Destination").and_then(Value::as_str)
-                    == Some("/run/freshell/mcp-capability.json")
+                    == Some("/run/freshell-mcp-capability.json")
                 && mount.get("RW").and_then(Value::as_bool) == Some(false)
         });
         if !found {
@@ -2072,6 +2072,39 @@ mod tests {
                 .map(String::as_str),
             Some("")
         );
+    }
+
+    #[test]
+    fn managed_mcp_grant_mount_is_outside_the_private_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let grant = root.path().join("grant.json");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(&grant, b"{}\n").unwrap();
+        std::fs::set_permissions(&grant, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mounts = TerminalMounts {
+            workspace,
+            git_common_dir: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_files: Vec::new(),
+            provider_user_root: None,
+            mcp_capability_file: Some(grant.clone()),
+            operator_home: None,
+        };
+        let (binds, _) = assemble_workload_binds(
+            &root.path().join("host"),
+            &root.path().join("runtime"),
+            "provider-volume",
+            None,
+            Some(&mounts),
+        )
+        .unwrap();
+
+        assert!(binds.contains(&format!(
+            "{}:/run/freshell-mcp-capability.json:ro",
+            grant.display()
+        )));
     }
 
     #[test]

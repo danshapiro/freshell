@@ -375,7 +375,7 @@ export class RestrictedDockerBroker {
       if (terminalWorkload && /^\/run\/freshell-secrets\/provider-\d+$/.test(destination) && mode === 'ro' && this.policy.allowedBootstrapFiles?.has(source)) {
         continue
       }
-      if (terminalWorkload && destination === '/run/freshell/mcp-capability.json' && mode === 'ro') {
+      if (terminalWorkload && destination === '/run/freshell-mcp-capability.json' && mode === 'ro') {
         const relative = path.relative(path.dirname(this.policy.runtimeRootPrefix), source)
         if (/^scenarios\/[^/]+\/control\/mcp-capabilities\/grant-[a-zA-Z0-9-]+\.json$/.test(relative)) continue
       }

@@ -92,12 +92,17 @@ describe('managed MCP mount', () => {
     expect(validate(createBody([
       ...ordinaryBinds,
       actorBind,
-      '/tmp/owned/scenarios/scenario/control/mcp-capabilities/grant-1234.json:/run/freshell/mcp-capability.json:ro',
+      '/tmp/owned/scenarios/scenario/control/mcp-capabilities/grant-1234.json:/run/freshell-mcp-capability.json:ro',
     ])).ok).toBe(true)
     expect(validate(createBody([
       ...ordinaryBinds,
       actorBind,
-      '/etc/passwd:/run/freshell/mcp-capability.json:ro',
+      '/tmp/owned/scenarios/scenario/control/mcp-capabilities/grant-1234.json:/run/freshell/mcp-capability.json:ro',
+    ])).ok).toBe(false)
+    expect(validate(createBody([
+      ...ordinaryBinds,
+      actorBind,
+      '/etc/passwd:/run/freshell-mcp-capability.json:ro',
     ])).ok).toBe(false)
     expect(validate(createBody([
       ...ordinaryBinds,

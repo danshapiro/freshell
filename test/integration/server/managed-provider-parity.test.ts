@@ -645,9 +645,16 @@ describe('ordinary and managed terminal provider parity', () => {
       row.provider === 'opencode' && row.kind === 'launch'
     )))
     wire.send({ type: 'terminal.input', terminalId, data: 'restart recovery prompt\r' })
-    await waitFor('OpenCode native identity before web restart', () => wire.recordRows().find(row => (
+    const identity = await waitFor('OpenCode native identity before web restart', () => wire.recordRows().find(row => (
       row.kind === 'identity' && row.terminalId === terminalId
     )))
+    await waitFor('OpenCode resume evidence before web restart', async () => {
+      const view = (await rig.inventory()).find((row: any) => row.terminalId === terminalId)
+      return view?.nativeSessionId === identity.nativeSession?.value
+        && view?.durabilityState === 'resume_captured' ? view : undefined
+    }, 45_000).catch(async error => {
+      throw new Error(`${String(error)}; identity: ${JSON.stringify(identity)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}; web: ${JSON.stringify(rig.web.capturedOutput()).slice(-4000)}`)
+    })
     const before = await waitFor('OpenCode container before web restart', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId ? view : undefined
@@ -660,8 +667,13 @@ describe('ordinary and managed terminal provider parity', () => {
     await rig.restartWebGracefully()
     const after = await waitFor('replacement after web restart', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
+      if (view?.recoveryState === 'blocked') {
+        throw new Error(`managed OpenCode recovery is blocked: ${JSON.stringify(view)}`)
+      }
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
-    }, 300_000)
+    }, 300_000).catch(async error => {
+      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}; web: ${JSON.stringify(rig.web.capturedOutput()).slice(-4000)}`)
+    })
     expect(after.soulId).toBe(before.soulId)
     const recoveredWire = await TerminalWire.connect(rig.info, true)
     sockets.push(recoveredWire)

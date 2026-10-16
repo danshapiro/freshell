@@ -68,7 +68,7 @@ pub async fn prepare_terminal(
             if capability.endpoint.is_empty() {
                 return Err("managed MCP endpoint is unavailable".into());
             }
-            let grant = read_mcp_grant(std::path::Path::new("/run/freshell/mcp-capability.json"))?;
+            let grant = read_mcp_grant(std::path::Path::new("/run/freshell-mcp-capability.json"))?;
             if grant.get("FRESHELL_URL") != Some(&capability.endpoint) {
                 return Err("managed MCP grant endpoint differs from launch context".into());
             }
@@ -195,10 +195,18 @@ pub async fn prepare_terminal(
 fn read_mcp_grant(
     path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let value: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(path).map_err(|_| "managed MCP grant is unavailable".to_string())?,
-    )
-    .map_err(|_| "managed MCP grant is malformed".to_string())?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("managed MCP grant is unavailable: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 {
+        return Err(format!(
+            "managed MCP grant is unavailable: invalid mounted file (size {})",
+            metadata.len()
+        ));
+    }
+    let bytes = crate::provider_secret_resolution::read_mounted_file_as_owner(path, &metadata)
+        .map_err(|error| format!("managed MCP grant is unavailable: {error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "managed MCP grant is malformed".to_string())?;
     let endpoint = value
         .get("endpoint")
         .and_then(serde_json::Value::as_str)

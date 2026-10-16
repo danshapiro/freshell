@@ -66,7 +66,8 @@ pub fn resolve_child_secrets(
         {
             return Err("OneCLI grant must be a bounded regular file".into());
         }
-        let raw = fs::read(&mount).map_err(|error| format!("read OneCLI grant: {error}"))?;
+        let raw = read_mounted_file_as_owner(&mount, &metadata)
+            .map_err(|error| format!("read OneCLI grant: {error}"))?;
         if let Some(relative) = reference.profile.provider_file_relative_path() {
             if raw.is_empty() {
                 return Err("OneCLI provider-file grant is empty".into());
@@ -83,6 +84,45 @@ pub fn resolve_child_secrets(
         }
     }
     Ok(resolved)
+}
+
+/// Read the one-file secret bind mount as its host owner. Root inside a
+/// managed workload has SETUID/SETGID for dropping provider children, but its
+/// DAC-bypass capabilities are removed; in a rootful Docker daemon the mount
+/// keeps the host UID and mode 0600, so the container's root cannot read it.
+/// This narrowly drops a helper process to the mounted file's owner instead
+/// of granting the session host broad filesystem read privileges or relaxing
+/// the host secret file's permissions.
+pub(crate) fn read_mounted_file_as_owner(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Vec<u8>, std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::CommandExt;
+
+        let output = std::process::Command::new("/usr/bin/cat")
+            .arg("--")
+            .arg(path)
+            .uid(metadata.uid())
+            .gid(metadata.gid())
+            .output()?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            return Err(std::io::Error::other(format!(
+                "secret reader exited with {}: {}",
+                output.status,
+                detail.trim()
+            )));
+        }
+        return Ok(output.stdout);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        fs::read(path)
+    }
 }
 
 fn resolve_profile(
@@ -436,6 +476,28 @@ fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a 
 mod tests {
     use super::*;
     use freshell_runtime_protocol::ProviderSecretReference;
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_grant_reader_preserves_private_file_mode() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let grant = root.path().join("provider-0");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&grant)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"OPENAI_API_KEY=fixture-secret\n").unwrap();
+
+        let metadata = fs::symlink_metadata(&grant).unwrap();
+        let contents = read_mounted_file_as_owner(&grant, &metadata).unwrap();
+
+        assert_eq!(contents, b"OPENAI_API_KEY=fixture-secret\n");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn provider_secret_profiles_accept_only_their_provider_and_keep_controls_out_of_child() {

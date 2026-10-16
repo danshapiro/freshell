@@ -442,6 +442,39 @@ fn private_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Expose only a staged snapshot through the read-only workload bind mount.
+/// Its parent remains owner-only on the host, but the session host inside the
+/// container has no DAC bypass capability and therefore cannot read files
+/// owned by the host user unless the mounted tree grants ordinary read/search
+/// permission.
+fn make_provider_stage_readable(root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() {
+                return Err("managed provider stage cannot contain symlinks".into());
+            }
+            if metadata.is_dir() {
+                make_provider_stage_readable(&path)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|error| error.to_string())?;
+            } else if metadata.is_file() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                    .map_err(|error| error.to_string())?;
+            } else {
+                return Err("managed provider stage contains an unsupported file type".into());
+            }
+        }
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn copy_provider_source(
     root: &Path,
     source: &Path,
@@ -754,6 +787,7 @@ fn stage_provider_root(
                 }
             }
         }
+        make_provider_stage_readable(&temporary)?;
         std::fs::rename(&temporary, &staged).map_err(|error| error.to_string())?;
         Ok(staged.clone())
     })();
@@ -1264,6 +1298,51 @@ mod tests {
             None,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // The session host is root inside the managed container, but its
+            // capabilities are dropped. The read-only bind mount keeps the
+            // host's private parent boundary, so selected staged inputs must
+            // be traversable/readable through the mount itself.
+            assert_eq!(
+                std::fs::metadata(staged.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(
+                std::fs::metadata(staged.join("settings.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+            assert_eq!(
+                std::fs::metadata(staged.join("plugins"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+            assert_eq!(
+                std::fs::metadata(staged.join("plugins/plugin.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(staged.join("settings.json")).unwrap(),
             "current setting"

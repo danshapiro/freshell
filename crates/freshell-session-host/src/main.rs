@@ -1905,7 +1905,12 @@ fn resolve_provider_config_source(root: &Path, source: &Path) -> Result<Option<P
         current = match std::fs::canonicalize(&current) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("provider config source unavailable: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "provider config source unavailable at {}: {error}",
+                    current.display()
+                ))
+            }
         };
         if !current.starts_with(&canonical_root) {
             tracing::warn!(

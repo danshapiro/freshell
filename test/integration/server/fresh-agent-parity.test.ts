@@ -89,6 +89,10 @@ describe('hosted fresh-agent provider inputs', () => {
     }, homeDir)
     await rig.start()
     opencodeProject = fs.mkdtempSync(path.join(root, '.opencode-parity-'))
+    // mkdtemp creates the project root as 0700. Managed workloads deliberately
+    // lack DAC bypass, so expose this non-secret fixture like a normal shared
+    // workspace before mounting it into the provider container.
+    fs.chmodSync(opencodeProject, 0o755)
     fs.mkdirSync(path.join(opencodeProject, '.opencode'), { recursive: true })
     fs.writeFileSync(path.join(opencodeProject, '.opencode/opencode.json'), JSON.stringify({
       provider: { project_fixture: { name: 'project fixture' } },
@@ -145,7 +149,17 @@ describe('hosted fresh-agent provider inputs', () => {
     const created = await wire.wait(frame => frame.requestId === requestId
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
     if (created.type === 'freshAgent.create.failed') {
-      throw new Error(`${JSON.stringify(created)}; inventory=${JSON.stringify(await rig.inventory())}; web=${JSON.stringify(rig.web.capturedOutput())}; supervisor=${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-6000)}`)
+      const logDirectory = path.join(homeDir, '.freshell', 'logs')
+      const creationLogs = fs.existsSync(logDirectory)
+        ? fs.readdirSync(logDirectory)
+          .filter(name => name.endsWith('.jsonl'))
+          .map(name => fs.readFileSync(path.join(logDirectory, name), 'utf8'))
+          .flatMap(contents => contents.split('\n'))
+          .filter(line => line.includes('fresh_agent.create.'))
+          .slice(-20)
+          .join('\n')
+        : 'no server JSONL log directory'
+      throw new Error(`${JSON.stringify(created)}; inventory=${JSON.stringify(await rig.inventory())}; creationLogs=${creationLogs}; web=${JSON.stringify(rig.web.capturedOutput())}; supervisor=${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-6000)}`)
     }
     expect(created.type, JSON.stringify(created)).toBe('freshAgent.created')
     expect(created.nameRef).toEqual({ kind: 'pending', id: namingHandle })
