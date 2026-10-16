@@ -18,6 +18,7 @@ import {
   processIdentity,
   resolveManagedProviderEnvironmentTargetMode,
   runManagedProviderEnvironmentTarget,
+  runExactDockerContainerOperation,
   settleExactDockerContainerRemoval,
   stopExact,
   workspaceCwdAliasMcpWrapperSource,
@@ -190,6 +191,39 @@ describe('managed provider environment target mode', () => {
       async milliseconds => { waits.push(milliseconds) },
       1_000,
     )).resolves.toBeUndefined()
+
+    expect(waits).toEqual([250, 250])
+  })
+
+  it('accepts a failed cleanup command only after the exact Docker container is gone', async () => {
+    const containerId = 'b'.repeat(64)
+    const error = new Error(`No such container: ${containerId}`)
+
+    await expect(runExactDockerContainerOperation(
+      containerId,
+      () => { throw error },
+      () => [],
+    )).resolves.toEqual({ kind: 'gone' })
+
+    await expect(runExactDockerContainerOperation(
+      containerId,
+      () => { throw new Error('Docker daemon is unavailable') },
+      () => [containerId],
+    )).rejects.toThrow('Docker daemon is unavailable')
+  })
+
+  it('waits for the exact ID to disappear when a cleanup command races automatic removal', async () => {
+    const containerId = 'c'.repeat(64)
+    const snapshots = [[containerId], [containerId], []]
+    const waits: number[] = []
+
+    await expect(runExactDockerContainerOperation(
+      containerId,
+      () => { throw new Error(`Error response from daemon: removal of container ${containerId} is already in progress`) },
+      () => snapshots.shift() ?? [],
+      async milliseconds => { waits.push(milliseconds) },
+      1_000,
+    )).resolves.toEqual({ kind: 'gone' })
 
     expect(waits).toEqual([250, 250])
   })

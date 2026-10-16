@@ -861,24 +861,84 @@ export async function settleExactDockerContainerRemoval(
   wait: (milliseconds: number) => Promise<void> = delay,
   timeoutMs = 15_000,
 ): Promise<void> {
+  const result = await runExactDockerContainerOperation(containerId, remove, listMatching, wait, timeoutMs)
+  if (result.kind === 'gone') return
+  await waitForExactDockerContainerAbsence(containerId, listMatching, wait, timeoutMs)
+}
+
+type ExactDockerContainerOperationResult<T> = { kind: 'completed'; value: T } | { kind: 'gone' }
+
+export async function runExactDockerContainerOperation<T>(
+  containerId: string,
+  operation: () => T,
+  listMatching: () => string[],
+  wait: (milliseconds: number) => Promise<void> = delay,
+  timeoutMs = 15_000,
+): Promise<ExactDockerContainerOperationResult<T>> {
   try {
-    remove()
+    return { kind: 'completed', value: operation() }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (!message.includes(`removal of container ${containerId} is already in progress`)) throw error
-  }
+    if (message.includes(`removal of container ${containerId} is already in progress`)) {
+      await waitForExactDockerContainerAbsence(containerId, listMatching, wait, timeoutMs)
+      return { kind: 'gone' }
+    }
 
+    const matching = listMatching()
+    assert(matching.length === 0 || (matching.length === 1 && matching[0] === containerId),
+      'Only the exact owned Docker container may remain during cleanup')
+    if (matching.length === 0) return { kind: 'gone' }
+    throw error
+  }
+}
+
+async function waitForExactDockerContainerAbsence(
+  containerId: string,
+  listMatching: () => string[],
+  wait: (milliseconds: number) => Promise<void>,
+  timeoutMs: number,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (true) {
     const matching = listMatching()
     assert(matching.length === 0 || (matching.length === 1 && matching[0] === containerId),
-      'Only the exact owned Docker container may remain during removal')
+      'Only the exact owned Docker container may remain during cleanup')
     if (matching.length === 0) return
     const remainingMs = deadline - Date.now()
     if (remainingMs <= 0) break
     await wait(Math.min(250, remainingMs))
   }
-  throw new Error(`Owned Docker container ${containerId} did not disappear after removal`)
+  throw new Error(`Owned Docker container ${containerId} did not disappear after cleanup`)
+}
+
+async function cleanupOwnedDockerContainer(
+  containerId: string,
+  runId: string,
+  stopArgs: string[],
+): Promise<{ containerId: string; settled: true }> {
+  const listMatching = () => docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean)
+  const matching = listMatching()
+  if (matching.length) {
+    assert.deepEqual(matching, [containerId], 'Only the exact owned checkpoint container may be stopped')
+    const inspected = await runExactDockerContainerOperation(containerId,
+      () => docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', containerId]),
+      listMatching)
+    if (inspected.kind === 'gone') return { containerId, settled: true }
+    assert.equal(inspected.value, `${containerId} ${runId}`, 'Refusing to clean up an unowned checkpoint container')
+
+    const stopped = await runExactDockerContainerOperation(containerId,
+      () => docker([...stopArgs, containerId], 20_000), listMatching)
+    if (stopped.kind === 'gone') return { containerId, settled: true }
+  }
+
+  const remaining = listMatching()
+  if (remaining.length) await settleExactDockerContainerRemoval(
+    containerId,
+    () => { docker(['container', 'rm', '--force', containerId], 20_000) },
+    listMatching,
+  )
+  assert.deepEqual(listMatching(), [])
+  return { containerId, settled: true }
 }
 
 function cancelOwnedCloudExecution(executionName: string, candidateSha: string): Record<string, unknown> {
@@ -1414,40 +1474,10 @@ export async function runCodeCheckpointTarget() {
     }
     await attempt('browserJoin', () => stopExact(browser, browserIdentity, browserJoin, true))
     await attempt('tunnelJoin', () => stopExact(tunnel, tunnelIdentity, tunnelJoin, true))
-    if (forwarderContainerId) await attempt('forwarderContainer', async () => {
-      const matching = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean)
-      if (matching.length) {
-        assert.deepEqual(matching, [forwarderContainerId], 'Only the exact owned checkpoint forwarder may be stopped')
-        const details = docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', forwarderContainerId])
-        assert.equal(details, `${forwarderContainerId} ${runId}`, 'Refusing to clean up an unowned checkpoint forwarder')
-        docker(['container', 'stop', '--timeout', '10', forwarderContainerId], 20_000)
-      }
-      const remaining = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean)
-      if (remaining.length) await settleExactDockerContainerRemoval(
-        forwarderContainerId,
-        () => { docker(['container', 'rm', '--force', forwarderContainerId], 20_000) },
-        () => docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean),
-      )
-      assert.deepEqual(docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean), [])
-      return { containerId: forwarderContainerId, settled: true }
-    })
-    if (containerId) await attempt('container', async () => {
-      const matching = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean)
-      if (matching.length) {
-        assert.deepEqual(matching, [containerId], 'Only the exact owned checkpoint container may be stopped')
-        const details = docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', containerId])
-        assert.equal(details, `${containerId} ${runId}`, 'Refusing to clean up an unowned checkpoint container')
-        docker(['container', 'stop', '--time', '10', containerId], 20_000)
-      }
-      const remaining = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean)
-      if (remaining.length) await settleExactDockerContainerRemoval(
-        containerId,
-        () => { docker(['container', 'rm', '--force', containerId], 20_000) },
-        () => docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean),
-      )
-      assert.deepEqual(docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean), [])
-      return { containerId, settled: true }
-    })
+    if (forwarderContainerId) await attempt('forwarderContainer', () =>
+      cleanupOwnedDockerContainer(forwarderContainerId, runId, ['container', 'stop', '--timeout', '10']))
+    if (containerId) await attempt('container', () =>
+      cleanupOwnedDockerContainer(containerId, runId, ['container', 'stop', '--time', '10']))
     else if (dockerRun && dockerRunIdentity && dockerRunJoin) await attempt('containerIdentity', async () => {
       const named = docker(['ps', '-aq', '--no-trunc', '--filter', `name=^/${containerName}$`]).split('\n').filter(Boolean)
       assert.deepEqual(named, [], 'Container without a published owned ID remains unknown; retain its fixture')
