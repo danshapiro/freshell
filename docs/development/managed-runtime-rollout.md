@@ -8,12 +8,12 @@ registry schema upgrade.
 
 The current candidate checks for this repair are the four user-approved
 ordinary turns: terminal Codex and OpenCode, plus FreshCodex and FreshOpenCode.
-The latest result is 1/4: FreshOpenCode passed; terminal Codex did not start,
-FreshCodex ended without a completed turn, and terminal OpenCode did not
-complete. Task 9 remains unresolved. The final configured full-suite gate,
-affected managed browser/smoke checks, and required independent reviews remain
-part of this run. Native recovery proofs and the backup/upgrade drill below are
-general rollout procedures, not acceptance gates for this repair. This runbook
+Claude live behavior remains unverified by explicit agreement. The configured
+full-suite gate, affected managed browser/smoke checks, and required independent
+reviews are also part of this run. Record actual results against the tested
+candidate in the repair's run record. Native recovery proofs and the
+backup/upgrade drill below are general rollout procedures, not acceptance
+gates for this repair. This runbook
 does not certify, promote, or describe an installed candidate. Managed
 Amplifier and Kilroy remain unqualified and release-disabled. Their exclusion
 does not remove ordinary legacy CLI integrations or existing regression tests.
@@ -202,10 +202,9 @@ change affects subsequent routing; it does not recreate already running souls.
 An existing managed-default installation does not need a routing transition
 merely to upgrade. This repair's acceptance remains the four user-approved
 ordinary-use checks, the final configured default suite, affected managed
-browser/smoke checks, and required independent reviews. Task 9 remains
-unresolved at 1/4; a failed or unobserved check is not acceptance. The earlier
-six-mode 0/6 result records the broader scope before the user narrowed these
-checks. The native recovery proofs and backup/upgrade drill below remain
+browser/smoke checks, and required independent reviews. A failed or unobserved
+check is not acceptance. The native recovery proofs and backup/upgrade drill
+below remain
 operator rollout guidance but are outside this repair's acceptance. The old
 all-mode production/pressure campaign is not an additional delivery gate.
 Selected-mode results must never be reported as global campaign or Gate 5 PASS.
@@ -214,10 +213,8 @@ Selected-mode results must never be reported as global campaign or Gate 5 PASS.
 
 Preparation does not write live artifacts, open the live registry with the
 candidate, pause writers, or restart services. The deployment packet remains
-in private files outside Git. At this documentation checkpoint, Task 9's four
-ordinary-use checks remain unresolved at 1/4; the final configured default
-suite and affected browser/smoke results for the current candidate remain
-pending. The later operator rollout steps still require resolving running-owner
+in private files outside Git. Use the repair's run record for current test and
+review results. The later operator rollout steps still require resolving running-owner
 and artifact metadata, verifying backups where applicable, and obtaining
 production approval.
 
@@ -369,9 +366,7 @@ Follow repository test coordination and destructive-test containment for these
 checks. Reuse current candidate results rather than repeating suites solely
 for prose changes. This repair's final record needs Task 9 ordinary-use results
 for the four selected modes, the final configured full-suite gate, affected
-managed browser/smoke checks, and the required Stage 5 review records. Task 9
-remains unresolved at 1/4 in the current candidate; the earlier six-mode 0/6
-result records the scope before the user narrowed these checks. The
+managed browser/smoke checks, and the required Stage 5 review records. The
 native-recovery rows and isolated backup/upgrade drill in the operator
 procedure above are not acceptance gates for this repair. A deterministic
 fixture does not replace a live ordinary-use result or a live recovery receipt
