@@ -854,6 +854,33 @@ function dockerMaybe(args: string[], timeout = 10_000): string | undefined {
   return result.stdout.trim()
 }
 
+export async function settleExactDockerContainerRemoval(
+  containerId: string,
+  remove: () => void,
+  listMatching: () => string[],
+  wait: (milliseconds: number) => Promise<void> = delay,
+  timeoutMs = 15_000,
+): Promise<void> {
+  try {
+    remove()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!message.includes(`removal of container ${containerId} is already in progress`)) throw error
+  }
+
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    const matching = listMatching()
+    assert(matching.length === 0 || (matching.length === 1 && matching[0] === containerId),
+      'Only the exact owned Docker container may remain during removal')
+    if (matching.length === 0) return
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) break
+    await wait(Math.min(250, remainingMs))
+  }
+  throw new Error(`Owned Docker container ${containerId} did not disappear after removal`)
+}
+
 function cancelOwnedCloudExecution(executionName: string, candidateSha: string): Record<string, unknown> {
   assert.match(executionName, new RegExp(`^freshell-e2e-${candidateSha.slice(0, 12)}-[a-z0-9-]+$`),
     'Refusing to cancel a Cloud execution not created for this checkpoint candidate')
@@ -1396,7 +1423,11 @@ export async function runCodeCheckpointTarget() {
         docker(['container', 'stop', '--timeout', '10', forwarderContainerId], 20_000)
       }
       const remaining = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean)
-      if (remaining.length) docker(['container', 'rm', '--force', forwarderContainerId], 20_000)
+      if (remaining.length) await settleExactDockerContainerRemoval(
+        forwarderContainerId,
+        () => { docker(['container', 'rm', '--force', forwarderContainerId], 20_000) },
+        () => docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean),
+      )
       assert.deepEqual(docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean), [])
       return { containerId: forwarderContainerId, settled: true }
     })
@@ -1409,7 +1440,11 @@ export async function runCodeCheckpointTarget() {
         docker(['container', 'stop', '--time', '10', containerId], 20_000)
       }
       const remaining = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean)
-      if (remaining.length) docker(['container', 'rm', '--force', containerId], 20_000)
+      if (remaining.length) await settleExactDockerContainerRemoval(
+        containerId,
+        () => { docker(['container', 'rm', '--force', containerId], 20_000) },
+        () => docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean),
+      )
       assert.deepEqual(docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean), [])
       return { containerId, settled: true }
     })

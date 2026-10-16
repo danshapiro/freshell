@@ -18,6 +18,7 @@ import {
   processIdentity,
   resolveManagedProviderEnvironmentTargetMode,
   runManagedProviderEnvironmentTarget,
+  settleExactDockerContainerRemoval,
   stopExact,
   workspaceCwdAliasMcpWrapperSource,
   workspaceCwdAliasReplacementProcessProbeSource,
@@ -175,6 +176,22 @@ describe('managed provider environment target mode', () => {
   it('keeps the existing managed target as the default and selects checkpoint only explicitly', () => {
     expect(resolveManagedProviderEnvironmentTargetMode([])).toBe('managed-environment')
     expect(resolveManagedProviderEnvironmentTargetMode(['--checkpoint'])).toBe('code-checkpoint')
+  })
+
+  it('waits for an exact container whose automatic Docker removal is already in progress', async () => {
+    const containerId = 'a'.repeat(64)
+    const snapshots = [[containerId], [containerId], []]
+    const waits: number[] = []
+
+    await expect(settleExactDockerContainerRemoval(
+      containerId,
+      () => { throw new Error(`Error response from daemon: removal of container ${containerId} is already in progress`) },
+      () => snapshots.shift() ?? [],
+      async milliseconds => { waits.push(milliseconds) },
+      1_000,
+    )).resolves.toBeUndefined()
+
+    expect(waits).toEqual([250, 250])
   })
 
   it('keeps the OpenCode MCP package and parent dependency outside the mounted workspace', () => {
