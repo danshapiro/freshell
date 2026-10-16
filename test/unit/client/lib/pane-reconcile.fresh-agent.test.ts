@@ -224,6 +224,23 @@ describe('buildReconcileRequest with fresh-agent panes', () => {
     expect(fa.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
   })
 
+  it('leaves managed panes without a native identity to managed inventory', () => {
+    let panes = emptyPanesState()
+    panes = addTerminalPane(panes, 'managed-terminal-tab', 'managed-terminal', {
+      mode: 'opencode',
+      terminalId: 'managed-terminal-id',
+      soulId: 'managed-terminal-soul',
+      runtimeStatus: 'blocked',
+    })
+    panes = addFreshAgentPane(panes, 'managed-agent-tab', 'managed-agent', {
+      soulId: 'managed-agent-soul',
+    })
+
+    const req = buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })
+
+    expect(req).toBeNull()
+  })
+
   it('skips fresh-agent panes without createRequestId', () => {
     // Built by hand: the initLayout reducer would mint a createRequestId.
     const panes = emptyPanesState()

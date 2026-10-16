@@ -155,10 +155,10 @@ const sentFrames: any[] = []
 const dispatchedTypes: string[] = []
 const dispatched = { types: dispatchedTypes }
 
-let seededPane: { createRequestId: string } | null = null
+let seededPane: { createRequestId: string; mode?: string; soulId?: string; runtimeStatus?: string; status?: string } | null = null
 let seededFreshAgentPane: { createRequestId: string } | null = null
 
-function seedPersistedTerminalPane(opts: { createRequestId: string }): void {
+function seedPersistedTerminalPane(opts: { createRequestId: string; mode?: string; soulId?: string; runtimeStatus?: string; status?: string }): void {
   seededPane = opts
 }
 
@@ -185,11 +185,13 @@ function createStore() {
         id: 'pane-1',
         content: {
           kind: 'terminal',
-          mode: 'shell',
+          mode: seededPane.mode ?? 'shell',
           shell: 'system',
-          status: 'running',
+          status: seededPane.status ?? 'running',
           createRequestId: seededPane.createRequestId,
           terminalId: 'term-old',
+          ...(seededPane.soulId ? { soulId: seededPane.soulId } : {}),
+          ...(seededPane.runtimeStatus ? { runtimeStatus: seededPane.runtimeStatus } : {}),
         },
       }
     : null
@@ -460,6 +462,26 @@ describe('App pane.reconcile adoption', () => {
     expect(sentFrames.some((f) => f.type === 'pane.reconcile.request')).toBe(true)
     expect(dispatched.types).not.toContain(clearDeadTerminals.type)
     expect(dispatched.types).toContain(setLiveTerminalIds.type) // non-destructive part stays
+  })
+
+  it('leaves managed soul panes to terminal inventory instead of generic reconcile', async () => {
+    seedPersistedTerminalPane({
+      createRequestId: 'cr-managed-blocked',
+      mode: 'opencode',
+      soulId: 'soul-blocked',
+      runtimeStatus: 'blocked',
+      status: 'error',
+    })
+    const { sentFrames, store } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
+
+    expect(sentFrames.some((frame) => frame.type === 'pane.reconcile.request')).toBe(false)
+    expect(wsMocks.clearReconcileCreateHold).toHaveBeenCalled()
+    expect(terminalPaneContentOf(store)).toMatchObject({
+      terminalId: 'term-old',
+      soulId: 'soul-blocked',
+      runtimeStatus: 'blocked',
+      status: 'error',
+    })
   })
 
   it('runs the legacy census when the server does not ack the capability', async () => {
