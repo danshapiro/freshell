@@ -521,6 +521,15 @@ fi
 docker volume rm "${P6_VOL_PNPM}" "${P6_VOL_NPM}" >/dev/null 2>&1 || true
 rm -rf "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}" 2>/dev/null || true
 
+# ---- Proof 7: cold runtime-suite dependency preparation and confinement ----
+echo "--- Proof 7: cold runtime-suite startup ---"
+if bash "${REPO_ROOT}/scripts/test/sandbox-runtime-startup.test.sh"; then
+  pass "cold and stale runtime dependencies are prepared before confined execution; failures stop the caller"
+else
+  fail "runtime-suite startup regression"
+fi
+echo
+
 # ---- final host isolation check ----
 FINAL_3001="$(host_3001)"
 FINAL_3002="$(host_3002)"
