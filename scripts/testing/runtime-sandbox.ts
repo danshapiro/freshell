@@ -288,7 +288,6 @@ export function seedManagedOpenCodeSource(input: SyntheticSourceInput): Syntheti
 }
 
 // Kept after the immutable Task7 seeder prefix; canonical production schemas only.
-import { PaneReconcileRequestSchema, FreshAgentCreateSchema } from '../../shared/ws-protocol.js'
 import { SessionRefSchema } from '../../shared/session-contract.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
@@ -1288,7 +1287,9 @@ export const FreshCodexControllerReattachmentSchema: z.ZodType<FreshCodexControl
 export const FreshCodexSavedHistoryPreservationSchema = z.object({ source: z.literal('owned provider-volume native history'),
   wrongSource: z.literal('coincident web-local native history'), heldHost: z.object({ containerId: z.string().regex(/^[a-f0-9]{64}$/),
     incarnationId: z.string().min(1), pid: z.number().int().positive() }).strict(),
-  bootstrap: PaneReconcileRequestSchema.strict(), bootstrapCreates: z.array(FreshAgentCreateSchema.strict()).max(1),
+  // Supervisor-owned panes restore through managed inventory, without a
+  // legacy reconcile request or a new fresh-agent allocation.
+  bootstrap: z.null(), bootstrapCreates: z.tuple([]),
   nativeSessionId: z.string().min(1), beforeHistory: FreshCodexHistoryStateSchema, afterReload: FreshCodexHistoryStateSchema,
   originalIdentity: z.object({ sessionRef: SessionRefSchema, resumeSessionId: z.string().optional(),
     createRequestId: z.string().min(1), soulId: z.string().min(1) }).strict(),

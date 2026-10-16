@@ -3606,8 +3606,7 @@ describe('fixed owned saved-history preservation artifact', () => {
     await rig.recordFreshCodexControllerReattachment(current, controllerReattachment)
     const input: owner.FreshCodexSavedHistoryPreservation = { source: 'owned provider-volume native history',
       wrongSource: 'coincident web-local native history', heldHost: { containerId: current.containerId, incarnationId: current.incarnationId, pid: 42 },
-      bootstrap: { type: 'pane.reconcile.request', reconcileId: 'reconcile-owned', panes: [{ paneKey: 'tab:pane', kind: 'fresh-agent',
-        mode: 'codex', createRequestId: 'request-owned', sessionRef: { provider: 'codex', sessionId: current.nativeSessionId } }] },
+      bootstrap: null,
       bootstrapCreates: [], nativeSessionId: current.nativeSessionId, beforeHistory: observedState, afterReload: observedState,
       originalIdentity: { sessionRef: { provider: 'codex', sessionId: current.nativeSessionId }, createRequestId: 'request-owned', soulId: current.soulId },
       managedLaunch: launch, bothSourcesUnchanged: true, observerWindow: { intervalMs: 60000, controllerReattachment, startupFinished,
@@ -3634,6 +3633,16 @@ describe('fixed owned saved-history preservation artifact', () => {
       })
       await expect(remote.publishFreshCodexSavedHistoryPreservation(current, input)).resolves.toEqual(result)
       expect(JSON.stringify(replies)).not.toContain('owner-only')
+      await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input,
+        bootstrap: { type: 'pane.reconcile.request', reconcileId: 'legacy-request', panes: [{
+          paneKey: 'tab:pane', kind: 'fresh-agent', mode: 'codex', createRequestId: 'request-owned',
+          sessionRef: input.originalIdentity.sessionRef,
+        }] },
+      })).rejects.toThrow()
+      await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input,
+        bootstrapCreates: [{ type: 'freshAgent.create', requestId: 'request-owned', tabId: 'tab', paneId: 'pane',
+          provider: 'codex', sessionType: 'freshcodex' }],
+      })).rejects.toThrow()
       await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
         operationId: 'foreign-history-preservation-path', action: 'freshcodex-history-preservation-artifact', handle: current,
         historyPreservation: input, outputPath: '/foreign/history' })).rejects.toThrow(/operation/)
