@@ -737,10 +737,19 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
   }
   return async (apiValue: unknown): Promise<void> => {
     if (deps.signal?.aborted) return
-    if (inFlight) { progress('in_flight'); return }
+    const api = asRecord(apiValue) as unknown as AdoptionTuiApi | null
+    if (inFlight) {
+      try {
+        // A pending refresh must not retain a receipt for a TUI context
+        // that a newer poll or slot wake can already see has changed.
+        if (lastEvidence !== null && (api?.state?.ready !== true
+          || currentRouteSessionId(api?.route?.current) !== root)) refuse('tui_context_changed')
+      } catch { refuse('native_loader_or_publication_failed') }
+      progress('in_flight')
+      return
+    }
     inFlight = true
     try {
-      const api = asRecord(apiValue) as unknown as AdoptionTuiApi | null
       if (!api || api.state?.ready !== true) return refuse('tui_not_ready')
       if (root === null) {
         const create = api.client?.session?.create

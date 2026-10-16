@@ -1171,6 +1171,57 @@ describe('default export (TuiPluginModule)', () => {
     } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
   })
 
+  it.each([
+    ['route-change', 'poll'], ['readiness-loss', 'poll'], ['unchanged', 'poll'],
+    ['route-change', 'session_prompt'], ['readiness-loss', 'session_prompt'], ['unchanged', 'session_prompt'],
+  ] as const)('rechecks an observed native context on %s during a pending same-root read via %s', async (condition, wake) => {
+    const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-pending-refresh-'))
+    const root = 'ses_loadednative1'
+    const launch = { incarnationId: 'incarnation-native1', launchNonce: 'launch-native1', evidenceRevision: 4,
+      executionGeneration: 2, requestedNativeSessionId: null }
+    const directory = join(home, '.freshell/native-identity', launch.launchNonce)
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_LAUNCH', JSON.stringify(launch))
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR', directory)
+    const session = { id: root, parentID: null }
+    const route = { current: { name: 'session', params: { sessionID: root } },
+      navigate: (name: string, params: { sessionID: string }) => { route.current = { name, params } } }
+    const state = { ready: true, session: { get: () => session, messages: () => [] } }
+    let finish!: (value: unknown) => void
+    const pending = new Promise(resolve => { finish = resolve })
+    const get = vi.fn(async () => ({ data: session }))
+    const messages = vi.fn().mockResolvedValueOnce({ data: [] }).mockReturnValue(pending)
+    const renderers: Record<string, (context: unknown, props: unknown) => unknown> = {}
+    const file = join(directory, 'opencode-loaded.json')
+    const observation = () => JSON.parse(readFileSync(file, 'utf8'))
+    const abort = new AbortController()
+    try {
+      plugin.tui({ state, route, client: { session: { create: async () => ({ data: session }), get, messages } },
+        slots: { register: ({ slots }: { slots: typeof renderers }) => { Object.assign(renderers, slots) } },
+        lifecycle: { signal: abort.signal } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(observation()).toMatchObject({ launch, native: { session_id: root, hydrated: true } })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(messages).toHaveBeenCalledTimes(2)
+      expect(messages).toHaveBeenLastCalledWith({ sessionID: root }, { throwOnError: true })
+      expect(observation().native.hydrated).toBe(true)
+
+      if (condition === 'route-change') route.current.params.sessionID = 'ses_othernative1'
+      if (condition === 'readiness-loss') state.ready = false
+      if (wake === 'poll') await vi.advanceTimersByTimeAsync(1000)
+      else expect(renderers.session_prompt({}, {})).toBeNull()
+
+      expect(observation()).toMatchObject({ launch, native: { session_id: root, hydrated: condition === 'unchanged' } })
+      expect(get).toHaveBeenCalledTimes(2)
+      expect(messages).toHaveBeenCalledTimes(2)
+      const beforeCompletion = readFileSync(file, 'utf8')
+      finish({ data: [] })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(readFileSync(file, 'utf8')).toBe(beforeCompletion)
+      expect(messages).toHaveBeenCalledTimes(2)
+    } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
+  })
+
   it('records actual mounted native slot wake counts while leaving unhydrated history blocked', async () => {
     const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-mounted-'))
     const root = 'ses_mounted1', tail = 'msg_mounted1'
