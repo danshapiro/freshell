@@ -62,7 +62,7 @@ The evidence and remaining empirical limits are recorded outside this plan in `l
 5. Prepare a clean commit-addressed cloud image serially using the existing build path when needed, under the same bounded ownership or a separately bounded owned build. Keep exact build/image identities and finite resource/time limits; do not run an unbounded host compile or race mutable/dirty tags. Run the unchanged coordinated full check inside the private guest, including its cloud client phase, local Docker companion, source-runtime, Rust and Electron phases. Export genuine inner coordinator results and every actual phase verdict, including phases not run after an earlier failure. Cloud cleanup traps suppress errors, so independently verify settlement/removal of the exact recorded per-run cloud job/execution before releasing ownership. No broad name-prefix cleanup is permitted.
 6. Task 0 is the first real full build/topology qualification and must pass with independent review before any crash implementation, including machines changes. A tool fixture, bridge probe or successful setup followed by a failing assertion proves only the setup that actually completed. Preserve all selected-case assertions and nonzero selection. Adjust only owned setup prerequisites; extend finite cold-preparation time for observed progress rather than weakening behavioral deadlines. If resources require a safer build budget, reduce Cargo jobs and requalify; never remove the enforced outer limits or use host authority as a fallback.
 7. After Task 1, Task 3 must exercise both canonical native renderer-recovery cases in the nested sandbox at the exact clean SHA. Xvfb, package metadata, a version command or a root-user launch does not prove the ordinary-user native path. Correct routine display/library/Chromium fixture setup only inside owned isolation and exercise it. If no equally isolated native or complete-gate route can satisfy acceptance, keep the run `FAILED/non-converged`; no mock-only, partial or live-host substitute qualifies. Windows installation/restart/user testing remains a separately approved rollout operation.
-8. The complete Electron native action plus readiness receives a 10,000 ms attempt budget beginning before native navigation, with 100 ms readiness polling within the remaining budget. The same owner must retire a timed-out attempt before a successor can acquire native authority. A never-settling load or evaluation cannot occupy the sole recovery slot forever; late native completion cannot activate, update privileged IPC identity, show, focus, log success or requeue retired work. Attempt timeout preserves future retries/cooldowns. Logical close, a new destination or quit permanently disposes the owner; retiring an old native window and hiding to tray do not. Implement this decision in Tasks 2/3 without adding another reconnect loop.
+8. The complete Electron native action plus readiness receives a finite attempt budget beginning before native navigation, initially 10,000 ms, with 100 ms readiness polling within the remaining budget. Increase that budget after a deadline expiration and retain the increase across retries/cooldowns, so a consistently slow but finite valid load can eventually finish instead of being restarted at the same deadline forever. Reset the budget only after verified success or a new logical owner; do not add a user setting or another reconnect loop. The same owner must retire a timed-out attempt before a successor can acquire native authority. A never-settling load or evaluation cannot occupy the sole recovery slot forever; late native completion cannot activate, update privileged IPC identity, show, focus, log success or requeue retired work. Attempt timeout preserves future retries/cooldowns. Logical close, a new destination or quit permanently disposes the owner; retiring an old native window and hiding to tray do not. Tasks 2/3 must cover both slow valid loads and permanently hung work.
 
 ## File responsibilities and task interfaces
 
@@ -154,7 +154,7 @@ Fresh task review must confirm the new wait observes real supervisor state, exis
 **Interfaces:**
 - Consumes: existing `scripts/sandbox-test.sh [--runtime-suite] "command"` and its exact workload exit status.
 - Produces: both ordinary/runtime modes pass `--cpus 2 --memory 8g --memory-swap 16g --pids-limit 512 -e CARGO_BUILD_JOBS=2`; native-tools remains its early independent branch. No new production override interface.
-- Produces: JSONL `sandbox_resources` and `sandbox_completed` with `severity`, `mode`, `cargoJobs`, `cpus`, `memoryBytes`, `memorySwapBytes`, `pidsLimit`, and completion `exitCode`.
+- Produces: JSONL `sandbox_resources` with `severity`, `mode`, `cargoJobs`, `cpus`, `memoryBytes`, `memorySwapBytes`, `pidsLimit`; `sandbox_completed` with `severity`, `mode`, `exitCode`. Both include controlled `cause`, `action` and `outcome` fields.
 - Produces: safe proof commands documented below; `sandbox-budget-smoke.mjs <jobs>` exits nonzero on missing limits, wrong NUM_JOBS, excess overlap, or incomplete work.
 
 - [ ] **Step 1: Write a failing behavioral wrapper test**
@@ -238,21 +238,7 @@ Expected: FAIL on absent `--cpus`/Cargo environment and absent JSONL resource re
 
 - [ ] **Step 3: Implement bounded defaults and the minimal resource fixture**
 
-Add `--cpus 2`, `--memory-swap 16g` and `-e CARGO_BUILD_JOBS=2` beside the existing shared `--memory 8g`. Explicit 16g RAM+swap preserves Docker's existing default allowance rather than silently removing swap. Before `docker "${DOCKER_ARGS[@]}"`, insert:
-
-```bash
-SANDBOX_MODE=ordinary
-[ "${RUNTIME_SUITE}" -eq 0 ] || SANDBOX_MODE=runtime-suite
-printf '{"severity":"info","event":"sandbox_resources","mode":"%s","cargoJobs":2,"cpus":2,"memoryBytes":8589934592,"memorySwapBytes":17179869184,"pidsLimit":512}\n' "${SANDBOX_MODE}" >&2
-```
-
-Immediately after collecting `DOCKER_STATUS` insert:
-
-```bash
-SANDBOX_SEVERITY=info
-[ "${DOCKER_STATUS}" -eq 0 ] || SANDBOX_SEVERITY=error
-printf '{"severity":"%s","event":"sandbox_completed","mode":"%s","exitCode":%s}\n' "${SANDBOX_SEVERITY}" "${SANDBOX_MODE}" "${DOCKER_STATUS}" >&2
-```
+Add `--cpus 2`, `--memory-swap 16g` and `-e CARGO_BUILD_JOBS=2` beside the existing shared `--memory 8g`. Explicit 16g RAM+swap preserves Docker's existing default allowance rather than silently removing swap. Keep the resource values in one shared defaults block used by both Docker arguments and the resource receipt, rather than duplicating independent literals. Emit `sandbox_resources` before launch and `sandbox_completed` immediately after collecting `DOCKER_STATUS`, preserving its exact exit code. Include the interface fields above and Global Constraint 7's controlled cause/action/outcome fields; failed completion uses error severity. Derive the implementation from the existing wrapper and exercise/parse both receipts in the behavioral wrapper test.
 
 Add `xvfb` and `xauth` to the existing Dockerfile apt list. Do not add Linux packaging/deployment behavior. Verify actual Electron startup before deciding whether any further native runtime library is needed.
 
@@ -320,12 +306,12 @@ fn main() {
 
 Timestamps are decimal strings to avoid JavaScript Number precision loss. This tiny fixture allocates at most 16 MiB in concurrent build scripts; it never ramps memory or aims for OOM. Its 2 GiB peak assertion concerns this entire tiny smoke container, not the real Clippy workload.
 
-Extend the existing self-test before Proof 4 with two bounded calls using its existing status-capture convention. Change its exact owned PID sentinel's `sleep 300` to `sleep 3600`, so bounded two-job preparation cannot make a healthy fixture expire during this now-longer test; the existing EXIT trap still stops only its exact recorded PID.
+Extend the existing self-test before Proof 4 with two bounded calls using its existing status-capture convention. Use ordinary sandbox mode for this compile-only smoke: its Cargo build scripts must execute from `/tmp`, and the ordinary entrypoint can prepare fresh dependencies. Runtime-suite's noexec tmpfs/read-only root/no-network boundary stays unchanged and remains covered by the existing isolation proof and both-mode wrapper tests. Change its exact owned PID sentinel's `sleep 300` to `sleep 3600`, so bounded two-job preparation cannot make a healthy fixture expire during this now-longer test; the existing EXIT trap still stops only its exact recorded PID.
 
 ```bash
 for budget in 1 2; do
   BUDGET_STATUS=0
-  BUDGET_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" --runtime-suite "CARGO_BUILD_JOBS=${budget} node scripts/testing/sandbox-budget-smoke.mjs ${budget}" 2>&1)" || BUDGET_STATUS=$?
+  BUDGET_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" "CARGO_BUILD_JOBS=${budget} node scripts/testing/sandbox-budget-smoke.mjs ${budget}" 2>&1)" || BUDGET_STATUS=$?
   if [ "${BUDGET_STATUS}" -eq 0 ]; then
     pass "effective cgroup controls and completed Cargo work at ${budget} jobs"
   else
@@ -344,9 +330,10 @@ Run all real Docker/image/sandbox commands below inside the guarded private gues
 
 ```bash
 pnpm run test:vitest run test/unit/scripts/sandbox-test.test.ts --config config/vitest/vitest.config.ts
-bash -n scripts/sandbox-test.sh scripts/sandbox-selftest.sh
+bash -n scripts/sandbox-test.sh
+bash -n scripts/sandbox-selftest.sh
 env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock scripts/sandbox-build.sh
-env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock scripts/sandbox-test.sh --runtime-suite "node scripts/testing/sandbox-budget-smoke.mjs 2"
+env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock scripts/sandbox-test.sh "node scripts/testing/sandbox-budget-smoke.mjs 2"
 ```
 
 Expected: wrapper tests PASS; syntax succeeds; headless image builds; tiny Cargo work completes with finite effective controls and ample memory. Rebuild only in the explicitly chosen rootful daemon, without changing the operator's Docker context. Run the actual proof one container at a time after committing its source, with an already-created external evidence directory:
@@ -520,7 +507,7 @@ it.each([[-3, true], [-102, false]])('ignores aborted or subframe failure %s/%s'
 })
 ```
 
-Replace the old permanent-circuit test and its delayed-second-unresponsive variant with the stronger autonomous-window and immediate-responsive cases above. Replace any unbounded `runAllTimersAsync` in permanent-failure cases with explicit clock advancement. Update the existing in-flight diagnostic assertion to the new `main_window_recovery_coalesced` event; behavior remains one in-flight attempt, with the failure retained.
+Replace the old permanent-circuit test and its delayed-second-unresponsive variant with the stronger autonomous-window and immediate-responsive cases above. Replace any unbounded `runAllTimersAsync` in permanent-failure cases with explicit clock advancement. Retain the existing in-flight diagnostic `main_window_recovery_skipped` with `reason: recovery-in-flight`; behavior remains one in-flight attempt, now with the failure retained for its successor.
 
 - [ ] **Step 2: Run red**
 
@@ -576,7 +563,7 @@ git commit -m "fix: resume Electron recovery after bounded cooldowns"
 
 **Interfaces:**
 - Consumes: Task 2's controller disposer; Task 1's bounded headless sandbox.
-- Produces: native readiness of the intended current candidate document, using the same 10,000 ms complete-attempt deadline that starts before native navigation and 100 ms polling within remaining time. Hung evaluation and native load are cancellable; no production timing override is added.
+- Produces: native readiness of the intended current candidate document, using the same finite adaptive complete-attempt deadline from Stage 2 decision 8, starting before native navigation, and 100 ms polling within remaining time. Hung evaluation and native load are cancellable; no production timing override is added.
 - Produces: `createRecoverableWindow({createNativeWindow, options, onWebContentsChanged, logger}): BrowserWindowLike` with `verifyRendererReady(loadUrl)` and `cancelRecovery()` methods.
 - Produces: main `StartupResult.disposeRendererRecovery(): void`; permanent disposal clears controller timers and aborts current native/load/verification work. Attempt deadline retirement allows future retries. Main startup installs listeners before `loadURL` and passes an actual native verifier. Logical close, new launch generation and quit dispose; retiring old native windows and hide-to-tray do not.
 
@@ -782,7 +769,7 @@ it('observes a synchronous initial navigation failure and retries the encoded de
     expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
     expect(ctx.serverSpawner.stop).not.toHaveBeenCalled()
   } finally {
-    if (result?.type === 'main') { result.disposeRendererRecovery(); clearTimeout(result.updateCheckTimer) }
+    if (result?.type === 'main') { result.disposeRendererRecovery?.(); clearTimeout(result.updateCheckTimer) }
     vi.useRealTimers()
   }
 })
@@ -813,6 +800,8 @@ it('disposes recovery once at quit initiation before waiting for the server', as
 
 Add behavioral cases alongside these drafts for an active native load and a candidate load that never settle, and for a hung native evaluation. Advance the complete attempt deadline without manually resolving those promises: the timed-out attempt must retire, reject and release the sole slot; the controller must later retry successfully without another event. Dispose during the same hung states and prove prompt permanent cancellation with no future work. Then settle every stale native result and prove it cannot activate a candidate, update privileged IPC identity, show/focus, emit success or interfere with a newer attempt. Assert that old-native destruction cannot dispose its successful logical replacement and that hide-to-tray preserves recovery. These tests exercise actual ownership behavior, not source text or an assumed native promise guarantee.
 
+Add a fake-clock regression in which each valid navigation/mount takes longer than the initial 10,000 ms budget: after the first timeout, an automatically retried attempt must receive the increased budget and succeed without another event. Cover repeated deadline expirations and cooldowns retaining the increased budget, verified success resetting it, and logical disposal cancelling promptly at any budget. Do not replace this with a fast mock or a timing override. The first-attempt timeout drafts above still exercise the initial budget.
+
 - [ ] **Step 2: Run red**
 
 ```bash
@@ -823,7 +812,7 @@ Expected: new modules are absent initially; then the meaningful startup case fai
 
 - [ ] **Step 3: Implement actual native readiness, complete-attempt ownership and startup wiring**
 
-Extract only the existing native adapter and tiny listener types from `entry.ts` into `recoverable-window.ts`, keeping the native constructor injectable for meaningful adapter tests. Give that existing logical owner one finite cancellable attempt spanning native load/replacement and readiness. Begin its 10,000 ms deadline before awaiting any native navigation; readiness polling consumes the remaining budget rather than resetting it after navigation. A hung `loadURL` or evaluation must reject on deadline/cancellation and retire its prior native authority before a successor proceeds. Do not implement a timeout race that leaves a candidate able to activate later. Preserve future retries after attempt timeout; permanent logical disposal separately prevents all later work. The invalidated controller/adapter/readiness production-code drafts were removed; no replacement production code is presumed executed or correct.
+Extract only the existing native adapter and tiny listener types from `entry.ts` into `recoverable-window.ts`, keeping the native constructor injectable for meaningful adapter tests. Give that existing logical owner one finite cancellable attempt spanning native load/replacement and readiness. Apply Stage 2 decision 8's adaptive budget before awaiting any native navigation; readiness polling consumes the remaining budget rather than resetting it after navigation. Timeout growth must persist across retries/cooldowns and must not impose the same deadline forever on a slow valid load. A hung `loadURL` or evaluation must reject on deadline/cancellation and retire its prior native authority before a successor proceeds. Do not implement a timeout race that leaves a candidate able to activate later. Preserve future retries after attempt timeout; permanent logical disposal separately prevents all later work. The invalidated controller/adapter/readiness production-code drafts were removed; no replacement production code is presumed executed or correct.
 
 Verify the actual native candidate: both current native URL and evaluated document must match the immutable intended origin/path, the document must be ready and Freshell's root must contain mounted content, and its navigation generation/native identity must still be current. Query equality is intentionally absent because auth bootstrap removes the URL token. Authentication, machine-selection and preparing roots are sufficient; no terminal/pane or Redux/WebSocket addition is required. Reject error pages, wrong documents, expired budgets, cancellation, destroyed objects and stale generations. Use no polling-tick logs.
 
@@ -956,7 +945,7 @@ Only create this second commit if E2E/refactor changed source after the checkpoi
 
 - [ ] **Step 1: Validate real-systemd feasibility safely and add failing policy tests**
 
-Before implementing the watchdog, build/run the owned smoke guest below only as far as `--probe`. The parent has already proved the underlying bounded private remount/systemd/D-Bus capability; this rechecks it with the actual fixture image and source. It must establish actual rootful placement, a private cgroup namespace, enforced resource limits and a guest systemd-created child cgroup. It must not kill a manager at this stage. If this probe regresses, report the explicit system-level coverage gap to the parent before continuing the task; never replace this proof with shared-host operations.
+First create only the guest Dockerfile, guest-smoke script and outer driver described in Step 3 below, copying the watchdog source unchanged. Build/run that owned fixture only as far as `--probe`, before implementing the watchdog policy. The parent has already proved the underlying bounded private remount/systemd/D-Bus capability; this rechecks it with the actual fixture image and source. It must establish actual rootful placement, a private cgroup namespace, enforced resource limits and a guest systemd-created child cgroup. It must not kill a manager at this stage. If this probe regresses, report the explicit system-level coverage gap to the parent before continuing the task; never replace this proof with shared-host operations.
 
 Create `tests/test-oomd-watchdog.py`. This executes the actual Bash watchdog against executable per-call fakes, records exact argv arrays, parses every emitted JSON line, and models normal nonzero `is-active` codes:
 
@@ -1221,7 +1210,7 @@ Create `tests/systemd-watchdog/guest-smoke.sh`:
 #!/usr/bin/env bash
 set -euo pipefail
 test "$(cat /proc/1/comm)" = systemd
-test "$(cat /proc/1/cgroup)" = '0::/'
+test "$(cat /proc/1/cgroup)" = '0::/init.scope'
 test "$(cat /sys/fs/cgroup/memory.max)" = 1073741824
 test "$(cat /sys/fs/cgroup/pids.max)" = 512
 read -r quota period < /sys/fs/cgroup/cpu.max
@@ -1255,7 +1244,7 @@ for uid in 1000 1001; do
   loginctl enable-linger "$name"
 done
 systemctl start user@1000.service user@1001.service
-cat > /tmp/owned-oomctl <<'OOM'
+cat > /usr/local/bin/owned-oomctl <<'OOM'
 #!/usr/bin/env bash
 for uid in 1001 1000; do
   if [ "${OMIT_UID:-}" != "$uid" ] && systemctl is-active --quiet "user@${uid}.service"; then
@@ -1263,8 +1252,8 @@ for uid in 1001 1000; do
   fi
 done
 OOM
-chmod 0755 /tmp/owned-oomctl
-export FRESHELL_OOMCTL=/tmp/owned-oomctl FRESHELL_WATCHDOG_SETTLE=0
+chmod 0755 /usr/local/bin/owned-oomctl
+export FRESHELL_OOMCTL=/usr/local/bin/owned-oomctl FRESHELL_WATCHDOG_SETTLE=0
 wait_receipt() {
   local uid="$1" minimum="$2"
   for attempt in $(seq 1 100); do
@@ -1314,7 +1303,7 @@ test "$(systemctl show user@1000.service --property=MainPID --value)" = "$manage
 printf '{"severity":"info","event":"systemd_watchdog_smoke_passed"}\n'
 ```
 
-This uses real systemctl for manager/service lifecycle and a clearly identified oomctl registration fixture, because registration timing is separate from the repair. No login/SSH/PAM session starts a manager after failure; `setpriv` observations change only the observing process UID/groups, without a PAM login, and occur after the watchdog produces new manager/service receipts. Install `dbus-user-session` explicitly because the fixture disables apt recommendations. The fixture-only stop timeout is shortened to two seconds so child teardown completes inside its bounded assertion wait; no production unit is changed. Install the enabled test unit before `enable-linger`, since enabling linger can itself start a manager.
+This uses real systemctl for manager/service lifecycle and a clearly identified oomctl registration fixture, because registration timing is separate from the repair. Keep the executable fixture under `/usr/local/bin`, since the guest's `/tmp` can remain noexec; assert it emits both active registrations normally and omits only UID 1000 with `OMIT_UID=1000` before using that seam to test restart policy. No login/SSH/PAM session starts a manager after failure; `setpriv` observations change only the observing process UID/groups, without a PAM login, and occur after the watchdog produces new manager/service receipts. Install `dbus-user-session` explicitly because the fixture disables apt recommendations. The fixture-only stop timeout is shortened to two seconds so child teardown completes inside its bounded assertion wait; no production unit is changed. Install the enabled test unit before `enable-linger`, since enabling linger can itself start a manager. The outer barrier asserts PID 1 is at `0::/` before boot; the guest-smoke assertion runs after systemd has moved PID 1 into `init.scope`.
 
 Create `tests/smoke-oomd-watchdog.sh` as the owned outer driver. The central safe invocation is:
 
@@ -1392,7 +1381,9 @@ On outer timeout, the EXIT trap removes only the recorded guest ID and image. Ca
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 tests/test-oomd-watchdog.py
 PYTHONDONTWRITEBYTECODE=1 bash tests/test-sentinelx-janitor.sh
-bash -n garageserver/sentinelx/bin/sentinelx-oomd-watchdog tests/smoke-oomd-watchdog.sh tests/systemd-watchdog/guest-smoke.sh
+bash -n garageserver/sentinelx/bin/sentinelx-oomd-watchdog
+bash -n tests/smoke-oomd-watchdog.sh
+bash -n tests/systemd-watchdog/guest-smoke.sh
 git add garageserver/sentinelx/bin/sentinelx-oomd-watchdog tests/test-sentinelx-janitor.sh tests/test-oomd-watchdog.py tests/smoke-oomd-watchdog.sh tests/systemd-watchdog/Dockerfile tests/systemd-watchdog/guest-smoke.sh garageserver/docs/sentinelx-sandbox.md garageserver/sentinelx/AGENTS.md
 git commit -m "fix: recover both failed user managers from the oomd watchdog"
 timeout 900 bash tests/smoke-oomd-watchdog.sh --probe
@@ -1409,10 +1400,10 @@ Append the current repair and runbook to `garageserver/docs/sentinelx-sandbox.md
 
 The runbook contains these operator-visible choices and commands, guarded by separately obtained deployment approval:
 
-1. Record reviewed machines commit, watchdog source SHA-256 and successful fake/broad/real-smoke receipts. Read installed script, unit/timer state, user-manager PIDs/state and registrations. Confirm `ExecStart` is `/usr/local/sbin/sentinelx-oomd-watchdog`; wait until no watchdog invocation is in progress. Do not run the broader `sentinelx-deploy` command.
+1. Record reviewed machines commit, watchdog source SHA-256 and successful fake/broad/real-smoke receipts. Read installed script, unit/timer state, user-manager PIDs/state and registrations. Confirm `ExecStart` is `/usr/local/sbin/sentinelx-oomd-watchdog`; wait until no watchdog invocation is in progress. Immediately before replacement, recheck both manager states: if either is failed, defer installation unless the separate deployment approval explicitly includes its automatic recovery on the next tick. Do not run the broader `sentinelx-deploy` command.
 2. Save a timestamped root-owned backup and stage only the reviewed script as root:root mode 0755 in `/usr/local/sbin`. Run `bash -n` on staging, then atomically replace the installed script and compare SHA-256. This script-only update needs no daemon reload, timer change, manager restart, Freshell restart or client restart.
 3. Observe the next natural timer activation and its exit/result, both active managers/full registrations, and Freshell health. A healthy tick can be silent. Confirm existing healthy manager/Freshell PIDs did not change. Never deliberately fail live managers to validate installation.
-4. If a manager is already failed, starting it must fall within the separately approved recovery operation; installing the script alone is not authorization to start arbitrary live managers.
+4. The installed watchdog starts failed managers automatically on a natural tick. Installation approval must therefore cover that recovery effect if a manager is already failed; otherwise the precondition in step 1 defers installation. No separate manual start or deliberate live failure is part of script installation.
 5. Rollback within approved scope restores the saved script using the same staged atomic replacement/hash check and observes the next tick. No service restart accompanies rollback.
 
 Exact script-only installation, to appear in the runbook and **not execute during this task**:
@@ -1473,7 +1464,7 @@ Reviewer-visible rollout choices are runbooks only. The sandbox change takes eff
 1. Primary review endpoint: `git -C /home/dan/code/freshell/.worktrees/freshell-crash-resilience diff 283e4c4b87e58f31a048732800cefb345b799082 HEAD`; record its exact final SHA. Auxiliary endpoint: `git -C /home/dan/code/machines/.worktrees/freshell-user-manager-recovery diff 0409315b6278cf343a9c8a963b236345d28fcbc1 HEAD`; record its exact final SHA. The external evidence directory is `/home/dan/code/freshell/.worktrees/.the-usual-logs/freshell-crash-resilience/reports`.
 2. Required final Freshell gate is the unchanged coordinated `pnpm run check` from an exact clean primary-branch checkout inside the qualified private guest, under the original host shared-gate reservation and Stage 2 operational/token/cleanup prerequisites. Remove only the two documented OpenCode optional-file environment values for that test process; require the existing robot identity, Cargo jobs two, a meaningful crash-resilience summary, both configured cloud backends and the local companion enabled. Keep all default phases, exact source/image identity and genuine inner coordinator records; a failed/partial gate remains failed/partial. Run the canonical Electron sandbox proof inside the guest at the final reviewed SHA and require both selected recovery cases with timing/native JSONL evidence. Export records, verify exact cloud and guest cleanup, remove temporary credentials, and only then release the host reservation. Do not restart production or install a Windows build as verification.
 3. Required machines endpoint is its focused policy matrix, all seven affected SentinelX suites, an honestly reported final `tests/validate.sh` result and successful real isolated-systemd smoke at the reviewed SHA. A broad pre-existing unrelated timeout requires an explicit recorded disposition; it is never green coverage. An unresolved safe-guest prerequisite keeps the overall result `FAILED/non-converged`; it cannot be turned into a platform-confidence footnote.
-4. Preserve actual workload/rootful-cgroup/headroom receipts, real >60-second Electron timing and no-false-success evidence, real manager/service-generation receipts and self-owned sentinel evidence. Parent updates the existing Kata items and usual run ledger with actual results, accepted residuals and every binding finding disposition.
+4. Preserve actual workload/rootful-cgroup/headroom receipts, real >60-second Electron timing and no-false-success evidence, real manager/service-generation receipts and self-owned sentinel evidence. Parent updates the existing Kata items and usual run ledger with actual results, the sole user-accepted pane-recovery deferral, documented limits and every binding finding disposition. Retaining host oomd policy/timer cadence and an overridable Cargo default documents the repair's scope and limits; it does not add user-accepted residuals or authorize broader host-policy work.
 5. End with clean focused commits and branches ready for user review. Push is permitted by repository instructions when the parent reaches that workflow stage. Stop before creating either PR; ask for the user's explicit approval to land the concrete branches. Deployment and Windows user testing remain separately approved operations, described with runbooks rather than performed here.
 
 ## Planner self-review
@@ -1486,5 +1477,6 @@ Reviewer-visible rollout choices are runbooks only. The sandbox change takes eff
 - Stage 2 self-review checked the unchanged dispatcher User Request byte-for-byte and exactly once; Task 0 ordering; the actual chosen guest/tool/resource profile; private source/daemon/cache ownership for Freshell proofs and the separately owned Task 4 systemd guest; host reservation through actual cleanup; measured token validity; bounded image preparation; complete native-action deadline versus permanent logical disposal; all real acceptance gates; and no live deployment/PR/Windows action. All 28 remaining Bash blocks, one Python block and 13 TypeScript/JavaScript blocks passed syntax checks; Markdown fences and the focused diff passed structural/whitespace checks. These are plan-quality checks, not implementation or acceptance test results; details are in the external Stage 2 self-review report.
 - The native-action completion premise was removed by design, with invalidated unexecuted production snippets replaced by decisions and required behavior. The new permanent cold-Clippy proof program was removed while retaining minimal wrapper/resource coverage and actual chosen-default current-source workload/headroom evidence through the executed external recipe.
 - Source snippets are draft guidance and must be reconciled with exact current interfaces during the parent's independent plan review before execution. The plan's source-tree authority rule applies after implementation begins.
+- Round 1 remediation self-review preserved the canonical User Request unchanged exactly once and checked only the edited decisions/commands against their source interfaces. Focused owned probes reproduced Cargo's noexec failure, completed the unchanged tiny Cargo fixture at one/two jobs without that mount, verified post-boot PID 1 in `init.scope`, and executed the registration fixture from `/usr/local/bin` with full/omitted-UID controls. All 26 Bash blocks, one Python block and 13 TypeScript/JavaScript blocks passed syntax checks; startup cleanup preserved its intended failure with no disposer, and each-file Bash checking detected a deliberately invalid second fixture. Details and the initial probe setup failure are retained in external `reports/plan-round-1-remediation.md`. These are plan-remediation checks only; Task 0, real current-source workload/native/systemd acceptance and the exact full gate remain required.
 
 
