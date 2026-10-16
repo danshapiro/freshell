@@ -14,3 +14,8 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 hmac = "0.12"
 thiserror = "2"
+
+[dev-dependencies]
+# Dev-only: the drift guard test asserts that the recipes built by
+# freshell-platform are the ones this crate's approved digest list accepts.
+freshell-platform = { path = "../freshell-platform" }

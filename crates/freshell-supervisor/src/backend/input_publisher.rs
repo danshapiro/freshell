@@ -1345,6 +1345,7 @@ mod tests {
             config_binds: vec![],
             resource_mounts: vec![],
             indexed_files: None,
+            operator_home: None,
         };
 
         assert_eq!(
@@ -1637,6 +1638,7 @@ mod tests {
                 .unwrap()
                 .indexed_files
                 .clone(),
+            operator_home: None,
         };
         let socket = owned.path().join("docker.sock");
         let listener = UnixListener::bind(&socket).unwrap();

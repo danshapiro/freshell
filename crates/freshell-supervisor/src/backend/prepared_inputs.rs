@@ -188,6 +188,7 @@ mod tests {
                 }],
                 staged_source_paths: None,
             }),
+            operator_home: None,
         };
         let descriptors = mount_descriptors(&mounts, "owned-provider").unwrap();
         let actual = json!({"HostConfig":{"Mounts":descriptors},"Mounts":[

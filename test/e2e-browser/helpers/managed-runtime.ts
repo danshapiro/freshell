@@ -79,6 +79,7 @@ export class ManagedRuntimeBrowserRig {
   private serverBin = ''
   private readonly serverEnv: Record<string, string>
   private readonly webHomeDir: string | undefined
+  private readonly resolvedOperatorHome: string | undefined
   private readonly supervisorEnv: Record<string, string>
   private readonly supervisorBinaryKind: 'test' | 'release'
   private readonly enabledProviders: string[]
@@ -102,6 +103,18 @@ export class ManagedRuntimeBrowserRig {
     } = { enabledProviders: ['opencode'] },
     webHomeDir?: string,
     fixtureInputs?: ManagedEnvironmentInputs,
+    /**
+     * Operator home for the managed-runtime supervisor: passed to the
+     * supervisor as `--operator-home`, so every terminal/fresh-agent soul
+     * receives the home as a read-only same-path bind with tmpfs masks over
+     * the operator's secret directories. Doubles as the web server's HOME
+     * unless webHomeDir is given (the server stages the user-provider root
+     * from it at pane creation). A relative name places the home under the
+     * harness testRoot — the only root the supervisor container can see;
+     * an absolute path must already be visible inside the supervisor
+     * container.
+     */
+    operatorHome?: string,
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase, webHomeDir, serverEnv.XDG_CONFIG_HOME, fixtureInputs)
@@ -111,6 +124,11 @@ export class ManagedRuntimeBrowserRig {
     }
     this.serverEnv = { ...serverEnv }
     this.webHomeDir = webHomeDir
+    this.resolvedOperatorHome = operatorHome === undefined
+      ? undefined
+      : path.isAbsolute(operatorHome)
+        ? operatorHome
+        : path.join(this.runtime.testRoot, operatorHome)
     this.supervisorEnv = { ...supervisorEnv }
     this.supervisorBinaryKind = supervisorBinaryKind
     this.enabledProviders = [...qualificationProviders.enabledProviders]
@@ -122,8 +140,16 @@ export class ManagedRuntimeBrowserRig {
     }
   }
 
+  /** Absolute operator-home path this rig wires into the supervisor and web
+    * server (undefined when the rig runs without an operator home). */
+  get operatorHomePath(): string | undefined {
+    return this.resolvedOperatorHome
+  }
+
   async start(): Promise<TestServerInfo> {
-    await this.runtime.prepare()
+    await this.runtime.prepare(this.resolvedOperatorHome === undefined
+      ? {}
+      : { operatorHome: this.resolvedOperatorHome })
     this.qualificationSupervisorBin = this.buildQualificationSupervisor()
     this.serverBin = this.buildManagedServer()
     const selected = this.pendingQualificationProviders()
@@ -163,10 +189,11 @@ export class ManagedRuntimeBrowserRig {
       binaryKind: this.supervisorBinaryKind,
       env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
       binaryPath: this.qualificationSupervisorBin,
+      operatorHome: this.resolvedOperatorHome,
     })
     this.web = new RustServer({
       preserveHomeOnStop: true,
-      homeDir: this.webHomeDir,
+      homeDir: this.webHomeDir ?? this.resolvedOperatorHome,
       env: {
         // Managed MCP calls back from Docker workloads, so this owned
         // ephemeral-port server must override RustServer's loopback default.
@@ -258,6 +285,7 @@ export class ManagedRuntimeBrowserRig {
       reuseSecret: true,
       env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
       binaryPath: this.qualificationSupervisorBin,
+      operatorHome: this.resolvedOperatorHome,
     })
     return this.supervisor
   }

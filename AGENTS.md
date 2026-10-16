@@ -191,6 +191,8 @@ pnpm run test:cloud:build    # Build and push the Docker image to Artifact Regis
 
 **Note:** The electron suite always runs locally even in cloud mode (it needs a display and native modules not available in the container).
 
+**Cloud coverage honesty (automatic local companion):** the cloud image deliberately excludes tests that need a locally built server and a Docker daemon (today: `test/integration/server/` — see `.dockerignore`). When a broad run (`pnpm run test` / `check` / `verify`) dispatches its client phase to the cloud backend, the harness automatically runs exactly those excluded tests LOCALLY in parallel (phase `client-local-only` in `scripts/run-standard-tests.ts`) and folds the result into the run verdict — a green cloud run means all suites ran and passed. Focused selector runs skip the companion when nothing intersects the excluded set (logged as `Local companion skipped`). `FRESHELL_VITEST_LOCAL_COMPANION=off` disables it, logging a loud warning that green then does NOT cover the excluded tests — use only for deliberate narrow checks. Direct `pnpm run test:cloud` invocations do NOT run the companion; use the broad commands for full coverage.
+
 **Identity:** cloud lanes never require an interactive `gcloud auth login`.
 They resolve a gcloud identity lazily, in this order: `--account=` flag >
 `FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (via

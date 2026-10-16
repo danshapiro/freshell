@@ -740,6 +740,7 @@ mod tests {
                 reference_aliases: vec![],
                 retired_reference_aliases: vec![],
             }],
+            operator_home: None,
         };
         let selected = selections(&mounts).unwrap();
         assert!(selected.iter().any(|point| point.relative_path == ".freshell/provider-roots/root-0/opencode.json" && !point.directory),
@@ -781,6 +782,7 @@ mod tests {
                     retired_reference_aliases: vec![],
                 },
             ],
+            operator_home: None,
         };
 
         let selected = selections(&mounts).unwrap();

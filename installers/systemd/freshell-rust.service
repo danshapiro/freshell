@@ -56,6 +56,16 @@ Restart=on-failure
 RestartSec=2
 # Give the graceful-shutdown path (WS close 4009 + PTY teardown) time to run.
 TimeoutStopSec=15
+# SAFE-11 retention: on stop, signal ONLY the main process. The server's
+# graceful shutdown reaps every PTY and sidecar it owns EXCEPT adopted
+# terminal-pane Codex sidecars, which it deliberately RETAINS across
+# restarts (crates/freshell-server/src/main.rs, "SAFE-11 deliberate
+# deviation"). systemd's default KillMode=control-group (and `mixed`
+# likewise) would slaughter exactly those retained sidecars after the
+# main process exits. Accepted trade-off (matches the setsid launcher's
+# crash semantics): if the server CRASHES, systemd does not reap its
+# children either.
+KillMode=process
 
 [Install]
 WantedBy=default.target

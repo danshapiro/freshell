@@ -184,7 +184,7 @@ export class RuntimeHarness {
     this.browserDir = path.join(this.evidenceDir, 'browser')
   }
 
-  async prepare(): Promise<void> {
+  async prepare(options: { operatorHome?: string } = {}): Promise<void> {
     fs.rmSync(this.testRoot, { recursive: true, force: true })
     fs.mkdirSync(this.testRoot, { recursive: true, mode: 0o700 })
     ensurePrivateDirectory(this.evidenceDir)
@@ -246,6 +246,7 @@ export class RuntimeHarness {
       allowedProviderInputRoots: new Set(this.phase >= 2 ? this.phase2ProviderInputRoots() : []),
       allowedProviderUserRoots: new Set(this.phase >= 2 ? this.phase2ProviderUserRoots() : []),
       allowedBootstrapFiles: new Set(this.phase >= 2 ? this.phase2BootstrapFiles() : []),
+      allowedOperatorHomeRoots: new Set(options.operatorHome ? [options.operatorHome] : []),
       testRunId: this.runId,
       logPath: path.join(this.evidenceDir, 'broker.jsonl'),
     })
@@ -423,6 +424,8 @@ export class RuntimeHarness {
     env?: Record<string, string>
     /** Exact harness-built supervisor binary; must live under this run's build directory. */
     binaryPath?: string
+    /** Operator home the supervisor mounts read-only into terminal/fresh-agent souls. */
+    operatorHome?: string
   }): Promise<SupervisorInstance> {
     const scenarioId = sanitizeName(options.scenarioId)
     const scenarioRoot = this.scenarioPath(scenarioId)
@@ -523,6 +526,7 @@ export class RuntimeHarness {
       args.push('--project-budget-cpu-milli', String(options.projectBudget.cpuMilli), '--project-budget-memory-bytes', String(options.projectBudget.memoryBytes), '--project-budget-pids', String(options.projectBudget.pidsMax))
     }
     args.push('--test-run-id', this.runId)
+    if (options.operatorHome) args.push('--operator-home', options.operatorHome)
     const containerId = docker(args).trim()
     if (!/^[0-9a-f]{64}$/.test(containerId)) throw new Error(`supervisor docker run returned invalid id: ${containerId}`)
     this.trackedSupervisorContainers.add(containerId)

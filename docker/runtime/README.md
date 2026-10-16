@@ -19,13 +19,24 @@ are forbidden from workload mounts.
 The trusted session-host starts as container UID 0, but terminal containers use
 `CapDrop=ALL` and add back only `CHOWN`, `SETUID`, and `SETGID`. Before spawning
 the PTY it prepares the soul-owned provider volume, then launches the actual
-shell/coding CLI through `setpriv` as UID `65534`, GID `0`, with
-`no-new-privileges`. The provider process has zero effective/permitted/
-inheritable/ambient capabilities. Under the supported **rootless Docker**
-backend, the host user's bind-mounted workspace maps to container group 0; the
-repository's group-write permissions therefore remain usable by the provider
-without broad host chmod/chown changes. Root-owned `0600` incarnation secret
-and host-control socket remain unreadable/unconnectable to the provider UID.
+shell/coding CLI through `setpriv` as UID `65534`, GID `0` (unchanged), with
+`no-new-privileges`. The provider UID `65534` has no passwd entry — same as
+today. The
+provider process has zero effective/permitted/inheritable/ambient capabilities.
+Under the supported **rootless Docker** backend, the host user's bind-mounted
+workspace maps to container group 0; the repository's group-write permissions
+therefore remain usable by the provider without broad host chmod/chown changes.
+Souls also mount the operator home read-only at its canonical path so in-home
+config `{file:}` references resolve; inside that mount the control-plane
+subtrees (`~/.freshell`, `~/.amplifier/onecli`, `~/.config/gcloud`) are
+tmpfs-masked. The root-owned `0600` incarnation secret and host-control socket
+remain unreadable/unconnectable to the provider UID, masked control-plane
+paths stay absent in-soul, and every other in-home secret keeps its owner-only
+mode as its guarantee — the `0600` secret guarantee now rests on this
+masked-home boundary. Run `scripts/prepare-operator-home.sh` on the Docker
+host (see `docs/development/managed-runtime.md`) once at deploy and after
+Amplifier key rotations so the home root is group-traversable and every mask
+destination exists before new souls launch.
 Every runtime still has a private PID namespace, read-only image root, bounded
 tmpfs, explicit CPU/memory/PID limits, and no Docker or supervisor-admin socket.
 

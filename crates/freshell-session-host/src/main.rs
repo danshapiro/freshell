@@ -243,6 +243,13 @@ async fn serve(args: &[String]) -> Result<(), String> {
         "host.boot",
         serde_json::json!({"hostBootId":host_boot_id,"incarnationId":incarnation_id}),
     )?;
+    let (provider_run_as_uid, provider_run_as_gid) = provider_run_as_identity();
+    emit_operator_home_readiness(
+        &state_dir,
+        &secret,
+        provider_run_as_uid,
+        provider_run_as_gid,
+    );
 
     let socket = PathBuf::from(socket_path);
     if socket.exists() {
@@ -6312,6 +6319,90 @@ fn append_event_with_secret(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(unix)]
+fn child_can_traverse(
+    mode_bits: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    child_uid: u32,
+    child_gid: u32,
+) -> bool {
+    let class_bits = if child_uid == owner_uid {
+        (mode_bits >> 6) & 0o7
+    } else if child_gid == owner_gid {
+        (mode_bits >> 3) & 0o7
+    } else {
+        mode_bits & 0o7
+    };
+    class_bits & 0o1 != 0
+}
+
+fn provider_run_as_identity() -> (u32, u32) {
+    provider_run_as_identity_from(|key| std::env::var(key).ok())
+}
+
+/// The provider child identity from `FRESHELL_PROVIDER_RUN_AS_UID`/`_GID`,
+/// defaulting per field to the managed-runtime child (65534:0). The lookup is
+/// injected so tests cover the set-and-parseable path without a
+/// process-wide env race.
+fn provider_run_as_identity_from(lookup: impl Fn(&str) -> Option<String>) -> (u32, u32) {
+    let parse = |key: &str| lookup(key).and_then(|value| value.parse().ok());
+    (
+        parse("FRESHELL_PROVIDER_RUN_AS_UID").unwrap_or(65_534),
+        parse("FRESHELL_PROVIDER_RUN_AS_GID").unwrap_or(0),
+    )
+}
+
+#[cfg(unix)]
+fn emit_operator_home_readiness(
+    state_dir: &Path,
+    process_secret: &[u8],
+    run_as_uid: u32,
+    run_as_gid: u32,
+) {
+    let home = match (
+        std::env::var_os("FRESHELL_OPERATOR_HOME_MOUNT"),
+        std::env::var_os("FRESHELL_OPERATOR_HOME"),
+    ) {
+        (Some(_), Some(home)) => PathBuf::from(home),
+        _ => return,
+    };
+    let data = match std::fs::metadata(&home) {
+        Ok(metadata) => {
+            use std::os::unix::fs::MetadataExt;
+            let mode = metadata.mode() & 0o7777;
+            serde_json::json!({
+                "path": home.to_string_lossy(),
+                "present": true,
+                "uid": metadata.uid(),
+                "gid": metadata.gid(),
+                "mode": format!("{:04o}", mode),
+                "home_root_traversable_by_child": child_can_traverse(
+                    mode,
+                    metadata.uid(),
+                    metadata.gid(),
+                    run_as_uid,
+                    run_as_gid,
+                ),
+            })
+        }
+        Err(_) => serde_json::json!({
+            "path": home.to_string_lossy(),
+            "present": false,
+        }),
+    };
+    let _ = append_event_with_secret(state_dir, process_secret, "operator_home_readiness", data);
+}
+
+#[cfg(not(unix))]
+fn emit_operator_home_readiness(
+    _state_dir: &Path,
+    _process_secret: &[u8],
+    _run_as_uid: u32,
+    _run_as_gid: u32,
+) {
+}
+
 fn optional_arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|arg| arg == key)
@@ -11029,5 +11120,176 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"runnable");
+    }
+
+    static OPERATOR_MARKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ScopedMarkerEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for ScopedMarkerEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn scoped_marker_env(keys: &[&'static str]) -> ScopedMarkerEnv {
+        ScopedMarkerEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        )
+    }
+
+    fn journal_events(state_dir: &Path) -> Vec<serde_json::Value> {
+        let bytes = std::fs::read(state_dir.join("host-lifecycle.jsonl")).unwrap_or_default();
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    fn readiness_events(state_dir: &Path) -> Vec<serde_json::Value> {
+        journal_events(state_dir)
+            .into_iter()
+            .filter(|event| event["event"] == "operator_home_readiness")
+            .map(|event| event["data"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn child_can_traverse_evaluates_dac_classes() {
+        // All metadata is the IN-CONTAINER view. Under the rootless daemon an
+        // operator-owned file (host uid/gid 1000) appears as container 0:0, and
+        // the child's gid 0 then matches the file's group.
+        assert!(child_can_traverse(0o700, 1000, 1000, 1000, 0)); // owner-x, child is owner
+        assert!(child_can_traverse(0o750, 0, 0, 65_534, 0)); // group-x, gid match: the rootless production shape
+        assert!(!child_can_traverse(0o750, 1000, 1000, 65_534, 0)); // group-x but gid mismatch: the rootful shape
+        assert!(!child_can_traverse(0o700, 0, 0, 65_534, 0)); // the incident's failure surface
+        assert!(!child_can_traverse(0o701, 0, 0, 65_534, 0)); // first-match: group with no x cannot fall through to other-x
+        assert!(child_can_traverse(0o701, 1000, 1000, 65_534, 65_534)); // other-x applies when neither uid nor gid matches
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_event_reflects_real_home_metadata_and_survives_stat_failure() {
+        let _lock = OPERATOR_MARKER_ENV_LOCK.lock().unwrap();
+        let _env = scoped_marker_env(&["FRESHELL_OPERATOR_HOME", "FRESHELL_OPERATOR_HOME_MOUNT"]);
+
+        // Case A: with the home mounted, mode 0750, owned by the test uid,
+        // and the provider child identity 65534:0, the startup emission
+        // produces exactly one operator_home_readiness event whose fields
+        // match the stat and whose home_root_traversable_by_child equals
+        // child_can_traverse applied to that stat.
+        let state_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let home_path = home.path().to_string_lossy().into_owned();
+        std::env::set_var("FRESHELL_OPERATOR_HOME", home.path());
+        std::env::set_var("FRESHELL_OPERATOR_HOME_MOUNT", "1");
+        emit_operator_home_readiness(state_dir.path(), b"test-secret-material", 65_534, 0);
+        let events = readiness_events(state_dir.path());
+        assert_eq!(events.len(), 1, "case A: {events:?}");
+        let data = &events[0];
+        assert_eq!(data["path"], home_path);
+        assert_eq!(data["present"], true);
+        assert_eq!(data["mode"], "0750");
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(home.path()).unwrap();
+            assert_eq!(data["uid"], u64::from(metadata.uid()));
+            assert_eq!(data["gid"], u64::from(metadata.gid()));
+            assert_eq!(
+                data["home_root_traversable_by_child"],
+                child_can_traverse(
+                    metadata.mode() & 0o7777,
+                    metadata.uid(),
+                    metadata.gid(),
+                    65_534,
+                    0
+                )
+            );
+        }
+        let mut field_names: Vec<String> = data.as_object().unwrap().keys().cloned().collect();
+        field_names.sort_unstable();
+        assert_eq!(
+            field_names,
+            [
+                "gid",
+                "home_root_traversable_by_child",
+                "mode",
+                "path",
+                "present",
+                "uid"
+            ]
+        );
+
+        // Case B: with FRESHELL_OPERATOR_HOME pointing at a path that does
+        // not exist, the emission must produce one event with present:false
+        // and startup must continue.
+        let state_dir = tempfile::tempdir().unwrap();
+        let missing = state_dir.path().join("no-such-operator-home");
+        let missing_path = missing.to_string_lossy().into_owned();
+        std::env::set_var("FRESHELL_OPERATOR_HOME", &missing);
+        emit_operator_home_readiness(state_dir.path(), b"test-secret-material", 65_534, 0);
+        let events = readiness_events(state_dir.path());
+        assert_eq!(events.len(), 1, "case B: {events:?}");
+        assert_eq!(events[0]["present"], false);
+        assert_eq!(events[0]["path"], missing_path);
+    }
+
+    #[test]
+    fn readiness_emission_requires_both_marker_env_vars() {
+        let _lock = OPERATOR_MARKER_ENV_LOCK.lock().unwrap();
+        let _env = scoped_marker_env(&["FRESHELL_OPERATOR_HOME", "FRESHELL_OPERATOR_HOME_MOUNT"]);
+        let state_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        std::env::set_var("FRESHELL_OPERATOR_HOME", home.path());
+        std::env::remove_var("FRESHELL_OPERATOR_HOME_MOUNT");
+        emit_operator_home_readiness(state_dir.path(), b"test-secret-material", 65_534, 0);
+        assert!(readiness_events(state_dir.path()).is_empty());
+
+        std::env::set_var("FRESHELL_OPERATOR_HOME_MOUNT", "1");
+        std::env::remove_var("FRESHELL_OPERATOR_HOME");
+        emit_operator_home_readiness(state_dir.path(), b"test-secret-material", 65_534, 0);
+        assert!(readiness_events(state_dir.path()).is_empty());
+    }
+
+    #[test]
+    fn provider_run_as_identity_defaults_when_env_absent() {
+        let _lock = OPERATOR_MARKER_ENV_LOCK.lock().unwrap();
+        let _env = scoped_marker_env(&[
+            "FRESHELL_PROVIDER_RUN_AS_UID",
+            "FRESHELL_PROVIDER_RUN_AS_GID",
+        ]);
+        std::env::remove_var("FRESHELL_PROVIDER_RUN_AS_UID");
+        std::env::remove_var("FRESHELL_PROVIDER_RUN_AS_GID");
+        assert_eq!(provider_run_as_identity(), (65_534, 0));
+    }
+
+    #[test]
+    fn provider_run_as_identity_parses_set_env_values() {
+        // Set-and-parseable vars produce the parsed child identity (the
+        // identity startup feeds the operator_home_readiness event); a value
+        // that does not parse keeps the per-field default.
+        let identity = provider_run_as_identity_from(|key| match key {
+            "FRESHELL_PROVIDER_RUN_AS_UID" => Some("1500".to_string()),
+            "FRESHELL_PROVIDER_RUN_AS_GID" => Some("2500".to_string()),
+            _ => None,
+        });
+        assert_eq!(identity, (1500, 2500));
+        let partial = provider_run_as_identity_from(|key| match key {
+            "FRESHELL_PROVIDER_RUN_AS_UID" => Some("not-a-uid".to_string()),
+            _ => None,
+        });
+        assert_eq!(partial, (65_534, 0));
     }
 }

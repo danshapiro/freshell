@@ -2,6 +2,7 @@ use freshell_runtime_protocol::{
     FreshAgentLaunchSpec, ProviderBootstrapFile, ProviderConfigRoot, ProviderLaunchContext,
     ProviderSecretReference, TerminalLaunchSpec,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -28,6 +29,15 @@ pub fn configure_capability_dir(control_socket: &Path) -> Result<(), String> {
         .map_err(|_| "managed MCP capability directory already configured".into())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorHomeMount {
+    pub home: PathBuf,
+    pub mask_rel_paths: Vec<String>,
+}
+
+pub const OPERATOR_HOME_MASK_REL_PATHS: &[&str] =
+    &[".freshell", ".amplifier/onecli", ".config/gcloud"];
+
 /// Exact extra-mount set for a Phase 2 terminal workload. Every source is
 /// canonicalized before Docker sees it; destinations preserve the host's
 /// absolute workspace/git paths so Git worktrees keep their common-dir links.
@@ -44,6 +54,7 @@ pub struct TerminalMounts {
     pub config_binds: Vec<ResolvedProviderConfigBind>,
     pub resource_mounts: Vec<freshell_runtime_protocol::ProviderResourceMount>,
     pub indexed_files: Option<freshell_runtime_protocol::IndexedProviderFiles>,
+    pub operator_home: Option<OperatorHomeMount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +349,15 @@ fn workload_mounts(
         purpose,
         context.and_then(|context| context.mcp_capability.as_ref()),
     )?;
+    let euid = unsafe { libc::geteuid() };
+    let operator_home = effective_operator_mount(
+        explicit_operator_home(
+            std::env::var_os("FRESHELL_SUPERVISOR_OPERATOR_HOME").as_deref(),
+            euid,
+        )
+        .or_else(|| operator_home_mount(std::env::var_os("HOME").as_deref(), euid)),
+        &workspace,
+    );
     Ok(TerminalMounts {
         workspace,
         git_common_dir,
@@ -350,6 +370,7 @@ fn workload_mounts(
         config_binds: prepared.config_binds,
         resource_mounts: prepared.resource_mounts,
         indexed_files: prepared.indexed_files,
+        operator_home,
     })
 }
 
@@ -404,6 +425,7 @@ pub(super) fn ordinary_claude_candidate_mounts(
         config_binds: prepared.config_binds,
         resource_mounts: prepared.resource_mounts,
         indexed_files: None,
+        operator_home: None,
     })
 }
 
@@ -811,6 +833,63 @@ mod prepared_stage_tests {
     }
 }
 
+pub fn explicit_operator_home(
+    path: Option<&std::ffi::OsStr>,
+    supervisor_euid: u32,
+) -> Option<OperatorHomeMount> {
+    derive_operator_mount(path, supervisor_euid)
+}
+
+pub fn operator_home_mount(
+    home_env: Option<&std::ffi::OsStr>,
+    supervisor_euid: u32,
+) -> Option<OperatorHomeMount> {
+    if supervisor_euid == 0 {
+        return None;
+    }
+    derive_operator_mount(home_env, supervisor_euid)
+}
+
+fn effective_operator_mount(
+    mount: Option<OperatorHomeMount>,
+    workspace: &Path,
+) -> Option<OperatorHomeMount> {
+    mount.filter(|mount| mount.home != workspace)
+}
+
+fn derive_operator_mount(
+    path: Option<&std::ffi::OsStr>,
+    supervisor_euid: u32,
+) -> Option<OperatorHomeMount> {
+    let home = std::fs::canonicalize(path?).ok()?;
+    if !home.is_dir() {
+        return None;
+    }
+    if directory_owner_uid(&home) != Some(supervisor_euid) {
+        return None;
+    }
+    let mask_rel_paths = OPERATOR_HOME_MASK_REL_PATHS
+        .iter()
+        .filter(|rel| home.join(rel).is_dir())
+        .map(|rel| rel.to_string())
+        .collect();
+    Some(OperatorHomeMount {
+        home,
+        mask_rel_paths,
+    })
+}
+
+#[cfg(unix)]
+fn directory_owner_uid(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|metadata| metadata.uid())
+}
+
+#[cfg(not(unix))]
+fn directory_owner_uid(_path: &Path) -> Option<u32> {
+    None
+}
+
 fn capability_directory() -> Result<PathBuf, String> {
     capability_directory_for(MountPurpose::Create)
 }
@@ -1201,5 +1280,86 @@ mod provider_secret_tests {
             )]);
         let legacy_mounts = terminal_mounts(&legacy).unwrap();
         assert_eq!(legacy_mounts.provider_secret_files, vec![indexed_source]);
+    }
+
+    #[test]
+    fn operator_home_mount_derives_masks_and_requires_operator_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        for rel in [".freshell", ".amplifier/onecli", ".config/gcloud"] {
+            std::fs::create_dir_all(home.join(rel)).unwrap();
+        }
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(&home).unwrap().uid() as u32;
+        let mount = operator_home_mount(Some(home.as_os_str()), owner).expect("owned home mounts");
+        assert_eq!(mount.home, home.canonicalize().unwrap());
+        assert_eq!(
+            mount.mask_rel_paths,
+            vec![".freshell", ".amplifier/onecli", ".config/gcloud"]
+        );
+        // A home owned by a different uid (e.g. root's /) must never mount.
+        assert!(operator_home_mount(Some(std::path::Path::new("/").as_os_str()), owner).is_none());
+    }
+
+    #[test]
+    fn operator_home_mount_filters_masks_to_existing_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(&home).unwrap().uid() as u32;
+        let mount = operator_home_mount(Some(home.as_os_str()), owner).expect("owned home mounts");
+        assert_eq!(mount.mask_rel_paths, vec![".freshell"]);
+    }
+
+    #[test]
+    fn operator_home_mount_is_dropped_when_workspace_equals_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        let home = home.canonicalize().unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(&home).unwrap().uid() as u32;
+        let mount = operator_home_mount(Some(home.as_os_str()), owner).unwrap();
+        assert_eq!(effective_operator_mount(Some(mount.clone()), &home), None);
+        let workspace = home.join("code").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        assert!(effective_operator_mount(Some(mount), &workspace).is_some());
+    }
+
+    #[test]
+    fn operator_home_mount_skips_unset_or_missing_home() {
+        let euid = unsafe { libc::geteuid() };
+        assert!(operator_home_mount(None, euid).is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(operator_home_mount(Some(tmp.path().join("nope").as_os_str()), euid).is_none());
+    }
+
+    #[test]
+    fn operator_home_env_path_never_mounts_for_a_root_supervisor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(operator_home_mount(Some(home.as_os_str()), 0).is_none());
+    }
+
+    #[test]
+    fn explicit_operator_home_flag_applies_the_owner_guard() {
+        // The rig supervisor runs as root in its container; under the rootless
+        // daemon the operator's files appear container-0-owned, so the explicit
+        // flag path mounts for it while the owner guard still rejects unowned homes.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(&home).unwrap().uid() as u32;
+        assert_eq!(
+            explicit_operator_home(Some(home.as_os_str()), owner).map(|m| m.home),
+            Some(home.canonicalize().unwrap())
+        );
+        assert_eq!(
+            explicit_operator_home(Some(home.as_os_str()), owner + 1),
+            None
+        );
     }
 }

@@ -61,6 +61,10 @@ export const LOCAL_ONLY_SPECS = [{
   spec: 'runtime-chaos-rust.spec.ts',
   selector: '--project=chromium test/e2e-browser/specs/runtime-chaos-rust.spec.ts',
   classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-opencode-home-file-reference-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
 }]
 
 const continuityRequested = process.env.FRESHELL_SMOKE
