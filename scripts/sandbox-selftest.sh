@@ -396,25 +396,20 @@ EOF
 # resolves from the registry; the npm fixture's lock stays dependency-free.
 # Lock-only generation keeps the case runs below exercising the entrypoint's
 # real frozen-install path.
-# The generators run as the container's root user: under this host's
-# rootless docker mapping, bind-mounted files keep the invoking user's
-# ownership, so root-created locks come back out as the invoking user's
-# own files — readable and chmod-able host-side for the steps below.
+# Make caller-created inputs readable before the generators run. Their
+# explicit umask also keeps generated locks readable in both Docker modes:
+# rootless root maps to the caller, but rootful root creates UID0 locks that
+# the caller cannot chmod afterward.
+chmod -R a+rX "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}"
 P6_GEN_STATUS=0
 docker run --rm --network "${NETWORK_NAME}" --entrypoint bash \
   -v "${P6_FIXTURE_PNPM}:/fixture" "${IMAGE_TAG}" \
-  -c 'bash -c "cd /fixture && pnpm install --lockfile-only"' \
+  -c 'umask 022; cd /fixture && pnpm install --lockfile-only' \
   >/dev/null 2>&1 || P6_GEN_STATUS=$?
 docker run --rm --network "${NETWORK_NAME}" --entrypoint bash \
   -v "${P6_FIXTURE_NPM}:/fixture" "${IMAGE_TAG}" \
-  -c 'bash -c "cd /fixture && npm install --package-lock-only"' \
+  -c 'umask 022; cd /fixture && npm install --package-lock-only' \
   >/dev/null 2>&1 || P6_GEN_STATUS=$?
-
-# The entrypoint's gosu drop means the container reads the fixture as the
-# "sandbox" user, while bind-mounted host files appear inside the container
-# as root-owned — they must be world-readable for the install to work.
-# chmod after creation so the invoking shell's umask cannot break the proof.
-chmod -R a+rX "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}"
 
 # Plant the stale npm-era node_modules (one-shot marker + junk) INTO each
 # throwaway volume, exactly as a legacy npm-era container would have left
