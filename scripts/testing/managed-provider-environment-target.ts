@@ -214,20 +214,42 @@ const path = require('node:path')
 const [pidText, receiptPath, expectedNonce, expectedCwd, expectedStartTicks] = process.argv.slice(1)
 const procPath = '/proc/' + Number(pidText)
 const result = { exists: false, isNode: false, envFileOperand: false, fixtureArguments: false, cwdMatches: false,
-  processStartTicksMatches: false }
-try {
-  result.exists = fs.existsSync(procPath + '/stat')
-  const command = fs.readFileSync(procPath + '/cmdline', 'utf8').split(String.fromCharCode(0)).filter(Boolean)
-  const stat = fs.readFileSync(procPath + '/stat', 'utf8')
-  const startTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
+  processStartTicksMatches: false, processState: null, processName: null, parentPid: null, executableName: null,
+  readErrors: [] }
+const readProc = (field, read) => {
+  try { return read() }
+  catch (error) {
+    result.readErrors.push({ field, code: error && typeof error === 'object' && 'code' in error ? String(error.code) : 'UNKNOWN' })
+    return null
+  }
+}
+result.exists = fs.existsSync(procPath + '/stat')
+const stat = readProc('stat', () => fs.readFileSync(procPath + '/stat', 'utf8'))
+if (stat !== null) {
+  const open = stat.indexOf('('), close = stat.lastIndexOf(')')
+  const fields = close >= 0 ? stat.slice(close + 2).trim().split(/\s+/) : []
+  result.processName = open >= 0 && close > open ? stat.slice(open + 1, close) : null
+  result.processState = fields[0] ?? null
+  result.parentPid = Number.isSafeInteger(Number(fields[1])) ? Number(fields[1]) : null
+  result.processStartTicksMatches = fields[19] === expectedStartTicks
+}
+const commandLine = readProc('cmdline', () => fs.readFileSync(procPath + '/cmdline', 'utf8'))
+if (commandLine !== null) {
+  const command = commandLine.split(String.fromCharCode(0)).filter(Boolean)
   const scriptIndex = command.indexOf('server.mjs')
-  result.isNode = path.basename(fs.readlinkSync(procPath + '/exe').replace(/ \(deleted\)$/, '')) === 'node'
   result.envFileOperand = command.includes('--env-file=.env')
   result.fixtureArguments = scriptIndex >= 0 && command[scriptIndex + 1] === receiptPath
     && command[scriptIndex + 2] === expectedNonce
-  result.cwdMatches = fs.readlinkSync(procPath + '/cwd') === expectedCwd
-  result.processStartTicksMatches = startTicks === expectedStartTicks
-} catch { /* Emit false checks so the host-side assertion reports the failed evidence. */ }
+}
+const executable = readProc('exe', () => fs.readlinkSync(procPath + '/exe'))
+if (executable !== null) {
+  result.executableName = path.basename(executable.replace(/ \(deleted\)$/, ''))
+  result.isNode = result.executableName === 'node'
+}
+const cwd = readProc('cwd', () => fs.readlinkSync(procPath + '/cwd'))
+if (cwd !== null) {
+  result.cwdMatches = cwd === expectedCwd
+}
 process.stdout.write(JSON.stringify(result))
 `
 }
@@ -523,6 +545,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
  const child=Bun.spawn([command.pathname],{stdout:'pipe',stderr:'pipe'});const output=JSON.parse(await new Response(child.stdout).text());if(await child.exited!==0)throw new Error('selected executable failed');
  const configuration=await api.client.config.get({directory:cwd});if(!configuration.data?.agent)throw new Error('resolved provider configuration was not available');const sessionFlag=process.argv.findIndex(value=>value==='--session'||value==='-s');const resumed=sessionFlag>=0?process.argv[sessionFlag+1]:undefined;const result=resumed?await api.client.session.get({directory:cwd,sessionID:resumed}):await api.client.session.create({directory:cwd,title:'Managed fixture'});if(!result.data?.id||(resumed&&result.data.id!==resumed))throw new Error('native session creation or resume failed');api.route.navigate('session',{sessionID:result.data.id});
  let mcpStatuses={},wrapperProbe={};if(cwd.endsWith('/preflight')){await new Promise(resolve=>setTimeout(resolve,3000));try{const response=await api.client.mcp.status({directory:cwd});mcpStatuses=Object.fromEntries(Object.entries(response.data??{}).map(([name,status])=>[name,{status:status?.status??'unknown',...(status?.status==='failed'?{error:String(status.error).replaceAll(options.expectedNonce,'[fixture-nonce]').slice(0,240)}:{})}]))}catch(error){mcpStatuses={queryError:String(error).replaceAll(options.expectedNonce,'[fixture-nonce]').slice(0,240)}}const wrapperPath=path.join(cwd,'.managed-fixture/mcp-cwd-alias/start');wrapperProbe.paths=[cwd,path.join(cwd,'.managed-fixture'),path.dirname(wrapperPath),wrapperPath].map(candidate=>{const relative=path.relative(cwd,candidate)||'.';try{const metadata=fs.statSync(candidate);fs.accessSync(candidate,fs.constants.X_OK);return{path:relative,mode:(metadata.mode&511).toString(8).padStart(4,'0'),uid:metadata.uid,gid:metadata.gid,searchAccess:'ok'}}catch(error){return{path:relative,code:error?.code??'unknown',message:String(error).slice(0,120)}}});try{const mount=fs.readFileSync('/proc/self/mountinfo','utf8').split('\\n').flatMap(line=>{const [left,right]=line.split(' - ');if(!right)return[];const fields=left.split(' '),mountpoint=fields[4]??'';if(wrapperPath!==mountpoint&&!wrapperPath.startsWith(mountpoint==='/'?'/':mountpoint+'/'))return[];const detail=right.split(' ');return[{mountRoot:fields[3],mountpoint,mountOptions:fields[5],filesystem:detail[0],source:detail[1],superOptions:detail[2]}]}).sort((a,b)=>b.mountpoint.length-a.mountpoint.length)[0];wrapperProbe.mount=mount??null}catch(error){wrapperProbe.mountProbeError=String(error).slice(0,160)}}
+ if(cwd.endsWith('/healthy')){await new Promise(resolve=>setTimeout(resolve,3000));try{const response=await api.client.mcp.status({directory:cwd});mcpStatuses=Object.fromEntries(Object.entries(response.data??{}).map(([name,status])=>[name,{status:status?.status??'unknown',...(status?.status==='failed'?{error:String(status.error).replaceAll(options.expectedNonce,'[fixture-nonce]').slice(0,240)}:{})}]))}catch(error){mcpStatuses={queryError:String(error).replaceAll(options.expectedNonce,'[fixture-nonce]').slice(0,240)}}}
  const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,model:configuration.data.model,dependency,resource,absoluteReference:configuration.data.agent.fixtureAbsolute.prompt,relativeReference:configuration.data.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),mcpStatuses,wrapperProbe,pid:process.pid,createdAt:new Date().toISOString()};
  fs.writeFileSync(path.join(cwd,'.managed-fixture/child-receipt.json'),JSON.stringify(receipt));const marker='MANAGED_ENV_OUTPUT '+output.resource;process.stdout.write('\\n'+marker+'\\n');api.ui.toast.show({message:marker,duration:180000});
 }};`)
@@ -1722,6 +1745,8 @@ export async function runManagedEnvironmentTarget() {
           assert.equal(child.runId, fixture.runId)
           assert.equal(child.bun, true)
           assert.equal(child.opencodeVersion, '1.18.21')
+          assert.equal(child.mcpStatuses?.workspace_cwd_alias_fixture?.status, 'connected',
+            'OpenCode must report the external-CWD MCP connected while its healthy TUI is alive')
           assert.equal(child.model, managedEnvironmentFixtureModel)
           assert.match(child.bunExecutable, /opencode/)
           assert.equal(child.executableMode, '0711')
@@ -1825,6 +1850,8 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(replacementChild.runId, rig.runtime.runId)
     assert.equal(replacementChild.expectedNonce, nonce)
     assert.equal(replacementChild.executableMode, '0711')
+    assert.equal(replacementChild.mcpStatuses?.workspace_cwd_alias_fixture?.status, 'connected',
+      'replacement OpenCode must report the external-CWD MCP connected')
     assert.equal(replacementCwdAliasMcp.expectedNonce, nonce)
     assert.equal(replacementCwdAliasMcp.helper, nonce)
     assert.equal(replacementCwdAliasMcp.terminalId, replacement.terminalId)
@@ -1837,21 +1864,70 @@ export async function runManagedEnvironmentTarget() {
     assert(replacementCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
     assert.equal(await fs.readFile(`${cwdAliasReceiptPath}.started`, 'utf8'), 'wrapper-started')
     assert(replacement.containerId)
-    const replacementMcpProcessProbe = JSON.parse(rig.runtime.execOwnedContainerExact(replacement.containerId, [
-      'node', '-e', workspaceCwdAliasReplacementProcessProbeSource(),
-      String(replacementCwdAliasMcp.pid), cwdAliasReceiptPath, nonce, selected.cwdAliasProject,
-      replacementCwdAliasMcp.processStartTicks,
-    ]))
-    assert.deepEqual(replacementMcpProcessProbe, {
-      exists: true, isNode: true, envFileOperand: true, fixtureArguments: true, cwdMatches: true,
-      processStartTicksMatches: true,
-    }, 'the .env MCP receipt must belong to a live process in the replacement container')
-    // Probe the receipt as soon as it appears. The provider-stage walk below can
-    // be sizeable, and the MCP child is owned by OpenCode; delaying this check
-    // until after that unrelated scan can observe a child that has since exited.
+    const processProbeObservations: Array<{ attempt: number; result: Record<string, unknown> }> = []
+    let consecutiveLiveIdentityMatches = 0
+    const liveIdentityFields = ['exists', 'isNode', 'envFileOperand', 'fixtureArguments', 'cwdMatches',
+      'processStartTicksMatches']
+    for (let attempt = 0; attempt < 12; attempt++) {
+      let result: Record<string, unknown>
+      try {
+        result = JSON.parse(rig.runtime.execOwnedContainerExact(replacement.containerId, [
+          'node', '-e', workspaceCwdAliasReplacementProcessProbeSource(),
+          String(replacementCwdAliasMcp.pid), cwdAliasReceiptPath, nonce, selected.cwdAliasProject,
+          replacementCwdAliasMcp.processStartTicks,
+        ])) as Record<string, unknown>
+      } catch (error) {
+        const probeError = error as NodeJS.ErrnoException
+        result = { probeExecutionError: probeError.code ?? probeError.name ?? 'UNKNOWN' }
+      }
+      processProbeObservations.push({ attempt, result })
+      const matchesReceipt = liveIdentityFields.every(field => result[field] === true)
+        && result.processName === 'node' && result.executableName === 'node'
+        && result.processState !== 'Z' && Array.isArray(result.readErrors) && result.readErrors.length === 0
+      consecutiveLiveIdentityMatches = matchesReceipt ? consecutiveLiveIdentityMatches + 1 : 0
+      if (consecutiveLiveIdentityMatches >= 2) break
+      if (attempt < 11) await delay(250)
+    }
+    const replacementTerminalRow = (await terminalDirectory(rig)).find(row => row.terminalId === replacement.terminalId)
+    const terminalStatus = {
+      status: typeof replacementTerminalRow?.status === 'string' ? replacementTerminalRow.status : 'missing',
+      runtimeStatus: typeof replacementTerminalRow?.runtimeStatus === 'string' ? replacementTerminalRow.runtimeStatus : null,
+      hasClients: replacementTerminalRow?.hasClients === true,
+    }
+    const replacementView = (await rig.inventory()).find(row => row.incarnationId === replacement.incarnationId)
+    const runtimeStatus = replacementView ? {
+      launchState: replacementView.launchState,
+      desiredState: replacementView.desiredState ?? null,
+      recoveryState: replacementView.recoveryState ?? null,
+      durabilityState: replacementView.durabilityState ?? null,
+      allocationState: replacementView.allocationState ?? null,
+    } : null
+    const mcpStatusAtTuiStartup = replacementChild.mcpStatuses?.workspace_cwd_alias_fixture?.status ?? 'missing'
+    const replacementMcpProcessProbe = processProbeObservations.at(-1)?.result ?? { probeExecutionError: 'NO_OBSERVATION' }
+    const liveProcessProved = consecutiveLiveIdentityMatches >= 2
+    const terminalStillRunning = terminalStatus.status === 'running'
+    if (!liveProcessProved || !terminalStillRunning || mcpStatusAtTuiStartup !== 'connected') {
+      let processTable: string | 'UNAVAILABLE'
+      try {
+        processTable = rig.runtime.topOwnedContainerExact(replacement.containerId, ['-eo', 'pid,ppid,stat,comm'])
+          .split('\n').slice(0, 80).join('\n')
+      } catch { processTable = 'UNAVAILABLE' }
+      rig.runtime.writeIncident('managed-environment-replacement-mcp-process-failure', {
+        severity: 'error', event: 'managed_environment.replacement_mcp_process_failed',
+        replacement: { terminalId: replacement.terminalId, incarnationId: replacement.incarnationId,
+          containerId: replacement.containerId, soulId: replacement.soulId },
+        mcpStatusAtTuiStartup, terminalStatus, runtimeStatus, consecutiveLiveIdentityMatches,
+        probeObservations: processProbeObservations, processTable,
+      })
+      throw new Error(`replacement MCP liveness proof failed: ${JSON.stringify({
+        mcpStatusAtTuiStartup, terminalStatus, runtimeStatus, consecutiveLiveIdentityMatches,
+        latestProbe: replacementMcpProcessProbe,
+      })}`)
+    }
     const replacementStage = await stageProof(rig, replacement, nonce)
     proof.nativeReplacement = { priorIncarnationId: original.incarnationId, incarnationId: replacement.incarnationId,
       soulId: replacement.soulId, nativeSessionId: replacement.nativeSessionId, stage: replacementStage,
+      terminalStatus, mcpStatusAtTuiStartup, consecutiveLiveIdentityMatches,
       child: replacementChild, workspaceCwdAliasMcp: { ...replacementCwdAliasMcp,
         verifiedInsideContainerId: replacement.containerId, verifiedIncarnationId: replacement.incarnationId,
         processProbe: replacementMcpProcessProbe } }

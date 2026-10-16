@@ -294,11 +294,24 @@ setInterval(() => {}, 1000)
         '-e', workspaceCwdAliasReplacementProcessProbeSource(), String(receipt.pid), receiptPath, nonce, directory, startTicks,
       ], { cwd: directory, encoding: 'utf8' }))
 
-      expect(runProbe(receipt.processStartTicks)).toEqual({
+      const liveProbe = runProbe(receipt.processStartTicks)
+      expect(liveProbe).toMatchObject({
         exists: true, isNode: true, envFileOperand: true, fixtureArguments: true, cwdMatches: true,
-        processStartTicksMatches: true,
+        processStartTicksMatches: true, processState: 'S', processName: 'node', executableName: 'node',
+        parentPid: expect.any(Number), readErrors: [],
       })
-      expect(runProbe(`${receipt.processStartTicks}-stale`).processStartTicksMatches).toBe(false)
+      const staleIdentityProbe = runProbe(`${receipt.processStartTicks}-stale`)
+      expect(staleIdentityProbe.processStartTicksMatches).toBe(false)
+      expect(staleIdentityProbe.processName).toBe('node')
+
+      const missingProbe = JSON.parse(execFileSync(process.execPath, [
+        '-e', workspaceCwdAliasReplacementProcessProbeSource(), String(Number.MAX_SAFE_INTEGER),
+        receiptPath, nonce, directory, receipt.processStartTicks,
+      ], { cwd: directory, encoding: 'utf8' }))
+      expect(missingProbe).toMatchObject({ exists: false, processState: null, processName: null, executableName: null })
+      expect(missingProbe.readErrors).toContainEqual({ field: 'stat', code: 'ENOENT' })
+      expect(JSON.stringify(missingProbe)).not.toContain(nonce)
+      expect(JSON.stringify(missingProbe)).not.toContain(receiptPath)
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) {
         const closed = new Promise<void>(resolve => child!.once('close', () => resolve()))
