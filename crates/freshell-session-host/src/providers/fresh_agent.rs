@@ -3826,6 +3826,126 @@ export function query({ prompt, options }) {
     }
 
     #[tokio::test]
+    async fn claude_checkpoint_continuation_failure_ends_host_liveness() {
+        // Runs in the disposable sandbox: the production sidecar owns and
+        // closes synthetic native children, never an operator's SDK process.
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let keys = [
+            "HOME",
+            "CLAUDE_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+            "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+            "FRESHELL_SIDECAR_TEST_CHECKPOINT",
+            "FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY",
+            "FRESHELL_SIDECAR_TEST_CONTINUATION_FAILURE",
+        ];
+        let _restore = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for scenario in [
+            "close-timeout",
+            "close-error",
+            "query-setup",
+            "native-startup",
+        ] {
+            let owned = tempfile::tempdir().unwrap();
+            let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            std::fs::write(
+                owned.path().join("native.jsonl"),
+                format!("{{\"type\":\"system\",\"sessionId\":\"{native}\"}}\n"),
+            )
+            .unwrap();
+            std::env::set_var("HOME", owned.path());
+            std::env::set_var("CLAUDE_HOME", owned.path().join(".claude"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", owned.path().join(".claude"));
+            std::env::set_var(
+                "FRESHELL_CLAUDE_SIDECAR",
+                repo.join("crates/freshell-claude-sidecar/index.mjs"),
+            );
+            std::env::set_var(
+                "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+                repo.join("test/unit/claude-sidecar/fixtures/native-startup-query.mjs"),
+            );
+            std::env::set_var("FRESHELL_SIDECAR_TEST_CHECKPOINT", "1");
+            std::env::set_var("FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY", "1");
+            std::env::set_var("FRESHELL_SIDECAR_TEST_CONTINUATION_FAILURE", scenario);
+            std::env::set_var(
+                "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+                json!({
+                    "incarnationId":"owned-incarnation", "launchNonce":"owned-nonce",
+                    "evidenceRevision":1,"executionGeneration":1,"requestedNativeSessionId":native,
+                })
+                .to_string(),
+            );
+            let mut profile = parity_profile(FreshProvider::Claude);
+            profile.cwd = owned.path().to_string_lossy().into();
+            profile.native_session_id = Some(native.into());
+            profile.session_ref = None;
+            profile.provider_launch_context = None;
+            profile.provider_secret_references.clear();
+            profile.plugins = None;
+            profile.permission_mode = Some("default".into());
+            let transport = HostedTransport::new(FreshProvider::Claude).await;
+            let actor =
+                FreshAgentHostActor::open(owned.path().join("actor"), profile, transport.clone())
+                    .await
+                    .unwrap();
+            actor
+                .dispatch(RequestId::new(), "owned checkpoint operation".into(), None)
+                .await
+                .unwrap();
+            let detected = tokio::time::timeout(Duration::from_secs(8), async {
+                while actor.is_live().await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            // Native liveness and the actor event journal have separate
+            // consumers. Wait for the journal's own terminal edge as well.
+            let failed_turn = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if actor.read_events(0, 128).await.events.iter().any(|row| {
+                        matches!(&row.event, AgentEvent::Provider { payload }
+                            if payload["event"]["type"] == "freshAgent.turn.complete"
+                                && payload["event"]["outcome"] == "failed")
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            let events = actor.read_events(0, 128).await.events;
+            if let ProviderState::Claude(state) = &transport.state {
+                state.shutdown().await;
+            }
+            assert!(
+                detected,
+                "{scenario}: failed continuation must end host liveness without another send"
+            );
+            assert!(
+                failed_turn,
+                "{scenario}: accepted turn must settle as failed"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|row| matches!(&row.event, AgentEvent::Provider { payload }
+                if payload["event"]["type"] == "freshAgent.error")),
+                "{scenario}: the actual failure must reach the host's event stream"
+            );
+            assert!(!owned.path().join("effect-count").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn normalized_claude_init_reaches_current_host_native_receiver() {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();

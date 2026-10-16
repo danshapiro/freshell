@@ -1,10 +1,17 @@
 // Controlled loader used only to exercise the real sidecar/native-hook boundary.
 import { exec } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
 import { appendFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 const nativeChildren = new Set()
 let nativeForks = 0
+let queryCount = 0
 export function query({ prompt, options }) {
+  const queryNumber = ++queryCount
+  const continuationFailure = process.env.FRESHELL_SIDECAR_TEST_CONTINUATION_FAILURE
+  if (queryNumber > 1 && continuationFailure === 'query-setup') throw new Error('owned replacement query setup failed')
+  process.stdout.write(JSON.stringify({ type: 'probe.native-options', queryNumber,
+    model: options.model, effort: options.effort, permissionMode: options.permissionMode, resume: options.resume }) + '\n')
   if (process.env.FRESHELL_SIDECAR_TEST_PREINIT_PERMISSION === '1') {
     void options.canUseTool('Bash', { command: 'owned-preinit-effect' }, {}).then((decision) =>
       process.stdout.write(JSON.stringify({ type: 'probe.preinit-permission', decision }) + '\n'))
@@ -16,12 +23,19 @@ export function query({ prompt, options }) {
   const checkpointScenario = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT === '1'
   const child = checkpointScenario && process.env.FRESHELL_SIDECAR_TEST_NATIVE_EXIT_DELAY === '1'
     ? options.spawnClaudeCodeProcess({ command: process.execPath,
-      args: ['-e', "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.exit(0),150))"], env: options.env }) : undefined
+      args: ['-e', `process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.exit(0),${continuationFailure === 'close-timeout' ? 6500 : 150}))`], env: options.env }) : undefined
   if (child) {
     if (nativeChildren.size) process.stdout.write(JSON.stringify({ type: 'probe.native-overlap' }) + '\n')
     nativeChildren.add(child.pid)
     process.stdout.write(JSON.stringify({ type: 'probe.native-child', pid: child.pid }) + '\n')
-    child.once('close', () => nativeChildren.delete(child.pid))
+    child.once('close', () => {
+      nativeChildren.delete(child.pid)
+      // A managed Rust shutdown intentionally closes its stdout consumer.
+      // Keep late fixture observations on owned disk instead of writing into
+      // that retired pipe and turning a successful shutdown into EPIPE.
+      appendFileSync(join(options.cwd, 'native-closed.jsonl'), JSON.stringify({ pid: child.pid }) + '\n')
+    })
+    options.abortController.signal.addEventListener('abort', () => child.stdin.end(), { once: true })
   }
   const transcriptPath = options.sessionId ? join(options.cwd, nativeRoot + '.jsonl')
     : checkpointScenario ? join(options.cwd, 'native.jsonl') : '/owned/native.jsonl'
@@ -29,7 +43,9 @@ export function query({ prompt, options }) {
     const command = options.settings?.hooks?.SessionStart?.[0]?.hooks?.[0]?.command
     const child = exec(command, { env: options.env }, (error) => {
       if (error) reject(error)
-      else setTimeout(() => options.model === 'restore-failure' ? reject(new Error('native restoration failed')) : resolve({}), 100)
+      else setTimeout(() => queryNumber > 1 && continuationFailure === 'native-startup'
+        ? reject(new Error('owned replacement native startup failed'))
+        : options.model === 'restore-failure' ? reject(new Error('native restoration failed')) : resolve({}), 100)
     })
     child.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart', session_id: nativeRoot,
       source: options.forkSession && options.model !== 'fork-without-native-ack' ? 'fork' : options.resume ? 'resume' : 'startup',
@@ -38,8 +54,26 @@ export function query({ prompt, options }) {
   if (!checkpointScenario) void (async () => { for await (const message of prompt) process.stdout.write(JSON.stringify({ type: 'probe.native-input', text: message.message.content }) + '\n') })()
   return {
     initializationResult: () => loaded,
+    async setModel(model) {
+      if (process.env.FRESHELL_SIDECAR_TEST_CONFIGURE_DELAY === '1') await new Promise(resolve => setTimeout(resolve, 50))
+      options.model = model
+    },
+    async applyFlagSettings({ effortLevel }) {
+      if (process.env.FRESHELL_SIDECAR_TEST_EFFORT_FAILURE === '1') throw new Error('owned effort setting failed')
+      options.effort = effortLevel ?? undefined
+    },
+    async setPermissionMode(permissionMode) { options.permissionMode = permissionMode },
     async *[Symbol.asyncIterator]() {
       if (!checkpointScenario) { await new Promise((resolve) => options.abortController.signal.addEventListener('abort', resolve, { once: true })); return }
+      if (queryNumber > 1 && continuationFailure === 'native-startup') {
+        // initializationResult and the output iterator are separate SDK
+        // channels: startup may reject while the iterator only ends on abort.
+        await loaded.catch(() => {})
+        if (!options.abortController.signal.aborted) {
+          await new Promise(resolve => options.abortController.signal.addEventListener('abort', resolve, { once: true }))
+        }
+        return
+      }
       await loaded
       const eager = process.env.FRESHELL_SIDECAR_TEST_CHECKPOINT_EAGER_RESUME === '1'
       async function* inputs() {
@@ -110,6 +144,9 @@ export function query({ prompt, options }) {
         }
       }
     },
-    close() { child?.stdin.end(); options.abortController.abort() },
+    close() {
+      if (queryNumber === 1 && continuationFailure === 'close-error') throw new Error('owned original query close failed')
+      child?.stdin.end(); options.abortController.abort()
+    },
   }
 }

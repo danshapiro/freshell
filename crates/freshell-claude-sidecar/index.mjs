@@ -77,8 +77,8 @@
 // (AskUserQuestion still routes to the question path first, per legacy ordering).
 
 import { createInterface } from 'node:readline'
-import { createHash, randomBytes } from 'node:crypto'
-import { isAbsolute, join, resolve } from 'node:path'
+import { randomBytes } from 'node:crypto'
+import { isAbsolute, join } from 'node:path'
 import { nativeProfileDigest } from './native-profile-digest.mjs'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
@@ -248,6 +248,10 @@ function createInputStream(onHandoff) {
 
 /** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>, turnCompleteGate?:{noteInterruptRequest:Function,noteInterruptSettled:Function,resultEmitsAttention:Function}, pendingResults?:number}>} */
 const sessions = new Map()
+// A failed session can leave the map before its native writer finishes closing.
+// Keep shutdown ownership until the actual child close event, independent of
+// query/session ownership.
+const nativeChildClosures = new Set()
 
 function normalizeCommands(rows, strict = false) {
   if (!Array.isArray(rows)) return undefined
@@ -470,45 +474,41 @@ async function consumeStream(sessionId, sdkQuery) {
     streamFailed = true
     if (st?.query === sdkQuery) emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
   } finally {
-    if (st?.query !== sdkQuery) {
+    if (st?.query !== sdkQuery || sessions.get(sessionId) !== st) {
       abort?.abort()
       await nativeChannel?.cleanup()
-      return
+    } else {
+      const failedContinuation = st.nativeCheckpointTransition === true
+      const closeReason = failedContinuation ? 'stream_error' : abort?.signal.aborted ? 'aborted' : streamFailed ? 'stream_error' : 'stream_end'
+      await closeSession(sessionId, st, closeReason, failedContinuation)
     }
-    const closeReason = abort?.signal.aborted ? 'aborted' : streamFailed ? 'stream_error' : 'stream_end'
-    // Stream ended (natural end, error, or abort). The transport is closing:
-    // clear any parked cards WITHOUT resolving their promises (LB-04: a late
-    // resolve lands inside the SDK's floating promise chain → unhandled
-    // rejection → crash under Node 22 throw-mode).
-    if (st) {
-      cancelPending(st, emit, sessionId, { resolveDeny: false })
-    }
-    // A turn that ends with NO result frame — stream exception OR natural
-    // EOF with a result still pending — IS a turn end the user didn't
-    // witness: ring the unified edge (the abort/sdk.exit path is a
-    // REQUESTED teardown and deliberately stays silent). pendingResults
-    // covers the accept→first-message window turnOpen cannot see, and
-    // counts queued sends a boolean would lose. The gate consult is LAST in
-    // the guard so a no-mint path never consumes an interrupt mark.
-    if (st && st.pendingResults > 0 && !st.abort.signal.aborted && st.turnCompleteGate.resultEmitsAttention()) {
-      const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
-      st.lastTurnCompleteAt = at
-      emit({ type: 'sdk.turn.complete', sessionId, at, outcome: 'failed' })
-    }
-    // Mirror SdkBridge: an aborted session surfaces sdk.exit; a natural end
-    // surfaces an idle status. NEITHER is a completion chime, so a mid-turn
-    // death cannot fake a turn.complete.
-    if (st?.abort.signal.aborted) emit({ type: 'sdk.exit', sessionId })
-    else emit({ type: 'sdk.status', sessionId, status: 'idle' })
-    sessions.delete(sessionId)
-    // Idle describes the last turn, not a usable native query. The Node bridge
-    // stays open after native EOF/death; the host needs this separate lifecycle
-    // edge to stop advertising a session that can no longer accept input.
-    emit({ type: 'sdk.session.closed', sessionId, nativeSessionId: st?.cliSessionId, queryGeneration: st?.queryGeneration,
-      reason: closeReason })
-    st?.abort.abort()
-    await st?.nativeChannel?.cleanup()
   }
+}
+
+async function closeSession(sessionId, st, closeReason, failedContinuation = false) {
+  if (!st || sessions.get(sessionId) !== st) return
+  sessions.delete(sessionId)
+  st.nativeReady = false
+  // The transport is closing: clear parked cards without resolving callbacks
+  // into an SDK that may already have closed its control channel (LB-04).
+  cancelPending(st, emit, sessionId, { resolveDeny: false })
+  // Native continuation deliberately aborts its previous query. Its failure
+  // still ends the accepted turn, even when startup also aborted a replacement.
+  // A requested teardown stays silent. Consult the gate last so a path without
+  // a pending turn never consumes an interrupt mark.
+  if (st.pendingResults > 0 && (failedContinuation || !st.abort.signal.aborted) && st.turnCompleteGate.resultEmitsAttention()) {
+    const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+    st.lastTurnCompleteAt = at
+    emit({ type: 'sdk.turn.complete', sessionId, at, outcome: 'failed' })
+  }
+  if (st.abort.signal.aborted && !failedContinuation) emit({ type: 'sdk.exit', sessionId })
+  else emit({ type: 'sdk.status', sessionId, status: 'idle' })
+  // Idle describes the last turn, not a usable native query. The host needs
+  // this lifecycle edge while the Node bridge itself stays open.
+  emit({ type: 'sdk.session.closed', sessionId, nativeSessionId: st.cliSessionId, queryGeneration: st.queryGeneration,
+    reason: closeReason })
+  st.abort.abort()
+  await st.nativeChannel?.cleanup()
 }
 
 // ── request handlers ─────────────────────────────────────────────────────────
@@ -600,7 +600,10 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
               acceptanceAmbiguous: !!error, message: error?.message ?? frame.response.error })
           },
         })
-        state.nativeChildClosed = new Promise((resolve) => child.once('close', resolve))
+        const closed = new Promise((resolve) => child.once('close', resolve))
+        state.nativeChildClosed = closed
+        nativeChildClosures.add(closed)
+        closed.then(() => nativeChildClosures.delete(closed))
         return child
       } : undefined,
       settingSources: ['user', 'project', 'local'],
@@ -672,7 +675,8 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
           launch, digest: observation.evidenceDigest, source: observation.native.source, queryGeneration: generation,
         } })
     }).catch((error) => {
-      if (state.queryGeneration !== generation) return
+      if (state.queryGeneration !== generation || sessions.get(sessionId) !== state) return
+      logerr(`native startup failed: ${error.message}`)
       emit({ type: 'sdk.error', sessionId, message: `native startup: ${error.message}` })
       abort.abort()
     })
@@ -685,24 +689,39 @@ async function continueNativeCheckpoint(sessionId, state, record) {
   const previousNativeClosed = state.nativeChildClosed
   state.query = undefined
   state.nativeContinuation = record
+  state.nativeCheckpointTransition = true
   state.nativeReady = false
   emit({ type: 'sdk.session.loading', sessionId,
     nativeBinding: { launch: state.launch, queryGeneration: state.queryGeneration + 1 } })
   state.abort = new AbortController()
-  previousQuery.close?.()
-  previousAbort.abort()
-  if (previousNativeClosed) {
-    let timeout
-    try {
-      await Promise.race([previousNativeClosed, new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('original native writer did not close')), 5_000)
-      })])
-    } finally { clearTimeout(timeout) }
+  try {
+    previousQuery.close?.()
+    previousAbort.abort()
+    if (previousNativeClosed) {
+      let timeout
+      try {
+        await Promise.race([previousNativeClosed, new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('original native writer did not close')), 5_000)
+        })])
+      } finally { clearTimeout(timeout) }
+    }
+    if (sessions.get(sessionId) !== state || state.abort.signal.aborted) throw new Error('native continuation cancelled before exact resume')
+    await openSessionQuery(sessionId, state, { ...state.createRequest, resumeSessionId: record.nativeSessionId }, state.launch, false)
+    await state.nativeReadyPromise
+    await deliverNativeContinuation(sessionId, state, record)
+  } catch (error) {
+    // The previous stream no longer owns state.query, and a replacement might
+    // not exist yet. This transition owns failure until continuation is live.
+    if (sessions.get(sessionId) === state) {
+      logerr(`native continuation failed: ${error?.message || error}`)
+      emit({ type: 'sdk.error', sessionId, message: `native continuation: ${error?.message || error}` })
+      await closeSession(sessionId, state, 'stream_error', true)
+    }
+    throw error
+  } finally {
+    previousAbort.abort()
+    state.nativeCheckpointTransition = false
   }
-  if (sessions.get(sessionId) !== state || state.abort.signal.aborted) throw new Error('native continuation cancelled before exact resume')
-  await openSessionQuery(sessionId, state, { ...state.createRequest, resumeSessionId: record.nativeSessionId }, state.launch, false)
-  await state.nativeReadyPromise
-  await deliverNativeContinuation(sessionId, state, record)
 }
 
 async function deliverNativeContinuation(sessionId, state, record) {
@@ -780,10 +799,9 @@ async function handleCreate(req) {
       turnCompleteGate: createTurnCompleteGate(),
       pendingResults: 0,
     }
-    // Liveness IS session-map membership: consumeStream's finally removes the
-    // session synchronously after cancelPending (LB-04 — a parked canUseTool
-    // promise must never be resolved after transport close), and stdin line
-    // events (macrotasks) cannot interleave inside that finally.
+    // Liveness is session-map membership: closeSession removes the session
+    // synchronously with its lifecycle/card cancellation frames. It never
+    // resolves a parked callback into an already closed SDK (LB-04).
     sessions.set(sessionId, state)
 
     let launch = process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH
@@ -878,10 +896,30 @@ async function handleConfigure(req) {
     return
   }
   try {
-    const settings = await configureSession(st, req.settings ?? {}, {
-      busy: req.busy === true || st.turnOpen || st.handedCompactLikely,
-    })
-    emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings })
+    const previousSettings = { ...st.settings }
+    const busy = req.busy === true || st.turnOpen || st.handedCompactLikely || st.pendingResults > 0
+      || (st.nativeChannel && !st.nativeReady) || (st.nativeStore && await st.nativeStore.inputState() !== 'clear')
+    const configuration = await configureSession(st, req.settings ?? {}, { busy }).then(
+      settings => ({ settings }), error => ({ error }),
+    )
+    // SDK configuration can partially succeed before a later setting fails.
+    // Bind future checkpoints and exact resumes to the actual applied state
+    // in either case; pending operations were refused before any SDK call.
+    if (st.nativeStore && Object.keys(st.settings).some(key => st.settings[key] !== previousSettings[key])) {
+      try {
+        const resumeRequest = { ...st.createRequest, ...st.settings }
+        const digest = await nativeProfileDigest(resumeRequest, st.settings)
+        await st.nativeStore.setProfileDigest(digest)
+        st.nativeProfileDigest = digest
+        st.createRequest = resumeRequest
+      } catch (error) {
+        emit({ type: 'sdk.error', sessionId: req.sessionId, message: `native settings: ${error.message}` })
+        await closeSession(req.sessionId, st, 'stream_error')
+        throw error
+      }
+    }
+    if ('error' in configuration) throw configuration.error
+    emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings: configuration.settings })
   } catch (err) {
     logerr(`session settings failed: ${err?.message || err}`)
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, settings: { ...st.settings }, message: String(err?.message || err) })
@@ -974,8 +1012,8 @@ let pendingShutdown
 function shutdownAndExit(awaitNativeShutdown = false) {
   if (pendingShutdown) return
   if (!awaitNativeShutdown) { shutdown(); process.exit(0) }
-  const closures = [...sessions.values()].map(state => state.nativeChannel && !state.nativeChildClosed
-    ? Promise.reject(new Error('native writer closure is unavailable')) : state.nativeChildClosed)
+  const closures = [...nativeChildClosures, ...[...sessions.values()].map(state => state.nativeChannel && !state.nativeChildClosed
+    ? Promise.reject(new Error('native writer closure is unavailable')) : state.nativeChildClosed)]
   shutdown()
   pendingShutdown = (async () => {
     let timer
@@ -1006,7 +1044,10 @@ rl.on('line', (line) => {
     }
     case 'configure': {
       const st = sessions.get(req.sessionId)
-      if (st) st.configureChain = (st.configureChain ?? Promise.resolve()).then(() => handleConfigure(req))
+      // Managed sends and settings share admission ordering, including the
+      // asynchronous profile/store checks before either operation takes effect.
+      if (st?.nativeChannel) st.inputChain = (st.inputChain ?? Promise.resolve()).then(() => handleConfigure(req))
+      else if (st) st.configureChain = (st.configureChain ?? Promise.resolve()).then(() => handleConfigure(req))
       else void handleConfigure(req)
       break
     }
