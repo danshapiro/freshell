@@ -246,10 +246,7 @@ P3C_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" --runtime-suite '
     echo "default-route-visible"
     exit 1
   fi
-  if touch /runtime-suite-root-write-probe 2>/dev/null; then
-    echo "root-writable"
-    exit 1
-  fi
+  bash scripts/test/assert-sandbox-readonly-root.sh
   cap_eff=$(awk "/^CapEff:/ {print \$2}" /proc/self/status)
   [ "$cap_eff" = "0000000000000000" ] || { echo "effective-capabilities:$cap_eff"; exit 1; }
   echo "runtime-suite-isolated"
