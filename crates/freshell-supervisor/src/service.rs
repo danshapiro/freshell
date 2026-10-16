@@ -8379,32 +8379,131 @@ mod interrupted_transaction_tests {
         assert_eq!(writers, 0);
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum DueRecoverySilenceCase {
+        Reserved,
+        OpenCodePreflight,
+        ForegroundStop,
+    }
+
+    async fn run_due_recovery_docker_silence(case: DueRecoverySilenceCase) {
+        let test_name = match case {
+            DueRecoverySilenceCase::Reserved => "service::interrupted_transaction_tests::due_recovery_docker_silence_settles_retry_and_releases_stop",
+            DueRecoverySilenceCase::OpenCodePreflight => "service::interrupted_transaction_tests::due_recovery_docker_silence_settles_retry_after_opencode_preflight",
+            DueRecoverySilenceCase::ForegroundStop => "service::interrupted_transaction_tests::due_recovery_docker_silence_does_not_block_foreground_stop",
+        };
+        // Match the ordinary Stop fixture's existing process boundary: a
+        // foreign registry's synchronous logging cannot spend this case's
+        // real Docker deadlines. All actors for one case remain together.
+        if run_docker_stop_test_child("FRESHELL_RECOVERY_SILENCE_TEST_CHILD", test_name).await {
+            return;
+        }
+        match case {
+            DueRecoverySilenceCase::Reserved => due_recovery_silence_settlement(false).await,
+            DueRecoverySilenceCase::OpenCodePreflight => {
+                due_recovery_silence_settlement(true).await
+            }
+            DueRecoverySilenceCase::ForegroundStop => complete_due_recovery_foreground_stop().await,
+        }
+    }
+
     #[tokio::test]
     async fn due_recovery_docker_silence_settles_retry_and_releases_stop() {
-        due_recovery_silence_settlement(false).await;
+        run_due_recovery_docker_silence(DueRecoverySilenceCase::Reserved).await;
     }
 
     #[tokio::test]
     async fn due_recovery_docker_silence_settles_retry_after_opencode_preflight() {
-        due_recovery_silence_settlement(true).await;
+        run_due_recovery_docker_silence(DueRecoverySilenceCase::OpenCodePreflight).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn due_recovery_docker_silence_is_independent_of_foreign_registry_logging() {
+        // Isolate the deliberate foreign lock holder from the broad test process.
+        if run_docker_stop_test_child(
+            "FRESHELL_RECOVERY_SILENCE_COORDINATOR_TEST_CHILD",
+            "service::interrupted_transaction_tests::due_recovery_docker_silence_is_independent_of_foreign_registry_logging",
+        ).await {
+            return;
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_registry = Registry::open(foreign.path().join("registry"), None).unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _registry = foreign_registry;
+            let _coordinator = crate::loss_report::incident_file_coordinator();
+            held_tx.send(()).unwrap();
+            matches!(
+                release_rx.recv_timeout(Duration::from_secs(180)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )
+        });
+        held_rx.await.unwrap();
+        let mut release = Some(release_tx);
+        for case in [
+            DueRecoverySilenceCase::Reserved,
+            DueRecoverySilenceCase::OpenCodePreflight,
+            DueRecoverySilenceCase::ForegroundStop,
+        ] {
+            let mut running = tokio::spawn(run_due_recovery_docker_silence(case));
+            // Each case retains its original 25/5/20-second behavior deadlines.
+            // This only bounds the regression's deliberate foreign-lock hold.
+            let result = tokio::time::timeout(Duration::from_secs(35), &mut running).await;
+            let (completed_while_held, joined) = match result {
+                Ok(joined) => (true, joined),
+                Err(_) => {
+                    drop(release.take());
+                    (false, running.await)
+                }
+            };
+            if !completed_while_held || joined.is_err() {
+                drop(release.take());
+                let held_until_release = holder.join().unwrap();
+                panic!("{case:?} foreign logging interference: completedWhileHeld={completed_while_held}, heldUntilRelease={held_until_release}, result={joined:?}");
+            }
+        }
+        drop(release);
+        assert!(
+            holder.join().unwrap(),
+            "foreign lock must remain held through all three cases"
+        );
     }
 
     async fn due_recovery_silence_settlement(preflight: bool) {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, fixture, soul) = silent_due_recovery(dir.path(), preflight).await;
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
         let mut observing = {
             let supervisor = supervisor.clone();
             tokio::spawn(async move { supervisor.observe_once().await })
         };
-        wait_for_silent_recovery_request(&fixture).await;
+        if wait_for_silent_recovery_requests(&fixture, 1)
+            .await
+            .is_err()
+        {
+            observing.abort();
+            let _ = observing.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("recovery must reach the real Docker socket: {diagnostic}");
+        }
         let observed = tokio::time::timeout(Duration::from_secs(25), &mut observing).await;
         if observed.is_err() {
             observing.abort();
+            let _ = observing.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("silent Docker must settle the observer: {diagnostic}");
         }
         observed
             .expect("silent Docker must release the observer through typed settlement")
             .unwrap()
             .unwrap();
+        assert!(
+            lifecycle.try_lock().is_ok(),
+            "completed recovery must release the lifecycle lock"
+        );
         let retry = supervisor
             .registry
             .recovery_retry(soul.clone(), 1)
@@ -8469,28 +8568,69 @@ mod interrupted_transaction_tests {
             requests,
             "backoff must keep the next observer pass from repeating Docker work"
         );
-        let (outcome, view) = tokio::time::timeout(
-            Duration::from_secs(5),
-            supervisor.stop(soul.clone(), Some(1)),
-        )
-        .await
-        .expect("Stop can acquire the released lifecycle lock")
-        .unwrap();
+        let inspection_count = if preflight { 2 } else { 1 };
+        let mut stopping = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.stop(soul, Some(1)).await })
+        };
+        // As in the ordinary Stop socket case, start the dependency budget
+        // when the peer accepts this Stop's inspection, after intent setup.
+        if wait_for_silent_recovery_requests(&fixture, inspection_count + 1)
+            .await
+            .is_err()
+        {
+            stopping.abort();
+            let _ = stopping.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("Stop must reach its own Docker inspection: {diagnostic}");
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(5), &mut stopping).await;
+        if stopped.is_err() {
+            stopping.abort();
+            let _ = stopping.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("Stop dependency must settle within its original budget: {diagnostic}");
+        }
+        let (outcome, view) = stopped.unwrap().unwrap().unwrap();
         assert_eq!(outcome, StopOutcome::BackendUnavailable);
         assert_ne!(view.cleanup_state, CleanupState::VerifiedEmpty);
-        finish_silent_recovery_stop(&supervisor, &fixture, &soul).await;
-        fixture.close().await;
+        assert!(lifecycle.try_lock().is_ok());
+        finish_silent_recovery_stop(
+            &supervisor,
+            fixture,
+            &soul,
+            &lifecycle,
+            inspection_count + 1,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn due_recovery_docker_silence_does_not_block_foreground_stop() {
+        run_due_recovery_docker_silence(DueRecoverySilenceCase::ForegroundStop).await;
+    }
+
+    async fn complete_due_recovery_foreground_stop() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, fixture, soul) = silent_due_recovery(dir.path(), false).await;
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
         let mut observing = {
             let supervisor = supervisor.clone();
             tokio::spawn(async move { supervisor.observe_once().await })
         };
-        wait_for_silent_recovery_request(&fixture).await;
+        if wait_for_silent_recovery_requests(&fixture, 1)
+            .await
+            .is_err()
+        {
+            observing.abort();
+            let _ = observing.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("recovery must reach the real Docker socket: {diagnostic}");
+        }
         let mut stopping = {
             let supervisor = supervisor.clone();
             let soul = soul.clone();
@@ -8510,7 +8650,6 @@ mod interrupted_transaction_tests {
         })
         .await
         .unwrap();
-        let lifecycle = supervisor.lifecycle_lock(&soul).await;
         assert!(
             lifecycle.try_lock().is_err(),
             "recovery owns the lock while Docker is silent"
@@ -8525,6 +8664,11 @@ mod interrupted_transaction_tests {
         if completed.is_err() {
             observing.abort();
             stopping.abort();
+            let _ = observing.await;
+            let _ = stopping.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("Docker silence cannot retain recovery's lock: {diagnostic}");
         }
         let (observed, stopped) =
             completed.expect("Docker silence cannot retain recovery's lock indefinitely");
@@ -8548,8 +8692,7 @@ mod interrupted_transaction_tests {
             )
             .unwrap();
         assert_eq!(verdict, "cancelled");
-        finish_silent_recovery_stop(&supervisor, &fixture, &soul).await;
-        fixture.close().await;
+        finish_silent_recovery_stop(&supervisor, fixture, &soul, &lifecycle, 2).await;
     }
 
     async fn silent_due_recovery(
@@ -8618,28 +8761,63 @@ mod interrupted_transaction_tests {
         (supervisor, fixture, soul)
     }
 
-    async fn wait_for_silent_recovery_request(fixture: &crate::backend::tests::StopDockerFixture) {
+    async fn wait_for_silent_recovery_requests(
+        fixture: &crate::backend::tests::StopDockerFixture,
+        count: usize,
+    ) -> Result<(), tokio::time::error::Elapsed> {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !fixture
+            while fixture
                 .state
                 .lock()
                 .unwrap()
                 .requests
                 .iter()
-                .any(|request| request.contains("/json "))
+                .filter(|request| request.contains("/json "))
+                .count()
+                < count
             {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("recovery must reach the real Docker socket");
+    }
+
+    async fn wait_for_silent_recovery_disconnects(
+        fixture: &crate::backend::tests::StopDockerFixture,
+        count: usize,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.state.lock().unwrap().disconnected < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    fn silent_recovery_diagnostic(
+        fixture: &crate::backend::tests::StopDockerFixture,
+        lifecycle: &Arc<Mutex<()>>,
+    ) -> serde_json::Value {
+        let state = fixture.state.lock().unwrap();
+        serde_json::json!({
+            "severity":"debug", "event":"test.due_recovery_silence.transport",
+            "acceptedInspections":state.requests.iter().filter(|request| request.contains("/json ")).count(),
+            "silentEofCount":state.disconnected,
+            "firstInspectionElapsedMs":state.first_inspection_at.map(|at| at.elapsed().as_millis()),
+            "firstSilentEofElapsedMs":state.first_silent_eof_at.zip(state.first_inspection_at).map(|(eof, accepted)| eof.duration_since(accepted).as_millis()),
+            "lifecycleLockHeld":lifecycle.try_lock().is_err(),
+        })
     }
 
     async fn finish_silent_recovery_stop(
         supervisor: &Supervisor,
-        fixture: &crate::backend::tests::StopDockerFixture,
+        fixture: crate::backend::tests::StopDockerFixture,
         soul: &SoulId,
+        lifecycle: &Arc<Mutex<()>>,
+        inspections: usize,
     ) {
+        let disconnected = wait_for_silent_recovery_disconnects(&fixture, inspections).await;
+        let diagnostic = silent_recovery_diagnostic(&fixture, lifecycle);
         assert_eq!(
             supervisor
                 .registry
@@ -8683,6 +8861,12 @@ mod interrupted_transaction_tests {
             .requests
             .iter()
             .any(|request| request.contains("/start ") || request.contains("/create")));
+        fixture.close().await;
+        assert!(
+            disconnected.is_ok(),
+            "all silent transports must close: {diagnostic}"
+        );
+        eprintln!("{diagnostic}");
     }
 
     #[tokio::test]
@@ -8722,6 +8906,12 @@ mod interrupted_transaction_tests {
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "exact Docker case must execute one test: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         true
