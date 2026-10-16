@@ -18,6 +18,12 @@ const TASK007_INPUT_ENV: &str = "FRESHELL_TASK007_STOPPED_FIXTURE_INPUT_FILE";
 const TASK007_OUTPUT_ENV: &str = "FRESHELL_TASK007_STOPPED_FIXTURE_OUTPUT_DIR";
 const TASK007_ROOT_ORDINALS: [usize; 9] = [0, 1, 2, 3, 4, 5, 6, 0, 1];
 
+// Historical stopped-repair setup repeatedly fsyncs complete registry
+// lifecycles. Serialize those setup phases. The owned baseline child reserves
+// the parent slot before its unchanged watchdog starts; its fresh process has
+// an independent slot. Actor races inside each prepared fixture stay concurrent.
+static STOPPED_REPAIR_FIXTURE_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Task007FixtureInput {
@@ -4262,6 +4268,7 @@ async fn stopped_legacy_fixture_target(
     root: &std::path::Path,
     native_root: &str,
 ) -> freshell_runtime_protocol::LostSoulRepairTarget {
+    let _setup = STOPPED_REPAIR_FIXTURE_SETUP.lock().await;
     let context = prepared_context_in_registry(registry, root).await;
     let conn = Connection::open(registry.database_path()).unwrap();
     conn.execute(
@@ -4620,6 +4627,7 @@ enum Task007OwnedCase {
 #[cfg(unix)]
 async fn run_task007_owned_case_child(case: Task007OwnedCase) -> bool {
     use std::os::unix::fs::OpenOptionsExt;
+    let needs_fixture_slot = matches!(&case, Task007OwnedCase::BaselineRetry);
     let (flag, name) = match case {
         Task007OwnedCase::BaselineRetry => (
             "FRESHELL_TASK007_BASELINE_RETRY_CHILD",
@@ -4633,6 +4641,20 @@ async fn run_task007_owned_case_child(case: Task007OwnedCase) -> bool {
     if std::env::var(flag).ok().as_deref() == Some("1") {
         return false;
     }
+    let _setup = if needs_fixture_slot {
+        let queued = std::time::Instant::now();
+        let guard = STOPPED_REPAIR_FIXTURE_SETUP.lock().await;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "severity":"debug", "event":"task007.owned_case_child.fixture_slot_acquired",
+                "case":name, "queueWaitMs":queued.elapsed().as_millis(),
+            })
+        );
+        Some(guard)
+    } else {
+        None
+    };
     let home = tempfile::tempdir().unwrap();
     let stdout_path = home.path().join("stdout.log");
     let stderr_path = home.path().join("stderr.log");
@@ -4708,7 +4730,7 @@ async fn run_task007_owned_case_child(case: Task007OwnedCase) -> bool {
     eprintln!(
         "{}",
         serde_json::json!({"severity":"debug", "event":"task007.owned_case_child.completed",
-        "case":name, "pid":child.id(), "selected":1, "executed":1, "passed":1, "exitCode":status.code()})
+        "case":name, "pid":child.id(), "selected":1, "executed":1, "passed":1, "exitCode":status.code(), "elapsedMs":started.elapsed().as_millis()})
     );
     true
 }
@@ -4756,6 +4778,17 @@ enum StoppedRepairBaselineCase {
     StopCancellation,
 }
 
+fn stopped_repair_fixture_phase(root: &std::path::Path, phase: &str, ordinal: Option<usize>) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "severity":"debug", "event":"task007.baseline_fixture.phase",
+            "pid":std::process::id(), "atMs":crate::registry::now_millis(),
+            "fixtureRoot":root, "phase":phase, "ordinal":ordinal,
+        })
+    );
+}
+
 // Setup and unused scenarios must return before polling ordinary recovery.
 // Keeping all four cases in one async body also keeps their debug poll
 // temporaries on the active stack, even when the outer future is boxed.
@@ -4777,11 +4810,15 @@ struct StoppedRepairBaselineFixture {
 
 async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
     let mut fixture = Box::pin(prepare_stopped_repair_baseline()).await;
+    stopped_repair_fixture_phase(fixture.dir.path(), "setup.complete", None);
     Box::pin(import_stopped_repair_baseline(&mut fixture)).await;
+    stopped_repair_fixture_phase(fixture.dir.path(), "imports.complete", None);
     if matches!(case, StoppedRepairBaselineCase::PendingWithdrawal) {
         fixture = Box::pin(pending_stopped_repair_baseline(fixture)).await;
     }
+    stopped_repair_fixture_phase(fixture.dir.path(), "finalize.begin", None);
     Box::pin(finalize_stopped_repair_baseline(&fixture)).await;
+    stopped_repair_fixture_phase(fixture.dir.path(), "finalize.complete", None);
     let soul = fixture.targets[0].soul_id.clone();
     if matches!(case, StoppedRepairBaselineCase::CreatedPreflight) {
         crate::recovery::tests::assert_created_repaired_preflight(
@@ -4806,6 +4843,7 @@ async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
         Box::pin(retry_stopped_repair_baseline(&fixture)).await;
         None
     };
+    stopped_repair_fixture_phase(fixture.dir.path(), "reopen.begin", None);
     Box::pin(reopen_stopped_repair_baseline(fixture, cancelled)).await;
 }
 
@@ -4819,6 +4857,7 @@ async fn prepare_stopped_repair_baseline() -> StoppedRepairBaselineFixture {
     };
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
+    stopped_repair_fixture_phase(dir.path(), "setup.begin", None);
     let registry = Registry::open(dir.path(), None).unwrap();
     let workspace = dir.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
@@ -4860,6 +4899,7 @@ async fn prepare_stopped_repair_baseline() -> StoppedRepairBaselineFixture {
     #[cfg(not(unix))]
     let (provider_uid, provider_gid) = (0, 0);
     for index in 0..9 {
+        stopped_repair_fixture_phase(dir.path(), "target.begin", Some(index));
         let target = stopped_legacy_fixture_target(&registry, dir.path(), &names[index % 7]).await;
         let terminal = serde_json::json!({"terminalId":format!("terminal-{}",target.soul_id),"streamId":format!("stream-{}",target.soul_id),"mode":"opencode","program":"opencode","env":{"HOME":"/home/freshell/provider","XDG_DATA_HOME":"/home/freshell/provider/.local/share","XDG_CONFIG_HOME":"/home/freshell/provider/.config"},"runAsUid":provider_uid,"runAsGid":provider_gid,"cols":80,"rows":24,"projectKey":"test-project","workspacePath":workspace,"cwd":workspace});
         Connection::open(registry.database_path())
@@ -4870,8 +4910,10 @@ async fn prepare_stopped_repair_baseline() -> StoppedRepairBaselineFixture {
             )
             .unwrap();
         targets.push(target);
+        stopped_repair_fixture_phase(dir.path(), "target.complete", Some(index));
     }
     let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    stopped_repair_fixture_phase(dir.path(), "preflight.begin", None);
     let scope = supervisor
         .preflight_lost_souls_from_inventory(
             PreflightLostSoulsRequest {
@@ -4949,6 +4991,7 @@ async fn import_stopped_repair_baseline(fixture: &mut StoppedRepairBaselineFixtu
         ..
     } = fixture;
     for index in 0..7 {
+        stopped_repair_fixture_phase(dir.path(), "import.begin", Some(index));
         let receipt = import_stopped_fixture_root(
             registry,
             &targets[index],
@@ -4993,6 +5036,7 @@ async fn import_stopped_repair_baseline(fixture: &mut StoppedRepairBaselineFixtu
             .await
             .unwrap();
         receipts.push(receipt);
+        stopped_repair_fixture_phase(dir.path(), "import.complete", Some(index));
     }
 }
 
@@ -5380,11 +5424,13 @@ async fn retry_stopped_repair_baseline(fixture: &StoppedRepairBaselineFixture) {
         targets,
         receipts,
         names,
+        dir,
         ..
     } = fixture;
     let soul = targets[0].soul_id.clone();
     let baseline = receipts[0].adoption_baseline.clone();
-    for _ in 0..2 {
+    for ordinal in 0..2 {
+        stopped_repair_fixture_phase(dir.path(), "retry.begin", Some(ordinal));
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         let outcome = supervisor
             .recover(RecoverRequest {
@@ -5395,6 +5441,7 @@ async fn retry_stopped_repair_baseline(fixture: &StoppedRepairBaselineFixture) {
             })
             .await
             .unwrap();
+        stopped_repair_fixture_phase(dir.path(), "retry.settled", Some(ordinal));
         assert_eq!(outcome.outcome, RecoveryOutcome::Blocked);
         let blocked = registry.recovery_context(soul.clone()).await.unwrap();
         assert_eq!(blocked.recovery_state, RecoveryState::Blocked);
