@@ -238,6 +238,20 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    // SO_REUSEPORT allows same-UID listeners to share an ephemeral port. In
+    // parallel tests, a fixture bound to 127.0.0.1 can therefore overlap a
+    // controller temporarily bound to 0.0.0.0; Linux may route a probe to the
+    // other test's listener, which resets it. Keep the listener lifecycle
+    // tests in this process isolated from one another for the full socket
+    // lifetime. This affects test scheduling only, not production binding.
+    static LISTENER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_listener_tests() -> std::sync::MutexGuard<'static, ()> {
+        LISTENER_TEST_LOCK
+            .lock()
+            .expect("listener test lock is not poisoned")
+    }
+
     // Keep this listener until the controller's initial bind succeeds, then
     // drop it before sending traffic so only the controller accepts requests.
     fn reusable_loopback_listener() -> StdTcpListener {
@@ -257,6 +271,7 @@ mod tests {
 
     #[test]
     fn two_reuseport_binds_on_same_addr_both_succeed() {
+        let _listener_test_guard = lock_listener_tests();
         let a = reusable_loopback_listener();
         let addr = a.local_addr().expect("first listener address");
         let b = bind_reusable(addr, true).expect("second reuseport bind must also succeed");
@@ -265,6 +280,7 @@ mod tests {
 
     #[test]
     fn foreign_squatter_blocks_our_bind() {
+        let _listener_test_guard = lock_listener_tests();
         let squatter =
             std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("squatter binds");
         let addr = squatter.local_addr().expect("squatter address");
@@ -279,6 +295,7 @@ mod tests {
     #[tokio::test]
     async fn serve_on_proves_bind_before_swapping_and_serves_traffic() {
         use axum::{routing::get, Router};
+        let _listener_test_guard = lock_listener_tests();
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
@@ -322,6 +339,7 @@ mod tests {
         // reports/V1.md): with notify_waiters and no barrier, 42-99/100 of
         // these iterations fail. Do NOT weaken this test.
         use axum::{routing::get, Router};
+        let _listener_test_guard = lock_listener_tests();
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
@@ -360,6 +378,7 @@ mod tests {
         use std::io::Write;
         use tokio::io::AsyncReadExt;
 
+        let _listener_test_guard = lock_listener_tests();
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
@@ -415,6 +434,7 @@ mod tests {
         use tokio::sync::{mpsc, watch};
         use tokio::time::timeout;
 
+        let _listener_test_guard = lock_listener_tests();
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
