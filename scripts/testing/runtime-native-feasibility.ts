@@ -638,6 +638,7 @@ export async function dispatchNativeFeasibility(input: {
     input.selection.mode ?? input.selection.provider!, '--case', input.selection.case])
   const originals: NativeExperimentOriginal[] = []
   const failures: string[] = []
+  const causes: unknown[] = []
   const requiredAssertions = input.selection.case === 'native-turn' ? [
     'readable-completed-native-store-before-death', 'replacement-new-incarnation-same-native-root',
     'original-owned-volume-transcript-continuity', 'same-workspace-selected-native-profile',
@@ -660,15 +661,16 @@ export async function dispatchNativeFeasibility(input: {
           if (!original.nativeOriginals) throw new Error('native-turn original references missing')
           deriveNativeRecoveryOriginals({ evidenceDir: original.nativeOriginals.evidenceDir, originalReference: original.nativeOriginals.reference, candidateSha: input.candidateSha, runId: input.ownerId, runtimeImage: input.imageDigest, selected: [input.selection.mode ?? input.selection.provider!], requiredStages: ['initial', 'after_provider_process_crash'] })
         }
-      } catch {
+      } catch (error) {
         failures.push(caseId)
+        causes.push(error)
       }
     }
   } finally {
     await input.cleanup()
   }
   if (failures.length > 0 || originals.length !== nativeFeasibilityCases(input.selection).length) {
-    throw new Error(`native experiment cases failed: ${failures.join(',')}`)
+    throw new AggregateError(causes, `native experiment cases failed: ${failures.join(',')}`)
   }
   return originals
 }
@@ -704,6 +706,7 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
   }
   let paidPrerequisiteFailed = false
   const servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []
+  const failures: unknown[] = []
   try {
     const prepared = await harness.prepareNativeArtifacts({ candidateSha: manifest.candidateSha,
       imageDigest: manifest.imageDigest, supervisor: manifest.artifacts.supervisor, host: manifest.artifacts.host,
@@ -732,37 +735,56 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
             || (selection.provider === 'amplifier' && caseId === 'create') || amplifierSeed
             || (receiverMode && caseId === 'create') || receiverSeed) paidPrerequisiteFailed = true
           const reason = error instanceof Error ? error.message : 'unknown native case failure'
-          harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
-            event: 'runtime.native_feasibility.case_failed', caseId, reason })
+          try {
+            harness.writeArtifact(`native-case-${caseId}-failure.json`, { severity: 'error',
+              event: 'runtime.native_feasibility.case_failed', caseId, reason })
+          } catch (diagnosticError) {
+            throw new AggregateError([error, diagnosticError], 'native case and diagnostic capture failed')
+          }
           throw error
         }
       },
       cleanup: async () => {},
     })
     harness.writeArtifact('native-originals.json', originals)
+  } catch (error) {
+    failures.push(error)
   } finally {
-    const serverCleanupErrors: string[] = []
+    // Diagnostics and resource ownership are independent: a full evidence disk
+    // must never prevent any server or the enclosing harness from settling.
+    const attempt = async (operation: () => unknown | Promise<unknown>) => {
+      try { await operation() } catch (error) { failures.push(error) }
+    }
+    try {
     for (const owned of servers) {
-      harness.writeArtifact(`${owned.scope}-server-output-private.json`, owned.server.capturedOutput())
+      await attempt(() => harness.writeArtifact(`${owned.scope}-server-output-private.json`, owned.server.capturedOutput()))
       if (owned.pid === undefined) {
         try { owned.pid = owned.server.processEvidence().pid } catch { /* Failed startup may have already joined its child. */ }
       }
-      try { await owned.server.stop() } catch (error) { serverCleanupErrors.push(String(error)) }
-      const absent = owned.pid === undefined ? null : !fs.existsSync(`/proc/${owned.pid}`)
-      harness.writeArtifact(`${owned.scope}-server-cleanup.json`, { pid: owned.pid, absent })
-      if (absent === false) serverCleanupErrors.push('owned native server did not stop')
+      await attempt(() => owned.server.stop())
+      await attempt(() => {
+        const absent = owned.pid === undefined ? null : !fs.existsSync(`/proc/${owned.pid}`)
+        if (absent === false) failures.push(new Error('owned native server did not stop'))
+        harness.writeArtifact(`${owned.scope}-server-cleanup.json`, { pid: owned.pid, absent })
+      })
     }
-    const containers = new Set([...harness.transferOwnedIds().containers,
-      ...(harness.broker?.receipts() ?? []).map((receipt) => receipt.containerId)])
-    for (const containerId of containers) {
-      try { fs.writeFileSync(path.join(harness.evidenceDir, `native-container-${containerId}.log`),
-        await harness.containerLogs(containerId), { mode: 0o600 }) }
-      catch { /* Cleanup still joins when an already-owned enclosure exited. */ }
+    await attempt(async () => {
+      const containers = new Set([...harness.transferOwnedIds().containers,
+        ...(harness.broker?.receipts() ?? []).map((receipt) => receipt.containerId)])
+      for (const containerId of containers) {
+        await attempt(async () => fs.writeFileSync(path.join(harness.evidenceDir, `native-container-${containerId}.log`),
+          await harness.containerLogs(containerId), { mode: 0o600 }))
+      }
+    })
+    } finally {
+      await attempt(async () => {
+        const cleanup = await harness.cleanup()
+        if (!cleanup.ok) throw new Error(`native owned cleanup failed: ${cleanup.errors.join('; ')}`)
+      })
     }
-    const cleanup = await harness.cleanup()
-    if (!cleanup.ok) throw new Error(`native owned cleanup failed: ${cleanup.errors.join('; ')}`)
-    if (serverCleanupErrors.length) throw new Error(`native server cleanup failed: ${serverCleanupErrors.join('; ')}`)
   }
+  if (failures.length === 1) throw failures[0]
+  if (failures.length) throw new AggregateError(failures, 'native feasibility execution or cleanup failed')
 }
 
 export async function executeManagedNativeCase(harness: RuntimeHarness,
@@ -4120,8 +4142,10 @@ export async function executeManagedNativeApproval(input: {
     while (Date.now() < deadline) {
       const batch = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
         params: { soulId, afterSequence: cursor, maxEvents: 128 } })
-      batches.push(batch); cursor = batch.data.head
+      batches.push(batch)
       harness.writeArtifact(`${scenario}-approval-events-private.json`, batches)
+      if (batch.data.resetRequired) throw new Error(`native approval event retention reset (retained from ${batch.data.retainedFrom})`)
+      for (const row of batch.data.events) cursor = Math.max(cursor, row.sequence)
       const events = batch.data.events.map((row: any) => row.event)
       observed.push(...events)
       const found = events.find(select)
@@ -4129,6 +4153,7 @@ export async function executeManagedNativeApproval(input: {
       if (events.some((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.result')) {
         throw new Error(`native turn completed without required ${label}`)
       }
+      if (cursor < batch.data.head && batch.data.events.length) continue
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
     throw new Error(`bounded native ${label} deadline exceeded`)

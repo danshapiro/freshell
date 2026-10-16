@@ -118,7 +118,34 @@ function hashFile(file: string): string {
   return hash.digest('hex')
 }
 
-export const REAL_NATIVE_READER = String.raw`
+// These two functions also run in the owned reader child. Keep them independent
+// of module state so private diagnostics use the same credential filtering.
+export function redactNativeDiagnostic(text: string, secrets: readonly string[]): string {
+  for (const secret of secrets) {
+    if (!secret) continue
+    text = text.split(secret).join('[redacted]')
+    text = text.split(JSON.stringify(secret).slice(1, -1)).join('[redacted]')
+  }
+  return text.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [redacted]')
+    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\\?"?\s*[:=]\s*\\?"?)[^"'\\\s;,}]+/gi, '$1[redacted]')
+}
+
+export function nativeExecutionDetails(value: unknown): Record<string, unknown> {
+  const error = value as { name?: unknown; message?: unknown; stack?: unknown; code?: unknown; status?: unknown;
+    signal?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown; error?: unknown; errors?: unknown[] }
+  return { name: error?.name, message: error?.message ?? String(value), stack: error?.stack, code: error?.code,
+    status: error?.status, signal: error?.signal, killed: error?.killed,
+    stdout: error?.stdout == null ? undefined : String(error.stdout), stderr: error?.stderr == null ? undefined : String(error.stderr),
+    error: error?.error == null ? undefined : nativeExecutionDetails(error.error),
+    errors: Array.isArray(error?.errors) ? error.errors.map(nativeExecutionDetails) : undefined }
+}
+
+function nativeDiagnosticSecrets(extra: readonly string[] = []): string[] {
+  return [...extra, ...Object.entries(process.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|API_KEY|AUTHORIZATION/i.test(key))
+    .map(([, value]) => value ?? '')]
+}
+
+export const REAL_NATIVE_READER = `const redactNativeDiagnostic = ${redactNativeDiagnostic.toString()};\nconst nativeExecutionDetails = ${nativeExecutionDetails.toString()};\n` + String.raw`
 const fs=require('node:fs'),cp=require('node:child_process'),crypto=require('node:crypto'),{Readable}=require('node:stream'),{pipeline}=require('node:stream/promises');
 const [requestFile,resultFile]=process.argv.slice(1),input=JSON.parse(fs.readFileSync(requestFile,'utf8'));
 const descriptor=JSON.parse(fs.readFileSync(input.descriptorFile,'utf8')),manifest=JSON.parse(descriptor.manifestJson);
@@ -131,9 +158,10 @@ if(process.getuid()!==65534||process.getgid()!==0||!/^CapEff:\s+0+$/m.test(statu
 if(cp.execFileSync('opencode',['--version'],{encoding:'utf8',timeout:Math.min(30000,remaining()),killSignal:'SIGKILL'}).trim()!=='1.18.21')throw Error('native version differs');
 const log=fs.openSync('/scratch/native-private.log','wx',0o600),server=cp.spawn('opencode',['serve','--hostname','127.0.0.1','--port','4199'],{cwd:input.workspacePath,stdio:['ignore',log,log]});fs.closeSync(log);
 let serverError,serverClosed=false;const closed=new Promise(resolve=>{server.once('error',error=>{serverError=error});server.once('close',()=>{serverClosed=true;resolve()})});
+let validation;
 const settled=()=>serverClosed||server.exitCode!==null||server.signalCode!==null;
 const stopServer=async()=>{if(settled())return;let force,limit;try{server.kill('SIGTERM');force=setTimeout(()=>{if(!settled())server.kill('SIGKILL')},2000);await Promise.race([closed,new Promise((_,reject)=>{limit=setTimeout(()=>reject(Error('native child settlement unresolved')),4000)})])}finally{clearTimeout(force);clearTimeout(limit)}};
-(async()=>{let count=0,result;try{
+(async()=>{let count=0,result,operationError;try{
 for(let n=0;n<200;n++){if(serverError||settled())throw Error('native startup failed');try{if((await fetch('http://127.0.0.1:4199/global/health',{signal:AbortSignal.timeout(Math.min(500,remaining()))})).ok)break}catch{}if(n===199)throw Error('native startup failed');await new Promise(r=>setTimeout(r,100))}
 if(serverError||settled())throw Error('native startup child did not survive health read');
 const get=async(route,file)=>{const signal=AbortSignal.timeout(Math.min(120000,remaining()));const r=await fetch('http://127.0.0.1:4199'+route,{headers:{'x-opencode-directory':input.workspacePath},signal});if(!r.ok||!r.body)throw Error('typed native read failed');await pipeline(Readable.fromWeb(r.body),fs.createWriteStream(file,{mode:0o600,flags:'wx'}),{signal});return r.headers.get('x-next-cursor')};
@@ -153,7 +181,12 @@ for(const session of sessions){
  if(exported.error||exported.status!==0||exported.signal){fs.appendFileSync('/scratch/native-private.log',exported.stderr||Buffer.alloc(0));throw Error('native export failed')};artifacts.push({path:exportFile,sha256:sha(exportFile)});
  const validationFile='/scratch/native-'+session+'-validation.json';fs.writeFileSync(validationFile,JSON.stringify({descriptorFile:input.descriptorFile,databaseFile:input.destinationDatabase,rootSessionId:input.rootSessionId,sessionId:session,infoFile,pageFiles:pages,exportFile}),{mode:0o600,flag:'wx'});
  const checked=cp.spawnSync('/opt/transfer-stage',['--stage','native','--request-file',validationFile],{cwd:input.workspacePath,encoding:'utf8',timeout:remaining(),killSignal:'SIGKILL',maxBuffer:1024*1024});
- if(checked.error||checked.status!==0||checked.signal)throw Error('native exact artifact validation failed');
+ if(checked.error||checked.status!==0||checked.signal){
+  validation={sessionId:session,execution:nativeExecutionDetails(checked)};
+  try{validation.diagnostic=JSON.parse(fs.readFileSync('/scratch/native-'+session+'-validation-error.json','utf8'))}
+  catch(error){validation.diagnosticReadError=nativeExecutionDetails(error)}
+  throw Error('native exact artifact validation failed');
+ }
  // Preserve every original native page byte without holding a whole session.
  // One aggregate GET artifact avoids thousands of separate Docker captures.
  const readFile='/scratch/native-'+session+'-read.json',readFd=fs.openSync(readFile,'wx',0o600),buffer=Buffer.alloc(65536);
@@ -163,9 +196,13 @@ for(const session of sessions){
 }
 if(count!==sessions.length||count<1)throw Error('native read selection incomplete');
 result={rootSessionId:input.rootSessionId,graphDigest:descriptor.sourceGeneration,nativeVersion:'1.18.21',nativeReadableSessionCount:count,providerUid:process.getuid(),providerGid:process.getgid(),snapshotSummary:input.savedSnapshotSummary,artifacts};
-}finally{await stopServer()}
+}catch(error){operationError=error;throw error}finally{try{await stopServer()}catch(error){throw operationError?new AggregateError([operationError,error],'native operation and child settlement failed'):error}}
 fs.writeFileSync(resultFile,JSON.stringify(result),{mode:0o600,flag:'wx'});process.stdout.write(JSON.stringify(result));
-})().catch(()=>{process.stderr.write(JSON.stringify({severity:'error',event:'opencode.real_rehearsal.native_refused',reasonCode:'native_read_failed'})+'\n');process.exitCode=1});`
+})().catch(error=>{
+ const secrets=Object.entries(process.env).filter(([key])=>/TOKEN|PASSWORD|SECRET|API_KEY|AUTHORIZATION/i.test(key)).map(([,value])=>value||'');
+ try{fs.writeFileSync('/scratch/native-failure-private.json',redactNativeDiagnostic(JSON.stringify({error:nativeExecutionDetails(error),validation}),secrets),{mode:0o600,flag:'wx'})}
+ catch{process.stderr.write(JSON.stringify({severity:'error',event:'opencode.real_rehearsal.diagnostic_failed',reasonCode:'private_diagnostic_write_failed'})+'\n')}
+ process.stderr.write(JSON.stringify({severity:'error',event:'opencode.real_rehearsal.native_refused',reasonCode:'native_read_failed'})+'\n');process.exitCode=1});`
 
 // Full imported graphs remain subject to the existing 8GiB payload ceiling.
 // Native historical006 projections were <=49MB/session and <=17MB/message.
@@ -195,6 +232,32 @@ export async function readRehearsalPreflight(manifest: RehearsalManifest, token:
       return !current || !current.eligibleOwners.includes(root.canonicalSoulId) || (current.canonicalSoulId !== null && current.canonicalSoulId !== root.canonicalSoulId)
         || !member || member.providerStoreId !== root.destinationStoreId || member.target.expectedIntentRevision !== root.expectedIntentRevision
     })) throw new Error('current external preflight source/member/owner/store scope differs')
+}
+
+export async function readNativeRehearsal(harness: RuntimeHarness, containerId: string, directory: string,
+  context: { rootSessionId: string; candidateSha: string; imageDigest: string }, secrets: readonly string[] = []): Promise<string> {
+  try {
+    return harness.execTransferProviderExact(containerId, ['node', '-e', REAL_NATIVE_READER, '/scratch/native-request.json', '/scratch/native-result.json'])
+  } catch (error) {
+    const captureErrors: unknown[] = [], redactions = nativeDiagnosticSecrets(secrets)
+    // Capture each private source independently, before the caller removes the
+    // volume. A missing startup log must not hide a validator's own diagnostic.
+    for (const [source, name] of [['native-private.log', 'native-failure.log'], ['native-failure-private.json', 'native-failure-private.json']]) {
+      const destination = path.join(directory, name!)
+      try {
+        await harness.captureTransferFileExact(containerId, '/scratch/' + source, destination)
+        fs.chmodSync(destination, 0o600)
+        fs.writeFileSync(destination, redactNativeDiagnostic(fs.readFileSync(destination, 'utf8'), redactions))
+      } catch (captureError) { captureErrors.push(nativeExecutionDetails(captureError)) }
+    }
+    try {
+      fs.writeFileSync(path.join(directory, 'native-failure.json'), redactNativeDiagnostic(JSON.stringify({ severity: 'error',
+        event: 'opencode.real_rehearsal.native_failed', ...context, execution: nativeExecutionDetails(error), captureErrors }), redactions), { mode: 0o600, flag: 'wx' })
+    } catch (diagnosticError) {
+      throw new AggregateError([error, diagnosticError], 'native read and private diagnostic capture failed')
+    }
+    throw error
+  }
 }
 
 export async function runRealRootRehearsal(input: { manifestFile: string; scratchDir: string; repoRoot?: string }): Promise<RehearsalReceipt> {
@@ -272,16 +335,8 @@ export async function runRealRootRehearsal(input: { manifestFile: string; scratc
         || exported.evidence.rowCount !== readable.evidence.rowCount || exported.evidence.assetCount !== readable.evidence.assetCount) throw new Error('complete installed reader receipt differs')
       harness.writeTransferRequest(owned.containerId, 'native-request.json', { ...providerRequest, savedSnapshotSummary: exported.evidence.savedSnapshotSummary, nativeBudgetMs: policy.operationTimeoutMs })
       phases.set(rootSessionId, 'native_read_export')
-      let nativeOutput: string
-      try {
-        nativeOutput = harness.execTransferProviderExact(owned.containerId, ['node', '-e', REAL_NATIVE_READER, '/scratch/native-request.json', '/scratch/native-result.json'])
-      } catch (error) {
-        writePrivate(path.join(directory, 'native-failure.json'), { severity: 'error', event: 'opencode.real_rehearsal.native_failed', rootSessionId, candidateSha, imageDigest: manifest.imageDigest })
-        // Preserve the owned consumer's private diagnostic before deleting
-        // its exact volume; an absent startup log cannot authorize a receipt.
-        try { await harness.captureTransferFileExact(owned.containerId, '/scratch/native-private.log', path.join(directory, 'native-failure.log')) } catch { /* startup may fail before its log is created */ }
-        throw error
-      }
+      const nativeOutput = await readNativeRehearsal(harness, owned.containerId, directory,
+        { rootSessionId, candidateSha, imageDigest: manifest.imageDigest }, [token])
       const native = JSON.parse(nativeOutput)
       if (native.rootSessionId !== rootSessionId || native.graphDigest !== root.graphDigest || native.nativeVersion !== '1.18.21'
         || native.providerUid !== 65534 || native.providerGid !== 0 || native.nativeReadableSessionCount < 1) throw new Error('actual pinned native graph receipt differs')
@@ -312,7 +367,7 @@ export async function runRealRootRehearsal(input: { manifestFile: string; scratc
       writePrivate(path.join(directory, 'stage-failure.json'), { severity: 'error', event: 'opencode.real_rehearsal.stage_failed',
         stage: phases.get(rootSessionId), rootSessionId, candidateSha, imageDigest: manifest.imageDigest,
         reasonCode: cause.code === 'ETIMEDOUT' || cause.signal === 'SIGKILL' ? 'owner_timeout_or_signal' : 'stage_refused' })
-      fs.writeFileSync(path.join(directory, 'stage-failure-private.log'), String(error).slice(0, 1024 * 1024), { mode: 0o600, flag: 'wx' })
+      fs.writeFileSync(path.join(directory, 'stage-failure-private.log'), redactNativeDiagnostic(String(error), nativeDiagnosticSecrets([token])).slice(0, 1024 * 1024), { mode: 0o600, flag: 'wx' })
     },
     cleanup: async () => {
       const originalOwned = harness.transferOwnedIds(), cleanup = await harness.cleanup()

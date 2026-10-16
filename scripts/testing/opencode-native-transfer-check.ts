@@ -31,6 +31,27 @@ export type NativeMatrixReceipt = {
   cases: NativeCaseOriginal[]
 }
 
+// Kept self-contained because the owned provider child embeds this function.
+export function expectedExportRefusal(label: string, result: { status: number | null; signal?: string | null; error?: unknown },
+  diagnostic: unknown, receiptProduced: boolean): boolean {
+  const reasons: Record<string, RegExp> = {
+    'changed-type': /source schema relationships differ for pinned table message_seq/,
+    'changed-key': /source schema relationships differ for pinned table message_seq/,
+    'changed-nullability': /source schema relationships differ for pinned table message_seq/,
+    'changed-foreign-key': /source schema relationships differ for pinned table message_seq/,
+    'changed-index': /source schema object inventory differs from pinned OpenCode/,
+    'changed-trigger': /source schema object inventory differs from pinned OpenCode/,
+    'changed-migration': /source migration journal does not match OpenCode v1\.18\.21/,
+    'missing-native-attachment-url': /native file part has no recognized URL/,
+    'changed-source-reference': /workspace file reference is unavailable/,
+    'missing-snapshot-descendant': /retained snapshot has an incomplete tree closure/,
+  }
+  const cause = diagnostic as { event?: unknown; detail?: unknown } | null
+  return result.status === 1 && !result.signal && !result.error && !receiptProduced
+    && cause?.event === 'opencode.rehearsal.stage_refused' && typeof cause.detail === 'string'
+    && !!reasons[label]?.test(cause.detail)
+}
+
 /** Shared finite dispatcher. Fixture children test plumbing, never qualify native. */
 export async function dispatchNativeCases(input: {
   imageDigest: string
@@ -71,7 +92,7 @@ export async function dispatchNativeCases(input: {
 // This fixed child runs only in a fresh, owned offline provider container. All
 // transcript bytes and native output stay in its private volume. Its ordinary
 // synthetic noReply prompt is prohibited in the real-root rehearsal driver.
-const NATIVE_CHILD = String.raw`
+const NATIVE_CHILD = `const expectedExportRefusal = ${expectedExportRefusal.toString()};\n` + String.raw`
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -111,7 +132,9 @@ function deniedExport(label,mutation){
  const modified=fs.readFileSync(source); const file=base+'/deny-'+label+'-request.json';
  write(file,{candidateSha,imageDigest,sourceDatabase:source,rootSessionId:roots[0],extractionRoot:base+'/deny-'+label,workspacePath:workspace,descriptorFile:base+'/deny-'+label+'-descriptor.json',payloadFile:base+'/deny-'+label+'-payload.json',destinationStoreId:'fixture-native-owner',destinationDatabase:destination,providerHome:home,providerUid:65534,providerGid:0,receiptFile:base+'/deny-'+label+'-receipt.json'});
  const result=cp.spawnSync('/opt/transfer-stage',['--stage','export','--request-file',file],{encoding:'utf8',timeout:45000,maxBuffer:1024*1024});
- assert('export-refuses-'+label,result.status!==0&&!fs.existsSync(base+'/deny-'+label+'-receipt.json'));
+ const diagnosticFile=base+'/deny-'+label+'-request-error.json';
+ const diagnostic=fs.existsSync(diagnosticFile)?JSON.parse(fs.readFileSync(diagnosticFile,'utf8')):null;
+ assert('export-refuses-'+label,expectedExportRefusal(label,result,diagnostic,fs.existsSync(base+'/deny-'+label+'-receipt.json')));
  assert('source-unchanged-by-refused-'+label,sha(fs.readFileSync(source))===sha(modified));
  fs.writeFileSync(source,before,{mode:0o600});
 }
