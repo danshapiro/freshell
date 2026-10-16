@@ -50,6 +50,7 @@ import {
   TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL,
   waitForTerminalOrdinaryTurnBaseline,
   waitForTerminalOrdinaryTurn,
+  terminalOrdinaryTurnRequest,
   type TerminalOrdinaryTurnBaseline,
   type TerminalOrdinaryTurnBrowserObservation,
   type TerminalOrdinaryTurnProvider,
@@ -218,7 +219,7 @@ async function executeAndAwaitNonceOutput(
 
 class OrdinaryTerminalTurnError extends Error {
   constructor(readonly stage: 'attach_ready' | 'turn_completion', readonly facts: TerminalOrdinaryTurnBrowserObservation | null, cause?: unknown) {
-    super('ordinary terminal turn did not show provider activity, fresh output, and completion', { cause })
+    super('ordinary terminal turn did not show a fresh rendered answer and completion for its native conversation', { cause })
     this.name = 'OrdinaryTerminalTurnError'
   }
 }
@@ -228,16 +229,19 @@ async function executeAndAwaitOrdinaryTurn(
   paneId: string,
   terminalId: string,
   provider: TerminalOrdinaryTurnProvider,
+  nativeSessionId: string | undefined,
 ): Promise<TerminalOrdinaryTurnBrowserObservation> {
+  if (!nativeSessionId) throw new OrdinaryTerminalTurnError('attach_ready', null, new Error('allocated native conversation is absent'))
   const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
   await terminal.waitFor({ state: 'visible', timeout: 90_000 })
   await terminal.click()
-  const requestText = 'Reply in one short sentence. Do not use tools.'
+  const { input: requestText, expectedAnswer } = terminalOrdinaryTurnRequest(`FRESHELL${randomBytes(8).toString('hex')}`)
 
-  const baseline = await waitForTerminalOrdinaryTurnBaseline(() => page.evaluate(({ globalName, providerName, id }) => {
+  const baseline = await waitForTerminalOrdinaryTurnBaseline(() => page.evaluate(({ globalName, providerName, id, nativeId, answer }) => {
     const observer = (window as any)[globalName]
-    return observer?.prepareBeforeSend(providerName, id) ?? null
-  }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, providerName: provider, id: terminalId }) as Promise<TerminalOrdinaryTurnBaseline | null>)
+    return observer?.prepareBeforeSend(providerName, id, nativeId, answer) ?? null
+  }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, providerName: provider, id: terminalId,
+    nativeId: nativeSessionId, answer: expectedAnswer }) as Promise<TerminalOrdinaryTurnBaseline | null>)
   if (!baseline) throw new OrdinaryTerminalTurnError('attach_ready', null)
   await page.keyboard.insertText(requestText)
 
@@ -653,7 +657,7 @@ test.describe.serial('ordinary managed-provider use', () => {
             if (definition.provider === 'amplifier') {
               throw new Error('Amplifier is excluded from the ordinary terminal smoke')
             }
-            await executeAndAwaitOrdinaryTurn(page, created.paneId, created.terminalId, definition.provider)
+            await executeAndAwaitOrdinaryTurn(page, created.paneId, created.terminalId, definition.provider, created.view.nativeSessionId)
             console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
               lane: 'terminal', provider: definition.provider }))
           } catch (error) {

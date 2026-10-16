@@ -13,7 +13,7 @@ import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
 import {
-  createManagedOpenCodeRuntimeBrowserRig, type ManagedFixtureRig, stopManagedRuntimeSoul,
+  createManagedOpenCodeRuntimeBrowserRig, type ManagedFixtureRig, completeManagedRuntimeStop,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
@@ -609,11 +609,11 @@ test.describe.serial('OpenCode provider qualification', () => {
       const noticeCount = await rig.openCodeQualificationNoticeCount()
       expect(noticeCount).toBe(0)
 
-      const firstStop = await stopManagedRuntimeSoul(rig, first.view.soulId)
-      const secondStop = await stopManagedRuntimeSoul(rig, second.view.soulId)
-      expect(firstStop.outcome).toBe('verified_empty')
-      expect(secondStop.outcome).toBe('verified_empty')
-      if (firstStop.outcome !== 'verified_empty' || secondStop.outcome !== 'verified_empty') {
+      const firstStop = await completeManagedRuntimeStop(rig, first.view.soulId)
+      const secondStop = await completeManagedRuntimeStop(rig, second.view.soulId)
+      expect(firstStop.completion.outcome).toBe('verified_empty')
+      expect(secondStop.completion.outcome).toBe('verified_empty')
+      if (firstStop.completion.outcome !== 'verified_empty' || secondStop.completion.outcome !== 'verified_empty') {
         throw new Error('OpenCode qualification Stop did not verify both enclosures empty')
       }
       const claimAfterStop = await rig.writerClaimFacts(writerHandle)
@@ -673,7 +673,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         oldEnclosureVerifiedEmpty: !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(first.view))).running
           && !(await rig.ownedContainerState(rig.runtimeEnclosureHandle(afterHostCrash))).running,
         verifiedEmptyOrdering: {
-          stopOutcome: firstStop.outcome,
+          stopOutcome: firstStop.completion.outcome,
           activeClaimCountAfterStop: claimAfterStop.activeClaimCount,
           globalConflictingClaimCountAfterStop: claimAfterStop.globalConflictingClaimCount,
           oldContainerRunningAfterStop,

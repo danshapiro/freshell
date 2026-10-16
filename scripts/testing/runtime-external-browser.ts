@@ -2106,6 +2106,7 @@ const PaneCreationProbeSchema = z.object({
 }).strict()
 const OrdinaryTerminalTurnFactsSchema = z.object({
   requestInputSeen: z.boolean(), activitySeen: z.boolean(), outputSeen: z.boolean(),
+  renderedAnswerSeen: z.boolean().optional(),
   outputFrameCount: z.number().int().nonnegative().max(10000), completionSeen: z.boolean(),
   completionSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable().optional(),
   completionOutcome: z.enum(['completed', 'failed']).nullable().optional(),

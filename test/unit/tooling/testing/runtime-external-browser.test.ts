@@ -1124,15 +1124,15 @@ describe('candidate-bound Cloud execution events', () => {
 
 describe('body-free ordinary-turn Cloud diagnostics', () => {
   it('retains safe native failure outcome and sequence from the production reducer in forwarded diagnostics', () => {
-    const target = { provider: 'codex' as const, terminalId: 'owned-terminal', streamId: 'owned-stream' }
-    const facts = { requestInputSeen: true, ...reduceTerminalOrdinaryTurnFrames([{
-      type: 'terminal.turn.complete', ...target, completionSeq: 9, outcome: 'failed', error: 'PRIVATE_API_ERROR',
+    const target = { provider: 'codex' as const, terminalId: 'owned-terminal', streamId: 'owned-stream', nativeSessionId: 'native-owned' }
+    const facts = { requestInputSeen: true, renderedAnswerSeen: false, ...reduceTerminalOrdinaryTurnFrames([{
+      type: 'terminal.turn.complete', ...target, sessionId: target.nativeSessionId, completionSeq: 9, outcome: 'failed', error: 'PRIVATE_API_ERROR',
     }], captureTerminalOrdinaryTurnBaseline([], target)) }
     const parsed = runner.parseManagedOrdinaryTurnDiagnosticText(JSON.stringify({
       event: 'durable_souls.ordinary_turn_failed', lane: 'terminal', provider: target.provider,
       ordinaryTurnFailureStage: 'turn_completion', ordinaryTurnFacts: { ...facts, error: 'PRIVATE_API_ERROR' },
     }))
-    expect(parsed).toMatchObject([{ ordinaryTurnFacts: { completionSeen: false, completionOutcome: 'failed', completionSeq: 9 } }])
+    expect(parsed).toMatchObject([{ ordinaryTurnFacts: { renderedAnswerSeen: false, completionSeen: false, completionOutcome: 'failed', completionSeq: 9 } }])
     expect(JSON.stringify(parsed)).not.toContain('PRIVATE_API_ERROR')
   })
 
