@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
+    io::{BufRead, Read},
     path::Path,
 };
 
@@ -1168,12 +1169,12 @@ fn probe_selected_provider_identity(
         "claude" | "kilroy" => probe_bounded_tree(
             &provider_home.join(".claude/projects"),
             expected,
-            ArtifactMatch::Claude,
+            NativeArtifactKind::Claude,
         ),
         "codex" => probe_bounded_tree(
             &provider_home.join(".codex/sessions"),
             expected,
-            ArtifactMatch::Codex,
+            NativeArtifactKind::Codex,
         ),
         "amplifier" => probe_amplifier(provider_home, expected),
         "opencode" => probe_opencode(provider_home, expected),
@@ -1655,12 +1656,14 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ArtifactMatch {
+enum NativeArtifactKind {
     Claude,
     Codex,
 }
 
-fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> ProviderStoreProbe {
+const MAX_NATIVE_ARTIFACT_INSPECTION_BYTES: u64 = 1024 * 1024;
+
+fn probe_bounded_tree(root: &Path, expected: &str, mode: NativeArtifactKind) -> ProviderStoreProbe {
     let provider_home = root
         .parent()
         .and_then(Path::parent)
@@ -1679,6 +1682,8 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
     let mut visited = 0_usize;
     let mut matches = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut unresolved_owner = false;
     while let Some((path, depth)) = queue.pop_front() {
         visited += 1;
         if visited > 50_000 {
@@ -1751,51 +1756,71 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
             }
             continue;
         }
-        {
-            let filename_match = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(expected));
-            if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        if !metadata.is_file() {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "provider artifact is not a regular file",
+                vec![path.display().to_string()],
+                None,
+            );
+        }
+        // Native ownership is header evidence, independent of transcript size.
+        // Inspect every owner so actual duplicate rollouts still block recovery.
+        match native_artifact_owner(&path, mode) {
+            Ok(Some(owner)) if owner == expected => matches.push(path.display().to_string()),
+            Ok(Some(_)) => {}
+            Ok(None) => unresolved_owner = true,
+            Err(error) => {
                 return blocked(
                     RecoveryBlockReason::StoreUnreadable,
-                    "provider artifact cannot be completely inspected within the byte limit",
-                    vec![root.display().to_string()],
-                    None,
-                );
-            }
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return blocked(
-                        RecoveryBlockReason::StoreUnreadable,
-                        "provider artifact read failed",
-                        vec![root.display().to_string()],
-                        Some("repair provider-state volume permissions"),
-                    )
-                }
-            };
-            let content_match = bytes
-                .windows(expected.len())
-                .any(|w| w == expected.as_bytes());
-            if filename_match || content_match {
-                matches.push(path.display().to_string());
-            } else if !native_artifact_excludes_identity(&bytes, expected, &mode) {
-                return blocked(
-                    RecoveryBlockReason::StoreUnreadable,
-                    "provider artifact is partial or its encoded identity is unresolved",
-                    vec![root.display().to_string()],
-                    None,
+                    &format!("read provider artifact {}: {error}", path.display()),
+                    vec![path.display().to_string()],
+                    Some("repair provider-state volume permissions"),
                 );
             }
         }
+        artifacts.push(path);
     }
     match matches.len() {
-        0 => ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: format!("no exact provider artifact for {expected}"),
-            evidence: vec![root.display().to_string()],
-            store_state: EvidenceStoreState::PresentReadable,
-        },
+        0 => {
+            // Absence needs a complete semantic census. A positive owner does
+            // not need to read unrelated conversation bodies or large outputs.
+            for path in artifacts {
+                let mut bytes = Vec::new();
+                if let Err(error) = fs::File::open(&path).and_then(|file| {
+                    file.take(MAX_NATIVE_ARTIFACT_INSPECTION_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                }) {
+                    return blocked(
+                        RecoveryBlockReason::StoreUnreadable,
+                        &format!("read provider artifact {}: {error}", path.display()),
+                        vec![path.display().to_string()],
+                        Some("repair provider-state volume permissions"),
+                    );
+                }
+                if bytes.len() as u64 > MAX_NATIVE_ARTIFACT_INSPECTION_BYTES
+                    || !native_artifact_excludes_identity(&bytes, expected, &mode)
+                {
+                    return blocked(
+                        RecoveryBlockReason::StoreUnreadable,
+                        "provider artifact is partial or cannot be completely inspected within the byte limit",
+                        vec![path.display().to_string()],
+                        None,
+                    );
+                }
+            }
+            ProviderStoreProbe::DefinitivelyUnavailable {
+                reason: format!("no exact provider artifact for {expected}"),
+                evidence: vec![root.display().to_string()],
+                store_state: EvidenceStoreState::PresentReadable,
+            }
+        }
+        1 if unresolved_owner => blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "provider artifact ownership could not be inspected",
+            vec![root.display().to_string()],
+            None,
+        ),
         1 => ProviderStoreProbe::Ready { evidence: matches },
         _ => blocked(
             RecoveryBlockReason::AmbiguousIdentity,
@@ -1806,9 +1831,49 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
     }
 }
 
-// A text-search miss cannot certify absence from malformed or encoded JSONL.
-// Encoded matches stay unresolved; this never selects another native session.
-fn native_artifact_excludes_identity(bytes: &[u8], expected: &str, mode: &ArtifactMatch) -> bool {
+fn native_artifact_owner(path: &Path, mode: NativeArtifactKind) -> std::io::Result<Option<String>> {
+    let file = fs::File::open(path)?;
+    // Match the native Codex locator's bounded first-line ownership semantics:
+    // only session_meta.payload.id owns the rollout, never filename or lineage.
+    // Claude can prefix its first sessionId-bearing row with companion records.
+    let mut reader = std::io::BufReader::new(file).take(MAX_NATIVE_ARTIFACT_INSPECTION_BYTES);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? > 0 {
+        if !line.ends_with(b"\n") {
+            return Ok(None);
+        }
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            return Ok(None);
+        };
+        let owner = match mode {
+            NativeArtifactKind::Codex => {
+                if record.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+                    return Ok(None);
+                }
+                record.pointer("/payload/id")
+            }
+            NativeArtifactKind::Claude => record.get("sessionId"),
+        };
+        if let Some(owner) = owner
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        {
+            return Ok(Some(owner.to_owned()));
+        }
+        if matches!(mode, NativeArtifactKind::Codex) || !record.is_object() {
+            return Ok(None);
+        }
+        line.clear();
+    }
+    Ok(None)
+}
+
+// Header ownership alone cannot certify absence from malformed JSONL bodies.
+fn native_artifact_excludes_identity(
+    bytes: &[u8],
+    expected: &str,
+    mode: &NativeArtifactKind,
+) -> bool {
     let mut identity: Option<String> = None;
     for line in bytes
         .split(|byte| *byte == b'\n')
@@ -1820,17 +1885,8 @@ fn native_artifact_excludes_identity(bytes: &[u8], expected: &str, mode: &Artifa
         if !value.is_object() {
             return false;
         }
-        let Ok(normalized) = serde_json::to_vec(&value) else {
-            return false;
-        };
-        if normalized
-            .windows(expected.len())
-            .any(|window| window == expected.as_bytes())
-        {
-            return false;
-        }
         let candidate = match mode {
-            ArtifactMatch::Claude => {
+            NativeArtifactKind::Claude => {
                 let kind = value.get("type").and_then(serde_json::Value::as_str);
                 let complete = match kind {
                     Some("user" | "assistant") => value.get("message").is_some_and(|message| {
@@ -1853,7 +1909,7 @@ fn native_artifact_excludes_identity(bytes: &[u8], expected: &str, mode: &Artifa
                 }
                 value.get("sessionId").and_then(serde_json::Value::as_str)
             }
-            ArtifactMatch::Codex => {
+            NativeArtifactKind::Codex => {
                 if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
                     value
                         .get("payload")
@@ -2372,6 +2428,159 @@ mod tests {
     }
 
     #[test]
+    fn native_probe_large_rollouts_remain_ready() {
+        let expected = "11111111-2222-3333-4444-555555555555";
+        for (provider, mode) in [
+            ("codex", "codex"),
+            ("codex", "freshcodex"),
+            ("claude", "claude"),
+            ("kilroy", "kilroy"),
+        ] {
+            for large_exact in [true, false] {
+                let home = tempfile::tempdir().unwrap();
+                let root = home.path().join(if provider == "codex" {
+                    ".codex/sessions/2026/10/15"
+                } else {
+                    ".claude/projects/work"
+                });
+                fs::create_dir_all(&root).unwrap();
+                let rollout = |id: &str, large: bool| {
+                    let text = if large {
+                        "x".repeat(1024 * 1024 + 1)
+                    } else {
+                        "saved".into()
+                    };
+                    let rows = if provider == "codex" {
+                        vec![
+                            serde_json::json!({"timestamp":"2026-10-15T00:00:00.000Z","type":"session_meta","payload":{"id":id,"cwd":"/work"}}),
+                            serde_json::json!({"timestamp":"2026-10-15T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}}),
+                        ]
+                    } else {
+                        vec![
+                            serde_json::json!({"type":"user","sessionId":id,"message":{"role":"user","content":"saved"}}),
+                            serde_json::json!({"type":"assistant","sessionId":id,"message":{"role":"assistant","content":text}}),
+                        ]
+                    };
+                    rows.iter()
+                        .map(|row| format!("{row}\n"))
+                        .collect::<String>()
+                };
+                fs::write(root.join("exact.jsonl"), rollout(expected, large_exact)).unwrap();
+                if !large_exact {
+                    fs::write(
+                        root.join("other.jsonl"),
+                        rollout("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", true),
+                    )
+                    .unwrap();
+                }
+                let mut spec = resume_spec_for_test(provider, expected, home.path());
+                spec.mode = mode.into();
+                let probe = probe_provider_store(home.path(), &spec);
+                assert!(
+                    matches!(probe, ProviderStoreProbe::Ready { .. }),
+                    "{mode}/large_exact={large_exact}: {probe:?}"
+                );
+                if !large_exact {
+                    fs::remove_file(root.join("exact.jsonl")).unwrap();
+                    let probe = probe_provider_store(home.path(), &spec);
+                    assert!(
+                        matches!(
+                            probe,
+                            ProviderStoreProbe::Blocked {
+                                reason: RecoveryBlockReason::StoreUnreadable,
+                                ..
+                            }
+                        ),
+                        "a large unrelated body cannot certify absence: {mode}: {probe:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_probe_codex_lineage_and_message_references_are_not_owners() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions");
+        fs::create_dir_all(&root).unwrap();
+        let parent = "11111111-2222-3333-4444-555555555555";
+        let child = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let parent_path = root.join("parent.jsonl");
+        fs::write(
+            &parent_path,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":parent,"cwd":"/work"}})
+            ),
+        )
+        .unwrap();
+        // Even a misleading filename and all known native lineage fields are references.
+        fs::write(root.join(format!("child-referring-to-{parent}.jsonl")), format!("{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":child,"cwd":"/work","session_id":parent,"forked_from_id":parent,"source":{"subagent":{"thread_spawn":{"parent_thread_id":parent}}}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("Discuss session {parent}")}]}}),
+        )).unwrap();
+        let spec = resume_spec_for_test("codex", parent, home.path());
+        let probe = probe_provider_store(home.path(), &spec);
+        assert!(
+            matches!(probe, ProviderStoreProbe::Ready { .. }),
+            "{probe:?}"
+        );
+        fs::remove_file(parent_path).unwrap();
+        let probe = probe_provider_store(home.path(), &spec);
+        assert!(
+            matches!(probe, ProviderStoreProbe::DefinitivelyUnavailable { .. }),
+            "lineage alone cannot own a rollout: {probe:?}"
+        );
+    }
+
+    #[test]
+    fn native_probe_codex_requires_native_owner_even_when_filename_and_text_match() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions");
+        fs::create_dir_all(&root).unwrap();
+        let expected = "11111111-2222-3333-4444-555555555555";
+        fs::write(
+            root.join(format!("{expected}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"response_item","payload":{"text":expected}})
+            ),
+        )
+        .unwrap();
+        let spec = resume_spec_for_test("codex", expected, home.path());
+        let probe = probe_provider_store(home.path(), &spec);
+        assert!(
+            matches!(
+                probe,
+                ProviderStoreProbe::Blocked {
+                    reason: RecoveryBlockReason::StoreUnreadable,
+                    ..
+                }
+            ),
+            "{probe:?}"
+        );
+        fs::write(
+            root.join("valid.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":expected,"cwd":"/work"}})
+            ),
+        )
+        .unwrap();
+        let probe = probe_provider_store(home.path(), &spec);
+        assert!(
+            matches!(
+                probe,
+                ProviderStoreProbe::Blocked {
+                    reason: RecoveryBlockReason::StoreUnreadable,
+                    ..
+                }
+            ),
+            "an uninspectable sibling owner must remain unresolved: {probe:?}"
+        );
+    }
+
+    #[test]
     fn incomplete_native_census_cannot_certify_absence() {
         for provider in ["claude", "codex", "amplifier"] {
             for fault in ["depth", "symlink", "bytes"] {
@@ -2884,7 +3093,12 @@ mod tests {
                 if provider == "amplifier" {
                     fs::create_dir(project.join("saved-exact-root")).unwrap();
                 } else {
-                    fs::write(project.join("history.jsonl"), "saved-exact-root").unwrap();
+                    let row = if provider == "codex" {
+                        serde_json::json!({"type":"session_meta","payload":{"id":"saved-exact-root","cwd":"/work"}})
+                    } else {
+                        serde_json::json!({"type":"user","sessionId":"saved-exact-root","message":{"role":"user","content":"saved"}})
+                    };
+                    fs::write(project.join("history.jsonl"), format!("{row}\n")).unwrap();
                 }
             }
             assert!(
