@@ -22,6 +22,12 @@ struct Daemon {
     consumed_rejection: bool,
     recovery_probes: Vec<String>,
     recovery_probe_available: bool,
+    recovery_probe_gate: Option<Arc<RecoveryProbeGate>>,
+}
+#[derive(Default)]
+struct RecoveryProbeGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 struct Backend(Arc<Mutex<Daemon>>, std::path::PathBuf);
 
@@ -215,11 +221,21 @@ impl RuntimeBackend for Backend {
                         resume_spec: Some(spec),
                         ..
                     } => {
-                        let mut state = state.lock().unwrap();
-                        state
-                            .recovery_probes
-                            .push(spec.provider_session.native_session_id.clone());
-                        if state.recovery_probe_available {
+                        let (available, gate) = {
+                            let mut state = state.lock().unwrap();
+                            state
+                                .recovery_probes
+                                .push(spec.provider_session.native_session_id.clone());
+                            (
+                                state.recovery_probe_available,
+                                state.recovery_probe_gate.take(),
+                            )
+                        };
+                        if let Some(gate) = gate {
+                            gate.entered.notify_one();
+                            gate.release.notified().await;
+                        }
+                        if available {
                             HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
                                 evidence_revision: spec.evidence_revision,
                                 resume_spec: spec,
@@ -529,8 +545,42 @@ async fn live_opencode_probe_coalesces_failed_evidence_reads_then_recovers_befor
         crate::recovery::LIVE_RESUME_EVIDENCE_RETRY_INTERVAL + Duration::from_millis(25),
     )
     .await;
-    daemon.lock().unwrap().recovery_probe_available = true;
-    let retried_live = supervisor.probe_recovery(soul.clone()).await.unwrap();
+    let gate = Arc::new(RecoveryProbeGate::default());
+    {
+        let mut daemon = daemon.lock().unwrap();
+        daemon.recovery_probe_available = true;
+        daemon.recovery_probe_gate = Some(gate.clone());
+    }
+    let entered = gate.entered.notified();
+    let delayed_probe_supervisor = supervisor.clone();
+    let delayed_probe_soul = soul.clone();
+    let delayed_probe = tokio::spawn(async move {
+        delayed_probe_supervisor
+            .probe_recovery(delayed_probe_soul)
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("the successful provider-store read reaches its gate");
+
+    // A newer store observation wins while the older provider read is still
+    // in flight. Releasing the delayed result must leave this position intact.
+    let mut newer =
+        crate::resume_catalog::exact_resume_candidate(&after_first_probe, Some("ses_exact"))
+            .unwrap()
+            .expect("the observed native session has an exact candidate");
+    newer.durable_position.provider_cursor = Some("position-after-delayed-probe".into());
+    let newer = registry
+        .store_verified_resume_spec(soul.clone(), newer)
+        .await
+        .unwrap();
+    gate.release.notify_one();
+
+    let retried_live = tokio::time::timeout(Duration::from_secs(5), delayed_probe)
+        .await
+        .expect("the delayed provider-store read completes")
+        .unwrap();
     assert!(matches!(retried_live, RecoveryProbe::ReattachReady { .. }));
     let durable = registry.recovery_context(soul.clone()).await.unwrap();
     assert_eq!(
@@ -539,7 +589,13 @@ async fn live_opencode_probe_coalesces_failed_evidence_reads_then_recovers_befor
             .as_ref()
             .map(|spec| spec.provider_session.native_session_id.as_str()),
         Some("ses_exact"),
-        "a later verified exact-session read must become durable resume evidence"
+        "a newer exact-session proof stays durable while an older read finishes"
+    );
+    let retained = durable.resume_spec.as_ref().expect("newer proof is saved");
+    assert_eq!(retained.evidence_revision, newer.evidence_revision);
+    assert_eq!(
+        retained.durable_position.provider_cursor.as_deref(),
+        Some("position-after-delayed-probe")
     );
     assert_eq!(
         daemon.lock().unwrap().recovery_probes,

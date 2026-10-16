@@ -146,9 +146,22 @@ impl Supervisor {
                         RecoveryProbe::ResumeReady { resume_spec, .. } => {
                             let stored = self
                                 .registry
-                                .store_verified_resume_spec(context.soul_id.clone(), *resume_spec)
+                                .store_verified_resume_spec_for_live_incarnation(
+                                    context.soul_id.clone(),
+                                    context.prior_handle.incarnation_id().clone(),
+                                    context.evidence_revision,
+                                    *resume_spec,
+                                )
                                 .await
                                 .map_err(map_registry)?;
+                            let Some(stored) = stored else {
+                                return Ok(blocked(
+                                    RecoveryPath::NativeResume,
+                                    RecoveryBlockReason::ProviderUnavailable,
+                                    "provider-store evidence was superseded by a newer incarnation or recovery state; retry the probe",
+                                    Some(2_000),
+                                ));
+                            };
                             RecoveryProbe::ResumeReady {
                                 evidence_revision: stored.evidence_revision,
                                 resume_spec: Box::new(stored),
@@ -212,12 +225,20 @@ impl Supervisor {
                     Ok(RecoveryProbe::ResumeReady { resume_spec, .. }) => {
                         match self
                             .registry
-                            .store_verified_resume_spec(context.soul_id.clone(), *resume_spec)
+                            .store_verified_resume_spec_for_live_incarnation(
+                                context.soul_id.clone(),
+                                context.prior_handle.incarnation_id().clone(),
+                                context.evidence_revision,
+                                *resume_spec,
+                            )
                             .await
                         {
-                            Ok(stored) => serde_json::json!({
+                            Ok(Some(stored)) => serde_json::json!({
                                 "result": "captured",
                                 "evidenceRevision": stored.evidence_revision,
+                            }),
+                            Ok(None) => serde_json::json!({
+                                "result": "superseded",
                             }),
                             Err(error) => serde_json::json!({
                                 "result": "persist_failed",

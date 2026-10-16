@@ -3449,6 +3449,36 @@ impl FreshCodexState {
         // ("send waits, rollback wins, then destroys").
         let _turn = turn_lock.lock().await;
 
+        // The checkpoint workspace barrier can park a send outside this
+        // handler while ownership changes. Recheck the captured wire fence
+        // after the turn lock so a delayed send cannot reach a replacement
+        // owner of the same thread id. Keep the coordinator guard through the
+        // turn/start request; ordinary legacy sends without a fence retain
+        // their existing behavior.
+        let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
+            let owner_key = self.resolve_ownership_key(&session_id);
+            match crate::ownership_lane::arm_reclaimless_op_guard(
+                &self.ownership,
+                PROVIDER,
+                &owner_key,
+                &format!("send-{}", uuid::Uuid::new_v4()),
+                send_fence,
+                "freshcodex/send",
+            ) {
+                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneOpGuard::Unwired => None,
+                crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %session_id, request_id = ?request_id,
+                        "fresh_agent_send_refused: ownership guard refused");
+                    self.send_error(&request_id, "SESSION_RESERVED", &message);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // Read defaults after acquiring the turn lock: a queued send inherits the
         // last accepted settings, while this message's explicit choices win.
         let stored = {
@@ -3594,6 +3624,7 @@ impl FreshCodexState {
                 return;
             }
         };
+        drop(ownership_guard);
 
         // Only persist choices once the provider has accepted them. Failed sends
         // keep the previous working settings for resume and retry.
@@ -27958,6 +27989,73 @@ pub(crate) mod tests {
                 "the stale send never answered typed: {frame}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_send_with_stale_fence_is_refused_for_an_already_running_codex_session() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        let before = registry.observe(PROVIDER, &thread_id);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            &thread_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-checkpoint-send-generation-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail(
+            PROVIDER,
+            &thread_id,
+            "op-checkpoint-send-generation-bump",
+            generation,
+            true,
+        );
+        let after = registry.observe(PROVIDER, &thread_id);
+        assert!(after.generation > before.generation);
+        assert!(matches!(
+            after.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        while rx.try_recv().is_ok() {}
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-stale-checkpoint-codex".into()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id,
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "delayed checkpoint prompt".into(),
+            images: None,
+            cwd: None,
+            settings: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "stale-codex-attempt".into(),
+                workspace: None,
+            }),
+        })
+        .await;
+
+        let mut saw_reserved = false;
+        let mut saw_accepted = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("event frame JSON");
+            saw_reserved |= frame.to_string().contains("SESSION_RESERVED");
+            saw_accepted |= frame.to_string().contains("freshAgent.send.accepted");
+        }
+        assert!(saw_reserved, "the stale owner fence is refused typed");
+        assert!(
+            !saw_accepted,
+            "the stale prompt is never accepted for dispatch"
+        );
     }
 
     /// b8ke ext r21 F2: a reconnect-replayed stale-fence COMPACT arriving

@@ -1354,8 +1354,42 @@ impl Registry {
     pub async fn store_verified_resume_spec(
         &self,
         soul_id: SoulId,
-        mut resume_spec: ResumeSpec,
+        resume_spec: ResumeSpec,
     ) -> Result<ResumeSpec, RegistryError> {
+        self.store_verified_resume_spec_inner(soul_id, resume_spec, None)
+            .await?
+            .ok_or_else(|| {
+                RegistryError::Integrity(
+                    "unfenced resume evidence update was unexpectedly superseded".into(),
+                )
+            })
+    }
+
+    /// Store provider-store evidence only if the incarnation and evidence
+    /// revision observed before the read are still current. An incarnation may
+    /// remain usable for a retry after its soul is blocked, including when a
+    /// failed cleanup left it stopping; `None` means its source or state changed.
+    pub async fn store_verified_resume_spec_for_live_incarnation(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        expected_evidence_revision: u64,
+        resume_spec: ResumeSpec,
+    ) -> Result<Option<ResumeSpec>, RegistryError> {
+        self.store_verified_resume_spec_inner(
+            soul_id,
+            resume_spec,
+            Some((incarnation_id, expected_evidence_revision)),
+        )
+        .await
+    }
+
+    async fn store_verified_resume_spec_inner(
+        &self,
+        soul_id: SoulId,
+        mut resume_spec: ResumeSpec,
+        expected_live_source: Option<(IncarnationId, u64)>,
+    ) -> Result<Option<ResumeSpec>, RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (provider, store, native, evidence, existing): (
@@ -1380,6 +1414,17 @@ impl Registry {
                 )
                 .optional()?
                 .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+            if let Some((incarnation_id, expected_revision)) = expected_live_source.as_ref() {
+                let current: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND (i.launch_state='running' OR (i.launch_state='stopping' AND s.recovery_state='blocked')) AND s.desired_state='running' AND s.recovery_state IN ('live','blocked') AND s.recovery_attempt_id IS NULL AND s.evidence_revision=?3)",
+                    params![soul_id.as_str(), incarnation_id.as_str(), expected_revision],
+                    |row| row.get(0),
+                )?;
+                if !current {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+            }
             if provider != resume_spec.provider_session.provider
                 || store != resume_spec.provider_session.provider_store_id
                 || native.as_deref() != Some(resume_spec.provider_session.native_session_id.as_str())
@@ -1397,7 +1442,7 @@ impl Registry {
                     && existing.durable_position == resume_spec.durable_position
                 {
                     tx.commit()?;
-                    return Ok(existing);
+                    return Ok(Some(existing));
                 }
             }
             let next_evidence = evidence
@@ -1423,7 +1468,7 @@ impl Registry {
                 ],
             )?;
             tx.commit()?;
-            Ok(resume_spec)
+            Ok(Some(resume_spec))
         })
         .await
     }
@@ -4512,6 +4557,133 @@ mod tests {
         assert_eq!(state, "recovering");
         assert_eq!(count, 0);
         assert_eq!(native, None);
+    }
+
+    #[tokio::test]
+    async fn live_resume_evidence_rejects_superseded_incarnation_and_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_test_runtime(&registry, soul.clone()).await;
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='opencode',native_session_id='exact-session' WHERE soul_id=?1",
+            params![soul.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut delayed = crate::checkpoints::tests::spec("opencode");
+        delayed.durable_position.provider_cursor = Some("older-position".into());
+        let mut newer = delayed.clone();
+        newer.durable_position.provider_cursor = Some("newer-position".into());
+
+        let first = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                0,
+                delayed.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("the initial live incarnation and evidence revision are current");
+        assert_eq!(first.evidence_revision, 1);
+
+        let wrong_incarnation = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                IncarnationId::new(),
+                first.evidence_revision,
+                delayed.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_incarnation.is_none(),
+            "a probe from another incarnation cannot publish evidence"
+        );
+
+        registry
+            .mark_stop_outcome(
+                prepared.incarnation_id.clone(),
+                StopOutcome::TerminationUnconfirmed,
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_recovery_blocked(
+                soul.clone(),
+                None,
+                RecoveryBlockReason::ProviderUnavailable,
+                vec!["synthetic provider store outage".into()],
+            )
+            .await
+            .unwrap();
+        let newer = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                first.evidence_revision,
+                newer,
+            )
+            .await
+            .unwrap()
+            .expect("a retry can publish evidence after blocked cleanup of the same incarnation");
+        assert_eq!(
+            newer.durable_position.provider_cursor.as_deref(),
+            Some("newer-position")
+        );
+
+        let late = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                0,
+                delayed.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(late.is_none(), "a late probe cannot replace newer evidence");
+
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let retained = context.resume_spec.expect("newer evidence remains saved");
+        assert_eq!(retained.evidence_revision, newer.evidence_revision);
+        assert_eq!(
+            retained.durable_position.provider_cursor.as_deref(),
+            Some("newer-position")
+        );
+
+        let start = registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        let during_recovery = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                start.context.prior_handle.incarnation_id().clone(),
+                newer.evidence_revision,
+                delayed,
+            )
+            .await
+            .unwrap();
+        assert!(
+            during_recovery.is_none(),
+            "an active recovery attempt cannot publish proof"
+        );
+        let final_context = registry.recovery_context(soul).await.unwrap();
+        assert_eq!(final_context.recovery_state, RecoveryState::Recovering);
+        assert_eq!(
+            final_context
+                .resume_spec
+                .as_ref()
+                .and_then(|spec| spec.durable_position.provider_cursor.as_deref()),
+            Some("newer-position")
+        );
     }
 
     #[tokio::test]

@@ -2134,6 +2134,39 @@ impl FreshOpencodeState {
                 }
             };
 
+        // The checkpoint workspace barrier can park this request before it
+        // reaches the provider lane. For an already-materialized session, arm
+        // against its captured owner pair only after this session lock is held,
+        // so an old send cannot be redirected to a reattached owner of the same
+        // durable id. A first send to a placeholder still uses the materialize
+        // claim below; a queued send releases this guard here and the drain
+        // re-arms it immediately before dispatch.
+        let mut checkpoint_send_guard =
+            if msg.checkpoint_intent.is_some() && session.real_session_id.is_some() {
+                let owner_key = self.resolve_ownership_key(&session_id);
+                match crate::ownership_lane::arm_reclaimless_op_guard(
+                    &self.fresh_agent.ownership,
+                    PROVIDER,
+                    &owner_key,
+                    &format!("send-{}", uuid::Uuid::new_v4()),
+                    send_fence,
+                    "freshopencode/send",
+                ) {
+                    crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                    crate::ownership_lane::LaneOpGuard::Unwired => None,
+                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                        drop(session);
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, request_id = ?request_id,
+                        "fresh_agent_send_refused: checkpoint ownership guard refused");
+                        self.send_error(&request_id, "SESSION_RESERVED", &message);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
         // send-during-compact queue: a send arriving while a COMPACT is in
         // flight — including the compact's settling tail (the tail is
         // still the compact's FIFO turn; Task 3's settling-flag gate
@@ -2159,6 +2192,7 @@ impl FreshOpencodeState {
                 .real_session_id
                 .clone()
                 .unwrap_or_else(|| session.placeholder_id.clone());
+            drop(checkpoint_send_guard.take());
             self.broadcast_send_accepted(&real_id, &msg.request_id, &session.cwd);
             session.pending_sends.push_back(msg.clone());
             tracing::warn!(target: "freshell_freshagent::opencode",
@@ -2178,13 +2212,14 @@ impl FreshOpencodeState {
             return;
         }
 
+        let op_guard = checkpoint_send_guard.take();
         self.send_locked(
             &session_arc,
             &mut session,
             msg,
             session_id,
             send_fence,
-            None,
+            op_guard,
             false,
         )
         .await;
@@ -2975,38 +3010,37 @@ impl FreshOpencodeState {
             // Drain-time fence re-validation (the user constraint): the
             // entry's captured pair is validated ATOMICALLY via the
             // lane's op guard — never a bare unlocked observe-then-act
-            // (the exact TOCTOU the guard's docs exist to close). FENCED
-            // entries only: an unfenced entry keeps the direct send
+            // (the exact TOCTOU the guard's docs exist to close). Fenced
+            // entries and checkpoint-intent entries are guarded; an ordinary unfenced entry keeps the direct send
             // path's parse-only tolerance (the queue re-enters the send
             // path; it is not stricter than the path it re-enters — the
             // no-laundering discipline binds the history-restructuring
             // lanes, not the append-a-turn send lane).
-            let op_guard = match send_fence {
-                None => None, // unfenced: direct-path tolerance
-                Some(fence) => {
-                    let op_id = format!("send-drain-{}", uuid::Uuid::new_v4());
-                    match crate::ownership_lane::arm_reclaimless_op_guard(
-                        &self.fresh_agent.ownership,
-                        PROVIDER,
-                        &real_id,
-                        &op_id,
-                        Some(fence),
-                        "freshopencode/send-drain",
-                    ) {
-                        crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
-                        crate::ownership_lane::LaneOpGuard::Unwired => None,
-                        crate::ownership_lane::LaneOpGuard::Refused { message } => {
-                            session.pending_sends.pop_front();
-                            tracing::warn!(target: "freshell_freshagent::opencode",
-                                session_id = %lookup_id, request_id = ?msg.request_id,
-                                observed_epoch = fence.epoch,
-                                observed_generation = fence.generation,
-                                "fresh_agent_send_drain_refused: ownership guard refused");
-                            self.send_error(&msg.request_id, "SESSION_RESERVED", &message);
-                            continue;
-                        }
+            let op_guard = if send_fence.is_some() || msg.checkpoint_intent.is_some() {
+                let op_id = format!("send-drain-{}", uuid::Uuid::new_v4());
+                match crate::ownership_lane::arm_reclaimless_op_guard(
+                    &self.fresh_agent.ownership,
+                    PROVIDER,
+                    &real_id,
+                    &op_id,
+                    send_fence,
+                    "freshopencode/send-drain",
+                ) {
+                    crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                    crate::ownership_lane::LaneOpGuard::Unwired => None,
+                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                        session.pending_sends.pop_front();
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %lookup_id, request_id = ?msg.request_id,
+                            observed_epoch = send_fence.map(|fence| fence.epoch),
+                            observed_generation = send_fence.map(|fence| fence.generation),
+                            "fresh_agent_send_drain_refused: ownership guard refused");
+                        self.send_error(&msg.request_id, "SESSION_RESERVED", &message);
+                        continue;
                     }
                 }
+            } else {
+                None // ordinary unfenced sends retain their direct-path tolerance
             };
             session.pending_sends.pop_front();
             self.send_locked(
@@ -10614,6 +10648,141 @@ mod tests {
                         && generation == before.generation + 1,
             ),
             "the fresh-agent owner stays authoritative at the bumped generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_send_with_stale_fence_is_refused_for_an_already_materialized_session() {
+        let (mut st, mut rx) = state_with_durable_serve_session().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        let initial = registry.observe(PROVIDER, DURABLE_ID);
+        let mut attach = attach_msg(DURABLE_ID);
+        attach.observed_epoch = Some(initial.epoch);
+        attach.observed_generation = Some(initial.generation);
+        st.handle_attach(attach).await;
+        let before = registry.observe(PROVIDER, DURABLE_ID);
+        assert!(matches!(
+            before.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            DURABLE_ID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-checkpoint-send-generation-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail(
+            PROVIDER,
+            DURABLE_ID,
+            "op-checkpoint-send-generation-bump",
+            generation,
+            true,
+        );
+        let after = registry.observe(PROVIDER, DURABLE_ID);
+        assert!(after.generation > before.generation);
+        assert!(matches!(
+            after.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg_fenced(
+            DURABLE_ID,
+            "delayed checkpoint prompt",
+            Some(before.epoch),
+            Some(before.generation),
+        );
+        send.request_id = Some("req-stale-checkpoint-opencode".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "stale-opencode-attempt".into(),
+            workspace: None,
+        });
+        st.handle_send(send).await;
+
+        let mut saw_reserved = false;
+        let mut saw_accepted = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).expect("event frame JSON");
+            saw_reserved |= frame.to_string().contains("SESSION_RESERVED");
+            saw_accepted |= frame.to_string().contains("freshAgent.send.accepted");
+        }
+        assert!(saw_reserved, "the stale owner fence is refused typed");
+        assert!(
+            !saw_accepted,
+            "the stale prompt is never accepted for dispatch"
+        );
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get(DURABLE_ID)
+            .cloned()
+            .expect("the resumed session remains mapped");
+        assert!(
+            session_arc.lock().await.turn_task.is_none(),
+            "a stale checkpoint prompt never starts a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_send_can_materialize_a_new_opencode_session() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-checkpoint-first-send"), None)
+            .await;
+        let placeholder = "freshopencode-req-checkpoint-first-send";
+        let observation = registry.observe(PROVIDER, placeholder);
+        let mut send = send_msg_fenced(
+            placeholder,
+            "first checkpoint prompt",
+            Some(observation.epoch),
+            Some(observation.generation),
+        );
+        send.request_id = Some("req-checkpoint-first-send-prompt".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "first-opencode-checkpoint-attempt".into(),
+            workspace: None,
+        });
+        st.handle_send(send).await;
+
+        let sessions = st.sessions.lock().await;
+        let session = sessions
+            .get(placeholder)
+            .expect("placeholder remains mapped after materialization")
+            .lock()
+            .await;
+        let durable_id = session
+            .real_session_id
+            .as_deref()
+            .expect("the checkpoint send materializes the provider session");
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        assert!(
+            session.turn_task.is_some(),
+            "the first prompt is dispatched"
+        );
+        let frames = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.contains("freshAgent.session.materialized")),
+            "the normal materialization event is emitted"
         );
     }
 

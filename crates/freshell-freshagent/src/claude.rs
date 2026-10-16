@@ -4321,6 +4321,19 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
+        // The checkpoint barrier can park this send while the captured
+        // workspace is saved. Parse and retain the pane's ownership fence so
+        // that a close, handoff, or reattach during that wait cannot redirect
+        // the delayed prompt to a different owner of the same session id.
+        let send_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    self.send_error(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
+
         // Task 10b: a durable claude UUID resolves through `cli_index` to the live
         // session -- no more SESSION_NOT_FOUND for a durable id the index maps.
         //
@@ -4368,6 +4381,35 @@ impl FreshClaudeState {
         // resolved before the teardown window serializes identically to one that
         // parked through it.
         let _turn = turn_lock.lock().await;
+        // Arm the coordinator guard only after the send has waited behind any
+        // earlier turn. A lifecycle transition during that wait advances the
+        // generation, so the captured fence is checked against the owner that
+        // will actually receive this prompt. Checkpointed sends always require
+        // the fence when the coordinator is wired; ordinary legacy sends keep
+        // their existing unfenced behavior, while any supplied fence is honored.
+        let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
+            let owner_key = self.resolve_ownership_key(&session_id);
+            match crate::ownership_lane::arm_reclaimless_op_guard(
+                &self.ownership,
+                PROVIDER,
+                &owner_key,
+                &format!("send-{}", uuid::Uuid::new_v4()),
+                send_fence,
+                "freshclaude/send",
+            ) {
+                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneOpGuard::Unwired => None,
+                crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        session_id = %session_id, request_id = ?request_id,
+                        "fresh_agent_send_refused: ownership guard refused");
+                    self.send_error(&request_id, "SESSION_RESERVED", &message);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if let Some(settings) = msg.settings.as_ref() {
             // kata z7j7: sandbox has NO claude-side concept — when it arrives on
             // a send, log observably (id + boolean flag only, never the prompt
@@ -4501,6 +4543,7 @@ impl FreshClaudeState {
             return;
         }
         drop(guard);
+        drop(ownership_guard);
 
         // Unified agent names (Task 4): the shared accepted-input callback —
         // the send reached the sidecar, so the user input is ACCEPTED. The
@@ -11594,6 +11637,125 @@ rl.on('line', (line) => {
         assert_eq!(attempt["requestId"], "request-7");
         assert_eq!(attempt["logicalAttemptId"], "attempt-7");
         assert!(checkpoint_attempt_for_send(&send_msg("legacy", "prompt")).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_delayed_send_with_stale_owner_fence_is_refused_before_dispatch() {
+        let (mut st, mut rx) = state_with_bus();
+        let session_id = "claude-send-stale-owner";
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fake_claude_session(&st, session_id).await;
+
+        let mut first_ticket = match crate::ownership_lane::begin_lane_claim(
+            &st.ownership,
+            PROVIDER,
+            session_id,
+            "test-send-owner-first",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("fixture: first send owner claim must be granted"),
+        };
+        assert!(crate::ownership_lane::commit_lane_claim(
+            &st.ownership,
+            &st.ownership_stamps,
+            Some(&st.broadcast_tx),
+            PROVIDER,
+            session_id,
+            &mut first_ticket,
+            session_id,
+            None,
+        )
+        .is_ok());
+        let old = registry.observe(PROVIDER, session_id);
+        let old_generation = old.generation;
+        let old_owner = match old.state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => owner,
+            other => panic!("fixture: first owner must be live: {other:?}"),
+        };
+        let old_operation = old_owner
+            .ownership_id
+            .clone()
+            .expect("the committed owner has an operation id");
+        registry.release(
+            PROVIDER,
+            session_id,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: old_operation,
+                generation: old_generation,
+                runtime: Some(old_owner),
+            },
+            "test",
+        );
+
+        let mut replacement_ticket = match crate::ownership_lane::begin_lane_claim(
+            &st.ownership,
+            PROVIDER,
+            session_id,
+            "test-send-owner-replacement",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("fixture: replacement send owner claim must be granted"),
+        };
+        assert!(crate::ownership_lane::commit_lane_claim(
+            &st.ownership,
+            &st.ownership_stamps,
+            Some(&st.broadcast_tx),
+            PROVIDER,
+            session_id,
+            &mut replacement_ticket,
+            session_id,
+            None,
+        )
+        .is_ok());
+        let current = registry.observe(PROVIDER, session_id);
+        assert!(current.generation > old_generation);
+
+        let mut send = send_msg(session_id, "delayed checkpoint prompt");
+        send.request_id = Some("stale-checkpoint-send".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "stale-checkpoint-attempt".into(),
+            workspace: None,
+        });
+        send.observed_epoch = Some(old.epoch);
+        send.observed_generation = Some(old_generation);
+        st.handle_send(send).await;
+
+        let mut frames: Vec<Value> = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            if let Ok(frame) = serde_json::from_str(&raw) {
+                frames.push(frame);
+            }
+        }
+        assert!(
+            frames.iter().any(|frame| {
+                frame.to_string().contains("SESSION_RESERVED")
+                    && frame.to_string().contains("stale")
+            }),
+            "the delayed send reports the stale owner fence: {frames:?}"
+        );
+        let sessions = st.sessions.lock().await;
+        let session = sessions
+            .get(session_id)
+            .expect("the old session stays mapped");
+        assert!(
+            !session.in_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale delayed prompt never arms a turn or reaches the sidecar"
+        );
+        assert!(
+            !session
+                .turn_tracker
+                .lock()
+                .expect("turn tracker mutex")
+                .busy(),
+            "a refused stale prompt leaves the turn tracker idle"
+        );
     }
 
     /// kata z7j7 (claude scope honesty): a settings-bearing send whose payload
