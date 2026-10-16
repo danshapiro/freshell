@@ -756,26 +756,26 @@ export async function runNativeFeasibility(args = process.argv.slice(2)): Promis
       try { await operation() } catch (error) { failures.push(error) }
     }
     try {
-    for (const owned of servers) {
-      await attempt(() => harness.writeArtifact(`${owned.scope}-server-output-private.json`, owned.server.capturedOutput()))
-      if (owned.pid === undefined) {
-        try { owned.pid = owned.server.processEvidence().pid } catch { /* Failed startup may have already joined its child. */ }
+      for (const owned of servers) {
+        await attempt(() => harness.writeArtifact(`${owned.scope}-server-output-private.json`, owned.server.capturedOutput()))
+        if (owned.pid === undefined) {
+          try { owned.pid = owned.server.processEvidence().pid } catch { /* Failed startup may have already joined its child. */ }
+        }
+        await attempt(() => owned.server.stop())
+        await attempt(() => {
+          const absent = owned.pid === undefined ? null : !fs.existsSync(`/proc/${owned.pid}`)
+          if (absent === false) failures.push(new Error('owned native server did not stop'))
+          harness.writeArtifact(`${owned.scope}-server-cleanup.json`, { pid: owned.pid, absent })
+        })
       }
-      await attempt(() => owned.server.stop())
-      await attempt(() => {
-        const absent = owned.pid === undefined ? null : !fs.existsSync(`/proc/${owned.pid}`)
-        if (absent === false) failures.push(new Error('owned native server did not stop'))
-        harness.writeArtifact(`${owned.scope}-server-cleanup.json`, { pid: owned.pid, absent })
+      await attempt(async () => {
+        const containers = new Set([...harness.transferOwnedIds().containers,
+          ...(harness.broker?.receipts() ?? []).map((receipt) => receipt.containerId)])
+        for (const containerId of containers) {
+          await attempt(async () => fs.writeFileSync(path.join(harness.evidenceDir, `native-container-${containerId}.log`),
+            await harness.containerLogs(containerId), { mode: 0o600 }))
+        }
       })
-    }
-    await attempt(async () => {
-      const containers = new Set([...harness.transferOwnedIds().containers,
-        ...(harness.broker?.receipts() ?? []).map((receipt) => receipt.containerId)])
-      for (const containerId of containers) {
-        await attempt(async () => fs.writeFileSync(path.join(harness.evidenceDir, `native-container-${containerId}.log`),
-          await harness.containerLogs(containerId), { mode: 0o600 }))
-      }
-    })
     } finally {
       await attempt(async () => {
         const cleanup = await harness.cleanup()
@@ -4137,15 +4137,32 @@ export async function executeManagedNativeApproval(input: {
   let cursor = 0
   const batches: unknown[] = []
   const observed: any[] = []
+  const readPage = async () => {
+    const batch = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
+      params: { soulId, afterSequence: cursor, maxEvents: 128 } })
+    batches.push(batch)
+    harness.writeArtifact(`${scenario}-approval-events-private.json`, batches)
+    if (batch.data.resetRequired) throw new Error(`native approval event retention reset (retained from ${batch.data.retainedFrom})`)
+    for (const row of batch.data.events) cursor = Math.max(cursor, row.sequence)
+    return batch
+  }
+  const readAvailable = async () => {
+    let batch = await readPage()
+    // Bound a snapshot to the journal head seen at its start, while consuming
+    // every delivered page. New producer activity cannot extend this forever.
+    const target = batch.data.head, events = [...batch.data.events]
+    while (cursor < target) {
+      const previous = cursor
+      batch = await readPage()
+      if (cursor <= previous) throw new Error('native approval event journal made no progress')
+      events.push(...batch.data.events)
+    }
+    return { ...batch, data: { ...batch.data, events } }
+  }
   const wait = async (select: (event: any) => boolean, label: string) => {
     const deadline = Date.now() + 90_000
     while (Date.now() < deadline) {
-      const batch = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
-        params: { soulId, afterSequence: cursor, maxEvents: 128 } })
-      batches.push(batch)
-      harness.writeArtifact(`${scenario}-approval-events-private.json`, batches)
-      if (batch.data.resetRequired) throw new Error(`native approval event retention reset (retained from ${batch.data.retainedFrom})`)
-      for (const row of batch.data.events) cursor = Math.max(cursor, row.sequence)
+      const batch = await readPage()
       const events = batch.data.events.map((row: any) => row.event)
       observed.push(...events)
       const found = events.find(select)
@@ -4248,10 +4265,8 @@ export async function executeManagedNativeApproval(input: {
       // Original dispatch acknowledgements precede this new event cursor.
       // An identical resolved decision may return its durable cached success;
       // only an actual new native dispatch would constitute replay.
-      const baseline = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
-        params: { soulId, afterSequence: cursor, maxEvents: 128 } })
+      const baseline = await readAvailable()
       harness.writeArtifact(`${scenario}-effect-recovery-event-baseline-private.json`, baseline)
-      cursor = baseline.data.head
       if (baseline.data.events.some((row: any) => row.event.kind === 'permission_requested')) {
         throw new Error('ambiguous effect revived a native permission callback')
       }
@@ -4275,7 +4290,7 @@ export async function executeManagedNativeApproval(input: {
       await inspect(recovery.data.view.containerId, 'native-edge-after-refused-input', true)
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000))
-    const current = await harness.adminOk(supervisor, { method: 'fresh_agent_read_events', params: { soulId, afterSequence: cursor, maxEvents: 128 } })
+    const current = await readAvailable()
     const cards = current.data.events.filter((row: any) => row.event.kind === 'permission_requested')
     if (input.decision === 'effect-before-observation' && current.data.events.some((row: any) =>
       row.event.kind === 'provider' && row.event.data.payload.event?.type === 'freshAgent.permission.dispatch')) {
@@ -4348,8 +4363,7 @@ export async function executeManagedNativeApproval(input: {
       throw new Error('changed native source/profile has no explicit recovery disposition')
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000))
-    const batch = currentView?.recoveryState === 'live' ? await harness.adminOk(supervisor, { method: 'fresh_agent_read_events',
-      params: { soulId, afterSequence: cursor, maxEvents: 128 } }) : null
+    const batch = currentView?.recoveryState === 'live' ? await readAvailable() : null
     harness.writeArtifact(`${scenario}-negative-native-disposition-private.json`, { recovery, replies, batch, effectCount: effectCount() })
     if (effectCount() !== 0 || batch?.data.events.some((row: any) => isCard(row.event))) {
       throw new Error('changed native source/profile replayed or revived the original operation')
