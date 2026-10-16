@@ -6818,6 +6818,46 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
+    async fn observe_opencode_readiness_identity(registry: &Registry, soul: &SoulId) {
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| &view.incarnation_id == context.prior_handle.incarnation_id())
+            .unwrap();
+        let launch = registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: view.incarnation_id,
+                launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: context.evidence_revision,
+                execution_generation: view.execution_generation,
+                requested_native_session_id: context.native_session_id.clone(),
+            })
+            .await
+            .unwrap();
+        registry
+            .record_native_identity_observation(
+                soul.clone(),
+                freshell_runtime_protocol::NativeIdentityObservation {
+                    native_session_id: context.native_session_id.clone().unwrap(),
+                    incarnation_id: launch.incarnation_id,
+                    launch_nonce: launch.launch_nonce,
+                    evidence_revision: launch.evidence_revision,
+                    source: freshell_runtime_protocol::NativeIdentitySource::OpencodeTui,
+                    evidence_digest: format!(
+                        "{:x}",
+                        Sha256::digest(b"synthetic scoped OpenCode readiness")
+                    ),
+                },
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
     async fn opencode_registry_readiness_commit_survives_process_crash_and_reopen() {
@@ -6862,6 +6902,9 @@ pub(crate) mod tests {
                 .expect("same synthetic launch must be recoverable after process death");
             assert!(replay.existing_request);
             assert_eq!(replay.incarnation_id.as_str(), descriptor.incarnation_id);
+            // Revalidate the current scoped loader observation after reopen,
+            // exactly as readiness retry requires for a genuine provider.
+            observe_opencode_readiness_identity(&registry, &soul_id).await;
 
             if point == "before_mark_running" {
                 assert_eq!(replay.state, LaunchState::Starting);
@@ -6933,7 +6976,7 @@ pub(crate) mod tests {
         let soul_id = SoulId::parse("soul-opencode-registry-crash").unwrap();
         let prepared = registry
             .prepare_launch(opencode_prep(
-                soul_id,
+                soul_id.clone(),
                 RequestId::parse("request-opencode-registry-crash").unwrap(),
                 &descriptor,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -6959,6 +7002,7 @@ pub(crate) mod tests {
             .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
             .await
             .unwrap();
+        observe_opencode_readiness_identity(&registry, &soul_id).await;
         if point == "before_mark_running" {
             unsafe {
                 libc::kill(libc::getpid(), libc::SIGKILL);
