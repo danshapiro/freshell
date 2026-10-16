@@ -59,16 +59,25 @@ export function createNativeCheckpointStore({ recordPath, transcriptPath, native
     delete proof.consumed
     return JSON.stringify(proof) === JSON.stringify(record.checkpoint)
   }
+  async function inputState() {
+    try {
+      const record = await read()
+      if (!record) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath, allowMissing: allowMissingTranscript,
+        parentFork, nativeSessionId }) ? 'blocked' : 'clear'
+      if (await consumed(record)) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath }) ? 'blocked' : 'clear'
+      return recoverable.has(record.phase) && await current(record) ? 'recoverable' : 'blocked'
+    } catch { return 'blocked' }
+  }
   return {
     disableParentFork: () => { if (parentFork) { parentFork = undefined; allowMissingTranscript = false } },
-    inputState: () => run(async () => {
-      try {
-        const record = await read()
-        if (!record) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath, allowMissing: allowMissingTranscript,
-          parentFork, nativeSessionId }) ? 'blocked' : 'clear'
-        if (await consumed(record)) return await nativeTranscriptHasDeferredOperation({ path: transcriptPath }) ? 'blocked' : 'clear'
-        return recoverable.has(record.phase) && await current(record) ? 'recoverable' : 'blocked'
-      } catch { return 'blocked' }
+    inputState: () => run(inputState),
+    setProfileDigest: (next) => run(async () => {
+      if (!/^[a-f0-9]{64}$/.test(next) || await inputState() !== 'clear') {
+        throw new Error('native checkpoint settings cannot change while an operation is pending')
+      }
+      // Only future operations use the new profile; never rewrite a journal
+      // record that binds an already pending operation to its original profile.
+      profileDigest = next
     }),
     publish: (toolUseID, inputDigest) => run(async () => {
       const checkpoint = await inspectNativeDeferredCheckpoint({ path: transcriptPath, nativeSessionId, toolUseID, inputDigest })
