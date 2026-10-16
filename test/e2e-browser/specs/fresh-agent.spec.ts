@@ -939,6 +939,22 @@ test.describe('Fresh Agent', () => {
   })
 
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    const creates: Array<Record<string, unknown>> = []
+    await page.routeWebSocket('**/ws', (socket) => {
+      const upstream = socket.connectToServer()
+      socket.onMessage((data) => {
+        const message = JSON.parse(String(data)) as Record<string, unknown>
+        if (message.type === 'freshAgent.create') {
+          creates.push(message)
+          return // Observe the actual client payload without launching a provider.
+        }
+        upstream.send(data)
+      })
+      upstream.onMessage((data) => socket.send(data))
+    })
+    // Routing applies to new sockets; reconnect before selecting the Fresh Agent.
+    await harness.forceDisconnect()
+    await harness.waitForConnection()
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
     await previewFreshclaudeDefaults(page)
@@ -948,9 +964,7 @@ test.describe('Fresh Agent', () => {
       effort: 'high',
     })
 
-    await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
-    await suppressFreshAgentNetworkForActivePane(page)
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await page.getByRole('option').first().click()
 
@@ -964,16 +978,15 @@ test.describe('Fresh Agent', () => {
     expect(thinkingOptions).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
     await expect(thinking).toHaveValue('high')
 
-    await expect.poll(async () => {
-      const sent = await harness.getSentWsMessages()
-      return sent.find((message: any) => message?.type === 'freshAgent.create') ?? null
-    }).toMatchObject({
+    await expect.poll(() => creates[0] ?? null).toMatchObject({
       type: 'freshAgent.create',
+      requestId: expect.any(String),
       sessionType: 'freshclaude',
       provider: 'claude',
       model: 'opus[1m]',
       effort: 'high',
     })
+    expect(creates).toHaveLength(1)
   })
 
   test('style setting persists per Fresh Agent pane type and applies serif rendering', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
