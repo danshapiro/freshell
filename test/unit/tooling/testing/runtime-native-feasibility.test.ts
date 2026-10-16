@@ -20,6 +20,7 @@ import { openCodeFreeAccessScript, dispatchNativeFeasibility, nativeFeasibilityC
   openCodeTuiSignalMetadata,
   executeManagedOpenCodeTuiReplacementFault,
   openCodeTuiOwnedStoreFault,
+  runNativeFeasibilityCli,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
   amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverStoreSnapshot, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
@@ -78,6 +79,81 @@ function createFixtureCheckout(directory: string): string {
 }
 
 describe('native tool failure recovery', () => {
+  it.each([false, true])('reports nested failures through the CLI with credentials redacted (evidence full=%s)', async evidenceFull => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-cli-failure-'))
+    const fixtureCommit = createFixtureCheckout(directory)
+    const manifest = path.join(directory, 'artifacts.json')
+    fs.writeFileSync(manifest, JSON.stringify({ candidateSha: fixtureCommit, imageDigest, artifacts: {
+      supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
+      host: { path: '/fixture/host', sha256: 'd'.repeat(64) },
+    }, sourceFiles: [] }))
+    const credential = 'dummy-cli-credential_"quoted"\nvalue'
+    vi.stubEnv('FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE', manifest)
+    vi.stubEnv('FRESHELL_NATIVE_TEST_API_KEY', credential)
+    vi.spyOn(process, 'cwd').mockReturnValue(directory)
+    const previousExitCode = process.exitCode
+    process.exitCode = undefined
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    let scratch: string | undefined
+    let executionAttempted = false
+    vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
+      scratch = this.testRoot; fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
+      return { supervisorPath: '/fixture/supervisor', hostPath: '/fixture/host', serverPath: '/fixture/server',
+        files: ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: 'codex/grants/' + suffix, path: manifest, sha256: 'e'.repeat(64) })) }
+    })
+    vi.spyOn(RuntimeHarness.prototype, 'startSupervisor').mockResolvedValue({} as never)
+    vi.spyOn(RustServer.prototype, 'start').mockImplementation(async () => {
+      executionAttempted = true
+      throw Object.assign(new Error(`distinctive CLI execution failure; configured credential ${credential}`), {
+        code: 'ECONNRESET', stdout: 'ordinary prompt: inspect the workspace', stderr: 'ordinary response: connection closed',
+      })
+    })
+    vi.spyOn(RustServer.prototype, 'processEvidence').mockReturnValue({ pid: 1_000_000_000 } as never)
+    vi.spyOn(RustServer.prototype, 'capturedOutput').mockReturnValue({} as never)
+    const write = vi.spyOn(RuntimeHarness.prototype, 'writeArtifact').mockImplementation(name => {
+      if (evidenceFull && executionAttempted) throw Object.assign(new Error(`ENOSPC: cannot write ${name}`), { code: 'ENOSPC' })
+      return name
+    })
+    const cleanupAttempts: string[] = []
+    vi.spyOn(RustServer.prototype, 'stop').mockImplementation(async () => {
+      cleanupAttempts.push('server')
+      throw new Error('distinctive CLI server cleanup failure')
+    })
+    vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockImplementation(async () => {
+      cleanupAttempts.push('harness')
+      return { ok: false, errors: ['distinctive CLI harness cleanup failure'] }
+    })
+    try {
+      await runNativeFeasibilityCli(['--provider', 'codex', '--case', 'native-turn'])
+      expect(process.exitCode).toBe(1)
+      expect(cleanupAttempts).toEqual(['server', 'harness'])
+      const output = stderr.mock.calls.map(([value]) => String(value)).join('')
+      expect(JSON.parse(output)).toMatchObject({ severity: 'error', event: 'runtime.native_feasibility.failed',
+        reason: 'native feasibility execution or cleanup failed' })
+      expect(output).toContain('distinctive CLI execution failure')
+      expect(output).toContain('ECONNRESET')
+      expect(output).toContain('ordinary prompt: inspect the workspace')
+      expect(output).toContain('ordinary response: connection closed')
+      expect(output).toContain('distinctive CLI server cleanup failure')
+      expect(output).toContain('distinctive CLI harness cleanup failure')
+      expect(output).toContain('[redacted]')
+      expect(output).not.toContain('dummy-cli-credential_')
+      if (evidenceFull) {
+        expect(output).toContain('ENOSPC')
+        for (const name of ['native-case-current-native-turn-failure.json', 'codex-current-native-turn-server-output-private.json',
+          'codex-current-native-turn-server-cleanup.json']) {
+          expect(write).toHaveBeenCalledWith(name, expect.anything())
+          expect(output).toContain(name)
+        }
+      }
+    } finally {
+      process.exitCode = previousExitCode
+      vi.restoreAllMocks(); vi.unstubAllEnvs()
+      if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it.each(['output-write', 'cleanup-write', 'output-read', 'stop', 'harness'] as const)(
     'joins owned cleanup and retains the run failure after %s fails', async fault => {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-cleanup-failure-'))
