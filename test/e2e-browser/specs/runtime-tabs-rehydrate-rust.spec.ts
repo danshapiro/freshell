@@ -433,9 +433,19 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(reloadReady.capabilities.managedRuntimeV1).toBe(true)
       const reloadLifecycle = () => sent.slice(reloadSentBaseline)
         .filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')
-      // Managed inventory restores this supervisor-owned pane. Legacy
-      // reconciliation and fresh allocation must remain absent on reload.
-      expect(reloadLifecycle()).toHaveLength(0)
+      const expectManagedReload = () => {
+        const frames = reloadLifecycle()
+        expect(frames.filter((frame) => frame.type === 'pane.reconcile.request')).toHaveLength(0)
+        const creates = frames.filter((frame) => frame.type === 'freshAgent.create')
+        expect(creates.length).toBeLessThanOrEqual(1)
+        for (const frame of creates) {
+          // The create protocol also rebinds an existing native reference;
+          // it must reuse this exact request and cannot allocate a new soul.
+          expect(frame).toMatchObject({ requestId: original.createRequestId, tabId: created.tabId, paneId: created.paneId,
+            provider: 'codex', sessionType: 'freshcodex', sessionRef: original.sessionRef })
+        }
+      }
+      expectManagedReload()
       await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible({ timeout: 60_000 })
       await expect(pane.getByText('deterministic fixture completion', { exact: true })).toBeVisible()
       await expect(composer).toBeDisabled()
@@ -453,11 +463,17 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const launches = ownership.launches
       expect(launches).toHaveLength(1)
       expect(launches[0].data).toMatchObject({ incarnationId: view.incarnationId, containerId: view.containerId, workerLaunchCount: 1 })
-      expect(reloadLifecycle()).toHaveLength(0)
+      expectManagedReload()
+      const settledReloadLifecycle = reloadLifecycle()
+      if (settledReloadLifecycle.some((frame) => frame.type === 'freshAgent.create')) {
+        const rebound = await waitForValue('existing managed bootstrap create acknowledgement', () => received.slice(reloadReceivedBaseline)
+          .find((frame) => frame.type === 'freshAgent.created' && frame.requestId === original.createRequestId), 30_000)
+        expect(rebound).toMatchObject({ sessionId: view.nativeSessionId, sessionRef: original.sessionRef })
+      }
       const historyEvidence = { source: 'owned provider-volume native history',
         wrongSource: 'coincident web-local native history', heldHost,
-        bootstrap: reloadLifecycle().find((frame) => frame.type === 'pane.reconcile.request') ?? null,
-        bootstrapCreates: reloadLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
+        bootstrap: settledReloadLifecycle.find((frame) => frame.type === 'pane.reconcile.request') ?? null,
+        bootstrapCreates: settledReloadLifecycle.filter((frame) => frame.type === 'freshAgent.create'),
         nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: (await fixtureState()),
         originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true }
       await rig.releaseRuntimeHost(rig.exactRuntimeHandle(view))
@@ -473,7 +489,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expectOriginalConversation()
       expect((await fixtureState())).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
-      expect(reloadLifecycle()).toHaveLength(0)
+      expectManagedReload()
+      expect(reloadLifecycle()).toHaveLength(settledReloadLifecycle.length)
       const { targetSoulRecoveries } = await rig.freshCodexSavedHistoryOwnershipFacts(rig.exactRuntimeHandle(view))
       expect(targetSoulRecoveries).toHaveLength(0)
       await rig.publishFreshCodexSavedHistoryPreservation(rig.exactRuntimeHandle(view), FreshCodexSavedHistoryPreservationSchema.parse({ ...historyEvidence,
