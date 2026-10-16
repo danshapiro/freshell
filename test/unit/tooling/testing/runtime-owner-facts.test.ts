@@ -3607,7 +3607,9 @@ describe('fixed owned saved-history preservation artifact', () => {
     const input: owner.FreshCodexSavedHistoryPreservation = { source: 'owned provider-volume native history',
       wrongSource: 'coincident web-local native history', heldHost: { containerId: current.containerId, incarnationId: current.incarnationId, pid: 42 },
       bootstrap: null,
-      bootstrapCreates: [], nativeSessionId: current.nativeSessionId, beforeHistory: observedState, afterReload: observedState,
+      bootstrapCreates: [{ type: 'freshAgent.create', requestId: 'request-owned', tabId: 'tab', paneId: 'pane',
+        provider: 'codex', sessionType: 'freshcodex', sessionRef: { provider: 'codex', sessionId: current.nativeSessionId } }],
+      nativeSessionId: current.nativeSessionId, beforeHistory: observedState, afterReload: observedState,
       originalIdentity: { sessionRef: { provider: 'codex', sessionId: current.nativeSessionId }, createRequestId: 'request-owned', soulId: current.soulId },
       managedLaunch: launch, bothSourcesUnchanged: true, observerWindow: { intervalMs: 60000, controllerReattachment, startupFinished,
         firstObservationNotBefore: 60100, holdRequestedAt: 103, heldAt: 104, releasedAt: 105, resumedAt: 106, targetSoulRecoveries: [] } }
@@ -3640,8 +3642,7 @@ describe('fixed owned saved-history preservation artifact', () => {
         }] },
       })).rejects.toThrow()
       await expect(rig.publishFreshCodexSavedHistoryPreservation(current, { ...input,
-        bootstrapCreates: [{ type: 'freshAgent.create', requestId: 'request-owned', tabId: 'tab', paneId: 'pane',
-          provider: 'codex', sessionType: 'freshcodex' }],
+        bootstrapCreates: [...input.bootstrapCreates, ...input.bootstrapCreates],
       })).rejects.toThrow()
       await expect(control({ runId: descriptor.runId, candidateSha: descriptor.candidateSha, scenarioId: 'browser-managed-runtime',
         operationId: 'foreign-history-preservation-path', action: 'freshcodex-history-preservation-artifact', handle: current,
