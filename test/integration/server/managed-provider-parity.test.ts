@@ -70,6 +70,7 @@ class TerminalWire {
   send(frame: unknown): void { this.socket.send(JSON.stringify(frame)) }
 
   recentFrames(): any[] { return this.frames.slice(-12) }
+  inputFailures(): any[] { return this.frames.filter(frame => frame.type === 'terminal.input.blocked' || frame.type === 'error') }
   terminalOutput(): string { return this.frames.filter(frame => frame.type === 'terminal.output').map(frame => frame.data).join('').slice(-4000) }
   recordRows(): RecordRow[] { return this.records }
 
@@ -483,6 +484,8 @@ describe('ordinary and managed terminal provider parity', () => {
         )))
       }
     }
+    const launch = observed.map(row => normalized(row))
+    const launchArgv = observed.map(row => [...row.argv])
     if (provider === 'claude') {
       const settings = observed.map(row => JSON.parse(row.argv[row.argv.indexOf('--settings') + 1]))
       expect(settings[0].hooks.SessionStart).toEqual(ordinaryClaudeSessionStart)
@@ -496,8 +499,20 @@ describe('ordinary and managed terminal provider parity', () => {
       expect(observed[1].argv.slice(0, 2)).toEqual(['-c', 'check_for_update_on_startup=false'])
       expect(observed[1].argv.filter((arg: string) => arg === 'check_for_update_on_startup=false')).toHaveLength(1)
       expect(observed[0].argv).not.toContain('check_for_update_on_startup=false')
+      // Ordinary Codex routes the model through its app-server plan; the
+      // durable route also supplies it to the TUI. Check that exact difference
+      // before comparing their common inputs. Keep both actual argument
+      // lists in the fixture receipt; do not hide model flags in normalized().
+      expect(launch[0].argv).not.toContain('--model')
+      const effortAt = launch[0].argv.indexOf('model_reasoning_effort="low"') - 1
+      expect(effortAt).toBeGreaterThanOrEqual(0)
+      expect(launch[1].argv).toEqual([
+        ...launch[0].argv.slice(0, effortAt), '--model', 'gpt-5.6-luna',
+        ...launch[0].argv.slice(effortAt),
+      ])
+      launch[1].argv = launch[0].argv
     }
-    expect(normalized(observed[1])).toEqual(normalized(observed[0]))
+    expect(launch[1]).toEqual(launch[0])
     if (provider === 'opencode') {
       const selected = JSON.parse(observed[1].tuiConfig)
       expect(selected.plugin, `managed TUI: ${observed[1].tuiConfig}; direct TUI: ${observed[0].tuiConfig}`).toContain('file://home-selected-tui.js')
@@ -585,9 +600,9 @@ describe('ordinary and managed terminal provider parity', () => {
         }
       })
       expect(rejectedCreate).toBeDefined()
-      const launch = observed.map(row => normalized(row))
       fs.writeFileSync(path.join(evidenceDir, `terminal-${provider}.json`), JSON.stringify({
         provider,
+        launchArgv,
         direct: { launch: launch[0], mcp: mcpResults[0], nativeIdentity: identities[0] ?? observed[0].nativeSession },
         managed: { launch: launch[1], mcp: mcpResults[1], nativeIdentity: identities[1] ?? observed[1].nativeSession },
         recovery: { replacementObserved: true, sameNativeSession: after.nativeSessionId === before.nativeSessionId },
@@ -710,7 +725,22 @@ describe('ordinary and managed terminal provider parity', () => {
     wire.send({ type: 'terminal.input', terminalId, data: `SELECT_SESSION ${switchedId}\r` })
     await wire.wait(frame => frame.type === 'terminal.session.associated'
       && frame.terminalId === terminalId && frame.sessionRef?.sessionId === switchedId, 30_000).catch(async error => {
-      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${Object.values(rig.web.capturedOutput()).join('\n').slice(-3000)}`)
+      const nativeDiagnostics = await rig.ownedProviderExec(before.containerId!, ['node', '-e', `
+        const fs = require('node:fs'), path = require('node:path')
+        const root = '/home/freshell/provider/.freshell/native-identity'
+        for (const nonce of fs.readdirSync(root)) {
+          const directory = path.join(root, nonce)
+          for (const file of fs.readdirSync(directory)) {
+            if (/^opencode-(loaded|refused)[.]json$/.test(file) || file === 'opencode-native-diagnostics') {
+              const selected = path.join(directory, file)
+              console.log(file, fs.statSync(selected).isDirectory()
+                ? fs.readdirSync(selected).map(name => [name, fs.readFileSync(path.join(selected, name), 'utf8')])
+                : fs.readFileSync(selected, 'utf8'))
+            }
+          }
+        }
+      `]).catch(diagnosticError => String(diagnosticError))
+      throw new Error(`${String(error)}; input failures: ${JSON.stringify(wire.inputFailures())}; native: ${nativeDiagnostics}; records: ${JSON.stringify(wire.recordRows())}; output: ${wire.terminalOutput()}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${Object.values(rig.web.capturedOutput()).join('\n').slice(-3000)}`)
     })
     await wire.wait(frame => frame.type === 'terminal.meta.updated'
       && frame.upsert?.some((row: any) => row.terminalId === terminalId && row.sessionId === switchedId), 30_000)

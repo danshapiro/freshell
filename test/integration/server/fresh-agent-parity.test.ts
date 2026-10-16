@@ -229,8 +229,11 @@ describe('hosted fresh-agent provider inputs', () => {
     const sendId = `send-${randomUUID()}`
     wire.send({ type: 'freshAgent.send', provider: row.provider, sessionType: row.sessionType,
       sessionId: created.sessionId, requestId: sendId, text: 'fixture prompt' })
+    const materialized = await wire.wait(frame => frame.type === 'freshAgent.session.materialized'
+      && frame.provider === row.provider && frame.previousSessionId === created.sessionId)
+    expect(materialized.sessionId).toBe(recorded.nativeSessionId)
     await wire.wait(frame => frame.type === 'freshAgent.turn.complete'
-      && frame.sessionId === created.sessionId)
+      && frame.provider === row.provider && frame.sessionId === materialized.sessionId)
 
     const resumeId = `resume-${randomUUID()}`
     wire.send({ type: 'freshAgent.create', requestId: resumeId,

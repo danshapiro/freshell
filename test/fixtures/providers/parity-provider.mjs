@@ -352,6 +352,41 @@ async function controlledOpenCodeTui(schemaPath, migrations) {
     .all(id).map(row => ({ ...JSON.parse(row.data), id: row.id, messageID: row.message_id, sessionID: row.session_id }))
   const messages = id => db.prepare('SELECT * FROM message WHERE session_id = ? ORDER BY time_created, id')
     .all(id).map(row => ({ info: { ...JSON.parse(row.data), id: row.id, sessionID: row.session_id }, parts: parts(row.id) }))
+  // Native input waits for the provider's health probe, SSE subscription and
+  // status snapshot. Serve those from the same store the TUI actually loads.
+  const { createServer } = await import('node:http')
+  const eventClients = new Set()
+  const sendJson = (res, value) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify(value))
+  }
+  const server = createServer((req, res) => {
+    const pathname = new URL(req.url, 'http://localhost').pathname
+    if (pathname === '/global/health') return sendJson(res, { healthy: true, version: '1.18.21' })
+    if (pathname === '/event' || pathname === '/global/event') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+      eventClients.add(res)
+      res.write(`data: ${JSON.stringify({ type: 'server.connected', properties: {} })}\n\n`)
+      req.on('close', () => eventClients.delete(res))
+      return
+    }
+    if (pathname === '/session/status') return sendJson(res, Object.fromEntries(
+      db.prepare('SELECT id FROM session').all().map(row => [row.id, { type: 'idle' }]),
+    ))
+    if (pathname === '/permission' || pathname === '/question') return sendJson(res, [])
+    if (pathname.startsWith('/session/')) {
+      const id = decodeURIComponent(pathname.slice('/session/'.length))
+      if (db.prepare('SELECT id FROM session WHERE id = ?').get(id)) return sendJson(res, get(id))
+    }
+    res.writeHead(404); res.end()
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(Number(argv[argv.indexOf('--port') + 1]), argv[argv.indexOf('--hostname') + 1], resolve)
+  })
+  const heartbeat = setInterval(() => {
+    for (const res of eventClients) res.write('data: {"type":"server.heartbeat","properties":{}}\n\n')
+  }, 10_000)
   const resume = argv.indexOf('--session')
   const selected = resume >= 0 ? argv[resume + 1] : null
   const route = { current: selected ? { name: 'session', params: { sessionID: selected } } : { name: 'home' },
@@ -413,7 +448,14 @@ async function controlledOpenCodeTui(schemaPath, migrations) {
       .run('prt_' + randomUUID().replaceAll('-', ''), message, id, now, now, JSON.stringify({ type: 'text', text: prompt }))
   })
   process.stdin.resume()
-  const dispose = () => { lifecycle.abort(); clearInterval(observation); db.close() }
+  const dispose = () => {
+    lifecycle.abort()
+    clearInterval(observation)
+    clearInterval(heartbeat)
+    for (const res of eventClients) res.end()
+    server.close()
+    db.close()
+  }
   process.once('exit', dispose)
 }
 
