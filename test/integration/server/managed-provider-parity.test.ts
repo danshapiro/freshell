@@ -648,6 +648,10 @@ describe('ordinary and managed terminal provider parity', () => {
     await waitFor('OpenCode native identity before web restart', () => wire.recordRows().find(row => (
       row.kind === 'identity' && row.terminalId === terminalId
     )))
+    await waitFor('OpenCode resume evidence before web restart', async () => {
+      const view = (await rig.inventory()).find((row: any) => row.terminalId === terminalId)
+      return view?.durabilityState === 'resume_captured' ? view : undefined
+    }, 45_000)
     const before = await waitFor('OpenCode container before web restart', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId ? view : undefined
