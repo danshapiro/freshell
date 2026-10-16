@@ -290,10 +290,21 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       let release!: () => void
       const held = new Promise<void>((resolve) => { release = resolve })
       let liveResponse: any
+      let diagnosticRouteId = 0
       await page.route('**/api/fresh-agent/threads/**', async (route) => {
+        const routeId = ++diagnosticRouteId
+        const internal = route as any
+        const originalHandled = internal._reportHandled.bind(internal)
+        internal._reportHandled = (done: boolean) => {
+          console.log(JSON.stringify({ event: 'held_history_route_handled', routeId, done, stack: new Error().stack }))
+          return originalHandled(done)
+        }
+        console.log(JSON.stringify({ event: 'held_history_route_entered', routeId }))
         const actual = await route.fetch()
         liveResponse = await actual.json()
+        console.log(JSON.stringify({ event: 'held_history_route_fetched', routeId, status: actual.status() }))
         await held
+        console.log(JSON.stringify({ event: 'held_history_route_released', routeId, handling: Boolean(internal._handlingPromise) }))
         await route.fulfill({ response: actual })
       })
       const baseline = sent.length

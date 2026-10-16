@@ -214,8 +214,10 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           // The fixture counter advances before its provider-history write.
           // The event follows that write, then the proxy sends its raw frame
           // with the pane's presentation ID. Match that wire ID before History.
-          return state.dispatchCount === 1 && state.completionCount === 1
-            && completedTurnSessionIds.has(createdSessionId) ? state : null
+          expect({ state, createdSessionId, nativeSessionId, completedTurnSessionIds: [...completedTurnSessionIds] })
+            .toMatchObject({ state: { dispatchCount: 1, completionCount: 1 },
+              completedTurnSessionIds: expect.arrayContaining([createdSessionId]) })
+          return state
         }))
         const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
           createdSessionId, nativeSessionId }
