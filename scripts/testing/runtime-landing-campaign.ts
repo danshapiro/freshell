@@ -36,7 +36,11 @@ import {
 import {
   loadCapabilityManifest,
   productionCertificationStatus,
+  certifiedDurableProviders,
+  releasedFreshAgentModes,
 } from './provider-certification.js'
+import { QUALIFICATION_PROVIDER_SELECTION_ENV } from './provider-qualification-selection.js'
+import { FRESH_AGENT_QUALIFICATION_MODES_ENV } from './fresh-agent-qualification-selection.js'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
@@ -151,12 +155,12 @@ const STEPS: Step[] = [
   defineCampaignProducerStep({
     id: 'fresh-agent-qualification',
     kind: 'producer',
-    title: 'Authentic hosted FreshClaude/Kilroy/FreshCodex/FreshOpenCode qualification',
+    title: 'Authentic hosted qualification for release-enabled fresh-agent modes',
     produces: [
       'FRESHELL_RUNTIME_PHASE3_FRESH_AGENT_RECEIPT',
       'FRESHELL_RUNTIME_PHASE5_FRESH_AGENT_RECEIPT',
     ],
-    qualificationModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'],
+    qualificationModes: releasedFreshAgentModes(capabilities).map(row => row.mode),
     explicitLiveOnly: true,
     requiredLiveEnv: 'FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE',
     runner: 'playwright',
@@ -186,9 +190,9 @@ const STEPS: Step[] = [
   defineCampaignProducerStep({
     id: 'managed-provider-qualification',
     kind: 'producer',
-    title: 'Combined Claude/Codex/OpenCode/Amplifier provider certification receipt',
+    title: 'Combined receipt for certified durable terminal providers',
     produces: ['FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT', 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT'],
-    qualificationProviders: ['claude', 'codex', 'opencode', 'amplifier'],
+    qualificationProviders: certifiedDurableProviders(capabilities),
     explicitLiveOnly: true,
     requiredLiveEnv: 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE',
     runner: 'playwright',
@@ -563,6 +567,10 @@ export async function runCampaign(args: readonly string[], options: CampaignRunn
         exitCode = 1
       } else {
         const producerEnvironment = { ...environment, ...receiptEnvironment }
+        if (parsed.scope === 'production') {
+          if (step.qualificationProviders) producerEnvironment[QUALIFICATION_PROVIDER_SELECTION_ENV] = step.qualificationProviders.join(',')
+          if (step.qualificationModes) producerEnvironment[FRESH_AGENT_QUALIFICATION_MODES_ENV] = step.qualificationModes.join(',')
+        }
         for (const name of step.produces.filter(isCanonicalPhase5BrowserReceipt)) delete producerEnvironment[name]
         exitCode = await step.run(producerEnvironment, logPath, execute)
       }

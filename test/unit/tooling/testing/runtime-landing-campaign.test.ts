@@ -3,7 +3,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { productionCertificationStatus, loadCapabilityManifest } from '../../../../scripts/testing/provider-certification.js'
+import { productionCertificationStatus, loadCapabilityManifest, certifiedDurableProviders, releasedFreshAgentModes,
+  classifyProviderCertificationCase, providerCertificationCaseId, resolveGateOutcome, DEFERRED_CASE_STATUS } from '../../../../scripts/testing/provider-certification.js'
 import { BROWSER_ORIGINAL_FILES, TABS_CASE_TITLES, validateBrowserOriginalIndex, validateProductionCampaignCoverage } from '../../../../scripts/testing/runtime-campaign-policy.js'
 import { ManagedExternalBrowserLifecycle, dispatchOwnedExternalBrowser } from '../../../../scripts/testing/runtime-external-browser.js'
 import * as providerEvidence from '../../../../scripts/testing/provider-qualification-receipt.js'
@@ -14,6 +15,8 @@ import * as soakEvidence from '../../../../scripts/testing/runtime-soak-evidence
 import * as parityEvidence from '../../../../scripts/testing/provider-parity-receipt.js'
 import { runCampaign } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import { defaultReceiptFileName } from '../../../../scripts/testing/runtime-receipts.js'
+import { parseQualificationProviderSelection, QUALIFICATION_PROVIDER_SELECTION_ENV } from '../../../../scripts/testing/provider-qualification-selection.js'
+import { parseFreshAgentQualificationModes, FRESH_AGENT_QUALIFICATION_MODES_ENV } from '../../../../scripts/testing/fresh-agent-qualification-selection.js'
 
 beforeEach(() => { vi.spyOn(console, 'log').mockImplementation(() => {}); vi.spyOn(console, 'error').mockImplementation(() => {}) })
 const roots: string[] = []
@@ -164,6 +167,13 @@ describe('actual campaign dispatch and outcome with fictional children', () => {
     expect(f.manifest()).toMatchObject({ selection: 'production', status: 'FAIL', qualifying: false, productionApproval: false,
       coverage: { complete: false } })
     expect(f.manifest().coverage.failures.some((failure: string) => failure.includes('attributable browser originals'))).toBe(true)
+    const managed = f.dispatches.find(row => row.args.includes('test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts'))!
+    const fresh = f.dispatches.find(row => row.args.includes('test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts'))!
+    const capabilities = loadCapabilityManifest(process.cwd())
+    expect(parseQualificationProviderSelection(managed.env[QUALIFICATION_PROVIDER_SELECTION_ENV] ?? ''))
+      .toEqual(certifiedDurableProviders(capabilities))
+    expect(parseFreshAgentQualificationModes(fresh.env[FRESH_AGENT_QUALIFICATION_MODES_ENV] ?? '', capabilities))
+      .toEqual(releasedFreshAgentModes(capabilities).map(row => row.mode))
   })
   it('preserves child failure despite positive adapter counts and receipts', async () => {
     const f = fixture()
@@ -351,8 +361,20 @@ describe('actual finalized browser publisher and independently loaded originals'
 // Isolate the already-owned native validators here: these cases prove campaign
 // composition over real filesystem/dispatcher originals, not native qualification.
 describe('complete finite campaign composition', () => {
-  async function completeFixture() {
+  async function completeFixture(declaredPolicy = false) {
     const f = fixture(), root = f.options.repoRoot, campaignRunId = randomUUID()
+    const capabilities = loadCapabilityManifest(process.cwd())
+    // The older all-provider fixture represents a hypothetical fully released policy.
+    // The declared-policy variant exercises today's producing classifications unchanged.
+    if (!declaredPolicy) {
+      Object.assign(capabilities.providers.find(row => row.provider === 'amplifier')!, {
+        managedEnabled: true, durableRecoveryEnabled: true, certificationState: 'certified',
+      })
+      capabilities.certification.productionGate.requiredCertifiedProviders.push('amplifier')
+      capabilities.freshAgentModes.find(row => row.mode === 'kilroy')!.enabledInReleaseScope = true
+    }
+    fs.mkdirSync(path.join(root, 'docs/development'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'docs/development/runtime-provider-capabilities.json'), JSON.stringify(capabilities))
     const empty = createHash('sha256').update('').digest('hex'), clean = { ...candidate, diffHash: empty, statusHash: empty }
     const runtimeImage = `sha256:${'b'.repeat(64)}`, browserImage = `sha256:${'c'.repeat(64)}`
     const provider = vi.spyOn(providerEvidence, 'validateProviderQualificationReceipt').mockImplementation(input => ({ providers: (input.receipt as any).providers } as any))
@@ -400,8 +422,8 @@ describe('complete finite campaign composition', () => {
             ? `.runtime-evidence/${candidate.sha}/${runId}/browser/${defaultReceiptFileName(name)}`
             : `.runtime-evidence/${candidate.sha}/campaigns/${campaignRunId}/receipts/${id}/${name.toLowerCase()}.json`
           const receipt = { status: 'PASS', candidateSha: candidate.sha, runtimeImage, receiptRunId: runId,
-            providers: (id === 'opencode-qualification' ? ['opencode'] : ['claude', 'codex', 'opencode', 'amplifier']).map(provider => ({ provider })),
-            rows: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'].map(mode => ({ mode })) }
+            providers: (id === 'opencode-qualification' ? ['opencode'] : certifiedDurableProviders(capabilities)).map(provider => ({ provider })),
+            rows: releasedFreshAgentModes(capabilities).map(row => ({ mode: row.mode })) }
           const digestSha256 = write(receiptPath, receipt)
           receipts[name] = { path: receiptPath, digestSha256, candidateSha: candidate.sha, campaignRunId, producerStepId: id }
           environment[name] = path.join(root, receiptPath)
@@ -427,22 +449,61 @@ describe('complete finite campaign composition', () => {
           status: 'PASS', exitCode: 0, blockedReason: null }
         const summaryPath = `.runtime-evidence/${candidate.sha}/${runId}/summary.json`
         const expectedCases = [...phase.cumulative_required_case_ids, ...manifest.certification_gates.provider_certification_case_ids, 'EVIDENCE-ARTIFACTS', 'EVIDENCE-CANDIDATE']
-        const summary = { gate: expected.gateId, phase: expected.phase, mode, status: 'PASS', blockedReason: null,
+        const caseResults = expectedCases.map(caseId => {
+          const provider = capabilities.providers.find(row => providerCertificationCaseId(row.provider) === caseId)
+          if (!provider) return { caseId, status: 'PASS' as const }
+          const classification = classifyProviderCertificationCase(mode, provider)
+          return { caseId, provider: provider.provider,
+            status: classification.status === 'REQUIRES_LIVE_RECEIPT' ? 'PASS' as const : classification.status,
+            ...(classification.reason ? { reason: classification.reason } : {}) }
+        })
+        const deferred = caseResults.filter(row => row.status === DEFERRED_CASE_STATUS).map(row => row.provider!)
+        const outcome = resolveGateOutcome({ mode, caseResults, expectedCaseIds: expectedCases, cleanupOk: true,
+          unsafeBrokerAttempts: 0, deferred, deferrableProviders: capabilities.certification.landingGate.deferrableProviders })
+        const summary = { gate: expected.gateId, phase: expected.phase, mode,
           candidateSha: candidate.sha, runId, campaign: { runId: campaignRunId, stepId: id }, imageRef: runtimeImage,
           requiredCases: phase.cumulative_required_case_ids, providerCertificationCases: manifest.certification_gates.provider_certification_case_ids,
-          caseResults: expectedCases.map(caseId => ({ caseId, status: 'PASS' })), cleanup: { ok: true, errors: [] }, unsafeDockerAttempts: [], failures: [],
+          ...outcome, deferredProviders: deferred, caseResults, cleanup: { ok: true, errors: [] }, unsafeDockerAttempts: [],
           missingArtifacts: [], invalidArtifacts: [], candidateIntegrity: { before: clean, after: clean, failures: [] } }
         for (const artifact of new Set<string>([...manifest.execution_contract.required_artifacts, ...phase.required_artifacts, ...manifest.certification_gates.required_artifacts])) {
           if (artifact === 'summary.json') continue
           write(`.runtime-evidence/${candidate.sha}/${runId}/${artifact.endsWith('/') ? artifact + 'fictional.json' : artifact}`, artifact.endsWith('.jsonl') ? '{}\n' : {})
         }
-        completedSteps.push({ ...base, kind: 'gate', logDigest: write(log, 'fictional gate completed'),
+        completedSteps.push({ ...base, outcome: outcome.status, exitCode: outcome.exitCode, failures: outcome.failures,
+          kind: 'gate', logDigest: write(log, 'fictional gate completed'),
           gate: { summaryPath, digestSha256: write(summaryPath, summary), runId, expected } })
       }
     }
     return { input: { selectedIds: ids, completedSteps, originals: { repoRoot: root, campaignRunId },
       candidate: { before: clean, after: clean }, images: { runtimeImage, browserImage } }, provider, fresh }
   }
+  it('accepts declared enabled rows and producer-authorized landing deferrals, while production remains blocked', async () => {
+    const f = await completeFixture(true)
+    const result = validateProductionCampaignCoverage(f.input)
+    expect(result.complete).toBe(false)
+    expect(result.failures.length).toBeGreaterThan(0)
+    expect(result.failures.every(failure => failure.startsWith('production-gate:'))).toBe(true)
+  })
+
+  it.each(['missing deferral', 'certified deferral', 'phase deferral', 'failed required case'])(
+    'rejects %s even beside an authorized landing deferral', async fault => {
+      const f = await completeFixture(true), input = f.input
+      const gate = input.completedSteps.find(step => step.id === 'landing-gate')!.gate
+      const target = path.join(input.originals.repoRoot, gate.summaryPath)
+      const summary = JSON.parse(fs.readFileSync(target, 'utf8'))
+      if (fault === 'missing deferral') summary.deferredProviders = []
+      if (fault === 'certified deferral') {
+        Object.assign(summary.caseResults.find((row: any) => row.caseId === 'PC-CODEX'), { status: DEFERRED_CASE_STATUS })
+        summary.deferredProviders.push('codex')
+      }
+      if (fault === 'phase deferral') Object.assign(summary.caseResults[0], { status: DEFERRED_CASE_STATUS, provider: 'amplifier' })
+      if (fault === 'failed required case') summary.caseResults[0].status = 'FAIL'
+      const bytes = JSON.stringify(summary)
+      fs.writeFileSync(target, bytes)
+      gate.digestSha256 = createHash('sha256').update(bytes).digest('hex')
+      expect(validateProductionCampaignCoverage(input).failures.some(failure => failure.startsWith('landing-gate:'))).toBe(true)
+    },
+  )
   it('composes all twelve actual original sets and invokes each existing qualification boundary', async () => {
     const f = await completeFixture()
     expect(validateProductionCampaignCoverage(f.input)).toEqual({ complete: true, failures: [] })
