@@ -244,12 +244,14 @@ mod tests {
     // other test's listener, which resets it. Keep the listener lifecycle
     // tests in this process isolated from one another for the full socket
     // lifetime. This affects test scheduling only, not production binding.
-    static LISTENER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static LISTENER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-    fn lock_listener_tests() -> std::sync::MutexGuard<'static, ()> {
-        LISTENER_TEST_LOCK
-            .lock()
-            .expect("listener test lock is not poisoned")
+    fn lock_listener_tests() -> tokio::sync::MutexGuard<'static, ()> {
+        LISTENER_TEST_LOCK.blocking_lock()
+    }
+
+    async fn lock_listener_tests_async() -> tokio::sync::MutexGuard<'static, ()> {
+        LISTENER_TEST_LOCK.lock().await
     }
 
     // Keep this listener until the controller's initial bind succeeds, then
@@ -295,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn serve_on_proves_bind_before_swapping_and_serves_traffic() {
         use axum::{routing::get, Router};
-        let _listener_test_guard = lock_listener_tests();
+        let _listener_test_guard = lock_listener_tests_async().await;
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
@@ -339,7 +341,7 @@ mod tests {
         // reports/V1.md): with notify_waiters and no barrier, 42-99/100 of
         // these iterations fail. Do NOT weaken this test.
         use axum::{routing::get, Router};
-        let _listener_test_guard = lock_listener_tests();
+        let _listener_test_guard = lock_listener_tests_async().await;
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
@@ -378,7 +380,7 @@ mod tests {
         use std::io::Write;
         use tokio::io::AsyncReadExt;
 
-        let _listener_test_guard = lock_listener_tests();
+        let _listener_test_guard = lock_listener_tests_async().await;
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
@@ -434,7 +436,7 @@ mod tests {
         use tokio::sync::{mpsc, watch};
         use tokio::time::timeout;
 
-        let _listener_test_guard = lock_listener_tests();
+        let _listener_test_guard = lock_listener_tests_async().await;
         let port_owner = reusable_loopback_listener();
         let port = port_owner
             .local_addr()
