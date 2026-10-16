@@ -15,6 +15,7 @@ import path from 'node:path'
 import { expect, type Page, type Browser } from '@playwright/test'
 
 import { providerNativeProfileMatches, type ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
+import { withOwnedCleanup } from '../../../scripts/testing/owned-cleanup.js'
 import { requireAmplifierOnecliBootstrap } from '../../../scripts/testing/runtime-amplifier-onecli.js'
 import {
   QUALIFICATION_PROVIDER_SELECTION_ENV,
@@ -590,107 +591,109 @@ test.describe.serial('ordinary managed-provider use', () => {
     test.setTimeout(3_600_000)
     let setupFailureStage: OrdinaryTerminalSetupFailureStage | null = 'provider_definitions'
     let rig: ReturnType<typeof createManagedRuntimeBrowserRig> | undefined
-    try {
-      const definitions = providerDefinitions()
-      setupFailureStage = 'runtime_construction'
-      rig = createManagedRuntimeBrowserRig(
-        process.cwd(),
-        5,
-        {},
-        { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
-        'release',
-        {
-          enabledProviders: definitions.map((definition) => definition.provider),
-          providerSettings: Object.fromEntries(definitions.map((definition) => [
-            definition.provider,
-            { model: definition.model, effort: definition.reasoningEffort },
-          ])),
-        },
-      )
-      setupFailureStage = 'runtime_start'
-      const info = await rig.start()
-      setupFailureStage = 'browser_script'
-      await page.addInitScript(buildTerminalOrdinaryTurnBrowserScript())
-      setupFailureStage = 'page_navigation'
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-      const harness = new TestHarness(page)
-      setupFailureStage = 'harness_ready'
-      await harness.waitForHarness()
-      setupFailureStage = 'connection_ready'
-      await harness.waitForConnection()
-      setupFailureStage = 'active_tab'
-      const tabId = await harness.getActiveTabId()
-      if (!tabId) throw new Error('ordinary provider smoke has no active tab')
+    await withOwnedCleanup(async () => {
+      try {
+        const definitions = providerDefinitions()
+        setupFailureStage = 'runtime_construction'
+        rig = createManagedRuntimeBrowserRig(
+          process.cwd(),
+          5,
+          {},
+          { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
+          'release',
+          {
+            enabledProviders: definitions.map((definition) => definition.provider),
+            providerSettings: Object.fromEntries(definitions.map((definition) => [
+              definition.provider,
+              { model: definition.model, effort: definition.reasoningEffort },
+            ])),
+          },
+        )
+        setupFailureStage = 'runtime_start'
+        const info = await rig.start()
+        setupFailureStage = 'browser_script'
+        await page.addInitScript(buildTerminalOrdinaryTurnBrowserScript())
+        setupFailureStage = 'page_navigation'
+        await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+        const harness = new TestHarness(page)
+        setupFailureStage = 'harness_ready'
+        await harness.waitForHarness()
+        setupFailureStage = 'connection_ready'
+        await harness.waitForConnection()
+        setupFailureStage = 'active_tab'
+        const tabId = await harness.getActiveTabId()
+        if (!tabId) throw new Error('ordinary provider smoke has no active tab')
 
-      setupFailureStage = null
-      for (const definition of definitions) {
-        let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
-        let paneSetupStage: ProviderPaneSetupStage | null = null
-        try {
-          const onPaneCreationTimeout = definition.provider === 'codex'
-            ? (target: { terminalId: string | null; createRequestId: string | null }) => (
-              reportPaneCreationProbe(harness, rig!, target)
-            )
-            : undefined
-          const onManagedViewTimeout = definition.provider === 'codex'
-            ? async ({ terminalId, createRequestId }: { terminalId: string; createRequestId: string }) => {
-              try {
-                const [sentMessages, receivedMessages] = await Promise.all([
-                  harness.getSentWsMessages(), harness.getReceivedWsMessages(),
-                ])
-                let inventoryRead: 'ok' | 'failed' = 'failed'
-                let inventory: unknown
+        setupFailureStage = null
+        for (const definition of definitions) {
+          let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
+          let paneSetupStage: ProviderPaneSetupStage | null = null
+          try {
+            const onPaneCreationTimeout = definition.provider === 'codex'
+              ? (target: { terminalId: string | null; createRequestId: string | null }) => (
+                reportPaneCreationProbe(harness, rig!, target)
+              )
+              : undefined
+            const onManagedViewTimeout = definition.provider === 'codex'
+              ? async ({ terminalId, createRequestId }: { terminalId: string; createRequestId: string }) => {
                 try {
-                  inventory = await rig!.inventory()
-                  inventoryRead = 'ok'
-                } catch { /* retain the create observation when owner inventory is unavailable */ }
-                const probe = projectManagedViewProbe({ terminalId, createRequestId, provider: 'codex',
-                  sentMessages, receivedMessages, inventoryRead, inventory })
-                console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.managed_view_probe',
-                  lane: 'terminal', provider: 'codex', probe }))
-              } catch { /* diagnostic failures must preserve the managed-view timeout */ }
+                  const [sentMessages, receivedMessages] = await Promise.all([
+                    harness.getSentWsMessages(), harness.getReceivedWsMessages(),
+                  ])
+                  let inventoryRead: 'ok' | 'failed' = 'failed'
+                  let inventory: unknown
+                  try {
+                    inventory = await rig!.inventory()
+                    inventoryRead = 'ok'
+                  } catch { /* retain the create observation when owner inventory is unavailable */ }
+                  const probe = projectManagedViewProbe({ terminalId, createRequestId, provider: 'codex',
+                    sentMessages, receivedMessages, inventoryRead, inventory })
+                  console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.managed_view_probe',
+                    lane: 'terminal', provider: 'codex', probe }))
+                } catch { /* diagnostic failures must preserve the managed-view timeout */ }
+              }
+              : undefined
+            created = await createProviderPane(page, harness, rig, tabId, definition,
+              stage => { paneSetupStage = stage }, onPaneCreationTimeout, onManagedViewTimeout)
+            if (definition.provider === 'amplifier') {
+              throw new Error('Amplifier is excluded from the ordinary terminal smoke')
             }
-            : undefined
-          created = await createProviderPane(page, harness, rig, tabId, definition,
-            stage => { paneSetupStage = stage }, onPaneCreationTimeout, onManagedViewTimeout)
-          if (definition.provider === 'amplifier') {
-            throw new Error('Amplifier is excluded from the ordinary terminal smoke')
+            await executeAndAwaitOrdinaryTurn(page, created.paneId, created.terminalId, definition.provider)
+            console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
+              lane: 'terminal', provider: definition.provider }))
+          } catch (error) {
+            let terminalFacts: { available: false } | {
+              available: true; provider: string; providerProcessPresent: boolean; nativeSessionIdPresent: boolean
+            } = { available: false }
+            if (created?.view.containerId) {
+              try {
+                const startup = await rig.managedTerminalStartupFacts(rig.runtimeEnclosureHandle(created.view))
+                terminalFacts = { available: true, provider: startup.provider,
+                  providerProcessPresent: startup.providerProcessPresent, nativeSessionIdPresent: !!created.view.nativeSessionId }
+              } catch { /* preserve the ordinary-turn failure */ }
+            }
+            console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
+              lane: 'terminal', provider: definition.provider,
+              errorName: error instanceof Error ? error.name : 'UnknownError', terminalFacts,
+              paneSetupFailureStage: created ? null : paneSetupStage,
+              ordinaryTurnFailureStage: error instanceof OrdinaryTerminalTurnError ? error.stage : null,
+              ordinaryTurnFacts: error instanceof OrdinaryTerminalTurnError ? error.facts : null }))
+            throw error
           }
-          await executeAndAwaitOrdinaryTurn(page, created.paneId, created.terminalId, definition.provider)
-          console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
-            lane: 'terminal', provider: definition.provider }))
-        } catch (error) {
-          let terminalFacts: { available: false } | {
-            available: true; provider: string; providerProcessPresent: boolean; nativeSessionIdPresent: boolean
-          } = { available: false }
-          if (created?.view.containerId) {
-            try {
-              const startup = await rig.managedTerminalStartupFacts(rig.runtimeEnclosureHandle(created.view))
-              terminalFacts = { available: true, provider: startup.provider,
-                providerProcessPresent: startup.providerProcessPresent, nativeSessionIdPresent: !!created.view.nativeSessionId }
-            } catch { /* preserve the ordinary-turn failure */ }
-          }
-          console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
-            lane: 'terminal', provider: definition.provider,
-            errorName: error instanceof Error ? error.name : 'UnknownError', terminalFacts,
-            paneSetupFailureStage: created ? null : paneSetupStage,
-            ordinaryTurnFailureStage: error instanceof OrdinaryTerminalTurnError ? error.stage : null,
-            ordinaryTurnFacts: error instanceof OrdinaryTerminalTurnError ? error.facts : null }))
-          throw error
         }
+      } catch (error) {
+        if (setupFailureStage !== null) {
+          console.info(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_setup_failed',
+            lane: 'terminal', stage: setupFailureStage }))
+        }
+        throw error
       }
-    } catch (error) {
-      if (setupFailureStage !== null) {
-        console.info(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_setup_failed',
-          lane: 'terminal', stage: setupFailureStage }))
-      }
-      throw error
-    } finally {
+    }, async () => {
       if (rig) {
         const cleanup = await rig.stop()
-        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+        if (!cleanup.ok) throw new Error(cleanup.errors.join('\n') || 'Owned runtime cleanup failed')
       }
-    }
+    })
   })
 })
 

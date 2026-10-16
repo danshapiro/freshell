@@ -4,6 +4,7 @@
  * allowlist is parsed before the RuntimeHarness (and therefore Docker) exists.
  */
 import { randomBytes } from 'node:crypto'
+import { withOwnedCleanup } from '../../../scripts/testing/owned-cleanup.js'
 
 import { expect, type Page } from '@playwright/test'
 
@@ -439,8 +440,8 @@ test.describe.serial('ordinary fresh-agent use', () => {
         effort: row.effort === 'provider-default' ? undefined : row.effort,
       }])),
     })
-    const wire = await observeFreshAgentBrowserWire(page)
-    try {
+    await withOwnedCleanup(async () => {
+      const wire = await observeFreshAgentBrowserWire(page)
       const info = await rig.start()
       process.env.FRESHELL_URL = info.baseUrl
       process.env.FRESHELL_TOKEN = info.token
@@ -543,9 +544,9 @@ test.describe.serial('ordinary fresh-agent use', () => {
           throw error
         }
       }
-    } finally {
+    }, async () => {
       const cleanup = await rig.stop()
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
-    }
+      if (!cleanup.ok) throw new Error(cleanup.errors.join('\n') || 'Owned runtime cleanup failed')
+    })
   })
 })

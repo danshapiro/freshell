@@ -2,6 +2,7 @@ import parser from '@typescript-eslint/parser'
 import plugin from '@typescript-eslint/eslint-plugin'
 
 const managed = [
+  "scripts/testing/owned-cleanup.ts",
   "test/e2e-browser/helpers/selection-nonvacuity.test.ts",
   "test/e2e-browser/helpers/managed-runtime.ts",
   "test/e2e-browser/helpers/external-managed-runtime.ts",

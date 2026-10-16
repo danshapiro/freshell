@@ -26,6 +26,7 @@ vi.mock('../../../e2e-browser/helpers/fixtures.js', () => ({
 
 import { runSelectedProviderQualification } from '../../../../scripts/testing/runtime-provider-qualification.js'
 import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/runtime-fresh-agent-qualification.js'
+import { withOwnedCleanup } from '../../../../scripts/testing/owned-cleanup.js'
 import { projectManagedViewProbe } from '../../../../scripts/testing/managed-view-probe.js'
 import { NativeRecoveryValidationError } from '../../../../scripts/testing/qualification-observations.js'
 
@@ -81,6 +82,72 @@ beforeEach(async () => {
 
 afterEach(async () => {
   if (fixtureRepoRoot) await fsp.rm(fixtureRepoRoot, { recursive: true, force: true })
+})
+
+describe('ordinary smoke failure cleanup', () => {
+  it('awaits owned cleanup before returning the operation result', async () => {
+    const resource = { released: false }
+    const operation = vi.fn().mockResolvedValue(resource)
+    const cleanup = vi.fn(async () => { resource.released = true })
+    await expect(withOwnedCleanup(operation, cleanup)).resolves.toBe(resource)
+    expect(resource.released).toBe(true)
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('keeps cleanup failure fatal when the operation succeeds', async () => {
+    const failure = new Error('owned cleanup failed after a successful turn')
+    const cleanup = vi.fn().mockRejectedValue(failure)
+    await expect(withOwnedCleanup(async () => 'completed turn', cleanup)).rejects.toBe(failure)
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('preserves the exact operation error when cleanup succeeds', async () => {
+    const failure = new Error('provider turn failed', { cause: new Error('provider unavailable') })
+    const cleanup = vi.fn().mockResolvedValue(undefined)
+    await expect(withOwnedCleanup(async () => { throw failure }, cleanup)).rejects.toBe(failure)
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  for (const lane of ['terminal', 'fresh-agent'] as const) {
+    for (const cleanupKind of ['rejection', 'failed settlement'] as const) {
+      it(`${lane} retains the original startup error when cleanup returns ${cleanupKind}`, async () => {
+        await import('../../../e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.js')
+        await import('../../../e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.js')
+        const title = lane === 'terminal'
+          ? 'each selected terminal provider completes one ordinary turn'
+          : 'each selected fresh-agent mode completes one ordinary turn'
+        const callback = registeredManagedBrowserCases.get(title)
+        if (!callback) throw new Error('actual ordinary smoke callback was not registered')
+        vi.stubEnv('FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS', 'codex')
+        vi.stubEnv('FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES', 'freshcodex')
+        const rootCause = new Error('provider connection was refused')
+        const primary = new Error('provider startup failed', { cause: rootCause })
+        const primaryStack = primary.stack
+        const cleanupFailure = new Error('owned enclosure cleanup failed')
+        const start = vi.fn().mockRejectedValue(primary)
+        const stop = cleanupKind === 'rejection'
+          ? vi.fn().mockRejectedValue(cleanupFailure)
+          : vi.fn().mockResolvedValue({ ok: false, errors: [cleanupFailure.message] })
+        const factory = vi.spyOn(managedBrowser, 'createManagedRuntimeBrowserRig').mockReturnValue({ start, stop } as any)
+        const page = { exposeBinding: vi.fn(), addInitScript: vi.fn() }
+        try {
+          const failure = await Reflect.apply(callback, undefined, [{ page }]).catch((error: unknown) => error)
+          expect(start).toHaveBeenCalledOnce()
+          expect(stop).toHaveBeenCalledOnce()
+          expect(failure).toBeInstanceOf(AggregateError)
+          expect(failure.cause).toBe(primary)
+          expect(failure.cause.cause).toBe(rootCause)
+          expect(failure.cause.stack).toBe(primaryStack)
+          expect(failure.errors[0]).toBe(primary)
+          expect(failure.message).toContain(cleanupFailure.message)
+          if (cleanupKind === 'rejection') expect(failure.errors[1]).toBe(cleanupFailure)
+        } finally {
+          factory.mockRestore()
+          vi.unstubAllEnvs()
+        }
+      })
+    }
+  }
 })
 
 describe('managed browser producers', () => {
