@@ -6,11 +6,17 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
+import { resolvePinnedRustCommand } from './rust-toolchain.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
 export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
 export const CONTROL_PROTOCOL_VERSION = 1
+
+export function phase2RuntimeImageBuildTag(runId: string): string {
+  const runSuffix = createHash('sha256').update(runId).digest('hex').slice(0, 32)
+  return `${PHASE2_RUNTIME_IMAGE_TAG}-${runSuffix}`
+}
 
 export type RuntimeLimits = {
   cpuMilli: number
@@ -141,6 +147,7 @@ export class RuntimeHarness {
   private readonly trackedVolumes = new Set<string>()
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
+  private runtimeBuildImageTag: string | undefined
 
   constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1) {
     this.repoRoot = fs.realpathSync(repoRoot)
@@ -257,6 +264,15 @@ export class RuntimeHarness {
     if (this.brokerStarted) {
       try { await this.broker.close() } catch (error) { errors.push(`broker close: ${String(error)}`) }
       this.brokerStarted = false
+    }
+    if (this.runtimeBuildImageTag) {
+      try {
+        const inspect = spawnSync('docker', ['image', 'inspect', this.runtimeBuildImageTag], { encoding: 'utf8' })
+        if (inspect.status === 0) docker(['image', 'rm', this.runtimeBuildImageTag])
+      } catch (error) {
+        errors.push(`runtime image ${this.runtimeBuildImageTag}: ${String(error)}`)
+      }
+      this.runtimeBuildImageTag = undefined
     }
     // Build copies are unique to this run, so retries/concurrent gates never
     // overwrite an executable that another still-running container/process
@@ -1017,7 +1033,8 @@ export class RuntimeHarness {
   }
 
   private ensureRuntimeImage(): void {
-    const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : PHASE2_RUNTIME_IMAGE_TAG
+    const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : phase2RuntimeImageBuildTag(this.runId)
+    if (this.phase >= 2) this.runtimeBuildImageTag = tag
     let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
     if (this.phase === 1) {
       if (inspect.status !== 0) {
@@ -1074,8 +1091,8 @@ export class RuntimeHarness {
 
   private buildBinaries(): void {
     fs.mkdirSync(this.buildDir, { recursive: true })
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
+    const rust = resolvePinnedRustCommand()
+    execFileSync(rust.executable, [...rust.prefixArgs, 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
     this.testSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-test')
     this.testHostBinary = path.join(this.buildDir, 'freshell-session-host-test')
     fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-supervisor'), this.testSupervisorBinary)
@@ -1083,7 +1100,7 @@ export class RuntimeHarness {
     fs.chmodSync(this.testSupervisorBinary, 0o755)
     fs.chmodSync(this.testHostBinary, 0o755)
 
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, stdio: 'inherit' })
+    execFileSync(rust.executable, [...rust.prefixArgs, 'cargo', 'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, stdio: 'inherit' })
     this.releaseSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-release')
     this.releaseHostBinary = path.join(this.buildDir, 'freshell-session-host-release')
     fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-supervisor'), this.releaseSupervisorBinary)
@@ -1112,8 +1129,8 @@ export class RuntimeHarness {
   }
 
   private collectBuildInfo(): unknown {
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    const rustc = execFileSync(mise, ['exec', 'rust@1.96', '--', 'rustc', '--version'], { encoding: 'utf8' }).trim()
+    const rust = resolvePinnedRustCommand()
+    const rustc = execFileSync(rust.executable, [...rust.prefixArgs, 'rustc', '--version'], { encoding: 'utf8' }).trim()
     return {
       candidateSha: this.candidateSha,
       runtimeImage: this.imageRef,
@@ -1168,10 +1185,34 @@ function dockerIsRootless(): boolean {
 }
 
 export function dockerSocketPath(): string {
-  const configured = process.env.DOCKER_HOST
-  if (configured?.startsWith('unix://')) return configured.slice('unix://'.length)
-  if (configured?.startsWith('unix:')) return configured.slice('unix:'.length)
-  return path.join('/run/user', String(process.getuid?.() ?? 1000), 'docker.sock')
+  const configured = process.env.DOCKER_HOST?.trim()
+  const contextHost = configured
+    ? undefined
+    : docker(['context', 'inspect', '--format', '{{(index .Endpoints "docker").Host}}']).trim()
+  return selectDockerSocketPath(configured, contextHost)
+}
+
+export function selectDockerSocketPath(
+  configuredHost: string | undefined,
+  contextHost: string | undefined,
+): string {
+  const endpoint = configuredHost?.trim() || contextHost?.trim()
+  if (!endpoint) {
+    throw new Error('Runtime parity tests could not determine the Docker endpoint from DOCKER_HOST or the active context.')
+  }
+
+  const socketPath = endpoint.startsWith('unix://')
+    ? endpoint.slice('unix://'.length)
+    : endpoint.startsWith('unix:')
+      ? endpoint.slice('unix:'.length)
+      : undefined
+  if (!socketPath?.startsWith('/')) {
+    throw new Error(
+      `Runtime parity tests require a Unix Docker socket; Docker endpoint was ${JSON.stringify(endpoint)}. `
+      + 'Set DOCKER_HOST to unix:///path/to/docker.sock or select a context with a Unix socket.',
+    )
+  }
+  return socketPath
 }
 
 function docker(args: string[]): string {

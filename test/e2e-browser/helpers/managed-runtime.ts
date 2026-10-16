@@ -11,6 +11,7 @@ import {
   type ProviderQualificationRow,
 } from '../../../scripts/testing/provider-qualification-receipt.js'
 import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
+import { resolvePinnedRustCommand } from '../../../scripts/testing/rust-toolchain.js'
 import { RustServer } from './rust-server.js'
 import type { TestServerInfo } from './test-server.js'
 import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
@@ -508,10 +509,10 @@ export class ManagedRuntimeBrowserRig {
   }
 
   private buildManagedServer(): string {
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
+    const rust = resolvePinnedRustCommand()
     const qualification = this.pendingQualificationProviders()
-    execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
+    execFileSync(rust.executable, [
+      ...rust.prefixArgs, 'cargo', 'build', '--release', '-p', 'freshell-server',
       '--features', this.fixtureFreshAgentModes.length > 0
         ? 'managed-fresh-agent-fixtures'
         : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
@@ -525,9 +526,9 @@ export class ManagedRuntimeBrowserRig {
 
   private buildQualificationSupervisor(): string | undefined {
     if (this.pendingQualificationProviders().length === 0) return undefined
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
+    const rust = resolvePinnedRustCommand()
+    execFileSync(rust.executable, [
+      ...rust.prefixArgs, 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
       '--features', 'provider-qualification',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
