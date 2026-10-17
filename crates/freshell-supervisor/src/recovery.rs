@@ -10822,47 +10822,25 @@ pub(crate) mod automatic_retry_tests {
                     .is_some_and(|r| r.contains("RETRY_BUDGET"))));
     }
 
-    #[test]
-    fn reserved_retry_recovers_exited_worker_in_running_enclosure() {
-        reserved_exited_worker_retry_case(false, true);
+    #[tokio::test]
+    async fn reserved_retry_recovers_exited_worker_in_running_enclosure() {
+        Box::pin(reserved_exited_worker_retry_case(false, true)).await;
     }
 
-    #[test]
-    fn reserved_retry_recovers_exited_worker_after_backend_outage() {
-        reserved_exited_worker_retry_case(true, true);
+    #[tokio::test]
+    async fn reserved_retry_recovers_exited_worker_after_backend_outage() {
+        Box::pin(reserved_exited_worker_retry_case(true, true)).await;
     }
 
-    #[test]
-    fn reserved_retry_recovers_exited_worker_without_saved_proof() {
-        reserved_exited_worker_retry_case(false, false);
+    #[tokio::test]
+    async fn reserved_retry_recovers_exited_worker_without_saved_proof() {
+        Box::pin(reserved_exited_worker_retry_case(false, false)).await;
     }
 
-    fn reserved_exited_worker_retry_case(prior_backend_outage: bool, saved_proof: bool) {
-        // The complete running-host recovery path exceeds libtest's small
-        // default stack in debug builds. Optimized verification deliberately
-        // uses the ordinary 2 MiB stack; failed assertions propagate via join.
-        std::thread::Builder::new()
-            .name("reserved-native-retry".into())
-            .stack_size(if cfg!(debug_assertions) { 16 } else { 2 } * 1024 * 1024)
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(Box::pin(run_reserved_exited_worker_retry_case(
-                        prior_backend_outage,
-                        saved_proof,
-                    )));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    async fn run_reserved_exited_worker_retry_case(prior_backend_outage: bool, saved_proof: bool) {
+    async fn reserved_exited_worker_retry_case(prior_backend_outage: bool, saved_proof: bool) {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, clock) = open(dir.path(), 0);
-        let soul = seed(&supervisor).await;
+        let soul = Box::pin(seed(&supervisor)).await;
         let before = supervisor
             .registry
             .recovery_context(soul.clone())
@@ -10905,7 +10883,7 @@ pub(crate) mod automatic_retry_tests {
 
         if prior_backend_outage {
             backend.unavailable(true);
-            let report = supervisor.reconcile_startup().await.unwrap();
+            let report = Box::pin(supervisor.reconcile_startup()).await.unwrap();
             assert_eq!(report.results.len(), 1);
             assert_eq!(report.results[0].outcome, Some(RecoveryOutcome::Blocked));
             assert_eq!(due(dir.path()), Some(2_000));
