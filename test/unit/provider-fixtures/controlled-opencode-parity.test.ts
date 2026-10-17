@@ -9,7 +9,10 @@ import { writeProviderParityEnvironment } from '../../helpers/provider-parity-en
 
 const root = path.resolve(import.meta.dirname, '../../..')
 
-it.each(['file', 'package'])('the copied OpenCode fixture loads a selected %s TUI and its native store', form => {
+it.each([
+  { form: 'file', format: 'json' }, { form: 'package', format: 'json' },
+  { form: 'file', format: 'jsonc' }, { form: 'package', format: 'jsonc' },
+])('the copied OpenCode fixture loads a selected $form TUI from $format and its native store', ({ form, format }) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-controlled-opencode-'))
   try {
     const workspace = path.join(directory, 'workspace')
@@ -48,8 +51,11 @@ export default { tui(api) {
 } };
 `)
     writeProviderParityEnvironment(path.join(home, '.config/opencode'), 'plugins/parity-environment')
-    const tui = path.join(directory, 'tui.json')
-    fs.writeFileSync(tui, JSON.stringify({ plugin: [pathToFileURL(form === 'file' ? entry : packageRoot).href] }))
+    const tui = path.join(directory, `tui.${format}`)
+    const spec = pathToFileURL(form === 'file' ? entry : packageRoot).href
+    fs.writeFileSync(tui, format === 'jsonc'
+      ? `{ // changed while web is down\n "plugin": [${JSON.stringify(spec)},],\n}`
+      : JSON.stringify({ plugin: [spec] }))
     const wrapper = path.join(workspace, 'parity-opencode')
     fs.writeFileSync(wrapper, "import './parity-provider.mjs'\n")
     const result = spawnSync(process.execPath, ['--experimental-transform-types', wrapper,

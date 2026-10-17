@@ -454,15 +454,16 @@ const opencodePinnedMigrations = [
   "20260622202450_simplify_session_input"
 ]
 
-async function controlledOpenCodeTui(schemaPath, migrations, resolveTuiEntry) {
+async function controlledOpenCodeTui(schemaPath, migrations, resolveTuiEntry, parseTuiConfig) {
   // This function runs in a child with Node's TypeScript transform enabled:
   // the installed TUI plugin contains parameter properties. All native and
   // hydrated reads below come from the same real controlled SQLite store.
+  // Selection observation and this child share the JSONC and entry resolvers.
   const fs = await import('node:fs')
   const path = await import('node:path')
   const { randomUUID, createHash } = await import('node:crypto')
   const { DatabaseSync } = await import('node:sqlite')
-  const config = JSON.parse(fs.readFileSync(process.env.OPENCODE_TUI_CONFIG, 'utf8'))
+  const config = parseTuiConfig(fs.readFileSync(process.env.OPENCODE_TUI_CONFIG, 'utf8'))
   const selectedPlugin = await resolveTuiEntry(config.plugin)
   if (!selectedPlugin) throw new Error('configured native TUI plugin missing')
   const plugin = (await import(selectedPlugin.url)).default
@@ -601,7 +602,8 @@ if (provider === 'opencode' && process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) {
     `const argv = process.argv.slice(1); await (${controlledOpenCodeTui.toString()})(
       ${JSON.stringify(schemaPath)},
       ${JSON.stringify(opencodePinnedMigrations)},
-      (${resolveOpenCodeTuiEntry.toString()}))`, '--', ...argv],
+      (${resolveOpenCodeTuiEntry.toString()}),
+      (${parseJsonc.toString()}))`, '--', ...argv],
   { env: process.env, cwd, stdio: 'inherit' })
   terminal.once('exit', code => { process.exitCode = code ?? 1 })
 } else if (provider === 'codex' || provider === 'opencode') {
