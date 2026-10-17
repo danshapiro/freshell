@@ -43,8 +43,8 @@ export default defineConfig({
       // These integration trees own their own runtime/artifact setup.
       'test/integration/tooling/**',
       'test/integration/electron/**',
-      // Cloud retains these files for the unit tests' actual teardown callbacks;
-      // their independent suites require a local managed runtime and Git checkout.
+      // These suites require a local managed runtime and Git checkout. Their
+      // shared teardown helper is covered by source-only tooling unit tests.
       ...(sourceOnlyCloudVitest ? [
         'test/integration/server/fresh-agent-parity.test.ts',
         'test/integration/server/managed-provider-parity.test.ts',

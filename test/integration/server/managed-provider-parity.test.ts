@@ -12,7 +12,8 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
-import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../helpers/provider-parity-broker.js'
+import { authorizeProviderParityRequest } from '../../helpers/provider-parity-broker.js'
+import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -634,36 +635,11 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     fs.writeFileSync(path.join(userConfig, 'plugins/parity-plugin.js'), 'export default { name: "parity" }\n')
   })
 
-  afterAll(async () => {
-    try {
-      await Promise.allSettled(sockets.map(socket => socket.close()))
-      if (rig) {
-        let volumes: ReturnType<typeof captureProviderParityVolumes> = []
-        let captureError: unknown
-        try {
-          volumes = captureProviderParityVolumes(registeredVolumes)
-          rig.runtime.writeIncident('provider-parity-registered-volumes', volumes)
-        } catch (error) { captureError = error }
-        const cleanup = await rig.stop()
-        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
-        if (captureError) throw captureError
-        rig.runtime.writeIncident('provider-parity-registered-volume-cleanup', {
-          removed: cleanupProviderParityVolumes(volumes),
-        })
-      }
-    } finally {
-      restoreOnecliEnvironment?.()
-      for (const [key, value] of Object.entries(inheritedProviderEnvironment)) {
-        if (value === undefined) delete process.env[key]
-        else process.env[key] = value
-      }
-      if (inheritedFreshellUrl === undefined) delete process.env.FRESHELL_URL
-      else process.env.FRESHELL_URL = inheritedFreshellUrl
-      if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
-      if (webHome) fs.rmSync(webHome, { recursive: true, force: true })
-      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
-    }
-  }, 180_000)
+  afterAll(() => cleanupProviderParity({
+    connections: sockets, rig, registeredVolumes, restoreOnecliEnvironment,
+    inheritedEnvironment: { ...inheritedProviderEnvironment, FRESHELL_URL: inheritedFreshellUrl },
+    directories: [workspace, webHome, onecli?.directory],
+  }), 180_000)
 
   it.each(providers)('%s preserves provider-visible launch and MCP behavior', async provider => {
     const observed: RecordRow[] = []

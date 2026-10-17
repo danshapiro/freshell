@@ -11,12 +11,9 @@ coverage/
 /server/
 /test/server/
 /test/unit/server/
-# Retain only the actual fake-grant implementation and teardown callbacks
-# executed by the default tooling unit suite; other retired tests stay excluded.
-/test/integration/server/*
-!/test/integration/server/provider-parity-onecli.ts
-!/test/integration/server/fresh-agent-parity.test.ts
-!/test/integration/server/managed-provider-parity.test.ts
+# Runtime integration suites run in the automatic local companion. Shared
+# fixture helpers live under test/helpers and remain in the source image.
+/test/integration/server/
 
 # Version control and CI
 .git/
