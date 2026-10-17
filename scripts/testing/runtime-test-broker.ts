@@ -641,9 +641,11 @@ export class RestrictedDockerBroker {
     }
     if (method === 'GET' && candidateVolume && !candidate
       && /^freshell-claude-candidate-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(candidateVolume)) {
-      const rejection = this.initialClaudePublicationRejection(candidateVolume.slice('freshell-claude-candidate-'.length))
-      if (rejection) {
-        this.block(response, method, url, 403, `candidate absence qualification unavailable at ${rejection}`, false)
+      const requestId = candidateVolume.slice('freshell-claude-candidate-'.length)
+      const rejection = this.initialClaudePublicationRejection(requestId)
+      const retained = rejection ? await this.publishedRetainedClaudeCandidate(requestId) : undefined
+      if (rejection && !retained?.input) {
+        this.block(response, method, url, 403, `candidate absence qualification unavailable at ${retained?.reason ?? rejection}`, false)
         return
       }
       const inspected = await this.forward(request, body)
@@ -1464,6 +1466,114 @@ export class RestrictedDockerBroker {
     return phase
   }
 
+  private async publishedRetainedClaudeCandidate(requestId: string, generationId?: string): Promise<{
+    input?: ClaudeCandidateAuthorization; reason?: string
+  }> {
+    let phase: string | undefined
+    const uuid = (value: unknown) => typeof value === 'string'
+      && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value)
+    const root = path.dirname(this.policy.runtimeRootPrefix)
+    try {
+      for (const scenario of this.fixtureDirectories(path.join(root, 'scenarios'), 32)) {
+        const control = path.join(root, 'scenarios', scenario, 'control')
+        for (const grant of this.fixtureDirectories(path.join(control, 'provider-roots'), 128)) {
+          if (!/^grant-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(grant)
+            || (generationId !== undefined && generationId !== grant)) continue
+          const stageRoot = path.join(control, 'provider-roots', grant)
+          const bindingPath = path.join(stageRoot, '.freshell/claude-candidate-binding.json')
+          if (!fs.existsSync(bindingPath)) continue
+          const binding = this.fixtureMetadata(bindingPath).value
+          if (binding.registryAttemptId == null) continue
+          phase = 'retained_binding'
+          if (binding.version !== 1 || !CLAUDE_SOURCE_FLAVORS.has(binding.provider)
+            || binding.generationId !== grant || binding.initialReservationId != null
+            || !Number.isSafeInteger(binding.intentRevision) || binding.intentRevision < 1
+            || typeof binding.registryAttemptId !== 'string' || !binding.registryAttemptId.startsWith('recovery-')
+            || !uuid(binding.registryAttemptId.slice(9)) || !/^[a-f0-9]{64}$/.test(binding.authoritySha256)
+            || !/^grant-[a-f0-9-]{36}$/.test(binding.priorGenerationId) || binding.priorGenerationId === grant) continue
+          const owner = [...this.initialProviderVolumes.values()].find(value => value.soulId === binding.soulId)
+          if (!owner) continue
+          phase = 'retained_owner'
+          const prior = await this.quiescentFixtureOwner(owner)
+          const reservation = this.initialReservations.get(owner.providerVolumeName)
+          if (!prior || !reservation) continue
+          const selected = [...this.preparedInputs.values()].find(value => value.installationId === owner.installationId
+            && value.soulId === owner.soulId && value.incarnationId === prior.incarnationId
+            && value.generationId === binding.priorGenerationId
+            && value.stageRoot === path.join(path.dirname(stageRoot), binding.priorGenerationId))
+          if (!selected) continue
+          phase = 'retained_metadata'
+          const previous = this.fixtureMetadata(path.join(selected.stageRoot, '.freshell/prepared-context.json')).value
+          const retained = previous.preparedInputs
+          if (retained?.generationId !== selected.generationId || previous.mcpCapability?.grantId !== selected.generationId
+            || retained.manifest?.relativePath !== '.freshell/input-manifest.json'
+            || !Array.isArray(retained.configBinds) || !Array.isArray(retained.resourceMounts)
+            || JSON.stringify(retained.configBinds.map((bind: Record<string, any>) => ({
+              sourceRelativePath: bind.sourceRelativePath, effectiveDestination: bind.effectiveDestination,
+            }))) !== JSON.stringify(selected.configurationBinds)
+            || retained.resourceMounts.length !== selected.resourceMounts.length
+            || retained.resourceMounts.some((mount: Record<string, any>, index: number) =>
+              ['providerRelativePath', 'effectiveDestination', 'kind', 'writable'].some(key => mount[key] !== selected.resourceMounts[index][key as keyof PreparedInputAuthorization['resourceMounts'][number]]))) continue
+          const priorManifest = this.fixtureMetadata(path.join(selected.stageRoot, retained.manifest.relativePath), 64 * 1024 * 1024)
+          if (sha256Hex(priorManifest.bytes) !== retained.manifest.sha256) continue
+          phase = 'retained_candidate_metadata'
+          const capability = this.fixtureMetadata(path.join(control, 'mcp-capabilities', `${grant}.json`), 128 * 1024).value
+          const context = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-context.json'))
+          const result = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-result.json'))
+          const inputs = context.value.preparedInputs
+          if (capability.soulId !== owner.soulId || capability.incarnationId != null
+            || !context.value.preparation?.claude || !inputs || inputs.generationId !== grant
+            || inputs.initialAuthReservation != null || context.value.mcpCapability?.grantId !== grant
+            || inputs.manifest?.relativePath !== '.freshell/input-manifest.json'
+            || JSON.stringify(result.value.providerLaunchContext) !== JSON.stringify(context.value)
+            || !Array.isArray(result.value.providerSecretReferences)
+            || sha256Hex(context.bytes) !== binding.preparedContextSha256
+            || sha256Hex(result.bytes) !== binding.preparedResultSha256) continue
+          const manifest = this.fixtureMetadata(path.join(stageRoot, inputs.manifest.relativePath), 64 * 1024 * 1024)
+          const binary = fs.lstatSync(owner.hostBinaryPath)
+          if (sha256Hex(manifest.bytes) !== binding.manifestSha256 || inputs.manifest.sha256 !== binding.manifestSha256
+            || !binary.isFile() || binary.isSymbolicLink() || binary.size > 128 * 1024 * 1024
+            || sha256Hex(fs.readFileSync(owner.hostBinaryPath)) !== owner.binarySha256) continue
+          const input: ClaudeCandidateAuthorization = { ...owner, generationId: grant, stageRoot, requestId,
+            reservationId: reservation.reservationId, workspacePath: binding.workspacePath, cwd: binding.cwd,
+            gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir,
+            manifestRelativePath: inputs.manifest.relativePath, configurationBinds: inputs.configBinds ?? [],
+            resourceMounts: inputs.resourceMounts ?? [], retained: { generationId: selected.generationId,
+              stageRoot: selected.stageRoot, configurationBinds: retained.configBinds,
+              resourceMounts: retained.resourceMounts, attemptId: binding.registryAttemptId } }
+          phase = 'retained_selected_target'
+          this.validateClaudeCandidateAuthorization(input, true)
+          return { input }
+        }
+      }
+    } catch { /* The retained reader receives only fully qualified metadata. */ }
+    return { reason: phase }
+  }
+
+  private async quiescentFixtureOwner(owner: InitialProviderVolumeAuthorization): Promise<BrokerReceipt | undefined> {
+    const latest = () => this.receipts().filter(receipt => receipt.installationId === owner.installationId
+      && receipt.soulId === owner.soulId).at(-1)
+    const prior = latest()
+    if (!prior || prior.providerVolumeName !== owner.providerVolumeName || prior.imageRef !== owner.imageRef
+      || prior.hostBinaryPath !== owner.hostBinaryPath) return
+    const inspected = await this.forward({ method: 'GET',
+      url: `${DOCKER_API_PREFIX}/containers/${prior.containerId}/json`, headers: {} } as IncomingMessage, Buffer.alloc(0))
+    if (latest() !== prior) return
+    let actual: Record<string, any> = {}
+    try { actual = JSON.parse(inspected.body.toString()) } catch {}
+    const labels = { project: 'freshell', 'com.freshell.managed': 'true',
+      'com.freshell.installation-id': prior.installationId, 'com.freshell.soul-id': prior.soulId,
+      'com.freshell.incarnation-id': prior.incarnationId, 'com.freshell.runtime-test-run-id': this.policy.testRunId }
+    const binary = actual.HostConfig?.Binds?.includes(`${owner.hostBinaryPath}:/runtime/freshell-session-host:ro`)
+      || actual.HostConfig?.Mounts?.some((mount: Record<string, any>) => mount.Type === 'bind'
+        && mount.Source === owner.hostBinaryPath && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    if (inspected.statusCode !== 404 && (inspected.statusCode !== 200 || actual.Id !== prior.containerId
+      || actual.Config?.Image !== prior.imageRef || !ownedHelperLabels(actual.Config?.Labels, labels)
+      || !binary || actual.State?.Running !== false || actual.State?.Paused === true
+      || actual.State?.Restarting === true || !['created', 'exited', 'dead'].includes(actual.State?.Status))) return
+    return prior
+  }
+
   private async registerPublishedFixtureInputs(body: Buffer, url: string): Promise<void> {
     let phase = 'owner'
     try {
@@ -1477,6 +1587,18 @@ export class RestrictedDockerBroker {
       const generation = labels['com.freshell.input-generation']
       const incarnationId = labels['com.freshell.incarnation-id']
       if (candidate && this.claudeCandidates.has(`freshell-claude-candidate-${labels['com.freshell.source-request-id']}`)) return
+      if (candidate && labels['com.freshell.source-recovery-attempt-id'] !== undefined) {
+        const published = await this.publishedRetainedClaudeCandidate(labels['com.freshell.source-request-id'], generation)
+        if (published.input && equalRecord(labels, candidateLabels(published.input, this.policy.testRunId))) {
+          phase = 'retained_candidate_authorization'
+          this.registerClaudeCandidate(published.input, true)
+        } else {
+          this.record({ method: 'POST', url, decision: 'block',
+            reason: `fixture publication unavailable at ${published.reason ?? 'retained_candidate_labels'}`,
+            destructive: false, unsafeAttempt: false })
+        }
+        return
+      }
       if (!candidate && [...this.preparedInputs.values()].some(input => input.installationId === owner.installationId
         && input.soulId === owner.soulId && input.incarnationId === incarnationId
         && (generation === undefined || generation === input.generationId))) return
@@ -1492,24 +1614,7 @@ export class RestrictedDockerBroker {
           || prior.providerVolumeName !== owner.providerVolumeName || prior.imageRef !== owner.imageRef
           || prior.hostBinaryPath !== owner.hostBinaryPath) return
         phase = 'retained_owner'
-        const inspected = await this.forward({ method: 'GET',
-          url: `${DOCKER_API_PREFIX}/containers/${prior.containerId}/json`, headers: {} } as IncomingMessage, Buffer.alloc(0))
-        if (this.receipts().filter(receipt => receipt.installationId === owner.installationId
-          && receipt.soulId === owner.soulId).at(-1) !== prior) return
-        let actual: Record<string, any> = {}
-        try { actual = JSON.parse(inspected.body.toString()) } catch {}
-        const expectedLabels = { project: 'freshell', 'com.freshell.managed': 'true',
-          'com.freshell.installation-id': prior.installationId, 'com.freshell.soul-id': prior.soulId,
-          'com.freshell.incarnation-id': prior.incarnationId, 'com.freshell.runtime-test-run-id': this.policy.testRunId }
-        const binaryBind = `${owner.hostBinaryPath}:/runtime/freshell-session-host:ro`
-        const sameBinary = actual.HostConfig?.Binds?.includes(binaryBind)
-          || actual.HostConfig?.Mounts?.some((mount: Record<string, any>) => mount.Type === 'bind'
-            && mount.Source === owner.hostBinaryPath && mount.Target === '/runtime/freshell-session-host'
-            && mount.ReadOnly === true)
-        if (inspected.statusCode !== 404 && (inspected.statusCode !== 200 || actual.Id !== prior.containerId
-          || actual.Config?.Image !== prior.imageRef || !ownedHelperLabels(actual.Config?.Labels, expectedLabels)
-          || !sameBinary || actual.State?.Running !== false || actual.State?.Paused === true
-          || actual.State?.Restarting === true || !['created', 'exited', 'dead'].includes(actual.State?.Status))) return
+        if (await this.quiescentFixtureOwner(owner) !== prior) return
       }
       const root = path.dirname(this.policy.runtimeRootPrefix)
       phase = 'physical_directories'

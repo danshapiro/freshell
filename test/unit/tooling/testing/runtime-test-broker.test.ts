@@ -1678,6 +1678,97 @@ describe('fixed indexed publisher broker',()=>{
       }, undefined, true)
     },
   )
+  it('publishes a retained Claude candidate from its quiescent owner and both frozen generations', async () => {
+    await withHttpBroker(async ({ directory, request, forwarded, broker: instance, setRuntimeRunning,
+      clearCandidateVolumeInspection, replaceCandidateVolumeInspection }) => {
+      const input = candidateAuthorization()
+      const artifact = Buffer.from('retained candidate owned host')
+      input.hostBinaryPath = path.join(directory, 'freshell-session-host')
+      await fs.writeFile(input.hostBinaryPath, artifact)
+      input.binarySha256 = createHash('sha256').update(artifact).digest('hex')
+      input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
+      instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath,
+        binarySha256: input.binarySha256 })
+      expect((await request('POST', '/v1.47/volumes/create', { Name: input.providerVolumeName, Driver: 'local', Labels: {
+        'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId,
+        'freshell.input.reservation': input.reservationId, 'freshell.input.incarnation': 'incarnation-one',
+        'freshell.input.intent': '1', 'freshell.input.daemon': input.daemonId,
+        'freshell.input.image': input.imageRef, 'freshell.input.binary-sha256': input.binarySha256,
+      } })).status).toBe(201)
+      const priorRuntime = path.join(directory, 'r/scenario/incarnation-one')
+      const actor = path.join(path.dirname(priorRuntime), 'souls',
+        createHash('sha256').update(`${input.installationId}\0${input.soulId}`).digest('hex'), 'actor')
+      const prior = JSON.parse(createBody([
+        `${input.hostBinaryPath}:/runtime/freshell-session-host:ro`, `${priorRuntime}:/run/freshell:rw`,
+        `${input.providerVolumeName}:/home/freshell/provider:rw`, '/workspace:/workspace:rw',
+        `${actor}:/run/freshell-host-actor:rw`,
+      ]).toString())
+      prior.Labels['com.freshell.soul-id'] = input.soulId
+      expect((await request('POST', '/v1.47/containers/create?name=retained-candidate-owner', prior)).status).toBe(201)
+      const generationId = 'grant-55555555-5555-4555-8555-555555555555'
+      input.retained = { generationId, stageRoot: path.join(path.dirname(input.stageRoot), generationId),
+        configurationBinds: structuredClone(input.configurationBinds), resourceMounts: structuredClone(input.resourceMounts),
+        attemptId: 'recovery-66666666-6666-4666-8666-666666666666' }
+      const priorPublication = await publishControllerPreparation(directory, { ...input, ...input.retained }, input.reservationId, 'claude')
+      instance.authorizePreparedInputs({ ...input, ...input.retained, incarnationId: 'incarnation-one', indexedSecretSources: [] })
+      const published = await publishControllerPreparation(directory, input, '', 'claude')
+      delete (published.context.preparedInputs as any).initialAuthReservation
+      const contextBytes = Buffer.from(JSON.stringify(published.context))
+      const resultBytes = Buffer.from(JSON.stringify({ providerLaunchContext: published.context, providerSecretReferences: [] }))
+      await fs.writeFile(path.join(published.metadata, 'prepared-context.json'), contextBytes)
+      await fs.writeFile(path.join(published.metadata, 'prepared-result.json'), resultBytes)
+      const binding = { version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        initialReservationId: null, registryAttemptId: input.retained.attemptId, priorGenerationId: generationId,
+        intentRevision: 1, authoritySha256: 'a'.repeat(64), workspacePath: input.workspacePath, cwd: input.cwd,
+        gitCommonDir: null, manifestSha256: published.context.preparedInputs.manifest.sha256,
+        preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
+        preparedResultSha256: createHash('sha256').update(resultBytes).digest('hex') }
+      const bindingPath = path.join(published.metadata, 'claude-candidate-binding.json')
+      await fs.writeFile(bindingPath, JSON.stringify(binding))
+      const url = `/v1.47/volumes/freshell-claude-candidate-${input.requestId}`
+      clearCandidateVolumeInspection()
+      setRuntimeRunning(false)
+      expect((await request('GET', url)).status, JSON.stringify(instance.eventsSnapshot().slice(-2))).toBe(404)
+      // An absence probe grants no mutation ownership. The exact published
+      // recovery attempt and both immutable stages still qualify creation.
+      const volume = { Name: url.split('/').at(-1), Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) }
+      const changedAttempt = structuredClone(volume)
+      changedAttempt.Labels['com.freshell.source-recovery-attempt-id'] = 'recovery-77777777-7777-4777-8777-777777777777'
+      expect((await request('POST', '/v1.47/volumes/create', changedAttempt)).status).toBe(403)
+      setRuntimeRunning(true)
+      expect((await request('GET', url)).status).toBe(403)
+      setRuntimeRunning(false)
+      for (const changed of [
+        { ...binding, soulId: 'foreign-soul' },
+        { ...binding, priorGenerationId: input.generationId },
+        { ...binding, preparedContextSha256: 'f'.repeat(64) },
+      ]) {
+        await fs.writeFile(bindingPath, JSON.stringify(changed))
+        expect((await request('GET', url)).status).toBe(403)
+        expect((await request('POST', '/v1.47/volumes/create', volume)).status).toBe(403)
+      }
+      await fs.writeFile(bindingPath, JSON.stringify(binding))
+      const priorContext = path.join(priorPublication.metadata, 'prepared-context.json')
+      await fs.writeFile(priorContext, JSON.stringify({ ...priorPublication.context,
+        preparedInputs: { ...priorPublication.context.preparedInputs, generationId: input.generationId } }))
+      expect((await request('GET', url)).status).toBe(403)
+      await fs.writeFile(priorContext, priorPublication.contextBytes)
+      replaceCandidateVolumeInspection()
+      const foreign = await request('GET', url)
+      expect(foreign.status).toBe(403)
+      expect(foreign.body).not.toContain('PRIVATE_FOREIGN_CANDIDATE')
+      clearCandidateVolumeInspection()
+      expect((await request('GET', url)).status).toBe(404)
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status,
+        JSON.stringify(instance.eventsSnapshot().slice(-2))).toBe(201)
+      const name = 'freshell-claude-candidate-reader-11111111-1111-4111-8111-111111111111'
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, candidateHelperBody(input, 'reader'))).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect(forwarded.some(operation => operation.url.includes(name))).toBe(true)
+    }, undefined, true)
+  })
   it.each(['claude', 'kilroy'])('probes actual %s candidate absence before creation only with a qualified owned publication', async provider => {
     await withHttpBroker(async ({ directory, request, forwarded, broker: instance, replaceCandidateVolumeInspection, clearCandidateVolumeInspection }) => {
       const input = candidateAuthorization()
