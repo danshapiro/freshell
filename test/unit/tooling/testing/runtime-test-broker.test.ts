@@ -329,6 +329,19 @@ it.each(['response', 'disconnect'])('records the actual upstream request and its
       ...(settlement === 'response' ? { statusCode: 503 } : { errorCategory: 'upstream_request_failed' }) })
     expect(events[1].durationMs).toEqual(expect.any(Number))
     expect(events[1].durationMs).toBeGreaterThanOrEqual(holdDuration)
+    const phases = events[1].transportPhases
+    expect(phases).toMatchObject({ socketAssignedMs: expect.any(Number), requestFinishedMs: expect.any(Number),
+      reusedSocket: false, socketConnectingAtAssignment: expect.any(Boolean) })
+    expect(phases.requestFinishedMs).toBeGreaterThanOrEqual(phases.socketAssignedMs)
+    expect(phases.requestFinishedMs).toBeLessThanOrEqual(events[1].durationMs)
+    if (settlement === 'response') {
+      expect(phases.responseHeadersMs - phases.requestFinishedMs).toBeGreaterThanOrEqual(holdDuration)
+      expect(phases.responseEndMs).toBeGreaterThanOrEqual(phases.responseHeadersMs)
+      expect(phases.responseEndMs).toBeLessThanOrEqual(events[1].durationMs)
+    } else {
+      expect(phases.responseHeadersMs).toBeNull()
+      expect(phases.responseEndMs).toBeNull()
+    }
     expect((await fs.readFile(logPath, 'utf8'))).not.toMatch(/private-header|private-response-body/)
     expect(instance.unsafeAttempts()).toEqual([])
   } finally {
