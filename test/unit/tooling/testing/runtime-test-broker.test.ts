@@ -12,7 +12,7 @@ import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type Prepare
 import { findInitialProviderVolume, type InitialProviderRegistrySource } from '../../../../scripts/testing/initial-provider-volume.js'
 import { buildRunOwnedRuntimeImage } from '../../../../scripts/testing/runtime-sandbox.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
-import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, providerParityFailureLogTail, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
 
 it('executes file and package TUI entrypoints while observing the selected project settings', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-parity-selection-'))
@@ -3203,4 +3203,23 @@ describe('finite Task2 legacy negative inspector admission', () => {
       expect(() => broker.admitTask2LegacyNegativeInspection(negativeLegacyInspection(), originalLegacyInspection())).toThrow()
     }, { allowTask2LegacyNegativeFixtures: true })
   })
+})
+
+it('retains bounded redacted structured callback diagnostics for failed provider cases', () => {
+  const secret = 'owned-callback-control-value'
+  const logs = [
+    'not structured',
+    JSON.stringify({ level: 'INFO', fields: { message: 'ordinary startup' } }),
+    ...Array.from({ length: 70 }, (_, n) => JSON.stringify({ level: 'WARN', target: 'freshell_server',
+      fields: { message: 'managed_mcp.callback_failed', error: `candidate reader failed ${n}; ${secret}; Bearer hidden-token`, payload: 'private provider bytes' } })),
+    JSON.stringify({ severity: 'error', event: 'session_host.fatal', error: 'native startup failure' }),
+  ].join('\n')
+  const retained = providerParityFailureLogTail(logs, [secret])
+  expect(retained).toHaveLength(32)
+  expect(retained.at(-2)).toMatchObject({ severity: 'warn', event: 'managed_mcp.callback_failed',
+    error: 'candidate reader failed 69; [redacted]; Bearer [redacted]' })
+  expect(retained.at(-1)).toMatchObject({ severity: 'error', event: 'session_host.fatal', error: 'native startup failure' })
+  expect(JSON.stringify(retained)).not.toContain(secret)
+  expect(JSON.stringify(retained)).not.toContain('private provider bytes')
+  expect(JSON.stringify(retained)).not.toContain('hidden-token')
 })
