@@ -77,6 +77,7 @@ impl DestinationCapacityProvider for FilesystemCapacityProvider {
 
 // libc exposes statvfs counters at the target's native unsigned-long width;
 // widen both before multiplying so 32-bit Unix builds keep the same byte math.
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 fn statvfs_available_bytes(stats: &libc::statvfs) -> u64 {
     (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64)
@@ -331,18 +332,18 @@ pub fn import_bundle_payload_with_capacity<R: Read>(
             "workspace or Git assets do not match the imported session references".into(),
         )
     })?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     crash_checkpoint("import.before_transaction_commit");
     transaction.commit()?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     crash_checkpoint("import.after_transaction_commit");
     drop(connection);
     sync_file_and_parent(destination_database)?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     crash_checkpoint("import.after_database_sync");
     let structural_sha256 = structural_digest(&manifest);
     let receipt = receipt_for(descriptor, &manifest, structural_sha256);
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     crash_checkpoint("import.after_receipt_constructed");
     Ok(receipt)
 }
@@ -5199,7 +5200,7 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn crash_checkpoint(point: &str) {
     if std::env::var("FRESHELL_OPENCODE_IMPORT_CRASH_POINT")
         .ok()

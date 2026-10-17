@@ -2387,8 +2387,7 @@ fn installed_store_probe_reopens_exact_database_read_only_and_returns_no_body() 
     let xdg_data_home = home.join(".local/share");
     let xdg_config_home = home.join(".config");
     fs::create_dir_all(&xdg_config_home).unwrap();
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
+    let (uid, gid) = rehearsal_current_identity();
     let reader = super::InstalledStoreReaderContext {
         database_path: &fixture.destination_database,
         workspace_root: &fixture.workspace,
@@ -3679,8 +3678,8 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
     let reader = InstalledStoreReaderContext {
         database_path: &fixture.destination_database,
         workspace_root: &fixture.workspace,
-        provider_uid: unsafe { libc::geteuid() },
-        provider_gid: unsafe { libc::getegid() },
+        provider_uid: rehearsal_current_identity().0,
+        provider_gid: rehearsal_current_identity().1,
         home,
         xdg_data_home: &xdg_data_home,
         xdg_config_home: &xdg_config_home,
