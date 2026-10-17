@@ -1,5 +1,5 @@
 use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -57,7 +57,7 @@ pub fn resolve_child_secrets(
     let mut resolved = ResolvedProviderSecrets::default();
     let mut environment_grants = Vec::new();
     let mut native_auth = false;
-    let mut oauth_auth = false;
+    let mut oauth_providers = BTreeSet::new();
     let mut mounted_ca = false;
     let mut seen = std::collections::BTreeSet::new();
     for (index, reference) in references.iter().enumerate() {
@@ -78,7 +78,7 @@ pub fn resolve_child_secrets(
                 return Err("OneCLI provider-file grant is empty or duplicated".into());
             }
             if reference.profile.auth_relative_path().is_some() {
-                oauth_auth = validate_native_auth(provider, &raw)?;
+                oauth_providers = validate_native_auth(provider, &raw)?;
                 native_auth = true;
             } else {
                 mounted_ca = true;
@@ -97,16 +97,18 @@ pub fn resolve_child_secrets(
             }
         }
     }
-    if oauth_auth
-        && resolved.environment.keys().any(|name| {
-            matches!(
-                (provider, name.as_str()),
-                ("codex", "OPENAI_API_KEY")
-                    | ("claude", "ANTHROPIC_API_KEY")
-                    | ("opencode", "OPENAI_API_KEY")
-            )
-        })
-    {
+    let conflict = match provider {
+        "codex" | "opencode" => {
+            oauth_providers.contains("openai")
+                && resolved.environment.contains_key("OPENAI_API_KEY")
+        }
+        "claude" => {
+            oauth_providers.contains("anthropic")
+                && resolved.environment.contains_key("ANTHROPIC_API_KEY")
+        }
+        _ => false,
+    };
+    if conflict {
         return Err("OneCLI native OAuth conflicts with environment API-key auth mode".into());
     }
     if resolved.environment.contains_key("ANTHROPIC_API_KEY")
@@ -138,12 +140,12 @@ pub fn resolve_child_secrets(
     Ok(resolved)
 }
 
-fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<bool, String> {
+fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<BTreeSet<String>, String> {
     let invalid = || "OneCLI typed native auth has an unsupported provider shape".to_owned();
     if provider == "amplifier" {
         let parsed = parse_keys_env(std::str::from_utf8(raw).map_err(|_| invalid())?)?;
         if parsed.keys().any(|name| name.ends_with("_API_KEY")) {
-            return Ok(false);
+            return Ok(BTreeSet::new());
         }
         return Err(invalid());
     }
@@ -155,47 +157,62 @@ fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<bool, String> {
             .is_some_and(|value| !value.is_empty())
     };
     match provider {
-        "codex"
-            if native["auth_mode"] == "chatgpt"
-                && native["OPENAI_API_KEY"].is_null()
-                && ["access_token", "refresh_token", "id_token", "account_id"]
-                    .iter()
-                    .all(|name| string(&native["tokens"], name))
-                && string(&native, "last_refresh") =>
-        {
-            Ok(true)
-        }
-        "codex"
-            if string(&native, "OPENAI_API_KEY")
-                && matches!(native["auth_mode"].as_str(), Some("apikey" | "api_key")) =>
-        {
-            Ok(false)
+        "codex" => {
+            // Codex 0.147 infers the mode for older auth files. Account identity
+            // and refresh metadata are optional; externally managed tokens may
+            // have an empty refresh token.
+            let mode = if native["auth_mode"].is_null() {
+                if native["OPENAI_API_KEY"].is_null() {
+                    "chatgpt"
+                } else {
+                    "apikey"
+                }
+            } else {
+                native["auth_mode"].as_str().unwrap_or_default()
+            };
+            match mode {
+                "chatgpt" | "chatgptAuthTokens"
+                    if native["OPENAI_API_KEY"].is_null()
+                        && ["access_token", "id_token"]
+                            .iter()
+                            .all(|name| string(&native["tokens"], name))
+                        && native["tokens"]["refresh_token"].is_string()
+                        && (native["tokens"]["account_id"].is_null()
+                            || native["tokens"]["account_id"].is_string())
+                        && (native["last_refresh"].is_null()
+                            || native["last_refresh"].is_string()) =>
+                {
+                    Ok(BTreeSet::from(["openai".into()]))
+                }
+                "apikey" | "api_key" if string(&native, "OPENAI_API_KEY") => Ok(BTreeSet::new()),
+                _ => Err(invalid()),
+            }
         }
         "claude"
             if string(&native["claudeAiOauth"], "accessToken")
                 && string(&native["claudeAiOauth"], "refreshToken") =>
         {
-            Ok(true)
+            Ok(BTreeSet::from(["anthropic".into()]))
         }
         "opencode" => {
             let Some(entries) = native.as_object().filter(|entries| !entries.is_empty()) else {
                 return Err(invalid());
             };
-            let mut oauth = false;
-            for entry in entries.values() {
+            let mut oauth_providers = BTreeSet::new();
+            for (model_provider, entry) in entries {
                 match entry["type"].as_str() {
                     Some("oauth")
                         if string(entry, "access")
                             && string(entry, "refresh")
                             && entry["expires"].as_i64().is_some_and(|expiry| expiry > 0) =>
                     {
-                        oauth = true
+                        oauth_providers.insert(model_provider.clone());
                     }
                     Some("api") if string(entry, "key") => {}
                     _ => return Err(invalid()),
                 }
             }
-            Ok(oauth)
+            Ok(oauth_providers)
         }
         _ => Err(invalid()),
     }
@@ -566,6 +583,200 @@ fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a 
 mod tests {
     use super::*;
     use freshell_runtime_protocol::ProviderSecretReference;
+
+    fn resolve_native_fixture(
+        provider: &str,
+        profiles: [ProviderSecretProfile; 2],
+        auth: &serde_json::Value,
+        environment: &str,
+    ) -> Result<ResolvedProviderSecrets, String> {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("provider-0"), auth.to_string()).unwrap();
+        fs::write(root.path().join("provider-1"), environment).unwrap();
+        let references = profiles.map(|profile| ProviderSecretReference {
+            source_path: String::new(),
+            profile,
+        });
+        resolve_child_secrets(provider, &references, root.path())
+    }
+
+    fn resolve_codex_fixture(
+        auth: &serde_json::Value,
+        environment: &str,
+    ) -> Result<ResolvedProviderSecrets, String> {
+        resolve_native_fixture(
+            "codex",
+            [
+                ProviderSecretProfile::CodexOnecliAuthFile,
+                ProviderSecretProfile::CodexOnecliEnvironment,
+            ],
+            auth,
+            environment,
+        )
+    }
+
+    #[test]
+    fn typed_codex_native_api_key_accepts_inferred_and_explicit_modes() {
+        for mode in [
+            None,
+            Some(serde_json::Value::Null),
+            Some("apikey".into()),
+            Some("api_key".into()),
+        ] {
+            let mut auth = serde_json::json!({"OPENAI_API_KEY": "synthetic-native-key"});
+            if let Some(mode) = mode {
+                auth["auth_mode"] = mode;
+            }
+            let resolved = resolve_codex_fixture(&auth, "HTTPS_PROXY=http://192.0.2.10:10255\n")
+                .expect("native API-key auth permits proxy-only transport");
+            assert!(!resolved.environment.contains_key("OPENAI_API_KEY"));
+            assert_eq!(
+                resolved.provider_files,
+                vec![(".codex/auth.json", auth.to_string().into_bytes())]
+            );
+        }
+    }
+
+    #[test]
+    fn typed_codex_native_oauth_accepts_optional_mode_and_metadata() {
+        for mode in [
+            None,
+            Some(serde_json::Value::Null),
+            Some("chatgpt".into()),
+            Some("chatgptAuthTokens".into()),
+        ] {
+            for metadata in [false, true] {
+                let mut auth = serde_json::json!({"tokens": {
+                    "id_token": "e30.eyJlbWFpbCI6ImZpeHR1cmVAZXhhbXBsZS50ZXN0In0.signature",
+                    "access_token": "synthetic-access", "refresh_token": ""
+                }});
+                if let Some(mode) = mode.clone() {
+                    auth["auth_mode"] = mode;
+                }
+                if metadata {
+                    auth["last_refresh"] = serde_json::Value::Null;
+                    auth["tokens"]["account_id"] = serde_json::Value::Null;
+                }
+                let resolved =
+                    resolve_codex_fixture(&auth, "HTTPS_PROXY=http://192.0.2.10:10255\n")
+                        .expect("native optional OAuth fields do not block launch");
+                assert_eq!(resolved.provider_files[0].1, auth.to_string().into_bytes());
+                let error = resolve_codex_fixture(&auth, "OPENAI_API_KEY=synthetic-conflict\n")
+                    .err()
+                    .expect("inferred and explicit OAuth both reject conflicting API-key mode");
+                assert_eq!(
+                    error,
+                    "OneCLI native OAuth conflicts with environment API-key auth mode"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_codex_native_auth_rejects_invalid_and_conflicting_modes_without_secret_values() {
+        for auth in [
+            serde_json::json!({"auth_mode": "unknown", "OPENAI_API_KEY": "synthetic-private-key"}),
+            serde_json::json!({"auth_mode": "apikey"}),
+            serde_json::json!({"OPENAI_API_KEY": 42}),
+            serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": "synthetic-private-key", "tokens": {"id_token":"synthetic-id", "access_token":"synthetic-access", "refresh_token":"synthetic-refresh"}}),
+            serde_json::json!({"tokens": {"access_token":"synthetic-access"}}),
+            serde_json::json!({"auth_mode": 42, "OPENAI_API_KEY":"synthetic-private-key"}),
+        ] {
+            let error = resolve_codex_fixture(&auth, "HTTPS_PROXY=http://192.0.2.10:10255\n")
+                .err()
+                .expect("invalid native auth must fail before launch");
+            assert_eq!(
+                error,
+                "OneCLI typed native auth has an unsupported provider shape"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_opencode_native_oauth_keeps_model_provider_identity() {
+        for (oauth_provider, key, conflicts) in [
+            ("anthropic", "OPENAI_API_KEY", false),
+            ("openai", "ANTHROPIC_API_KEY", false),
+            ("openai", "OPENROUTER_API_KEY", false),
+            ("openrouter", "OPENAI_API_KEY", false),
+            ("openai", "OPENAI_API_KEY", true),
+            ("anthropic", "ANTHROPIC_API_KEY", false),
+        ] {
+            let auth = serde_json::json!({oauth_provider: {
+                "type":"oauth", "access":"synthetic-access", "refresh":"synthetic-refresh", "expires":1790000000000_i64
+            }});
+            let result = resolve_native_fixture(
+                "opencode",
+                [
+                    ProviderSecretProfile::OpencodeOnecliAuthFile,
+                    ProviderSecretProfile::OpencodeOnecliEnvironment,
+                ],
+                &auth,
+                &format!("{key}=synthetic-environment-key\n"),
+            );
+            if conflicts {
+                assert_eq!(
+                    result.err().expect("same-provider modes conflict"),
+                    "OneCLI native OAuth conflicts with environment API-key auth mode"
+                );
+            } else {
+                let resolved =
+                    result.expect("different model providers can use separate auth modes");
+                assert_eq!(
+                    resolved.environment.get(key).map(String::as_str),
+                    Some("synthetic-environment-key")
+                );
+                assert_eq!(
+                    resolved.provider_files,
+                    vec![(
+                        ".local/share/opencode/auth.json",
+                        auth.to_string().into_bytes()
+                    )]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_opencode_mixed_native_credentials_keep_each_oauth_provider() {
+        let mut auth = serde_json::json!({
+            "anthropic": {"type":"oauth", "access":"synthetic-access", "refresh":"synthetic-refresh", "expires":1790000000000_i64},
+            "openai": {"type":"api", "key":"synthetic-native-key"}
+        });
+        let profiles = [
+            ProviderSecretProfile::OpencodeOnecliAuthFile,
+            ProviderSecretProfile::OpencodeOnecliEnvironment,
+        ];
+        let resolved = resolve_native_fixture(
+            "opencode",
+            profiles,
+            &auth,
+            "OPENAI_API_KEY=synthetic-environment-key\n",
+        )
+        .expect("an unrelated OAuth entry does not mask the native API-key entry");
+        assert!(resolved.environment.contains_key("OPENAI_API_KEY"));
+        auth["openai"] = serde_json::json!({"type":"oauth", "access":"synthetic-access", "refresh":"synthetic-refresh", "expires":1790000000000_i64});
+        let error = resolve_native_fixture(
+            "opencode",
+            profiles,
+            &auth,
+            "OPENAI_API_KEY=synthetic-private-key\n",
+        )
+        .err()
+        .expect("OpenAI retains its existing OAuth/API-key conflict check");
+        assert_eq!(
+            error,
+            "OneCLI native OAuth conflicts with environment API-key auth mode"
+        );
+        let resolved = resolve_native_fixture(
+            "opencode",
+            profiles,
+            &auth,
+            "ANTHROPIC_API_KEY=synthetic-environment-key\n",
+        )
+        .expect("preserve OpenCode's existing Anthropic credential precedence");
+        assert!(resolved.environment.contains_key("ANTHROPIC_API_KEY"));
+    }
 
     #[test]
     fn typed_codex_oauth_accepts_proxy_only_transport_without_changing_auth_mode() {
