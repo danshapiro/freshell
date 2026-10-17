@@ -3741,6 +3741,7 @@ export function query({ prompt, options }) {
                 swap_bytes: 0,
                 pids_max: 32,
             },
+            control_fence: std::sync::Mutex::new(crate::HostControlFence::default()),
             persisted: Mutex::new(crate::PersistedHostState::default()),
             child: Mutex::new(None),
             pty: Mutex::new(None),
