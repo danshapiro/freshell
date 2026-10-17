@@ -2590,6 +2590,7 @@ mod tests {
     /// failures are retried; any [`ScenarioError::Product`] violation panics
     /// immediately, so the falsifying power holds on the FIRST attempt while
     /// transient environment noise is retried away.
+    #[cfg(unix)]
     #[tokio::test]
     async fn configure_rolls_back_the_listener_when_persist_fails() {
         for attempt in 1..=5 {
@@ -2615,6 +2616,7 @@ mod tests {
     /// Failures are classified per [`ScenarioError`]: only documented
     /// transient socket artifacts come back as `Env`; every in-memory
     /// product invariant comes back as `Product` and fails the test fast.
+    #[cfg(unix)]
     async fn rollback_scenario_once() -> Result<(), ScenarioError> {
         use axum::body::Body;
         use axum::http::Request;
@@ -2938,6 +2940,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn disable_keeps_loopback_and_reports_error_when_persist_fails() {
         // FAIL-SAFE counterpart of Task 2.3's rollback test (Task 6.1 #9): when the

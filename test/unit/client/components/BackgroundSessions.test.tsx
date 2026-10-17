@@ -9,6 +9,7 @@ import panesReducer from '../../../../src/store/panesSlice'
 import settingsReducer from '../../../../src/store/settingsSlice'
 import terminalDirectoryReducer from '../../../../src/store/terminalDirectorySlice'
 import freshAgentReducer, { applyRuntimeOwner } from '../../../../src/store/freshAgentSlice'
+import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
 
 const sentMessages: any[] = []
 const mockGetTerminalDirectoryPage = vi.fn()
@@ -49,6 +50,32 @@ function makeStore() {
   })
 }
 
+const retainedCases = [
+  { recoveryState: 'blocked', runtimeStatus: 'blocked', paneStatus: 'error', label: 'Blocked' },
+  { recoveryState: 'lost', runtimeStatus: 'exited', paneStatus: 'error', label: 'Lost' },
+  { recoveryState: 'stopped', runtimeStatus: 'exited', paneStatus: 'exited', label: 'Stopped' },
+] as const
+
+const retainedRecoverySummary: ManagedRuntimeRecoverySummary = {
+  desiredState: 'running', recoveryState: 'blocked', reason: 'STORE_UNREADABLE',
+  attemptId: 'attempt-retained', incidentId: 'incident-retained',
+  durabilityState: 'resume_captured', allocationState: 'verified_durable',
+}
+
+function retainedDirectoryPage({ recoveryState, runtimeStatus }: typeof retainedCases[number]) {
+  return {
+    items: [{
+      terminalId: 'retained-managed', title: 'Retained managed', mode: 'codex',
+      status: runtimeStatus, runtimeStatus, soulId: 'soul-retained', hasClients: false,
+      createdAt: 1, lastActivityAt: 2,
+      recoverySummary: { ...retainedRecoverySummary, recoveryState },
+      sessionRef: { provider: 'codex', sessionId: 'native-retained' },
+    }],
+    nextCursor: null,
+    revision: 1,
+  }
+}
+
 describe('BackgroundSessions', () => {
   beforeEach(() => {
     sentMessages.length = 0
@@ -77,6 +104,35 @@ describe('BackgroundSessions', () => {
 
   afterEach(() => {
     cleanup()
+  })
+
+  it.each(retainedCases)('shows the retained $recoveryState row reason and final status', async (row) => {
+    mockGetTerminalDirectoryPage.mockResolvedValue(retainedDirectoryPage(row))
+    render(<Provider store={makeStore()}><BackgroundSessions /></Provider>)
+    await screen.findByRole('button', { name: 'Attach' })
+    expect(screen.getByText('STORE_UNREADABLE')).toBeVisible()
+    expect(screen.getByText(row.label)).toBeVisible()
+  })
+
+  it.each(retainedCases)('attaches the retained $recoveryState row with its exact status and existing identity', async (row) => {
+    mockGetTerminalDirectoryPage.mockResolvedValue(retainedDirectoryPage(row))
+    const store = makeStore()
+    const user = userEvent.setup()
+    render(<Provider store={store}><BackgroundSessions /></Provider>)
+    const attach = await screen.findByRole('button', { name: 'Attach' })
+    await user.click(attach)
+    const [tab] = store.getState().tabs.tabs
+    const layout = store.getState().panes.layouts[tab.id]
+    expect(layout.type).toBe('leaf')
+    if (layout.type !== 'leaf') throw new Error('expected leaf')
+    expect(layout.content).toMatchObject({
+      terminalId: 'retained-managed', mode: 'codex', soulId: 'soul-retained', runtimeStatus: row.runtimeStatus,
+      sessionRef: { provider: 'codex', sessionId: 'native-retained' },
+    })
+    expect(layout.content.status).toBe(row.paneStatus)
+    expect(tab.status).toBe(layout.content.status)
+    expect(layout.content).toMatchObject({ recoverySummary: { reason: 'STORE_UNREADABLE',
+      attemptId: 'attempt-retained', incidentId: 'incident-retained' } })
   })
 
   it('attaches with the real terminal mode, not hardcoded shell', async () => {

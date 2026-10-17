@@ -12,15 +12,15 @@ use freshell_freshagent::naming::{admit_pending_projection, session_projection, 
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
     AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentForked,
-    FreshAgentKilled, FreshAgentRecoveryStopped, ServerMessage, SessionLocator, SessionType,
-    StringOrNumber,
+    FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend, ServerMessage, SessionLocator,
+    SessionType, StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
-    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest,
-    ProviderBootstrapFile, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId,
-    StopOutcome, ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest, RequestId,
+    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome, ViewIntentKind,
+    ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -40,6 +40,12 @@ const FIXTURE_MODES_ENV: &str = "FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES";
 const PROVIDER_UID: u32 = 65_534;
 const PROVIDER_GID: u32 = 0;
 
+pub(crate) fn context_for_fresh_provider(
+    provider_launch_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
+) -> Option<freshell_runtime_protocol::ProviderLaunchContext> {
+    provider_launch_context
+}
+
 pub(crate) struct HostedFreshAgentProxy {
     client: RuntimeClient,
     broadcast: Arc<broadcast::Sender<String>>,
@@ -48,6 +54,9 @@ pub(crate) struct HostedFreshAgentProxy {
     pollers: Mutex<HashSet<SoulId>>,
     fixture_modes: HashSet<String>,
     naming: OnceLock<Arc<dyn SessionNaming>>,
+    checkpoint_barrier:
+        OnceLock<Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier>>,
+    ownership: OnceLock<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
 }
 
 struct RollbackInvocation {
@@ -81,7 +90,100 @@ impl HostedFreshAgentProxy {
             pollers: Mutex::new(HashSet::new()),
             fixture_modes,
             naming: OnceLock::new(),
+            checkpoint_barrier: OnceLock::new(),
+            ownership: OnceLock::new(),
         })))
+    }
+
+    pub(crate) fn set_checkpoint_barrier(
+        &self,
+        barrier: Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier>,
+    ) {
+        let _ = self.checkpoint_barrier.set(barrier);
+    }
+
+    pub(crate) fn set_ownership(
+        &self,
+        ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let _ = self.ownership.set(ownership);
+    }
+
+    fn post_barrier_admission(&self, message: &FreshAgentSend) -> Result<(), &'static str> {
+        let (epoch, generation) = match (message.observed_epoch, message.observed_generation) {
+            (None, None) => return Ok(()),
+            (Some(epoch), Some(generation)) => (epoch, generation),
+            _ => return Err("fresh-agent ownership fence is incomplete"),
+        };
+        let Some(ownership) = self.ownership.get() else {
+            return Ok(());
+        };
+        let provider = provider_wire(&message.provider);
+        let canonical_id = ownership.resolve_canonical(&provider, &message.session_id);
+        let current = ownership.observe(&provider, &canonical_id);
+        if current.epoch != epoch || current.generation != generation {
+            return Err("fresh-agent session changed while the checkpoint was being captured");
+        }
+        match current.state {
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent =>
+            {
+                Ok(())
+            }
+            _ => Err("fresh-agent session is no longer available for this send"),
+        }
+    }
+
+    async fn dispatch_send(&self, message: FreshAgentSend) {
+        let provider = message.provider;
+        let session_id = message.session_id.clone();
+        let session_type = message.session_type;
+        let checkpoint_logical_attempt_id = message
+            .checkpoint_intent
+            .as_ref()
+            .map(|intent| intent.logical_attempt_id.clone());
+        if let Err(reason) = self.post_barrier_admission(&message) {
+            self.error_event_code(
+                &provider,
+                &session_id,
+                session_type,
+                "FRESH_AGENT_STALE_SESSION",
+                reason,
+            );
+            return;
+        }
+        let request_id = message
+            .request_id
+            .as_deref()
+            .and_then(|value| RequestId::parse(value.to_string()).ok())
+            .unwrap_or_default();
+        let result = match self
+            .resolve_soul(&provider, session_type, &session_id)
+            .await
+        {
+            Some(soul) => {
+                let settings = turn_settings(message.settings, message.cwd);
+                self.client
+                    .fresh_agent_send(
+                        request_id,
+                        soul,
+                        message.text,
+                        settings,
+                        checkpoint_logical_attempt_id,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+            None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+        };
+        if result.is_err() {
+            self.error_event(
+                &provider,
+                &session_id,
+                session_type,
+                "managed fresh-agent input was not accepted",
+            );
+        }
     }
 
     pub(crate) fn set_session_naming(&self, naming: Arc<dyn SessionNaming>) {
@@ -136,34 +238,19 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Send(message) => {
-                let provider = message.provider;
-                let session_id = message.session_id.clone();
-                let session_type = message.session_type;
-                let request_id = message
-                    .request_id
-                    .as_deref()
-                    .and_then(|value| RequestId::parse(value.to_string()).ok())
-                    .unwrap_or_else(RequestId::new);
-                let result = match self
-                    .resolve_soul(&provider, session_type, &session_id)
-                    .await
-                {
-                    Some(soul) => {
-                        let settings = turn_settings(message.settings, message.cwd);
-                        self.client
-                            .fresh_agent_send(request_id, soul, message.text, settings)
-                            .await
-                            .map(|_| ())
+                if message.checkpoint_intent.is_some() {
+                    if let Some(barrier) = self.checkpoint_barrier.get() {
+                        let proxy = Arc::clone(&self);
+                        let capture_send = message.clone();
+                        let forward = Box::pin(async move { proxy.dispatch_send(message).await });
+                        Arc::clone(barrier)
+                            .barrier_and_forward(capture_send, forward)
+                            .await;
+                    } else {
+                        self.dispatch_send(message).await;
                     }
-                    None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
-                };
-                if result.is_err() {
-                    self.error_event(
-                        &provider,
-                        &session_id,
-                        session_type,
-                        "managed fresh-agent input was not accepted",
-                    );
+                } else {
+                    self.dispatch_send(message).await;
                 }
             }
             HostedFreshAgentCommand::Interrupt(message) => {
@@ -241,7 +328,7 @@ impl HostedFreshAgentProxy {
                     .request_id
                     .as_deref()
                     .and_then(|value| RequestId::parse(value.to_string()).ok())
-                    .unwrap_or_else(RequestId::new);
+                    .unwrap_or_default();
                 let result = match self
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
@@ -276,7 +363,7 @@ impl HostedFreshAgentProxy {
                     .request_id
                     .as_deref()
                     .and_then(|value| RequestId::parse(value.to_string()).ok())
-                    .unwrap_or_else(RequestId::new);
+                    .unwrap_or_default();
                 let result = match self
                     .resolve_soul(&provider, session_type, &session_id)
                     .await
@@ -447,48 +534,125 @@ impl HostedFreshAgentProxy {
             .map(|value| value.session_id.clone());
         let session_type = session_type_wire(message.session_type);
         let request_id = stable_request_id(&message.request_id).map_err(|_| ())?;
-        let provider_bootstrap_files = provider_bootstrap_files(&provider).map_err(|_| ())?;
-        let provider_secret_references =
-            crate::managed_provider_bootstrap::named_provider_onecli_references(provider.as_str())
-                .map_err(|_| ())?;
-        let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
-            &soul,
-            provider.as_str(),
-            crate::managed_mcp_capability::OpencodeEphemeralInput {
-                cwd: Some(&cwd),
-                workspace: Some(&workspace),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| {
-            tracing::warn!(%error, "fresh_agent.create.capability_failed");
-        })?;
-        let mut provider_launch_context =
-            crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
+        let provider_bootstrap_files = Vec::new();
+        let mut provider_secret_references =
+            crate::managed_provider_bootstrap::named_provider_onecli_references(
+                provider.native_provider(),
+            )
+            .map_err(|_| ())?;
+        let (mcp_capability, mut provider_launch_context) = if provider == FreshProvider::Opencode {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
+            let prepared = crate::managed_provider_references::prepare_managed_opencode(
+                crate::managed_provider_references::OpencodePreparation {
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    original: &original,
+                    references: provider_secret_references,
+                    auth_authority: None,
+                    selected_sources: None,
+                    accepted_global_root: None,
+                    selected_resource_roots: None,
+                    native_source_flags: None,
+                    rebind_enabled: None,
+                    inherited_inline: None,
+                    inline_edits: Some(freshell_platform::opencode_config::OwnedConfigEdits {
+                        disable_snapshots: true,
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+            })?;
+            provider_secret_references = prepared.references;
+            let capability = prepared.context.mcp_capability.clone().ok_or(())?;
+            (capability, Some(prepared.context))
+        } else if provider == FreshProvider::Codex {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
+            let context = crate::managed_provider_references::codex::prepare_managed(
+                crate::managed_provider_references::codex::CodexPreparation {
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    original: &original,
+                    args: &[],
+                    references: &provider_secret_references,
+                },
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+            })?;
+            (context.mcp_capability.clone().ok_or(())?, Some(context))
+        } else if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
+            let context = crate::managed_provider_references::claude::prepare_managed(
+                crate::managed_provider_references::claude::ClaudePreparation {
+                    native_source_runtime:
+                        freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
+                    reservation_provider: provider.as_str(),
+                    git_common_dir: git_common_dir(&workspace).as_deref(),
+                    selected_settings: None,
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    original: &original,
+                    args: &[],
+                    plugins: message.plugins.as_deref().unwrap_or_default(),
+                    references: &provider_secret_references,
+                },
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+            })?;
+            (context.mcp_capability.clone().ok_or(())?, Some(context))
+        } else {
+            let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
+                &soul,
                 provider.as_str(),
-                &workspace,
-                &cwd,
-                Some(mcp_capability.clone()),
-            );
-        // Fresh agents use the direct provider transports, which currently do
-        // not inject Freshell's terminal MCP server. Retain ordinary provider
-        // MCP/config files, plugins, and the staged user root; only remove
-        // terminal-specific Freshell injection to match the direct route.
-        if let Some(context) = provider_launch_context.as_mut() {
-            match &mut context.preparation {
-                freshell_runtime_protocol::ProviderPreparation::Claude { mcp_args } => {
-                    mcp_args.clear()
-                }
-                freshell_runtime_protocol::ProviderPreparation::Codex {
-                    tui_args,
-                    sidecar_args,
-                } => {
-                    tui_args.clear();
-                    sidecar_args.clear();
-                }
-                _ => {}
-            }
-        }
+                crate::managed_mcp_capability::OpencodeEphemeralInput {
+                    cwd: Some(&cwd),
+                    workspace: Some(&workspace),
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, "fresh_agent.create.capability_failed");
+            })?;
+            let provider_launch_context =
+                crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
+                    provider.as_str(),
+                    &workspace,
+                    &cwd,
+                    Some(mcp_capability.clone()),
+                )
+                .map_err(|error| {
+                    tracing::warn!(event="fresh_agent.create.provider_environment_failed", %error);
+                })?;
+            (mcp_capability, provider_launch_context)
+        };
+        provider_launch_context = context_for_fresh_provider(provider_launch_context);
         let launch = FreshAgentLaunchSpec {
             session_id: public_session_id.clone(),
             provider: provider.clone(),
@@ -562,15 +726,62 @@ impl HostedFreshAgentProxy {
             }),
             expected_control_epoch: None,
         };
-        let launched = self
-            .client
-            .launch(request_id, request)
+        let launched = if provider == FreshProvider::Opencode {
+            let home = std::env::var_os("HOME").map(PathBuf::from).ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
+            let references = request
+                .fresh_agent
+                .as_ref()
+                .unwrap()
+                .provider_secret_references
+                .iter()
+                .filter(|r| !r.profile.is_configuration_file())
+                .cloned()
+                .collect();
+            crate::managed_provider_references::launch_initial_opencode(
+                crate::managed_provider_references::OpencodePreparation {
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    original: &original,
+                    references,
+                    auth_authority: None,
+                    selected_sources: None,
+                    accepted_global_root: None,
+                    selected_resource_roots: None,
+                    native_source_flags: None,
+                    rebind_enabled: None,
+                    inherited_inline: None,
+                    inline_edits: Some(freshell_platform::opencode_config::OwnedConfigEdits {
+                        disable_snapshots: true,
+                        ..Default::default()
+                    }),
+                },
+                request_id,
+                request,
+            )
             .await
             .map_err(|error| {
-                let _ =
-                    crate::managed_mcp_capability::revoke_mcp_capability(&mcp_capability.grant_id);
-                tracing::warn!(?error, "fresh_agent.create.launch_failed");
-            })?;
+                tracing::warn!(event="fresh_agent.create.initial_opencode_failed",%error);
+            })?
+        } else {
+            self.client
+                .launch(request_id, request)
+                .await
+                .map_err(|error| {
+                    // A failed reply cannot establish that this exact
+                    // preparation was never accepted. Preserve its journal and
+                    // stage for existing same-conversation reconciliation.
+                    tracing::warn!(event="provider.inputs.initial_launch.unconfirmed",
+                        provider=provider.as_str(),soul_id=%soul,
+                        grant_id=%mcp_capability.grant_id,
+                        stage="controller",operation="launch",%error,
+                        "Retain provider inputs until dispatch outcome is confirmed");
+                })?
+        };
         let naming_projection = match message.naming_handle.as_deref() {
             Some(handle) if !handle.trim().is_empty() => {
                 admit_pending_projection(
@@ -1213,40 +1424,6 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn provider_bootstrap_files(
-    provider: &FreshProvider,
-) -> Result<Vec<ProviderBootstrapFile>, String> {
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let (override_key, fallback, relative) = match provider {
-        FreshProvider::Kilroy => (
-            "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE",
-            home.map(|value| value.join(".claude/.credentials.json")),
-            ".claude/.credentials.json",
-        ),
-        FreshProvider::Claude | FreshProvider::Codex | FreshProvider::Opencode => {
-            return Ok(Vec::new())
-        }
-    };
-    let candidate = std::env::var(override_key)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or(fallback)
-        .filter(|value| value.is_file());
-    let Some(candidate) = candidate else {
-        return Ok(Vec::new());
-    };
-    let source_path = std::fs::canonicalize(candidate)
-        .map_err(|_| "provider credential reference is unreadable".to_string())?;
-    Ok(vec![ProviderBootstrapFile {
-        source_path: source_path.to_string_lossy().into_owned(),
-        provider_relative_path: relative.into(),
-    }])
 }
 
 #[cfg(test)]

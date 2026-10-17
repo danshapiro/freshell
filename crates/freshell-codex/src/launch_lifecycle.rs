@@ -1212,6 +1212,16 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 cmd.kill_on_drop(true);
             }
 
+            #[cfg(target_os = "linux")]
+            if self.sidecar_context.provider_exec_profile {
+                let additional = if program == "/usr/bin/setpriv" {
+                    &["codex"][..]
+                } else {
+                    &[]
+                };
+                freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
+                    .map_err(|error| error.to_string())?;
+            }
             let mut child = cmd
                 .spawn()
                 .map_err(|error| format!("codex app-server spawn failed ({command}): {error}"))?;
@@ -1483,6 +1493,40 @@ async fn persist_record_or_terminate_exact_child(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "real-transport", target_os = "linux"))]
+    #[tokio::test]
+    async fn provider_exec_profile_rejects_actual_managed_codex_app_server_spawn() {
+        use super::*;
+        for count in [17, 1] {
+            let context = crate::launch_plan::CodexSidecarLaunchContext {
+                provider_exec_profile: true,
+                config_args: vec![],
+                env: (0..count)
+                    .map(|i| (format!("FRESHELL_EXEC_FIXTURE_{i}"), "x".repeat(64 * 1024)))
+                    .collect(),
+            };
+            let runtime = SpawnedCodexAppServerRuntime {
+                codex_command: Some(format!(
+                    "node {}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+                    env!("CARGO_MANIFEST_DIR")
+                )),
+                ..SpawnedCodexAppServerRuntime::with_context(context)
+            };
+            let result = runtime.ensure_ready(None).await;
+            runtime
+                .shutdown()
+                .await
+                .expect("cleanup only this exact synthetic app-server in lifecycle sandbox");
+            if count == 17 {
+                assert!(matches!(result,Err(ref cause) if cause.contains("provider exec profile")),"managed terminal app-server must reject its complete oversized environment before dispatch");
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "valid selected inputs must still execute the actual app-server handshake"
+                );
+            }
+        }
+    }
     use super::*;
 
     #[tokio::test]

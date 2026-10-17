@@ -14,7 +14,7 @@ import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from '.
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
 import { TabNameSourceSchema } from './session-names.js'
-import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage } from './managed-runtime.js'
+import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage, ManagedRuntimeRecoverySummary } from './managed-runtime.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -899,6 +899,16 @@ export const FreshAgentSendSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  /** kata bdpt Task 7: one server-owned pre-turn checkpoint barrier is
+   *  correlated with this provider attempt and dispatched as part of this
+   *  same send. Explicit workspace scope is persisted pane intent only. */
+  checkpointIntent: z.object({
+    logicalAttemptId: z.string().trim().min(1).max(128),
+    workspace: z.object({
+      path: z.string().min(1).max(4096),
+      provenance: z.enum(['directory-picker', 'resolved-project', 'legacy-checkpoint']),
+    }).optional(),
+  }).optional(),
   /** b8ke ext r8 F5: the send's delayed-request fence (crashed-session
    *  recovery re-claims carry it, so a stale queued send is typed-refused,
    *  never an unfenced recreation). */
@@ -917,6 +927,14 @@ export const FreshAgentSendSchema = z.object({
     mediaType: z.string(),
     data: z.string(),
   })).optional(),
+}).superRefine((send, context) => {
+  if (send.checkpointIntent && !send.requestId?.trim()) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['requestId'],
+      message: 'requestId is required when checkpointIntent is present',
+    })
+  }
 })
 
 export const FreshAgentInterruptSchema = z.object({
@@ -1322,7 +1340,18 @@ export type PongMessage = {
   timestamp: string
 }
 
+export type ProviderPreparationFailure = {
+  code: 'SELECTED_REFERENCE_UNAVAILABLE'
+  stage: 'configuration'
+  operation: 'resolve'
+  cause: 'not_found' | 'permission_denied' | 'cyclic' | 'unknown'
+  workspace: string
+  declaringConfig: string
+  selectedPath?: string
+}
+
 export type ErrorMessage = {
+  providerPreparationFailure?: ProviderPreparationFailure
   type: 'error'
   code: ErrorCode
   message: string
@@ -1509,12 +1538,15 @@ export type TerminalExitMessage = {
   type: 'terminal.exit'
   terminalId: string
   exitCode: number
+  managedRetained?: boolean
+  exitCodeAvailable?: boolean
 }
 
 export type TerminalStatusMessage = {
   type: 'terminal.status'
   terminalId: string
-  status: 'running' | 'recovering' | 'exited'
+  status: 'running' | 'recovering' | 'blocked' | 'exited'
+  recoverySummary?: ManagedRuntimeRecoverySummary
   reason?: string
   attempt?: number
   /** Auto-resume 'recovering' frames only: the bounded retry budget. The
@@ -1834,6 +1866,27 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_DIVERGED'
   | 'RESTORE_STALE_REVISION'
 
+export const FreshAgentCheckpointOutcomeSchema = z.object({
+  type: z.literal('freshAgent.checkpoint.outcome'),
+  logicalAttemptId: z.string().min(1),
+  requestId: z.string().min(1),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  status: z.enum(['available', 'unavailable']),
+  checkpointId: z.string().min(1).optional(),
+  workspace: z.object({
+    path: z.string().min(1),
+    provenance: z.enum(['directory-picker', 'resolved-project', 'legacy-checkpoint']),
+  }).strict().optional(),
+  code: z.string().optional(),
+  reason: z.string().optional(),
+  nativeTurnId: z.string().min(1).optional(),
+  displayTurnId: z.string().min(1).optional(),
+}).strict()
+
+export type FreshAgentCheckpointOutcome = z.infer<typeof FreshAgentCheckpointOutcomeSchema>
+
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
@@ -1844,6 +1897,7 @@ export type FreshAgentServerMessage =
       ownerKind?: 'terminal' | 'fresh-agent'
       ownerGeneration?: number
       ownerEpoch?: number }
+  | FreshAgentCheckpointOutcome
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
@@ -1933,7 +1987,10 @@ export type TerminalInventoryMessage = {
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
-    runtimeStatus?: 'running' | 'recovering'
+    runtimeStatus?: 'running' | 'recovering' | 'blocked' | 'exited'
+    soulId?: string
+    incarnationId?: string
+    recoverySummary?: ManagedRuntimeRecoverySummary
     cwd?: string
     codexDurability?: CodexDurabilityRef
     /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */

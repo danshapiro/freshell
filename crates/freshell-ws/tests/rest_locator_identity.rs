@@ -119,6 +119,7 @@ async fn spawn_merged_server(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::clone(&cli_commands),
@@ -342,6 +343,11 @@ fn cleanup(h: &Harness) {
 /// exactly as the plugin would, via the pub drain (no sweep-timer race).
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_created_opencode_pane_binds_identity_row_and_ledger() {
+    if common::opencode_home::run_with_opencode_home(
+        "rest_created_opencode_pane_binds_identity_row_and_ledger",
+    ) {
+        return;
+    }
     let h = spawn_merged_server(vec![common::sleeper_cli_spec("opencode")], None).await;
     let (tid, _pane_id) = rest_create(&h, "opencode").await;
 

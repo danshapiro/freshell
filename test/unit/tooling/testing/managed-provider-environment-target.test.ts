@@ -1,0 +1,578 @@
+import { execFileSync, spawn } from 'node:child_process'
+import fs from 'node:fs/promises'
+import { createConnection, createServer, type AddressInfo } from 'node:net'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { describe, expect, it } from 'vitest'
+import {
+  assertManagedTerminalCreated,
+  summarizeRustServerLogEvents,
+} from '../../../../scripts/testing/managed-environment-create.js'
+import {
+  checkpointTcpForwarderSource,
+  committedAcceptanceSha,
+  directHomeAppendMcpServerSource,
+  externalTargetRead,
+  managedHomeAppendFixturePaths,
+  managedEnvironmentFixtureLayout,
+  processIdentity,
+  resolveManagedProviderEnvironmentTargetMode,
+  runManagedProviderEnvironmentTarget,
+  runExactDockerContainerOperation,
+  settleExactDockerContainerRemoval,
+  stopExact,
+  workspaceCwdAliasMcpWrapperSource,
+  workspaceCwdAliasReplacementProcessProbeSource,
+  writeWorkspaceCwdAliasMcpWrapper,
+} from '../../../../scripts/testing/managed-provider-environment-target.js'
+
+async function listenOnLoopback(server: ReturnType<typeof createServer>): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  return (server.address() as AddressInfo).port
+}
+
+describe('managed provider environment target mode', () => {
+  it('rejects acceptance evidence from a dirty worktree', async () => {
+    const repository = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-acceptance-provenance-'))
+    try {
+      await fs.writeFile(path.join(repository, 'source.txt'), 'committed candidate\n')
+      execFileSync('git', ['init', '-q'], { cwd: repository })
+      execFileSync('git', ['add', 'source.txt'], { cwd: repository })
+      execFileSync('git', ['-c', 'user.name=Acceptance Test', '-c', 'user.email=acceptance@example.invalid',
+        'commit', '-q', '-m', 'candidate'], { cwd: repository })
+
+      const candidate = committedAcceptanceSha(repository)
+      expect(candidate).toMatch(/^[a-f0-9]{40}$/)
+      await fs.writeFile(path.join(repository, 'uncommitted.txt'), 'not part of HEAD\n')
+      expect(() => committedAcceptanceSha(repository)).toThrow(/exact committed candidate/)
+    } finally {
+      await fs.rm(repository, { recursive: true, force: true })
+    }
+  })
+
+  it('records typed provider preparation causes without persisting paths', () => {
+    const incidents: unknown[] = []
+    const owner = {
+      web: { capturedOutput: () => ({ stdout: '', stderr: '' }), info: { logsDir: '/nonexistent/managed-test' } },
+      runtime: { containerLogs: () => '', writeIncident: (_name: string, value: unknown) => incidents.push(value) },
+      supervisor: { containerId: 'a'.repeat(64) },
+    }
+    const response = {
+      type: 'error' as const,
+      code: 'PTY_SPAWN_FAILED' as const,
+      timestamp: new Date().toISOString(),
+      message: 'managed runtime launch failed: runtime supervisor rejected request: BackendUnavailable: /private/runtime/path',
+      providerPreparationFailure: {
+        code: 'SELECTED_REFERENCE_UNAVAILABLE' as const,
+        stage: 'configuration' as const,
+        operation: 'resolve' as const,
+        cause: 'permission_denied' as const,
+        workspace: '/private/workspace',
+        declaringConfig: '/private/home/opencode.json',
+        selectedPath: '/private/home/mcp-server.mjs',
+      },
+    }
+
+    expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
+    expect(incidents).toHaveLength(1)
+    expect(incidents[0]).toMatchObject({
+      runtimeErrorCode: 'BackendUnavailable',
+      runtimeErrorClass: 'supervisor_rejected',
+      providerPreparationFailure: {
+        code: 'SELECTED_REFERENCE_UNAVAILABLE', stage: 'configuration', operation: 'resolve', cause: 'permission_denied',
+      },
+    })
+    expect(JSON.stringify(incidents[0])).not.toContain('/private/')
+  })
+
+  it('records only a fixed runtime launch operation for managed host failures', () => {
+    const incidents: unknown[] = []
+    const owner = {
+      web: { capturedOutput: () => ({ stdout: '', stderr: '' }), info: { logsDir: '/nonexistent/managed-test' } },
+      runtime: { containerLogs: () => '', writeIncident: (_name: string, value: unknown) => incidents.push(value) },
+      supervisor: { containerId: 'a'.repeat(64) },
+    }
+    const response = {
+      type: 'error' as const,
+      code: 'PTY_SPAWN_FAILED' as const,
+      timestamp: new Date().toISOString(),
+      message: 'managed runtime launch failed: runtime supervisor rejected request: HostUnreachable: prepare provider config: /private/provider/opencode.json TOKEN_SENTINEL',
+    }
+
+    expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
+    expect(incidents[0]).toMatchObject({ runtimeErrorOperation: 'provider_config' })
+    expect(JSON.stringify(incidents[0])).not.toContain('/private/')
+    expect(JSON.stringify(incidents[0])).not.toContain('TOKEN_SENTINEL')
+  })
+
+  it('retains only bounded event names and levels from server logs', () => {
+    const logs = [
+      JSON.stringify({ level: 'ERROR', event: 'provider.opencode.resource.failed', target: 'freshell_server::managed_runtime',
+        stage: 'prepare', msg: 'PRIVATE_CONFIG_SENTINEL', token: 'PRIVATE_TOKEN_SENTINEL' }),
+      JSON.stringify({ level: 'ERROR', target: 'freshell_server::managed_runtime', stage: 'activate', code: 'PTY', msg: 'PRIVATE_ERROR_SENTINEL' }),
+      JSON.stringify({ level: 'WARN', event: 'invalid event name', target: 'freshell_server::managed_runtime', msg: 'PRIVATE_MESSAGE_SENTINEL' }),
+      '{invalid json',
+    ].join('\n')
+
+    const summary = summarizeRustServerLogEvents(logs)
+
+    expect(summary).toEqual([
+      { level: 'ERROR', event: 'provider.opencode.resource.failed', target: 'freshell_server::managed_runtime', fields: ['stage'] },
+      { level: 'ERROR', target: 'freshell_server::managed_runtime', fields: ['code', 'stage'] },
+    ])
+    expect(JSON.stringify(summary)).not.toContain('PRIVATE_')
+  })
+
+  it('keeps the bounded tail of a large active server log in failure evidence', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-server-log-'))
+    const incidents: Array<Record<string, unknown>> = []
+    try {
+      const logPath = path.join(directory, 'rust-server.jsonl')
+      const tail = { level: 'INFO', target: 'freshell_server::managed_runtime', stage: 'activate' }
+      await fs.writeFile(logPath, `${'x'.repeat(5 * 1024 * 1024)}\n${JSON.stringify(tail)}\n`)
+      expect((await fs.stat(logPath)).size).toBeGreaterThan(4 * 1024 * 1024)
+
+      const owner = {
+        web: { capturedOutput: () => ({ stdout: '', stderr: '' }), info: { logsDir: directory } },
+        runtime: { containerLogs: () => '', writeIncident: (_name: string, value: unknown) => incidents.push(value as Record<string, unknown>) },
+        supervisor: { containerId: 'a'.repeat(64) },
+      }
+      const response = { type: 'error' as const, code: 'PTY_SPAWN_FAILED' as const,
+        timestamp: new Date().toISOString(), message: 'managed runtime launch failed' }
+
+      expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
+      expect(incidents[0]?.serverLogEvents).toEqual([
+        { level: 'INFO', target: tail.target, fields: ['stage'] },
+      ])
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('waits for the target Retry-After before retrying a rate-limited control read', async () => {
+    const responses = [
+      new Response('rate limited', { status: 429, headers: { 'retry-after': '2' } }),
+      new Response(JSON.stringify({ content: JSON.stringify({ requestId: 'request-1' }) }), { status: 200 }),
+    ]
+    const waits: number[] = []
+    let calls = 0
+    const fetcher: typeof fetch = async () => {
+      calls += 1
+      return responses.shift()!
+    }
+
+    const result = await externalTargetRead('http://127.0.0.1:1234', 'token', '/control/request.json', {
+      fetcher,
+      wait: async milliseconds => { waits.push(milliseconds) },
+    })
+
+    expect(result).toEqual({ requestId: 'request-1' })
+    expect(calls).toBe(2)
+    expect(waits).toEqual([2_000])
+  })
+
+  it('keeps the existing managed target as the default and selects checkpoint only explicitly', () => {
+    expect(resolveManagedProviderEnvironmentTargetMode([])).toBe('managed-environment')
+    expect(resolveManagedProviderEnvironmentTargetMode(['--checkpoint'])).toBe('code-checkpoint')
+  })
+
+  it('waits for an exact container whose automatic Docker removal is already in progress', async () => {
+    const containerId = 'a'.repeat(64)
+    const snapshots = [[containerId], [containerId], []]
+    const waits: number[] = []
+
+    await expect(settleExactDockerContainerRemoval(
+      containerId,
+      () => { throw new Error(`Error response from daemon: removal of container ${containerId} is already in progress`) },
+      () => snapshots.shift() ?? [],
+      async milliseconds => { waits.push(milliseconds) },
+      1_000,
+    )).resolves.toBeUndefined()
+
+    expect(waits).toEqual([250, 250])
+  })
+
+  it('accepts a failed cleanup command only after the exact Docker container is gone', async () => {
+    const containerId = 'b'.repeat(64)
+    const error = new Error(`No such container: ${containerId}`)
+
+    await expect(runExactDockerContainerOperation(
+      containerId,
+      () => { throw error },
+      () => [],
+    )).resolves.toEqual({ kind: 'gone' })
+
+    await expect(runExactDockerContainerOperation(
+      containerId,
+      () => { throw new Error('Docker daemon is unavailable') },
+      () => [containerId],
+    )).rejects.toThrow('Docker daemon is unavailable')
+  })
+
+  it('waits for the exact ID to disappear when a cleanup command races automatic removal', async () => {
+    const containerId = 'c'.repeat(64)
+    const snapshots = [[containerId], [containerId], []]
+    const waits: number[] = []
+
+    await expect(runExactDockerContainerOperation(
+      containerId,
+      () => { throw new Error(`Error response from daemon: removal of container ${containerId} is already in progress`) },
+      () => snapshots.shift() ?? [],
+      async milliseconds => { waits.push(milliseconds) },
+      1_000,
+    )).resolves.toEqual({ kind: 'gone' })
+
+    expect(waits).toEqual([250, 250])
+  })
+
+  it('keeps the OpenCode MCP package and parent dependency outside the mounted workspace', () => {
+    const fixture = managedEnvironmentFixtureLayout('/tmp/managed-environment-fixture')
+    const packageRelativeToWorkspace = path.relative(fixture.workspace, fixture.mcpPackage)
+    expect(packageRelativeToWorkspace.startsWith(`..${path.sep}`) || path.isAbsolute(packageRelativeToWorkspace)).toBe(true)
+    expect(fixture.mcpParentDependency).toBe(path.join(fixture.resources, 'node_modules/managed-fixture-mcp-dependency'))
+  })
+
+  it('seeds the direct HOME append file at the HOME root outside XDG resource roots', () => {
+    const home = '/tmp/managed-environment-fixture/home'
+    const cwd = '/tmp/managed-environment-fixture/workspace/preflight'
+    const paths = managedHomeAppendFixturePaths(home, cwd, 'preflight')
+
+    expect(paths.script).toBe(path.join(home, 'direct-home-preflight.mjs'))
+    expect(path.dirname(paths.script)).toBe(home)
+    expect(paths.script.startsWith(path.join(home, 'fixture-xdg') + path.sep)).toBe(false)
+    expect(paths.output).toBe(path.join(path.dirname(paths.script), 'direct-home-preflight.txt'))
+    expect(path.dirname(paths.output)).toBe(path.dirname(paths.script))
+    expect(paths.receipt).toBe(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json'))
+  })
+
+  it('runs an external-CWD MCP wrapper and reports a Node startup syntax error', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-cwd-alias-mcp-'))
+    try {
+      const workspace = path.join(directory, 'workspace')
+      const resource = path.join(directory, 'selected-resources/cwd-alias-project')
+      const wrapper = path.join(workspace, '.managed-fixture/mcp-cwd-alias/start')
+      const receipt = path.join(workspace, '.managed-fixture/mcp-cwd-alias-receipt.json')
+      await fs.mkdir(path.dirname(wrapper), { recursive: true })
+      await fs.mkdir(resource, { recursive: true })
+      await fs.writeFile(wrapper, workspaceCwdAliasMcpWrapperSource(), { mode: 0o751 })
+      await fs.writeFile(path.join(resource, '.env'), 'FRESHELL_MANAGED_CWD_ALIAS_ENV=expected-nonce\n')
+      await fs.writeFile(path.join(resource, 'server.mjs'), `import fs from 'node:fs'
+const [receiptPath, expectedNonce] = process.argv.slice(2)
+fs.writeFileSync(receiptPath, JSON.stringify({ envValueLoaded: process.env.FRESHELL_MANAGED_CWD_ALIAS_ENV === expectedNonce,
+  envFileTarget: fs.realpathSync('.env'), envFileOperand: process.execArgv.find(value => value.startsWith('--env-file=')),
+  cwd: process.cwd() }))
+`)
+
+      const launch = async (expectedReceipt: string) => {
+        const child = spawn(wrapper, [expectedReceipt, 'expected-nonce'], {
+          cwd: resource,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        })
+        let stderr = ''
+        child.stderr?.setEncoding('utf8')
+        child.stderr?.on('data', chunk => { stderr += chunk })
+        const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+          child.once('error', reject)
+          child.once('close', (code, signal) => resolve({ code, signal }))
+        })
+        return { exit, stderr }
+      }
+
+      const success = await launch(receipt)
+      expect(success).toMatchObject({ exit: { code: 0, signal: null }, stderr: '' })
+      expect(await fs.readFile(`${receipt}.started`, 'utf8')).toBe('wrapper-started')
+      expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toEqual({
+        envValueLoaded: true,
+        envFileTarget: path.join(resource, '.env'),
+        envFileOperand: '--env-file=.env',
+        cwd: resource,
+      })
+
+      await fs.writeFile(path.join(resource, 'server.mjs'), 'const = invalid\n')
+      const failureReceipt = path.join(workspace, '.managed-fixture/syntax-error-receipt.json')
+      const failure = await launch(failureReceipt)
+      expect(failure.exit).toEqual({ code: 1, signal: null })
+      expect(JSON.parse(await fs.readFile(failureReceipt, 'utf8'))).toMatchObject({
+        wrapperStarted: true,
+        nodeExitCode: 1,
+        stderrHasSyntaxError: true,
+      })
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('binds a generated replacement-process probe to the live MCP process identity', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-cwd-alias-probe-'))
+    const receiptPath = path.join(directory, 'mcp-cwd-alias-receipt.json')
+    const nonce = 'replacement-probe-nonce'
+    let child: ReturnType<typeof spawn> | undefined
+    try {
+      await fs.writeFile(path.join(directory, '.env'), 'PROBE_ENV=ready\n')
+      await fs.writeFile(path.join(directory, 'server.mjs'), `import fs from 'node:fs'
+const [receiptPath] = process.argv.slice(2)
+const stat = fs.readFileSync('/proc/self/stat', 'utf8')
+const processStartTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\\s+/)[19]
+fs.writeFileSync(receiptPath, JSON.stringify({ pid: process.pid, processStartTicks }))
+process.stdout.write(JSON.stringify({ pid: process.pid, processStartTicks }) + '\\n')
+setInterval(() => {}, 1000)
+`)
+      child = spawn(process.execPath, ['--env-file=.env', 'server.mjs', receiptPath, nonce], {
+        cwd: directory, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let buffered = ''
+      const receipt = await new Promise<{ pid: number; processStartTicks: string }>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('MCP fixture did not report ready')), 5_000)
+        child!.once('error', error => { clearTimeout(timeout); reject(error) })
+        child!.once('exit', (code, signal) => {
+          clearTimeout(timeout)
+          reject(new Error(`MCP fixture exited before ready (${code ?? signal})`))
+        })
+        child!.stdout!.setEncoding('utf8')
+        child!.stdout!.on('data', chunk => {
+          buffered += chunk
+          const boundary = buffered.indexOf('\n')
+          if (boundary < 0) return
+          clearTimeout(timeout)
+          try { resolve(JSON.parse(buffered.slice(0, boundary))) }
+          catch (error) { reject(error) }
+        })
+      })
+      const runProbe = (startTicks: string) => JSON.parse(execFileSync(process.execPath, [
+        '-e', workspaceCwdAliasReplacementProcessProbeSource(), String(receipt.pid), receiptPath, nonce, directory, startTicks,
+      ], { cwd: directory, encoding: 'utf8' }))
+
+      const liveProbe = runProbe(receipt.processStartTicks)
+      expect(liveProbe).toMatchObject({
+        exists: true, isNode: true, envFileOperand: true, fixtureArguments: true, cwdMatches: true,
+        processStartTicksMatches: true, processState: 'S', processName: 'node', executableName: 'node',
+        parentPid: expect.any(Number), readErrors: [],
+      })
+      const staleIdentityProbe = runProbe(`${receipt.processStartTicks}-stale`)
+      expect(staleIdentityProbe.processStartTicksMatches).toBe(false)
+      expect(staleIdentityProbe.processName).toBe('node')
+
+      const missingProbe = JSON.parse(execFileSync(process.execPath, [
+        '-e', workspaceCwdAliasReplacementProcessProbeSource(), String(Number.MAX_SAFE_INTEGER),
+        receiptPath, nonce, directory, receipt.processStartTicks,
+      ], { cwd: directory, encoding: 'utf8' }))
+      expect(missingProbe).toMatchObject({ exists: false, processState: null, processName: null, executableName: null })
+      expect(missingProbe.readErrors).toContainEqual({ field: 'stat', code: 'ENOENT' })
+      expect(JSON.stringify(missingProbe)).not.toContain(nonce)
+      expect(JSON.stringify(missingProbe)).not.toContain(receiptPath)
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const closed = new Promise<void>(resolve => child!.once('close', () => resolve()))
+        child.kill('SIGTERM')
+        await closed
+      }
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a workspace MCP wrapper searchable under a private process umask', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-wrapper-mode-'))
+    try {
+      const fixtureDirectory = path.join(directory, '.managed-fixture')
+      await fs.mkdir(fixtureDirectory, { recursive: true, mode: 0o777 })
+      await fs.chmod(fixtureDirectory, 0o777)
+      const wrapper = path.join(fixtureDirectory, 'mcp-cwd-alias/start')
+      const moduleUrl = pathToFileURL(path.resolve('scripts/testing/managed-provider-environment-target.ts')).href
+      const script = `import fs from 'node:fs/promises'
+import path from 'node:path'
+import { writeWorkspaceCwdAliasMcpWrapper } from ${JSON.stringify(moduleUrl)}
+const wrapper = ${JSON.stringify(wrapper)}
+process.umask(0o077)
+await writeWorkspaceCwdAliasMcpWrapper(wrapper)
+const directory = await fs.stat(path.dirname(wrapper))
+const executable = await fs.stat(wrapper)
+process.stdout.write(JSON.stringify({ directoryMode: directory.mode & 0o777, executableMode: executable.mode & 0o777 }))`
+      const child = spawn(process.execPath, ['--import', 'tsx/esm', '--input-type=module', '-e', script], {
+        cwd: path.resolve('.'), stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stdout = '', stderr = ''
+      child.stdout?.setEncoding('utf8')
+      child.stderr?.setEncoding('utf8')
+      child.stdout?.on('data', chunk => { stdout += chunk })
+      child.stderr?.on('data', chunk => { stderr += chunk })
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        child.once('error', reject)
+        child.once('close', (code, signal) => resolve({ code, signal }))
+      })
+      expect(exit, stderr).toEqual({ code: 0, signal: null })
+      expect(JSON.parse(stdout)).toEqual({ directoryMode: 0o755, executableMode: 0o751 })
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('generates a runnable direct HOME MCP script that appends to its sibling file', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-home-mcp-'))
+    try {
+      const script = path.join(directory, 'server.mjs')
+      const output = path.join(directory, 'sibling.txt')
+      const receipt = path.join(directory, 'receipt.json')
+      await fs.writeFile(script, directHomeAppendMcpServerSource(path.basename(output)))
+      await fs.writeFile(output, 'before')
+
+      const child = spawn(process.execPath, [script, receipt, 'expected-nonce'], {
+        cwd: directory,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr?.setEncoding('utf8')
+      child.stderr?.on('data', chunk => { stderr += chunk })
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        child.once('error', reject)
+        child.once('close', (code, signal) => resolve({ code, signal }))
+      })
+
+      expect(exit, stderr).toEqual({ code: 0, signal: null })
+      expect(await fs.readFile(output, 'utf8')).toBe('before|expected-nonce')
+      expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toMatchObject({
+        expectedNonce: 'expected-nonce',
+        output: 'before|expected-nonce',
+        outputExists: true,
+      })
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('forwards one fixed TCP target while preserving streamed client data', async () => {
+    const upstream = createServer(socket => {
+      socket.on('data', chunk => socket.write(chunk))
+    })
+    const upstreamPort = await listenOnLoopback(upstream)
+    const listenProbe = createServer()
+    const listenPort = await listenOnLoopback(listenProbe)
+    await new Promise<void>(resolve => listenProbe.close(() => resolve()))
+
+    const forwarder = spawn(process.execPath, ['-e', checkpointTcpForwarderSource], {
+      env: {
+        ...process.env,
+        FRESHELL_CHECKPOINT_FORWARDER_HOST: '127.0.0.1',
+        FRESHELL_CHECKPOINT_FORWARDER_PORT: String(listenPort),
+        FRESHELL_CHECKPOINT_UPSTREAM_HOST: '127.0.0.1',
+        FRESHELL_CHECKPOINT_UPSTREAM_PORT: String(upstreamPort),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    forwarder.stdout.on('data', chunk => { stdout += chunk.toString() })
+    forwarder.stderr.on('data', chunk => { stderr += chunk.toString() })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`forwarder did not become ready: ${stdout} ${stderr}`)), 5_000)
+        forwarder.stdout.on('data', () => {
+          if (!stdout.includes('code_checkpoint.forwarder_listening')) return
+          clearTimeout(timer)
+          resolve()
+        })
+        forwarder.once('error', error => {
+          clearTimeout(timer)
+          reject(error)
+        })
+        forwarder.once('exit', (code, signal) => {
+          clearTimeout(timer)
+          reject(new Error(`forwarder exited before ready (${code ?? signal}): ${stdout} ${stderr}`))
+        })
+      })
+
+      const payload = Buffer.from('checkpoint-forwarder-stream-proof')
+      const received = await new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = []
+        let byteLength = 0
+        const client = createConnection({ host: '127.0.0.1', port: listenPort }, () => client.write(payload))
+        const timer = setTimeout(() => {
+          client.destroy()
+          reject(new Error('forwarded TCP stream timed out'))
+        }, 5_000)
+        client.on('data', chunk => {
+          chunks.push(Buffer.from(chunk))
+          byteLength += chunk.length
+          if (byteLength >= payload.length) {
+            clearTimeout(timer)
+            resolve(Buffer.concat(chunks))
+            client.destroy()
+          }
+        })
+        client.once('error', error => {
+          clearTimeout(timer)
+          reject(error)
+        })
+      })
+      expect(received).toEqual(payload)
+    } finally {
+      if (forwarder.exitCode === null && forwarder.signalCode === null) {
+        forwarder.kill('SIGTERM')
+        await new Promise<void>(resolve => forwarder.once('exit', () => resolve()))
+      }
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+    }
+  })
+
+  it('settles the exact detached child process group when a wrapper exits before its child', async () => {
+    const parentSource = `const {spawn}=require('node:child_process');const grandchild=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});process.stdout.write(JSON.stringify({pid:grandchild.pid})+'\\n');setInterval(()=>{},1000)`
+    const wrapper = spawn(process.execPath, ['-e', parentSource], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    })
+    let stdout = ''
+    let stderr = ''
+    wrapper.stdout.on('data', chunk => { stdout += chunk.toString() })
+    wrapper.stderr.on('data', chunk => { stderr += chunk.toString() })
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      wrapper.once('error', reject)
+      wrapper.once('close', (code, signal) => resolve({ code, signal }))
+    })
+    const childPid = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`wrapper did not publish its child PID: ${stdout} ${stderr}`)), 5_000)
+      wrapper.stdout.on('data', () => {
+        const match = stdout.match(/\{"pid":(\d+)\}/)
+        if (!match) return
+        clearTimeout(timer)
+        resolve(Number(match[1]))
+      })
+      wrapper.once('error', error => {
+        clearTimeout(timer)
+        reject(error)
+      })
+      wrapper.once('exit', (code, signal) => {
+        clearTimeout(timer)
+        reject(new Error(`wrapper exited before publishing its child PID (${code ?? signal}): ${stdout} ${stderr}`))
+      })
+    })
+    const identity = await processIdentity(wrapper)
+    expect(identity.processGroupId).toBe(wrapper.pid)
+    expect(identity.sessionId).toBe(wrapper.pid)
+    await stopExact(wrapper, identity, closed, true)
+    expect(wrapper.signalCode).toBe('SIGTERM')
+    const childState = await fs.readFile(`/proc/${childPid}/stat`, 'utf8').then(raw =>
+      raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/)[0],
+    ).catch(() => undefined)
+    expect(childState === undefined || childState === 'Z').toBe(true)
+  })
+
+  it.each([['--managed'], ['--checkpoint', '--checkpoint'], ['--checkpoint', 'other'], ['--unknown']])(
+    'rejects unsupported or ambiguous target arguments %j', (...args) => {
+      expect(() => resolveManagedProviderEnvironmentTargetMode(args)).toThrow(/usage/i)
+    },
+  )
+
+  it('fails closed on a local backend instead of falling back from checkpoint mode', async () => {
+    const priorBackend = process.env.FRESHELL_E2E_BACKEND
+    process.env.FRESHELL_E2E_BACKEND = 'local'
+    try {
+      await expect(runManagedProviderEnvironmentTarget(['--checkpoint']))
+        .rejects.toThrow('Checkpoint acceptance requires configured Cloud')
+    } finally {
+      if (priorBackend === undefined) delete process.env.FRESHELL_E2E_BACKEND
+      else process.env.FRESHELL_E2E_BACKEND = priorBackend
+    }
+  })
+})

@@ -8,7 +8,7 @@ import {
   patchSessionRunningStateFromTerminalMeta,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
-import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab, updateTab } from '@/store/tabsSlice'
 import {
   ApiError,
   api,
@@ -108,7 +108,14 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
-import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes } from '@/store/panesSlice'
+import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes, updatePaneContent } from '@/store/panesSlice'
+import { collectPaneEntries } from '@/lib/pane-utils'
+import {
+  aggregateTerminalTabStatus,
+  isRetainedManagedTerminal,
+  managedTerminalProjection,
+  managedTerminalResumePaneStatus,
+} from '@/lib/managed-terminal.js'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { foldTerminalInventoryTitles } from '@/lib/terminal-inventory-titles'
@@ -1619,6 +1626,7 @@ export default function App() {
         }
         if (msg.type === 'terminal.inventory') {
           const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
+          const tabsWithManagedInventory = new Set<string>()
           const terminalMeta = Array.isArray(msg.terminalMeta) ? msg.terminalMeta : []
           const terminalMetaRequestedAt = Date.now()
           const previousTerminalMeta = appStore.getState().terminalMeta?.byTerminalId ?? {}
@@ -1642,9 +1650,30 @@ export default function App() {
                 sessionRef: terminal.sessionRef,
               })
             }
+            if (isRetainedManagedTerminal(terminal)) {
+              const managedStatus = managedTerminalResumePaneStatus(terminal)
+              const isLive = managedStatus === 'running' || managedStatus === 'recovering'
+              for (const [tabId, layout] of Object.entries(appStore.getState().panes.layouts)) {
+                let matchedTerminal = false
+                for (const { paneId, content } of collectPaneEntries(layout)) {
+                  if (content.kind === 'terminal' && content.terminalId === terminal.terminalId) {
+                    matchedTerminal = true
+                    dispatch(updatePaneContent({ tabId, paneId, content: {
+                      ...content,
+                      ...managedTerminalProjection(terminal),
+                      status: managedStatus,
+                      ...(isLive ? { launchFailure: undefined } : {}),
+                    } }))
+                  }
+                }
+                if (matchedTerminal) {
+                  tabsWithManagedInventory.add(tabId)
+                }
+              }
+            }
           }
           const liveIds = terminals
-            .filter((t: any) => t.status === 'running')
+            .filter((t: any) => t.status === 'running' || isRetainedManagedTerminal(t))
             .map((t: any) => t.terminalId as string)
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))
@@ -1655,6 +1684,14 @@ export default function App() {
           // fallback census if the reconcile later fails).
           if (!paneReconcileActiveRef.current) {
             runDestructiveTerminalCensus(liveIds)
+          }
+          for (const tabId of tabsWithManagedInventory) {
+            const layout = appStore.getState().panes.layouts[tabId]
+            if (!layout) continue
+            const status = aggregateTerminalTabStatus(collectPaneEntries(layout).flatMap(({ content }) => (
+              content.kind === 'terminal' ? [content.status] : []
+            )))
+            if (status) dispatch(updateTab({ id: tabId, updates: { status } }))
           }
           dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: terminalMetaRequestedAt }))
           dispatch(patchSessionRunningStateFromTerminalMeta({

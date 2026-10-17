@@ -8,8 +8,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::common::{
-    double_option, AgentProvider, CodexDurability, PermissionMode, Sandbox, SessionLocator,
-    SessionType, Shell, StringOrNumber, TerminalAttachIntent, TerminalAttachPriority,
+    double_option, AgentProvider, CodexDurability, FreshAgentCheckpointIntent, PermissionMode,
+    Sandbox, SessionLocator, SessionType, Shell, StringOrNumber, TerminalAttachIntent,
+    TerminalAttachPriority,
 };
 
 /// A message sent from a client to the server.
@@ -989,6 +990,11 @@ pub struct FreshAgentSend {
     pub observed_epoch: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<u64>,
+    /// Modern send/capture barrier identity. The server captures and settles
+    /// this attempt before dispatching the provider send; legacy frames omit
+    /// it and retain their existing behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_intent: Option<FreshAgentCheckpointIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

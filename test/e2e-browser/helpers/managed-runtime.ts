@@ -10,9 +10,9 @@ import {
   type ProviderQualificationReceiptV2,
   type ProviderQualificationRow,
 } from '../../../scripts/testing/provider-qualification-receipt.js'
-import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
+import { RuntimeHarness, type RuntimeFixtureInputs, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
-import type { TestServerInfo } from './test-server.js'
+import type { E2eServerInfo as TestServerInfo } from './server-fixture-support.js'
 import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
 import {
   buildFreshAgentQualificationReceipt,
@@ -22,6 +22,8 @@ import {
 
 export const P2_OPENCODE_VERSION = '1.18.21'
 export const P2_OPENCODE_MODEL = 'openai/gpt-5.6-luna'
+
+export type ManagedEnvironmentInputs = RuntimeFixtureInputs & { defaultCwd: string }
 
 export type ManagedRuntimeView = {
   soulId: string
@@ -84,6 +86,7 @@ export class ManagedRuntimeBrowserRig {
   private readonly providerSettings: Record<string, Record<string, unknown>>
   private readonly freshAgentModes: string[]
   private readonly fixtureFreshAgentModes: string[]
+  private readonly defaultCwd: string
   private qualificationSupervisorBin: string | undefined
 
   constructor(
@@ -99,6 +102,7 @@ export class ManagedRuntimeBrowserRig {
       fixtureFreshAgentModes?: string[]
     } = { enabledProviders: ['opencode'] },
     webHomeDir?: string,
+    fixtureInputs?: ManagedEnvironmentInputs,
     /**
      * Operator home for the managed-runtime supervisor: passed to the
      * supervisor as `--operator-home`, so every terminal/fresh-agent soul
@@ -113,7 +117,11 @@ export class ManagedRuntimeBrowserRig {
     operatorHome?: string,
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
-    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase)
+    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase, webHomeDir, serverEnv.XDG_CONFIG_HOME, fixtureInputs)
+    this.defaultCwd = fixtureInputs?.defaultCwd ?? this.repoRoot
+    if (fixtureInputs && !fixtureInputs.workspaceRoots.includes(this.defaultCwd)) {
+      throw new Error('managed environment default cwd must be an explicitly selected workspace')
+    }
     this.serverEnv = { ...serverEnv }
     this.webHomeDir = webHomeDir
     this.resolvedOperatorHome = operatorHome === undefined
@@ -208,7 +216,7 @@ export class ManagedRuntimeBrowserRig {
         await fsp.writeFile(path.join(freshell, 'config.json'), JSON.stringify({
           version: 1,
           settings: {
-            defaultCwd: this.repoRoot,
+            defaultCwd: this.defaultCwd,
             codingCli: {
               enabledProviders: this.enabledProviders,
               providers: {

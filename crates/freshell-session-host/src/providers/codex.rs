@@ -35,6 +35,7 @@ pub async fn prepare(
         // It has no web-owned MCP context to inherit, so use the explicit
         // empty launch context rather than silently reintroducing web state.
         sidecar_context: CodexSidecarLaunchContext {
+            provider_exec_profile: true,
             config_args: terminal
                 .provider_launch_context
                 .as_ref()

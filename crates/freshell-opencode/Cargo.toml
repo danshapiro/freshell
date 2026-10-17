@@ -30,6 +30,9 @@ publish.workspace = true
 # live in the next step). Default-off keeps the shared workspace build lean.
 default = []
 real-transport = ["dep:reqwest", "dep:libc", "tokio/process", "tokio/io-util"]
+# The opt-in contract requires a separately provisioned pinned OpenCode binary; it
+# stays out of default workspace/pre-push behavior and reuses production transport.
+real-provider-contract-tests = ["real-transport"]
 
 [dependencies]
 freshell-platform = { path = "../freshell-platform" }
@@ -67,3 +70,8 @@ tokio = { version = "1", features = ["test-util"] }
 # F3 test facility: a capturing `Layer` + `tracing::subscriber::set_default` so the
 # malformed-inline-config warning is assertable (the freshell-codex/DIAG-01 idiom).
 tracing-subscriber = "0.3"
+
+[[test]]
+name = "checkpoint_message_id_contract"
+path = "tests/checkpoint_message_id_contract.rs"
+required-features = ["real-provider-contract-tests"]

@@ -78,6 +78,8 @@ import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
+import { managedSdkSpawn } from './exec-profile.mjs'
+import { hostedMcpServers } from './hosted-mcp.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -238,6 +240,27 @@ function handleSdkMessage(sessionId, msg) {
   }
 
   switch (msg.type) {
+    case 'user': {
+      // The SDK replays actual persisted user messages when this query opts in.
+      // Only the unique UUID that this sidecar supplied for a checkpointed send
+      // can resolve its attempt; assistant/tool/result frames and unrelated
+      // user rows are never identity evidence.
+      if (msg.isReplay === true && msg.message?.role === 'user' && isUuid(msg.uuid)) {
+        const attempt = st.pendingCheckpointAttempts.get(msg.uuid)
+        if (attempt) {
+          st.pendingCheckpointAttempts.delete(msg.uuid)
+          emit({
+            type: 'sdk.checkpointTurnIdentity',
+            sessionId,
+            logicalAttemptId: attempt.logicalAttemptId,
+            requestId: attempt.requestId,
+            nativeTurnId: msg.uuid,
+            displayTurnId: msg.uuid,
+          })
+        }
+      }
+      break
+    }
     case 'system': {
       if (msg.subtype === 'init') {
         st.cliSessionId = msg.session_id
@@ -384,6 +407,7 @@ function handleCreate(req) {
       // finally can mint the edge for a result-less turn end.
       turnCompleteGate: createTurnCompleteGate(),
       pendingResults: 0,
+      pendingCheckpointAttempts: new Map(),
     }
     const { iterable, handle } = createInputStream((isCompact) => {
       if (isCompact) state.handedCompactLikely = true
@@ -395,6 +419,9 @@ function handleCreate(req) {
     // events (macrotasks) cannot interleave inside that finally.
     sessions.set(sessionId, state)
 
+    const sdkStderr = process.env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
+      ? data => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', event: 'provider.stderr', bytes: Buffer.byteLength(String(data)) })}\n`)
+      : data => logerr(`sdk stderr: ${String(data).trimEnd()}`)
     const sdkQuery = query({
       prompt: iterable,
       options: {
@@ -415,12 +442,18 @@ function handleCreate(req) {
         plugins: Array.isArray(req.plugins)
           ? req.plugins.map(path => ({ type: 'local', path }))
           : undefined,
+        mcpServers: hostedMcpServers(req.hostedMcp),
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
+        // This is the SDK's native persisted-user witness. Without the replay
+        // flag a supplied SDKUserMessage UUID is not surfaced back to the
+        // sidecar, so checkpoint identity must remain unbound.
+        extraArgs: { 'replay-user-messages': null },
         abortController: abort,
         env: createClaudeSdkCleanEnv(process.env),
         settingSources: ['user', 'project', 'local'],
-        stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
+        spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
+        stderr: sdkStderr,
         canUseTool: async (toolName, input, options) => {
           const s = sessions.get(sessionId)
           if (!s) return { behavior: 'allow', updatedInput: input }
@@ -443,8 +476,7 @@ function handleCreate(req) {
       }).catch((error) => logerr(`session commands unavailable: ${error?.message || error}`))
     }
 
-    // Placeholder returns IMMEDIATELY (the SDK query is lazy) — exactly as
-    // SdkBridge.createSession returns the nanoid before system/init arrives.
+    // Return the placeholder before the native system/init identity arrives.
     emit({ type: 'created', requestId, sessionId })
     consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
   } catch (err) {
@@ -463,15 +495,29 @@ function handleSend(req) {
   // the quiesce handler can drain never-handed compacts from the input queue
   // and so a same-tick handoff arms the BUSY-forcing handed flag.
   const isCompact = /^\s*\/compact(\s|$)/.test(String(req.text ?? ''))
-  st.inputStream.push(
-    {
+  const attempt = req.checkpointAttempt
+  const checkpointAttempt = attempt && isUuid(attempt.uuid)
+    && typeof attempt.logicalAttemptId === 'string' && attempt.logicalAttemptId.length > 0
+    && typeof attempt.requestId === 'string' && attempt.requestId.length > 0
+    ? { uuid: attempt.uuid, logicalAttemptId: attempt.logicalAttemptId, requestId: attempt.requestId }
+    : undefined
+  const userMessage = {
       type: 'user',
       message: { role: 'user', content: userMessageContent(req.text, req.images) },
       parent_tool_use_id: null,
       session_id: st.cliSessionId || 'default',
-    },
-    isCompact,
-  )
+      ...(checkpointAttempt ? { uuid: checkpointAttempt.uuid } : {}),
+    }
+  if (checkpointAttempt) {
+    // Bound stale/missing-replay entries. Eviction means unavailable identity,
+    // never an approximate join by request order or prompt text.
+    st.pendingCheckpointAttempts.delete(checkpointAttempt.uuid)
+    st.pendingCheckpointAttempts.set(checkpointAttempt.uuid, checkpointAttempt)
+    while (st.pendingCheckpointAttempts.size > 128) {
+      st.pendingCheckpointAttempts.delete(st.pendingCheckpointAttempts.keys().next().value)
+    }
+  }
+  st.inputStream.push(userMessage, isCompact)
   // Unified attention bookkeeping: this send is now ACCEPTED (the input-stream
   // push succeeded) and awaits exactly one terminal frame — a COUNTER, not a
   // boolean: two queued sends leave it at 2 and the first result must drop it
@@ -480,6 +526,11 @@ function handleSend(req) {
   // the first assistant/system frame and cannot see the accept→first-message
   // window. The gate is NOT reset here — see turn-complete-gate.mjs.
   st.pendingResults += 1
+}
+
+function isUuid(value) {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 }
 
 async function handleConfigure(req) {

@@ -179,6 +179,36 @@ describe('buildResumeContent', () => {
     expect('liveTerminal' in content).toBe(false)
   })
 
+  it('preserves the blocked state when building a resumed managed terminal pane', () => {
+    const recoverySummary = {
+      desiredState: 'running' as const,
+      recoveryState: 'blocked' as const,
+      reason: 'host_unreachable',
+      durabilityState: 'resume_captured' as const,
+      allocationState: 'verified_durable' as const,
+    }
+    const content = buildResumeContent({
+      sessionType: 'codex',
+      sessionId: 'blocked-session',
+      liveTerminal: {
+        terminalId: 'term-blocked',
+        serverInstanceId: 'srv-local',
+        soulId: 'blocked-soul',
+        incarnationId: 'blocked-incarnation',
+        runtimeStatus: 'blocked',
+        recoverySummary,
+      },
+    })
+
+    expect(content).toMatchObject({
+      kind: 'terminal',
+      terminalId: 'term-blocked',
+      status: 'error',
+      runtimeStatus: 'blocked',
+      recoverySummary,
+    })
+  })
+
   it('fresh-agent panes have no terminalId', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',

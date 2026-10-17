@@ -42,7 +42,7 @@
     "prepare:claude-sidecar": "tsx scripts/ensure-claude-sidecar.ts",
     "prepare:electron-runtime": "tsx scripts/prepare-electron-runtime.ts",
     "verify:electron-artifact": "tsx scripts/verify-electron-artifact.ts",
-    "prestart": "pnpm run prepare:rust-runtime",
+    "prestart": "tsx scripts/prepare-rust-runtime.ts",
     "start": "cross-env NODE_ENV=production tsx scripts/start-rust-server.ts target/release/freshell-server",
     "serve:precheck": "cross-env FRESHELL_PRECHECK_INTENT=serve tsx scripts/precheck.ts",
     "serve": "pnpm run serve:precheck && pnpm run build && pnpm run start",

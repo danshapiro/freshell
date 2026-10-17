@@ -1,6 +1,15 @@
 import { createSelector } from '@reduxjs/toolkit'
+import type { ManagedRuntimeProjectionFields } from '../../../shared/managed-runtime.js'
+import { isRetainedManagedTerminal, managedTerminalProjection } from '@/lib/managed-terminal'
 import type { RootState } from '../store'
-import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping, ProjectGroup } from '../types'
+import type {
+  BackgroundTerminal,
+  CodingCliProviderName,
+  FreshAgentCheckpointWorkspace,
+  WorktreeGrouping,
+  ProjectGroup,
+} from '../types'
+import { normalizeFreshAgentCheckpointWorkspace } from '../paneTypes'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
@@ -21,7 +30,7 @@ import { isScopedSessionRow, selectSessionRowRecord } from '@/store/selectors/se
  */
 const selectSessionStatusTiers = makeSelectSessionStatusTiers()
 
-export interface SidebarSessionItem {
+export interface SidebarSessionItem extends ManagedRuntimeProjectionFields {
   id: string
   sessionId: string
   provider: CodingCliProviderName
@@ -40,6 +49,7 @@ export interface SidebarSessionItem {
   archived?: boolean
   timestamp: number
   cwd?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   hasTab: boolean
   ratchetedActivity?: number
   isRunning: boolean
@@ -137,6 +147,8 @@ function getCodexDurabilityReason(durability?: CodexDurabilityRef): string | und
 }
 
 type RunningSessionInfo = {
+  terminal: BackgroundTerminal
+  isRunning: boolean
   terminalId: string
   createdAt: number
   allTerminalIds: string[]
@@ -201,7 +213,7 @@ export function buildSessionItems(
   }
 
   for (const terminal of terminals || []) {
-    if (terminal.status === 'running') {
+    if (terminal.status === 'running' || isRetainedManagedTerminal(terminal)) {
       const codexDurabilitySessionId = terminal.mode === 'codex'
         ? getCodexDurabilitySessionId(terminal.codexDurability)
         : undefined
@@ -235,12 +247,17 @@ export function buildSessionItems(
           existing.codexDurabilityState = codexDurabilityState
         }
         existing.codexDurabilityReason = existing.codexDurabilityReason ?? codexDurabilityReason
-        if (terminal.createdAt < existing.createdAt) {
+        if ((terminal.soulId && !existing.terminal.soulId)
+          || (Boolean(terminal.soulId) === Boolean(existing.terminal.soulId) && terminal.createdAt < existing.createdAt)) {
+          existing.terminal = terminal
+          existing.isRunning = terminal.status === 'running'
           existing.terminalId = terminal.terminalId
           existing.createdAt = terminal.createdAt
         }
       } else {
         runningSessionMap.set(sessionKey, {
+          terminal,
+          isRunning: terminal.status === 'running',
           terminalId: terminal.terminalId,
           createdAt: terminal.createdAt,
           allTerminalIds: [terminal.terminalId],
@@ -318,9 +335,11 @@ export function buildSessionItems(
         archived: session.archived,
         timestamp: session.lastActivityAt,
         cwd: session.cwd,
+        checkpointWorkspace: normalizeFreshAgentCheckpointWorkspace(session.checkpointWorkspace),
         hasTab: tabInfo?.hasTab ?? false,
         ratchetedActivity,
-        isRunning: !!runningTerminalId,
+        isRunning: runningTerminal ? runningTerminal.isRunning : !!runningTerminalId,
+        ...managedTerminalProjection(runningTerminal?.terminal),
         runningTerminalId,
         runningTerminalIds,
         isSubagent: session.isSubagent,
@@ -417,7 +436,8 @@ export function buildSessionItems(
       cwd: input.cwd,
       hasTab,
       ratchetedActivity: sessionActivity[key],
-      isRunning: !!runningTerminalId,
+      isRunning: runningTerminal ? runningTerminal.isRunning : !!runningTerminalId,
+        ...managedTerminalProjection(runningTerminal?.terminal),
       runningTerminalId,
       runningTerminalIds,
       isSubagent: input.metadata?.isSubagent
@@ -531,7 +551,7 @@ export function buildSessionItems(
   }
 
   for (const terminal of terminals || []) {
-    if (terminal.status !== 'running') continue
+    if (terminal.status !== 'running' && !isRetainedManagedTerminal(terminal)) continue
     if (terminal.sessionRef) continue
     if (!terminal.mode || terminal.mode === 'shell' || !isNonShellMode(terminal.mode)) continue
 
@@ -574,7 +594,8 @@ export function buildSessionItems(
       cwd: terminal.cwd,
       hasTab: paneInfo?.hasTab ?? false,
       ratchetedActivity: sessionActivity[key],
-      isRunning: true,
+      isRunning: terminal.status === 'running',
+      ...managedTerminalProjection(terminal),
       runningTerminalId: terminal.terminalId,
       runningTerminalIds: [terminal.terminalId],
       isFallback: true,
@@ -722,7 +743,7 @@ export function filterSessionItemsByVisibility(
     if (!settings.showSubagents && item.isSubagent) return false
     if (settings.ignoreCodexSubagents && item.isSubagent && item.provider === 'codex') return false
     if (shouldHideAsNonInteractive(item, settings.showNoninteractiveSessions)) return false
-    if (settings.hideEmptySessions && !item.hasTitle && !item.hasTab && !item.isRunning) return false
+    if (settings.hideEmptySessions && !item.hasTitle && !item.hasTab && !item.isRunning && !item.soulId) return false
     if (isExcludedByFirstUserMessage(item.firstUserMessage, exclusions, settings.excludeFirstChatMustStart)) return false
     return true
   })

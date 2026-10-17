@@ -132,6 +132,7 @@ pub enum DedupeDecision {
 /// the retry proceeds as a fresh create).
 fn waiter_error(request_id: &str) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,

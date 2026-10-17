@@ -60,9 +60,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # the image for legacy npm-era branches: docker/sandbox/entrypoint.sh
 # selects the manager per tree (packageManager field, else lock presence),
 # so old package-lock.json-only branches keep their `npm ci` path. pnpm's
-# per-user store and state land under the sandbox user's HOME
-# (/home/sandbox, sandbox-owned by construction), so no extra chown or
-# VOLUME entries are needed for it.
+# per-user store and state use an explicit sandbox-owned volume. Runtime-suite
+# containers have a read-only root, so the store cannot live only in the
+# container filesystem.
 RUN npm install -g pnpm@10.34.5
 
 # pnpm's default store-path resolution probes the project root's
@@ -93,6 +93,11 @@ RUN if getent passwd "${UID}" >/dev/null 2>&1; then \
       useradd -m -u "${UID}" -g "${GID}" -s /bin/bash sandbox; \
     fi \
     && chown -R "${UID}:${GID}" /usr/local/cargo /usr/local/rustup
+
+# This writable target must exist in the image before the named pnpm store is
+# mounted, because runtime-suite containers have a read-only root filesystem.
+RUN mkdir -p /home/sandbox/.local/share/pnpm/store \
+    && chown -R "${UID}:${GID}" /home/sandbox/.local
 
 # Playwright's own installer needs its system dependency list resolved once
 # a browser version is known (that happens per-run from package.json at

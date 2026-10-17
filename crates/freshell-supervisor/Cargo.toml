@@ -13,12 +13,13 @@ provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 [dependencies]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
+freshell-platform = { path = "../freshell-platform" }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }
 anyhow = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { package = "rusqlite", version = "0.31", features = ["bundled"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 async-trait = "0.1"
@@ -29,3 +30,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json"] }

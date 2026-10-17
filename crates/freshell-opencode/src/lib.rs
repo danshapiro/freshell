@@ -51,10 +51,10 @@ pub use model::{
     FRESHOPENCODE_DEFAULT_EFFORT,
 };
 pub use serve::{
-    build_prompt_body, default_opencode_database, display_error_chain, is_healthy_response,
-    resolve_opencode_database, CreatedSession, DaemonSignal, EffectiveOpencodeDatabase, Endpoint,
-    EventSource, EventStreamHandle, ForkedSession, OpencodeServeManager, PortAllocator,
-    ProcessSpawner, Route, ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError,
-    ServeHttpRequest, ServeHttpResponse, ServeProcess, SessionSignal, SpawnRequest,
-    OPENCODE_SIDECAR_OWNERSHIP_ENV,
+    build_prompt_body, build_prompt_body_with_message_id, default_opencode_database,
+    display_error_chain, is_healthy_response, observed_user_message_id, resolve_opencode_database,
+    CreatedSession, DaemonSignal, EffectiveOpencodeDatabase, Endpoint, EventSource,
+    EventStreamHandle, ForkedSession, OpencodeServeManager, PortAllocator, ProcessSpawner, Route,
+    ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError, ServeHttpRequest,
+    ServeHttpResponse, ServeProcess, SessionSignal, SpawnRequest, OPENCODE_SIDECAR_OWNERSHIP_ENV,
 };

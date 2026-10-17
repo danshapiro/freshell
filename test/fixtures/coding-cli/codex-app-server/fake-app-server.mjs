@@ -183,15 +183,30 @@ function ensureDurableArtifact(threadId) {
   // session_meta first line, the shape the real codex rollout writer produces
   // and the Rust indexer parses (parse_codex_session_content requires an id +
   // cwd -- the R10b cwd-less exclusion gate skips files without one).
-  fs.writeFileSync(thread.path, JSON.stringify({
-    timestamp: now.toISOString(),
-    type: 'session_meta',
-    payload: { id: threadId, cwd: process.cwd(), createdAt: now.toISOString() },
-  }) + '\n', 'utf8')
+  try {
+    fs.writeFileSync(thread.path, JSON.stringify({
+      timestamp: now.toISOString(),
+      type: 'session_meta',
+      payload: { id: threadId, cwd: process.cwd(), createdAt: now.toISOString() },
+    }) + '\n', { encoding: 'utf8', flag: 'wx' })
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error
+  }
   return {
     codexHome,
     thread,
   }
+}
+
+function appendDurableUserMessage(thread, params) {
+  const message = Array.isArray(params?.input)
+    ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
+    : ''
+  fs.appendFileSync(thread.path, JSON.stringify({
+    timestamp: new Date().toISOString(),
+    type: 'event_msg',
+    payload: { type: 'user_message', message },
+  }) + '\n', 'utf8')
 }
 
 function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
@@ -304,6 +319,8 @@ function makeThreadTurnsPage(params = {}) {
   }
 }
 
+let uniqueThreadStartCounter = 0
+
 function successResult(method, params) {
   if (method === 'initialize') {
     return {
@@ -314,7 +331,10 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/start') {
-    const threadId = behavior.threadStartThreadId || 'thread-new-1'
+    const threadId = behavior.threadStartThreadId
+      || (behavior.uniqueThreadIds === true
+        ? `thread-${process.pid}-${++uniqueThreadStartCounter}`
+        : 'thread-new-1')
     const rolloutPath = behavior.threadStartRolloutPath || behavior.rolloutPath
     const thread = makeThread(threadId, params)
     if (rolloutPath) thread.path = rolloutPath
@@ -989,6 +1009,9 @@ wss.on('connection', (socket) => {
       }
       if (method === 'turn/start' && message.params?.threadId) {
         const { thread } = ensureDurableArtifact(message.params.threadId)
+        if (behavior.persistRolloutUserMessages) {
+          appendDurableUserMessage(thread, message.params)
+        }
         const rolloutPath = thread.path
         const rolloutParent = path.dirname(rolloutPath)
         for (const [watchId, watchedPath] of watches) {

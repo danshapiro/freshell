@@ -17,6 +17,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_ws::WsState;
 
+pub mod opencode_home;
+
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
 /// Frame-receive / poll budget for the WS e2e suites. DEFLAKE (the-usual
@@ -190,6 +192,7 @@ pub async fn spawn_server_with_specs_and_shared_settings(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -271,6 +274,7 @@ pub async fn spawn_server_with_specs(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -609,6 +613,7 @@ pub async fn spawn_server_with_specs_and_naming(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -689,6 +694,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -797,6 +803,7 @@ pub async fn spawn_server_with_specs_hub_and_state(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -886,6 +893,7 @@ pub async fn spawn_server_with_specs_and_state(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -978,6 +986,7 @@ pub async fn spawn_server_with_ledger(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -1071,6 +1080,7 @@ pub async fn spawn_server_with_ledger_and_state(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -1160,6 +1170,7 @@ pub async fn spawn_server_with_specs_and_activity(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -1247,6 +1258,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -1364,6 +1376,7 @@ pub async fn spawn_server_with_specs_activity_codex_locator_and_naming(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -1477,6 +1490,7 @@ pub async fn spawn_server_with_create_protect_probes(
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(Vec::new()),
@@ -1755,6 +1769,16 @@ pub async fn next_frame_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Va
             .expect("no ws error");
         if let WsMessage::Text(text) = &msg {
             let value: serde_json::Value = serde_json::from_str(text).expect("json frame");
+            if wanted == "terminal.created" && value["type"] == "error" {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "severity": "error", "event": "test_terminal_create_error",
+                        "requestId": value["requestId"], "code": value["code"],
+                        "message": value["message"],
+                    })
+                );
+            }
             if value["type"] == serde_json::json!(wanted) {
                 return value;
             }

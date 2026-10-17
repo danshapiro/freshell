@@ -60,7 +60,49 @@ struct McpCapabilityRequest<'a> {
     provider: Option<&'a str>,
     tui_source: Option<&'a freshell_runtime_protocol::ProviderConfigReference>,
     workspace: Option<&'a str>,
+    auth_lookup_authority: Option<&'a str>,
+    claude_recovery_source: Option<&'a freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
+    cwd: Option<&'a str>,
+    prior_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
+    provider_secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
+    provider_path_inputs: Option<&'a freshell_runtime_protocol::ProviderPathInputs>,
 }
+
+#[derive(Clone)]
+struct AuthLookupAuthority {
+    start: crate::registry::RecoveryStart,
+    expires: Instant,
+}
+struct AuthLookupScope {
+    authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
+    key: String,
+}
+
+#[path = "claude_source_observation.rs"]
+mod claude_source_observation;
+#[cfg(test)]
+#[path = "native_auth_lookup_tests.rs"]
+mod native_auth_lookup_tests;
+#[cfg(test)]
+#[path = "provider_preparation_tests.rs"]
+mod provider_preparation_tests;
+impl Drop for AuthLookupScope {
+    fn drop(&mut self) {
+        self.authorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+type ProviderPathInputBindings = HashMap<
+    (SoulId, String),
+    (
+        freshell_runtime_protocol::ProviderPathInputs,
+        Option<Instant>,
+    ),
+>;
+pub(crate) type LiveResumeEvidenceKey = (String, String, Option<String>);
 
 #[derive(Clone)]
 pub struct Supervisor {
@@ -71,6 +113,10 @@ pub struct Supervisor {
     /// remain independently recoverable. Stop intentionally does not take this
     /// lock: its durable intent revision must be able to preempt recovery.
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Bounds repeated provider-store probes for an unchanged live identity.
+    pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
+    auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
+    provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
 }
 
 impl Supervisor {
@@ -117,6 +163,9 @@ impl Supervisor {
             backend,
             config: Arc::new(config),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
+            auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
+            provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -162,6 +211,103 @@ impl Supervisor {
             ));
         }
         match envelope.body {
+            AdminCommand::ReserveProviderInputs(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let lock = self.lifecycle_lock(&request.soul_id).await;
+                let _held = lock.lock().await;
+                let reservation = self
+                    .registry
+                    .reserve_initial_inputs(
+                        request,
+                        self.config.image_ref.clone(),
+                        self.config.host_binary_path.clone(),
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                let observation = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.backend.observe_initial_auth_volume(&reservation),
+                )
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "initial auth source observation timed out",
+                    )
+                })?
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "initial auth source observation failed; retry preparation",
+                    )
+                })?;
+                self.registry
+                    .record_initial_observation(reservation, observation)
+                    .await
+                    .map(AdminResult::ProviderInputReservation)
+                    .map_err(map_registry)
+            }
+            AdminCommand::BindProviderPathInputs(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let invalid = || {
+                    RuntimeError::new(RuntimeErrorCode::InvalidRequest,"provider path input binding has invalid or changed generation; reprepare before dispatch")
+                };
+                let id = request
+                    .generation_id
+                    .strip_prefix("grant-")
+                    .ok_or_else(invalid)?;
+                uuid::Uuid::parse_str(id).map_err(|_| invalid())?;
+                let mut bindings = self
+                    .provider_path_inputs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                bindings.retain(|_, (_, expires)| {
+                    expires.is_none_or(|expires| expires > Instant::now())
+                });
+                let key = (request.soul_id, request.generation_id);
+                if request.inputs.is_empty() {
+                    bindings.remove(&key);
+                } else if let Some((prior, _)) = bindings.get(&key) {
+                    if prior != &request.inputs {
+                        return Err(invalid());
+                    }
+                } else {
+                    if bindings
+                        .iter()
+                        .any(|((soul, _), (_, expires))| *soul == key.0 && expires.is_some())
+                    {
+                        return Err(invalid());
+                    }
+                    bindings.insert(
+                        key,
+                        (
+                            request.inputs,
+                            Some(Instant::now() + Duration::from_secs(600)),
+                        ),
+                    );
+                }
+                Ok(AdminResult::ProviderPathInputsBound)
+            }
+            AdminCommand::NativeAuthLookup(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.lookup_native_auth(request)
+                    .await
+                    .map(AdminResult::NativeAuthLookup)
+            }
+            AdminCommand::ObserveClaudeSources(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.observe_claude_sources(*request)
+                    .await
+                    .map(AdminResult::ClaudeSourceObservation)
+            }
             AdminCommand::Health => Ok(AdminResult::Health {
                 control_epoch: self.registry.control_epoch(),
                 installation_id: self.registry.installation_id().clone(),
@@ -363,6 +509,7 @@ impl Supervisor {
                         request.soul_id,
                         request.text,
                         request.settings,
+                        request.checkpoint_logical_attempt_id,
                     )
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
@@ -523,11 +670,215 @@ impl Supervisor {
         }
     }
 
+    fn auth_lookup_scope(&self, start: &crate::registry::RecoveryStart) -> AuthLookupScope {
+        let key = uuid::Uuid::new_v4().to_string();
+        let mut authorities = self
+            .auth_lookup_authorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        authorities.retain(|_, authority| authority.expires > Instant::now());
+        authorities.insert(
+            key.clone(),
+            AuthLookupAuthority {
+                start: start.clone(),
+                expires: Instant::now() + Duration::from_secs(30),
+            },
+        );
+        AuthLookupScope {
+            authorities: self.auth_lookup_authorities.clone(),
+            key,
+        }
+    }
+
+    async fn lookup_native_auth(
+        &self,
+        request: freshell_runtime_protocol::NativeAuthLookupRequest,
+    ) -> Result<freshell_runtime_protocol::NativeAuthValues, RuntimeError> {
+        let denied = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "native auth lookup requires the current provider preparation attempt",
+            )
+        };
+        freshell_platform::native_auth_exchange::validate_keys(&request.keys)
+            .map_err(|_| denied())?;
+        if request.attempt_authority.len() != 36 {
+            return Err(denied());
+        }
+        if let Some((reservation, expected)) = self
+            .registry
+            .initial_input_reservation(request.soul_id.clone(), request.attempt_authority.clone())
+            .await
+            .map_err(map_registry)?
+        {
+            if reservation.provider != "opencode"
+                || reservation.image_ref != self.config.image_ref
+                || reservation.binary != self.config.host_binary_path
+            {
+                return Err(denied());
+            }
+            let observed = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.backend.observe_initial_auth_volume(&reservation),
+            )
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "initial auth revalidation timed out",
+                )
+            })?
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "initial auth source changed; reprepare before dispatch",
+                )
+            })?;
+            if observed != expected
+                || self
+                    .registry
+                    .initial_input_reservation(
+                        request.soul_id.clone(),
+                        request.attempt_authority.clone(),
+                    )
+                    .await
+                    .map_err(map_registry)?
+                    .is_none()
+            {
+                return Err(denied());
+            }
+            let values = match expected {
+                freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { .. } => {
+                    std::collections::BTreeMap::new()
+                }
+                freshell_runtime_protocol::InitialAuthVolumeObservation::OwnedUndispatched {
+                    incarnation_id,
+                    ..
+                } => {
+                    // Preparation may already have installed a typed auth file
+                    // before refusing the input selection. Read the exact owned
+                    // quiescent store rather than inventing native-auth absence.
+                    let lock = self.lifecycle_lock(&request.soul_id).await;
+                    let _held = lock.lock().await;
+                    if self
+                        .registry
+                        .initial_input_reservation(
+                            request.soul_id.clone(),
+                            request.attempt_authority.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?
+                        .is_none()
+                    {
+                        return Err(denied());
+                    };
+                    let prior = self
+                        .registry
+                        .owned_handle(incarnation_id)
+                        .await
+                        .map_err(map_registry)?;
+                    let values = tokio::time::timeout(
+                        Duration::from_secs(25),
+                        self.backend.read_native_auth(
+                            &prior,
+                            &request.keys,
+                            &self.config.host_binary_path,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "initial replan native auth lookup timed out",
+                        )
+                    })?
+                    .map_err(|_| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "initial replan native auth lookup unavailable",
+                        )
+                    })?;
+                    if self
+                        .registry
+                        .initial_input_reservation(
+                            request.soul_id.clone(),
+                            request.attempt_authority.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?
+                        .is_none()
+                    {
+                        return Err(denied());
+                    };
+                    values
+                }
+            };
+            return Ok(freshell_runtime_protocol::NativeAuthValues(values));
+        }
+        let authority = {
+            let authorities = self
+                .auth_lookup_authorities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authorities
+                .get(&request.attempt_authority)
+                .filter(|authority| authority.expires > Instant::now())
+                .cloned()
+                .ok_or_else(denied)?
+        };
+        if authority.start.context.soul_id != request.soul_id
+            || authority.start.context.provider != "opencode"
+            || !self
+                .registry
+                .validate_auth_lookup_attempt(authority.start.clone())
+                .await
+                .map_err(map_registry)?
+        {
+            return Err(denied());
+        }
+        // The recovery owner already holds the soul lock. This operation uses
+        // its short-lived authority and drops the map/registry locks before IPC.
+        let values = tokio::time::timeout(
+            Duration::from_secs(25),
+            self.backend.read_native_auth(
+                &authority.start.context.prior_handle,
+                &request.keys,
+                &self.config.host_binary_path,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "native auth lookup timed out",
+            )
+        })?
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "native auth owned lookup failed",
+            )
+        })?;
+        freshell_platform::native_auth_exchange::validate_selected(&request.keys, &values)
+            .map_err(|_| denied())?;
+        if !self
+            .registry
+            .validate_auth_lookup_attempt(authority.start)
+            .await
+            .map_err(map_registry)?
+        {
+            return Err(denied());
+        }
+        Ok(freshell_runtime_protocol::NativeAuthValues(values))
+    }
+
     async fn launch(
         &self,
         request_id: RequestId,
         request: freshell_runtime_protocol::LaunchRequest,
     ) -> Result<LaunchResult, RuntimeError> {
+        let lock = self.lifecycle_lock(&request.soul_id).await;
+        let _guard = lock.lock().await;
         let limits = request.limits.validate()?;
         request.validate_workload()?;
         if !release_qualified_workload(
@@ -638,6 +989,24 @@ impl Supervisor {
             let created = self
                 .backend
                 .create_stopped(&CreateRuntimeSpec {
+                    prior_provider_owner: self
+                        .registry
+                        .prior_provider_owner(prepared.incarnation_id.clone())
+                        .await
+                        .map_err(map_registry)?,
+                    initial_input_reservation: self
+                        .registry
+                        .bound_input_reservation(prepared.incarnation_id.clone())
+                        .await
+                        .map_err(map_registry)
+                        .map_err(|error| {
+                            self.activation_failure(
+                                &prepared,
+                                state,
+                                "revalidate_initial_provider_source",
+                                error,
+                            )
+                        })?,
                     installation_id: self.registry.installation_id().clone(),
                     soul_id: prepared.soul_id.clone(),
                     incarnation_id: prepared.incarnation_id.clone(),
@@ -711,6 +1080,7 @@ impl Supervisor {
                 .map_err(|error| {
                     self.activation_failure(&prepared, state, "read_running_host_status", error)
                 })?;
+            self.complete_pending_provider_preparation(&handle).await?;
             return self
                 .launch_result_from_status(
                     prepared.incarnation_id.clone(),
@@ -783,20 +1153,36 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
             })?;
-        let accepted = self
+        let accepted = match self
             .send_grant(&handle, &workload, &authenticated, &grant)
             .await
-            .map_err(|error| {
-                self.activation_failure(&prepared, state, "deliver_execution_grant", error)
-            })?;
+        {
+            Ok(accepted) => accepted,
+            Err(error)
+                if error.code == RuntimeErrorCode::ProviderInputsChanged
+                    && workload.resume_spec.is_none() =>
+            {
+                // The typed refusal alone cannot authorize redispatch: verify
+                // this exact boot has never crossed its durable grant fence.
+                self.settle_rejected_initial_inputs(&handle, &authenticated, &grant)
+                    .await?;
+                return Err(self.activation_failure(
+                    &prepared,
+                    state,
+                    "provider_inputs_changed_before_dispatch",
+                    error,
+                ));
+            }
+            Err(error) => {
+                return Err(self.activation_failure(
+                    &prepared,
+                    state,
+                    "deliver_execution_grant",
+                    error,
+                ))
+            }
+        };
         crash_if("after_grant_delivery");
-        self.registry
-            .mark_running(handle.incarnation_id().clone())
-            .await
-            .map_err(map_registry)
-            .map_err(|error| {
-                self.activation_failure(&prepared, state, "commit_running_state", error)
-            })?;
         if let Some(native_session_id) = accepted.native_session_id.as_ref() {
             self.registry
                 .record_native_session(
@@ -808,6 +1194,23 @@ impl Supervisor {
                 .map_err(map_registry)
                 .map_err(|error| {
                     self.activation_failure(&prepared, state, "record_native_identity", error)
+                })?;
+        }
+        self.registry
+            .mark_running_with_provider_preparation(
+                handle.incarnation_id().clone(),
+                workload.resume_spec.is_none(),
+            )
+            .await
+            .map_err(map_registry)
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "commit_running_state", error)
+            })?;
+        if workload.resume_spec.is_none() {
+            self.complete_pending_provider_preparation(&handle)
+                .await
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "commit_provider_inputs", error)
                 })?;
         }
         append_event(
@@ -828,6 +1231,75 @@ impl Supervisor {
             effective_limits: authenticated.effective_limits,
             fixture_evidence: accepted.fixture_evidence,
         })
+    }
+
+    async fn settle_rejected_initial_inputs(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        host: &AuthenticatedHost,
+        grant: &crate::registry::ExecutionGrantRecord,
+    ) -> Result<(), RuntimeError> {
+        let unavailable = || {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "initial provider input rejection is unconfirmed; retain ownership and reconcile",
+            )
+        };
+        self.registry
+            .validate_rejected_initial_inputs(handle.incarnation_id().clone())
+            .await
+            .map_err(|_| unavailable())?;
+        let status = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                host,
+                HostCommand::Status {
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await
+            .map_err(|_| unavailable())?;
+        let never_dispatched = matches!(
+            status,
+            HostResult::Status {
+                host_boot_id,
+                worker_pid: None,
+                worker_launch_count: 0,
+                max_execution_generation,
+                native_session_id: None,
+                ..
+            } if host_boot_id == grant.host_boot_id
+                && max_execution_generation < grant.execution_generation
+        );
+        if !never_dispatched {
+            return Err(unavailable());
+        }
+        self.backend
+            .request_stop(handle, 2)
+            .await
+            .map_err(|_| unavailable())?;
+        if !self
+            .verify_empty_with_budget(handle, Duration::from_secs(3))
+            .await
+            .map_err(|_| unavailable())?
+        {
+            return Err(unavailable());
+        };
+        self.backend
+            .discard_rejected_provider_inputs(handle)
+            .await
+            .map_err(|_| unavailable())?;
+        self.registry
+            .settle_rejected_initial_inputs(handle.incarnation_id().clone())
+            .await
+            .map_err(|_| unavailable())?;
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.provider_inputs.initial_replan_ready",
+            serde_json::json!({"severity":"info","soulId":handle.soul_id(),"incarnationId":handle.incarnation_id(),"operation":"settle_unconsumed_generation"}),
+        );
+        Ok(())
     }
 
     fn activation_failure(
@@ -984,6 +1456,7 @@ impl Supervisor {
         soul_id: SoulId,
         text: String,
         settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<String>,
     ) -> Result<CommandState, RuntimeError> {
         if text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
             return Err(RuntimeError::new(
@@ -1004,7 +1477,13 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
-        let settings_correlation = serde_json::to_vec(&settings).map_err(|_| {
+        let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
+            Some(logical_attempt_id) => {
+                serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
+            }
+            None => serde_json::to_vec(&settings),
+        }
+        .map_err(|_| {
             RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 "fresh-agent settings could not be correlated",
@@ -1063,6 +1542,7 @@ impl Supervisor {
                     request_id: request_id.clone(),
                     text,
                     settings,
+                    checkpoint_logical_attempt_id,
                 },
             )
             .await;
@@ -1559,28 +2039,63 @@ impl Supervisor {
         max_bytes: u64,
         expected_stream_epoch: Option<String>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
-        let handle = self
+        let source = self
             .registry
-            .active_handle_for_soul(soul_id.clone())
+            .retained_output_source(soul_id.clone())
             .await
             .map_err(map_registry)?;
-        let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await?;
-        match self
-            .send_authenticated_host_command(
-                handle.incarnation_id().clone(),
-                handle.runtime_dir(),
+        crate::retained_output::validate_source(&source, &self.config.runtime_root)
+            .map_err(|error| RuntimeError::new(RuntimeErrorCode::OwnershipMismatch, error))?;
+        // This independent capability is used only for exact read-only backend
+        // emptiness verification, never input, kill, or replacement dispatch.
+        let handle = self
+            .registry
+            .owned_handle(source.incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let live = async {
+            let host = self
+                .authenticate_host(&source.incarnation_id, &source.runtime_dir)
+                .await?;
+            self.send_authenticated_host_command(
+                source.incarnation_id.clone(),
+                &source.runtime_dir,
                 &host,
                 HostCommand::TerminalReadOutput {
-                    incarnation_id: handle.incarnation_id().clone(),
+                    incarnation_id: source.incarnation_id.clone(),
                     after_seq,
                     max_bytes,
-                    expected_stream_epoch,
+                    expected_stream_epoch: expected_stream_epoch.clone(),
                 },
             )
-            .await?
-        {
+            .await
+        }
+        .await;
+        let reply = match live {
+            Ok(reply) => reply,
+            Err(_) => {
+                let verified_empty = self.backend.verify_empty(&handle).await.unwrap_or(false);
+                let output = tokio::task::spawn_blocking(move || {
+                    crate::retained_output::read(
+                        source,
+                        after_seq,
+                        max_bytes,
+                        expected_stream_epoch,
+                        verified_empty,
+                    )
+                })
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "retained output reader failed",
+                    )
+                })?
+                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+                return Ok(output);
+            }
+        };
+        match reply {
             HostResult::TerminalOutput(output) => {
                 if let Some(native_session_id) = output.native_session_id.as_ref() {
                     match self
@@ -1686,7 +2201,7 @@ impl Supervisor {
                 "invalid managed MCP endpoint",
             ));
         }
-        if !matches!(action, "activate" | "revoke") {
+        if !matches!(action, "activate" | "revoke" | "commit" | "abort") {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 "invalid managed MCP action",
@@ -1701,6 +2216,12 @@ impl Supervisor {
                 provider: None,
                 tui_source: None,
                 workspace: None,
+                auth_lookup_authority: None,
+                claude_recovery_source: None,
+                cwd: None,
+                prior_context: None,
+                provider_secret_references: None,
+                provider_path_inputs: None,
             })
             .await?;
         if response != b"ok" {
@@ -1709,33 +2230,264 @@ impl Supervisor {
                 "capability_pending: server rejected scoped grant",
             ));
         }
+        if matches!(action, "abort" | "revoke") {
+            self.provider_path_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(soul_id.clone(), grant_id.into()));
+        }
         Ok(())
+    }
+
+    /// Retry only a durable acceptance proof for this immutable incarnation.
+    /// Running alone never authorizes completion of a resumed generation.
+    pub(crate) fn complete_pending_provider_preparation<'a>(
+        &'a self,
+        handle: &'a crate::registry::OwnedRuntimeHandle,
+    ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a {
+        // Recovery embeds this operation on several branches. Keep the large
+        // provider completion future off the ordinary control-worker stack.
+        Box::pin(async move {
+            if !self
+                .registry
+                .provider_preparation_is_pending(handle.incarnation_id().clone())
+                .await
+                .map_err(map_registry)?
+            {
+                return Ok(());
+            }
+            if let Err(error) = self.commit_provider_preparation(handle).await {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.provider_preparation.pending",
+                    serde_json::json!({
+                        "severity":"error", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                        "operation":"complete_accepted_generation", "errorCode":error.code,
+                    }),
+                );
+                return Err(error);
+            }
+            self.registry
+                .mark_provider_preparation_complete(handle.incarnation_id().clone())
+                .await
+                .map_err(map_registry)?;
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.provider_preparation.completed",
+                serde_json::json!({
+                    "severity":"info", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                }),
+            );
+            Ok(())
+        })
+    }
+
+    async fn commit_provider_preparation(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<(), RuntimeError> {
+        let context = handle
+            .terminal()
+            .and_then(|terminal| terminal.provider_launch_context.as_ref())
+            .or_else(|| {
+                handle
+                    .fresh_agent()
+                    .and_then(|agent| agent.provider_launch_context.as_ref())
+            });
+        if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
+            self.notify_mcp_capability(
+                "commit",
+                &capability.endpoint,
+                handle.soul_id(),
+                handle.incarnation_id(),
+                &capability.grant_id,
+            )
+            .await?;
+        }
+        if context
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .is_some()
+        {
+            self.backend
+                .commit_prepared_inputs(handle)
+                .await
+                .map_err(map_backend)?;
+            // The pending flag is armed atomically with initial acceptance or
+            // exact verified recovery success. Healthy retries preserve those
+            // gates while finishing interrupted release/retirement.
+            if let Some(prior) = self
+                .registry
+                .prior_provider_owner(handle.incarnation_id().clone())
+                .await
+                .map_err(map_registry)?
+            {
+                self.backend
+                    .retire_prior_prepared_inputs(handle, &prior)
+                    .await
+                    .map_err(map_backend)?;
+            }
+        }
+        if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
+            self.commit_provider_path_inputs(handle.soul_id(), &inputs.generation_id);
+        }
+        Ok(())
+    }
+
+    fn bound_provider_path_inputs(
+        &self,
+        soul_id: &SoulId,
+        generation_id: Option<&str>,
+    ) -> freshell_runtime_protocol::ProviderPathInputs {
+        generation_id
+            .and_then(|generation| {
+                self.provider_path_inputs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&(soul_id.clone(), generation.into()))
+                    .filter(|(_, expires)| expires.is_none_or(|expires| expires > Instant::now()))
+                    .map(|(inputs, _)| inputs.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn commit_provider_path_inputs(&self, soul_id: &SoulId, generation_id: &str) {
+        let mut bindings = self
+            .provider_path_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = (soul_id.clone(), generation_id.to_string());
+        // The controller has retired the prior generation only after acceptance.
+        // Keep the current selection process-local for replacement, with no
+        // preparation timeout once it belongs to the accepted running context.
+        bindings.retain(|key, _| key.0 != *soul_id || *key == current);
+        if let Some((_, expires)) = bindings.get_mut(&current) {
+            *expires = None;
+        }
+    }
+
+    fn claude_recovery_source_binding(
+        &self,
+        start: &crate::registry::RecoveryStart,
+        scope_key: &str,
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+    ) -> Result<freshell_runtime_protocol::ClaudeRecoverySourceBinding, RuntimeError> {
+        use sha2::Digest;
+        let unavailable = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "Claude prior source generation unavailable; retain inputs and reprepare",
+            )
+        };
+        let saved = start
+            .context
+            .prior_handle
+            .terminal()
+            .and_then(|spec| spec.provider_launch_context.as_ref())
+            .or_else(|| {
+                start
+                    .context
+                    .prior_handle
+                    .fresh_agent()
+                    .and_then(|spec| spec.provider_launch_context.as_ref())
+            })
+            .ok_or_else(unavailable)?;
+        context.validate("claude")?;
+        let inputs = context.prepared_inputs.as_ref().ok_or_else(unavailable)?;
+        if saved
+            .prepared_inputs
+            .as_ref()
+            .map(|inputs| inputs.generation_id.as_str())
+            != Some(inputs.generation_id.as_str())
+        {
+            return Err(unavailable());
+        }
+        let authority = freshell_runtime_protocol::ClaudeSourceAuthority::RecoveryAttempt {
+            attempt_id: scope_key.into(),
+        };
+        let raw = freshell_runtime_protocol::bounded_json_bytes(
+            &authority,
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        )
+        .map_err(|_| unavailable())?;
+        let binding = freshell_runtime_protocol::ClaudeRecoverySourceBinding {
+            provider: start.context.provider.clone(),
+            git_common_dir: start
+                .context
+                .prior_handle
+                .terminal()
+                .and_then(|spec| spec.git_common_dir.clone())
+                .or_else(|| {
+                    start
+                        .context
+                        .prior_handle
+                        .fresh_agent()
+                        .and_then(|spec| spec.git_common_dir.clone())
+                }),
+            authority_sha256: format!("{:x}", sha2::Sha256::digest(raw)),
+            registry_attempt_id: start.attempt_id.clone(),
+            intent_revision: start.context.intent_revision,
+            prior_generation_id: inputs.generation_id.clone(),
+        };
+        binding.validate()?;
+        Ok(binding)
     }
 
     pub(crate) async fn issue_replacement_mcp_capability(
         &self,
-        soul_id: &SoulId,
+        start: &crate::registry::RecoveryStart,
         provider: &str,
-        tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+        references: &[freshell_runtime_protocol::ProviderSecretReference],
+        cwd: &str,
         workspace: &str,
-    ) -> Result<freshell_runtime_protocol::McpCapabilityReference, RuntimeError> {
+    ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        let tui_source = match &context.preparation {
+            freshell_runtime_protocol::ProviderPreparation::Opencode { tui_source, .. } => {
+                tui_source.as_ref()
+            }
+            _ => None,
+        };
+        let scope = self.auth_lookup_scope(start);
+        let claude_recovery_source = if provider == "claude"
+            && matches!(start.context.provider.as_str(), "claude" | "kilroy")
+        {
+            Some(self.claude_recovery_source_binding(start, &scope.key, context)?)
+        } else {
+            None
+        };
+        let path_inputs = self.bound_provider_path_inputs(
+            &start.context.soul_id,
+            context
+                .prepared_inputs
+                .as_ref()
+                .map(|inputs| inputs.generation_id.as_str()),
+        );
         let response = self
             .mcp_capability_callback(McpCapabilityRequest {
                 action: "issue",
-                soul_id,
+                soul_id: &start.context.soul_id,
                 incarnation_id: None,
                 grant_id: None,
                 provider: Some(provider),
                 tui_source,
                 workspace: Some(workspace),
+                auth_lookup_authority: Some(&scope.key),
+                claude_recovery_source: claude_recovery_source.as_ref(),
+                cwd: Some(cwd),
+                prior_context: Some(context),
+                provider_secret_references: Some(references),
+                provider_path_inputs: Some(&path_inputs),
             })
             .await?;
-        serde_json::from_slice(&response).map_err(|_| {
-            RuntimeError::new(
-                RuntimeErrorCode::HostUnreachable,
-                "capability_pending: server returned an invalid scoped grant reference",
-            )
-        })
+        let prepared: freshell_runtime_protocol::PreparedProviderContext =
+            serde_json::from_slice(&response).map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "capability_pending: server returned an invalid scoped grant reference",
+                )
+            })?;
+        prepared.validate(provider)?;
+        Ok(prepared)
     }
 
     async fn mcp_capability_callback(
@@ -1748,16 +2500,25 @@ impl Supervisor {
                 "invalid managed runtime control secret",
             ));
         }
-        let body = serde_json::to_vec(&serde_json::json!({
-            "action": request.action,
-            "controlSecret": self.config.control_secret,
-            "soulId": request.soul_id,
-            "incarnationId": request.incarnation_id,
-            "grantId": request.grant_id,
-            "provider": request.provider,
-            "tuiSource": request.tui_source,
-            "workspace": request.workspace,
-        }))
+        let body = freshell_runtime_protocol::bounded_json_bytes(
+            &serde_json::json!({
+                "action": request.action,
+                "controlSecret": self.config.control_secret,
+                "soulId": request.soul_id,
+                "incarnationId": request.incarnation_id,
+                "grantId": request.grant_id,
+                "provider": request.provider,
+                "tuiSource": request.tui_source,
+                "workspace": request.workspace,
+                "authLookupAuthority": request.auth_lookup_authority,
+                "claudeRecoverySource": request.claude_recovery_source,
+                "cwd":request.cwd,
+                "priorContext":request.prior_context,
+                "providerSecretReferences":request.provider_secret_references,
+                "providerPathInputs":request.provider_path_inputs,
+            }),
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        )
         .map_err(|error| RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string()))?;
         let callback_socket = self.config.control_socket_path.with_file_name("mcp.sock");
         let exchange = async {
@@ -1765,10 +2526,18 @@ impl Supervisor {
             socket.write_all(&body).await?;
             socket.shutdown().await?;
             let mut response = Vec::new();
-            socket.read_to_end(&mut response).await?;
+            (&mut socket)
+                .take((freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES + 1) as u64)
+                .read_to_end(&mut response)
+                .await?;
+            if response.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
+                return Err(std::io::Error::other(
+                    "provider preparation reply exceeds limit",
+                ));
+            }
             Ok::<_, std::io::Error>(response)
         };
-        let response = tokio::time::timeout(Duration::from_secs(5), exchange)
+        let response = tokio::time::timeout(Duration::from_secs(35), exchange)
             .await
             .map_err(|_| {
                 RuntimeError::new(
@@ -2023,6 +2792,21 @@ impl Supervisor {
         grant: &ExecutionGrantRecord,
     ) -> Result<AcceptedGrant, RuntimeError> {
         let incarnation_id = handle.incarnation_id().clone();
+        let preparation = workload
+            .terminal
+            .as_ref()
+            .and_then(|launch| launch.provider_launch_context.as_ref())
+            .or_else(|| {
+                workload
+                    .fresh_agent
+                    .as_ref()
+                    .and_then(|launch| launch.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.prepared_inputs.as_ref());
+        let provider_path_inputs = self.bound_provider_path_inputs(
+            &workload.soul_id,
+            preparation.map(|inputs| inputs.generation_id.as_str()),
+        );
         let command = HostCommand::GrantExecution {
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),
@@ -2031,6 +2815,7 @@ impl Supervisor {
             execution_generation: grant.execution_generation,
             grant_id: grant.grant_id.clone(),
             fixture: workload.fixture,
+            provider_path_inputs,
             terminal: workload.terminal.clone().map(Box::new),
             fresh_agent: workload.fresh_agent.clone().map(Box::new),
             resume_spec: workload.resume_spec.clone().map(Box::new),
@@ -2693,6 +3478,31 @@ mod release_scope_tests {
     };
 
     #[test]
+    fn provider_fresh_launch_digest_rejects_changed_prepared_workload() {
+        let mut request: freshell_runtime_protocol::LaunchRequest = serde_json::from_value(
+            serde_json::json!({
+                "soulId": SoulId::new(), "provider":"claude", "providerStoreId":"synthetic-store",
+                "creationSeedRef":"synthetic-seed", "limits": {"cpuMilli":1000,"memoryBytes":1073741824,"swapBytes":0,"pidsMax":128},
+                "freshAgent": {
+                    "sessionId":"synthetic-session", "provider":"claude", "sessionType":"freshclaude",
+                    "runtimeVariant":"claude-sdk-sidecar", "providerStoreId":"synthetic-store",
+                    "cwd":"/synthetic/workspace", "workspacePath":"/synthetic/workspace",
+                    "runAsUid":65534, "runAsGid":0, "model":"synthetic-model"
+                }
+            })
+        ).unwrap();
+        let original = super::semantic_launch_digest(&request).unwrap();
+        request.fresh_agent.as_mut().unwrap().model = Some("changed-model".into());
+        assert_ne!(
+            original,
+            super::semantic_launch_digest(&request).unwrap(),
+            "changed fresh workload must not coalesce with the previous immutable launch"
+        );
+        request.fresh_agent.as_mut().unwrap().model = Some("synthetic-model".into());
+        assert_eq!(original, super::semantic_launch_digest(&request).unwrap());
+    }
+
+    #[test]
     fn semantic_operation_identity_classifies_record_transition_and_replay() {
         assert_eq!(
             classify_fresh_agent_operation_identity(None, None).unwrap(),
@@ -2853,6 +3663,7 @@ fn semantic_launch_digest(
         "nativeSessionId": request.native_session_id,
         "fixture": request.fixture,
         "terminal": request.terminal,
+        "freshAgent": request.fresh_agent,
     });
     let bytes = serde_json::to_vec(&value)
         .map_err(|e| RuntimeError::new(RuntimeErrorCode::InvalidRequest, e.to_string()))?;

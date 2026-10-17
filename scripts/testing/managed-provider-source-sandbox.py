@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Closed pinned-provider source consumer in an owned rootless container."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import uuid
+
+IMAGE = "sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c"
+TEST = "managed_mcp_capability::tests::managed_provider_amplifier_native_local_bundle_survives_transport"
+LABEL = "com.freshell.provider-source-probe"
+
+
+def docker(*args, check=True):
+    return subprocess.run(["docker", *args], text=True, capture_output=True,
+                          timeout=180, check=check)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provider",choices=["amplifier","codex","claude","claude-reader","native-auth-reader"],default="amplifier")
+    parser.add_argument("--test-binary", type=Path, required=True)
+    parser.add_argument("--receipt-dir", type=Path, required=True)
+    args = parser.parse_args()
+    selected_test = {
+        "amplifier": TEST,
+        "codex": "managed_mcp_capability::tests::managed_provider_codex_native_typed_inputs_survive_transport",
+        "claude": "managed_provider_sdk_tests::managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_prompt",
+        "claude-reader": "claude_source_observation::tests::claude_final_reader_real_pipe_bounds_binding_failures_and_joins",
+        "native-auth-reader": "provider_input_preparation::tests::provider_secret_native_auth_private_home_",
+    }[args.provider]
+    native_auth_reader = args.provider == "native-auth-reader"
+    selection = [selected_test] if native_auth_reader else ["--exact", selected_test]
+    expected_tests = [selected_test + case for case in ("absent", "foreign", "reserved", "selected")] if native_auth_reader else [selected_test]
+    binary = args.test_binary.resolve(strict=True)
+    artifact_prefix = "freshell_session_host" if args.provider in ("claude-reader", "native-auth-reader") else "freshell_server"
+    if not binary.is_file() or not re.fullmatch(artifact_prefix + r"-[0-9a-f]{16}", binary.name):
+        raise RuntimeError("source fixture requires its compiled server test artifact")
+    expected_directory = Path(__file__).resolve().parents[2] / "target/debug/deps"
+    if binary.parent != expected_directory.resolve():
+        raise RuntimeError("source fixture test artifact must belong to this worktree")
+    host_artifact = expected_directory.parent / "freshell-session-host"
+    if native_auth_reader and (not host_artifact.is_file() or host_artifact.is_symlink() or host_artifact.resolve() != host_artifact):
+        raise RuntimeError("native auth fixture requires its own physical compiled session host")
+    listing = subprocess.run([str(binary), *selection, "--list"],
+                             env={"PATH": "/usr/bin:/bin"}, text=True,
+                             capture_output=True, timeout=20, check=True)
+    listed_tests = [line.removesuffix(": test") for line in listing.stdout.splitlines() if line.endswith(": test")]
+    if sorted(listed_tests) != sorted(expected_tests):
+        raise RuntimeError("source fixture compiled artifact contains no exact selected test")
+    if not args.receipt_dir.is_dir():
+        raise RuntimeError("source fixture receipt directory must already exist")
+    if "name=rootless" not in json.loads(docker("info", "--format", "{{json .SecurityOptions}}").stdout):
+        raise RuntimeError("source fixture requires the qualified rootless daemon")
+    if docker("image", "inspect", "--format", "{{.Id}}", IMAGE).stdout.strip() != IMAGE:
+        raise RuntimeError("source fixture requires its exact already-present provider image")
+    with binary.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    name = "freshell-source-probe-" + uuid.uuid4().hex
+    created = False
+    receipt = {"image": IMAGE, "testArtifactSha256": digest, "test": selected_test,
+               "runId": name, "rootless": True}
+    if native_auth_reader:
+        with host_artifact.open("rb") as stream:
+            receipt["sessionHostArtifactSha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+    reader = args.provider in ("claude-reader", "native-auth-reader")
+    identity_args = ["--cap-add", "CHOWN", "--cap-add", "SETGID", "--cap-add", "SETUID", "--env", "FRESHELL_TEST_RESTRICTED_READER=1"] if reader else []
+    test_env = ["--env", "RUST_TEST_THREADS=4", "--env", "TOKIO_WORKER_THREADS=2"] if native_auth_reader else []
+    host_mount = ["--mount", f"type=bind,src={host_artifact},dst=/runtime/freshell-session-host,readonly"] if native_auth_reader else []
+    try:
+        docker("create", "--name", name, "--label", f"{LABEL}={name}",
+               "--network", "none", "--read-only", "--user", "0:0" if reader else "65534:0", "--cap-drop", "ALL", *identity_args, *test_env,
+               "--security-opt", "no-new-privileges:true", "--pids-limit", "128", "--memory", "2g",
+               "--mount", f"type=bind,src={binary},dst=/runtime/source-consumer-tests,readonly",
+               *host_mount,
+               "--tmpfs", "/fixture:rw,exec,nosuid,nodev,size=512m,uid=65534,gid=0,mode=0700",
+               "--tmpfs", f"/home/freshell/provider:rw,{'exec' if args.provider == 'codex' else 'noexec'},nosuid,nodev,size=512m,uid=65534,gid=0,mode=0700",
+               "--tmpfs", f"/tmp:rw,nosuid,nodev,noexec,size=256m,uid={0 if reader else 65534},gid=0,mode={'1777' if reader else '0700'}",
+               "--env", "HOME=/home/freshell/provider",
+               "--env", "AMPLIFIER_HOME=/home/freshell/provider/.amplifier",
+               "--env", "FRESHELL_TEST_EXECUTABLE_TMP_DIR=/fixture",
+               "--entrypoint", "/runtime/source-consumer-tests", IMAGE,
+               *selection, "--nocapture", "--test-threads", "4" if native_auth_reader else "1")
+        created = True
+        result = docker("start", "--attach", name, check=False)
+        receipt["exitCode"] = result.returncode
+        cases = []
+        for line in result.stdout.splitlines():
+            marker = "provider_source_consumer "
+            if marker in line:
+                value = json.loads(line.split(marker, 1)[1])
+                cases.append({"provider": value["provider"], "case": value["case"], "digest": value["digest"]})
+        receipt["consumedCases"] = cases
+        expected_count = len(expected_tests)
+        if result.returncode == 0 and (len(cases) != {"amplifier":18,"codex":5,"claude":1,"claude-reader":0,"native-auth-reader":0}[args.provider] or f"test result: ok. {expected_count} passed;" not in result.stdout):
+            receipt["exitCode"] = 2
+            receipt["failureClass"] = "native_consumer_count_mismatch"
+        # Only the Rust fixture's classified assertion/digest receipt is emitted.
+        # The native provider's raw streams stay inside its test process.
+        print(result.stdout, end="", flush=True)
+        print(result.stderr, end="", flush=True)
+    finally:
+        observed = docker("container", "inspect", name, check=False)
+        if observed.returncode == 0:
+            value = json.loads(observed.stdout)[0]
+            if value["Config"].get("Labels", {}).get(LABEL) != name:
+                raise RuntimeError("source fixture cleanup ownership changed")
+            docker("rm", "--force", value["Id"])
+        receipt["ownedCleanup"] = docker("container", "inspect", name, check=False).returncode != 0
+        receipt_name = {"amplifier":"task002-native-source-consumers.json", "codex":"task002-native-codex-source-consumers.json", "claude":"task002-native-claude-sdk-consumers.json", "claude-reader":"task002-repair13-native-claude-reader.json", "native-auth-reader":"task006-native-auth-reader.json"}[args.provider]
+        (args.receipt_dir / receipt_name).write_text(json.dumps(receipt, sort_keys=True) + "\n")
+    if not created or not receipt["ownedCleanup"]:
+        raise RuntimeError("source fixture failed its owned cleanup proof")
+    raise SystemExit(receipt["exitCode"])
+
+
+if __name__ == "__main__":
+    main()

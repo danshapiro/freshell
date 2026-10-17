@@ -4,6 +4,7 @@ import { render, screen, fireEvent, cleanup, act, waitFor, within } from '@testi
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
+import { collectPaneContents } from '@/lib/pane-utils'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer, { closeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
@@ -825,6 +826,24 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('running session decoration', () => {
+    it.each(['blocked', 'exited'] as const)('clicks the retained managed %s terminal without resuming a new process', async (status) => {
+      const id=sessionId('managed-retained')
+      const projects:ProjectGroup[]=[{projectPath:'/repo',sessions:[{sessionId:id,projectPath:'/repo',lastActivityAt:1,
+        title:'Retained managed session',cwd:'/repo'}]}]
+      const terminal={terminalId:'retained-managed',title:'Retained',mode:'claude',status,runtimeStatus:status,
+        soulId:'soul-retained',hasClients:false,createdAt:1,lastActivityAt:2,sessionRef:{provider:'claude',sessionId:id},cwd:'/repo'} as unknown as BackgroundTerminal
+      const store=createTestStore({projects,serverInstanceId:'srv-local'})
+      renderSidebar(store,[terminal])
+      await act(async()=>{vi.advanceTimersByTime(100)})
+      fireEvent.click(screen.getByText('Retained managed session').closest('button')!)
+      const [tab]=store.getState().tabs.tabs
+      const layout=store.getState().panes.layouts[tab.id]
+      expect(layout.type).toBe('leaf')
+      if(layout.type!=='leaf') throw new Error('expected leaf')
+      expect(layout.content).toMatchObject({terminalId:'retained-managed',soulId:'soul-retained',runtimeStatus:status,
+        sessionRef:{provider:'claude',sessionId:id}})
+    })
+
     it('marks session as running when matching terminal exists', async () => {
       const projects: ProjectGroup[] = [
         {
@@ -4187,6 +4206,46 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('sidebar click opens pane', () => {
+    it.each(['tab', 'split'] as const)('preserves the checkpoint workspace when opening a fresh-agent session in %s mode', async (sessionOpenMode) => {
+      const targetSessionId = sessionId(`fresh-workspace-${sessionOpenMode}`)
+      const checkpointWorkspace = { path: '/selected/fresh-project', provenance: 'directory-picker' as const }
+      const projects: ProjectGroup[] = [{
+        projectPath: '/selected/fresh-project',
+        sessions: [{
+          sessionId: targetSessionId,
+          provider: 'claude',
+          sessionType: 'freshclaude',
+          projectPath: '/selected/fresh-project',
+          lastActivityAt: Date.now(),
+          title: 'Fresh checkpoint workspace',
+          cwd: '/selected/fresh-project',
+          checkpointWorkspace,
+        }],
+      }]
+      const tabs = [{ id: 'tab-1', mode: 'shell' as const }]
+      const panes = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf' as const,
+            id: 'pane-1',
+            content: { kind: 'terminal' as const, mode: 'shell' as const, createRequestId: 'req-1', status: 'running' as const },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+      const store = createTestStore({ projects, tabs, panes, activeTabId: 'tab-1', sessionOpenMode })
+      renderSidebar(store, [])
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+      fireEvent.click(screen.getByText('Fresh checkpoint workspace').closest('button')!)
+
+      const pane = Object.values(store.getState().panes.layouts)
+        .flatMap((layout) => collectPaneContents(layout))
+        .find((content) => content.kind === 'fresh-agent' && content.sessionRef?.sessionId === targetSessionId)
+      expect(pane).toMatchObject({ kind: 'fresh-agent', checkpointWorkspace })
+    })
+
     it('splits a new pane in the current tab when clicking a session', async () => {
       const projects: ProjectGroup[] = [
         {
@@ -4261,8 +4320,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
       }
     })
 
-    it('focuses existing pane when clicking a session already open in another tab', async () => {
+    it('focuses the existing fresh-agent pane with its checkpoint workspace when clicking its session', async () => {
       const targetSessionId = sessionId('session-already-in-pane')
+      const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
 
       const projects: ProjectGroup[] = [
         {
@@ -4274,6 +4334,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               lastActivityAt: Date.now(),
               title: 'Already in pane',
               cwd: '/home/user/project',
+              sessionType: 'freshclaude',
             },
           ],
         },
@@ -4300,11 +4361,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             type: 'leaf',
             id: 'pane-2',
             content: {
-              kind: 'terminal',
-              mode: 'claude',
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
               createRequestId: 'req-2',
-              status: 'running',
+              status: 'idle',
               resumeSessionId: targetSessionId,
+              sessionRef: { provider: 'claude', sessionId: targetSessionId },
+              checkpointWorkspace,
             },
           },
         },
@@ -4332,6 +4396,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.tabs).toHaveLength(2)
       expect(state.tabs.activeTabId).toBe('tab-2')
       expect(state.panes.activePane['tab-2']).toBe('pane-2')
+      expect(state.panes.layouts['tab-2']).toMatchObject({
+        type: 'leaf',
+        content: { kind: 'fresh-agent', checkpointWorkspace },
+      })
     })
 
     it('does not hijack a foreign copied pane when opening the local session', async () => {

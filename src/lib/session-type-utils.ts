@@ -1,3 +1,5 @@
+import type { ManagedRuntimeProjectionFields } from '../../shared/managed-runtime.js'
+import { managedTerminalProjection, managedTerminalResumePaneStatus } from './managed-terminal.js'
 import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
@@ -5,7 +7,11 @@ import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { FreshAgentProviderName, FreshAgentProviderSettings } from '@/lib/fresh-agent-provider-types'
 import type { CodingCliProviderName } from '@/store/types'
-import type { FreshAgentPaneInput, TerminalPaneInput } from '@/store/paneTypes'
+import type {
+  FreshAgentCheckpointWorkspace,
+  FreshAgentPaneInput,
+  TerminalPaneInput,
+} from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import {
   getPairedPublicSessionType,
@@ -188,11 +194,12 @@ export function buildResumeContent(opts: {
   sessionType: string
   sessionId: string
   cwd?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   freshAgentProviderSettings?: FreshAgentProviderSettings
   liveTerminal?: {
     terminalId: string
     serverInstanceId: string
-  }
+  } & ManagedRuntimeProjectionFields
 }): TerminalPaneInput | FreshAgentPaneInput {
   const freshAgentType = resolveFreshAgentType(opts.sessionType)
   if (freshAgentType) {
@@ -211,6 +218,7 @@ export function buildResumeContent(opts: {
         sessionId: opts.sessionId,
       },
       initialCwd: opts.cwd,
+      ...(opts.checkpointWorkspace ? { checkpointWorkspace: opts.checkpointWorkspace } : {}),
       modelSelection: ps?.modelSelection,
       model: freshAgentType.defaultModel,
       ...(permissionMode ? { permissionMode } : {}),
@@ -231,6 +239,7 @@ export function buildResumeContent(opts: {
         sessionId: opts.sessionId,
       },
       initialCwd: opts.cwd,
+      ...(opts.checkpointWorkspace ? { checkpointWorkspace: opts.checkpointWorkspace } : {}),
       modelSelection: ps?.modelSelection,
       permissionMode: ps?.defaultPermissionMode ?? freshAgentProviderConfig.defaultPermissionMode,
       effort: ps?.effort,
@@ -247,7 +256,8 @@ export function buildResumeContent(opts: {
       ? {
           terminalId: opts.liveTerminal.terminalId,
           serverInstanceId: opts.liveTerminal.serverInstanceId,
-          status: 'running' as const,
+          status: managedTerminalResumePaneStatus(opts.liveTerminal),
+          ...managedTerminalProjection(opts.liveTerminal),
         }
       : {}),
     sessionRef: {

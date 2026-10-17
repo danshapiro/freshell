@@ -49,6 +49,7 @@ async fn spawn_server_with_default_cwd(
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
@@ -154,6 +155,11 @@ async fn next_created_or_error(ws: &mut common::TestWs, request_id: &str) -> Val
 
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_create_with_deleted_cwd_rehomes_instead_of_failing_spawn() {
+    if common::opencode_home::run_with_opencode_home(
+        "restore_create_with_deleted_cwd_rehomes_instead_of_failing_spawn",
+    ) {
+        return;
+    }
     // Fallback target: a validated defaultCwd in a live temp dir.
     let default_dir = live_temp_dir("default");
     let (ws_url, registry) = spawn_server_with_default_cwd(&default_dir).await;

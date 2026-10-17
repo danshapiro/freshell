@@ -153,6 +153,32 @@ pub enum SessionType {
     Freshopencode,
 }
 
+/// Immutable scope carried with one automatic pre-turn code checkpoint.
+/// Provenance records how a non-Git directory became an explicit scope; the
+/// server still resolves and validates the path before capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentCheckpointWorkspace {
+    pub path: String,
+    pub provenance: CheckpointWorkspaceProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckpointWorkspaceProvenance {
+    DirectoryPicker,
+    ResolvedProject,
+    LegacyCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentCheckpointIntent {
+    pub logical_attempt_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<FreshAgentCheckpointWorkspace>,
+}
+
 /// Sandbox policy shared by terminal and fresh-agent launch requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

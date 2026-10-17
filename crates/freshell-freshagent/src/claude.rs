@@ -78,6 +78,19 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 const PROVIDER: &str = "claude";
 
+/// Build the sidecar-only correlation record for one checkpointed Claude
+/// send. The UUID is supplied on SDKUserMessage and later accepted only when
+/// the SDK replays the persisted user row carrying that same UUID.
+fn checkpoint_attempt_for_send(msg: &FreshAgentSend) -> Option<Value> {
+    let intent = msg.checkpoint_intent.as_ref()?;
+    let request_id = msg.request_id.as_deref().filter(|id| !id.is_empty())?;
+    Some(json!({
+        "uuid": uuid::Uuid::new_v4().to_string(),
+        "logicalAttemptId": intent.logical_attempt_id,
+        "requestId": request_id,
+    }))
+}
+
 /// b8ke ext r22 F1: the pane-scoped PROVISIONAL identity for a fresh
 /// create's pre-spawn claim — the createRequestId the caller already
 /// carries, namespaced so it can never collide with a provider-minted
@@ -100,10 +113,15 @@ const MID_ROLLBACK_PARK_TICK: Duration = Duration::from_millis(10);
 /// Shared, cheaply-cloneable freshclaude WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
 pub struct FreshClaudeState {
+    /// Host-only selection of the fixed Freshell stdio MCP recipe. Its endpoint
+    /// and grant remain in the child environment, never in create IPC.
+    hosted_mcp: bool,
     /// The shared WS broadcast bus (pre-serialized frames), fanned out by every
     /// `freshell-ws` connection so the oracle's capture socket records
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`.
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// Server-owned durability edge for checkpoint-related provider frames.
+    checkpoint_event_sink: crate::CheckpointEventSink,
     /// placeholder-nanoid → live claude session (sidecar stdin + owned child + consumer).
     sessions: Arc<TokioMutex<HashMap<String, ClaudeSession>>>,
     /// durable Claude UUID (`cliSessionId` from `sdk.session.init`) -> sessions-map key.
@@ -763,7 +781,9 @@ impl FreshClaudeState {
     /// Build the state around the shared broadcast bus.
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
+            hosted_mcp: false,
             broadcast_tx,
+            checkpoint_event_sink: crate::CheckpointEventSink::default(),
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
@@ -794,6 +814,18 @@ impl FreshClaudeState {
             #[cfg(test)]
             kill_close_failure_pause: None,
         }
+    }
+
+    pub fn with_hosted_mcp(mut self, selected: bool) -> Self {
+        self.hosted_mcp = selected;
+        self
+    }
+
+    pub fn set_checkpoint_event_persister(
+        &self,
+        persister: crate::CheckpointEventPersister,
+    ) -> Result<(), &'static str> {
+        self.checkpoint_event_sink.set_persister(persister)
     }
 
     /// b8ke focused episode-2 round-3 F3: crate-visible session-key resolver
@@ -1821,6 +1853,16 @@ impl FreshClaudeState {
         }
     }
 
+    async fn broadcast_checkpoint_frame(
+        &self,
+        frame: String,
+        require_match: bool,
+    ) -> Result<(), String> {
+        self.checkpoint_event_sink
+            .broadcast(&self.broadcast_tx, frame, require_match)
+            .await
+    }
+
     // ── freshAgent.create (WS) ───────────────────────────────────────────────────────
 
     /// Handle a `freshAgent.create` for claude/kilroy: spawn the Node sidecar, drive the
@@ -2294,6 +2336,7 @@ impl FreshClaudeState {
             "permissionMode": msg.permission_mode,
             "effort": msg.effort,
             "plugins": msg.plugins,
+            "hostedMcp": self.hosted_mcp,
             "modelSelection": msg.model_selection,
             "resumeSessionId": resume_sid,
         });
@@ -4278,6 +4321,19 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
+        // The checkpoint barrier can park this send while the captured
+        // workspace is saved. Parse and retain the pane's ownership fence so
+        // that a close, handoff, or reattach during that wait cannot redirect
+        // the delayed prompt to a different owner of the same session id.
+        let send_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    self.send_error(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
+
         // Task 10b: a durable claude UUID resolves through `cli_index` to the live
         // session -- no more SESSION_NOT_FOUND for a durable id the index maps.
         //
@@ -4325,6 +4381,35 @@ impl FreshClaudeState {
         // resolved before the teardown window serializes identically to one that
         // parked through it.
         let _turn = turn_lock.lock().await;
+        // Arm the coordinator guard only after the send has waited behind any
+        // earlier turn. A lifecycle transition during that wait advances the
+        // generation, so the captured fence is checked against the owner that
+        // will actually receive this prompt. Checkpointed sends always require
+        // the fence when the coordinator is wired; ordinary legacy sends keep
+        // their existing unfenced behavior, while any supplied fence is honored.
+        let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
+            let owner_key = self.resolve_ownership_key(&session_id);
+            match crate::ownership_lane::arm_reclaimless_op_guard(
+                &self.ownership,
+                PROVIDER,
+                &owner_key,
+                &format!("send-{}", uuid::Uuid::new_v4()),
+                send_fence,
+                "freshclaude/send",
+            ) {
+                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneOpGuard::Unwired => None,
+                crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        session_id = %session_id, request_id = ?request_id,
+                        "fresh_agent_send_refused: ownership guard refused");
+                    self.send_error(&request_id, "SESSION_RESERVED", &message);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if let Some(settings) = msg.settings.as_ref() {
             // kata z7j7: sandbox has NO claude-side concept — when it arrives on
             // a send, log observably (id + boolean flag only, never the prompt
@@ -4438,8 +4523,12 @@ impl FreshClaudeState {
         };
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
+        let checkpoint_attempt = checkpoint_attempt_for_send(&msg);
         let mut send_req =
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
+        if let Some(attempt) = checkpoint_attempt {
+            send_req["checkpointAttempt"] = attempt;
+        }
         if let Some(images) = msg.images {
             send_req["images"] = json!(images);
         }
@@ -4454,6 +4543,7 @@ impl FreshClaudeState {
             return;
         }
         drop(guard);
+        drop(ownership_guard);
 
         // Unified agent names (Task 4): the shared accepted-input callback —
         // the send reached the sidecar, so the user input is ACCEPTED. The
@@ -5231,20 +5321,31 @@ impl FreshClaudeState {
         };
         let name_ref = projection.as_ref().map(|(r, _)| r.clone());
         let session_name = projection.map(|(_, record)| record);
-        self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
-            FreshAgentSessionMaterialized {
-                previous_session_id: old_id.to_string(),
+        let message = ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
+            previous_session_id: old_id.to_string(),
+            provider: PROVIDER.to_string(),
+            session_id: new_id.to_string(),
+            session_type: session_type.to_string(),
+            session_ref: Some(freshell_protocol::SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: new_id.to_string(),
-                session_type: session_type.to_string(),
-                session_ref: Some(freshell_protocol::SessionLocator {
-                    provider: PROVIDER.to_string(),
-                    session_id: new_id.to_string(),
-                }),
-                name_ref,
-                session_name,
-            },
-        ));
+            }),
+            name_ref,
+            session_name,
+        });
+        if let Ok(frame) = serde_json::to_string(&message) {
+            if let Err(error) = self
+                .checkpoint_event_sink
+                .persist_before_broadcast(&frame, false)
+                .await
+            {
+                tracing::error!(target: "freshell_freshagent::claude",
+                    cause = %error,
+                    "freshagent.claude.checkpoint_alias_persist_failed"
+                );
+            }
+        }
+        self.broadcast(&message);
     }
 
     /// Handle a `freshAgent.undo` / `freshAgent.redo` for claude/kilroy (kata 1wxv
@@ -7326,6 +7427,7 @@ impl FreshClaudeState {
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
@@ -8608,7 +8710,19 @@ impl FreshClaudeState {
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                 if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
-                    let _ = broadcast_tx.send(frame);
+                    if value.get("type").and_then(Value::as_str)
+                        == Some("sdk.checkpointTurnIdentity")
+                    {
+                        if let Err(error) = state.broadcast_checkpoint_frame(frame, true).await {
+                            tracing::error!(target: "freshell_freshagent::claude",
+                                session_id = %stamp,
+                                cause = %error,
+                                "freshagent.claude.checkpoint_identity_persist_failed"
+                            );
+                        }
+                    } else {
+                        let _ = broadcast_tx.send(frame);
+                    }
                 }
             }
             // Task 5 (unified needs-attention signal): capture the armed state
@@ -9226,6 +9340,7 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         "sdk.session.snapshot" => "freshAgent.session.snapshot",
         "sdk.session.changed" => "freshAgent.session.changed",
         "sdk.session.init" => "freshAgent.session.init",
+        "sdk.checkpointTurnIdentity" => "checkpointTurnIdentity",
         "sdk.session.metadata" => "freshAgent.session.metadata",
         "sdk.assistant" => "freshAgent.assistant",
         "sdk.stream" => "freshAgent.stream",
@@ -9535,6 +9650,8 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
         .ok()
         .zip(std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok());
+    #[cfg(target_os = "linux")]
+    let run_as_wrapped = run_as.is_some();
     let mut cmd = if let Some((uid, gid)) = run_as {
         let mut command = tokio::process::Command::new("/usr/bin/setpriv");
         command.args([
@@ -9570,6 +9687,17 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         .stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
+    #[cfg(target_os = "linux")]
+    if freshell_platform::managed_child_secrets::snapshot().is_some() {
+        let wrapper_targets = [node.as_str()];
+        let additional = if run_as_wrapped {
+            &wrapper_targets[..]
+        } else {
+            &[]
+        };
+        freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
+            .map_err(|error| error.to_string())?;
+    }
     let mut child = cmd.spawn().map_err(|e| {
         format!(
             "claude sidecar spawn failed ({node} {}): {e}",
@@ -9583,6 +9711,53 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         drain_reader(err);
     }
     Ok((child, stdin, stdout, ownership_id))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provider_exec_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn provider_exec_profile_checks_actual_managed_claude_sidecar_spawn() {
+        const CASE: &str = "FRESHELL_EXEC_PROFILE_FIXTURE_CHILD";
+        if let Ok(case) = std::env::var(CASE) {
+            let owned = tempfile::tempdir().unwrap();
+            let script = owned.path().join("synthetic-sidecar.mjs");
+            std::fs::write(&script, "setInterval(()=>{},1000)\n").unwrap();
+            std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+            let count = if case == "large" { 17 } else { 1 };
+            freshell_platform::managed_child_secrets::install(
+                (0..count)
+                    .map(|i| (format!("FRESHELL_EXEC_FIXTURE_{i}"), "x".repeat(64 * 1024)))
+                    .collect(),
+            )
+            .unwrap();
+            let mut result = spawn_sidecar().await;
+            if let Ok((child, _, _, _)) = &mut result {
+                let pid = child.id().unwrap();
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+                eprintln!("synthetic owned sidecar pid {pid} stopped in fixture namespace");
+            }
+            if case == "large" {
+                assert!(matches!(result,Err(ref cause) if cause.contains("provider exec profile")),"managed fresh sidecar must reject oversized actual inherited+selected environment before spawn");
+            } else {
+                assert!(result.is_ok(),"valid finite selected environment must still launch the actual sidecar command");
+            }
+            return;
+        }
+        for case in ["large", "small"] {
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).env_clear()
+                .env("PATH","/usr/local/bin:/usr/bin:/bin").env(CASE,case)
+                .args(["--exact","claude::provider_exec_tests::provider_exec_profile_checks_actual_managed_claude_sidecar_spawn","--nocapture"])
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "actual sidecar fixture case {case} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 /// Read the sidecar's stdout until the `created` (→ the nanoid placeholder) or
@@ -11438,7 +11613,149 @@ rl.on('line', (line) => {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         }
+    }
+
+    #[test]
+    fn checkpoint_turn_identity_claude_send_carries_valid_uuid_and_attempt_correlation() {
+        let mut msg = send_msg("claude-placeholder", "same prompt");
+        msg.request_id = Some("request-7".to_string());
+        msg.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "attempt-7".to_string(),
+            workspace: None,
+        });
+
+        let attempt = checkpoint_attempt_for_send(&msg).expect("checkpoint attempt");
+        let uuid = uuid::Uuid::parse_str(attempt["uuid"].as_str().expect("UUID string"))
+            .expect("valid UUID");
+        assert_eq!(
+            uuid.get_version_num(),
+            4,
+            "the SDK input uses a fresh v4 UUID"
+        );
+        assert_eq!(attempt["requestId"], "request-7");
+        assert_eq!(attempt["logicalAttemptId"], "attempt-7");
+        assert!(checkpoint_attempt_for_send(&send_msg("legacy", "prompt")).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_delayed_send_with_stale_owner_fence_is_refused_before_dispatch() {
+        let (mut st, mut rx) = state_with_bus();
+        let session_id = "claude-send-stale-owner";
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fake_claude_session(&st, session_id).await;
+
+        let mut first_ticket = match crate::ownership_lane::begin_lane_claim(
+            &st.ownership,
+            PROVIDER,
+            session_id,
+            "test-send-owner-first",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("fixture: first send owner claim must be granted"),
+        };
+        assert!(crate::ownership_lane::commit_lane_claim(
+            &st.ownership,
+            &st.ownership_stamps,
+            Some(&st.broadcast_tx),
+            PROVIDER,
+            session_id,
+            &mut first_ticket,
+            session_id,
+            None,
+        )
+        .is_ok());
+        let old = registry.observe(PROVIDER, session_id);
+        let old_generation = old.generation;
+        let old_owner = match old.state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => owner,
+            other => panic!("fixture: first owner must be live: {other:?}"),
+        };
+        let old_operation = old_owner
+            .ownership_id
+            .clone()
+            .expect("the committed owner has an operation id");
+        registry.release(
+            PROVIDER,
+            session_id,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: old_operation,
+                generation: old_generation,
+                runtime: Some(old_owner),
+            },
+            "test",
+        );
+
+        let mut replacement_ticket = match crate::ownership_lane::begin_lane_claim(
+            &st.ownership,
+            PROVIDER,
+            session_id,
+            "test-send-owner-replacement",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("fixture: replacement send owner claim must be granted"),
+        };
+        assert!(crate::ownership_lane::commit_lane_claim(
+            &st.ownership,
+            &st.ownership_stamps,
+            Some(&st.broadcast_tx),
+            PROVIDER,
+            session_id,
+            &mut replacement_ticket,
+            session_id,
+            None,
+        )
+        .is_ok());
+        let current = registry.observe(PROVIDER, session_id);
+        assert!(current.generation > old_generation);
+
+        let mut send = send_msg(session_id, "delayed checkpoint prompt");
+        send.request_id = Some("stale-checkpoint-send".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "stale-checkpoint-attempt".into(),
+            workspace: None,
+        });
+        send.observed_epoch = Some(old.epoch);
+        send.observed_generation = Some(old_generation);
+        st.handle_send(send).await;
+
+        let mut frames: Vec<Value> = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            if let Ok(frame) = serde_json::from_str(&raw) {
+                frames.push(frame);
+            }
+        }
+        assert!(
+            frames.iter().any(|frame| {
+                frame.to_string().contains("SESSION_RESERVED")
+                    && frame.to_string().contains("stale")
+            }),
+            "the delayed send reports the stale owner fence: {frames:?}"
+        );
+        let sessions = st.sessions.lock().await;
+        let session = sessions
+            .get(session_id)
+            .expect("the old session stays mapped");
+        assert!(
+            !session.in_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale delayed prompt never arms a turn or reaches the sidecar"
+        );
+        assert!(
+            !session
+                .turn_tracker
+                .lock()
+                .expect("turn tracker mutex")
+                .busy(),
+            "a refused stale prompt leaves the turn tracker idle"
+        );
     }
 
     /// kata z7j7 (claude scope honesty): a settings-bearing send whose payload

@@ -1337,6 +1337,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         max_attempts: u32,
     ) {
         let msg = freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+            recovery_summary: None,
             status: freshell_protocol::RuntimeStatus::Recovering,
             terminal_id: terminal_id.to_string(),
             attempt: Some(attempt as i64),
@@ -1400,6 +1401,7 @@ pub(crate) fn broadcast_settled_frame(
     resume_cycles: Option<u32>,
 ) {
     let msg = freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+        recovery_summary: None,
         status: freshell_protocol::RuntimeStatus::Exited,
         terminal_id: terminal_id.to_string(),
         attempt: None,
@@ -3047,6 +3049,7 @@ mod tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),

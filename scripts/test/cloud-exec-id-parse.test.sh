@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test: cloud-exec-id-parse — regression for execution-ID capture from
-# `gcloud run jobs execute --wait` output.
+# Test: cloud-exec-id-parse — regression for execution-ID capture from both
+# `gcloud run jobs execute --wait` and `--async` output.
 #
 # gcloud prints "Execution [NAME] has successfully completed." (brackets are
 # literal around the name, ANSI SGR codes around it on color-capable output).
@@ -46,13 +46,24 @@ touch "$FAKE_LOG"
 cat > "$FAKE_DIR/gcloud" << 'FAKE'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "$FAKE_LOG"
-# Mimic current gcloud: "Execution [NAME] ..." with literal brackets and ANSI
-# SGR codes around the name (observed ngcloud output 2026-08-18).
+# Mimic gcloud's accepted execution output with literal brackets and ANSI
+# SGR codes around the name (gcloud 581.0.0).
 if [[ "$*" == *"run jobs execute"* ]]; then
-  printf 'Creating execution...\nExecution [\033[1mtest-exec-123\033[m] has successfully completed.\n'
+  if [[ "$*" == *" --async"* ]]; then
+    printf 'Execution [\033[1mtest-exec-123\033[m] is being started asynchronously.\n'
+  else
+    printf 'Creating execution...\nExecution [\033[1mtest-exec-123\033[m] has successfully completed.\n'
+  fi
   exit 0
 fi
 if [[ "$*" == *"executions describe"* ]]; then
+  if [[ "$*" == *"completionTime"* ]]; then
+    if [[ -s "${FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT:-/nonexistent}" ]]; then
+      echo "dispatch receipt available before completion wait" >> "$FAKE_LOG"
+    fi
+    echo "2026-10-12T00:00:00Z"
+    exit 0
+  fi
   if [[ "$*" == *"succeededCount"* ]]; then
     # Report every requested shard as succeeded (vitest passes per-execution
     # --tasks=N; e2e creates the job with --tasks=N). The wrappers require
@@ -67,6 +78,10 @@ fi
 if [[ "$*" == *"executions list"* ]]; then echo "test-exec-123"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
 if [[ "$*" == *"logging read"* ]]; then
+  if [[ "$*" == *"textPayload =~"* ]]; then
+    printf '[{"labels":{"run.googleapis.com/execution_name":"test-exec-123","run.googleapis.com/task_index":"0"},"textPayload":"  1 passed (1.0s)"}]\n'
+    exit 0
+  fi
   # One zero-retry completion receipt per task, as Cloud Logging would return
   # for the single-task execution this stub reports above. Without this
   # branch the e2e wrapper's structured-receipt reconciliation fails closed
@@ -92,13 +107,99 @@ check "vitest wrapper prints success footer" grep -q "All tasks completed succes
 check "vitest describe targets clean execution id" \
   bash -c "grep -q 'executions describe .* test-exec-123 ' '$FAKE_LOG' && ! grep -q 'executions describe .*\[' '$FAKE_LOG'"
 
+# Confirm the Vitest wrapper still waits in its existing execution path.
+check "vitest wrapper retains wait-for-completion execution mode" \
+  grep -q 'run jobs execute .* --wait' "$FAKE_LOG"
+
 # --- e2e wrapper ---
 rm -f "$FAKE_LOG"; touch "$FAKE_LOG"
+export FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT="$FAKE_DIR/e2e-dispatch.json"
+rm -f "$FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT"
 E2E_OUT=$(bash "$ROOT/scripts/e2e-cloud.sh" run --cloud --shards=1 2>&1) && E2E_RC=0 || E2E_RC=$?
 check "e2e wrapper exits 0 on green run" bash -c "[ $E2E_RC -eq 0 ]"
 check "e2e wrapper reports truthfully (succeeded=1)" grep -q "Succeeded tasks: 1" <<< "$E2E_OUT"
 check "e2e describe targets clean execution id" \
   bash -c "grep -q 'executions describe .* test-exec-123 ' '$FAKE_LOG' && ! grep -q 'executions describe .*\[' '$FAKE_LOG'"
+check "e2e execution uses asynchronous acceptance before its bounded completion wait" \
+  bash -c "grep -q 'run jobs execute .* --async' '$FAKE_LOG' && grep -q 'dispatch receipt available before completion wait' '$FAKE_LOG'"
+check "e2e wrapper records the exact accepted Cloud Run execution" \
+  bash -c "jq -e '.jobName and .executionName == \"test-exec-123\" and (.acceptedAt | test(\"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$\"))' '$FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT' >/dev/null"
+
+check_duration() {
+  local input="$1" expected="$2" actual
+  actual=$(node "$ROOT/scripts/e2e-cloud-duration.mjs" "$input" 2>/dev/null) || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+check_duration_rejected() {
+  local input="$1"
+  ! node "$ROOT/scripts/e2e-cloud-duration.mjs" "$input" >/dev/null 2>&1
+}
+
+check "cloud timeout parser accepts decimal hours" check_duration "1.5h" "5400"
+check "cloud timeout parser rounds a fractional mixed duration up to whole seconds" \
+  check_duration "1m30.5s" "91"
+check "cloud timeout parser preserves gcloud's rounded one-second minimum" \
+  check_duration "PT0.99995S" "1"
+check "cloud timeout parser accepts ISO time durations" check_duration "PT1H" "3600"
+check "cloud timeout parser accepts ISO day and time durations" check_duration "P1DT2H" "93600"
+check "cloud timeout parser matches gcloud fractional-year normalization" \
+  check_duration "P0.00016Y" "6308"
+check "cloud timeout parser preserves gcloud's lower-side year half-way rounding" \
+  check_duration "P0.00005Y" "3154"
+check "cloud timeout parser preserves gcloud's lower-adjacent year half-way rounding" \
+  check_duration "P0.00015Y" "3154"
+check "cloud timeout parser preserves gcloud's upper-side year half-way rounding" \
+  check_duration "P0.00025Y" "9470"
+check "cloud timeout parser preserves gcloud's upper-adjacent year half-way rounding" \
+  check_duration "P0.00035Y" "9470"
+check "cloud timeout parser preserves gcloud's lower-side hour half-way rounding" \
+  check_duration "1.00015h" "3601"
+check "cloud timeout parser preserves gcloud's upper-side hour half-way rounding" \
+  check_duration "1.00025h" "3602"
+check "cloud timeout parser preserves gcloud's upper-adjacent hour half-way rounding" \
+  check_duration "1.00035h" "3602"
+check "cloud timeout parser matches gcloud fractional-month normalization" \
+  check_duration "P0.1M" "259200"
+check "cloud timeout parser rounds gcloud fractional-day normalization up safely" \
+  check_duration "P0.00016D" "18"
+check "cloud timeout parser rounds gcloud fractional-week normalization up safely" \
+  check_duration "P0.00016W" "96"
+check "cloud timeout parser treats a bare integer as seconds" check_duration "60" "60"
+check "cloud timeout parser accepts whitespace around a bare integer" \
+  check_duration " 60 " "60"
+check "cloud timeout parser rejects calendar fractions that normalize below gcloud's minimum" \
+  check_duration_rejected "P0.001M"
+
+check_rejected_timeout_before_job() {
+  local duration="$1" output
+  : > "$FAKE_LOG"
+  if output=$(bash "$ROOT/scripts/e2e-cloud.sh" run --cloud --shards=1 "--timeout=$duration" 2>&1); then
+    return 1
+  fi
+  ! grep -q 'FAKE_GCLOUD: run jobs create' "$FAKE_LOG" \
+    && ! grep -q 'FAKE_GCLOUD: run jobs execute' "$FAKE_LOG" \
+    && grep -q 'unsupported Cloud Run task timeout duration' <<< "$output"
+}
+
+check "cloud timeout parser rejects malformed durations before creating a job" \
+  check_rejected_timeout_before_job "1hbanana"
+check "cloud timeout parser rejects zero seconds before creating a job" \
+  check_rejected_timeout_before_job "0"
+check "cloud timeout parser rejects zero ISO duration before creating a job" \
+  check_rejected_timeout_before_job "PT0S"
+check "cloud timeout parser rejects values below gcloud's one-second minimum before creating a job" \
+  check_rejected_timeout_before_job "0.5s"
+check "cloud timeout parser rejects durations beyond the safe wait bound before creating a job" \
+  check_rejected_timeout_before_job "999999999999999999999999999999999999999s"
+check "cloud timeout parser rejects calendar fractions below gcloud's minimum before creating a job" \
+  check_rejected_timeout_before_job "P0.001M"
+
+: > "$FAKE_LOG"
+VALID_DECIMAL_OUT=$(bash "$ROOT/scripts/e2e-cloud.sh" run --cloud --shards=1 --timeout=1.5h 2>&1) && VALID_DECIMAL_RC=0 || VALID_DECIMAL_RC=$?
+check "e2e wrapper accepts a decimal Cloud Run timeout" bash -c "[ $VALID_DECIMAL_RC -eq 0 ]"
+check "e2e wrapper passes the accepted decimal timeout to Cloud Run" \
+  grep -q 'run jobs create .* --task-timeout=1.5h' "$FAKE_LOG"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

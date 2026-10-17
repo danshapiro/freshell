@@ -14,9 +14,10 @@ use freshell_codex::launch_plan::CodexSidecarLaunchContext;
 use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, RollbackRequest};
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
-    AgentProvider, FreshAgentApprovalRespond, FreshAgentCompact, FreshAgentCreate, FreshAgentFork,
-    FreshAgentInterrupt, FreshAgentKill, FreshAgentQuestionRespond, FreshAgentSend,
-    FreshAgentSendSettings, ServerMessage, SessionLocator, SessionType, StringOrNumber,
+    AgentProvider, FreshAgentApprovalRespond, FreshAgentCheckpointIntent, FreshAgentCompact,
+    FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
+    FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendSettings, ServerMessage,
+    SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_protocol::{
     AgentEvent, FreshAgentCapture, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
@@ -155,7 +156,15 @@ impl HostedTransport {
         let broadcast_tx = Arc::new(broadcast_tx);
         let state = match provider {
             FreshProvider::Claude | FreshProvider::Kilroy => {
-                ProviderState::Claude(FreshClaudeState::new(Arc::clone(&broadcast_tx)))
+                let hosted_mcp = context.is_some_and(|context| {
+                    matches!(
+                        &context.preparation,
+                        ProviderPreparation::Claude { mcp_args } if !mcp_args.is_empty()
+                    )
+                });
+                ProviderState::Claude(
+                    FreshClaudeState::new(Arc::clone(&broadcast_tx)).with_hosted_mcp(hosted_mcp),
+                )
             }
             FreshProvider::Codex => {
                 let sidecar_args = context
@@ -173,6 +182,7 @@ impl HostedTransport {
                         json!({"freshAgent":{"enabled":true}}),
                     )
                     .with_sidecar_launch_context(CodexSidecarLaunchContext {
+                        provider_exec_profile: true,
                         config_args: sidecar_args,
                         env: Default::default(),
                     }),
@@ -427,22 +437,20 @@ impl FreshAgentTransport for HostedTransport {
             Some(expected) => Some(self.wait_exact_native(expected).await?),
             None if matches!(self.provider, FreshProvider::Codex) => Some(session_id),
             None if matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy) => {
-                let mut receiver = self.native_rx.lock().await;
-                Some(
-                    tokio::time::timeout(CREATE_TIMEOUT, async {
-                        loop {
-                            if let Some(observed) = receiver.borrow().clone() {
-                                return Ok::<_, String>(observed);
-                            }
-                            receiver
-                                .changed()
-                                .await
-                                .map_err(|_| "provider identity channel closed".to_string())?;
-                        }
-                    })
-                    .await
-                    .map_err(|_| "provider did not materialize native identity".to_string())??,
-                )
+                // The real SDK starts MCP/configuration before its first user
+                // turn but publishes system/init identity only with that turn.
+                // The bridge captures the native identity when it arrives.
+                let observed = self.native_rx.lock().await.borrow().clone();
+                if observed.is_none() {
+                    tracing::info!(
+                        event = "provider.identity.awaiting_first_turn",
+                        stage = "host_create",
+                        runtime_variant = %profile.runtime_variant,
+                        native_identity = "unrecorded",
+                        "provider started before native identity materialization"
+                    );
+                }
+                observed
             }
             None => None,
         };
@@ -454,6 +462,17 @@ impl FreshAgentTransport for HostedTransport {
         request_id: &RequestId,
         text: &str,
         profile: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatch_with_checkpoint_identity(request_id, text, profile, None)
+            .await
+    }
+
+    async fn dispatch_with_checkpoint_identity(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        logical_attempt_id: Option<&str>,
     ) -> Result<DispatchAck, DispatchFailure> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
@@ -487,6 +506,12 @@ impl FreshAgentTransport for HostedTransport {
                 model: profile.model,
                 permission_mode: profile.permission_mode,
                 sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
+            }),
+            checkpoint_intent: logical_attempt_id.map(|logical_attempt_id| {
+                FreshAgentCheckpointIntent {
+                    logical_attempt_id: logical_attempt_id.to_string(),
+                    workspace: None,
+                }
             }),
         };
         match &self.state {
@@ -1114,7 +1139,7 @@ fn spawn_broadcast_bridge(
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if event_type == "sdk.session.init" {
+                if matches!(event_type, "sdk.session.init" | "freshAgent.session.init") {
                     if let Some(session_id) = event
                         .get("cliSessionId")
                         .or_else(|| event.get("sessionId"))
@@ -1310,6 +1335,43 @@ mod tests {
 
     static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+    #[tokio::test]
+    async fn managed_provider_claude_native_identity_uses_actual_adapter_event_name() {
+        let (bus, rx) = broadcast::channel(8);
+        let (created, _) = watch::channel(None);
+        let (native, mut identity) = watch::channel(None);
+        let (events, mut event_rx) = mpsc::channel(8);
+        let (send_outcomes, _) = broadcast::channel(8);
+        let (kill_outcomes, _) = broadcast::channel(8);
+        spawn_broadcast_bridge(
+            FreshProvider::Claude,
+            rx,
+            BroadcastBridgeOutputs {
+                created,
+                native,
+                events,
+                send_outcomes,
+                kill_outcomes,
+                suppressed_kills: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            },
+        );
+        bus.send(json!({"type":"freshAgent.event","sessionId":"owned-placeholder",
+            "event":{"type":"freshAgent.session.init","cliSessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}).to_string()).unwrap();
+        let received = tokio::time::timeout(Duration::from_millis(250), identity.changed()).await;
+        assert!(
+            received.is_ok(),
+            "the actual Claude adapter identity must reach the host"
+        );
+        assert_eq!(
+            identity.borrow().as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+        assert!(
+            matches!(event_rx.recv().await, Some(AgentEvent::Started { native_session_id })
+            if native_session_id == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+    }
+
     struct SnapshotProviderEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl Drop for SnapshotProviderEnv {
         fn drop(&mut self) {
@@ -1319,6 +1381,105 @@ mod tests {
                     None => std::env::remove_var(key),
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_provider_fresh_claude_sends_only_fixed_hosted_mcp_selection() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("sidecar.mjs");
+        let receipt = dir.path().join("create.json");
+        std::fs::write(&script, r#"
+import {createInterface} from 'node:readline';
+import {writeFileSync} from 'node:fs';
+const lines=createInterface({input:process.stdin});
+lines.on('line', line=>{
+  const req=JSON.parse(line);
+  if(req.type==='create'){
+    writeFileSync(process.env.FRESHELL_TEST_MCP_RECEIPT,JSON.stringify(req));
+    process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture'})+'\n');
+    if(req.model!=='deferred-identity')process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
+  }
+  if(req.type==='shutdown')process.exit(0);
+});
+"#).unwrap();
+        let keys = [
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_NODE",
+            "FRESHELL_TEST_MCP_RECEIPT",
+        ];
+        let _env = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("FRESHELL_TEST_MCP_RECEIPT", &receipt);
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
+            },
+            mcp_capability: None,
+            config: vec![],
+            prepared_inputs: None,
+        };
+        for (selected, deferred_identity, expected_identity) in [
+            (true, false, None),
+            (false, false, None),
+            (true, true, None),
+            (true, false, Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+        ] {
+            let transport = HostedTransport::new_with_context(
+                FreshProvider::Claude,
+                selected.then_some(&context),
+            )
+            .await;
+            let profile = FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "freshclaude".into(),
+                cwd: dir.path().to_string_lossy().into(),
+                model: deferred_identity.then(|| "deferred-identity".into()),
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "owned-store".into(),
+                native_session_id: expected_identity.map(str::to_owned),
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: selected.then_some(context.clone()),
+                provider_secret_references: vec![],
+            };
+            let started =
+                tokio::time::timeout(Duration::from_secs(1), transport.start(&profile)).await;
+            let observed: Value =
+                serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+            transport.stop().await.unwrap();
+            let started = started.expect("Claude create cannot wait for the first model turn");
+            if expected_identity.is_some() {
+                assert!(
+                    started.is_err(),
+                    "an exact resume must reject a different actual native identity"
+                );
+                continue;
+            }
+            let started = started.unwrap();
+            if deferred_identity {
+                assert!(
+                    started.native_session_id.is_none(),
+                    "unrecorded native identity must remain unknown"
+                );
+            }
+            assert_eq!(
+                observed["hostedMcp"], selected,
+                "only accepted hosted selection enables the SDK recipe"
+            );
+            assert!(
+                observed.get("mcpServers").is_none(),
+                "arbitrary MCP maps are never sent over private create IPC"
+            );
         }
     }
 
@@ -1370,12 +1531,30 @@ mod tests {
         let pre = actor.snapshot().await;
         let spawned_before_send = audit.exists();
         let first = actor
-            .dispatch(
+            .dispatch_with_checkpoint_identity(
                 RequestId::parse("first-owned-send").unwrap(),
                 "First owned prompt".into(),
                 None,
+                Some("managed-opencode-attempt-1".into()),
             )
             .await;
+        let checkpoint_identity = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = actor.read_events(0, 256).await.events;
+                if let Some(payload) = events.iter().find_map(|entry| match &entry.event {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "checkpointTurnIdentity" =>
+                    {
+                        Some(payload.clone())
+                    }
+                    _ => None,
+                }) {
+                    break payload;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         let identity = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(native) = actor.profile().await.native_session_id {
@@ -1412,6 +1591,14 @@ mod tests {
         .await;
         let final_native = actor.profile().await.native_session_id;
         transport.stop().await.unwrap();
+        let checkpoint_identity = match checkpoint_identity {
+            Ok(payload) => payload,
+            Err(_) => panic!(
+                "hosted OpenCode send must preserve checkpoint identity through the provider; actor events: {:#?}; fixture audit: {}",
+                actor.read_events(0, 256).await,
+                std::fs::read_to_string(&audit).unwrap_or_default()
+            ),
+        };
         let rows: Vec<Value> = std::fs::read_to_string(&audit)
             .unwrap_or_default()
             .lines()
@@ -1424,7 +1611,35 @@ mod tests {
         assert_eq!(pre.unwrap()["threadId"], registered);
         first.unwrap();
         second.unwrap();
+        assert_eq!(
+            checkpoint_identity["event"]["logicalAttemptId"],
+            "managed-opencode-attempt-1"
+        );
+        assert_eq!(
+            checkpoint_identity["event"]["requestId"],
+            "first-owned-send"
+        );
+        assert!(checkpoint_identity["event"]["nativeTurnId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")));
         observed_prompts.unwrap();
+        let identity_receipt_count = actor
+            .read_events(0, 256)
+            .await
+            .events
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.event,
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "checkpointTurnIdentity"
+                )
+            })
+            .count();
+        assert_eq!(
+            identity_receipt_count, 1,
+            "the second legacy send must not create a checkpoint identity receipt"
+        );
         let native = identity.unwrap();
         assert_eq!(live.unwrap()["threadId"], native);
         assert_eq!(final_native.as_deref(), Some(native.as_str()));
@@ -2079,6 +2294,7 @@ mod tests {
                 session_id: format!("native-{}", provider.as_str()),
             }),
             provider_launch_context: Some(ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation,
                 mcp_capability: None,
                 config: vec![freshell_runtime_protocol::ProviderConfigReference {
@@ -2089,6 +2305,7 @@ mod tests {
                 }],
             }),
             provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: "/run/freshell-secrets/onecli/env".into(),
                 profile: match provider {
                     FreshProvider::Claude => {
@@ -2676,6 +2893,7 @@ mod tests {
                     provider: provider.as_str().into(), session_id: "exact-native".into(),
                 }),
                 provider_launch_context: Some(ProviderLaunchContext {
+            prepared_inputs: None,
                     preparation,
                     mcp_capability: None,
                     config: vec![freshell_runtime_protocol::ProviderConfigReference {
@@ -2686,6 +2904,7 @@ mod tests {
                     }],
                 }),
                 provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                    provider_relative_path: None,
                     source_path: "/run/freshell-secrets/onecli".into(),
                     profile: match provider {
                         FreshProvider::Claude => freshell_runtime_protocol::ProviderSecretProfile::ClaudeOnecliEnvironment,

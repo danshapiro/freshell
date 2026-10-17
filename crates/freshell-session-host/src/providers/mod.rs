@@ -29,13 +29,14 @@ pub struct PreparedTerminal {
     pub terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     pub codex: Option<codex::PreparedCodexLaunch>,
     pub child_env: std::collections::BTreeMap<String, String>,
+    pub claude_settings: Option<String>,
 }
 
 pub fn prepare_provider_state_before_bootstrap(
     terminal: &mut freshell_runtime_protocol::TerminalLaunchSpec,
-) -> Result<(), String> {
+) -> Result<Vec<std::path::PathBuf>, String> {
     if terminal.mode != "amplifier" {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let session_id = terminal
         .resume_session_id
@@ -55,26 +56,122 @@ pub fn prepare_provider_state_before_bootstrap(
     if let Some(recorded_cwd) = ensured.working_dir_of_existing {
         terminal.cwd = recorded_cwd;
     }
+    Ok(ensured.created_paths)
+}
+
+/// Prepared inputs already have a private, provider-owned HOME. Create native
+/// session state as that owner rather than transferring pre-existing inodes.
+pub fn prepare_amplifier_state_as_owner(
+    terminal: &mut freshell_runtime_protocol::TerminalLaunchSpec,
+) -> Result<(), String> {
+    let session_id = terminal
+        .resume_session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or("managed Amplifier launch requires one exact launcher-assigned session id")?;
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let output = std::process::Command::new("/usr/bin/setpriv")
+        .args(crate::provider_identity_args(
+            terminal.run_as_uid,
+            terminal.run_as_gid,
+        ))
+        .arg(exe)
+        .arg("prepare-amplifier-state")
+        .args([session_id, &terminal.cwd, &terminal.terminal_id])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| "prepare Amplifier session state helper failed")?;
+    if !output.status.success() || output.stdout.len() > 256 * 1024 {
+        return Err("prepare Amplifier session state helper failed".into());
+    }
+    let recorded_cwd: Option<String> = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "prepare Amplifier session state response is invalid")?;
+    if let Some(cwd) = recorded_cwd {
+        validate_amplifier_state_cwd(&cwd)?;
+        terminal.cwd = cwd;
+    }
     Ok(())
+}
+
+fn validate_amplifier_state_cwd(cwd: &str) -> Result<(), String> {
+    if cwd.len() > 64 * 1024
+        || !std::path::Path::new(cwd).is_absolute()
+        || cwd.chars().any(char::is_control)
+    {
+        return Err("Amplifier session working directory is invalid".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn run_amplifier_state_worker(args: &[String]) -> Result<(), String> {
+    let [session_id, cwd, terminal_id] = args else {
+        return Err("invalid Amplifier state preparation arguments".into());
+    };
+    validate_amplifier_state_cwd(cwd)?;
+    let ensured = freshell_sessions::amplifier_stub::ensure_session(
+        std::path::Path::new("/home/freshell/provider/.amplifier"),
+        session_id,
+        cwd,
+        terminal_id,
+    )
+    .map_err(|error| format!("prepare Amplifier session stub: {error}"))?;
+    if let Some(recorded_cwd) = ensured.working_dir_of_existing.as_deref() {
+        validate_amplifier_state_cwd(recorded_cwd)?;
+    }
+    let response = serde_json::to_vec(&ensured.working_dir_of_existing)
+        .map_err(|_| "encode Amplifier state response failed")?;
+    std::io::Write::write_all(&mut std::io::stdout(), &response)
+        .map_err(|_| "write Amplifier state response failed".into())
+}
+
+fn prepare_amplifier_package_target() -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let root = std::path::Path::new("/home/freshell/provider/.freshell/amplifier");
+    let config = root.join("uv.toml");
+    let bytes =
+        b"[pip]\ntarget = \"/home/freshell/provider/.freshell/amplifier/python-packages\"\n";
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)
+        .map_err(|_| "create managed Amplifier package configuration directory failed")?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config)
+    {
+        Ok(mut file) => std::io::Write::write_all(&mut file, bytes)
+            .map_err(|_| "write managed Amplifier package configuration failed".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&config)
+                .map_err(|_| "inspect managed Amplifier package configuration failed")?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() != bytes.len() as u64
+                || std::fs::read(&config)
+                    .map_err(|_| "read managed Amplifier package configuration failed")?
+                    != bytes
+            {
+                return Err("managed Amplifier package configuration conflicts with its fixed native target".into());
+            }
+            Ok(())
+        }
+        Err(_) => Err("create managed Amplifier package configuration failed".into()),
+    }
 }
 
 pub async fn prepare_terminal(
     mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+    selected_claude_settings: Option<&str>,
 ) -> Result<PreparedTerminal, String> {
     let mut child_env = child_secret_env.clone();
-    if let Some(context) = terminal.provider_launch_context.as_ref() {
-        if let Some(capability) = context.mcp_capability.as_ref() {
-            if capability.endpoint.is_empty() {
-                return Err("managed MCP endpoint is unavailable".into());
-            }
-            let grant = read_mcp_grant(std::path::Path::new("/run/freshell/mcp-capability.json"))?;
-            if grant.get("FRESHELL_URL") != Some(&capability.endpoint) {
-                return Err("managed MCP grant endpoint differs from launch context".into());
-            }
-            probe_managed_endpoint(&capability.endpoint).await?;
-            child_env.extend(grant);
-        }
+    prepare_scoped_mcp_environment(terminal.provider_launch_context.as_ref(), &mut child_env)
+        .await?;
+    if terminal.mode == "amplifier" {
+        prepare_provider_features(&terminal, "amplifier-packages")?;
     }
     if terminal.mode == "claude"
         && terminal
@@ -106,7 +203,7 @@ pub async fn prepare_terminal(
                         "/run/freshell-private/user-provider/ephemeral/inline-config.json",
                     )
                     .map_err(|_| "managed OpenCode inline config is unavailable")?;
-                    terminal.env.insert("OPENCODE_CONFIG_CONTENT".into(), raw);
+                    child_env.insert("OPENCODE_CONFIG_CONTENT".into(), raw);
                 }
             }
         }
@@ -118,24 +215,26 @@ pub async fn prepare_terminal(
             Some("0" | "false")
         );
         if !rebind_disabled {
+            let prepared_tui = terminal
+                .provider_launch_context
+                .as_ref()
+                .is_some_and(|context| context.prepared_inputs.is_some())
+                && child_env.contains_key("OPENCODE_TUI_CONFIG");
             let source = terminal
                 .env
                 .get("OPENCODE_TUI_CONFIG")
                 .or_else(|| child_env.get("OPENCODE_TUI_CONFIG"))
                 .cloned();
-            let mut args = vec!["opencode-rebind"];
-            if let Some(source) = source.as_deref() {
-                args.push(source);
-            }
-            prepare_provider_features_for_identity(
+            if let Some(selector) = prepare_opencode_rebind(
                 terminal.run_as_uid,
                 terminal.run_as_gid,
-                &args,
-            )?;
-            terminal.env.insert(
-                "OPENCODE_TUI_CONFIG".into(),
-                "/home/freshell/provider/.freshell/opencode/tui.json".into(),
-            );
+                prepared_tui,
+                source.as_deref(),
+            )? {
+                terminal
+                    .env
+                    .insert("OPENCODE_TUI_CONFIG".into(), selector.into());
+            }
         }
         let permission = terminal
             .env
@@ -144,18 +243,18 @@ pub async fn prepare_terminal(
             .provider_launch_context
             .as_ref()
             .is_some_and(|context| context.mcp_capability.is_some());
-        let plan = freshell_platform::opencode_config::prepare_opencode_config(
-            std::path::Path::new(&terminal.cwd),
-            std::path::Path::new("/home/freshell/provider/.config/opencode"),
-        )
-        .map_err(|error| error.to_string())?;
+        let plan = opencode_plan(
+            &terminal.cwd,
+            terminal.provider_launch_context.as_ref(),
+            prepared_opencode_plan,
+        )?;
         let inherited = terminal
             .env
-            .get("OPENCODE_CONFIG_CONTENT")
-            .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT"));
-        if inherited.is_some() || permission.is_some() || has_mcp {
+            .remove("OPENCODE_CONFIG_CONTENT")
+            .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT").cloned());
+        if !plan.inline_prepared && (inherited.is_some() || permission.is_some() || has_mcp) {
             let config = freshell_platform::opencode_config::merge_owned_entries(
-                inherited.map(String::as_str),
+                inherited.as_deref(),
                 &plan,
                 &freshell_platform::opencode_config::OwnedConfigEdits {
                     disable_snapshots: false,
@@ -165,31 +264,50 @@ pub async fn prepare_terminal(
                 },
             )
             .map_err(|error| error.to_string())?;
-            terminal
-                .env
-                .insert("OPENCODE_CONFIG_CONTENT".into(), config.clone());
             child_env.insert("OPENCODE_CONFIG_CONTENT".into(), config);
         }
     }
+    // Keep the persisted/validated launch recipe separate from the final
+    // child-only settings argument, just as credential environment is separate.
     apply_terminal_context(&mut terminal)?;
-    if terminal.mode == "codex" {
-        let mut sidecar_env = terminal.env.clone();
-        sidecar_env.extend(child_env.clone());
-        let prepared = codex::prepare(&terminal, &sidecar_env).await?;
-        let mut args = prepared.remote_args.to_vec();
-        args.extend(terminal.args);
-        terminal.args = args;
-        return Ok(PreparedTerminal {
-            terminal,
-            codex: Some(prepared),
-            child_env,
-        });
-    }
     Ok(PreparedTerminal {
         terminal,
         codex: None,
         child_env,
+        claude_settings: selected_claude_settings.map(str::to_owned),
     })
+}
+
+/// Codex's app-server is native execution. The host calls this only after
+/// consuming the grant, alongside the terminal process dispatch.
+pub async fn start_terminal_sidecar(
+    mut prepared: PreparedTerminal,
+) -> Result<PreparedTerminal, String> {
+    if prepared.terminal.mode == "codex" {
+        let mut sidecar_env = prepared.terminal.env.clone();
+        sidecar_env.extend(prepared.child_env.clone());
+        let codex = codex::prepare(&prepared.terminal, &sidecar_env).await?;
+        let mut args = codex.remote_args.to_vec();
+        args.extend(prepared.terminal.args);
+        prepared.terminal.args = args;
+        prepared.codex = Some(codex);
+    }
+    Ok(prepared)
+}
+
+async fn prepare_scoped_mcp_environment(
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+    child_env: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
+        let grant = read_mcp_grant(std::path::Path::new("/run/freshell/mcp-capability.json"))?;
+        if grant.get("FRESHELL_URL") != Some(&capability.endpoint) {
+            return Err("managed MCP grant endpoint differs from launch context".into());
+        }
+        probe_managed_endpoint(&capability.endpoint).await?;
+        child_env.extend(grant);
+    }
+    Ok(())
 }
 
 fn read_mcp_grant(
@@ -266,11 +384,13 @@ fn prepare_provider_features_for_identity(uid: u32, gid: u32, args: &[&str]) -> 
     }
 }
 
-pub fn prepare_fresh_agent_child_environment(
+pub async fn prepare_fresh_agent_child_environment(
     launch: &freshell_runtime_protocol::FreshAgentLaunchSpec,
     child_env: &mut std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
 ) -> Result<(), String> {
     use freshell_runtime_protocol::{FreshProvider, ProviderPreparation};
+    prepare_scoped_mcp_environment(launch.provider_launch_context.as_ref(), child_env).await?;
     if launch.provider != FreshProvider::Opencode {
         return Ok(());
     }
@@ -299,16 +419,25 @@ pub fn prepare_fresh_agent_child_environment(
             }
         }
     }
-    let plan = freshell_platform::opencode_config::prepare_opencode_config(
-        std::path::Path::new(&launch.cwd),
-        std::path::Path::new("/home/freshell/provider/.config/opencode"),
-    )
-    .map_err(|error| error.to_string())?;
-    if let Some(inherited) = child_env.get("OPENCODE_CONFIG_CONTENT") {
+    let plan = opencode_plan(
+        &launch.cwd,
+        launch.provider_launch_context.as_ref(),
+        prepared_opencode_plan,
+    )?;
+    let has_mcp = launch
+        .provider_launch_context
+        .as_ref()
+        .is_some_and(|context| context.mcp_capability.is_some());
+    if !plan.inline_prepared && (child_env.contains_key("OPENCODE_CONFIG_CONTENT") || has_mcp) {
         let normalized = freshell_platform::opencode_config::merge_owned_entries(
-            Some(inherited),
+            child_env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
             &plan,
-            &freshell_platform::opencode_config::OwnedConfigEdits::default(),
+            &freshell_platform::opencode_config::OwnedConfigEdits {
+                disable_snapshots: true,
+                freshell_command: has_mcp
+                    .then(|| vec!["node".into(), "/opt/freshell-mcp/server.js".into()]),
+                ..Default::default()
+            },
         )
         .map_err(|error| error.to_string())?;
         child_env.insert("OPENCODE_CONFIG_CONTENT".into(), normalized);
@@ -319,23 +448,64 @@ pub fn prepare_fresh_agent_child_environment(
             .map(String::as_str),
         Some("0" | "false")
     ) {
+        let prepared_tui = launch
+            .provider_launch_context
+            .as_ref()
+            .is_some_and(|context| context.prepared_inputs.is_some())
+            && child_env.contains_key("OPENCODE_TUI_CONFIG");
         let source = child_env.get("OPENCODE_TUI_CONFIG").cloned();
-        let mut args = vec!["opencode-rebind"];
-        if let Some(source) = source.as_deref() {
-            args.push(source);
+        if let Some(selector) = prepare_opencode_rebind(
+            launch.run_as_uid,
+            launch.run_as_gid,
+            prepared_tui,
+            source.as_deref(),
+        )? {
+            child_env.insert("OPENCODE_TUI_CONFIG".into(), selector.into());
         }
-        prepare_provider_features_for_identity(launch.run_as_uid, launch.run_as_gid, &args)?;
-        child_env.insert(
-            "OPENCODE_TUI_CONFIG".into(),
-            "/home/freshell/provider/.freshell/opencode/tui.json".into(),
-        );
     }
     Ok(())
+}
+
+fn prepare_opencode_rebind(
+    uid: u32,
+    gid: u32,
+    prepared_source: bool,
+    selected: Option<&str>,
+) -> Result<Option<&'static str>, String> {
+    if prepared_source {
+        prepare_provider_features_for_identity(uid, gid, &["opencode-rebind-source"])?;
+        Ok(None)
+    } else {
+        let mut args = vec!["opencode-rebind"];
+        if let Some(selected) = selected {
+            args.push(selected);
+        }
+        prepare_provider_features_for_identity(uid, gid, &args)?;
+        Ok(Some("/home/freshell/provider/.freshell/opencode/tui.json"))
+    }
+}
+
+fn opencode_plan(
+    cwd: &str,
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+    prepared: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+) -> Result<freshell_platform::opencode_config::OpencodeConfigPlan, String> {
+    if context.is_some_and(|context| context.prepared_inputs.is_some()) {
+        return prepared
+            .cloned()
+            .ok_or_else(|| "accepted OpenCode source ownership plan is unavailable".into());
+    }
+    freshell_platform::opencode_config::prepare_opencode_config(
+        std::path::Path::new(cwd),
+        std::path::Path::new("/home/freshell/provider/.config/opencode"),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String> {
     let provider_home = std::path::Path::new("/home/freshell/provider");
     match args {
+        [operation] if operation == "amplifier-packages" => prepare_amplifier_package_target(),
         [operation] if operation == "claude-mcp" => {
             use std::os::unix::fs::OpenOptionsExt;
             let destination = provider_home.join(".claude/freshell-mcp.json");
@@ -353,6 +523,10 @@ pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String
                 .open(destination)
                 .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
                 .map_err(|error| error.to_string())
+        }
+        [operation] if operation == "opencode-rebind-source" => {
+            freshell_platform::opencode_plugin::ensure_rebind_plugin_source(provider_home)
+                .map_err(|_| "managed OpenCode rebind plugin installation failed".into())
         }
         [operation] | [operation, _] if operation == "opencode-rebind" => {
             let selected = args.get(1).map(std::path::Path::new);
@@ -485,11 +659,13 @@ pub async fn probe_resume(
             reason,
             evidence,
             store_state,
+            negative_paths,
         }) => RecoveryProbe::DefinitivelyUnavailable {
             path: RecoveryPath::NativeResume,
             reason,
             evidence,
             store_state,
+            negative_paths,
         },
         Ok(ProviderStoreProbe::Blocked {
             reason,
@@ -551,6 +727,78 @@ mod provider_secret_context_tests {
         McpCapabilityReference, ProviderLaunchContext, ProviderPreparation,
     };
 
+    #[tokio::test]
+    async fn provider_secret_codex_preparation_defers_native_dispatch() {
+        let owned = tempfile::tempdir().unwrap();
+        // A native process could not start from this cwd. Preparation must
+        // still finish without dispatching it before the grant is consumed.
+        let cwd = owned.path().join("missing-native-cwd");
+        let terminal = serde_json::from_value(serde_json::json!({
+            "terminalId":"synthetic-codex", "streamId":"synthetic-stream", "mode":"codex", "program":"codex",
+            "args":["--model","synthetic-model"],"cwd":cwd,"workspacePath":owned.path(),
+            "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"synthetic",
+            "env":{}
+        })).unwrap();
+        let secrets = std::collections::BTreeMap::from([(
+            "SYNTHETIC_CREDENTIAL".into(),
+            "synthetic-child-only-value".into(),
+        )]);
+        let prepared = prepare_terminal(terminal, &secrets, None, None)
+            .await
+            .expect("source preparation cannot dispatch the Codex app-server");
+        assert_eq!(prepared.terminal.args, ["--model", "synthetic-model"]);
+        assert!(prepared.codex.is_none());
+        assert_eq!(prepared.child_env, secrets);
+        assert!(!serde_json::to_string(&prepared.terminal)
+            .unwrap()
+            .contains("synthetic-child-only-value"));
+    }
+
+    #[tokio::test]
+    async fn provider_secret_inline_configuration_stays_only_in_actual_child_environment() {
+        let owned = tempfile::tempdir().unwrap();
+        let terminal=serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal-inline", "streamId":"stream-inline", "mode":"opencode", "program":"opencode",
+            "cwd":owned.path(),"workspacePath":owned.path(),"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project-inline",
+            "env":{"FRESHELL_OPENCODE_REBIND":"0"}
+        })).unwrap();
+        let secrets = std::collections::BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            "{\"model\":\"sentinel-private-inline\"}".into(),
+        )]);
+        let prepared = prepare_terminal(terminal, &secrets, None, None)
+            .await
+            .unwrap();
+        let metadata = serde_json::to_string(&prepared.terminal).unwrap();
+        assert!(
+            !metadata.contains("sentinel-private-inline"),
+            "private normalized config cannot enter terminal launch serialization"
+        );
+        assert!(!prepared
+            .terminal
+            .env
+            .contains_key("OPENCODE_CONFIG_CONTENT"));
+        let receipt=std::process::Command::new("node").args(["-e","const c=JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);process.stdout.write(require('crypto').createHash('sha256').update(c.model).digest('hex'));"]).envs(&prepared.child_env).output().unwrap();
+        assert!(receipt.status.success());
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            String::from_utf8(receipt.stdout).unwrap(),
+            format!("{:x}", Sha256::digest(b"sentinel-private-inline"))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_secret_fresh_codex_requires_its_selected_scoped_mcp_grant() {
+        let launch: freshell_runtime_protocol::FreshAgentLaunchSpec=serde_json::from_value(serde_json::json!({"sessionId":"synthetic-fresh","provider":"codex","sessionType":"freshcodex","runtimeVariant":"codex-app-server","providerStoreId":"synthetic-store","cwd":"/synthetic-workspace","workspacePath":"/synthetic-workspace","runAsUid":65534,"runAsGid":0,"providerLaunchContext":{"preparation":{"codex":{"tui_args":[],"sidecar_args":[]}},"mcpCapability":{"grantId":"grant-synthetic","endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"}}})).unwrap();
+        let mut env = Default::default();
+        let error = prepare_fresh_agent_child_environment(&launch, &mut env, None)
+            .await
+            .expect_err(
+                "fresh native Codex must require the selected scoped grant before it starts",
+            );
+        assert!(error.contains("grant is unavailable"));
+    }
+
     #[test]
     fn scoped_mcp_grant_becomes_provider_process_environment() {
         let grant = tempfile::NamedTempFile::new().unwrap();
@@ -582,6 +830,7 @@ mod provider_secret_context_tests {
             }))
             .unwrap();
         terminal.provider_launch_context = Some(ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
             },

@@ -200,8 +200,32 @@ async fn validate_dir(
                 .unwrap_or(false)
         })
         .unwrap_or(false);
+    // Account homes select a launch cwd only. Canonicalize both sides so a
+    // symlink to HOME cannot turn it into an explicit snapshot scope.
+    let checkpoint_workspace_eligible = is_dir
+        && resolved
+            .fs_path
+            .as_deref()
+            .is_some_and(|path| !is_checkpoint_home(Path::new(path)));
 
-    Json(json!({ "valid": is_dir, "resolvedPath": resolved.display })).into_response()
+    Json(json!({
+        "valid": is_dir,
+        "resolvedPath": resolved.display,
+        "checkpointWorkspaceEligible": checkpoint_workspace_eligible,
+    }))
+    .into_response()
+}
+
+fn is_checkpoint_home(path: &Path) -> bool {
+    is_checkpoint_home_with_lookup(path, &crate::checkpoints::account_home_for_directory)
+}
+
+fn is_checkpoint_home_with_lookup(
+    path: &Path,
+    account_home_for_directory: &crate::checkpoints::AccountHomeForDirectory,
+) -> bool {
+    crate::checkpoints::account_home_checkpoint_path_with_lookup(path, account_home_for_directory)
+        .unwrap_or(true)
 }
 
 /// `GET /api/files/read?path=<p>` \u2192 `{ content, size, modifiedAt }` (`files-router.ts:85`).
@@ -1394,6 +1418,7 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["valid"], true);
         assert_eq!(v["resolvedPath"], dir);
+        assert_eq!(v["checkpointWorkspaceEligible"], true);
         let bogus = format!("{}/freshell-nonexistent-xyz", tmp.path().display());
         let resp = validate_dir(
             State(test_state()),
@@ -1404,6 +1429,110 @@ mod tests {
         .into_response();
         let v = body_json(resp).await;
         assert_eq!(v["valid"], false);
+        assert_eq!(v["checkpointWorkspaceEligible"], false);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_keeps_account_home_as_launch_directory_only() {
+        let _guard = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_string_lossy().into_owned();
+        let project = home.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", Some(home_path.as_str())),
+            ("FRESHELL_HOME", None),
+            ("USERPROFILE", None),
+        ]);
+        let response = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": home_path })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["checkpointWorkspaceEligible"], false);
+
+        let response = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": project })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["checkpointWorkspaceEligible"], true);
+
+        #[cfg(unix)]
+        {
+            let home_alias = home.path().join("home-alias");
+            std::os::unix::fs::symlink(home.path(), &home_alias).unwrap();
+            let response = validate_dir(
+                State(test_state()),
+                auth_headers(),
+                Json(json!({ "path": home_alias })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = body_json(response).await;
+            assert_eq!(value["valid"], true);
+            assert_eq!(value["checkpointWorkspaceEligible"], false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_excludes_passwd_home_when_home_env_is_redirected() {
+        let _guard = env_lock();
+        let redirected_home = tempfile::tempdir().unwrap();
+        let redirected_home_path = redirected_home.path().to_string_lossy().into_owned();
+        let account_home =
+            std::fs::canonicalize(crate::session_directory::passwd_entry_home()).unwrap();
+        let account_home_path = account_home.to_string_lossy().into_owned();
+        let _env = EnvGuard::set(&[
+            ("HOME", Some(redirected_home_path.as_str())),
+            ("FRESHELL_HOME", None),
+            ("USERPROFILE", None),
+        ]);
+
+        let response = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": account_home_path })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["checkpointWorkspaceEligible"], false);
+    }
+
+    #[test]
+    fn picker_scope_is_ineligible_when_owner_account_cannot_be_resolved() {
+        let workspace = tempfile::tempdir().unwrap();
+        let account_lookup = |_path: &Path| Err("synthetic NSS lookup failure".to_string());
+
+        assert!(is_checkpoint_home_with_lookup(
+            workspace.path(),
+            &account_lookup
+        ));
+    }
+
+    #[test]
+    fn picker_scope_stays_eligible_for_an_owner_without_a_user_profile() {
+        let workspace = tempfile::tempdir().unwrap();
+        let no_user_profile = |_path: &Path| Ok(None);
+
+        assert!(!is_checkpoint_home_with_lookup(
+            workspace.path(),
+            &no_user_profile
+        ));
     }
 
     /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs

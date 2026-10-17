@@ -159,6 +159,7 @@ impl ManagedViewProjectionStore {
 pub struct ManagedRuntimeApiState {
     pub auth_token: Arc<String>,
     pub client: Option<RuntimeClient>,
+    terminal_controller: Option<Arc<crate::managed_runtime::ServerManagedRuntimeController>>,
     projection_store: ManagedViewProjectionStore,
     pane_ledger: Arc<PaneLedger>,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
@@ -175,6 +176,7 @@ impl ManagedRuntimeApiState {
         let state = Self {
             auth_token,
             client,
+            terminal_controller: None,
             projection_store: ManagedViewProjectionStore::open(projection_path)?,
             pane_ledger,
             broadcast_tx,
@@ -188,6 +190,14 @@ impl ManagedRuntimeApiState {
             state.project_all_bindings(&snapshot).await;
         }
         Ok(state)
+    }
+
+    pub fn with_terminal_controller(
+        mut self,
+        controller: Option<Arc<crate::managed_runtime::ServerManagedRuntimeController>>,
+    ) -> Self {
+        self.terminal_controller = controller;
+        self
     }
 
     pub fn spawn_projector(&self) {
@@ -496,15 +506,21 @@ async fn retry_soul(
         Ok(client) => client,
         Err(rejection) => return rejection.into_response(),
     };
-    match client
-        .recover_expected_with_request_id(
-            request_id,
-            soul,
-            RecoveryTrigger::ManualRetry,
-            Some(revision),
-        )
-        .await
-    {
+    let result = if let Some(controller) = &state.terminal_controller {
+        controller
+            .retry_with_request_id(request_id, soul, revision)
+            .await
+    } else {
+        client
+            .recover_expected_with_request_id(
+                request_id,
+                soul,
+                RecoveryTrigger::ManualRetry,
+                Some(revision),
+            )
+            .await
+    };
+    match result {
         Ok(result) => Json(result).into_response(),
         Err(error) => client_error(error),
     }

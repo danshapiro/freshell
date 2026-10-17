@@ -14,6 +14,11 @@ export function turnPlainText(turn: FreshAgentTurn): string {
   return text || stripSystemReminders(turn.summary ?? '')
 }
 
+export type FreshAgentTurnRewindAvailability =
+  | { status: 'pending' }
+  | { status: 'available' }
+  | { status: 'unavailable'; reason: string }
+
 export type TurnActionCallbacks = {
   canFork: boolean
   /** kata 1wxv: snapshot-stamped `capabilities.undo` — absent/false hides the icon. */
@@ -23,6 +28,7 @@ export type TurnActionCallbacks = {
   canRedo?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  getRewindAvailability?: (turn: FreshAgentTurn) => FreshAgentTurnRewindAvailability | undefined
   onRollbackToTurn?: (turnId: string) => void
   onRedoToTurn?: (turnId: string) => void
 }
@@ -34,6 +40,9 @@ export type TurnActionCallbacks = {
  * surfaces never drift apart.
  */
 export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnActionCallbacks): ActionSheetItem[] {
+  const rewindAvailability = callbacks.getRewindAvailability?.(turn)
+  const rewindPending = rewindAvailability?.status === 'pending'
+  const rewindUnavailable = rewindAvailability?.status === 'unavailable'
   return [
     {
       label: 'Copy turn text',
@@ -54,8 +63,10 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
       run: () => callbacks.onRollbackToTurn?.(turn.turnId ?? turn.id),
     },
     {
-      label: 'Rewind code to here',
-      disabled: callbacks.onRewindToTurn === undefined || turn.role !== 'user',
+      label: rewindUnavailable
+        ? `Rewind unavailable: ${rewindAvailability.reason}`
+        : rewindPending ? 'Saving code rewind checkpoint…' : 'Rewind code to here',
+      disabled: callbacks.onRewindToTurn === undefined || turn.role !== 'user' || rewindPending || rewindUnavailable,
       destructive: true,
       run: () => callbacks.onRewindToTurn?.(turn),
     },
@@ -80,6 +91,7 @@ export function FreshAgentTurnActions({
   onForkFromTurn,
   onRollbackToTurn,
   onRewindToTurn,
+  getRewindAvailability,
   onOpenActions,
 }: TurnActionCallbacks & {
   turn: FreshAgentTurn
@@ -87,6 +99,9 @@ export function FreshAgentTurnActions({
 }) {
   const [copied, setCopied] = useState(false)
   const canRewind = onRewindToTurn !== undefined && turn.role === 'user'
+  const rewindAvailability = getRewindAvailability?.(turn)
+  const rewindPending = rewindAvailability?.status === 'pending'
+  const rewindUnavailable = rewindAvailability?.status === 'unavailable'
 
   const handleCopy = useCallback(async () => {
     const ok = await copyText(turnPlainText(turn))
@@ -139,9 +154,16 @@ export function FreshAgentTurnActions({
           <button
             type="button"
             onClick={() => onRewindToTurn?.(turn)}
-            className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-            aria-label="Rewind code to here"
-            title="Rewind code to the checkpoint taken when this message was sent"
+            disabled={rewindPending || rewindUnavailable}
+            className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label={rewindUnavailable
+              ? 'Rewind unavailable for this message'
+              : rewindPending ? 'Saving code rewind checkpoint' : 'Rewind code to here'}
+            title={rewindUnavailable
+              ? `Rewind unavailable: ${rewindAvailability.reason}`
+              : rewindPending
+                ? 'Saving the code state from before this message'
+                : 'Rewind code to the checkpoint taken when this message was sent'}
           >
             <History className="h-3 w-3" />
           </button>

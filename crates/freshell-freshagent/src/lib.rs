@@ -59,6 +59,8 @@ pub mod spawn_gate;
 pub(crate) mod summary;
 pub mod target_resolver;
 pub mod terminal_tabs;
+#[cfg(test)]
+mod test_environment;
 
 pub use claude::FreshClaudeState;
 // Kata 09v1 + SYNC-06: the TWO claude_snapshot items visible outside this
@@ -99,6 +101,52 @@ pub use naming::{
 /// uses (identity owner + registry row), so this crate never imports `freshell-ws`.
 /// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
 pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// Server-owned durability hook for checkpoint-relevant provider frames. The
+/// fresh-agent crate sends the frame through this hook before broadcasting it,
+/// while the concrete checkpoint store remains owned by `freshell-server`.
+pub type CheckpointEventPersister = std::sync::Arc<
+    dyn Fn(String, bool) -> futures_util::future::BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
+>;
+
+/// Clone-shared, set-once bridge from provider producers to the server-owned
+/// checkpoint store. A required match means this frame carries an identity for
+/// a checkpointed request; persistence must refuse a missing association rather
+/// than report success and expose an ID that will disappear after restart.
+#[derive(Clone, Default)]
+pub struct CheckpointEventSink(Arc<std::sync::OnceLock<CheckpointEventPersister>>);
+
+impl CheckpointEventSink {
+    pub fn set_persister(&self, persister: CheckpointEventPersister) -> Result<(), &'static str> {
+        self.0
+            .set(persister)
+            .map_err(|_| "checkpoint event persister is already installed")
+    }
+
+    pub async fn persist_before_broadcast(
+        &self,
+        frame: &str,
+        require_match: bool,
+    ) -> Result<(), String> {
+        if let Some(persist) = self.0.get() {
+            persist(frame.to_string(), require_match).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn broadcast(
+        &self,
+        broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+        frame: String,
+        require_match: bool,
+    ) -> Result<(), String> {
+        self.persist_before_broadcast(&frame, require_match).await?;
+        let _ = broadcast_tx.send(frame);
+        Ok(())
+    }
+}
 
 /// Door 3 (resume-validation): the gate-fired callback shape --
 /// `(provider, stale_session_id)`. In production, `freshell-server`'s main.rs
@@ -1973,6 +2021,7 @@ pub struct FreshAgentState {
     /// `freshell-ws` connection. `ui.command` / `freshAgent.session.materialized` /
     /// `sessions.changed` are pushed here.
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    checkpoint_event_sink: CheckpointEventSink,
     /// paneId → pane record (placeholder id, cwd, model/effort, durable id).
     panes: Arc<Mutex<HashMap<String, PaneEntry>>>,
     /// The single lazily-started `opencode serve` client for this server process.
@@ -2295,6 +2344,7 @@ impl FreshAgentState {
         Self {
             auth_token,
             broadcast_tx,
+            checkpoint_event_sink: CheckpointEventSink::default(),
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             hosted_rest: Arc::new(std::sync::OnceLock::new()),
@@ -2342,6 +2392,15 @@ impl FreshAgentState {
     ) -> Self {
         self.ownership = Some(ownership);
         self
+    }
+
+    /// Wire the server-owned checkpoint store before provider states clone
+    /// this shared REST state.
+    pub fn set_checkpoint_event_persister(
+        &self,
+        persister: CheckpointEventPersister,
+    ) -> Result<(), &'static str> {
+        self.checkpoint_event_sink.set_persister(persister)
     }
 
     /// Side-effect-free coordinator read for `(provider, session_id)`
@@ -2772,6 +2831,26 @@ impl FreshAgentState {
             // subscribed before the handshake, so it will observe every broadcast.
             let _ = self.broadcast_tx.send(frame);
         }
+    }
+
+    pub(crate) async fn persist_checkpoint_frame(
+        &self,
+        frame: &str,
+        require_match: bool,
+    ) -> Result<(), String> {
+        self.checkpoint_event_sink
+            .persist_before_broadcast(frame, require_match)
+            .await
+    }
+
+    pub(crate) async fn broadcast_checkpoint_frame(
+        &self,
+        frame: String,
+        require_match: bool,
+    ) -> Result<(), String> {
+        self.checkpoint_event_sink
+            .broadcast(&self.broadcast_tx, frame, require_match)
+            .await
     }
 
     /// b8ke focused round-3 review R3-1: register the REST-driven turn
@@ -7246,6 +7325,35 @@ mod in_flight_registry_tests {
         assert!(registry.contains("dur-1"));
         drop(guard);
         assert!(!registry.contains("dur-1"));
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_event_sink_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn persistence_failure_withholds_provider_identity_frame() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let sink = CheckpointEventSink::default();
+        sink.set_persister(Arc::new(|_, _| {
+            Box::pin(async { Err("checkpoint store is unavailable".to_string()) })
+        }))
+        .unwrap();
+
+        let result = sink
+            .broadcast(&tx, "checkpoint identity with native id".to_string(), true)
+            .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            "checkpoint store is unavailable",
+            "the producer must learn that its identity receipt was not made durable"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 }
 

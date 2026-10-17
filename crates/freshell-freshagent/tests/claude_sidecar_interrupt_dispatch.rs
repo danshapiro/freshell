@@ -26,8 +26,9 @@
 //! fake-sidecar tests already impose.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Stub SDK entry: supplies `query` for the sidecar's SDK import
@@ -53,11 +54,39 @@ fn real_sidecar_source(module: &str) -> String {
         .unwrap_or_else(|e| panic!("read the real crates/freshell-claude-sidecar/{module}: {e}"))
 }
 
+/// Keep the child and its pipe readers owned until every assertion has settled,
+/// including an early startup failure. Rust's Child does not reap itself on drop.
+struct SidecarProcess {
+    child: Child,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl Drop for SidecarProcess {
+    fn drop(&mut self) {
+        // Killing an already-exited child can fail; wait still reaps that child.
+        let _ = self.child.kill();
+        let waited = self.child.wait();
+        let readers = std::mem::take(&mut self.readers);
+        let joined = readers
+            .into_iter()
+            .map(JoinHandle::join)
+            .collect::<Vec<_>>();
+        if !std::thread::panicking() {
+            waited.expect("reap owned sidecar");
+            for result in joined {
+                result.expect("join owned sidecar pipe reader");
+            }
+        }
+    }
+}
+
 #[test]
 fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
     let dir = tempfile::tempdir().expect("create temp dir");
     for module in [
         "index.mjs",
+        "exec-profile.mjs",
+        "hosted-mcp.mjs",
         "monotonic-clock.mjs",
         "permission-channel.mjs",
         "session-settings.mjs",
@@ -73,35 +102,39 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
     std::fs::write(sdk_dir.join("package.json"), STUB_SDK_PACKAGE_JSON).expect("stub package");
     std::fs::write(sdk_dir.join("index.mjs"), STUB_SDK_INDEX).expect("stub entry");
 
-    let mut child = Command::new("node")
+    let child = Command::new("node")
         .arg(dir.path().join("index.mjs"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn node with the real sidecar source (node is required by this crate's tests)");
+    let mut sidecar = SidecarProcess {
+        child,
+        readers: Vec::new(),
+    };
 
     // Reader threads: forward each line with a tag so the main thread can poll
     // with timeouts (the pre-fix failure mode is "no stdout frame ever arrives",
     // which must fail the test, not hang it).
     let (tx, rx) = mpsc::channel::<(&'static str, String)>();
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout = sidecar.child.stdout.take().expect("piped stdout");
+    let stderr = sidecar.child.stderr.take().expect("piped stderr");
     let tx_out = tx.clone();
-    std::thread::spawn(move || {
+    sidecar.readers.push(std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if tx_out.send(("stdout", line)).is_err() {
                 break;
             }
         }
-    });
-    std::thread::spawn(move || {
+    }));
+    sidecar.readers.push(std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             if tx.send(("stderr", line)).is_err() {
                 break;
             }
         }
-    });
+    }));
 
     // Gate on the sidecar's startup log so the interrupt frame is never written
     // before the dispatch loop is armed.
@@ -124,7 +157,7 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
         "sidecar never logged ready; stderr so far: {stderr_lines:?}"
     );
 
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdin = sidecar.child.stdin.take().expect("piped stdin");
     stdin
         .write_all(b"{\"type\":\"interrupt\",\"sessionId\":\"nope\"}\n")
         .expect("write interrupt frame");
@@ -149,8 +182,7 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
         }
     }
 
-    child.kill().ok();
-    child.wait().ok();
+    drop(sidecar);
 
     assert!(
         !stderr_lines

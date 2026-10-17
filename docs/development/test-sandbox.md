@@ -42,6 +42,52 @@ to the unprivileged `sandbox` UID before test code and the self-test verifies th
 effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
 Docker socket; this wrapper never grants it to tests.
 
+For the Rust phase of the existing full suite, explicitly select this mode:
+
+```bash
+FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test
+# Or run the existing standalone Rust launcher with Cargo test arguments:
+FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust <filter> -- --exact
+```
+
+Only the exact value `1` enables routing; other test backend settings do not.
+The Rust launcher runs its unchanged locked server build and workspace tests
+inside the strict sandbox, selects the container's server binary, and gives
+ordinary temporary files a short owned directory under `/freshell-test-artifacts`
+so nested Unix socket paths fit the operating system's limit and temporary
+executables can run. Explicit executable fixtures use a separate
+owned directory under the sandbox Cargo target volume's `/freshell-test-artifacts`
+alias, outside the checkout's Node package lookup scope. Cargo uses three parallel build jobs;
+libtest runs four cases at once and default Tokio runtimes use two workers
+within the existing container resource limits. Explicit test worker counts
+and the complete test workload remain unchanged. The launcher logs its owned
+temporary directories and removes both on exit or before awaiting an interrupted
+child that might ignore termination. Sandbox,
+dependency, and inner-runner failures return failure without host Cargo fallback.
+The same exact opt-in routes the source-runtime process suite through the strict
+sandbox. Its prebuild guard, client build, tools build, and locked release Rust
+build still run natively in that order. The sandbox prepares its separate locked
+release binary, then runs the complete runtime suite against the native client
+and tools artifacts without rebuilding those bind-mounted files. It owns an
+executable temporary directory, transports the checkout commit identity, and
+returns failures without host runtime fallback. A direct focused invocation is:
+
+```bash
+FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:source-runtime
+```
+
+The client and Electron phases keep their configured backends and coordinator.
+The wrapper records its owned container and settles it before returning a
+signal failure; stopping the attached Docker client alone is insufficient.
+The strict Rust route also starts an independent guard for its exact owned
+container. If the phase watchdog kills the launcher, the guard reuses the
+wrapper's CID/name settlement checks; unknown daemon state retains the
+control directory and an error receipt. Ordinary completion joins the guard
+before returning. The coordinator's watchdog limits and kill behavior remain
+unchanged.
+Warm dependency caches through the documented ordinary sandbox preparation
+before a strict run if needed; strict mode keeps its read-only home and no network.
+
 ## Safety guarantees
 
 | What | Guarantee |
@@ -67,8 +113,10 @@ lock presence, npm's `package-lock.json` first so legacy branches keep their
   explicit `--store-dir /home/sandbox/.local/share/pnpm/store`. The explicit
   store dir is load-bearing: pnpm's default store-path resolution probes the
   project root's writability, and the bind-mounted repo is not writable by the
-  sandbox user, so the default probe would fail every install. The store lives
-  inside the container at the same per-user location pnpm would pick itself.
+  sandbox user, so the default probe would fail every install. The store uses
+  the sandbox-owned `freshell-sandbox-pnpm-store` volume. This keeps it writable
+  under `--runtime-suite`'s read-only container root and lets its offline
+  dependency install reuse packages prepared by an ordinary sandbox run.
 - Install success is recorded in `node_modules/.sandbox-deps-state` — a
   fingerprint over the manager and its version, the install policy flags, the
   root manifest, the selected manager's lock/config files, and the workspace

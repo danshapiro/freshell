@@ -5,8 +5,10 @@ import { configureStore } from '@reduxjs/toolkit'
 import HistoryView from '@/components/HistoryView'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
-import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
+import panesReducer, { initLayout } from '@/store/panesSlice'
+
+const HISTORY_SESSION_ID = '11111111-2222-4333-8444-555555555555'
 
 // Keep api helpers stubbed; spread the real module so pure named exports
 // (e.g. isApiUnauthorizedError, consumed by fetchSessionWindow's rejection
@@ -33,8 +35,26 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
-function renderHistoryView(onOpenSession = vi.fn()) {
+function renderHistoryView(onOpenSession = vi.fn(), sessionType?: string, historyLoaded = false) {
   const projectPath = '/test/project'
+  const projects = [
+    {
+      projectPath,
+      color: '#6b7280',
+      sessions: [
+        {
+          provider: 'claude',
+          sessionId: HISTORY_SESSION_ID,
+          projectPath,
+          lastActivityAt: Date.now(),
+          title: 'Test Session',
+          summary: 'summary',
+          nameRef: { kind: 'session', provider: 'claude', sessionId: HISTORY_SESSION_ID },
+          ...(sessionType ? { sessionType } : {}),
+        },
+      ],
+    },
+  ]
   const store = configureStore({
     reducer: {
       sessions: sessionsReducer,
@@ -50,23 +70,8 @@ function renderHistoryView(onOpenSession = vi.fn()) {
       }),
     preloadedState: {
       sessions: {
-        projects: [
-          {
-            projectPath,
-            color: '#6b7280',
-            sessions: [
-              {
-                provider: 'claude',
-                sessionId: 'session-123',
-                projectPath,
-                lastActivityAt: Date.now(),
-                title: 'Test Session',
-                summary: 'summary',
-                nameRef: { kind: 'session', provider: 'claude', sessionId: 'session-123' },
-              },
-            ],
-          },
-        ],
+        projects,
+        ...(historyLoaded ? { windows: { history: { projects, lastLoadedAt: 1 } } } : {}),
         expandedProjects: new Set([projectPath]),
       },
       tabs: { tabs: [], activeTabId: null },
@@ -112,6 +117,43 @@ describe('HistoryView mobile behavior', () => {
     expect(onOpenSession).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps the existing pane checkpoint workspace when history reopens that session with its current flavor', async () => {
+    const { store } = renderHistoryView(vi.fn(), 'freshclaude', true)
+    const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+    act(() => {
+      store.dispatch(addTab({
+        id: 'tab-source',
+        title: 'Existing Kilroy',
+        status: 'running',
+        mode: 'claude',
+        sessionRef: { provider: 'claude', sessionId: HISTORY_SESSION_ID },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-source',
+        paneId: 'pane-source',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'kilroy',
+          provider: 'claude',
+          createRequestId: 'req-source',
+          resumeSessionId: HISTORY_SESSION_ID,
+          sessionRef: { provider: 'claude', sessionId: HISTORY_SESSION_ID },
+          status: 'idle',
+          checkpointWorkspace,
+        },
+      }))
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /open session test session/i }))
+
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-source']).toMatchObject({
+        type: 'leaf',
+        content: { kind: 'fresh-agent', sessionType: 'freshclaude', checkpointWorkspace },
+      })
+    })
+  })
+
   it('shows a nonblocking native-sync status row in the mobile session details sheet', async () => {
     ;(globalThis as any).setMobileForTest(true)
     const { store } = renderHistoryView()
@@ -124,7 +166,7 @@ describe('HistoryView mobile behavior', () => {
     act(() => {
       store.dispatch(receiveSessionNames([{
         record: {
-          ref: { kind: 'session', provider: 'claude', sessionId: 'session-123' },
+          ref: { kind: 'session', provider: 'claude', sessionId: HISTORY_SESSION_ID },
           name: 'Test Session',
           source: 'first_message',
           revision: 1,

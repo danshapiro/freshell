@@ -7,6 +7,58 @@ use freshell_runtime_protocol::{
 use tokio::net::UnixListener;
 
 #[test]
+fn managed_provider_fresh_claude_retains_validated_mcp_recipe() {
+    let args = vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()];
+    let context = freshell_runtime_protocol::ProviderLaunchContext {
+        preparation: freshell_runtime_protocol::ProviderPreparation::Claude {
+            mcp_args: args.clone(),
+        },
+        mcp_capability: None,
+        config: vec![],
+        prepared_inputs: None,
+    };
+    let context = context_for_fresh_provider(Some(context)).unwrap();
+    let freshell_runtime_protocol::ProviderPreparation::Claude { mcp_args } = context.preparation
+    else {
+        panic!("Claude preparation missing")
+    };
+    assert_eq!(
+        mcp_args, args,
+        "fresh Claude must retain the selected MCP recipe"
+    );
+}
+
+#[test]
+fn managed_provider_fresh_codex_retains_terminal_and_native_sidecar_arguments() {
+    let args = crate::managed_provider_bootstrap::managed_codex_mcp_args().unwrap();
+    let context = freshell_runtime_protocol::ProviderLaunchContext {
+        preparation: freshell_runtime_protocol::ProviderPreparation::Codex {
+            tui_args: args.clone(),
+            sidecar_args: args.clone(),
+        },
+        mcp_capability: None,
+        config: vec![],
+        prepared_inputs: None,
+    };
+    let context = context_for_fresh_provider(Some(context)).unwrap();
+    let freshell_runtime_protocol::ProviderPreparation::Codex {
+        tui_args,
+        sidecar_args,
+    } = context.preparation
+    else {
+        panic!("Codex preparation missing")
+    };
+    assert_eq!(
+        tui_args, args,
+        "terminal arguments must remain in accepted fresh context"
+    );
+    assert_eq!(
+        sidecar_args, args,
+        "the actual native app-server receives the retained configuration pairs"
+    );
+}
+
+#[test]
 fn hosted_created_frame_uses_the_public_request_identity() {
     let (broadcast, mut receiver) = broadcast::channel(8);
     let proxy = HostedFreshAgentProxy {
@@ -17,6 +69,8 @@ fn hosted_created_frame_uses_the_public_request_identity() {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
     };
     proxy.forward_host_event(
         AgentEvent::Provider {
@@ -49,6 +103,8 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
     });
 
     proxy
@@ -323,6 +379,8 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: std::sync::OnceLock::new(),
+        checkpoint_barrier: std::sync::OnceLock::new(),
+        ownership: std::sync::OnceLock::new(),
     });
     Arc::clone(&proxy)
         .handle(HostedFreshAgentCommand::Fork(FreshAgentFork {
@@ -646,6 +704,8 @@ async fn rollback_commands_keep_direction_target_and_request_fences() {
             pollers: Mutex::new(HashSet::new()),
             fixture_modes: HashSet::new(),
             naming: OnceLock::new(),
+            checkpoint_barrier: OnceLock::new(),
+            ownership: OnceLock::new(),
         });
         let message = serde_json::json!({"provider":"codex","sessionId":"public-thread","sessionType":"freshcodex",
             "requestId":"rollback-ui-request","mode":"toTurn","turnId":"turn-selected","cwd":"/workspace"});
@@ -711,6 +771,8 @@ fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
     })
 }
 

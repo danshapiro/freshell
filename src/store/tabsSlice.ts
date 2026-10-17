@@ -5,11 +5,17 @@ import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import { updateSessionActivity } from './sessionActivitySlice'
-import type { PaneContent, PaneNode } from './paneTypes'
+import type {
+  FreshAgentCheckpointWorkspace,
+  PaneContent,
+  PaneNode,
+} from './paneTypes'
+import { normalizeFreshAgentCheckpointWorkspace } from './paneTypes'
 import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalRowIdentity } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
+import { managedTerminalProjection, managedTerminalResumePaneStatus } from '@/lib/managed-terminal'
 import { getFreshAgentProviderConfig, getFreshAgentProviderLabel } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry } from './tabRegistrySlice'
@@ -307,6 +313,7 @@ type AddTabPayload = {
   mode?: TabMode
   shell?: ShellType
   initialCwd?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   sessionRef?: Tab['sessionRef']
   serverInstanceId?: string
   resumeSessionId?: string
@@ -352,9 +359,11 @@ export const tabsSlice = createSlice({
         description: payload.description,
         codingCliProvider,
         status: payload.status || 'creating',
+        runtimeStatus: payload.runtimeStatus,
         mode: payload.mode || 'shell',
         shell: payload.shell || 'system',
         initialCwd: payload.initialCwd,
+        checkpointWorkspace: normalizeFreshAgentCheckpointWorkspace(payload.checkpointWorkspace),
         sessionRef,
         serverInstanceId: payload.serverInstanceId,
         resumeSessionId: undefined,
@@ -1694,13 +1703,15 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle, liveTerminalOnly }: {
+    { sessionId, title, cwd, checkpointWorkspace, provider, sessionType, terminalId, managedRuntime, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle, liveTerminalOnly }: {
       sessionId: string
       title?: string
       cwd?: string
+      checkpointWorkspace?: FreshAgentCheckpointWorkspace
       provider?: CodingCliProviderName
       sessionType?: string
       terminalId?: string
+      managedRuntime?: ManagedRuntimeProjectionFields
       forceNew?: boolean
       firstUserMessage?: string
       isSubagent?: boolean
@@ -1736,6 +1747,7 @@ export const openSessionTab = createAsyncThunk(
       sessionType: resolvedSessionType,
       sessionId,
       cwd,
+      checkpointWorkspace,
       freshAgentProviderSettings,
     })
 
@@ -1815,13 +1827,15 @@ export const openSessionTab = createAsyncThunk(
           return
         }
       }
-      // Running terminals are always terminal panes (fresh-agent uses SDK, not PTY)
+      // Retained terminals are always terminal panes (fresh-agent uses SDK, not PTY).
       const tabId = nanoid()
+      const status = managedTerminalResumePaneStatus(managedRuntime ?? {})
       dispatch(addTab({
         id: tabId,
         // Coding agents name by working directory; provider label is the fallback.
         title: title || (cwd ? basenameSegment(cwd) : null) || getProviderLabel(resolvedProvider, extensions),
-        status: 'running',
+        status,
+        ...managedTerminalProjection(managedRuntime),
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
@@ -1837,7 +1851,8 @@ export const openSessionTab = createAsyncThunk(
           serverInstanceId: localServerInstanceId,
           sessionRef: liveTerminalOnly ? undefined : desiredResumeContent.sessionRef,
           initialCwd: cwd,
-          status: 'running',
+          status,
+        ...managedTerminalProjection(managedRuntime),
         },
       }))
       return
@@ -1898,6 +1913,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
+        checkpointWorkspace: desiredResumeContent.checkpointWorkspace,
         sessionRef: desiredResumeContent.sessionRef,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))

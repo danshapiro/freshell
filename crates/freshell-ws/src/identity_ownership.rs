@@ -895,6 +895,7 @@ mod tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(state_broadcast_tx()),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),

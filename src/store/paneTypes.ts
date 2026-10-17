@@ -1,4 +1,5 @@
-import type { TerminalStatus, TabMode, ShellType } from './types'
+import type { TerminalStatus, TabMode, ShellType, FreshAgentCheckpointWorkspace } from './types'
+export type { FreshAgentCheckpointWorkspace } from './types'
 import {
   FreshAgentModelSelectionSchema,
   type FreshAgentModelSelection,
@@ -10,6 +11,7 @@ import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/f
 import type { FreshAgentStyle } from '@shared/settings'
 import type { SessionNameRef } from '@shared/session-names'
 import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
+import type { ProviderPreparationFailure } from '@shared/ws-protocol'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -66,6 +68,148 @@ export function normalizeFreshAgentEffortOverride(value: unknown): string | unde
   return trimmed.length > 0 ? trimmed : undefined
 }
 
+export type FreshAgentCheckpointOutcome = {
+  version: 1
+  /** Conversation generation; changes only when the pane is deliberately replaced. */
+  conversationRequestId?: string
+  /** Durable provider session identity, allowing a reopened pane to reuse saved outcomes. */
+  conversationSessionKey?: string
+  requestId: string
+  displayTurnId?: string
+  nativeTurnId?: string
+  status: 'available' | 'unavailable'
+  checkpointId?: string
+  workspace?: FreshAgentCheckpointWorkspace
+  code?: string
+  reason?: string
+}
+
+/** Keep the same maximum history window as the durable server outcome store. */
+export const FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT = 8192
+
+function checkpointOutcomeString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) return undefined
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) return undefined
+  return value
+}
+
+export function freshAgentCheckpointConversationKey(
+  provider: unknown,
+  sessionType: unknown,
+  sessionId: unknown,
+): string | undefined {
+  if (provider !== 'claude' && provider !== 'codex' && provider !== 'opencode') return undefined
+  if (sessionType !== 'freshclaude' && sessionType !== 'freshcodex'
+    && sessionType !== 'kilroy' && sessionType !== 'freshopencode') return undefined
+  const normalizedSessionId = checkpointOutcomeString(sessionId, 256)
+  if (!normalizedSessionId) return undefined
+  return JSON.stringify([provider, sessionType, normalizedSessionId])
+}
+
+export function freshAgentCheckpointConversationKeyForContent(
+  content: {
+    provider?: unknown
+    sessionType?: unknown
+    sessionId?: unknown
+    resumeSessionId?: unknown
+    sessionRef?: unknown
+  },
+): string | undefined {
+  const sessionRef = content.sessionRef && typeof content.sessionRef === 'object' && !Array.isArray(content.sessionRef)
+    ? content.sessionRef as Record<string, unknown>
+    : undefined
+  const provider = content.provider
+  const sessionId = sessionRef && sessionRef.provider === provider
+    ? sessionRef.sessionId
+    : (content.sessionId ?? content.resumeSessionId)
+  return freshAgentCheckpointConversationKey(provider, content.sessionType, sessionId)
+}
+
+function checkpointOutcomeReason(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240)
+  return normalized || undefined
+}
+
+export function normalizeFreshAgentCheckpointWorkspace(value: unknown): FreshAgentCheckpointWorkspace | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const candidate = value as Record<string, unknown>
+  const path = checkpointOutcomeString(candidate.path, 4096)
+  if (!path) return undefined
+  if (candidate.provenance !== 'directory-picker'
+    && candidate.provenance !== 'resolved-project'
+    && candidate.provenance !== 'legacy-checkpoint') return undefined
+  return { path, provenance: candidate.provenance }
+}
+
+/**
+ * Retain a bounded record of settled checkpoint availability. The
+ * whitelist deliberately excludes the submitted prompt and provider payloads.
+ */
+export function normalizeFreshAgentCheckpointOutcomes(
+  value: unknown,
+  conversationRequestId?: string,
+  conversationSessionKey?: string,
+): FreshAgentCheckpointOutcome[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const byRequest = new Map<string, FreshAgentCheckpointOutcome>()
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const record = candidate as Record<string, unknown>
+    const requestId = checkpointOutcomeString(record.requestId, 128)
+    if (!requestId || !/^[A-Za-z0-9_.:-]+$/.test(requestId)) continue
+    if (record.version !== undefined && record.version !== 1) continue
+    const recordConversationRequestId = record.conversationRequestId === undefined
+      ? undefined
+      : checkpointOutcomeString(record.conversationRequestId, 128)
+    const recordConversationSessionKey = record.conversationSessionKey === undefined
+      ? undefined
+      : checkpointOutcomeString(record.conversationSessionKey, 512)
+    if (record.conversationRequestId !== undefined
+      && (!recordConversationRequestId || !/^[A-Za-z0-9_.:-]+$/.test(recordConversationRequestId))) continue
+    if (conversationRequestId && recordConversationRequestId
+      && recordConversationRequestId !== conversationRequestId
+      && (!conversationSessionKey || recordConversationSessionKey !== conversationSessionKey)) continue
+    if (record.status !== 'available' && record.status !== 'unavailable') continue
+
+    const displayTurnId = checkpointOutcomeString(record.displayTurnId, 256)
+    const nativeTurnId = checkpointOutcomeString(record.nativeTurnId, 256)
+    const checkpointId = checkpointOutcomeString(record.checkpointId, 256)
+    const workspace = normalizeFreshAgentCheckpointWorkspace(record.workspace)
+    const code = typeof record.code === 'string'
+      && record.code.length <= 96
+      && /^[a-z0-9_.:-]+$/.test(record.code)
+      ? record.code
+      : undefined
+    const reason = checkpointOutcomeReason(record.reason)
+
+    if (record.status === 'available' && !checkpointId) continue
+    if (record.status === 'unavailable' && !code && !reason) continue
+
+    byRequest.delete(requestId)
+    byRequest.set(requestId, {
+      version: 1,
+      requestId,
+      ...(recordConversationRequestId ? { conversationRequestId: recordConversationRequestId } : {}),
+      ...(recordConversationSessionKey ? { conversationSessionKey: recordConversationSessionKey } : {}),
+      ...(displayTurnId ? { displayTurnId } : {}),
+      ...(nativeTurnId ? { nativeTurnId } : {}),
+      status: record.status,
+      ...(checkpointId ? { checkpointId } : {}),
+      ...(workspace ? { workspace } : {}),
+      ...(code ? { code } : {}),
+      ...(reason ? { reason } : {}),
+    })
+  }
+  const normalized = [...byRequest.values()].slice(-FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT)
+  return normalized.length > 0 ? normalized : undefined
+}
+
 export function normalizeFreshAgentModelEffortLevels(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined
@@ -89,10 +233,12 @@ export type { CrashTrace }
  * TerminalView's create-error fold for refusal frames carrying the typed
  * owner fields (the additive `ownerKind`/`ownerGeneration` on
  * SESSION_RESERVED / RESTORE_UNAVAILABLE); rendered by the typed failure
- * card with attach/retry/open-as-fresh-agent actions. VOLATILE — stripped
- * by persistMiddleware, never persisted.
+ * card with attach/retry/open-as-fresh-agent actions. Owner refusals are
+ * volatile. A typed managed preparation failure can survive reload before
+ * a backend terminal exists, so reload does not repeat the failed request.
  */
 export type LaunchFailure = {
+  providerPreparationFailure?: ProviderPreparationFailure
   code: 'SESSION_RESERVED' | 'RESTORE_UNAVAILABLE' | 'HANDOFF_IN_PROGRESS' | 'REAP_TIMEOUT'
     | 'TARGET_SPAWN_FAILED' | 'STALE_GENERATION' | 'LAUNCH_FAILED' | 'SESSION_MISSING'
   message: string
@@ -116,11 +262,64 @@ export type HandoffError = {
   generation: number
 }
 
+function normalizeProviderPreparationFailure(value: unknown): ProviderPreparationFailure | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const isPath = (path: unknown): path is string => typeof path === 'string'
+    && path.length > 0 && !/[\u0000-\u001f]/.test(path)
+  if (record.code !== 'SELECTED_REFERENCE_UNAVAILABLE' || record.stage !== 'configuration'
+    || record.operation !== 'resolve' || !isPath(record.workspace) || !isPath(record.declaringConfig)
+    || !['not_found', 'permission_denied', 'cyclic', 'unknown'].includes(String(record.cause))
+    || (record.selectedPath !== undefined && !isPath(record.selectedPath))) return undefined
+  return {
+    code: record.code,
+    stage: record.stage,
+    operation: record.operation,
+    cause: record.cause as ProviderPreparationFailure['cause'],
+    workspace: record.workspace,
+    declaringConfig: record.declaringConfig,
+    ...(record.selectedPath !== undefined ? { selectedPath: record.selectedPath as string } : {}),
+  }
+}
+
+/** Only typed selection metadata enters the retained card; raw error text stays volatile. */
+export function buildManagedPreparationFailure(value: unknown): LaunchFailure | undefined {
+  const failure = normalizeProviderPreparationFailure(value)
+  if (!failure) return undefined
+  const reasons: Record<ProviderPreparationFailure['cause'], string> = {
+    not_found: 'referenced file was not found',
+    permission_denied: 'referenced file is inaccessible',
+    cyclic: 'referenced file is cyclic',
+    unknown: 'referenced file is unavailable',
+  }
+  return {
+    code: 'LAUNCH_FAILED',
+    message: `Configuration blocked: ${failure.selectedPath ?? failure.declaringConfig}: ${reasons[failure.cause]}`,
+    retryable: true,
+    providerPreparationFailure: failure,
+  }
+}
+
+/** A failure before registration blocks automatic creation, without granting runtime authority. */
+export function retainedManagedPreparationFailure(content: TerminalPaneContent): LaunchFailure | undefined {
+  const failure = content.launchFailure
+  if (content.mode !== 'opencode' || content.status !== 'error' || !content.createRequestId
+    || content.terminalId || content.soulId || content.sessionRef || content.resumeSessionId
+    || failure?.code !== 'LAUNCH_FAILED' || failure.ownerKind !== undefined
+    || failure.ownerGeneration !== undefined || failure.terminalId !== undefined) return undefined
+  return buildManagedPreparationFailure(failure.providerPreparationFailure)
+}
+
 /** Sanitize an unknown value into a LaunchFailure (normalizePaneContent's whitelist gate). */
 export function normalizeLaunchFailure(value: unknown): LaunchFailure | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const record = value as Record<string, unknown>
   if (typeof record.code !== 'string' || typeof record.message !== 'string') return undefined
+  if (record.code === 'LAUNCH_FAILED' && record.ownerKind === undefined
+    && record.ownerGeneration === undefined && record.terminalId === undefined) {
+    const failure = buildManagedPreparationFailure(record.providerPreparationFailure)
+    if (failure) return failure
+  }
   return {
     code: record.code as LaunchFailure['code'],
     message: record.message,
@@ -301,6 +500,10 @@ export type FreshAgentPaneContent = {
   /** Explicit restore failure when no canonical durable target exists. */
   restoreError?: RestoreError
   initialCwd?: string
+  /** Independently selected code scope for per-turn rewind checkpoints. */
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
+  /** Bounded settled per-turn rewind availability; prompt text is never stored here. */
+  checkpointOutcomes?: FreshAgentCheckpointOutcome[]
   createError?: FreshAgentCreateError
   /** Volatile close failure, shown in the pane's dismissible yellow error banner. */
   closeError?: string

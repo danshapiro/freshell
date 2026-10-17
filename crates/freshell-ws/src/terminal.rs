@@ -81,6 +81,10 @@ mod terminal_create_ordering_tests;
 #[path = "terminal_launch_prep_tests.rs"]
 mod terminal_launch_prep_tests;
 
+#[cfg(test)]
+#[path = "managed_fixture_denies_host_pty.rs"]
+mod managed_fixture_denies_host_pty;
+
 #[path = "connection_writer.rs"]
 mod connection_writer;
 #[path = "interactive_creates.rs"]
@@ -576,11 +580,8 @@ async fn run_loop(
             // The capability gates creation; output follows the row owner.
             _ = managed_output_ticker.tick(), if state.registry.has_managed_controller() => {
                 for terminal_id in state.registry.managed_attached_to(conn_id) {
-                    match refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024).await {
-                        Ok(()) => {}
-                        Err(error) => tracing::warn!(terminal_id = %terminal_id, error = %error,
-                            "managed_runtime.output_refresh_failed"),
-                    }
+                    // The shared registry logs changed classified failures once.
+                    let _ = refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024).await;
                 }
             }
             inbound = ws_rx.next() => {
@@ -948,6 +949,7 @@ async fn handle_client_text(
         match value.get("type").and_then(|t| t.as_str()) {
             Some("terminal.create") => {
                 let reply = ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
                     owner_kind: None,
                     owner_generation: None,
                     owner_epoch: None,
@@ -1051,6 +1053,41 @@ async fn handle_client_text(
     if let Some(reply) = fresh_agent_control_refusal(&message) {
         return send(ws_tx, &reply).await;
     }
+    if let ClientMessage::FreshAgentSend(fresh_send) = &message {
+        if fresh_send.checkpoint_intent.is_some()
+            && fresh_send
+                .request_id
+                .as_deref()
+                .is_none_or(|request_id| request_id.trim().is_empty())
+        {
+            tracing::warn!(
+                event = "code_checkpoint.send_missing_request_id",
+                provider = ?fresh_send.provider,
+                session_id = %fresh_send.session_id,
+                "modern checkpoint send was rejected before capture or provider dispatch"
+            );
+            return send(
+                ws_tx,
+                &ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
+                    code: ErrorCode::InvalidMessage,
+                    message: "requestId is required when checkpointIntent is present".into(),
+                    timestamp: crate::now_iso(),
+                    actual_session_ref: None,
+                    expected_session_ref: None,
+                    request_id: None,
+                    retry_after_ms: None,
+                    terminal_exit_code: None,
+                    terminal_id: None,
+                    live_terminal_id: None,
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
+                }),
+            )
+            .await;
+        }
+    }
     // Explicit managed fresh-agent rollout: every fresh-agent operation is
     // consumed by the external gateway when installed. It is never allowed
     // to fall through and mint a competing web-owned provider writer.
@@ -1082,6 +1119,7 @@ async fn handle_client_text(
                 send(
                     ws_tx,
                     &ServerMessage::Error(ErrorMsg {
+                        provider_preparation_failure: None,
                         owner_kind: None,
                         owner_generation: None,
                         owner_epoch: None,
@@ -1278,6 +1316,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: None,
                                     owner_epoch: None,
@@ -1326,6 +1365,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: Some(snap.generation),
                                     owner_epoch: Some(snap.epoch),
@@ -1409,6 +1449,7 @@ async fn handle_client_text(
                                 return send(
                                     ws_tx,
                                     &ServerMessage::Error(ErrorMsg {
+                                        provider_preparation_failure: None,
                                         owner_kind: Some(owner_kind_str.to_string()),
                                         owner_generation: Some(snap.generation),
                                         owner_epoch: Some(snap.epoch),
@@ -1446,6 +1487,7 @@ async fn handle_client_text(
                                 return send(
                                     ws_tx,
                                     &ServerMessage::Error(ErrorMsg {
+                                        provider_preparation_failure: None,
                                         owner_kind: None,
                                         owner_generation: Some(snap.generation),
                                         owner_epoch: Some(snap.epoch),
@@ -1555,6 +1597,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: Some(current_generation),
                                     owner_epoch: Some(current_epoch),
@@ -1591,6 +1634,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: Some(generation),
                                     owner_epoch: Some(ownership.boot_epoch()),
@@ -1946,6 +1990,32 @@ async fn handle_client_text(
             true
         }
         ClientMessage::FreshAgentSend(send) => {
+            if send.checkpoint_intent.is_some() {
+                if let Some(service) = state.checkpoint_send.service.clone() {
+                    let captured_send = send.clone();
+                    let forward: futures::future::BoxFuture<'static, ()> = match send.provider {
+                        freshell_protocol::AgentProvider::Codex => {
+                            let fresh_codex = state.fresh_codex.clone();
+                            Box::pin(async move { fresh_codex.handle_send(send).await })
+                        }
+                        freshell_protocol::AgentProvider::Claude => {
+                            let fresh_claude = state.fresh_claude.clone();
+                            Box::pin(async move { fresh_claude.handle_send(send).await })
+                        }
+                        freshell_protocol::AgentProvider::Opencode => {
+                            let fresh_opencode = state.fresh_opencode.clone();
+                            Box::pin(async move { fresh_opencode.handle_send(send).await })
+                        }
+                        freshell_protocol::AgentProvider::Amplifier => Box::pin(async {}),
+                    };
+                    tokio::spawn(
+                        Arc::clone(&service)
+                            .barrier_and_forward(captured_send, forward)
+                            .instrument(tracing::Span::current()),
+                    );
+                    return true;
+                }
+            }
             match send.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
@@ -2479,6 +2549,7 @@ async fn handle_client_text(
             send(
                 ws_tx,
                 &ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
                     owner_kind: None,
                     owner_generation: None,
                     owner_epoch: None,
@@ -2857,6 +2928,7 @@ fn build_codex_managed_launch_setup(
         tui_mcp_injection: tui,
         terminal_env,
         sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext {
+            provider_exec_profile: false,
             config_args: sidecar.args,
             env: sidecar_env,
         },
@@ -3132,6 +3204,7 @@ async fn send_session_reserved(
     owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: owner.map(|o| o.owner_kind.to_string()),
         owner_generation: owner.map(|o| o.owner_generation),
         owner_epoch: owner.map(|o| o.owner_epoch),
@@ -3413,9 +3486,12 @@ fn settle_managed_compat_adoption(
             .create_request_id
             .as_deref()
             .is_some_and(|id| id != create.request_id)
-        || !registry.is_pty_running(&descriptor.terminal_id)
+        || registry
+            .managed_descriptor(&descriptor.terminal_id)
+            .as_ref()
+            != Some(descriptor)
     {
-        return Err("managed adoption identity or liveness changed".to_string());
+        return Err("managed adoption identity or membership changed".to_string());
     }
     let locator = descriptor
         .resume_session_id
@@ -3558,6 +3634,7 @@ mod managed_runtime_id_tests {
 
     struct LookupOnlyController {
         descriptor: ManagedTerminalDescriptor,
+        final_tail: bool,
     }
 
     impl ManagedTerminalController for LookupOnlyController {
@@ -3574,7 +3651,13 @@ mod managed_runtime_id_tests {
         fn launch<'a>(
             &'a self,
             _request: ManagedTerminalLaunch,
-        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
             Box::pin(async { Err("launch must not run during compatibility adoption".into()) })
         }
 
@@ -3583,7 +3666,13 @@ mod managed_runtime_id_tests {
             _terminal: ManagedTerminalDescriptor,
             _data: String,
         ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                assert!(
+                    !self.final_tail,
+                    "ended compatibility facade must not dispatch controller input"
+                );
+                Ok(())
+            })
         }
 
         fn resize<'a>(
@@ -3608,7 +3697,29 @@ mod managed_runtime_id_tests {
             _after_seq: i64,
             _max_bytes: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
-            Box::pin(async { Err("not needed".into()) })
+            Box::pin(async move {
+                if !self.final_tail {
+                    return Err("not needed".into());
+                }
+                Ok(ManagedOutputRead {
+                    lifecycle: None,
+                    completion: Some(freshell_terminal::registry::ManagedOutputCompletion {
+                        stream_epoch: self.descriptor.stream_id.clone(),
+                        incarnation_id: self.descriptor.incarnation_id.clone(),
+                        head_seq: 1,
+                        exit_code: Some(17),
+                    }),
+                    stream_epoch: Some(self.descriptor.stream_id.clone()),
+                    incarnation_id: Some(self.descriptor.incarnation_id.clone()),
+                    reset_required: false,
+                    truncated: false,
+                    retained_from_seq: 1,
+                    head_seq: 1,
+                    exit_code: Some(17),
+                    native_session_id: self.descriptor.resume_session_id.clone(),
+                    chunks: vec![],
+                })
+            })
         }
     }
 
@@ -3671,6 +3782,7 @@ mod managed_runtime_id_tests {
         };
         registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
             descriptor: descriptor.clone(),
+            final_tail: false,
         })));
 
         let adopted =
@@ -3719,6 +3831,7 @@ mod managed_runtime_id_tests {
             .registry
             .set_managed_controller(Some(Arc::new(LookupOnlyController {
                 descriptor: descriptor.clone(),
+                final_tail: false,
             })));
         if already_registered {
             state.registry.register_managed(descriptor);
@@ -3834,6 +3947,11 @@ mod managed_runtime_id_tests {
             )
         };
         assert!(check(&descriptor).is_ok());
+        registry.finish_managed_exit(&descriptor.terminal_id, 17);
+        assert!(
+            check(&descriptor).is_ok(),
+            "exact ended managed membership remains adoptable"
+        );
         descriptor.mode = "claude".into();
         assert!(check(&descriptor).is_err());
         descriptor.mode = "opencode".into();
@@ -3842,6 +3960,132 @@ mod managed_runtime_id_tests {
         descriptor.create_request_id = Some("create-match".into());
         descriptor.resume_session_id = Some("ses_other".into());
         assert!(check(&descriptor).is_err());
+        descriptor.resume_session_id = Some("ses_match".into());
+        descriptor.incarnation_id = "another-incarnation".into();
+        assert!(
+            check(&descriptor).is_err(),
+            "stale incarnation cannot adopt retained membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_legacy_create_reuses_ended_facade_and_replays_final_tail() {
+        let mut state = super::pane_reconcile_gate_tests::state();
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "opencode".into(),
+            label: "OpenCode".into(),
+            default_cmd: "opencode".into(),
+            ..Default::default()
+        }]);
+        let request = "legacy-ended-managed-create";
+        let terminal = stable_managed_uuid(request, b"terminal")
+            .simple()
+            .to_string();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "retained-ended-soul".into(),
+            incarnation_id: "retained-ended-incarnation".into(),
+            terminal_id: terminal.clone(),
+            stream_id: "retained-ended-stream".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_retained_ended".into()),
+            create_request_id: Some(request.into()),
+        };
+        state.registry.register_managed(descriptor.clone());
+        state
+            .registry
+            .ingest_managed_output(&terminal, 1, 1, "final retained tail\n".into());
+        assert!(state.registry.finish_managed_exit(&terminal, 17));
+        assert!(!state.registry.is_pty_running(&terminal));
+        // The lookup controller makes launch fail; a successful create must
+        // have retained this exact already-ended facade without launching.
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(LookupOnlyController {
+                descriptor: descriptor.clone(),
+                final_tail: true,
+            })));
+        let frames = Arc::new(std::sync::Mutex::new(Vec::<ServerMessage>::new()));
+        let collector = Arc::clone(&frames);
+        let sink: freshell_terminal::FrameSink =
+            Arc::new(move |frame| collector.lock().unwrap().push(frame));
+        let create = serde_json::from_value(serde_json::json!({ "requestId":request, "mode":"opencode", "shell":"system", "restore":true,
+            "sessionRef":{"provider":"opencode","sessionId":"ses_retained_ended"} })).unwrap();
+        assert!(
+            super::handle_create(
+                create,
+                None,
+                &mut crate::create_gate::CreateOutput::Channel(&sink),
+                &state,
+                17,
+                true,
+                &mut crate::create_limit::CreateRateLimiter::new(100, 1000),
+                &super::ConnectionIdentity::default(),
+                super::now_ms()
+            )
+            .await
+        );
+        assert!(frames.lock().unwrap().iter().any(|frame| matches!(frame, ServerMessage::TerminalCreated(created) if created.terminal_id == terminal)),
+            "legacy create must acknowledge the exact retained ended handle");
+        assert_eq!(
+            state.registry.managed_descriptor(&terminal),
+            Some(descriptor)
+        );
+        // Attach rereads the completed source without launching a replacement,
+        // preserving the original managed identity and final replay tail.
+        let attach = super::TerminalAttach {
+            terminal_id: terminal.clone(),
+            intent: freshell_protocol::TerminalAttachIntent::ViewportHydrate,
+            cols: 120,
+            rows: 30,
+            attach_request_id: None,
+            surface_reset: None,
+            expected_session_ref: None,
+            max_replay_bytes: None,
+            replay_page_bytes: None,
+            priority: None,
+            since_seq: Some(0),
+            create_request_id: None,
+            tab_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+        };
+        assert!(matches!(
+            super::handle_attach(attach, &state, 17, &sink, false, false, None).await,
+            super::AttachReply::Legacy
+        ));
+        let frames = frames.lock().unwrap();
+        assert!(frames.iter().any(|frame| matches!(frame, ServerMessage::TerminalOutput(output) if output.terminal_id == terminal && output.data.contains("final retained tail"))));
+        assert!(frames.iter().any(|frame| matches!(frame, ServerMessage::TerminalExit(exit) if exit.terminal_id == terminal && exit.exit_code == 17)));
+        drop(frames);
+    }
+
+    #[tokio::test]
+    async fn managed_ended_compat_facade_refuses_input_without_controller_dispatch() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "ended-input-soul".into(),
+            incarnation_id: "ended-input-incarnation".into(),
+            terminal_id: "ended-input-terminal".into(),
+            stream_id: "ended-input-stream".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_ended_input".into()),
+            create_request_id: Some("ended-input-create".into()),
+        };
+        registry.register_managed(descriptor.clone());
+        registry.finish_managed_exit(&descriptor.terminal_id, 17);
+        registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
+            descriptor: descriptor.clone(),
+            final_tail: true,
+        })));
+        assert!(
+            registry
+                .managed_input(&descriptor.terminal_id, "must not dispatch".into())
+                .await
+                .is_err(),
+            "ended facade must refuse input before controller dispatch"
+        );
     }
 }
 
@@ -4121,6 +4365,171 @@ mod managed_resume_gate_tests {
     use std::sync::Mutex;
 
     struct FixedProbe(SessionExistence);
+
+    struct MissingSelectedReference {
+        root: std::path::PathBuf,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl freshell_terminal::registry::ManagedTerminalController for MissingSelectedReference {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn launch<'a>(
+            &'a self,
+            request: freshell_terminal::registry::ManagedTerminalLaunch,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<
+                freshell_terminal::registry::ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let selected = self.root.join("missing-selected.txt");
+                let io_error = std::fs::canonicalize(&selected).unwrap_err();
+                assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
+                assert_eq!(request.mode, "opencode");
+                Err(freshell_terminal::registry::ManagedTerminalLaunchError {
+                    message: "selected configuration reference is unavailable".into(),
+                    provider_preparation_failure: Some(freshell_protocol::ProviderPreparationFailure {
+                        code: freshell_protocol::ProviderPreparationFailureCode::SelectedReferenceUnavailable,
+                        stage: freshell_protocol::ProviderPreparationFailureStage::Configuration,
+                        operation: freshell_protocol::ProviderPreparationFailureOperation::Resolve,
+                        cause: freshell_protocol::ProviderPreparationFailureCause::NotFound,
+                        workspace: self.root.to_string_lossy().into_owned(),
+                        declaring_config: self.root.join("opencode.json").to_string_lossy().into_owned(),
+                        selected_path: Some(selected.to_string_lossy().into_owned()),
+                    }),
+                })
+            })
+        }
+        fn input<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: String,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            panic!("a failed request has no input target")
+        }
+        fn resize<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            panic!("a failed request has no resize target")
+        }
+        fn stop<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            panic!("a failed request has no process")
+        }
+        fn read_output<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<freshell_terminal::registry::ManagedOutputRead, String>,
+        > {
+            panic!("a failed request has no output target")
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_preparation_failure_keeps_typed_missing_reference_on_the_create_request() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::pane_reconcile_gate_tests::state();
+        state.registry =
+            freshell_terminal::TerminalRegistry::new().with_managed_environment_fixture_only(true);
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "opencode".into(),
+            label: "OpenCode".into(),
+            default_cmd: "opencode".into(),
+            ..Default::default()
+        }]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(MissingSelectedReference {
+                root: root.path().into(),
+                calls: Arc::clone(&calls),
+            })));
+        let conn_id = 19;
+        state.registry.set_managed_runtime_connection(conn_id, true);
+        let (mut ws_tx, mut client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        {
+            let mut output = crate::create_gate::CreateOutput::Socket(&mut ws_tx);
+            let create: TerminalCreate = serde_json::from_value(serde_json::json!({
+            "requestId": "managed-reference-failed-request", "mode": "opencode", "shell": "system",
+            "cwd": root.path(),
+        }))
+        .unwrap();
+            let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+            assert!(
+                handle_create(
+                    create,
+                    None,
+                    &mut output,
+                    &state,
+                    conn_id,
+                    false,
+                    &mut limiter,
+                    &ConnectionIdentity::default(),
+                    now_ms()
+                )
+                .await
+            );
+        }
+        let wire = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+        let frame: ServerMessage = serde_json::from_value(wire)
+            .expect("actual WS frame uses the additive serialized contract");
+        client.close(None).await.unwrap();
+        let ServerMessage::Error(error) = frame else {
+            panic!("failed request must not create a backend terminal")
+        };
+        assert_eq!(error.code, ErrorCode::PtySpawnFailed);
+        assert_eq!(
+            error.request_id.as_deref(),
+            Some("managed-reference-failed-request")
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the actual create reached the missing-file producer"
+        );
+        assert!(
+            state.registry.directory().is_empty(),
+            "no backend or ordinary PTY is registered after refusal"
+        );
+        let metadata = error
+            .provider_preparation_failure
+            .as_ref()
+            .expect("WS must retain the producer's typed failure");
+        assert_eq!(
+            metadata.selected_path.as_deref(),
+            root.path().join("missing-selected.txt").to_str()
+        );
+        assert_eq!(
+            metadata.cause,
+            freshell_protocol::ProviderPreparationFailureCause::NotFound
+        );
+        assert!(
+            state.registry.directory().is_empty(),
+            "no backend or ordinary PTY may be fabricated for the failed request"
+        );
+    }
 
     impl SessionExistenceProbe for FixedProbe {
         fn exists(&self, _: &str, _: &str) -> SessionExistence {
@@ -6445,6 +6854,7 @@ pub(crate) async fn handle_create(
     // every non-negotiating connection retain the legacy local spawn path.
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
+    let mut provider_preparation_failure = None;
     let create_result: std::io::Result<()> = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
@@ -6471,9 +6881,11 @@ pub(crate) async fn handle_create(
                 );
                 Ok(())
             }
-            Err(error) => Err(std::io::Error::other(format!(
-                "managed runtime launch failed: {error}"
-            ))),
+            Err(error) => {
+                let message = format!("managed runtime launch failed: {error}");
+                provider_preparation_failure = error.provider_preparation_failure;
+                Err(std::io::Error::other(message))
+            }
         }
     } else {
         // The legacy PTY spawn is synchronous; run it on the blocking pool so
@@ -6585,8 +6997,16 @@ pub(crate) async fn handle_create(
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
-            .await;
+        return send_create_error_details(
+            out,
+            ErrorCode::PtySpawnFailed,
+            message,
+            &create.request_id,
+            None,
+            None,
+            provider_preparation_failure,
+        )
+        .await;
     }
 
     // D8: arm the lease's TTL kill path — record the just-spawned child's pid
@@ -7350,6 +7770,7 @@ pub async fn respawn_agent_terminal(
         // registry API surface for no user-visible gain.
         let msg =
             freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+                recovery_summary: None,
                 status: freshell_protocol::RuntimeStatus::Recovering,
                 terminal_id: terminal_id.clone(),
                 attempt: None,
@@ -7937,8 +8358,9 @@ use crate::terminal_meta::record_for_create as terminal_meta_record_for_create;
 /// revision}` to every authenticated connection via the broadcast bus.
 ///
 /// Wired call sites mirror the reference: `terminal.create` success/failed-delivery
-/// (`ws:2553`/`ws:2570`) and valid `terminal.kill` (`ws:2988`). NOT wired: the
-/// natural-exit path — the original broadcasts on exit only for
+/// (`ws:2553`/`ws:2570`), valid `terminal.kill` (`ws:2988`), and managed lifecycle
+/// projection changes so terminal-list views see final recovery status. NOT wired:
+/// a plain local PTY natural-exit path — the original broadcasts on exit only for
 /// `recoverableForRestore` terminals (`ws:571-578`, session-repair subsystem,
 /// unported), and the live capture (`port/oracle/robustness/exit-orig.json`) shows
 /// no `terminals.changed` on a plain exit. `recoverableTerminalIds` never applies
@@ -8250,7 +8672,29 @@ pub(crate) async fn send_create_error_with_owner(
     live_terminal_id: Option<String>,
     owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
 ) -> bool {
+    send_create_error_details(
+        out,
+        code,
+        message,
+        request_id,
+        live_terminal_id,
+        owner,
+        None,
+    )
+    .await
+}
+
+async fn send_create_error_details(
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    code: ErrorCode,
+    message: String,
+    request_id: &str,
+    live_terminal_id: Option<String>,
+    owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
+    provider_preparation_failure: Option<freshell_protocol::ProviderPreparationFailure>,
+) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure,
         owner_kind: owner.map(|o| o.owner_kind.to_string()),
         owner_generation: owner.map(|o| o.owner_generation),
         owner_epoch: owner.map(|o| o.owner_epoch),
@@ -8285,6 +8729,7 @@ pub(crate) async fn send_create_error_with_stale_pair(
     current_generation: u64,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: Some(current_generation),
         owner_epoch: Some(current_epoch),
@@ -8494,25 +8939,97 @@ async fn refresh_managed_output_and_associate(
     // still binding the native identity.
     let gate = managed_output_gate(terminal_id);
     let _guard = gate.lock().await;
-    if !state.registry.is_live(terminal_id) {
+    if state.registry.managed_descriptor(terminal_id).is_none() {
         return Ok(());
     }
-    // Bound the remote read, but never cancel the subsequent durable identity
-    // transaction mid-write merely because it took longer than the read SLA.
-    let read = tokio::time::timeout(
+    let result = match tokio::time::timeout(
         std::time::Duration::from_millis(500),
         state
             .registry
             .refresh_managed_output(terminal_id, max_bytes),
     )
     .await
-    .map_err(|_| "managed output read timed out".to_string())??;
+    {
+        Ok(read) => read,
+        Err(_) => {
+            let lifecycle_changed = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                state.registry.observe_managed_lifecycle(terminal_id),
+            )
+            .await
+            .unwrap_or(false);
+            Err(freshell_terminal::registry::ManagedOutputRefreshError {
+                message: "managed output read timed out".into(),
+                lifecycle_changed,
+            })
+        }
+    };
+    let read = match result {
+        Ok(read) => {
+            state
+                .registry
+                .observe_managed_output_failure(terminal_id, None);
+            read
+        }
+        Err(error) => {
+            if error.lifecycle_changed {
+                broadcast_terminals_changed(state);
+            }
+            let cause = if error.message.contains("timed out") || error.message.contains("timeout")
+            {
+                "timeout"
+            } else if error.message.contains("identity") || error.message.contains("ownership") {
+                "identity"
+            } else if error.message.contains("frame")
+                || error.message.contains("sequence")
+                || error.message.contains("bounds")
+            {
+                "invalid_output"
+            } else {
+                "transport_unavailable"
+            };
+            state
+                .registry
+                .observe_managed_output_failure(terminal_id, Some(cause));
+            return Err(error.message);
+        }
+    };
     if let Some(session_id) = read.native_session_id.as_deref() {
         crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
             .await;
     }
-    if let Some(exit_code) = read.exit_code {
-        state.registry.finish_managed_exit(terminal_id, exit_code);
+    let lifecycle_changed = state
+        .registry
+        .publish_managed_lifecycle(terminal_id, read.lifecycle);
+    let delivered = state
+        .registry
+        .managed_output_cursor(terminal_id)
+        .unwrap_or(0);
+    if let Some(completion) = read.completion {
+        let descriptor = state
+            .registry
+            .managed_descriptor(terminal_id)
+            .ok_or("managed terminal disappeared")?;
+        if completion.stream_epoch != descriptor.stream_id
+            || completion.incarnation_id != descriptor.incarnation_id
+            || completion.head_seq != read.head_seq
+        {
+            return Err("managed completion source mismatch".into());
+        }
+        if delivered >= completion.head_seq {
+            state
+                .registry
+                .finish_managed_completion(terminal_id, completion.exit_code);
+        }
+    } else if let Some(exit_code) = read.exit_code {
+        // Transport-independent controller fixtures and older compatible
+        // controllers carry a known settled code with their sampled head.
+        if delivered >= read.head_seq {
+            state.registry.finish_managed_exit(terminal_id, exit_code);
+        }
+    }
+    if lifecycle_changed {
+        broadcast_terminals_changed(state);
     }
     Ok(())
 }
@@ -8694,6 +9211,7 @@ async fn handle_attach(
     // never colliding with createRequestIds — see ws-client's
     // clearTrackedCreate-on-error behavior).
     AttachReply::Error(Box::new(ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -8862,6 +9380,7 @@ fn input_session_identity_mismatch_error(
     actual: Option<SessionLocator>,
 ) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -8900,6 +9419,7 @@ pub(crate) fn terminal_dims_in_range(cols: i64, rows: i64) -> bool {
 /// a `requestId` field.
 fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -8959,6 +9479,7 @@ fn managed_runtime_input_blocked(
 
 fn managed_runtime_error(terminal_id: &str, detail: &str) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -9525,6 +10046,7 @@ async fn handle_kill(
 ) -> bool {
     let unknown_terminal_error = |terminal_id: String| {
         ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
@@ -9651,6 +10173,7 @@ async fn handle_kill(
                     return send(ws_tx, &msg).await;
                 }
                 let msg = ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
                     owner_kind: None,
                     owner_generation: None,
                     owner_epoch: None,
@@ -9776,6 +10299,7 @@ async fn handle_kill(
                 return send(ws_tx, &msg).await;
             }
             let msg = ServerMessage::Error(ErrorMsg {
+                provider_preparation_failure: None,
                 owner_kind: refused_owner_kind,
                 owner_generation: refused_owner_generation,
                 owner_epoch: refused_owner_epoch,
@@ -9885,6 +10409,7 @@ async fn handle_kill(
                 return send(ws_tx, &msg).await;
             }
             let msg = ServerMessage::Error(ErrorMsg {
+                provider_preparation_failure: None,
                 owner_kind: None,
                 owner_generation: None,
                 owner_epoch: None,
@@ -9953,6 +10478,7 @@ async fn handle_kill(
                 return send(
                     ws_tx,
                     &ServerMessage::Error(ErrorMsg {
+                        provider_preparation_failure: None,
                         owner_kind: None,
                         owner_generation: None,
                         owner_epoch: None,
@@ -9994,6 +10520,7 @@ async fn handle_kill(
     if existed {
         if persisted_despite_error {
             let msg = ServerMessage::Error(ErrorMsg {
+                provider_preparation_failure: None,
                 owner_kind: None,
                 owner_generation: None,
                 owner_epoch: None,
@@ -11163,6 +11690,7 @@ mod terminals_changed_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -11362,6 +11890,7 @@ mod terminal_kill_stop_wedge_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -11795,6 +12324,7 @@ mod terminal_meta_created_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
@@ -12348,7 +12878,7 @@ mod pane_reconcile_gate_tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+    pub(super) async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
         let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
         let router = axum::Router::new().route(
@@ -12394,7 +12924,7 @@ mod pane_reconcile_gate_tests {
         (sink, client)
     }
 
-    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+    pub(super) async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
             .await
             .expect("frame within timeout")
@@ -12439,6 +12969,7 @@ mod pane_reconcile_gate_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -12460,6 +12991,119 @@ mod pane_reconcile_gate_tests {
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
         }
+    }
+
+    struct GatedCheckpointSend {
+        seen_send: tokio::sync::Mutex<Option<freshell_protocol::FreshAgentSend>>,
+        entered: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl crate::checkpoint_barrier::FreshAgentCheckpointBarrier for GatedCheckpointSend {
+        fn barrier_and_forward(
+            self: Arc<Self>,
+            send: freshell_protocol::FreshAgentSend,
+            forward: futures::future::BoxFuture<'static, ()>,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                *self.seen_send.lock().await = Some(send);
+                if let Some(entered) = self.entered.lock().await.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = self.release.lock().await.take() {
+                    let _ = release.await;
+                }
+                forward.await;
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_intent_send_is_gated_by_server_barrier_before_opencode_dispatch() {
+        let (mut ws_tx, _client) = loopback_sink_and_client().await;
+        let mut state = state();
+        let mut provider_events = state.broadcast_tx.subscribe();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let barrier = Arc::new(GatedCheckpointSend {
+            seen_send: tokio::sync::Mutex::new(None),
+            entered: tokio::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        });
+        state.checkpoint_send.service = Some(barrier.clone());
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        let (interactive_create_tx, _interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+
+        let keep_open = handle_client_text(
+            r#"{"type":"freshAgent.send","provider":"opencode","sessionId":"missing-opencode-session","sessionType":"freshopencode","text":"checkpoint barrier probe","requestId":"checkpoint-barrier-request","checkpointIntent":{"logicalAttemptId":"checkpoint-barrier-attempt","workspace":{"path":"/tmp/checkpoint-barrier-probe","provenance":"directory-picker"}}}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            false,
+            &interactive_create_tx,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+            &mut conn_identity,
+            &mut Default::default(),
+            &None,
+        )
+        .await;
+        assert!(
+            keep_open,
+            "a checkpointed send must keep the websocket open"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .expect("checkpoint barrier was invoked")
+            .expect("barrier entry signal");
+
+        let captured = barrier
+            .seen_send
+            .lock()
+            .await
+            .clone()
+            .expect("barrier receives the original send");
+        assert_eq!(
+            captured.request_id.as_deref(),
+            Some("checkpoint-barrier-request")
+        );
+        assert_eq!(
+            captured.checkpoint_intent,
+            Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "checkpoint-barrier-attempt".to_string(),
+                workspace: Some(freshell_protocol::FreshAgentCheckpointWorkspace {
+                    path: "/tmp/checkpoint-barrier-probe".to_string(),
+                    provenance: freshell_protocol::CheckpointWorkspaceProvenance::DirectoryPicker,
+                }),
+            })
+        );
+        assert!(
+            matches!(
+                provider_events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "provider dispatch must remain blocked until the barrier settles"
+        );
+
+        release_tx.send(()).expect("release provider dispatch");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), provider_events.recv())
+            .await
+            .expect("provider dispatch produces an event after release")
+            .expect("provider event channel remains open");
+        let event: serde_json::Value = serde_json::from_str(&event).expect("provider event JSON");
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["requestId"], "checkpoint-barrier-request");
+        assert!(event["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("SESSION_NOT_FOUND:")));
     }
 
     #[tokio::test]
@@ -12644,13 +13288,28 @@ mod pane_reconcile_gate_tests {
 mod managed_output_order_tests {
     use super::*;
     use freshell_terminal::registry::{
-        ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController,
-        ManagedTerminalDescriptor, ManagedTerminalFuture,
+        ManagedLifecycle, ManagedLifecycleState, ManagedOutputChunk, ManagedOutputRead,
+        ManagedTerminalController, ManagedTerminalDescriptor, ManagedTerminalFuture,
     };
 
-    struct ExitedOpenCodeRead;
+    struct ExitedOpenCodeRead {
+        final_head: i64,
+        lifecycle: Option<ManagedLifecycle>,
+        exit_code: Option<i64>,
+        native_session_id: Option<String>,
+        read_pending: bool,
+        read_error: Option<String>,
+        error_lifecycle: Option<ManagedLifecycle>,
+    }
 
     impl ManagedTerminalController for ExitedOpenCodeRead {
+        fn lifecycle_observation<'a>(
+            &'a self,
+            _: &'a ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Option<ManagedLifecycle>> {
+            Box::pin(std::future::ready(self.error_lifecycle.clone()))
+        }
+
         fn lookup_terminal<'a>(
             &'a self,
             _: &'a str,
@@ -12662,7 +13321,13 @@ mod managed_output_order_tests {
         fn launch<'a>(
             &'a self,
             _: ManagedTerminalLaunch,
-        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
             Box::pin(async { Err("unused launch".into()) })
         }
 
@@ -12680,7 +13345,7 @@ mod managed_output_order_tests {
             _: u16,
             _: u16,
         ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unused resize".into()) })
+            Box::pin(async { Ok(()) })
         }
 
         fn stop<'a>(
@@ -12693,27 +13358,87 @@ mod managed_output_order_tests {
         fn read_output<'a>(
             &'a self,
             _: ManagedTerminalDescriptor,
-            _: i64,
+            after: i64,
             _: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
-            Box::pin(async {
+            if self.read_pending {
+                return Box::pin(std::future::pending());
+            }
+            if let Some(error) = &self.read_error {
+                let error = error.clone();
+                return Box::pin(async move { Err(error) });
+            }
+            Box::pin(async move {
                 Ok(ManagedOutputRead {
+                    lifecycle: self.lifecycle.clone(),
+                    completion: None,
                     stream_epoch: Some("S-managed-short-lived".into()),
                     incarnation_id: Some("incarnation-short-lived".into()),
                     reset_required: false,
                     truncated: false,
                     retained_from_seq: 1,
-                    head_seq: 1,
-                    exit_code: Some(17),
-                    native_session_id: Some("ses-short-lived".into()),
-                    chunks: vec![ManagedOutputChunk {
-                        seq_start: 1,
-                        seq_end: 1,
-                        data: "last output\n".into(),
-                    }],
+                    head_seq: self.final_head,
+                    exit_code: self.exit_code,
+                    native_session_id: self.native_session_id.clone(),
+                    chunks: if after < self.final_head {
+                        vec![ManagedOutputChunk {
+                            seq_start: after + 1,
+                            seq_end: after + 1,
+                            data: if self.final_head == 1 {
+                                "last output\n".into()
+                            } else {
+                                "x".repeat(65536)
+                            },
+                        }]
+                    } else {
+                        vec![]
+                    },
                 })
             })
         }
+    }
+
+    fn install_blocked_read_controller(
+        state: &WsState,
+        suffix: &str,
+        read_pending: bool,
+        read_error: Option<&str>,
+    ) -> String {
+        let terminal_id = format!("T-managed-{suffix}");
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: format!("soul-{suffix}"),
+            incarnation_id: format!("incarnation-{suffix}"),
+            terminal_id: terminal_id.clone(),
+            stream_id: format!("S-managed-{suffix}"),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some(format!("ses-{suffix}")),
+            create_request_id: Some(format!("req-{suffix}")),
+        });
+        let blocked_lifecycle = ManagedLifecycle {
+            state: ManagedLifecycleState::Blocked,
+            recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
+                desired_state: "running".into(),
+                recovery_state: "blocked".into(),
+                reason: Some("host_unreachable".into()),
+                attempt_id: Some(format!("attempt-{suffix}")),
+                incident_id: Some(format!("incident-{suffix}")),
+                durability_state: "retained".into(),
+                allocation_state: "retained".into(),
+            }),
+        };
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 0,
+                lifecycle: None,
+                exit_code: None,
+                native_session_id: None,
+                read_pending,
+                read_error: read_error.map(str::to_owned),
+                error_lifecycle: Some(blocked_lifecycle),
+            })));
+        terminal_id
     }
 
     #[tokio::test]
@@ -12732,7 +13457,15 @@ mod managed_output_order_tests {
         });
         state
             .registry
-            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead)));
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 1,
+                lifecycle: None,
+                exit_code: Some(17),
+                native_session_id: Some("ses-short-lived".into()),
+                read_pending: false,
+                read_error: None,
+                error_lifecycle: None,
+            })));
 
         refresh_managed_output_and_associate(&state, terminal_id, 1024)
             .await
@@ -12755,6 +13488,382 @@ mod managed_output_order_tests {
         assert_eq!(row.status, freshell_protocol::TerminalRunStatus::Exited);
         assert_eq!(row.resume_session_id.as_deref(), Some("ses-short-lived"));
         assert_eq!(row.snapshot, "last output\n");
+    }
+
+    #[tokio::test]
+    async fn managed_final_exit_waits_for_all_retained_pages() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal = "T-managed-short-lived";
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-short-lived".into(),
+            incarnation_id: "incarnation-short-lived".into(),
+            terminal_id: terminal.into(),
+            stream_id: "S-managed-short-lived".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: Some("req-short-lived".into()),
+        });
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 3,
+                lifecycle: None,
+                exit_code: Some(17),
+                native_session_id: Some("ses-short-lived".into()),
+                read_pending: false,
+                read_error: None,
+                error_lifecycle: None,
+            })));
+        for delivered in 1..=3 {
+            refresh_managed_output_and_associate(&state, terminal, 65536)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.registry.managed_output_cursor(terminal),
+                Some(delivered)
+            );
+            assert_eq!(
+                state.registry.directory()[0].status,
+                if delivered == 3 {
+                    freshell_protocol::TerminalRunStatus::Exited
+                } else {
+                    freshell_protocol::TerminalRunStatus::Running
+                },
+                "exit cannot strand undelivered final pages"
+            );
+        }
+        assert_eq!(state.registry.directory()[0].snapshot.len(), 3 * 65536);
+    }
+
+    #[tokio::test]
+    async fn managed_final_lifecycle_broadcasts_terminal_directory_changes_once() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id = "T-managed-blocked";
+        let mut events = state.broadcast_tx.subscribe();
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-blocked".into(),
+            incarnation_id: "incarnation-blocked".into(),
+            terminal_id: terminal_id.into(),
+            stream_id: "S-managed-blocked".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses-blocked".into()),
+            create_request_id: Some("req-blocked".into()),
+        });
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 1,
+                lifecycle: Some(ManagedLifecycle {
+                    state: ManagedLifecycleState::Blocked,
+                    recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
+                        desired_state: "running".into(),
+                        recovery_state: "blocked".into(),
+                        reason: Some("provider preparation failed".into()),
+                        attempt_id: Some("attempt-blocked".into()),
+                        incident_id: Some("incident-blocked".into()),
+                        durability_state: "retained".into(),
+                        allocation_state: "retained".into(),
+                    }),
+                }),
+                exit_code: None,
+                native_session_id: None,
+                read_pending: false,
+                read_error: None,
+                error_lifecycle: None,
+            })));
+
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .expect("lifecycle refresh succeeds");
+        assert_eq!(
+            state.registry.directory()[0].status,
+            freshell_protocol::TerminalRunStatus::Exited
+        );
+        assert_eq!(
+            state.registry.directory()[0].runtime_status,
+            Some(freshell_protocol::RuntimeStatus::Blocked)
+        );
+        let changed: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            changed,
+            serde_json::json!({ "type": "terminals.changed", "revision": 1 })
+        );
+
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .expect("unchanged lifecycle refresh succeeds");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_cached_final_lifecycle_broadcasts_when_output_read_fails() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id = install_blocked_read_controller(
+            &state,
+            "blocked-read-error",
+            false,
+            Some("managed output read failed"),
+        );
+        let mut events = state.broadcast_tx.subscribe();
+
+        assert!(
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
+                .await
+                .unwrap_err()
+                .contains("managed output read failed")
+        );
+        assert_eq!(
+            state.registry.directory()[0].runtime_status,
+            Some(freshell_protocol::RuntimeStatus::Blocked)
+        );
+        let changed: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            changed,
+            serde_json::json!({ "type": "terminals.changed", "revision": 1 })
+        );
+
+        assert!(
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_cached_final_lifecycle_broadcasts_when_output_read_times_out() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id =
+            install_blocked_read_controller(&state, "blocked-read-timeout", true, None);
+        let mut events = state.broadcast_tx.subscribe();
+
+        assert!(
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
+                .await
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert_eq!(
+            state.registry.directory()[0].runtime_status,
+            Some(freshell_protocol::RuntimeStatus::Blocked)
+        );
+        let changed: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            changed,
+            serde_json::json!({ "type": "terminals.changed", "revision": 1 })
+        );
+
+        assert!(
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    include!("managed_retained_socket_tests.rs");
+
+    struct FailedRead(StdMutex<Option<String>>);
+    impl ManagedTerminalController for FailedRead {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn launch<'a>(
+            &'a self,
+            _: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn input<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn resize<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn stop<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn read_output<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            after: i64,
+            _: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async move {
+                if let Some(error) = self.0.lock().unwrap().clone() {
+                    return Err(error);
+                }
+                Ok(ManagedOutputRead {
+                    lifecycle: None,
+                    completion: None,
+                    stream_epoch: None,
+                    incarnation_id: None,
+                    reset_required: false,
+                    truncated: false,
+                    retained_from_seq: after,
+                    head_seq: after,
+                    exit_code: None,
+                    native_session_id: None,
+                    chunks: vec![],
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedEvents(Arc<StdMutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?};", field.name()));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_output_failure_transitions_are_shared_by_two_readers_and_redacted() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let events = Arc::new(StdMutex::new(vec![]));
+        let subscriber = tracing_subscriber::registry().with(CapturedEvents(events.clone()));
+        async {
+            let state = super::pane_reconcile_gate_tests::state();
+            let terminal = "T-managed-failures";
+            state.registry.register_managed(ManagedTerminalDescriptor {
+                soul_id: "soul-failure".into(),
+                incarnation_id: "incarnation-failure".into(),
+                terminal_id: terminal.into(),
+                stream_id: "epoch-failure".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            });
+            let controller = Arc::new(FailedRead(StdMutex::new(Some(
+                "transport unavailable secret=synthetic-sensitive".into(),
+            ))));
+            state
+                .registry
+                .set_managed_controller(Some(controller.clone()));
+            for conn in 1..=2 {
+                assert!(
+                    state
+                        .registry
+                        .attach(
+                            terminal,
+                            conn,
+                            Arc::new(|_| {}),
+                            None,
+                            0,
+                            false,
+                            false,
+                            None,
+                            None,
+                            None,
+                            Default::default()
+                        )
+                        .found
+                );
+            }
+            for _ in 0..20 {
+                for conn in 1..=2 {
+                    assert_eq!(state.registry.managed_attached_to(conn), vec![terminal]);
+                    assert!(
+                        refresh_managed_output_and_associate(&state, terminal, 65536)
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            let first = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.contains("managed_runtime.output_refresh_failed"))
+                .count();
+            assert_eq!(
+                first, 1,
+                "one shared warning for forty unchanged socket polls"
+            );
+            *controller.0.lock().unwrap() = Some("managed output read timed out".into());
+            assert!(
+                refresh_managed_output_and_associate(&state, terminal, 65536)
+                    .await
+                    .is_err()
+            );
+            *controller.0.lock().unwrap() = None;
+            refresh_managed_output_and_associate(&state, terminal, 65536)
+                .await
+                .unwrap();
+            let captured = events.lock().unwrap();
+            assert_eq!(
+                captured
+                    .iter()
+                    .filter(|e| e.contains("managed_runtime.output_refresh_failed"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                captured
+                    .iter()
+                    .filter(|e| e.contains("managed_runtime.output_refresh_recovered"))
+                    .count(),
+                1
+            );
+            assert!(
+                captured.iter().all(|e| !e.contains("synthetic-sensitive")),
+                "raw remote error contents must not enter logs"
+            );
+        }
+        .with_subscriber(subscriber)
+        .await;
     }
 }
 #[cfg(test)]
@@ -12938,7 +14047,7 @@ mod host_stats_dispatch_tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+    pub(super) async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
         let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
         let router = axum::Router::new().route(
@@ -12981,7 +14090,7 @@ mod host_stats_dispatch_tests {
         (sink, client)
     }
 
-    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+    pub(super) async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
             .await
             .expect("frame within timeout")
@@ -13026,6 +14135,7 @@ mod host_stats_dispatch_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats,
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),

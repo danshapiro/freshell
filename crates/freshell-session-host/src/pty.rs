@@ -48,6 +48,7 @@ impl HostedPty {
         launch: &TerminalLaunchSpec,
         child_secret_env: BTreeMap<String, String>,
         prepared_codex: Option<PreparedCodexLaunch>,
+        claude_settings: Option<String>,
     ) -> Result<Self, String> {
         launch.validate().map_err(|e| e.message)?;
         let launch_floor_ms = epoch_ms().saturating_sub(500);
@@ -66,7 +67,14 @@ impl HostedPty {
         let sink = Box::new(move |message: ServerMessage| {
             if let ServerMessage::TerminalOutput(frame) = message {
                 if let Ok(mut journal) = sink_output.lock() {
-                    let _ = journal.append(&frame.data);
+                    if journal.append(&frame.data).is_err() {
+                        journal.record_failure();
+                        tracing::error!(
+                            event = "managed_runtime.output_writer_failed",
+                            cause = "spool_write",
+                            "Retained output writer failed"
+                        );
+                    }
                 }
             }
         });
@@ -78,9 +86,24 @@ impl HostedPty {
             .as_ref()
             .map(|prepared| Arc::clone(&prepared.sidecar));
         let runtime_handle = tokio::runtime::Handle::try_current().ok();
+        let settled_output = Arc::clone(&output);
         let on_exit = Box::new(move |code: i64| {
+            // The PTY reader calls this only after its final framer flush.
+            let settled = settled_output
+                .lock()
+                .map(|mut journal| journal.complete(code).is_ok())
+                .unwrap_or(false);
+            // Process exit is independent of whether retained output settled;
+            // supervision must never reattach a process that has already exited.
             exit_value.store(code, Ordering::SeqCst);
             exit_flag.store(true, Ordering::SeqCst);
+            if !settled {
+                tracing::error!(
+                    event = "managed_runtime.output_completion_failed",
+                    cause = "spool_settlement",
+                    "Output completion could not be committed"
+                );
+            }
             if let (Some(handle), Some(sidecar)) =
                 (runtime_handle.as_ref(), codex_sidecar_on_exit.as_ref())
             {
@@ -92,7 +115,11 @@ impl HostedPty {
         });
         let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
         provider_args.push(launch.program.clone());
-        provider_args.extend(launch.args.clone());
+        for (index, argument) in launch.args.iter().enumerate() {
+            provider_args.push(if launch.mode == "claude" && index > 0 && launch.args[index - 1] == "--settings" && argument == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT {
+                claude_settings.as_ref().ok_or("selected Claude settings origin is unavailable; retain inputs and reprepare before dispatch")?.clone()
+            } else { argument.clone() });
+        }
         let spec = SpawnSpec {
             program: "/usr/bin/setpriv".to_string(),
             args: provider_args,
@@ -110,15 +137,29 @@ impl HostedPty {
         provider_env.insert("GIT_CONFIG_COUNT".into(), "1".into());
         provider_env.insert("GIT_CONFIG_KEY_0".into(), "safe.directory".into());
         provider_env.insert("GIT_CONFIG_VALUE_0".into(), launch.workspace_path.clone());
-        let mut pty = match PtyTerminal::spawn_with_sink(
-            &spec,
-            &provider_env,
-            &launch.terminal_id,
-            &launch.stream_id,
-            None,
-            Some(sink),
-            Some(on_exit),
-        ) {
+        let spawn = (|| {
+            #[cfg(target_os = "linux")]
+            freshell_platform::provider_exec::check_final_exec(
+                &spec.program,
+                &spec.args,
+                &provider_env,
+                &[&launch.program],
+                freshell_platform::provider_exec::process_profile()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            PtyTerminal::spawn_with_sink(
+                &spec,
+                &provider_env,
+                &launch.terminal_id,
+                &launch.stream_id,
+                None,
+                Some(sink),
+                Some(on_exit),
+            )
+            .map_err(|error| error.to_string())
+        })();
+        let mut pty = match spawn {
             Ok(pty) => pty,
             Err(error) => {
                 if let Some(prepared) = prepared_codex {
@@ -244,8 +285,6 @@ impl HostedPty {
             batch.reset_required = true;
             batch.truncated = true;
         }
-        batch.exited = self.exited();
-        batch.exit_code = self.exited().then(|| self.exit_code());
         batch.native_session_id = self
             .native_session_id
             .lock()
@@ -255,7 +294,7 @@ impl HostedPty {
     }
 
     pub async fn stop(&mut self) {
-        self.pty.kill();
+        self.pty.stop_and_join_output();
         if let Some(codex) = self.codex.take() {
             codex.event_task.abort();
             let _ = codex.sidecar.shutdown().await;
@@ -430,6 +469,136 @@ fn output_read_position(
 #[cfg(test)]
 mod output_epoch_tests {
     use super::output_read_position;
+
+    async fn retained_pty(
+        root: &std::path::Path,
+        script: &str,
+    ) -> (super::HostedPty, freshell_runtime_protocol::IncarnationId) {
+        let launch:super::TerminalLaunchSpec=serde_json::from_value(serde_json::json!({
+            "terminalId":"retained-pty","streamId":"launch-prefix","mode":"shell","program":"/bin/sh",
+            "args":["-c",script],"env":{"PATH":"/usr/bin:/bin"},"cwd":root,
+            "runAsUid":unsafe {libc::geteuid()},"runAsGid":unsafe {libc::getegid()},
+            "cols":120,"rows":30,"projectKey":"retained-fixture","workspacePath":root
+        })).unwrap();
+        let incarnation = freshell_runtime_protocol::IncarnationId::new();
+        (
+            super::HostedPty::spawn(
+                root,
+                incarnation.clone(),
+                &launch,
+                Default::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+            incarnation,
+        )
+    }
+
+    #[tokio::test]
+    async fn retained_output_pty_eof_flushes_final_head_before_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let (hosted, incarnation) = retained_pty(
+            root.path(),
+            "head -c 150000 /dev/zero | tr '\\000' 'x'; printf 'final-tail'; exit 17",
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !hosted.exited() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let completion = std::fs::read(root.path().join("terminal-spool-completion.json"));
+        let mut windows = vec![];
+        let head = hosted.head_seq();
+        for _reader in 0..2 {
+            let mut cursor = 0;
+            let mut window = String::new();
+            while cursor < head {
+                let batch = hosted
+                    .read_output(
+                        incarnation.clone(),
+                        cursor,
+                        65536,
+                        Some(hosted.stream_epoch()),
+                    )
+                    .unwrap();
+                assert!(batch.exited);
+                assert_eq!(batch.head_seq, head);
+                assert_eq!(batch.exit_code, Some(17));
+                for frame in batch.frames {
+                    cursor = frame.seq_end;
+                    window.push_str(&frame.data);
+                }
+            }
+            windows.push(window);
+        }
+        drop(hosted); // actual PTY waiter and reader join before assertions
+        assert_eq!(windows[0], "x".repeat(150000) + "final-tail");
+        assert_eq!(windows[0], windows[1]);
+        let completion: serde_json::Value = serde_json::from_slice(
+            &completion.expect("settled EOF publishes coherent durable completion"),
+        )
+        .unwrap();
+        assert_eq!(completion["headSeq"], head);
+        assert!(completion["streamEpoch"]
+            .as_str()
+            .unwrap()
+            .starts_with("launch-prefix-hostboot-"));
+        assert_eq!(completion["exit"]["code"], 17);
+    }
+
+    #[tokio::test]
+    async fn retained_output_failure_does_not_hide_provider_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let (hosted, incarnation) = retained_pty(root.path(), "sleep 0.1; exit 23").await;
+        hosted.output.lock().unwrap().record_failure();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !hosted.exited() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("journal completion failure must not leave an exited provider reported live");
+
+        assert_eq!(hosted.exit_code(), 23);
+        let output_error = hosted
+            .read_output(incarnation, 0, 65536, Some(hosted.stream_epoch()))
+            .expect_err("the failed retained-output journal remains unavailable");
+        assert_eq!(
+            output_error.code,
+            freshell_runtime_protocol::RuntimeErrorCode::HostUnreachable
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_output_successful_stop_joins_reader_before_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut hosted, _) = retained_pty(root.path(), "printf 'stop-tail'; sleep 300").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while hosted.head_seq() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        hosted.stop().await;
+        let exited = hosted.exited();
+        let completion = std::fs::read(root.path().join("terminal-spool-completion.json"));
+        drop(hosted);
+        assert!(
+            exited,
+            "successful Stop settles the output reader before returning"
+        );
+        assert!(
+            completion.is_ok(),
+            "successful Stop freezes a retained completion before reply"
+        );
+    }
 
     #[test]
     fn obsolete_source_epoch_forces_one_call_full_replay() {
@@ -704,5 +873,43 @@ mod codex_identity_tests {
         assert!(validate_codex_candidate(Some("thread-a"), None, "thread-b", false).is_err());
         assert!(validate_codex_candidate(None, None, "thread-a", true).is_err());
         assert!(validate_codex_candidate(None, Some("thread-a"), "thread-b", false).is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provider_exec_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn provider_exec_profile_rejects_combined_final_environment_before_pty_dispatch() {
+        let owned = tempfile::tempdir().unwrap();
+        let launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"exec-profile","streamId":"exec-profile-stream","mode":"codex",
+            "program":"/usr/bin/true","cwd":owned.path(),"workspacePath":owned.path(),
+            "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"exec-profile",
+            "env":{"PATH":"/usr/bin:/bin"}
+        }))
+        .unwrap();
+        let environment = (0..17)
+            .map(|i| (format!("FRESHELL_EXEC_FIXTURE_{i}"), "x".repeat(64 * 1024)))
+            .collect();
+        let mut result = HostedPty::spawn(
+            owned.path(),
+            IncarnationId::new(),
+            &launch,
+            environment,
+            None,
+            None,
+        )
+        .await;
+        // This regression owns and stops only the unexpectedly dispatched
+        // synthetic PTY, inside the required lifecycle sandbox.
+        if let Ok(pty) = &mut result {
+            pty.stop().await;
+        }
+        assert!(
+            matches!(result,Err(ref cause) if cause.contains("provider exec profile")),
+            "oversized final argv+env must fail with a classified pre-dispatch profile error"
+        );
     }
 }

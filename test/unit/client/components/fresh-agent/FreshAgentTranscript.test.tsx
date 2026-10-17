@@ -2054,6 +2054,30 @@ describe('FreshAgentTranscript', () => {
       expect(onRewind).toHaveBeenCalledWith(expect.objectContaining({ id: 'turn-1', role: 'user' }))
     })
 
+    it('shows unavailable rewind state and disables the action on the affected turn', () => {
+      const reason = 'Select a project folder to save code rewind.'
+      const onRewind = vi.fn()
+      render(
+        <FreshAgentTranscript
+          paneId="pane-unavailable-rewind"
+          turns={TURNS}
+          canFork={false}
+          onRewindToTurn={onRewind}
+          getRewindAvailability={(turn) => turn.turnId === 'turn-1' ? { status: 'unavailable', reason } : undefined}
+        />,
+      )
+
+      const userArticle = screen.getByRole('article', { name: 'You transcript turn' })
+      expect(within(userArticle).getByRole('note', { name: 'Code rewind unavailable for this message' }))
+        .toHaveTextContent(`Code rewind unavailable for this message: ${reason}`)
+      expect(within(userArticle).getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+
+      const build = getFreshAgentTurnItemsBuilder('pane-unavailable-rewind')
+      const rewindItem = build!(0)!.find((item) => item.label.startsWith('Rewind unavailable:'))
+      expect(rewindItem).toMatchObject({ label: `Rewind unavailable: ${reason}`, disabled: true })
+      expect(onRewind).not.toHaveBeenCalled()
+    })
+
     it('gates fork/rollback/rewind per capability and role through the registered builder', () => {
       const onRewind = vi.fn()
       render(

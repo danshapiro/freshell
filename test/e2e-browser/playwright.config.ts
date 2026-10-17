@@ -1,9 +1,20 @@
 import { defineConfig, devices } from '@playwright/test'
 import { DEFAULT_TEST_TIMEOUT_MS } from './helpers/test-harness.js'
+import {
+  EXTERNAL_TARGET_SPECS,
+  externalFixtureRequested,
+  resolvePairedExternalFixture,
+  validateExternalSelection,
+} from '../../scripts/testing/e2e-external-target.js'
 
-/** Match-all browser projects exclude only the separately selected live-CLI smoke. */
+/** Ordinary browser discovery excludes separately selected smoke/owned targets. */
 export const CONTINUITY_SMOKE_SPEC = /continuity-smoke\.spec\.ts$/
-export const MATCH_ALL_TEST_IGNORE = [CONTINUITY_SMOKE_SPEC]
+export const MATCH_ALL_TEST_IGNORE = [CONTINUITY_SMOKE_SPEC,
+  ...Object.values(EXTERNAL_TARGET_SPECS).map(spec => `**/${spec}`)]
+const externalFixture = resolvePairedExternalFixture(process.env, externalFixtureRequested(process.argv))
+if (externalFixture && process.argv.some(arg => arg === 'test' || arg === '--project' || arg.startsWith('--project='))) {
+  validateExternalSelection(process.argv)
+}
 
 /**
  * These specs require local provider binaries or a host Docker supervisor.
@@ -91,6 +102,11 @@ export default defineConfig({
       use: devices['Desktop Chrome'],
       testIgnore: MATCH_ALL_TEST_IGNORE,
     },
+    ...(externalFixture ? [{
+      name: 'chromium-external-target',
+      use: devices['Desktop Chrome'],
+      testMatch: [`**/${externalFixture.spec}`],
+    }] : []),
     ...(continuityRequested ? [{
       name: 'continuity-smoke',
       use: devices['Desktop Chrome'],

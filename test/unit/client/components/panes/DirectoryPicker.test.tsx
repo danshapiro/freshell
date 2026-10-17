@@ -165,6 +165,11 @@ describe('DirectoryPicker', () => {
 
   it('validates and confirms directory on Enter', async () => {
     const { onConfirm } = renderDirectoryPicker()
+    mockApiPost.mockResolvedValueOnce({
+      valid: true,
+      resolvedPath: '/tmp/selected',
+      checkpointWorkspaceEligible: true,
+    })
     const input = screen.getByLabelText('Starting directory for Claude')
 
     fireEvent.change(input, { target: { value: '/tmp/selected' } })
@@ -173,7 +178,26 @@ describe('DirectoryPicker', () => {
     await waitFor(() => {
       expect(mockApiPost).toHaveBeenCalledWith('/api/files/validate-dir', { path: '/tmp/selected' })
     })
-    expect(onConfirm).toHaveBeenCalledWith('/resolved/path')
+    expect(onConfirm).toHaveBeenCalledWith('/tmp/selected', {
+      path: '/tmp/selected',
+      provenance: 'directory-picker',
+    })
+  })
+
+  it('confirms account-home selection as launch cwd without checkpoint scope', async () => {
+    mockApiPost.mockResolvedValueOnce({
+      valid: true,
+      resolvedPath: '/home/user',
+      checkpointWorkspaceEligible: false,
+    })
+    const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
+    const input = screen.getByLabelText('Starting directory for Claude')
+
+    fireEvent.change(input, { target: { value: '/home/user' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledWith('/home/user'))
+    expect(onConfirm).toHaveBeenCalledTimes(1)
   })
 
   it('confirms typed input on Enter when no suggestion is actively selected', async () => {
@@ -322,6 +346,11 @@ describe('DirectoryPicker', () => {
     it('creates directory and confirms on success', async () => {
       mockApiGet.mockResolvedValueOnce({ directories: [] })
       mockApiPost.mockResolvedValueOnce({ created: true, resolvedPath: '/tmp/new-dir' })
+      mockApiPost.mockResolvedValueOnce({
+        valid: true,
+        resolvedPath: '/tmp/new-dir',
+        checkpointWorkspaceEligible: true,
+      })
       const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
 
       const input = screen.getByLabelText('Starting directory for Claude')
@@ -333,7 +362,11 @@ describe('DirectoryPicker', () => {
       await waitFor(() => {
         expect(mockApiPost).toHaveBeenCalledWith('/api/files/mkdir', { path: '/tmp/new-dir' })
       })
-      expect(onConfirm).toHaveBeenCalledWith('/tmp/new-dir')
+      expect(mockApiPost).toHaveBeenCalledWith('/api/files/validate-dir', { path: '/tmp/new-dir' })
+      expect(onConfirm).toHaveBeenCalledWith('/tmp/new-dir', {
+        path: '/tmp/new-dir',
+        provenance: 'directory-picker',
+      })
     })
 
     it('shows creating state while request is in flight', async () => {
@@ -402,6 +435,11 @@ describe('DirectoryPicker', () => {
       mockApiPost
         .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
         .mockReturnValueOnce(new Promise((resolve) => { resolveSecond = resolve }))
+        .mockResolvedValueOnce({
+          valid: true,
+          resolvedPath: '/tmp/dir-b',
+          checkpointWorkspaceEligible: true,
+        })
       const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
 
       const input = screen.getByLabelText('Starting directory for Claude')
@@ -417,7 +455,10 @@ describe('DirectoryPicker', () => {
 
       resolveSecond!({ created: true, resolvedPath: '/tmp/dir-b' })
       await waitFor(() => {
-        expect(onConfirm).toHaveBeenCalledWith('/tmp/dir-b')
+        expect(onConfirm).toHaveBeenCalledWith('/tmp/dir-b', {
+          path: '/tmp/dir-b',
+          provenance: 'directory-picker',
+        })
       })
       expect(onConfirm).toHaveBeenCalledTimes(1)
     })
@@ -451,6 +492,11 @@ describe('DirectoryPicker', () => {
     it('triggers create on Shift+Enter', async () => {
       mockApiGet.mockResolvedValueOnce({ directories: [] })
       mockApiPost.mockResolvedValueOnce({ created: true, resolvedPath: '/tmp/shift-enter' })
+      mockApiPost.mockResolvedValueOnce({
+        valid: true,
+        resolvedPath: '/tmp/shift-enter',
+        checkpointWorkspaceEligible: true,
+      })
       const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
 
       const input = screen.getByLabelText('Starting directory for Claude')
@@ -460,7 +506,10 @@ describe('DirectoryPicker', () => {
       await waitFor(() => {
         expect(mockApiPost).toHaveBeenCalledWith('/api/files/mkdir', { path: '/tmp/shift-enter' })
       })
-      expect(onConfirm).toHaveBeenCalledWith('/tmp/shift-enter')
+      expect(onConfirm).toHaveBeenCalledWith('/tmp/shift-enter', {
+        path: '/tmp/shift-enter',
+        provenance: 'directory-picker',
+      })
     })
   })
 

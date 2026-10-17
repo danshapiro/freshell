@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 69,
+  "messageCount": 70,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -615,6 +615,50 @@
           ],
           "type": "string"
         },
+        "providerPreparationFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "cause": {
+              "enum": [
+                "unknown",
+                "not_found",
+                "permission_denied",
+                "cyclic"
+              ],
+              "type": "string"
+            },
+            "code": {
+              "const": "SELECTED_REFERENCE_UNAVAILABLE",
+              "type": "string"
+            },
+            "declaringConfig": {
+              "type": "string"
+            },
+            "operation": {
+              "const": "resolve",
+              "type": "string"
+            },
+            "selectedPath": {
+              "type": "string"
+            },
+            "stage": {
+              "const": "configuration",
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cause",
+            "code",
+            "declaringConfig",
+            "operation",
+            "stage",
+            "workspace"
+          ],
+          "type": "object"
+        },
         "requestId": {
           "type": "string"
         },
@@ -883,6 +927,95 @@
       },
       "required": [
         "extensions",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.checkpoint.outcome": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "checkpointId": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "displayTurnId": {
+          "type": "string"
+        },
+        "logicalAttemptId": {
+          "type": "string"
+        },
+        "nativeTurnId": {
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "codex",
+            "claude",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "available",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.checkpoint.outcome",
+          "type": "string"
+        },
+        "workspace": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "provenance": {
+              "enum": [
+                "directory-picker",
+                "resolved-project",
+                "legacy-checkpoint"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "provenance"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "logicalAttemptId",
+        "provider",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "status",
         "type"
       ],
       "type": "object"
@@ -4554,6 +4687,12 @@
         "exitCode": {
           "type": "number"
         },
+        "exitCodeAvailable": {
+          "type": "boolean"
+        },
+        "managedRetained": {
+          "type": "boolean"
+        },
         "terminalId": {
           "type": "string"
         },
@@ -4835,6 +4974,9 @@
               "description": {
                 "type": "string"
               },
+              "incarnationId": {
+                "type": "string"
+              },
               "lastActivityAt": {
                 "type": "number"
               },
@@ -4888,13 +5030,72 @@
                   }
                 ]
               },
+              "recoverySummary": {
+                "additionalProperties": false,
+                "properties": {
+                  "allocationState": {
+                    "enum": [
+                      "allocated",
+                      "materializing",
+                      "verified_durable",
+                      "degraded"
+                    ],
+                    "type": "string"
+                  },
+                  "attemptId": {
+                    "type": "string"
+                  },
+                  "desiredState": {
+                    "enum": [
+                      "running",
+                      "stopped"
+                    ],
+                    "type": "string"
+                  },
+                  "durabilityState": {
+                    "enum": [
+                      "unknown",
+                      "live_only",
+                      "resume_captured",
+                      "checkpoint_captured",
+                      "intrinsically_non_resumable"
+                    ],
+                    "type": "string"
+                  },
+                  "incidentId": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "recoveryState": {
+                    "enum": [
+                      "live",
+                      "blocked",
+                      "recovering",
+                      "stopped",
+                      "lost"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "allocationState",
+                  "desiredState",
+                  "durabilityState",
+                  "recoveryState"
+                ],
+                "type": "object"
+              },
               "resumeTargetIsSubagent": {
                 "type": "boolean"
               },
               "runtimeStatus": {
                 "enum": [
+                  "blocked",
                   "running",
-                  "recovering"
+                  "recovering",
+                  "exited"
                 ],
                 "type": "string"
               },
@@ -4999,6 +5200,9 @@
                   "sessionId"
                 ],
                 "type": "object"
+              },
+              "soulId": {
+                "type": "string"
               },
               "status": {
                 "enum": [
@@ -5486,11 +5690,69 @@
         "reason": {
           "type": "string"
         },
+        "recoverySummary": {
+          "additionalProperties": false,
+          "properties": {
+            "allocationState": {
+              "enum": [
+                "allocated",
+                "materializing",
+                "verified_durable",
+                "degraded"
+              ],
+              "type": "string"
+            },
+            "attemptId": {
+              "type": "string"
+            },
+            "desiredState": {
+              "enum": [
+                "running",
+                "stopped"
+              ],
+              "type": "string"
+            },
+            "durabilityState": {
+              "enum": [
+                "unknown",
+                "live_only",
+                "resume_captured",
+                "checkpoint_captured",
+                "intrinsically_non_resumable"
+              ],
+              "type": "string"
+            },
+            "incidentId": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "recoveryState": {
+              "enum": [
+                "live",
+                "blocked",
+                "recovering",
+                "stopped",
+                "lost"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "allocationState",
+            "desiredState",
+            "durabilityState",
+            "recoveryState"
+          ],
+          "type": "object"
+        },
         "resumeCycles": {
           "type": "number"
         },
         "status": {
           "enum": [
+            "blocked",
             "running",
             "recovering",
             "exited"

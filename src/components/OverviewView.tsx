@@ -14,17 +14,18 @@ import { collectTerminalIds } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { RefreshCw, Circle, Play, Pencil, Trash2, Sparkles, ExternalLink } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
+import { isRetainedManagedTerminal, managedTerminalPaneStatus, managedTerminalProjection } from '@/lib/managed-terminal.js'
+import ManagedTerminalRecoveryDetails from './ManagedTerminalRecoveryDetails.js'
+import type { BackgroundTerminal } from '@/store/types'
 
-type TerminalOverview = {
+type TerminalOverview = BackgroundTerminal & {
   terminalId: string
   title: string
   description?: string
   createdAt: number
   lastActivityAt: number
-  status: 'running' | 'exited'
   hasClients: boolean
   cwd?: string
-  mode?: string
   /** Unified agent names (Task 1/2 projection): the terminal's naming
    * identity and its last-known canonical record. */
   nameRef?: SessionNameRef
@@ -147,7 +148,33 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
   }, [ws])
 
   const runningTerminals = items.filter((t) => t.status === 'running')
+  const attachableTerminals = items.filter((t) => t.status !== 'exited' && (t.status === 'running' || isRetainedManagedTerminal(t)))
   const exitedTerminals = items.filter((t) => t.status === 'exited')
+
+  const openTerminal = (terminal: TerminalOverview) => {
+    const existing = findTabByTerminalId(terminal.terminalId)
+    if (existing) {
+      dispatch(setActiveTab(existing.id))
+    } else {
+      const tabId = nanoid()
+      const status = managedTerminalPaneStatus(terminal, terminal.status === 'exited' ? 'exited' : 'running')
+      const mode = isRetainedManagedTerminal(terminal) ? terminal.mode : 'shell'
+      dispatch(addTab({ id: tabId, title: terminal.title, status, mode,
+        ...(isRetainedManagedTerminal(terminal) ? {
+          initialCwd: terminal.cwd, sessionRef: terminal.sessionRef,
+          ...managedTerminalProjection(terminal),
+        } : {}),
+      }))
+      dispatch(initLayout({ tabId, content: {
+        kind: 'terminal', mode, terminalId: terminal.terminalId, status,
+        ...(isRetainedManagedTerminal(terminal) ? {
+          initialCwd: terminal.cwd, sessionRef: terminal.sessionRef,
+          ...managedTerminalProjection(terminal),
+        } : {}),
+      } }))
+    }
+    onOpenTab?.()
+  }
 
   return (
     <div className="h-full flex flex-col">
@@ -193,32 +220,21 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
           )}
 
           {/* Running terminals */}
-          {runningTerminals.length > 0 && (
+          {attachableTerminals.length > 0 && (
             <div>
               <h2 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
                 <Circle className="h-2 w-2 fill-success text-success" />
-                Running
+                {attachableTerminals.length === runningTerminals.length ? 'Running' : 'Terminals'}
               </h2>
               <div className="space-y-2">
-                {runningTerminals
+                {attachableTerminals
                   .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
                   .map((t) => (
                     <TerminalCard
                       key={t.terminalId}
                       terminal={t}
                       isOpen={!!findTabByTerminalId(t.terminalId)}
-                      onOpen={() => {
-                        const existing = findTabByTerminalId(t.terminalId)
-                        if (existing) {
-                          dispatch(setActiveTab(existing.id))
-                          onOpenTab?.()
-                          return
-                        }
-                        const tabId = nanoid()
-                        dispatch(addTab({ id: tabId, title: t.title, status: 'running', mode: 'shell' }))
-                        dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell', terminalId: t.terminalId, status: 'running' } }))
-                        onOpenTab?.()
-                      }}
+                      onOpen={() => openTerminal(t)}
                       onRename={async (title, description) => {
                         const scoped = terminalCardScopedRename(t)
                         await renameOverviewTerminal({
@@ -270,18 +286,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                       key={t.terminalId}
                       terminal={t}
                       isOpen={!!findTabByTerminalId(t.terminalId)}
-                      onOpen={() => {
-                        const existing = findTabByTerminalId(t.terminalId)
-                        if (existing) {
-                          dispatch(setActiveTab(existing.id))
-                          onOpenTab?.()
-                          return
-                        }
-                        const tabId = nanoid()
-                        dispatch(addTab({ id: tabId, title: t.title, status: 'exited', mode: 'shell' }))
-                        dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell', terminalId: t.terminalId, status: 'exited' } }))
-                        onOpenTab?.()
-                      }}
+                      onOpen={() => openTerminal(t)}
                       onRename={async (title, description) => {
                         const scoped = terminalCardScopedRename(t)
                         await renameOverviewTerminal({
@@ -499,6 +504,8 @@ function TerminalCard({
               </span>
             )}
           </div>
+
+          <ManagedTerminalRecoveryDetails terminal={terminal} />
 
           {nativeSyncStatus && nativeSyncStatus.status !== 'synced' ? (
             <div

@@ -1,5 +1,8 @@
 import type { CodingCliProviderName } from './coding-cli-types'
-import type { TokenSummary } from '@shared/ws-protocol'
+import {
+  FreshAgentCheckpointOutcomeSchema,
+  type TokenSummary,
+} from '@shared/ws-protocol'
 import type { TitleSource } from '@shared/title-source'
 import {
   FreshAgentSnapshotSchema,
@@ -8,7 +11,11 @@ import { FreshAgentApiContractError } from '@/lib/fresh-agent-api-error'
 import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
-import type { SessionLocator } from '@/store/paneTypes'
+import {
+  normalizeFreshAgentCheckpointWorkspace,
+  type FreshAgentCheckpointWorkspace,
+  type SessionLocator,
+} from '@/store/paneTypes'
 import type { RecoveryInventory } from '@/lib/recovery/types'
 import type { Machine } from '@/lib/machine-identity'
 import {
@@ -622,6 +629,43 @@ export async function getFreshAgentModelCapabilities(
   }
 }
 
+const FreshAgentCheckpointOutcomePageSchema = z.object({
+  outcomes: z.array(FreshAgentCheckpointOutcomeSchema),
+  nextCursor: z.string().min(1).optional(),
+}).strict()
+
+export type FreshAgentCheckpointOutcomePage = z.infer<typeof FreshAgentCheckpointOutcomePageSchema>
+
+export async function getFreshAgentCheckpointOutcomePage(
+  identity: {
+    provider: string
+    sessionId: string
+    sessionType: string
+    cursor?: string
+  },
+  options: ApiRequestOptions = {},
+): Promise<FreshAgentCheckpointOutcomePage> {
+  const query = new URLSearchParams({
+    provider: identity.provider,
+    sessionId: identity.sessionId,
+    sessionType: identity.sessionType,
+    limit: '200',
+  })
+  if (identity.cursor) query.set('cursor', identity.cursor)
+  const raw = await with429Retry(
+    () => api.get(`/api/fresh-agent/checkpoints/outcomes?${query.toString()}`, options),
+    options,
+  )
+  const parsed = FreshAgentCheckpointOutcomePageSchema.safeParse(raw)
+  if (!parsed.success) {
+    throw new FreshAgentApiContractError(
+      'Fresh-agent checkpoint outcome response did not match the shared contract.',
+      parsed.error.issues,
+    )
+  }
+  return parsed.data
+}
+
 export async function refreshFreshAgentModelCapabilities(
   sessionType: string,
   options: ApiRequestOptions & { cwd?: string } = {},
@@ -735,6 +779,7 @@ export type SearchResult = {
   provider: CodingCliProviderName
   projectPath: string
   checkoutPath?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   title?: string
   summary?: string
   sessionType?: string
@@ -828,52 +873,78 @@ function groupDirectoryItemsAsProjects(
     // selectors see it. Absent map (older server) → no color, exactly the
     // pre-SESSION-05 behavior.
     ...(projectColors?.[projectPath] ? { color: projectColors[projectPath] } : {}),
-    sessions: sessions.map((item) => ({
-      provider: item.provider,
-      sessionId: item.sessionId,
-      projectPath: item.projectPath,
-      ...(item.checkoutPath ? { checkoutPath: item.checkoutPath } : {}),
-      lastActivityAt: item.lastActivityAt,
-      createdAt: item.createdAt,
-      archived: item.archived,
-      cwd: item.cwd,
-      title: item.title,
-      summary: item.summary,
-      isSubagent: item.isSubagent,
-      isNonInteractive: item.isNonInteractive,
-      isRunning: item.isRunning,
-      runningTerminalId: item.runningTerminalId,
-      liveTerminalOnly: item.liveTerminalOnly,
-      firstUserMessage: item.firstUserMessage,
-      sessionType: item.sessionType,
-      // STATUS-STRIP: window rows carry live usage so the fresh-agent strip
-      // context meter reads the same data the sidebar fetches.
-      ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
-      // b5fb: the reviewed reset flow's provenance fields (allowlist mapper —
-      // forward explicitly or they never reach Redux).
-      ...(item.titleOverridden ? { titleOverridden: true } : {}),
-      ...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
-      ...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
-      // Unified agent names (Task 2 projection): the row's canonical ref +
-      // last-known name — a fresh second client's sessionNames cache
-      // bootstraps from these (its ready-time read races its hydration).
-      ...(item.nameRef ? { nameRef: item.nameRef } : {}),
-      ...(item.sessionName !== undefined ? { sessionName: item.sessionName } : {}),
-    })),
+    sessions: sessions.map((item) => {
+      const checkpointWorkspace = checkpointWorkspaceForDirectoryItem(item)
+      return {
+        provider: item.provider,
+        sessionId: item.sessionId,
+        projectPath: item.projectPath,
+        ...(item.checkoutPath ? { checkoutPath: item.checkoutPath } : {}),
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
+        lastActivityAt: item.lastActivityAt,
+        createdAt: item.createdAt,
+        archived: item.archived,
+        cwd: item.cwd,
+        title: item.title,
+        summary: item.summary,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
+        isRunning: item.isRunning,
+        runningTerminalId: item.runningTerminalId,
+        liveTerminalOnly: item.liveTerminalOnly,
+        firstUserMessage: item.firstUserMessage,
+        sessionType: item.sessionType,
+        // STATUS-STRIP: window rows carry live usage so the fresh-agent strip
+        // context meter reads the same data the sidebar fetches.
+        ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
+        // b5fb: the reviewed reset flow's provenance fields (allowlist mapper —
+        // forward explicitly or they never reach Redux).
+        ...(item.titleOverridden ? { titleOverridden: true } : {}),
+        ...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
+        ...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
+        // Unified agent names (Task 2 projection): the row's canonical ref +
+        // last-known name — a fresh second client's sessionNames cache
+        // bootstraps from these (its ready-time read races its hydration).
+        ...(item.nameRef ? { nameRef: item.nameRef } : {}),
+        ...(item.sessionName !== undefined ? { sessionName: item.sessionName } : {}),
+      }
+    }),
   }))
+}
+
+function checkpointWorkspaceForDirectoryItem(
+  item: Pick<ReadModelSessionDirectoryItem, 'checkoutPath' | 'projectPath' | 'checkpointWorkspace'>,
+): FreshAgentCheckpointWorkspace | undefined {
+  // The picked scope is independent of launch cwd. `checkoutPath` is a
+  // presentation value that can fall back to cwd, so it cannot override a
+  // separately persisted picker choice.
+  const explicitWorkspace = normalizeFreshAgentCheckpointWorkspace(item.checkpointWorkspace)
+  if (explicitWorkspace?.provenance === 'directory-picker') return explicitWorkspace
+  if (item.checkoutPath) {
+    return normalizeFreshAgentCheckpointWorkspace({ path: item.checkoutPath, provenance: 'resolved-project' })
+  }
+  const path = item.projectPath
+  if (!path || path === 'unknown' || path.startsWith('terminal:')) return undefined
+  return normalizeFreshAgentCheckpointWorkspace({ path, provenance: 'resolved-project' })
 }
 
 export async function setSessionMetadata(
   provider: string,
   sessionId: string,
   sessionType: string,
-  options: { sessionTypeSource?: 'explicit' | 'materialized' } = {},
+  options: {
+    sessionTypeSource?: 'explicit' | 'materialized'
+    checkpointWorkspace?: FreshAgentCheckpointWorkspace
+  } = {},
 ): Promise<void> {
   await api.post('/api/session-metadata', {
     provider,
     sessionId,
     sessionType,
     sessionTypeSource: options.sessionTypeSource ?? 'explicit',
+    ...(options.checkpointWorkspace?.provenance === 'directory-picker'
+      ? { checkpointWorkspace: options.checkpointWorkspace }
+      : {}),
   })
 }
 
@@ -1110,31 +1181,36 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
   })) as ReadModelSessionDirectoryPage
 
   const response: SearchResponse = {
-    results: page.items.map((item) => ({
-      sessionId: item.sessionId,
-      provider: item.provider,
-      projectPath: item.projectPath,
-      title: item.title,
-      summary: item.summary,
-      matchedIn: item.matchedIn === 'firstUserMessage' ? 'userMessage' : item.matchedIn ?? 'title',
-      snippet: item.snippet,
-      lastActivityAt: item.lastActivityAt,
-      createdAt: item.createdAt,
-      archived: item.archived,
-      cwd: item.cwd,
-      sessionType: item.sessionType,
-      firstUserMessage: item.firstUserMessage,
-      isSubagent: item.isSubagent,
-      isNonInteractive: item.isNonInteractive,
-      isRunning: item.isRunning,
-      runningTerminalId: item.runningTerminalId,
-      liveTerminalOnly: item.liveTerminalOnly,
-      ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
-      // b5fb: forward the reset-flow provenance fields (allowlist mapper).
-      ...(item.titleOverridden ? { titleOverridden: true } : {}),
-      ...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
-      ...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
-    })),
+    results: page.items.map((item) => {
+      const checkpointWorkspace = checkpointWorkspaceForDirectoryItem(item)
+      return {
+        sessionId: item.sessionId,
+        provider: item.provider,
+        projectPath: item.projectPath,
+        ...(item.checkoutPath ? { checkoutPath: item.checkoutPath } : {}),
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
+        title: item.title,
+        summary: item.summary,
+        matchedIn: item.matchedIn === 'firstUserMessage' ? 'userMessage' : item.matchedIn ?? 'title',
+        snippet: item.snippet,
+        lastActivityAt: item.lastActivityAt,
+        createdAt: item.createdAt,
+        archived: item.archived,
+        cwd: item.cwd,
+        sessionType: item.sessionType,
+        firstUserMessage: item.firstUserMessage,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
+        isRunning: item.isRunning,
+        runningTerminalId: item.runningTerminalId,
+        liveTerminalOnly: item.liveTerminalOnly,
+        ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
+        // b5fb: forward the reset-flow provenance fields (allowlist mapper).
+        ...(item.titleOverridden ? { titleOverridden: true } : {}),
+        ...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
+        ...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
+      }
+    }),
     tier,
     query,
     totalScanned: page.items.length,

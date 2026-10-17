@@ -43,6 +43,12 @@ mod managed_mcp_capability;
 mod managed_ports;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_provider_bootstrap;
+#[cfg(all(test, unix, feature = "managed-provider-qualification"))]
+mod managed_provider_launch_tests;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_provider_references;
+#[cfg(all(test, unix, feature = "managed-provider-qualification"))]
+mod managed_provider_sdk_tests;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime;
 #[cfg(feature = "managed-runtime-v1")]
@@ -997,6 +1003,14 @@ async fn main() -> ExitCode {
     // socket — the original `WsHandler.broadcast`. Capacity is generous so a paced
     // fresh-agent turn's handful of broadcasts never laps a briefly-busy consumer.
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(1024).0);
+    let checkpoint_home = Arc::new(home.clone().unwrap_or_else(|| PathBuf::from(".")));
+    let checkpoint_service = Arc::new(checkpoints::CheckpointService::new(
+        Arc::clone(&checkpoint_home),
+        Arc::clone(&broadcast_tx),
+    ));
+    let checkpoint_barrier: Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier> =
+        checkpoint_service.clone();
+    checkpoint_service.start_observer();
 
     // The shared UI-screenshot broker over that same bus: `POST /api/screenshots`
     // registers a request + broadcasts `screenshot.capture`; the `/ws` loop routes
@@ -1018,6 +1032,20 @@ async fn main() -> ExitCode {
         Arc::clone(&broadcast_tx),
         serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({})),
     );
+    let checkpoint_event_persister: freshell_freshagent::CheckpointEventPersister = {
+        let checkpoint_service = Arc::clone(&checkpoint_service);
+        Arc::new(move |frame, require_match| {
+            let service = Arc::clone(&checkpoint_service);
+            Box::pin(async move {
+                service
+                    .persist_event_before_broadcast_with_match(&frame, require_match)
+                    .await
+            })
+        })
+    };
+    fresh_codex_state
+        .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
+        .expect("Codex checkpoint event persister is installed once");
 
     // The freshclaude WS fresh-agent slice: shares the broadcast bus so its
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the
@@ -1025,6 +1053,9 @@ async fn main() -> ExitCode {
     // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
     let mut fresh_claude_state =
         freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    fresh_claude_state
+        .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
+        .expect("Claude checkpoint event persister is installed once");
 
     // Task 12 (D8 for fresh agents): the ONE server-wide per-sessionRef create/resume
     // lease map, shared by every fresh-agent runtime (keys are provider-namespaced).
@@ -1098,6 +1129,9 @@ async fn main() -> ExitCode {
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
             .with_layout(layout_store.clone())
             .with_ownership(Arc::clone(&ownership));
+    fresh_agent_state
+        .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
+        .expect("OpenCode checkpoint event persister is installed once");
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =
@@ -1119,10 +1153,13 @@ async fn main() -> ExitCode {
     // the registry's kill/exit/confirmed-kill paths release coordinator
     // ownership fenced (release-only integration; the WS/REST/auto-resume
     // lanes claim).
+    let managed_environment_fixture_only =
+        std::env::var("FRESHELL_MANAGED_ENVIRONMENT_FIXTURE_ONLY").as_deref() == Ok("1");
     let registry = freshell_terminal::TerminalRegistry::new()
-        .with_ownership(std::sync::Arc::clone(&ownership));
+        .with_ownership(std::sync::Arc::clone(&ownership))
+        .with_managed_environment_fixture_only(managed_environment_fixture_only);
     #[cfg(feature = "managed-runtime-v1")]
-    let (managed_runtime_available, managed_runtime_client) = {
+    let (managed_runtime_available, managed_runtime_client, managed_runtime_controller) = {
         let controller = managed_runtime::ServerManagedRuntimeController::from_env()
             .await
             .map_err(|error| {
@@ -1146,13 +1183,18 @@ async fn main() -> ExitCode {
                 });
             managed_mcp_capability::spawn_renewal_loop(client.clone());
         }
-        registry.set_managed_controller(controller.map(|controller| {
+        registry.set_managed_controller(controller.clone().map(|controller| {
             controller as Arc<dyn freshell_terminal::registry::ManagedTerminalController>
         }));
-        (available, client)
+        (available, client, controller)
     };
     #[cfg(not(feature = "managed-runtime-v1"))]
     let managed_runtime_available = false;
+    if managed_environment_fixture_only && !managed_runtime_available {
+        tracing::error!("managed_environment_fixture.controller_unavailable");
+        eprintln!("managed environment fixture requires an initialized managed runtime controller");
+        std::process::exit(1);
+    }
     #[cfg(feature = "managed-runtime-v1")]
     let hosted_fresh_gateway = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
         managed_runtime_client.clone(),
@@ -1164,6 +1206,8 @@ async fn main() -> ExitCode {
     });
     #[cfg(feature = "managed-runtime-v1")]
     if let Some(gateway) = hosted_fresh_gateway.as_ref() {
+        gateway.set_checkpoint_barrier(Arc::clone(&checkpoint_barrier));
+        gateway.set_ownership(Arc::clone(&ownership));
         fresh_agent_state
             .set_hosted_rest_gateway(gateway.clone())
             .unwrap_or_else(|error| {
@@ -2266,6 +2310,9 @@ async fn main() -> ExitCode {
             interest: host_stats_interest.clone(),
             collector: Some(host_stats_collector.clone()),
         },
+        checkpoint_send: freshell_ws::checkpoint_barrier::WsCheckpointState {
+            service: Some(Arc::clone(&checkpoint_barrier)),
+        },
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),
         cli_commands: Arc::clone(&cli_commands),
@@ -2987,7 +3034,8 @@ async fn main() -> ExitCode {
     // back to the cwd-relative `.` the other home-relative state above uses.
     let checkpoints_state = checkpoints::CheckpointsApiState {
         auth_token: Arc::clone(&auth_token),
-        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+        home: Arc::clone(&checkpoint_home),
+        service: Arc::clone(&checkpoint_service),
     };
 
     // `POST /api/fresh-agent/attachments` (`fresh-agent-extras-router.ts:260-287`):
@@ -3050,7 +3098,8 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|error| {
             eprintln!("managed runtime API initialization failed: {error}");
             std::process::exit(1);
-        });
+        })
+        .with_terminal_controller(managed_runtime_controller.clone());
         state.spawn_projector();
         managed_runtime_api::router(state)
     };
@@ -4655,6 +4704,7 @@ mod sessions_sweep_tests {
             screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),

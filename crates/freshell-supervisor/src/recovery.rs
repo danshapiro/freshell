@@ -28,6 +28,12 @@ use freshell_runtime_protocol::{
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep, Duration, Instant};
 
+#[cfg(test)]
+pub(crate) const LIVE_RESUME_EVIDENCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+pub(crate) const LIVE_RESUME_EVIDENCE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const LIVE_RESUME_EVIDENCE_ATTEMPT_CACHE_MAX_ENTRIES: usize = 1_024;
+
 impl Supervisor {
     pub(crate) async fn probe_recovery(
         &self,
@@ -59,7 +65,7 @@ impl Supervisor {
                     RecoveryBlockReason::OldRuntimeNotEmpty,
                     &message,
                     None,
-                ))
+                ));
             }
             Err(error) => {
                 return Ok(blocked(
@@ -67,7 +73,7 @@ impl Supervisor {
                     RecoveryBlockReason::ProviderUnavailable,
                     &error.to_string(),
                     Some(2_000),
-                ))
+                ));
             }
         };
 
@@ -109,6 +115,16 @@ impl Supervisor {
                             .await
                             .map_err(map_registry)?;
                     }
+                    if !status.exited {
+                        if context.provider != "shell" && context.resume_spec.is_none() {
+                            self.capture_live_resume_evidence(&context, &host, &status)
+                                .await;
+                        }
+                        return Ok(live_reattach_probe(&context, &status));
+                    }
+                    if context.provider == "shell" {
+                        return Ok(shell_terminal_end_probe(&context));
+                    }
                     let candidate = match resume_catalog::exact_resume_candidate(
                         &context,
                         status.native_session_id.as_deref(),
@@ -130,9 +146,22 @@ impl Supervisor {
                         RecoveryProbe::ResumeReady { resume_spec, .. } => {
                             let stored = self
                                 .registry
-                                .store_verified_resume_spec(context.soul_id.clone(), *resume_spec)
+                                .store_verified_resume_spec_for_live_incarnation(
+                                    context.soul_id.clone(),
+                                    context.prior_handle.incarnation_id().clone(),
+                                    context.evidence_revision,
+                                    *resume_spec,
+                                )
                                 .await
                                 .map_err(map_registry)?;
+                            let Some(stored) = stored else {
+                                return Ok(blocked(
+                                    RecoveryPath::NativeResume,
+                                    RecoveryBlockReason::ProviderUnavailable,
+                                    "provider-store evidence was superseded by a newer incarnation or recovery state; retry the probe",
+                                    Some(2_000),
+                                ));
+                            };
                             RecoveryProbe::ResumeReady {
                                 evidence_revision: stored.evidence_revision,
                                 resume_spec: Box::new(stored),
@@ -141,16 +170,6 @@ impl Supervisor {
                         other => other,
                     };
 
-                    if !status.exited {
-                        return Ok(RecoveryProbe::ReattachReady {
-                            handle: ReattachHandle {
-                                incarnation_id: context.prior_handle.incarnation_id().clone(),
-                                host_boot_id: status.host_boot_id,
-                                container_id: context.prior_handle.container_id().to_string(),
-                            },
-                            protocol_version: CONTROL_PROTOCOL_VERSION,
-                        });
-                    }
                     return Ok(after_native_probe(&context, captured));
                 }
                 Err(_) if context.resume_spec.is_some() => return offline_probe(&context),
@@ -160,7 +179,7 @@ impl Supervisor {
                         RecoveryBlockReason::ProviderUnavailable,
                         &error.message,
                         Some(2_000),
-                    ))
+                    ));
                 }
             }
         }
@@ -181,6 +200,114 @@ impl Supervisor {
             ),
             Some(2_000),
         ))
+    }
+
+    /// Capture a verified exact-session resume proof while the provider store
+    /// is still reachable. A live process remains reattachable even when the
+    /// provider cannot produce a proof yet; the lifecycle event records that
+    /// gap so an eventual whole-enclosure exit does not look like a mystery.
+    async fn capture_live_resume_evidence(
+        &self,
+        context: &RecoveryContext,
+        host: &crate::service::AuthenticatedHost,
+        status: &crate::service::HostStatus,
+    ) {
+        if !self.live_resume_evidence_capture_due(context, status).await {
+            return;
+        }
+
+        let capture = match resume_catalog::exact_resume_candidate(
+            context,
+            status.native_session_id.as_deref(),
+        ) {
+            Ok(Some(candidate)) => {
+                match self.probe_host_store(context, host, Some(candidate)).await {
+                    Ok(RecoveryProbe::ResumeReady { resume_spec, .. }) => {
+                        match self
+                            .registry
+                            .store_verified_resume_spec_for_live_incarnation(
+                                context.soul_id.clone(),
+                                context.prior_handle.incarnation_id().clone(),
+                                context.evidence_revision,
+                                *resume_spec,
+                            )
+                            .await
+                        {
+                            Ok(Some(stored)) => serde_json::json!({
+                                "result": "captured",
+                                "evidenceRevision": stored.evidence_revision,
+                            }),
+                            Ok(None) => serde_json::json!({
+                                "result": "superseded",
+                            }),
+                            Err(error) => serde_json::json!({
+                                "result": "persist_failed",
+                                "error": error.to_string(),
+                            }),
+                        }
+                    }
+                    Ok(probe) => serde_json::json!({
+                        "result": "not_verified",
+                        "probe": probe,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "result": "probe_failed",
+                        "errorCode": error.code,
+                        "error": error.message,
+                    }),
+                }
+            }
+            Ok(None) => serde_json::json!({ "result": "identity_unavailable" }),
+            Err(probe) => serde_json::json!({
+                "result": "candidate_blocked",
+                "probe": probe,
+            }),
+        };
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.live_resume_evidence",
+            serde_json::json!({
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "provider": context.provider,
+                "capture": capture,
+            }),
+        );
+    }
+
+    async fn live_resume_evidence_capture_due(
+        &self,
+        context: &RecoveryContext,
+        status: &crate::service::HostStatus,
+    ) -> bool {
+        let key = (
+            context.soul_id.as_str().to_string(),
+            context.prior_handle.incarnation_id().as_str().to_string(),
+            status
+                .native_session_id
+                .clone()
+                .or_else(|| context.native_session_id.clone()),
+        );
+        let now = Instant::now();
+        let mut attempts = self.live_resume_evidence_attempts.lock().await;
+        attempts.retain(|_, attempted_at| {
+            now.duration_since(*attempted_at) < LIVE_RESUME_EVIDENCE_RETRY_INTERVAL
+        });
+        if attempts.contains_key(&key) {
+            return false;
+        }
+
+        if attempts.len() >= LIVE_RESUME_EVIDENCE_ATTEMPT_CACHE_MAX_ENTRIES {
+            if let Some(oldest_key) = attempts
+                .iter()
+                .min_by_key(|(_, attempted_at)| **attempted_at)
+                .map(|(key, _)| key.clone())
+            {
+                attempts.remove(&oldest_key);
+            }
+        }
+        attempts.insert(key, now);
+        true
     }
 
     async fn probe_host_store(
@@ -258,6 +385,30 @@ impl Supervisor {
                     view,
                 });
             }
+            if view.desired_state == DesiredState::Running
+                && view.recovery_state == freshell_runtime_protocol::RecoveryState::Blocked
+                && matches!(
+                    view.recovery_reason.as_deref(),
+                    Some("RETRY_BUDGET" | "BLOCKED_RETRY_BUDGET")
+                )
+                && request.trigger != RecoveryTrigger::ManualRetry
+            {
+                return Ok(RecoveryResult {
+                    outcome: RecoveryOutcome::Blocked,
+                    probe: Some(blocked(
+                        RecoveryPath::NativeResume,
+                        RecoveryBlockReason::RetryBudget,
+                        "automatic recovery budget is exhausted; repair the dependency and explicitly retry",
+                        None,
+                    )),
+                    view,
+                    prior_incarnation_id: None,
+                    attempt_id: None,
+                    expected_native_session_id: None,
+                    observed_native_session_id: None,
+                    incident_id: None,
+                });
+            }
         }
         if self
             .registry
@@ -316,6 +467,12 @@ impl Supervisor {
                     .mark_recovery_live(request.soul_id.clone(), handle.incarnation_id.clone())
                     .await
                     .map_err(map_registry)?;
+                let owned = self
+                    .registry
+                    .owned_handle(handle.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                self.complete_pending_provider_preparation(&owned).await?;
                 Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Reattached,
                     view: self.view_for(&handle.incarnation_id).await?,
@@ -392,6 +549,12 @@ impl Supervisor {
                             )
                             .await
                             .map_err(map_registry)?;
+                        let owned = self
+                            .registry
+                            .owned_handle(handle.incarnation_id.clone())
+                            .await
+                            .map_err(map_registry)?;
+                        self.complete_pending_provider_preparation(&owned).await?;
                         Ok(RecoveryResult {
                             outcome: RecoveryOutcome::Reattached,
                             view: self.view_for(&handle.incarnation_id).await?,
@@ -572,6 +735,7 @@ impl Supervisor {
             start.context.terminal.clone()
         };
         let mut replacement_terminal = replacement_terminal;
+        let mut replacement_fresh = fresh_without_raw_bootstrap(start.context.fresh_agent.clone());
         if replacement_terminal.as_ref().is_some_and(|terminal| {
             matches!(
                 terminal.mode.as_str(),
@@ -610,43 +774,45 @@ impl Supervisor {
                 incident_id: None,
             });
         }
-        if let Some(terminal) = replacement_terminal.as_mut() {
-            if terminal
-                .provider_launch_context
-                .as_ref()
-                .and_then(|context| context.mcp_capability.as_ref())
-                .is_some()
-            {
-                let tui_source = terminal
-                    .provider_launch_context
-                    .as_ref()
-                    .and_then(|context| {
-                        if let freshell_runtime_protocol::ProviderPreparation::Opencode {
-                            tui_source,
-                            ..
-                        } = &context.preparation
-                        {
-                            tui_source.as_ref()
-                        } else {
-                            None
-                        }
-                    });
-                let refreshed_capability = self
-                    .issue_replacement_mcp_capability(&soul_id, &terminal.mode, tui_source, &terminal.workspace_path)
-                    .await
-                    .and_then(|reference| {
-                        crate::backend::docker::staged_provider_root_for_grant(
-                            &reference.grant_id,
+        let replacement_context = replacement_terminal
+            .as_ref()
+            .and_then(|terminal| {
+                terminal.provider_launch_context.as_ref().map(|context| {
+                    (
+                        terminal.mode.clone(),
+                        context.clone(),
+                        terminal.provider_secret_references.clone(),
+                        terminal.cwd.clone(),
+                        terminal.workspace_path.clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                replacement_fresh.as_ref().and_then(|agent| {
+                    agent.provider_launch_context.as_ref().map(|context| {
+                        (
+                            agent.provider.native_provider().to_owned(),
+                            context.clone(),
+                            agent.provider_secret_references.clone(),
+                            agent.cwd.clone(),
+                            agent.workspace_path.clone(),
                         )
-                        .map(|staged_root| (reference, staged_root))
-                        .map_err(|error| {
-                            RuntimeError::new(
-                                    RuntimeErrorCode::HostUnreachable,
-                                    format!("capability_pending: staged provider root unavailable: {error}"),
-                                )
-                        })
-                    });
-                let (reference, staged_root) = match refreshed_capability {
+                    })
+                })
+            });
+        if let Some((provider, context, references, cwd, workspace)) = replacement_context {
+            if context.mcp_capability.is_some() {
+                let refreshed_capability = self
+                    .issue_replacement_mcp_capability(
+                        &start,
+                        &provider,
+                        &context,
+                        &references,
+                        &cwd,
+                        &workspace,
+                    )
+                    .await;
+                let prepared_context = match refreshed_capability {
                     Ok(refreshed) => refreshed,
                     Err(error) => {
                         let reason = RecoveryBlockReason::CapabilityPending;
@@ -673,8 +839,11 @@ impl Supervisor {
                         });
                     }
                 };
-                replace_terminal_mcp_reference(terminal, reference);
-                refresh_terminal_provider_config(terminal, &staged_root);
+                install_prepared_provider_context(
+                    replacement_terminal.as_mut(),
+                    replacement_fresh.as_mut(),
+                    prepared_context,
+                )?;
             }
         }
         let prepared = match self
@@ -682,7 +851,7 @@ impl Supervisor {
             .prepare_replacement(
                 start.clone(),
                 replacement_terminal,
-                fresh_without_raw_bootstrap(start.context.fresh_agent.clone()),
+                replacement_fresh,
                 resume_spec.clone(),
                 path,
             )
@@ -852,12 +1021,19 @@ impl Supervisor {
         let provider = start.context.provider.clone();
         self.registry
             .mark_recovery_success(
-                soul_id,
+                soul_id.clone(),
                 prepared.prepared.incarnation_id.clone(),
                 attempt_id.clone(),
             )
             .await
             .map_err(map_registry)?;
+        let accepted = self
+            .registry
+            .owned_handle(prepared.prepared.incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        self.complete_pending_provider_preparation(&accepted)
+            .await?;
         let elapsed_ms = recovery_started
             .elapsed()
             .as_millis()
@@ -921,7 +1097,7 @@ impl Supervisor {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::InvalidRequest,
                     "legacy loss preservation requires a definitive-negative probe",
-                ))
+                ));
             }
         };
         let (_, mut preserved_evidence) =
@@ -1199,6 +1375,12 @@ impl Supervisor {
                     .mark_recovery_live(soul_id, handle.incarnation_id.clone())
                     .await
                     .map_err(map_registry)?;
+                let owned = self
+                    .registry
+                    .owned_handle(handle.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                self.complete_pending_provider_preparation(&owned).await?;
                 Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Reattached,
                     view: self.view_for(&handle.incarnation_id).await?,
@@ -1274,50 +1456,8 @@ impl Supervisor {
         for path in provider_paths {
             let row = match path {
                 RecoveryPath::Reattach => self.prove_reattach_unavailable(context).await?,
-                RecoveryPath::NativeResume => match native_probe {
-                    RecoveryProbe::DefinitivelyUnavailable {
-                        reason,
-                        evidence,
-                        store_state,
-                        ..
-                    } => {
-                        if matches!(
-                            store_state,
-                            EvidenceStoreState::Unknown | EvidenceStoreState::PresentUnreadable
-                        ) {
-                            return Err(blocked(
-                                RecoveryPath::NativeResume,
-                                RecoveryBlockReason::StoreUnreadable,
-                                "native provider state is not definitively readable or missing",
-                                None,
-                            ));
-                        }
-                        RecoveryPathEvidence {
-                            path: RecoveryPath::NativeResume,
-                            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                            reason_code: reason.clone(),
-                            evidence_refs: evidence.clone(),
-                            store_state: *store_state,
-                        }
-                    }
-                    other => return Err(other.clone()),
-                },
-                RecoveryPath::CheckpointRestore => {
-                    match checkpoints::probe_after_provider(context, native_probe) {
-                        RecoveryProbe::DefinitivelyUnavailable {
-                            reason,
-                            evidence,
-                            store_state,
-                            ..
-                        } => RecoveryPathEvidence {
-                            path: RecoveryPath::CheckpointRestore,
-                            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                            reason_code: reason,
-                            evidence_refs: evidence,
-                            store_state,
-                        },
-                        other => return Err(other),
-                    }
+                RecoveryPath::NativeResume | RecoveryPath::CheckpointRestore => {
+                    checkpoints::inspected_negative(native_probe, *path)?
                 }
                 RecoveryPath::PristineSeed => {
                     if context.never_dispatched {
@@ -1329,6 +1469,14 @@ impl Supervisor {
                             ),
                         });
                     }
+                    if context.dispatched_command_count == 0 {
+                        return Err(blocked(
+                            RecoveryPath::PristineSeed,
+                            RecoveryBlockReason::AmbiguousIdentity,
+                            "initialization/native identity is uncertain; no durable input dispatch establishes pristine-seed unavailability",
+                            None,
+                        ));
+                    }
                     RecoveryPathEvidence {
                         path: RecoveryPath::PristineSeed,
                         verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
@@ -1336,6 +1484,10 @@ impl Supervisor {
                         evidence_refs: vec![
                             format!("acceptedCommandCount={}", context.accepted_command_count),
                             format!("completedCommandCount={}", context.completed_command_count),
+                            format!(
+                                "dispatchedCommandCount={}",
+                                context.dispatched_command_count
+                            ),
                         ],
                         store_state: EvidenceStoreState::NotApplicable,
                     }
@@ -1427,14 +1579,7 @@ impl Supervisor {
                         )
                     })?;
                 if !status.exited {
-                    return Err(RecoveryProbe::ReattachReady {
-                        handle: ReattachHandle {
-                            incarnation_id: context.prior_handle.incarnation_id().clone(),
-                            host_boot_id: status.host_boot_id,
-                            container_id: context.prior_handle.container_id().to_string(),
-                        },
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
-                    });
+                    return Err(live_reattach_probe(context, &status));
                 }
                 Ok(RecoveryPathEvidence {
                     path: RecoveryPath::Reattach,
@@ -1645,6 +1790,7 @@ impl Supervisor {
                     request_id: request_id.clone(),
                     text: command.data,
                     settings: Some(fresh_agent_replay_settings(agent)),
+                    checkpoint_logical_attempt_id: None,
                 }
             } else {
                 HostCommand::TerminalInput {
@@ -1874,95 +2020,98 @@ fn fresh_agent_replay_settings(
 }
 
 fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe) -> RecoveryProbe {
-    match probe {
-        ready @ RecoveryProbe::ResumeReady { .. }
-        | ready @ RecoveryProbe::Blocked { .. }
-        | ready @ RecoveryProbe::PristineSeedReady { .. }
-        | ready @ RecoveryProbe::ReattachReady { .. } => ready,
-        RecoveryProbe::DefinitivelyUnavailable {
-            reason,
-            mut evidence,
-            store_state,
-            ..
-        } => {
-            if context.never_dispatched {
-                return RecoveryProbe::PristineSeedReady {
-                    seed: context.creation_seed_ref.clone(),
-                    never_dispatched_proof: format!(
-                        "{}:supervisor-and-host-command-journals-empty",
-                        context.soul_id
-                    ),
-                };
-            }
-            match checkpoints::probe_after_provider(
-                context,
-                &RecoveryProbe::DefinitivelyUnavailable {
-                    path: RecoveryPath::NativeResume,
-                    reason: reason.clone(),
-                    evidence: evidence.clone(),
-                    store_state,
-                },
-            ) {
-                blocked @ RecoveryProbe::Blocked { .. } => blocked,
-                RecoveryProbe::DefinitivelyUnavailable {
-                    reason: checkpoint_reason,
-                    evidence: checkpoint_evidence,
-                    ..
-                } => {
-                    evidence.extend(checkpoint_evidence);
-                    RecoveryProbe::DefinitivelyUnavailable {
-                        path: RecoveryPath::NativeResume,
-                        reason: format!(
-                            "native resume unavailable ({reason}); checkpoint unavailable ({checkpoint_reason}); pristine seed forbidden after dispatch"
-                        ),
-                        evidence,
-                        store_state,
-                    }
-                }
-                other => other,
-            }
-        }
+    if !matches!(probe, RecoveryProbe::DefinitivelyUnavailable { .. }) {
+        return probe;
+    }
+    if context.never_dispatched {
+        return RecoveryProbe::PristineSeedReady {
+            seed: context.creation_seed_ref.clone(),
+            never_dispatched_proof: format!(
+                "{}:supervisor-and-host-command-journals-empty",
+                context.soul_id
+            ),
+        };
+    }
+    if let Err(blocked) = checkpoints::inspected_negative(&probe, RecoveryPath::NativeResume) {
+        return blocked;
+    }
+    match checkpoints::probe_after_provider(context, &probe) {
+        RecoveryProbe::DefinitivelyUnavailable { .. } => probe,
+        other => other,
+    }
+}
+
+fn live_reattach_probe(
+    context: &RecoveryContext,
+    status: &crate::service::HostStatus,
+) -> RecoveryProbe {
+    if status.worker_pid.is_none() {
+        return blocked(
+            RecoveryPath::Reattach,
+            RecoveryBlockReason::ProviderUnavailable,
+            "host has no confirmed provider worker; process termination remains unknown",
+            Some(2_000),
+        );
+    }
+    RecoveryProbe::ReattachReady {
+        handle: ReattachHandle {
+            incarnation_id: context.prior_handle.incarnation_id().clone(),
+            host_boot_id: status.host_boot_id.clone(),
+            container_id: context.prior_handle.container_id().to_string(),
+        },
+        protocol_version: CONTROL_PROTOCOL_VERSION,
+    }
+}
+
+/// Called only after authenticated worker exit or an owned ended backend
+/// inspection. Final loss certification independently rechecks that proof.
+fn shell_terminal_end_probe(context: &RecoveryContext) -> RecoveryProbe {
+    if context.never_dispatched {
+        return RecoveryProbe::PristineSeedReady {
+            seed: context.creation_seed_ref.clone(),
+            never_dispatched_proof: format!(
+                "{}:supervisor-input-journal-undispatched",
+                context.soul_id
+            ),
+        };
+    }
+    RecoveryProbe::DefinitivelyUnavailable {
+        path: RecoveryPath::Reattach,
+        reason: "non-resumable shell ended after input dispatch".into(),
+        evidence: vec![format!(
+            "incarnationId={}",
+            context.prior_handle.incarnation_id()
+        )],
+        store_state: EvidenceStoreState::NotApplicable,
+        negative_paths: Vec::new(),
     }
 }
 
 fn offline_probe(context: &RecoveryContext) -> Result<RecoveryProbe, RuntimeError> {
+    if context.provider == "shell" {
+        return Ok(shell_terminal_end_probe(context));
+    }
     if let Some(spec) = context.resume_spec.clone() {
         return Ok(RecoveryProbe::ResumeReady {
             evidence_revision: spec.evidence_revision,
             resume_spec: Box::new(spec),
         });
     }
-    if context.native_session_id.is_some() {
-        return Ok(blocked(
-            RecoveryPath::NativeResume,
-            RecoveryBlockReason::StoreUnreadable,
-            "a native identity was allocated, but no verified durable resume evidence was captured",
-            None,
-        ));
-    }
     if context.never_dispatched {
         return Ok(RecoveryProbe::PristineSeedReady {
             seed: context.creation_seed_ref.clone(),
-            never_dispatched_proof: format!("{}:supervisor-input-journal-empty", context.soul_id),
+            never_dispatched_proof: format!(
+                "{}:supervisor-input-journal-and-initialization-undispatched",
+                context.soul_id
+            ),
         });
     }
-    match checkpoints::probe(context) {
-        blocked_probe @ RecoveryProbe::Blocked { .. } => Ok(blocked_probe),
-        RecoveryProbe::DefinitivelyUnavailable {
-            mut evidence,
-            reason,
-            ..
-        } => {
-            evidence.push("nativeResume=definitively_unavailable".into());
-            Ok(RecoveryProbe::DefinitivelyUnavailable {
-                path: RecoveryPath::NativeResume,
-                reason: format!("native resume unavailable; {reason}"),
-                evidence,
-                store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
-            })
-        }
-        other => Ok(other),
-    }
+    Ok(blocked(
+        RecoveryPath::NativeResume,
+        RecoveryBlockReason::AmbiguousIdentity,
+        "native identity/resume metadata is unrecorded or unverified; provider store absence has not been established",
+        None,
+    ))
 }
 
 fn downtime_bucket(elapsed_ms: u64) -> &'static str {
@@ -2061,22 +2210,7 @@ fn terminal_without_first_boot_state(
     })
 }
 
-fn refresh_terminal_provider_config(
-    terminal: &mut TerminalLaunchSpec,
-    user_root: &std::path::Path,
-) {
-    let Some(context) = terminal.provider_launch_context.as_mut() else {
-        return;
-    };
-    refresh_provider_context_from_user_root(
-        context,
-        &terminal.mode,
-        std::path::Path::new(&terminal.workspace_path),
-        std::path::Path::new(&terminal.cwd),
-        user_root,
-    );
-}
-
+#[cfg(test)]
 fn replace_terminal_mcp_reference(
     terminal: &mut TerminalLaunchSpec,
     reference: freshell_runtime_protocol::McpCapabilityReference,
@@ -2086,6 +2220,33 @@ fn replace_terminal_mcp_reference(
     }
 }
 
+fn install_prepared_provider_context(
+    terminal: Option<&mut TerminalLaunchSpec>,
+    fresh: Option<&mut freshell_runtime_protocol::FreshAgentLaunchSpec>,
+    prepared: freshell_runtime_protocol::PreparedProviderContext,
+) -> Result<(), RuntimeError> {
+    match (terminal, fresh) {
+        (Some(terminal), None) => {
+            prepared.validate(&terminal.mode)?;
+            terminal.provider_launch_context = Some(prepared.provider_launch_context);
+            terminal.provider_secret_references = prepared.provider_secret_references;
+        }
+        (None, Some(agent)) => {
+            prepared.validate(agent.provider.native_provider())?;
+            agent.provider_launch_context = Some(prepared.provider_launch_context);
+            agent.provider_secret_references = prepared.provider_secret_references;
+        }
+        _ => {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "complete provider replacement requires exactly one workload",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn refresh_provider_context_from_user_root(
     context: &mut freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
@@ -2198,6 +2359,7 @@ fn refresh_provider_context_from_user_root(
     }
 }
 
+#[cfg(test)]
 fn safe_provider_config_source(
     root: &std::path::Path,
     candidate: &std::path::Path,
@@ -2249,6 +2411,8 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    include!("shell_recovery_tests.rs");
+    include!("retained_output_tests.rs");
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
 
@@ -2352,6 +2516,7 @@ mod tests {
             &RecoveryProbe::DefinitivelyUnavailable {
                 path: RecoveryPath::NativeResume,
                 reason: "structured-negative".into(),
+                negative_paths: Vec::new(),
                 evidence: vec!["digest-only".into()],
                 store_state: EvidenceStoreState::Missing,
             }
@@ -2399,6 +2564,7 @@ mod tests {
         let mut replacement = replacement;
         replacement.provider_launch_context =
             Some(freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
                     project_config: Vec::new(),
                     tui_config: None,
@@ -2424,11 +2590,82 @@ mod tests {
         );
         let reference = replacement
             .provider_launch_context
+            .as_ref()
             .unwrap()
             .mcp_capability
+            .as_ref()
             .unwrap();
         assert_eq!(reference.grant_id, "grant-new");
         assert_eq!(reference.endpoint, "http://host.docker.internal:4001");
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let references = (0..6)
+            .map(|index| freshell_runtime_protocol::ProviderSecretReference {
+                source_path: format!("/private/current-source-{index}"),
+                profile:
+                    freshell_runtime_protocol::ProviderSecretProfile::OpencodeConfigurationFile,
+                provider_relative_path: Some(format!(".freshell/references/{index}")),
+            })
+            .collect::<Vec<_>>();
+        let mut context = replacement
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .clone();
+        context.mcp_capability.as_mut().unwrap().grant_id = generation.clone();
+        context.prepared_inputs = Some(freshell_runtime_protocol::PreparedProviderInputs {
+            generation_id: generation.clone(),
+            initial_auth_reservation: None,
+            manifest: freshell_runtime_protocol::ProviderInputManifestReference {
+                relative_path: ".freshell/input-manifest.json".into(),
+                sha256: "a".repeat(64),
+                source_count: 6,
+                alias_count: 0,
+                recipe_count: 0,
+            },
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: Some(freshell_runtime_protocol::IndexedProviderFiles {
+                volume_name: freshell_runtime_protocol::indexed_provider_volume_name(
+                    &SoulId::new(),
+                    &generation,
+                ),
+                aliases: vec![],
+                staged_source_paths: None,
+            }),
+        });
+        let complete = freshell_runtime_protocol::PreparedProviderContext {
+            provider_launch_context: context,
+            provider_secret_references: references.clone(),
+        };
+        let mut fresh:freshell_runtime_protocol::FreshAgentLaunchSpec=serde_json::from_value(serde_json::json!({
+            "sessionId":"fresh-replacement","provider":"opencode","sessionType":"freshopencode","runtimeVariant":"opencode-serve",
+            "providerStoreId":"store","cwd":"/workspace","workspacePath":"/workspace","runAsUid":65534,"runAsGid":0
+        })).unwrap();
+        install_prepared_provider_context(Some(&mut replacement), None, complete.clone()).unwrap();
+        install_prepared_provider_context(None, Some(&mut fresh), complete).unwrap();
+        assert_eq!(replacement.provider_secret_references, references);
+        assert_eq!(fresh.provider_secret_references, references);
+        assert_eq!(
+            replacement
+                .provider_launch_context
+                .unwrap()
+                .prepared_inputs
+                .unwrap()
+                .generation_id,
+            generation
+        );
+        assert_eq!(
+            fresh
+                .provider_launch_context
+                .unwrap()
+                .prepared_inputs
+                .unwrap()
+                .generation_id,
+            generation
+        );
+        assert_eq!(replacement.program, terminal.program);
+        assert_eq!(replacement.args, terminal.args);
+        assert!(replacement.provider_bootstrap_files.is_empty());
     }
 
     #[test]
@@ -2440,6 +2677,7 @@ mod tests {
         std::fs::create_dir_all(&user_root).unwrap();
         std::fs::write(user_root.join("old.jsonc"), "{}").unwrap();
         let mut context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![],
                 tui_config: None,

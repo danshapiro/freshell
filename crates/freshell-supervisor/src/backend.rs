@@ -1,5 +1,10 @@
+mod claude_source_observation;
 pub mod docker;
+mod input_publisher;
+mod native_auth;
 mod native_history;
+mod prepared_inputs;
+mod provider_mountpoints;
 
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
@@ -39,6 +44,8 @@ pub enum BackendError {
 
 #[derive(Debug, Clone)]
 pub struct CreateRuntimeSpec {
+    pub initial_input_reservation: Option<crate::registry::BoundInputReservation>,
+    pub prior_provider_owner: Option<OwnedRuntimeHandle>,
     pub installation_id: InstallationId,
     pub soul_id: SoulId,
     pub incarnation_id: IncarnationId,
@@ -117,8 +124,73 @@ pub struct BackendInspection {
     pub configured_limits: RuntimeLimits,
 }
 
+#[derive(Clone)]
+pub enum ClaudeSourceOwner {
+    Initial {
+        reservation: crate::registry::OwnedInputReservation,
+        observation: freshell_runtime_protocol::InitialAuthVolumeObservation,
+    },
+    Retained {
+        handle: Box<OwnedRuntimeHandle>,
+        recovery_source: Option<freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
+    },
+}
+
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    async fn observe_claude_sources(
+        &self,
+        _owner: &ClaudeSourceOwner,
+        _request: &freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+        _test_run_id: &str,
+    ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
+        Err(BackendError::Unavailable(
+            "Claude native source reader unavailable; retain inputs and reprepare".into(),
+        ))
+    }
+    async fn observe_initial_auth_volume(
+        &self,
+        _reservation: &crate::registry::OwnedInputReservation,
+    ) -> Result<freshell_runtime_protocol::InitialAuthVolumeObservation, BackendError> {
+        Err(BackendError::Unavailable(
+            "initial auth source observation unavailable".into(),
+        ))
+    }
+    /// Remove only the generation of a positively rejected, stopped initial
+    /// host. The owning supervisor must prove the grant was never consumed.
+    async fn discard_rejected_provider_inputs(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unavailable(
+            "rejected provider input cleanup unavailable".into(),
+        ))
+    }
+    async fn commit_prepared_inputs(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+    /// Called only after accepted grant/registry commit and exact native
+    /// verification when a resume requires it. No pre-dispatch retirement.
+    async fn retire_prior_prepared_inputs(
+        &self,
+        _current: &OwnedRuntimeHandle,
+        _prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn read_native_auth(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _keys: &[String],
+        _reader_binary: &Path,
+    ) -> Result<BTreeMap<String, String>, BackendError> {
+        Err(BackendError::Unavailable(
+            "native auth reader unavailable".into(),
+        ))
+    }
     async fn read_native_history(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -158,12 +230,17 @@ pub trait RuntimeBackend: Send + Sync {
 #[derive(Clone)]
 pub struct DockerEngineBackend {
     socket_path: PathBuf,
+    input_publishers:
+        std::sync::Arc<std::sync::Mutex<BTreeMap<String, input_publisher::HeldPublisher>>>,
+    input_publication_claims: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl DockerEngineBackend {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            input_publishers: Default::default(),
+            input_publication_claims: Default::default(),
         }
     }
 
@@ -254,6 +331,45 @@ impl DockerEngineBackend {
             ));
         }
         verify_inspect_config(handle, &value)?;
+        let mounts = match (handle.terminal(), handle.fresh_agent()) {
+            (Some(terminal), None) => Some(docker::terminal_mounts_for_adoption(terminal)),
+            (None, Some(agent)) => Some(docker::fresh_agent_mounts_for_adoption(agent)),
+            _ => None,
+        }
+        .transpose()
+        .map_err(BackendError::OwnershipMismatch)?;
+        if let Some(mounts) = mounts {
+            let mut volumes = BTreeMap::new();
+            let mut names = std::collections::BTreeSet::new();
+            if !mounts.resource_mounts.is_empty() {
+                names.insert(handle.provider_volume_name().to_owned());
+            }
+            if let Some(files) = &mounts.indexed_files {
+                names.insert(files.volume_name.clone());
+            }
+            for name in names {
+                let inspected = self
+                    .request_bounded(
+                        "GET",
+                        &format!("{DOCKER_API}/volumes/{name}"),
+                        None,
+                        1024 * 1024,
+                    )
+                    .await?;
+                if inspected.status != 200 {
+                    return Err(BackendError::OwnershipMismatch(
+                        "prepared owned volume is unavailable".into(),
+                    ));
+                }
+                let inspected = serde_json::from_slice(&inspected.body).map_err(|_| {
+                    BackendError::OwnershipMismatch(
+                        "prepared owned volume inspection invalid".into(),
+                    )
+                })?;
+                volumes.insert(name, inspected);
+            }
+            prepared_inputs::verify(&value, &mounts, handle.provider_volume_name(), &volumes)?;
+        }
         Ok(Some(value))
     }
 
@@ -549,6 +665,9 @@ fn assemble_workload_binds(
             ));
         }
         for (index, source) in mounts.provider_secret_files.iter().enumerate() {
+            if mounts.indexed_secret_sources.contains_key(&index) {
+                continue;
+            }
             binds.push(format!(
                 "{}:/run/freshell-secrets/provider-{index}:ro",
                 source.display()
@@ -585,6 +704,81 @@ fn assemble_workload_binds(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn observe_claude_sources(
+        &self,
+        owner: &ClaudeSourceOwner,
+        request: &freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+        test_run_id: &str,
+    ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
+        self.read_claude_source_helper(
+            owner,
+            request,
+            test_run_id,
+            std::time::Duration::from_secs(25),
+        )
+        .await
+    }
+    async fn observe_initial_auth_volume(
+        &self,
+        reservation: &crate::registry::OwnedInputReservation,
+    ) -> Result<freshell_runtime_protocol::InitialAuthVolumeObservation, BackendError> {
+        self.observe_initial_volume(reservation).await
+    }
+    async fn commit_prepared_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let context = handle
+            .terminal()
+            .and_then(|spec| spec.provider_launch_context.as_ref())
+            .or_else(|| {
+                handle
+                    .fresh_agent()
+                    .and_then(|spec| spec.provider_launch_context.as_ref())
+            });
+        if let Some(inputs) = context
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .filter(|inputs| inputs.indexed_files.is_some())
+        {
+            self.release_indexed_publication(
+                handle.soul_id(),
+                handle.incarnation_id(),
+                &inputs.generation_id,
+                &json!({"com.freshell.managed-inputs":"true","com.freshell.installation-id":handle.installation_id(),"com.freshell.soul-id":handle.soul_id(),"com.freshell.incarnation-id":handle.incarnation_id(),"com.freshell.input-generation":inputs.generation_id}),
+                handle.image_ref(),handle.host_binary_path(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    async fn discard_rejected_provider_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        self.remove_stopped_input_workload(handle).await?;
+        self.remove_stopped_indexed_inputs(handle).await
+    }
+    async fn retire_prior_prepared_inputs(
+        &self,
+        current: &OwnedRuntimeHandle,
+        prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        self.retire_prior_indexed_inputs(current, prior).await
+    }
+    async fn read_native_auth(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        keys: &[String],
+        reader_binary: &Path,
+    ) -> Result<BTreeMap<String, String>, BackendError> {
+        self.read_auth_helper(
+            handle,
+            keys,
+            reader_binary,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+    }
     async fn read_native_history(
         &self,
         handle: &OwnedRuntimeHandle,
@@ -614,6 +808,26 @@ impl RuntimeBackend for DockerEngineBackend {
             ));
         }
         let binary = canonical_regular_file(&spec.host_binary_path)?;
+        let initial_reference = spec
+            .terminal
+            .as_ref()
+            .and_then(|workload| workload.provider_launch_context.as_ref())
+            .or_else(|| {
+                spec.fresh_agent
+                    .as_ref()
+                    .and_then(|workload| workload.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .and_then(|inputs| inputs.initial_auth_reservation.as_deref());
+        if initial_reference.is_some_and(|id| {
+            spec.initial_input_reservation
+                .as_ref()
+                .is_none_or(|bound| bound.reservation.id != id)
+        }) {
+            return Err(BackendError::InvalidConfig(
+                "initial provider source lost its current prepared reservation".into(),
+            ));
+        }
         let runtime_dir = canonical_dir(&spec.runtime_dir)?;
         let actor_state_dir = if spec.fresh_agent.is_some() {
             let runtime_root = runtime_dir.parent().ok_or_else(|| {
@@ -655,6 +869,12 @@ impl RuntimeBackend for DockerEngineBackend {
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let (daemon_id, rootless) = self.daemon_info().await?;
+        self.ensure_reserved_initial_volume(spec, &daemon_id, rootless)
+            .await?;
+        if let Some(mounts) = &terminal_mounts {
+            self.prepare_provider_mountpoints(spec, mounts, &binary, &daemon_id)
+                .await?;
+        }
         let memory_swap = spec
             .limits
             .memory_bytes
@@ -698,7 +918,7 @@ impl RuntimeBackend for DockerEngineBackend {
         } else {
             Vec::new()
         };
-        let body = docker_create_body(
+        let mut body = docker_create_body(
             spec,
             binds,
             host_env,
@@ -708,6 +928,44 @@ impl RuntimeBackend for DockerEngineBackend {
             requested_limits,
             memory_swap,
         );
+        if let Some(mounts) = &terminal_mounts {
+            let context = spec
+                .terminal
+                .as_ref()
+                .and_then(|spec| spec.provider_launch_context.as_ref())
+                .or_else(|| {
+                    spec.fresh_agent
+                        .as_ref()
+                        .and_then(|spec| spec.provider_launch_context.as_ref())
+                });
+            if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
+                if inputs.indexed_files.as_ref().is_some_and(|files| {
+                    files.volume_name
+                        != freshell_runtime_protocol::indexed_provider_volume_name(
+                            &spec.soul_id,
+                            &inputs.generation_id,
+                        )
+                }) {
+                    return Err(BackendError::InvalidConfig(
+                        "indexed provider volume belongs to another soul/preparation".into(),
+                    ));
+                }
+            }
+            body["HostConfig"]["Mounts"] = serde_json::to_value(
+                prepared_inputs::mount_descriptors(mounts, &spec.provider_volume_name)?,
+            )
+            .map_err(|_| {
+                BackendError::InvalidConfig("prepared mount metadata cannot be encoded".into())
+            })?;
+            if mounts.indexed_files.is_some() && !rootless {
+                return Err(BackendError::Unavailable(
+                    "indexed provider input publication requires the configured rootless backend"
+                        .into(),
+                ));
+            }
+            self.begin_indexed_publication(spec, mounts, &binary)
+                .await?;
+        }
         // The name is diagnostic only and is deliberately unique per create attempt.
         // A crash after Docker create but before the container-id commit can leave a
         // stopped, unregistered object. Retrying the PREPARED transaction must be able
@@ -726,6 +984,12 @@ impl RuntimeBackend for DockerEngineBackend {
             )
             .await?;
         if response.status != 201 {
+            // Transport failures and server errors can hide a successful create.
+            // Only a definitive request rejection proves that no workload has
+            // acquired this generation's mounts.
+            if matches!(response.status, 400 | 401 | 403 | 404 | 409 | 422) {
+                self.abort_indexed_publication(spec).await?;
+            }
             return Err(response.as_error());
         }
         let value: Value = serde_json::from_slice(&response.body)
@@ -953,10 +1217,13 @@ fn runtime_tmpfs(mode: Option<&str>) -> std::collections::BTreeMap<String, Strin
             "rw,exec,nosuid,nodev,size=64m,mode=1777".to_string(),
         );
     }
-    if matches!(mode, Some("claude" | "codex" | "opencode" | "amplifier")) {
+    if matches!(
+        mode,
+        Some("claude" | "kilroy" | "codex" | "opencode" | "amplifier")
+    ) {
         mounts.insert(
             "/run/freshell-private".to_string(),
-            "rw,noexec,nosuid,nodev,size=16m,mode=0700".to_string(),
+            "rw,noexec,nosuid,nodev,size=16m,mode=0710".to_string(),
         );
     }
     mounts
@@ -1350,13 +1617,13 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         }
     }
     if let Some(terminal) = handle.terminal() {
-        let expected =
-            docker::terminal_mounts(terminal).map_err(BackendError::OwnershipMismatch)?;
+        let expected = docker::terminal_mounts_for_adoption(terminal)
+            .map_err(BackendError::OwnershipMismatch)?;
         verify_workload_mounts(mounts, &expected)?;
     }
     if let Some(agent) = handle.fresh_agent() {
-        let expected =
-            docker::fresh_agent_mounts(agent).map_err(BackendError::OwnershipMismatch)?;
+        let expected = docker::fresh_agent_mounts_for_adoption(agent)
+            .map_err(BackendError::OwnershipMismatch)?;
         verify_workload_mounts(mounts, &expected)?;
     }
     Ok(())
@@ -1391,6 +1658,11 @@ fn verify_workload_mounts(
         }
     }
     for (index, source) in expected.provider_secret_files.iter().enumerate() {
+        // The prepared mount verifier establishes the owned tmpfs/subpath
+        // identity for these inputs; they are no longer controller binds.
+        if expected.indexed_secret_sources.contains_key(&index) {
+            continue;
+        }
         let source_text = source.to_string_lossy();
         let destination = format!("/run/freshell-secrets/provider-{index}");
         let found = mounts.iter().any(|mount| {
@@ -1574,7 +1846,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn fresh_agent_ownership_requires_the_same_souls_private_actor_mount() {
+    fn provider_private_parent_mount_adoption_checks_topology_and_actor_ownership() {
         let root = tempfile::tempdir().unwrap();
         let runtime_dir = root.path().join("incarnation-one");
         let workspace = root.path().join("workspace");
@@ -1666,6 +1938,18 @@ mod tests {
             ],
         });
         assert!(verify_inspect_config(&handle, &inspected).is_ok());
+        for option in [
+            "rw,noexec,nosuid,nodev,size=16m,mode=0700",
+            "rw,noexec,nosuid,nodev,size=16m,mode=0750",
+            "rw,noexec,nosuid,nodev,size=16m,mode=0710,uid=65534",
+        ] {
+            inspected["HostConfig"]["Tmpfs"]["/run/freshell-private"] = serde_json::json!(option);
+            assert!(matches!(
+                verify_inspect_config(&handle, &inspected),
+                Err(BackendError::OwnershipMismatch(_))
+            ));
+        }
+        inspected["HostConfig"]["Tmpfs"] = serde_json::json!(runtime_tmpfs(Some("codex")));
 
         inspected["Mounts"][4]["Source"] = serde_json::json!(host_actor_state_dir(
             root.path(),
@@ -1699,7 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_gets_dedicated_bounded_exec_tmpfs_while_global_tmp_stays_noexec() {
+    fn provider_private_parent_mount_preserves_bounded_opencode_exec_topology() {
         let opencode = runtime_tmpfs(Some("opencode"));
         assert_eq!(
             opencode.get("/tmp").map(String::as_str),
@@ -1712,7 +1996,7 @@ mod tests {
         assert_eq!(opencode.len(), 3);
         assert_eq!(
             opencode.get("/run/freshell-private").map(String::as_str),
-            Some("rw,noexec,nosuid,nodev,size=16m,mode=0700")
+            Some("rw,noexec,nosuid,nodev,size=16m,mode=0710")
         );
 
         let shell = runtime_tmpfs(Some("shell"));
@@ -1823,6 +2107,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: vec![ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: keys.to_string_lossy().into_owned(),
                 profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
@@ -1841,6 +2126,8 @@ mod tests {
             })
             .collect();
         let spec = CreateRuntimeSpec {
+            prior_provider_owner: None,
+            initial_input_reservation: None,
             installation_id: InstallationId::parse("installation-test").unwrap(),
             soul_id: SoulId::parse("soul-test").unwrap(),
             incarnation_id: IncarnationId::parse("incarnation-test").unwrap(),
@@ -1978,6 +2265,80 @@ mod tests {
         assert_ne!(digest(running), original);
     }
 
+    #[test]
+    fn provider_prepared_metadata_changes_both_route_immutable_digests() {
+        use freshell_runtime_protocol::{
+            PreparedProviderInputs, ProviderInputManifestReference, ProviderLaunchContext,
+            ProviderPreparation,
+        };
+        let inputs = PreparedProviderInputs {
+            generation_id: "grant-digest".into(),
+            initial_auth_reservation: None,
+            manifest: ProviderInputManifestReference {
+                relative_path: ".freshell/input-manifest.json".into(),
+                sha256: "a".repeat(64),
+                source_count: 0,
+                alias_count: 0,
+                recipe_count: 0,
+            },
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: None,
+        };
+        let context = ProviderLaunchContext {
+            prepared_inputs: Some(inputs),
+            preparation: ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+            mcp_capability: None,
+            config: vec![],
+        };
+        let terminal:TerminalLaunchSpec=serde_json::from_value(json!({
+            "terminalId":"terminal-digest","streamId":"stream-digest","mode":"codex","program":"codex",
+            "cwd":"/workspace","workspacePath":"/workspace","runAsUid":65534,"runAsGid":0,
+            "cols":80,"rows":24,"projectKey":"project-digest","providerLaunchContext":context,
+        })).unwrap();
+        let fresh:FreshAgentLaunchSpec=serde_json::from_value(json!({
+            "sessionId":"session-digest","provider":"codex","sessionType":"freshcodex","runtimeVariant":"codex-app-server",
+            "providerStoreId":"store-digest","cwd":"/workspace","workspacePath":"/workspace","runAsUid":65534,"runAsGid":0,
+            "providerLaunchContext":context,
+        })).unwrap();
+        for fresh_route in [false, true] {
+            let mut expected = ExpectedConfig {
+                image_ref: "sha256:image".into(),
+                installation_id: "installation-digest".into(),
+                soul_id: "soul-digest".into(),
+                incarnation_id: "incarnation-digest".into(),
+                host_binary_path: "/runtime/host".into(),
+                runtime_dir: "/runtime/incarnation".into(),
+                limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 128 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 64,
+                },
+                terminal: (!fresh_route).then_some(terminal.clone()),
+                fresh_agent: fresh_route.then(|| (&fresh).into()),
+                provider_volume_name: "owned-provider".into(),
+            };
+            let before = digest_expected(&expected).unwrap();
+            let context = if let Some(terminal) = expected.terminal.as_mut() {
+                terminal.provider_launch_context.as_mut().unwrap()
+            } else {
+                expected
+                    .fresh_agent
+                    .as_mut()
+                    .unwrap()
+                    .provider_launch_context
+                    .as_mut()
+                    .unwrap()
+            };
+            context.prepared_inputs.as_mut().unwrap().manifest.sha256 = "b".repeat(64);
+            assert_ne!(digest_expected(&expected).unwrap(),before,"prepared metadata must participate in the immutable proof for route fresh={fresh_route}");
+        }
+    }
+
     fn fresh_agent_spec_fixture() -> FreshAgentLaunchSpec {
         FreshAgentLaunchSpec {
             session_id: "session-fixture".into(),
@@ -2045,8 +2406,13 @@ mod tests {
             git_common_dir: None,
             provider_bootstrap_files: vec![],
             provider_secret_files: vec![],
+            indexed_secret_sources: BTreeMap::new(),
             provider_user_root: None,
             mcp_capability_file: None,
+            input_manifest: None,
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: None,
             operator_home: Some(OperatorHomeMount {
                 home: home.clone(),
                 mask_rel_paths: vec![".freshell".to_string()],
@@ -2105,8 +2471,13 @@ mod tests {
             git_common_dir: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_files: Vec::new(),
+            indexed_secret_sources: BTreeMap::new(),
             provider_user_root: None,
             mcp_capability_file: None,
+            input_manifest: None,
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: None,
             operator_home: Some(OperatorHomeMount {
                 home: PathBuf::from(std::ffi::OsString::from_vec(b"/ho\x80me".to_vec())),
                 mask_rel_paths: vec![".freshell".to_string()],

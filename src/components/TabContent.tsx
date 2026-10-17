@@ -37,6 +37,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       sessionType: resumeSessionType,
       sessionId: tabSessionId,
       cwd: tab.initialCwd,
+      checkpointWorkspace: tab.checkpointWorkspace,
     })
   } else if (tab.mode !== 'shell') {
     defaultContent = {

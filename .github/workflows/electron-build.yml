@@ -100,6 +100,12 @@ jobs:
         if: matrix.os == 'windows-2022'
         run: cargo test --locked -p freshell-platform --lib cli_launch::cli_argv_goldens_file::native_windows_generated_claude_hooks_work_in_shells
 
+      # Exercise the real Windows owner-SID and ProfileList APIs for SYSTEM's
+      # profile. The Linux Rust/browser jobs cannot cover this Windows branch.
+      - name: Test Windows SYSTEM checkpoint-home rejection
+        if: matrix.os == 'windows-2022'
+        run: cargo test --locked -p freshell-server --bin freshell-server checkpoints::tests::windows_system_profile_is_rejected_as_checkpoint_scope
+
       - name: Run Electron unit tests
         run: pnpm run test:electron
 

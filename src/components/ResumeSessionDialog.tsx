@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useStore } from 'react-redux'
 import { api } from '@/lib/api'
-import { resumeSessionInTab, type ResumeTarget } from '@/lib/resume-session'
+import {
+  findCheckpointWorkspaceForSession,
+  resumeSessionInTab,
+  type ResumeTarget,
+} from '@/lib/resume-session'
 import { OVERLAY_Z } from '@/components/ui/overlay'
 import { useAppDispatch } from '@/store/hooks'
 import type { RootState } from '@/store/store'
@@ -91,7 +95,15 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
 
   const finishResume = useCallback(
     (target: ResumeTarget, note: string) => {
-      resumeSessionInTab(store.getState(), dispatch, target, onNavigate)
+      const state = store.getState()
+      const checkpointWorkspace = target.checkpointWorkspace
+        ?? findCheckpointWorkspaceForSession(state, target)
+      resumeSessionInTab(
+        state,
+        dispatch,
+        { ...target, ...(checkpointWorkspace ? { checkpointWorkspace } : {}) },
+        onNavigate,
+      )
       setPhase({ kind: 'resumed', note })
       closeTimerRef.current = window.setTimeout(onClose, RESUMED_CLOSE_MS)
     },

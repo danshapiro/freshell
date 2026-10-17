@@ -456,6 +456,7 @@ fn build_codex_managed_launch_setup(
         tui_mcp_injection: tui,
         terminal_env,
         sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext {
+            provider_exec_profile: false,
             config_args: sidecar.args,
             env: sidecar_env,
         },
@@ -5307,6 +5308,11 @@ if (args.includes('app-server')) {{
     /// record.
     #[tokio::test]
     async fn rest_cli_terminal_create_seeds_the_requested_name_into_the_pending_record() {
+        if crate::test_environment::run_with_opencode_home(
+            "terminal_tabs::tests::rest_cli_terminal_create_seeds_the_requested_name_into_the_pending_record",
+        ) {
+            return;
+        }
         use crate::naming::SessionNaming as _;
         use freshell_protocol::session_names::{NameIntent, SessionNameRef};
 
@@ -5606,6 +5612,11 @@ if (args.includes('app-server')) {{
 
     #[tokio::test]
     async fn create_opencode_tab_fresh_spawns_with_hostname_port_args_and_arms_locator() {
+        if crate::test_environment::run_with_opencode_home(
+            "terminal_tabs::tests::create_opencode_tab_fresh_spawns_with_hostname_port_args_and_arms_locator",
+        ) {
+            return;
+        }
         let home = unique_temp_home("opencode-fresh");
         let argv_file = unique_argv_file("opencode-fresh");
         let state =
@@ -7112,7 +7123,10 @@ if (args.includes('app-server')) {{
             _: freshell_terminal::registry::ManagedTerminalLaunch,
         ) -> freshell_terminal::registry::ManagedTerminalFuture<
             'a,
-            Result<freshell_terminal::registry::ManagedTerminalDescriptor, String>,
+            Result<
+                freshell_terminal::registry::ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
         > {
             Box::pin(async { Err("unexpected managed launch".into()) })
         }
@@ -8391,6 +8405,11 @@ if (args.includes('app-server')) {{
 
     #[tokio::test]
     async fn create_opencode_tab_with_session_ref_flows_into_pane_content() {
+        if crate::test_environment::run_with_opencode_home(
+            "terminal_tabs::tests::create_opencode_tab_with_session_ref_flows_into_pane_content",
+        ) {
+            return;
+        }
         let argv_file = unique_argv_file("opencode-synth");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(

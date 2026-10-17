@@ -3495,6 +3495,7 @@ describe('TerminalView lifecycle updates', () => {
     function setupTypedPane(options: {
       content?: Partial<TerminalPaneContent>
       tabMetadata?: Record<string, { sessionType?: string }>
+      tabCheckpointWorkspace?: { path: string; provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint' }
       seed?: (store: ReturnType<typeof configureStore>) => void
     } = {}) {
       const tabId = 'tab-b8ke'
@@ -3533,6 +3534,10 @@ describe('TerminalView lifecycle updates', () => {
               title: 'Codex',
               titleSetByUser: false,
               createRequestId: 'req-b8ke',
+              ...(options.tabCheckpointWorkspace ? { checkpointWorkspace: options.tabCheckpointWorkspace } : {}),
+              ...(options.tabCheckpointWorkspace
+                ? { sessionRef: { provider: 'codex' as const, sessionId: TYPED_SESSION_ID } }
+                : {}),
               ...(options.tabMetadata ? { sessionMetadataByKey: options.tabMetadata } : {}),
             }],
             activeTabId: tabId,
@@ -4195,7 +4200,8 @@ describe('TerminalView lifecycle updates', () => {
 
     it('b8ke ext r16 F5: the open-as-fresh-agent action resolves the retired pre-rekey key to the canonical key', async () => {
       const CANONICAL_ID = '77777777-8888-4999-aaaa-bbbbbbbbbbbb'
-      const { store } = setupTypedPane()
+      const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+      const { store } = setupTypedPane({ tabCheckpointWorkspace: checkpointWorkspace })
       // The pane holds the RETIRED pre-rekey reference; the runtime-owners
       // map carries the alias mirror (the server's rekey mirror frame —
       // the same chain the owner selection resolves through).
@@ -4247,6 +4253,7 @@ describe('TerminalView lifecycle updates', () => {
         // The converted pane's sessionRef carries the CANONICAL key (the
         // retired pre-rekey key must never reach the lifecycle start).
         expect(leaf.content.sessionRef?.sessionId).toBe(CANONICAL_ID)
+        expect(leaf.content.checkpointWorkspace).toEqual(checkpointWorkspace)
       } else {
         throw new Error('the pane did not convert')
       }
@@ -6058,6 +6065,7 @@ describe('TerminalView lifecycle updates', () => {
       mode?: TerminalPaneContent['mode']
       recoverySummary?: TerminalPaneContent['recoverySummary']
       soulId?: string
+      runtimeStatus?: TerminalPaneContent['runtimeStatus']
       hidden?: boolean
       clearSends?: boolean
       requestId?: string
@@ -6098,6 +6106,7 @@ describe('TerminalView lifecycle updates', () => {
         ...(opts?.streamId ? { streamId: opts.streamId } : {}),
         ...(opts?.recoverySummary ? { recoverySummary: opts.recoverySummary } : {}),
         ...(opts?.soulId ? { soulId: opts.soulId } : {}),
+        ...(opts?.runtimeStatus ? { runtimeStatus: opts.runtimeStatus } : {}),
         ...(opts?.contentServerInstanceId ? { serverInstanceId: opts.contentServerInstanceId } : {}),
       }
 
@@ -6648,6 +6657,45 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(store.getState().panes.refreshRequestsByPane[tabId]).toBeUndefined()
+    })
+
+    it('refreshes the exact retained blocked handle without recreating or sending input', async () => {
+      const { store, tabId, paneId, terminalId } = await renderTerminalHarness({
+        terminalId: 'term-retained-blocked-refresh', soulId: 'retained-soul', runtimeStatus: 'blocked',
+        streamId: 'retained-stream', fromStore: true,
+        recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'wrong_native_identity',
+          durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+      })
+      const before = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).content
+      wsMocks.send.mockClear()
+      act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+      await waitFor(() => {
+        const sends = wsMocks.send.mock.calls.map(([msg]) => msg)
+        const detach = sends.findIndex(msg => msg.type === 'terminal.detach' && msg.terminalId === terminalId)
+        const attach = sends.findIndex(msg => msg.type === 'terminal.attach' && msg.terminalId === terminalId)
+        expect(detach).toBeGreaterThanOrEqual(0)
+        expect(attach).toBeGreaterThan(detach)
+        expect(sends[attach]).toMatchObject({ terminalId, sinceSeq: 0, intent: 'viewport_hydrate' })
+        expect(store.getState().panes.refreshRequestsByPane[tabId]).toBeUndefined()
+      })
+      expect((store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).content).toMatchObject(before)
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg).filter(msg =>
+        ['terminal.create', 'terminal.input', 'pane.reconcile.request'].includes(msg.type))).toEqual([])
+    })
+
+    it('refuses blocked refresh when retained runtime membership is unknown', async () => {
+      const { store, tabId, paneId } = await renderTerminalHarness({
+        terminalId: 'term-unknown-blocked-refresh', soulId: 'unconfirmed-soul', fromStore: true,
+        ackInitialAttach: false, waitForMessageHandler: false, waitForTerminalInstance: false,
+        recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'unknown_handle',
+          durabilityState: 'unknown', allocationState: 'allocated' },
+      })
+      wsMocks.send.mockClear()
+      act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg).filter(msg =>
+        ['terminal.detach', 'terminal.attach', 'terminal.create', 'terminal.input'].includes(msg.type))).toEqual([])
+      expect(store.getState().panes.refreshRequestsByPane[tabId]?.[paneId]).toBeDefined()
     })
 
     it('sends sinceSeq=0 when attaching without previously rendered output', async () => {

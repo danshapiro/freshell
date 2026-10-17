@@ -9,6 +9,52 @@ set -euo pipefail
 TARGET_UID="$(id -u sandbox)"
 TARGET_GID="$(id -g sandbox)"
 
+# This exact, closed fixture is used only by the checkpoint permission smoke.
+# The wrapper permits it only in the networkless runtime suite; setup has no
+# caller-supplied path, command, or ownership script. All observations and
+# mutations happen later as the unprivileged sandbox user.
+if [ "${FRESHELL_SANDBOX_CHECKPOINT_FIXTURE:-}" = "1" ]; then
+  if [ "${FRESHELL_SANDBOX_MODE:-}" != "runtime-suite" ] || [ "$(id -u)" -ne 0 ]; then
+    echo "[sandbox] checkpoint fixture requires the root runtime-suite initializer" >&2
+    exit 2
+  fi
+  CHECKPOINT_FIXTURE_ROOT="/tmp/freshell-checkpoint-fixture"
+  mkdir -p \
+    "${CHECKPOINT_FIXTURE_ROOT}/project" \
+    "${CHECKPOINT_FIXTURE_ROOT}/storage" \
+    "${CHECKPOINT_FIXTURE_ROOT}/home"
+  chown "${TARGET_UID}:${TARGET_GID}" \
+    "${CHECKPOINT_FIXTURE_ROOT}" \
+    "${CHECKPOINT_FIXTURE_ROOT}/project" \
+    "${CHECKPOINT_FIXTURE_ROOT}/storage" \
+    "${CHECKPOINT_FIXTURE_ROOT}/home"
+  chmod 0755 \
+    "${CHECKPOINT_FIXTURE_ROOT}" \
+    "${CHECKPOINT_FIXTURE_ROOT}/project" \
+    "${CHECKPOINT_FIXTURE_ROOT}/storage" \
+    "${CHECKPOINT_FIXTURE_ROOT}/home"
+
+  printf '%s\n' 'private-file.ignored' 'private-dir.ignored/' \
+    >"${CHECKPOINT_FIXTURE_ROOT}/project/.gitignore"
+  chown "${TARGET_UID}:${TARGET_GID}" "${CHECKPOINT_FIXTURE_ROOT}/project/.gitignore"
+  chmod 0644 "${CHECKPOINT_FIXTURE_ROOT}/project/.gitignore"
+
+  printf '%s\n' 'restricted checkpoint file sentinel' \
+    >"${CHECKPOINT_FIXTURE_ROOT}/project/private-file.ignored"
+  chmod 0600 "${CHECKPOINT_FIXTURE_ROOT}/project/private-file.ignored"
+  chown 0:0 "${CHECKPOINT_FIXTURE_ROOT}/project/private-file.ignored"
+
+  mkdir "${CHECKPOINT_FIXTURE_ROOT}/project/private-dir.ignored"
+  printf '%s\n' 'restricted checkpoint directory sentinel' \
+    >"${CHECKPOINT_FIXTURE_ROOT}/project/private-dir.ignored/private.txt"
+  chmod 0600 "${CHECKPOINT_FIXTURE_ROOT}/project/private-dir.ignored/private.txt"
+  chown 0:0 "${CHECKPOINT_FIXTURE_ROOT}/project/private-dir.ignored/private.txt"
+  chmod 0700 "${CHECKPOINT_FIXTURE_ROOT}/project/private-dir.ignored"
+  chown 0:0 "${CHECKPOINT_FIXTURE_ROOT}/project/private-dir.ignored"
+
+  export FRESHELL_CHECKPOINT_FIXTURE_ROOT="${CHECKPOINT_FIXTURE_ROOT}"
+fi
+
 cd /workspace
 
 # /home/sandbox/.cache is where npm/pnpm postinstall scripts (electron,
@@ -25,6 +71,7 @@ chown "${TARGET_UID}:${TARGET_GID}" /home/sandbox/.cache
 VOLUME_DIRS=(
   "/usr/local/cargo/registry"
   "/usr/local/cargo/git"
+  "/home/sandbox/.local/share/pnpm/store"
   "/workspace/target"
   "/workspace/node_modules"
   "/home/sandbox/.cache/ms-playwright"

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use crate::common::{
     AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
-    CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
-    TurnCompletionSnapshot,
+    CodexDurability, ErrorCode, FreshAgentCheckpointWorkspace, OpencodeActivityRecord,
+    SessionLocator, SessionType, TerminalMetaRecord, TurnCompletionSnapshot,
 };
 use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
@@ -66,6 +66,8 @@ pub enum ServerMessage {
     ExtensionsRegistry(ExtensionsRegistry),
     #[serde(rename = "freshAgent.create.failed")]
     FreshAgentCreateFailed(FreshAgentCreateFailed),
+    #[serde(rename = "freshAgent.checkpoint.outcome")]
+    FreshAgentCheckpointOutcome(FreshAgentCheckpointOutcome),
     #[serde(rename = "freshAgent.created")]
     FreshAgentCreated(FreshAgentCreated),
     #[serde(rename = "freshAgent.event")]
@@ -207,7 +209,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 69] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 70] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -226,6 +228,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 69] = [
     "extension.server.starting",
     "extension.server.stopped",
     "extensions.registry",
+    "freshAgent.checkpoint.outcome",
     "freshAgent.create.failed",
     "freshAgent.created",
     "freshAgent.event",
@@ -278,6 +281,40 @@ pub const SERVER_MESSAGE_TYPES: [&str; 69] = [
     "terminals.changed",
     "ui.command",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAgentCheckpointStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentCheckpointOutcome {
+    pub logical_attempt_id: String,
+    pub request_id: String,
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub session_type: SessionType,
+    pub status: FreshAgentCheckpointStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<FreshAgentCheckpointWorkspace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Provider-native user row identity, added only after the provider confirms
+    /// the actual persisted/replayed row for this logical attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_turn_id: Option<String>,
+    /// Actual display-row key joined to `nativeTurnId`, when the provider
+    /// projection has materialized that row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_turn_id: Option<String>,
+}
 
 /// Supervisor startup-scan readiness carried by
 /// [`ServerMessage::RuntimeInventoryChanged`]. Mirrors
@@ -408,6 +445,7 @@ pub enum SessionRepairEvent {
 pub enum RuntimeStatus {
     Running,
     Recovering,
+    Blocked,
     /// The auto-resume SETTLE frame (kata znhn item 3): broadcast with the
     /// OLD terminal id whenever a planned auto-resume settles without a
     /// replacement (guard-abort, retries exhausted, flap circuit breaker,
@@ -811,8 +849,51 @@ pub struct ConfigFallback {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProviderPreparationFailureCode {
+    SelectedReferenceUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreparationFailureStage {
+    Configuration,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreparationFailureOperation {
+    Resolve,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreparationFailureCause {
+    NotFound,
+    PermissionDenied,
+    Cyclic,
+    Unknown,
+}
+
+/// Selected-reference metadata only. No configuration or credential payloads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPreparationFailure {
+    pub code: ProviderPreparationFailureCode,
+    pub stage: ProviderPreparationFailureStage,
+    pub operation: ProviderPreparationFailureOperation,
+    pub cause: ProviderPreparationFailureCause,
+    pub workspace: String,
+    pub declaring_config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorMsg {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_preparation_failure: Option<ProviderPreparationFailure>,
     pub code: ErrorCode,
     pub message: String,
     pub timestamp: String,
@@ -1508,6 +1589,28 @@ pub struct TerminalCreated {
 pub struct TerminalExit {
     pub exit_code: i64,
     pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_retained: Option<bool>,
+    /// False explicitly denotes an unavailable exit result; exitCode is -1
+    /// for compatibility with clients that require the existing numeric field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code_available: Option<bool>,
+}
+
+/// Existing managed projection shape, without a runtime-control dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedRecoverySummary {
+    pub desired_state: String,
+    pub recovery_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<String>,
+    pub durability_state: String,
+    pub allocation_state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1534,6 +1637,12 @@ pub struct InventoryTerminal {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<RuntimeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_summary: Option<ManagedRecoverySummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
     /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
@@ -1674,6 +1783,8 @@ pub struct TerminalSessionAssociated {
 pub struct TerminalStatus {
     pub status: RuntimeStatus,
     pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_summary: Option<ManagedRecoverySummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<i64>,
     /// Auto-resume `recovering` frames only: the bounded retry budget. The
@@ -2210,6 +2321,7 @@ mod tests {
         // (round-1 review: the earlier `Error` sketch did not compile
         // against the repo type).
         let msg = ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             code: ErrorCode::RestoreUnavailable,
             message: "Session 01a0828d is still running on the server.".into(),
             timestamp: "2026-09-09T00:00:00Z".into(),
@@ -2233,6 +2345,7 @@ mod tests {
         // Additive-optional: a legacy error frame with no owner fields stays
         // byte-identical on the wire (the frozen refusal surface).
         let legacy = ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             code: ErrorCode::InternalError,
             message: "unrelated".into(),
             timestamp: "2026-09-09T00:00:00Z".into(),

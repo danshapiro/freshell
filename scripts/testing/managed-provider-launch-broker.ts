@@ -1,0 +1,115 @@
+//! Trusted closed-fixture entrypoint. Only this container receives Docker IPC;
+//! the native startup fixture receives this broker's restricted proxy socket.
+import fs from 'node:fs'
+import path from 'node:path'
+import { diagnosticPath, RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from './runtime-test-broker.js'
+
+const root=process.env.FRESHELL_PROVIDER_LAUNCH_FIXTURE ?? ''
+if (path.dirname(root)!=='/tmp' || !/^fln-[a-f0-9]{16}$/.test(path.basename(root))) {
+  throw new Error('closed provider startup requires its exact owned fixture root')
+}
+const configuration=JSON.parse(fs.readFileSync(path.join(root,'broker-configuration.json'),'utf8'))
+const image=configuration.provider==='claude'
+  ? 'sha256:b09595b8f02dae505e6719d7617305ab8f5ad53a7138b3b1580ac553c0f2663a'
+  : 'sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c'
+if (configuration.imageRef!==image || !['opencode','codex','claude','amplifier'].includes(configuration.provider) || !Array.isArray(configuration.initialVolumes) || configuration.initialVolumes.length!==(configuration.provider==='amplifier'?1:2)) {
+  throw new Error('closed provider startup image or finite source set changed')
+}
+if (!['freshclaude','kilroy'].includes(configuration.claudeFlavor)
+  || (configuration.claudeFlavor==='kilroy' && configuration.provider!=='claude')) {
+  throw new Error('closed provider startup Claude flavor changed')
+}
+const gateways=new Set<string>()
+const broker=new RestrictedDockerBroker({
+  realSocketPath:'/run/fixture-docker.sock',proxySocketPath:path.join(root,'broker.sock'),
+  runtimeRootPrefix:path.join(root,'scenarios'),allowedHostBinaryPaths:new Set([configuration.hostBinaryPath]),
+  allowedImageRefs:new Set([image]),allowTerminalWorkloads:true,
+  allowedWorkspaceRoots:new Set([path.join(root,'workspace')]),
+  allowedProviderUserRoots:new Set(configuration.provider==='claude'
+    ? ['/home/freshell/provider',path.join(root,'source-home/.claude'),path.join(root,'source-home/selected-config'),path.join(root,'source-home/selected-plugin'),path.join(root,'source-home/imported-memory.md'),path.join(root,'source-home/rule-memory.md')]
+    : configuration.provider==='codex'
+    ? ['/home/freshell/provider',path.join(root,'source-home/.codex')]
+    : configuration.provider==='amplifier'
+    ? ['/home/freshell/provider',path.join(root,'source-home/.amplifier'),path.join(root,'scenarios/external-amplifier-bundle')]
+    : ['/home/freshell/provider',path.join(root,'.opencode'),path.join(root,'scenarios/external-native-resources')]),
+  allowedBootstrapFiles:new Set([path.join(root,'grants/environment.env'),path.join(root,'grants/auth.json'),path.join(root,'grants/ca.pem')]),
+  allowedHostGatewayAddresses:gateways,
+  testRunId:configuration.runId,logPath:path.join(root,'broker.jsonl'),
+})
+if (configuration.provider==='opencode') broker.failNextInputPublicationBeforeCreate()
+for (const authorization of configuration.initialVolumes) broker.authorizeInitialProviderVolume(authorization)
+await broker.start()
+const accepted=new Set<string>()
+const candidates=new Map<string,ClaudeCandidateAuthorization>()
+const timer=setInterval(()=>{
+  try {
+    const gatewayFile=path.join(root,'controller-gateway.json')
+    if (fs.existsSync(gatewayFile) && gateways.size===0) {
+      const gateway=JSON.parse(fs.readFileSync(gatewayFile,'utf8'))
+      if (typeof gateway.address!=='string' || !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(gateway.address)) throw new Error('closed controller gateway is invalid')
+      gateways.add(gateway.address)
+    }
+    const directory=path.join(root,'handoff')
+    const entries=fs.readdirSync(directory).filter((name)=>name.endsWith('.json'))
+    // Amplifier uses one exact soul for initial seed establishment and its
+    // genuine existing-conversation replacement; other fixtures have two routes.
+    if (entries.length>2) throw new Error('closed provider fixture exceeds its finite two launch attempts')
+    for (const name of entries) {
+      if (accepted.has(name)) continue
+      if (!/^[a-zA-Z0-9_-]{1,128}\.json$/.test(name)) throw new Error('closed provider fixture handoff name invalid')
+      const file=path.join(directory,name)
+      const stat=fs.lstatSync(file)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size>1024*1024) throw new Error('closed provider fixture handoff profile exceeded')
+      const input=JSON.parse(fs.readFileSync(file,'utf8')) as PreparedInputAuthorization
+      if (!configuration.initialVolumes.some((source:any)=>source.installationId===input.installationId
+        && source.soulId===input.soulId && source.providerVolumeName===input.providerVolumeName)) {
+        throw new Error('closed provider fixture handoff owner changed')
+      }
+      broker.authorizePreparedInputs(input)
+      accepted.add(name)
+      fs.writeFileSync(file.slice(0,-'.json'.length)+'.accepted','ok',{mode:0o600})
+    }
+    const candidateDirectory=path.join(root,'candidate-handoff')
+    const candidateEntries=fs.readdirSync(candidateDirectory).filter((name)=>name.endsWith('.json'))
+    if (candidateEntries.length>6 || (configuration.provider!=='claude' && candidateEntries.length)) throw new Error('closed candidate handoff exceeds two routes and two replans')
+    for (const name of candidateEntries) {
+      if (candidates.has(name)) continue
+      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.json$/.test(name)) throw new Error('closed candidate handoff request identity invalid')
+      const file=path.join(candidateDirectory,name),stat=fs.lstatSync(file)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size>1024*1024) throw new Error('closed candidate handoff profile exceeded')
+      const input=JSON.parse(fs.readFileSync(file,'utf8')) as ClaudeCandidateAuthorization
+      if (name!==`${input.requestId}.json`) throw new Error('closed candidate handoff request changed')
+      broker.authorizeClaudeCandidate(input)
+      candidates.set(name,input)
+      fs.writeFileSync(file.slice(0,-'.json'.length)+'.accepted','ok',{mode:0o600})
+    }
+    if (fs.existsSync(path.join(root,'broker-complete'))) {
+      clearInterval(timer)
+      void broker.close().then(()=>{
+        fs.writeFileSync(path.join(root,'broker-receipt.json'),JSON.stringify({
+          events:broker.eventsSnapshot(),receipts:broker.receipts(),unsafeAttempts:broker.unsafeAttempts(),acceptedPreparations:accepted.size,
+          authorizedCandidates:[...candidates.values()],
+        })+'\n',{mode:0o600})
+      })
+    }
+  } catch (error) {
+    clearInterval(timer)
+    const cause=error instanceof Error?error.message:String(error)
+    const failurePath=path.join(root,'broker-failure')
+    fs.writeFileSync(failurePath,cause,{mode:0o600})
+    try {
+      const detail:Record<string,string>={cause}
+      if (error && typeof error==='object') {
+        const rejected=error as {targetPath?:unknown;preparationStageRoot?:unknown}
+        if (typeof rejected.targetPath==='string') detail.targetPath=diagnosticPath(rejected.targetPath)??'<invalid>'
+        if (typeof rejected.preparationStageRoot==='string') detail.preparationStageRoot=diagnosticPath(rejected.preparationStageRoot)??'<invalid>'
+      }
+      fs.writeFileSync(failurePath,JSON.stringify(detail),{mode:0o600})
+    } catch {
+      // Preserve the fixed cause even if optional path diagnostics cannot be
+      // serialized; the outer sandbox records the broker's state and logs.
+    }
+    void broker.close()
+    process.exitCode=1
+  }
+},20)

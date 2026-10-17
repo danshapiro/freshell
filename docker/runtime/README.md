@@ -1,7 +1,7 @@
 # Managed runtime image and deployment contract
 
 Phase 2 uses a digest-pinned workload image based on Node 22.23.2 with exact
-Claude Code 2.1.263 and OpenCode 1.18.21 installs. `provider-versions.json` is the machine-readable
+Claude Code 2.1.263, OpenCode 1.18.21, and Bun 1.4.3 installs. `provider-versions.json` is the machine-readable
 version receipt and `Dockerfile` must reproduce it; floating `latest` tags are
 not accepted by the supervisor or live gate. The runtime harness disables
 BuildKit provenance/SBOM attestations for this local workload build so unrelated
@@ -60,7 +60,8 @@ while Node's environment proxy is enabled, then verifies Freshell's API request
 did not reach the proxy.
 The controller supplies each incarnation's scoped MCP grant in the
 provider environment. Provider MCP configuration, including user entries,
-keeps its ordinary semantics.
+keeps its ordinary semantics. Bun is available for local MCP commands that run
+package scripts with `bun run`.
 
 Provider credentials and MCP capability bytes are never placed in durable
 launch records or terminal environment snapshots. Managed providers obtain

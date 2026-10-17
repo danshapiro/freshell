@@ -11,6 +11,12 @@
     "digest": "sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
   },
   "node": "22.23.2",
+  "runtimeTools": {
+    "bun": {
+      "package": "bun",
+      "version": "1.4.3"
+    }
+  },
   "providers": {
     "claude": {
       "package": "@anthropic-ai/claude-code",

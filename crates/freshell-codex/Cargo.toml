@@ -31,7 +31,7 @@ publish.workspace = true
 # feature (verified to compile; wired live in the next step). Default-off keeps the shared
 # workspace build lean.
 default = []
-real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "tokio/net", "tokio/io-util", "tokio/process"]
+real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "dep:freshell-platform", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]
 # Derive for the durable sidecar record rows (`sidecar_store`) — the versioned
@@ -61,6 +61,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # FRESHELL_CODEX_SIDECAR_ID tag (runtime.ts:494) so no orphan survives (the oracle
 # `ownership.cleanup` invariant). Only needed by the real transport.
 libc = { version = "0.2", optional = true }
+freshell-platform = { path = "../freshell-platform", optional = true }
 
 [dev-dependencies]
 # Tempdirs for the sidecar-store unit tests — no global state, nothing outside

@@ -68,4 +68,23 @@ describe('resumeSessionInTab', () => {
     expect(dispatch).toHaveBeenCalledWith(openSessionTabAction)
     expect(onNavigate).toHaveBeenCalledWith('terminal')
   })
+
+  it('preserves an explicitly carried checkpoint workspace when opening a resumed tab', () => {
+    findPaneForSession.mockReturnValue(undefined)
+    const checkpointWorkspace = { path: '/projects/selected', provenance: 'directory-picker' as const }
+    const target = {
+      provider: 'codex',
+      sessionId: 'thread-123',
+      cwd: '/home/user',
+      checkpointWorkspace,
+    }
+
+    resumeSessionInTab(state, dispatch, target, onNavigate)
+
+    expect(openSessionTab).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'thread-123',
+      cwd: '/home/user',
+      checkpointWorkspace,
+    }))
+  })
 })

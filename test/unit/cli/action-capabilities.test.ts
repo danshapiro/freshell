@@ -35,7 +35,9 @@ async function runCli(args: string[], url: string): Promise<{ code: number | nul
   let stderr = ''
   child.stdout.on('data', (chunk) => { stdout += String(chunk) })
   child.stderr.on('data', (chunk) => { stderr += String(chunk) })
-  const [code] = await once(child, 'exit') as [number | null]
+  // Wait for stdio to finish draining too; `exit` can arrive while buffered
+  // stderr diagnostics are still being delivered to these listeners.
+  const [code] = await once(child, 'close') as [number | null]
   return { code, stdout, stderr }
 }
 

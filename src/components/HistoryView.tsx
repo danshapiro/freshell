@@ -6,6 +6,7 @@ import { removeSessionFromProjects, toggleProjectExpanded } from '@/store/sessio
 import { api } from '@/lib/api'
 import { activateSessionSurface, fetchSessionWindow, type FetchSessionWindowResult } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
+import { findCheckpointWorkspaceForSession } from '@/lib/resume-session'
 import { applySessionRenameCascade } from '@/store/titleSync'
 import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
 import { renameSessionName } from '@/lib/session-names'
@@ -230,6 +231,9 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     const label = getProviderLabel(session.provider)
     const mode = (session.provider || 'claude') as CodingCliProviderName
     const displayName = sessionDisplayName(session, sessionNames)
+    const state = store.getState()
+    const checkpointWorkspace = session.checkpointWorkspace
+      ?? findCheckpointWorkspaceForSession(state, { provider: mode, sessionId: session.sessionId })
     dispatch(openSessionTab({
       sessionId: session.sessionId,
       title: displayName || label,
@@ -240,6 +244,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
       isSubagent: session.isSubagent,
       isNonInteractive: session.isNonInteractive,
       hasTitle: !!displayName,
+      ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
     }))
     onOpenSession?.()
   }

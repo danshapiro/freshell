@@ -18,6 +18,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub mod fresh_agent_ops;
 pub use fresh_agent_ops::*;
+pub mod provider_inputs;
+pub use provider_inputs::*;
+pub mod terminal_spool;
+pub use terminal_spool::{
+    TerminalExitObservation, TerminalSpoolCompletion, TerminalSpoolDescriptor,
+};
 
 #[cfg(test)]
 #[path = "fresh_agent_ops_tests.rs"]
@@ -338,6 +344,10 @@ pub enum RecoveryProbe {
         evidence: Vec<String>,
         #[serde(default)]
         store_state: EvidenceStoreState,
+        /// Path-specific negative inspection results. Empty legacy rows are
+        /// intentionally insufficient to authorize loss of a coding session.
+        #[serde(default)]
+        negative_paths: Vec<RecoveryPathEvidence>,
     },
     Blocked {
         path: RecoveryPath,
@@ -700,6 +710,7 @@ pub enum StopOutcome {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RuntimeErrorCode {
     InvalidRequest,
+    ProviderInputsChanged,
     ProtocolVersionMismatch,
     UnauthorizedRole,
     FrameTooLarge,
@@ -913,6 +924,10 @@ pub struct ProviderBootstrapFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSecretProfile {
+    ClaudeConfigurationFile,
+    CodexConfigurationFile,
+    OpencodeConfigurationFile,
+    AmplifierConfigurationFile,
     ClaudeOnecliEnvironment,
     ClaudeOnecliAuthFile,
     CodexOnecliEnvironment,
@@ -936,16 +951,32 @@ pub enum ProviderSecretProfile {
 impl ProviderSecretProfile {
     pub fn provider(self) -> &'static str {
         match self {
-            Self::ClaudeOnecliEnvironment | Self::ClaudeOnecliAuthFile => "claude",
-            Self::CodexOnecliEnvironment | Self::CodexOnecliAuthFile => "codex",
+            Self::ClaudeOnecliEnvironment
+            | Self::ClaudeOnecliAuthFile
+            | Self::ClaudeConfigurationFile => "claude",
+            Self::CodexOnecliEnvironment
+            | Self::CodexOnecliAuthFile
+            | Self::CodexConfigurationFile => "codex",
             Self::OpencodeOnecliEnvironment
             | Self::OpencodeOnecliAuthFile
-            | Self::OpencodeOnecliCaFile => "opencode",
+            | Self::OpencodeOnecliCaFile
+            | Self::OpencodeConfigurationFile => "opencode",
             Self::AmplifierOnecliEnvironment
+            | Self::AmplifierConfigurationFile
             | Self::AmplifierOnecliKeysFile
             | Self::AmplifierOnecliLunarouteGlm53
             | Self::LegacyAmplifierOnecliAnthropicHaikuLow => "amplifier",
         }
+    }
+
+    pub fn is_configuration_file(self) -> bool {
+        matches!(
+            self,
+            Self::ClaudeConfigurationFile
+                | Self::CodexConfigurationFile
+                | Self::OpencodeConfigurationFile
+                | Self::AmplifierConfigurationFile
+        )
     }
 
     pub fn auth_relative_path(self) -> Option<&'static str> {
@@ -975,11 +1006,15 @@ pub struct ProviderSecretReference {
     /// session host reads its read-only mount immediately before child spawn.
     pub source_path: String,
     pub profile: ProviderSecretProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderLaunchContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_inputs: Option<PreparedProviderInputs>,
     pub preparation: ProviderPreparation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_capability: Option<McpCapabilityReference>,
@@ -1052,6 +1087,9 @@ pub struct ProviderConfigReference {
 
 impl ProviderLaunchContext {
     pub fn validate(&self, provider: &str) -> Result<(), RuntimeError> {
+        if let Some(inputs) = &self.prepared_inputs {
+            inputs.validate(self.mcp_capability.as_ref())?;
+        }
         let invalid = || {
             RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1299,6 +1337,7 @@ mod provider_launch_context_tests {
             host_gateway_address: None,
         };
         let mut context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Opencode {
                 project_config: Vec::new(),
                 tui_config: Some(reference),
@@ -1337,6 +1376,7 @@ mod provider_launch_context_tests {
     #[test]
     fn typed_provider_context_round_trips_without_secret_material() {
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
             },
@@ -1388,6 +1428,29 @@ mod provider_launch_context_tests {
     }
 
     #[test]
+    fn managed_codex_named_profile_control_reaches_durable_launch_arguments() {
+        for flag in ["--profile", "-p"] {
+            let original = vec![
+                flag.into(),
+                "selected_profile-1".into(),
+                "--model".into(),
+                "fixture-model".into(),
+            ];
+            assert_eq!(
+                durable_managed_terminal_args("codex", original.clone(), None)
+                    .expect("native named profile control must remain usable"),
+                original
+            );
+            assert!(durable_managed_terminal_args(
+                "codex",
+                vec![flag.into(), "../config".into()],
+                None
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn managed_codex_accepts_only_the_packaged_mcp_recipe_after_preparation() {
         let args = vec![
             "-c".into(), "mcp_servers.freshell.command=\"node\"".into(),
@@ -1414,6 +1477,7 @@ mod provider_launch_context_tests {
         assert!(serde_json::from_value::<ProviderLaunchContext>(nested).is_err());
 
         let context = ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude { mcp_args: vec![] },
             mcp_capability: None,
             config: vec![ProviderConfigReference {
@@ -1453,6 +1517,7 @@ mod provider_launch_context_tests {
         }))
         .unwrap();
         launch.provider_launch_context = Some(ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: vec!["--api-key".into(), "fixture-secret-bytes".into()],
             },
@@ -1479,6 +1544,69 @@ mod provider_launch_context_tests {
             host_gateway_address: None,
         });
         assert!(launch.validate().is_err());
+    }
+
+    #[test]
+    fn configuration_file_grants_allow_many_unique_destinations_in_both_launch_routes() {
+        let references: Vec<_> = (0..128)
+            .map(|index| ProviderSecretReference {
+                source_path: format!("/private/reference-{index}"),
+                profile: ProviderSecretProfile::OpencodeConfigurationFile,
+                provider_relative_path: Some(format!(".freshell/references/{index}")),
+            })
+            .collect();
+        assert!(validate_provider_secrets("opencode", &references).is_ok());
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal", "streamId":"stream", "mode":"opencode",
+            "program":"opencode", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project",
+            "workspacePath":"/workspace"
+        }))
+        .unwrap();
+        terminal.provider_secret_references = references.clone();
+        assert!(terminal.validate().is_ok());
+        let mut fresh: FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            "sessionId":"presentation", "provider":"opencode", "sessionType":"freshopencode",
+            "runtimeVariant":"pinned", "providerStoreId":"store", "cwd":"/workspace",
+            "workspacePath":"/workspace", "runAsUid":65534, "runAsGid":0
+        }))
+        .unwrap();
+        fresh.provider_secret_references = references;
+        assert!(fresh.validate().is_ok());
+        // A valid filesystem path can exceed the legacy credential reference
+        // limit. Configuration references use the preparation frame budget.
+        let deep_source = format!("/private/{}/selected", "directory/".repeat(205));
+        terminal.provider_secret_references[0].source_path = deep_source.clone();
+        fresh.provider_secret_references[0].source_path = deep_source;
+        assert!(terminal.validate().is_ok());
+        assert!(fresh.validate().is_ok());
+    }
+    #[test]
+    fn configuration_file_grants_reject_cross_provider_duplicate_and_unsafe_destinations() {
+        let reference = ProviderSecretReference {
+            source_path: "/private/reference".into(),
+            profile: ProviderSecretProfile::ClaudeConfigurationFile,
+            provider_relative_path: Some(".freshell/references/one".into()),
+        };
+        assert!(validate_provider_secrets("claude", std::slice::from_ref(&reference)).is_ok());
+        assert!(validate_provider_secrets("codex", std::slice::from_ref(&reference)).is_err());
+        assert!(
+            validate_provider_secrets("claude", &[reference.clone(), reference.clone()]).is_err()
+        );
+        for path in [
+            ".claude/auth.json",
+            ".freshell/references/../one",
+            ".freshell/references/one/two",
+            "/absolute",
+            ".freshell/references/",
+        ] {
+            let mut invalid = reference.clone();
+            invalid.provider_relative_path = Some(path.into());
+            assert!(validate_provider_secrets("claude", &[invalid]).is_err());
+        }
+        let mut legacy = reference;
+        legacy.profile = ProviderSecretProfile::ClaudeOnecliAuthFile;
+        assert!(validate_provider_secrets("claude", &[legacy]).is_err());
     }
 
     #[test]
@@ -1516,6 +1644,7 @@ mod provider_launch_context_tests {
         ] {
             for profile in profiles {
                 let references = [ProviderSecretReference {
+                    provider_relative_path: None,
                     source_path: "/private/onecli-grant".into(),
                     profile,
                 }];
@@ -1526,6 +1655,7 @@ mod provider_launch_context_tests {
         assert!(validate_provider_secrets(
             "amplifier",
             &[ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: "/private/legacy".into(),
                 profile: ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow,
             }]
@@ -1602,6 +1732,15 @@ mod double_optional {
 }
 
 impl FreshProvider {
+    /// Native input recipes are shared by the two existing Claude flavors.
+    /// Runtime identities and reservation owners still use `as_str()`.
+    pub fn native_provider(&self) -> &'static str {
+        match self {
+            Self::Kilroy => "claude",
+            _ => self.as_str(),
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -1692,7 +1831,6 @@ impl FreshAgentLaunchSpec {
                         .is_some_and(|native| native != &reference.session_id)
             })
             || self.provider_bootstrap_files.len() > 16
-            || self.provider_secret_references.len() > 4
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1759,9 +1897,19 @@ impl FreshAgentLaunchSpec {
             }
         }
         if let Some(context) = &self.provider_launch_context {
-            context.validate(self.provider.as_str())?;
+            context.validate(self.provider.native_provider())?;
         }
-        validate_provider_secrets(self.provider.as_str(), &self.provider_secret_references)?;
+        validate_provider_secrets(
+            self.provider.native_provider(),
+            &self.provider_secret_references,
+        )?;
+        if let Some(inputs) = self
+            .provider_launch_context
+            .as_ref()
+            .and_then(|context| context.prepared_inputs.as_ref())
+        {
+            inputs.validate_references(&self.provider_secret_references)?;
+        }
         if self.provider != FreshProvider::Kilroy && !self.provider_bootstrap_files.is_empty() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1878,10 +2026,7 @@ impl TerminalLaunchSpec {
                 "managed terminal launch has an empty/root-uid required field",
             ));
         }
-        if self.env.len() > 512
-            || self.args.len() > 512
-            || self.provider_bootstrap_files.len() > 16
-            || self.provider_secret_references.len() > 4
+        if self.env.len() > 512 || self.args.len() > 512 || self.provider_bootstrap_files.len() > 16
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1962,6 +2107,13 @@ impl TerminalLaunchSpec {
             }
         }
         validate_provider_secrets(&self.mode, &self.provider_secret_references)?;
+        if let Some(inputs) = self
+            .provider_launch_context
+            .as_ref()
+            .and_then(|context| context.prepared_inputs.as_ref())
+        {
+            inputs.validate_references(&self.provider_secret_references)?;
+        }
         if let Some(context) = &self.provider_launch_context {
             context.validate(&self.mode)?;
         }
@@ -2009,6 +2161,10 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
+        if mode == "claude" && flag == "--init-only" {
+            index += 1;
+            continue;
+        }
         if mode == "codex" && flag == "resume" && index + 1 < args.len() {
             if !safe_selector(&args[index + 1]) {
                 return Err(invalid());
@@ -2034,7 +2190,9 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
         let allowed = match (mode, flag) {
             ("claude", "--settings") => {
                 let digest = format!("{:x}", sha2::Sha256::digest(value.as_bytes()));
-                APPROVED_CLAUDE_SETTINGS_DIGESTS.contains(&digest.as_str())
+                value == freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT
+                    || freshell_platform::cli_launch::is_owned_claude_settings(value)
+                    || APPROVED_CLAUDE_SETTINGS_DIGESTS.contains(&digest.as_str())
             }
             ("claude", "--mcp-config") => matches!(
                 value.as_str(),
@@ -2043,6 +2201,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
             ("claude", "--session-id" | "--resume") => safe_selector(value),
             ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
             ("claude", "--plugin-dir") => safe_selector(value),
+            ("claude", "--setting-sources") => freshell_platform::claude_inputs::parse_setting_sources(value).is_ok(),
             ("codex", "-c") => {
                 matches!(
                     value.as_str(),
@@ -2057,6 +2216,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                     .and_then(|part| part.strip_suffix('"'))
                     .is_some_and(safe_selector)
             }
+            ("codex", "--profile" | "-p") => freshell_platform::codex_inputs::valid_profile(value),
             ("codex", "--model" | "--sandbox") => safe_selector(value),
             ("codex", "--remote") => value
                 .strip_prefix("ws://127.0.0.1:")
@@ -2076,8 +2236,9 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
 }
 
 /// Convert the web process's ordinary launch argv into its durable recipe.
-/// Claude's web-owned MCP file is omitted and its settings are regenerated
-/// from the shipped non-secret recipe before validation.
+/// Claude's web-owned MCP file is omitted. Its shipped settings recipe is
+/// regenerated; selected user settings use an owned marker resolved only from
+/// accepted private inputs at final child argv construction.
 pub fn durable_managed_terminal_args(
     mode: &str,
     args: Vec<String>,
@@ -2121,23 +2282,60 @@ pub fn durable_managed_terminal_args(
     };
     let mut out = Vec::with_capacity(args.len());
     let mut index = 0;
+    let mut selected_settings = None;
     while index < args.len() {
         match args[index].as_str() {
+            flag if flag == "--setting-sources" || flag.starts_with("--setting-sources=") => {
+                let value = if let Some(value) = flag.strip_prefix("--setting-sources=") {
+                    index += 1;
+                    value
+                } else {
+                    let value = args.get(index + 1).ok_or_else(invalid)?;
+                    index += 2;
+                    value.as_str()
+                };
+                let selected = freshell_platform::claude_inputs::parse_setting_sources(value)
+                    .map_err(|_| invalid())?;
+                out.push("--setting-sources".into());
+                out.push(
+                    selected
+                        .into_iter()
+                        .map(|source| source.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
             "--mcp-config" => {
                 args.get(index + 1).ok_or_else(invalid)?;
                 index += 2;
             }
-            "--settings" => {
-                args.get(index + 1).ok_or_else(invalid)?;
-                out.push("--settings".into());
-                out.push(claude_settings.ok_or_else(invalid)?.into());
-                index += 2;
+            flag if flag == "--settings" || flag.starts_with("--settings=") => {
+                let value = if let Some(value) = flag.strip_prefix("--settings=") {
+                    index += 1;
+                    value
+                } else {
+                    let value = args.get(index + 1).ok_or_else(invalid)?;
+                    index += 2;
+                    value.as_str()
+                };
+                selected_settings = Some((out.len(), value));
             }
             _ => {
                 out.push(args[index].clone());
                 index += 1;
             }
         }
+    }
+    if let Some((position, value)) = selected_settings {
+        out.insert(position, "--settings".into());
+        out.insert(
+            position + 1,
+            if freshell_platform::cli_launch::is_owned_claude_settings(value) {
+                claude_settings.ok_or_else(invalid)?.into()
+            } else {
+                freshell_platform::claude_inputs::MANAGED_SETTINGS_ARGUMENT.into()
+            },
+        );
     }
     validate_managed_terminal_args(mode, &out)?;
     Ok(out)
@@ -2152,26 +2350,61 @@ fn safe_selector(value: &str) -> bool {
         })
 }
 
-fn validate_provider_secrets(
+pub fn validate_provider_secrets(
     provider: &str,
     references: &[ProviderSecretReference],
 ) -> Result<(), RuntimeError> {
-    let mut seen = std::collections::BTreeSet::new();
+    let invalid = || {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "managed provider grant profile, destination or capacity is invalid",
+        )
+    };
+    if references.len() > 132 {
+        return Err(invalid());
+    }
+    let mut legacy_profiles = std::collections::BTreeSet::new();
+    let mut destinations = std::collections::BTreeSet::new();
     for reference in references {
         if reference.profile.provider() != provider
             || !std::path::Path::new(&reference.source_path).is_absolute()
-            || reference.source_path.len() > 1024
+            || reference.source_path.len()
+                > if reference.profile.is_configuration_file() {
+                    MAX_CONTROL_FRAME_BYTES
+                } else {
+                    1024
+                }
             || reference.source_path.chars().any(char::is_control)
-            || !seen.insert(reference.profile as u8)
             || matches!(
                 reference.profile,
                 ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow
             )
         {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::InvalidRequest,
-                "managed OneCLI profile is unsafe or belongs to another provider",
-            ));
+            return Err(invalid());
+        }
+        if reference.profile.is_configuration_file() {
+            let destination = reference
+                .provider_relative_path
+                .as_deref()
+                .ok_or_else(invalid)?;
+            let id = destination
+                .strip_prefix(".freshell/references/")
+                .ok_or_else(invalid)?;
+            if id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                || !destinations.insert(destination)
+                || destinations.len() > 128
+            {
+                return Err(invalid());
+            }
+        } else if reference.provider_relative_path.is_some()
+            || !legacy_profiles.insert(reference.profile as u8)
+            || legacy_profiles.len() > 4
+        {
+            return Err(invalid());
         }
     }
     Ok(())
@@ -2210,6 +2443,8 @@ pub struct RuntimeOutputBatch {
     pub truncated: bool,
     #[serde(default)]
     pub exited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TerminalSpoolCompletion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
     /// Provider-native durable conversation id discovered by the session host.
@@ -2265,6 +2500,12 @@ pub struct FreshAgentSendRequest {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<FreshAgentTurnSettings>,
+    /// Opaque checkpoint attempt identity, when this send crossed the modern
+    /// server-owned snapshot barrier. It is passed through the managed host to
+    /// the provider so the native turn receipt can be joined without text or
+    /// ordinal matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_logical_attempt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -2594,6 +2835,10 @@ pub struct QualificationWriterClaimEvidence {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AdminCommand {
     Health,
+    ReserveProviderInputs(ReserveProviderInputsRequest),
+    NativeAuthLookup(NativeAuthLookupRequest),
+    ObserveClaudeSources(Box<ObserveClaudeSourcesRequest>),
+    BindProviderPathInputs(BindProviderPathInputsRequest),
     Launch(Box<LaunchRequest>),
     Stop(StopRequest),
     Inventory,
@@ -2626,6 +2871,361 @@ pub enum AdminCommand {
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReserveProviderInputsRequest {
+    pub expected_control_epoch: Option<u64>,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub creation_seed_ref: String,
+}
+
+/// Exact registry-backed creation identity. The observation is recorded only
+/// after the selected daemon confirms the reserved volume is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderInputReservation {
+    pub reservation_id: String,
+    pub installation_id: InstallationId,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub creation_seed_ref: String,
+    pub intent_revision: u64,
+    pub provider_volume_name: String,
+    pub image_ref: String,
+    pub host_binary_path: String,
+    pub host_binary_sha256: String,
+    pub observation: InitialAuthVolumeObservation,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InitialAuthVolumeObservation {
+    /// The exact creation-owned volume after a positively rejected initial
+    /// grant. This is retained ownership evidence, not a claim of absence.
+    OwnedUndispatched {
+        #[serde(rename = "daemonId")]
+        daemon_id: DockerDaemonId,
+        #[serde(rename = "incarnationId")]
+        incarnation_id: IncarnationId,
+    },
+    Absent {
+        #[serde(rename = "daemonId")]
+        daemon_id: DockerDaemonId,
+    },
+}
+
+/// Transient nested callback request; the authority is scoped by the supervisor
+/// to the recovery attempt whose lifecycle lock is already held.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeAuthLookupRequest {
+    pub expected_control_epoch: Option<u64>,
+    pub soul_id: SoulId,
+    pub attempt_authority: String,
+    pub keys: Vec<String>,
+}
+
+/// Claude source selection has its own purpose and eligibility. Creation
+/// absence authorizes an empty initial HOME, never source or native-store absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClaudeSourceAuthority {
+    InitialReservation {
+        #[serde(rename = "reservationId")]
+        reservation_id: String,
+    },
+    RecoveryAttempt {
+        #[serde(rename = "attemptId")]
+        attempt_id: String,
+    },
+}
+
+pub type ClaudeSourceObservation = freshell_platform::claude_inputs::observation::ObservationReply;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObserveClaudeSourcesRequest {
+    pub expected_control_epoch: Option<u64>,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub authority: ClaudeSourceAuthority,
+    pub workspace_path: String,
+    pub git_common_dir: Option<String>,
+    pub candidate: Option<PreparedProviderContext>,
+    pub observation_request: freshell_platform::claude_inputs::observation::ObservationRequest,
+}
+
+/// Selection-only input to the fixed Claude candidate projection helper.
+/// Ordinary documents stay on its verified private stage mount; credentials,
+/// secret references and native provider stores are not projection inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeCandidateProjectionRequest {
+    pub source_request: freshell_platform::claude_inputs::observation::ObservationRequest,
+    pub workspace_path: String,
+    pub provider_launch_context: ProviderLaunchContext,
+    pub publication: ClaudeCandidatePublication,
+}
+
+/// Credential-free issuer metadata published beside a complete ordinary
+/// Claude result. It qualifies the published generation, not a provider HOME.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeCandidatePublication {
+    pub version: u8,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub authority_sha256: String,
+    pub initial_reservation_id: Option<String>,
+    pub registry_attempt_id: Option<RecoveryAttemptId>,
+    pub intent_revision: u64,
+    pub prior_generation_id: Option<String>,
+    pub generation_id: String,
+    pub manifest_sha256: String,
+    pub prepared_context_sha256: String,
+    pub prepared_result_sha256: String,
+    pub selector_manifest_sha256: String,
+    pub plan_revision: u8,
+    pub native_source_runtime: freshell_platform::claude_inputs::NativeSourceRuntime,
+    pub workspace_path: String,
+    pub cwd: std::path::PathBuf,
+    pub git_common_dir: Option<String>,
+}
+
+/// Finite provenance supplied by the authenticated recovery callback owner.
+/// The scope key itself is confined to the existing private callback channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeRecoverySourceBinding {
+    pub provider: String,
+    pub git_common_dir: Option<String>,
+    pub authority_sha256: String,
+    pub registry_attempt_id: RecoveryAttemptId,
+    pub intent_revision: u64,
+    pub prior_generation_id: String,
+}
+
+impl ClaudeRecoverySourceBinding {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if !matches!(self.provider.as_str(), "claude" | "kilroy")
+            || self.authority_sha256.len() != 64
+            || !self
+                .authority_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || RecoveryAttemptId::parse(self.registry_attempt_id.as_str()).is_err()
+            || self.intent_revision == 0
+            || !self.prior_generation_id.starts_with("grant-")
+            || uuid::Uuid::parse_str(&self.prior_generation_id[6..]).is_err()
+            || self.git_common_dir.as_ref().is_some_and(|path| {
+                path.len() > 64 * 1024
+                    || path.chars().any(char::is_control)
+                    || !std::path::Path::new(path).is_absolute()
+            })
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "Claude recovery source binding is unavailable; retain inputs and reprepare",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ClaudeCandidateProjectionRequest {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        use sha2::Digest;
+        let invalid = || {
+            RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+            "Claude candidate projection has incomplete ordinary selection metadata; retain inputs and reprepare")
+        };
+        self.source_request.validate().map_err(|_| invalid())?;
+        self.provider_launch_context.validate("claude")?;
+        let inputs = self
+            .provider_launch_context
+            .prepared_inputs
+            .as_ref()
+            .ok_or_else(invalid)?;
+        if self.workspace_path.len() > 64 * 1024
+            || self.workspace_path.chars().any(char::is_control)
+            || !std::path::Path::new(&self.workspace_path).is_absolute()
+            || !self.source_request.cwd.starts_with(&self.workspace_path)
+            || inputs.manifest.source_count != 0
+            || inputs.manifest.alias_count != 0
+            || inputs.manifest.recipe_count != 0
+            || inputs.indexed_files.is_some()
+        {
+            return Err(invalid());
+        }
+        let source = &self.source_request;
+        let binding = source.candidate_binding.as_ref().ok_or_else(invalid)?;
+        let published = &self.publication;
+        let publication_bytes =
+            bounded_json_bytes(published, MAX_CONTROL_FRAME_BYTES).map_err(|_| invalid())?;
+        let context_bytes =
+            bounded_json_bytes(&self.provider_launch_context, MAX_CONTROL_FRAME_BYTES)
+                .map_err(|_| invalid())?;
+        let initial = published.initial_reservation_id.as_ref();
+        if published.version != 1
+            || !matches!(published.provider.as_str(), "claude" | "kilroy")
+            || (published.provider == "kilroy"
+                && source.native_source_runtime
+                    != freshell_platform::claude_inputs::NativeSourceRuntime::Sdk)
+            || published.soul_id.as_str() != binding.soul_id
+            || published.generation_id != binding.generation_id
+            || published.generation_id != inputs.generation_id
+            || published.manifest_sha256 != binding.manifest_sha256
+            || published.manifest_sha256 != inputs.manifest.sha256
+            || published.prepared_result_sha256 != binding.prepared_result_sha256
+            || published.authority_sha256 != binding.authority_sha256
+            || published.workspace_path != self.workspace_path
+            || published.cwd != source.cwd
+            || published.native_source_runtime != source.native_source_runtime
+            || published.selector_manifest_sha256 != source.selector_manifest_sha256
+            || published.plan_revision != source.plan_revision
+            || published.intent_revision == 0
+            || published.soul_id.as_str().len() > 160
+            || published.soul_id.as_str().chars().any(char::is_control)
+            || published.soul_id.as_str().is_empty()
+            || format!("{:x}", Sha256::digest(publication_bytes)) != binding.publication_sha256
+            || format!("{:x}", Sha256::digest(context_bytes)) != published.prepared_context_sha256
+            || if let Some(reservation) = initial {
+                published.intent_revision != 1
+                    || uuid::Uuid::parse_str(reservation).is_err()
+                    || inputs.initial_auth_reservation.as_ref() != initial
+                    || published.registry_attempt_id.is_some()
+                    || published.prior_generation_id.is_some()
+            } else {
+                published
+                    .registry_attempt_id
+                    .as_ref()
+                    .is_none_or(|attempt| RecoveryAttemptId::parse(attempt.as_str()).is_err())
+                    || published
+                        .prior_generation_id
+                        .as_ref()
+                        .is_none_or(|generation| {
+                            !generation.starts_with("grant-")
+                                || uuid::Uuid::parse_str(&generation[6..]).is_err()
+                        })
+            }
+            || published.git_common_dir.as_ref().is_some_and(|path| {
+                path.len() > 64 * 1024
+                    || path.chars().any(char::is_control)
+                    || !std::path::Path::new(path).is_absolute()
+            })
+        {
+            return Err(invalid());
+        }
+        bounded_json_bytes(
+            source,
+            freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
+        )
+        .map_err(|_| invalid())?;
+        bounded_json_bytes(self, MAX_CONTROL_FRAME_BYTES).map_err(|_| invalid())?;
+        Ok(())
+    }
+}
+
+impl ObserveClaudeSourcesRequest {
+    pub fn candidate_projection(
+        &self,
+        publication: ClaudeCandidatePublication,
+    ) -> Result<ClaudeCandidateProjectionRequest, RuntimeError> {
+        use sha2::Digest;
+        self.validate()?;
+        let unavailable = || {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "Claude candidate publication binding unavailable; retain inputs and reprepare",
+            )
+        };
+        let candidate = self.candidate.as_ref().ok_or_else(unavailable)?;
+        let authority = bounded_json_bytes(&self.authority, MAX_CONTROL_FRAME_BYTES)
+            .map_err(|_| unavailable())?;
+        let result =
+            bounded_json_bytes(candidate, MAX_CONTROL_FRAME_BYTES).map_err(|_| unavailable())?;
+        if publication.soul_id != self.soul_id
+            || publication.provider != self.provider
+            || publication.workspace_path != self.workspace_path
+            || publication.git_common_dir != self.git_common_dir
+            || publication.authority_sha256 != format!("{:x}", Sha256::digest(authority))
+            || publication.prepared_result_sha256 != format!("{:x}", Sha256::digest(result))
+            || match &self.authority {
+                ClaudeSourceAuthority::InitialReservation { reservation_id } => {
+                    publication.initial_reservation_id.as_ref() != Some(reservation_id)
+                }
+                ClaudeSourceAuthority::RecoveryAttempt { .. } => {
+                    publication.initial_reservation_id.is_some()
+                }
+            }
+        {
+            return Err(unavailable());
+        }
+        let projection = ClaudeCandidateProjectionRequest {
+            source_request: self.observation_request.clone(),
+            workspace_path: self.workspace_path.clone(),
+            provider_launch_context: candidate.provider_launch_context.clone(),
+            publication,
+        };
+        projection.validate()?;
+        Ok(projection)
+    }
+
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(RuntimeErrorCode::InvalidRequest,
+            "Claude source request has invalid selection or authority; retain inputs and reprepare")
+        };
+        if !matches!(self.provider.as_str(), "claude" | "kilroy")
+            || self.observation_request.home != std::path::Path::new("/home/freshell/provider")
+        {
+            return Err(invalid());
+        }
+        let id = match &self.authority {
+            ClaudeSourceAuthority::InitialReservation { reservation_id } => reservation_id,
+            ClaudeSourceAuthority::RecoveryAttempt { attempt_id } => attempt_id,
+        };
+        if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
+            return Err(invalid());
+        }
+        self.observation_request.validate().map_err(|_| invalid())?;
+        for path in std::iter::once(&self.workspace_path).chain(self.git_common_dir.iter()) {
+            if path.len() > 64 * 1024
+                || path.chars().any(char::is_control)
+                || !std::path::Path::new(path).is_absolute()
+            {
+                return Err(invalid());
+            }
+        }
+        if !self
+            .observation_request
+            .cwd
+            .starts_with(&self.workspace_path)
+        {
+            return Err(invalid());
+        }
+        if let Some(candidate) = &self.candidate {
+            candidate.validate("claude")?;
+            if candidate.provider_launch_context.prepared_inputs.is_none() {
+                return Err(invalid());
+            }
+        }
+        bounded_json_bytes(self, MAX_CONTROL_FRAME_BYTES).map_err(|_| invalid())?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NativeAuthValues(pub std::collections::BTreeMap<String, String>);
+impl fmt::Debug for NativeAuthValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeAuthValues")
+            .field("selected_count", &self.0.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2742,6 +3342,10 @@ pub struct LaunchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum AdminResult {
+    ProviderInputReservation(ProviderInputReservation),
+    NativeAuthLookup(NativeAuthValues),
+    ClaudeSourceObservation(ClaudeSourceObservation),
+    ProviderPathInputsBound,
     Health {
         control_epoch: u64,
         installation_id: InstallationId,
@@ -2806,6 +3410,8 @@ pub enum HostCommand {
         grant_id: GrantId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fixture: Option<FixtureKind>,
+        #[serde(default, skip_serializing_if = "ProviderPathInputs::is_empty")]
+        provider_path_inputs: ProviderPathInputs,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal: Option<Box<TerminalLaunchSpec>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2847,6 +3453,8 @@ pub enum HostCommand {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         settings: Option<FreshAgentTurnSettings>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_logical_attempt_id: Option<String>,
     },
     FreshAgentFork {
         incarnation_id: IncarnationId,
@@ -3010,6 +3618,57 @@ where
     write_frame_with_limit(writer, value, MAX_CONTROL_FRAME_BYTES).await
 }
 
+pub fn bounded_json_bytes<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, FrameError> {
+    struct BoundedWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        overflow: bool,
+    }
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(required) = self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.limit)
+            else {
+                self.overflow = true;
+                return Err(std::io::Error::other("control frame exceeds limit"));
+            };
+            if required > self.bytes.capacity() {
+                let capacity = self
+                    .bytes
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+                    .min(self.limit);
+                self.bytes
+                    .try_reserve_exact(capacity - self.bytes.len())
+                    .map_err(std::io::Error::other)?;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let limit = limit.min(u32::MAX as usize);
+    let mut writer = BoundedWriter {
+        bytes: Vec::with_capacity(limit.min(4096)),
+        limit,
+        overflow: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        return Err(if writer.overflow {
+            FrameError::TooLarge
+        } else {
+            FrameError::Json(error)
+        });
+    }
+    Ok(writer.bytes)
+}
+
 pub async fn write_frame_with_limit<W, T>(
     writer: &mut W,
     value: &T,
@@ -3019,10 +3678,7 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let bytes = serde_json::to_vec(value)?;
-    if bytes.len() > limit {
-        return Err(FrameError::TooLarge);
-    }
+    let bytes = bounded_json_bytes(value, limit)?;
     writer
         .write_all(&(bytes.len() as u32).to_be_bytes())
         .await?;
@@ -3088,6 +3744,95 @@ mod tests {
     }
 
     #[test]
+    fn hosted_checkpoint_send_identity_is_optional_and_backward_compatible() {
+        let request: FreshAgentSendRequest = serde_json::from_value(serde_json::json!({
+            "soulId": "soul-hosted",
+            "text": "continue",
+            "checkpointLogicalAttemptId": "attempt-hosted-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            request.checkpoint_logical_attempt_id.as_deref(),
+            Some("attempt-hosted-1")
+        );
+
+        let legacy_request: FreshAgentSendRequest = serde_json::from_value(serde_json::json!({
+            "soulId": "soul-hosted",
+            "text": "legacy continue"
+        }))
+        .unwrap();
+        assert_eq!(legacy_request.checkpoint_logical_attempt_id, None);
+        assert_eq!(
+            serde_json::to_value(&legacy_request).unwrap(),
+            serde_json::json!({ "soulId": "soul-hosted", "text": "legacy continue" })
+        );
+
+        let host_command: HostCommand = serde_json::from_value(serde_json::json!({
+            "method": "fresh_agent_send",
+            "params": {
+                "incarnation_id": "incarnation-hosted",
+                "request_id": "request-hosted",
+                "text": "continue",
+                "checkpoint_logical_attempt_id": "attempt-hosted-1"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            host_command,
+            HostCommand::FreshAgentSend {
+                checkpoint_logical_attempt_id: Some(ref id),
+                ..
+            } if id == "attempt-hosted-1"
+        ));
+
+        let legacy_host_command: HostCommand = serde_json::from_value(serde_json::json!({
+            "method": "fresh_agent_send",
+            "params": {
+                "incarnation_id": "incarnation-hosted",
+                "request_id": "request-hosted",
+                "text": "legacy continue"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy_host_command,
+            HostCommand::FreshAgentSend {
+                checkpoint_logical_attempt_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_preparation_serialization_stops_before_materializing_oversized_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Many<'a>(&'a AtomicUsize);
+        impl Serialize for Many<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(100_000))?;
+                for _ in 0..100_000 {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    seq.serialize_element("metadata")?;
+                }
+                seq.end()
+            }
+        }
+        let count = AtomicUsize::new(0);
+        assert!(matches!(
+            bounded_json_bytes(&Many(&count), 1024),
+            Err(FrameError::TooLarge)
+        ));
+        assert!(
+            count.load(Ordering::SeqCst) < 200,
+            "oversized metadata was fully materialized before its bound"
+        );
+        let exact = serde_json::json!({"prepared":"metadata"});
+        let bytes = serde_json::to_vec(&exact).unwrap();
+        assert_eq!(bounded_json_bytes(&exact, bytes.len()).unwrap(), bytes);
+    }
+
+    #[test]
     fn durable_terminal_argument_recipe_preserves_provider_options_and_legacy_modes() {
         for (provider, args) in [
             (
@@ -3150,12 +3895,150 @@ mod tests {
     }
 
     #[test]
+    fn managed_claude_source_selector_survives_native_argument_recipe_and_rejects_unknown_sources()
+    {
+        for (input, selected) in [
+            ("project,local", "project,local"),
+            ("", ""),
+            ("local, user,local", "user,local"),
+        ] {
+            let args = vec!["--setting-sources".into(), input.into()];
+            let retained = durable_managed_terminal_args("claude", args, None).unwrap();
+            assert_eq!(retained, vec!["--setting-sources", selected]);
+            validate_managed_terminal_args("claude", &retained).unwrap();
+        }
+        let retained =
+            durable_managed_terminal_args("claude", vec!["--setting-sources=project".into()], None)
+                .unwrap();
+        assert_eq!(retained, vec!["--setting-sources", "project"]);
+        for input in ["unknown", "project,", "user,secret=value"] {
+            assert!(durable_managed_terminal_args(
+                "claude",
+                vec!["--setting-sources".into(), input.into()],
+                None
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn claude_provider_native_plugin_argument_survives_durable_recipe() {
         let args = vec!["--plugin-dir".into(), "/workspace/claude-plugin".into()];
         assert_eq!(
             durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
             args
         );
+    }
+
+    #[test]
+    fn managed_claude_duplicate_settings_uses_only_last_native_selection() {
+        use freshell_platform::claude_inputs::{
+            selected_settings_argument, MANAGED_SETTINGS_ARGUMENT,
+        };
+        use freshell_platform::cli_launch::{claude_settings_json, ProviderTarget};
+        let shipped = claude_settings_json(ProviderTarget::Unix);
+        for ignored in [
+            "missing-ignored-settings.json",
+            "{\"env\":{\"PRIVATE_IGNORED\":\"sentinel\"}}",
+        ] {
+            for last in [format!("--settings={shipped}"), "--settings".into()] {
+                let mut args = vec![
+                    "--settings".into(),
+                    ignored.into(),
+                    "--init-only".into(),
+                    last,
+                ];
+                if args.last().unwrap() == "--settings" {
+                    args.push(shipped.clone());
+                }
+                let retained =
+                    durable_managed_terminal_args("claude", args, Some(&shipped)).unwrap();
+                validate_managed_terminal_args("claude", &retained).unwrap();
+                assert_eq!(
+                    selected_settings_argument(&retained),
+                    Some(shipped.as_str())
+                );
+                assert!(!retained.iter().any(|arg| arg == MANAGED_SETTINGS_ARGUMENT),
+                    "an ignored earlier selection must not demand private selected settings at spawn");
+                assert!(!serde_json::to_string(&retained)
+                    .unwrap()
+                    .contains("PRIVATE_IGNORED"));
+            }
+        }
+        let retained = durable_managed_terminal_args(
+            "claude",
+            vec![
+                "--settings".into(),
+                shipped.clone(),
+                "--settings=selected-last.json".into(),
+            ],
+            Some(&shipped),
+        )
+        .unwrap();
+        assert_eq!(
+            selected_settings_argument(&retained),
+            Some(MANAGED_SETTINGS_ARGUMENT)
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|arg| arg.as_str() == "--settings")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn claude_native_initialization_argument_retains_selected_plugin_and_rejects_credentials() {
+        let args = vec![
+            "--init-only".into(),
+            "--plugin-dir".into(),
+            "/workspace/plugin".into(),
+        ];
+        assert_eq!(
+            durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
+            args
+        );
+        assert!(durable_managed_terminal_args(
+            "claude",
+            vec![
+                "--init-only".into(),
+                "--api-key".into(),
+                "private-value".into()
+            ],
+            None
+        )
+        .is_err());
+        assert!(durable_managed_terminal_args("codex", vec!["--init-only".into()], None).is_err());
+    }
+
+    #[test]
+    fn managed_claude_shipped_hook_recipe_is_accepted_and_custom_hooks_are_rejected() {
+        use freshell_platform::cli_launch::{claude_settings_json, ProviderTarget};
+        for target in [ProviderTarget::Unix, ProviderTarget::Windows] {
+            let settings = claude_settings_json(target);
+            assert!(validate_managed_terminal_args(
+                "claude",
+                &["--settings".into(), settings.clone()]
+            )
+            .is_ok());
+            let mut changed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+            changed["hooks"]["Stop"][0]["hooks"][0]["command"] =
+                serde_json::json!("echo PRIVATE_UNAPPROVED_HOOK");
+            let error = validate_managed_terminal_args(
+                "claude",
+                &["--settings".into(), changed.to_string()],
+            )
+            .unwrap_err();
+            assert!(!error.message.contains("PRIVATE_UNAPPROVED_HOOK"));
+            changed = serde_json::from_str(&settings).unwrap();
+            changed["env"] = serde_json::json!({"API_KEY":"PRIVATE_UNAPPROVED_SETTING"});
+            assert!(validate_managed_terminal_args(
+                "claude",
+                &["--settings".into(), changed.to_string()]
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -3306,6 +4189,34 @@ mod tests {
             serde_json::from_value::<RecoveryProbe>(encoded).unwrap(),
             RecoveryProbe::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn recovery_negative_wire_preserves_inspected_rows_and_defaults_legacy_unknown() {
+        let legacy = serde_json::json!({"kind":"definitively_unavailable","data":{
+            "path":"native_resume","reason":"old absence","evidence":["store"],"store_state":"missing"
+        }});
+        let mut probe: RecoveryProbe = serde_json::from_value(legacy).unwrap();
+        let RecoveryProbe::DefinitivelyUnavailable { negative_paths, .. } = &mut probe else {
+            panic!("wrong probe")
+        };
+        assert!(
+            negative_paths.is_empty(),
+            "legacy wire must not invent inspection"
+        );
+        negative_paths.push(RecoveryPathEvidence {
+            path: RecoveryPath::CheckpointRestore,
+            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+            reason_code: "EXACT_SQLITE_NO_MATCH".into(),
+            evidence_refs: vec!["provider://effective.db/exact-session".into()],
+            store_state: EvidenceStoreState::PresentReadable,
+        });
+        let decoded: RecoveryProbe =
+            serde_json::from_slice(&serde_json::to_vec(&probe).unwrap()).unwrap();
+        assert_eq!(
+            decoded, probe,
+            "typed inspection must survive the host IPC wire"
+        );
     }
 
     #[test]
@@ -3491,6 +4402,38 @@ mod tests {
             HostCommand::FreshAgentResolve { decision_id, .. }
                 if decision_id == "decision-7"
         ));
+    }
+
+    #[test]
+    fn fresh_kilroy_consumes_claude_recipes_without_changing_runtime_identity() {
+        let mut launch = fresh_agent_launch(FreshProvider::Kilroy, "kilroy");
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+            prepared_inputs: None,
+            mcp_capability: None,
+            config: Vec::new(),
+        };
+        assert!(context.validate("kilroy").is_err());
+        launch.provider_launch_context = Some(context);
+        launch.provider_secret_references = vec![ProviderSecretReference {
+            source_path: "/synthetic/private/claude-environment".into(),
+            profile: ProviderSecretProfile::ClaudeOnecliEnvironment,
+            provider_relative_path: None,
+        }];
+        launch.validate().unwrap();
+        let retained: FreshAgentLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&launch).unwrap()).unwrap();
+        assert_eq!(retained.provider, FreshProvider::Kilroy);
+        assert_eq!(retained.session_type, "kilroy");
+        assert_eq!(retained.native_session_id.as_deref(), Some("native-one"));
+        assert_eq!(retained, launch);
+        launch.provider = FreshProvider::Codex;
+        launch.session_type = "freshcodex".into();
+        assert!(launch.validate().is_err());
+        launch.provider_launch_context = None;
+        assert!(launch.validate().is_err());
     }
 
     #[test]

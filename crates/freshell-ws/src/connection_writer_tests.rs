@@ -631,6 +631,8 @@ async fn preludes_always_precede_replay_and_exit_follows_output() {
     sender.push_server(output(2));
     sender.push_server(ServerMessage::TerminalExit(
         freshell_protocol::TerminalExit {
+            managed_retained: None,
+            exit_code_available: None,
             terminal_id: "term".into(),
             exit_code: 0,
         },
@@ -887,6 +889,8 @@ async fn superseding_attach_discards_old_queued_output_and_old_exit() {
     sender.push_server(output(1));
     sender.push_server(ServerMessage::TerminalExit(
         freshell_protocol::TerminalExit {
+            managed_retained: None,
+            exit_code_available: None,
             terminal_id: "term".into(),
             exit_code: 0,
         },
@@ -904,6 +908,8 @@ async fn superseding_attach_discards_old_queued_output_and_old_exit() {
     sender.push_server(replay);
     sender.push_server(ServerMessage::TerminalExit(
         freshell_protocol::TerminalExit {
+            managed_retained: None,
+            exit_code_available: None,
             terminal_id: "term".into(),
             exit_code: 0,
         },

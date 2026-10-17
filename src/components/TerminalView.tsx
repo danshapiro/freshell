@@ -37,6 +37,7 @@ import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
+import { canReplayManagedTerminal, managedTerminalPaneStatus } from '@/lib/managed-terminal.js'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
@@ -72,7 +73,9 @@ import { TerminalStuckCard } from '@/components/TerminalStuckCard'
 import { TerminalLaunchFailureCard } from '@/components/TerminalLaunchFailureCard'
 import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import { buildResumeContent, freshSessionTypeForPaneFlavor } from '@/lib/session-type-utils'
+import { findCheckpointWorkspaceForSession } from '@/lib/resume-session'
 import type { LaunchFailure } from '@/store/paneTypes'
+import { buildManagedPreparationFailure, retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
@@ -664,6 +667,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const content = root ? findPaneContent(root, paneId) : null
     return content?.kind === 'terminal' ? content.closeError : undefined
   })
+  const storedLaunchFailure = useAppSelector((s) => {
+    const root = s.panes.layouts[tabId]
+    const content = root ? findPaneContent(root, paneId) : null
+    return content?.kind === 'terminal' ? content.launchFailure : undefined
+  })
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
@@ -902,6 +910,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+  const managedReplayAvailable = canReplayManagedTerminal(terminalContent)
 
   // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
   // pane observing a FRESH-AGENT owner for its canonical session — the
@@ -3464,7 +3473,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
-    if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) {
+    if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary) && !canReplayManagedTerminal(contentRef.current)) {
       log.debug('attach gate declined: managed runtime recovery requires an explicit decision', {
         terminalId: tid,
         paneId: paneIdRef.current,
@@ -3923,7 +3932,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const currentContent = contentRef.current
     if (!tid || !currentContent) return false
     if (!paneRefreshTargetMatchesContent(request.target, currentContent)) return false
-    if (isManagedRuntimeRecoveryDecision(currentContent.recoverySummary)) return false
+    if (isManagedRuntimeRecoveryDecision(currentContent.recoverySummary) && !canReplayManagedTerminal(currentContent)) return false
 
     handledRefreshRequestIdRef.current = request.requestId
     // An explicit pane refresh is user intent, not automatic recovery cycling:
@@ -4082,7 +4091,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!isTerminal || !terminalContent) return
-    if (isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)) return
+    if (isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary) && !managedReplayAvailable) return
     if (shouldWaitForProviderBehavior) return
     const termCandidate = termRef.current
     if (!termCandidate) return
@@ -4647,7 +4656,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
 
       unsub = ws.onMessage((msg) => {
-        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary) && !canReplayManagedTerminal(contentRef.current)) return
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
 
@@ -5941,12 +5950,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           // Settle frame (znhn item 3): the deterministic end of an
           // auto-resume story — clears the recovering notice on a FRAME,
-          // never a timer. Hard rule (D-1, validated A1/A6): dispatches ONLY
-          // into terminalLifecycleSlice — NEVER pane content/status. Cross-
+          // never a timer. Ordinary settle frames dispatch ONLY into
+          // terminalLifecycleSlice — NEVER pane content/status. Cross-
           // channel ordering vs terminal.exit is unguaranteed (unbiased
           // select!, terminal.rs:325-334); the running|recovering content-
-          // write allowlist below is the load-bearing barrier that keeps an
-          // out-of-order 'exited' frame away from pane content.
+          // write allowlist below keeps an out-of-order ordinary 'exited'
+          // frame away from pane content. An authoritative managed recovery
+          // summary carries its own final verdict and preserves its facade.
           if (statusMine && msg.status === 'exited') {
             dispatch(
               recordAutoResumeSettled({
@@ -5959,15 +5969,37 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             )
           }
           if (msg.terminalId === tid) {
-            if (
-              msg.status === 'running'
-              || msg.status === 'recovering'
-            ) {
-              updateContent({ status: msg.status })
+            if (contentRef.current?.soulId && msg.recoverySummary) {
+              const status = managedTerminalPaneStatus({
+                ...contentRef.current, runtimeStatus: msg.status, recoverySummary: msg.recoverySummary,
+              }, msg.status === 'running' || msg.status === 'recovering' ? msg.status : 'exited')
+              updateContent({
+                status,
+                runtimeStatus: msg.status,
+                recoverySummary: msg.recoverySummary,
+                ...(status === 'running' || status === 'recovering' ? { launchFailure: undefined } : {}),
+              })
               const statusTab = tabRef.current
-              if (statusTab) {
-                dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
-              }
+              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: {
+                status,
+                runtimeStatus: msg.status,
+                recoverySummary: msg.recoverySummary,
+              } }))
+            } else if (msg.status === 'running' || msg.status === 'recovering') {
+              const terminal = contentRef.current
+              const status = managedTerminalPaneStatus(terminal ?? {}, msg.status)
+              updateContent({
+                status,
+                ...(status === 'running' || status === 'recovering' ? { launchFailure: undefined } : {}),
+              })
+              const statusTab = tabRef.current
+              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: {
+                status,
+                ...(terminal?.soulId ? {
+                  runtimeStatus: status === msg.status ? msg.status : terminal.runtimeStatus,
+                  recoverySummary: terminal.recoverySummary,
+                } : {}),
+              } }))
             }
           }
           return
@@ -6016,18 +6048,43 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
-          // Record on EVERY exit path (including the early-return branches
-          // below): this is the only moment both paneId and the dying
-          // terminalId are simultaneously known — the tail clears
-          // terminalIdRef/terminalId, and subsequent auto-resume frames
-          // (terminal.status 'recovering' / terminal.replaced) carry the old
-          // id and can only be matched via the recorded lastTerminalId.
-          dispatch(recordTerminalExit({
-            paneId: paneIdRef.current,
-            terminalId: msg.terminalId,
-            exitCode: msg.exitCode,
-            at: Date.now(),
-          }))
+          // An unavailable managed code clears stale exit evidence. Known
+          // codes retain the ordinary lifecycle record used by auto-resume.
+          if (msg.managedRetained === true && msg.exitCodeAvailable === false) {
+            dispatch(clearTerminalLifecycle({ paneId: paneIdRef.current }))
+          } else {
+            dispatch(recordTerminalExit({
+              paneId: paneIdRef.current,
+              terminalId: msg.terminalId,
+              exitCode: msg.exitCode,
+              at: Date.now(),
+            }))
+          }
+
+          if (msg.managedRetained === true) {
+            launchAttemptRef.current = null
+            clearQuarantineRepair()
+            dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+            discardPendingInput('terminal_gone')
+            const terminal = contentRef.current
+            // A retained exit can race the recovery projection on reconnect.
+            // Keep an already-rendered managed failure visible when this frame
+            // has no supervisor summary to replace it with.
+            const statusFallback = terminal?.status === 'error' ? 'error' : 'exited'
+            const status = managedTerminalPaneStatus(terminal ?? {}, statusFallback)
+            const runtimeStatus = terminal?.runtimeStatus === 'blocked'
+              || terminal?.recoverySummary?.recoveryState === 'blocked'
+              ? 'blocked'
+              : 'exited'
+            updateContent({ status, runtimeStatus })
+            const exitTab = tabRef.current
+            if (exitTab) dispatch(updateTab({ id: exitTab.id, updates: {
+              status,
+              runtimeStatus,
+              recoverySummary: terminal?.recoverySummary,
+            } }))
+            return
+          }
 
           const launchAttempt = launchAttemptRef.current
           const exitedDuringLaunch = launchAttempt?.terminalId === tid && !launchAttempt.attachReady
@@ -6453,7 +6510,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // the card carries the attach/retry/open-as-fresh-agent actions.
           // Rides the same updateContent (the ref-based merge would
           // otherwise clobber it).
-          const typedLaunchFailure: LaunchFailure | undefined = msg.ownerKind !== undefined || typeof msg.ownerGeneration === 'number'
+          const preparationFailure = launchAttempt && msg.code === 'PTY_SPAWN_FAILED'
+            && mode === 'opencode' && !tid && !contentRef.current?.soulId
+            && !contentRef.current?.sessionRef && !contentRef.current?.resumeSessionId
+            && contentRef.current?.createRequestId === reqId
+            && ws.getServerCapabilities?.()?.managedRuntimeV1 === true
+            && msg.ownerKind === undefined && msg.ownerGeneration === undefined
+            ? buildManagedPreparationFailure(msg.providerPreparationFailure)
+            : undefined
+          const typedLaunchFailure: LaunchFailure | undefined = preparationFailure ?? (msg.ownerKind !== undefined || typeof msg.ownerGeneration === 'number'
             ? {
               code: msg.code === 'RESTORE_UNAVAILABLE' ? 'RESTORE_UNAVAILABLE' : 'LAUNCH_FAILED',
               message: msg.message || msg.code || 'The launch was refused.',
@@ -6462,7 +6527,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               ...(typeof msg.ownerGeneration === 'number' ? { ownerGeneration: msg.ownerGeneration } : {}),
               ...(typeof msg.liveTerminalId === 'string' ? { terminalId: msg.liveTerminalId } : {}),
             }
-            : undefined
+            : undefined)
           updateContent({
             status: 'error',
             streamId: undefined,
@@ -6478,7 +6543,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const prefix = launchAttempt
             ? (launchAttempt.restore ? '[Restore failed]' : '[Launch failed]')
             : '[Error]'
-          writeLocalXtermNotice(term, `\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
+          writeLocalXtermNotice(term, `\r\n${prefix} ${preparationFailure?.message || msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
         const activeAttachForInvalidTerminalError = currentAttachRef.current
@@ -6961,6 +7026,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           pendingSinceSeq: 0,
           pendingReason: 'initial_hydrate',
         }
+        if (contentRef.current && retainedManagedPreparationFailure(contentRef.current)) return
         sendCreate(createRequestId)
       }
     }
@@ -7027,6 +7093,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     terminalContent?.reconcileEpoch,
     terminalContent?.recoverySummary?.desiredState,
     terminalContent?.recoverySummary?.recoveryState,
+    // A durable inventory can establish a retained handle after the decision
+    // card mounted. Replay starts then without waiting for an identity change.
+    managedReplayAvailable,
     // reconcilePendingSince: re-run when the pane's pre-verdict wait state
     // changes -- the verdict fold (or the bounded timeout) clears the entry
     // and the deferred mount-create must then proceed (Task 8).
@@ -7206,9 +7275,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
   const managedRecoveryDecision = isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)
   const managedTerminal = Boolean(terminalContent.soulId || terminalContent.recoverySummary)
-  const managedAutomaticRecovery = (managedTerminal && !terminalContent.recoverySummary)
+  const managedAutomaticRecovery = terminalContent.runtimeStatus !== 'exited' && ((managedTerminal && !terminalContent.recoverySummary)
     || terminalContent.recoverySummary?.recoveryState === 'live'
-    || terminalContent.recoverySummary?.recoveryState === 'recovering'
+    || terminalContent.recoverySummary?.recoveryState === 'recovering')
   // Keep recovery diagnostics in state, but show only actionable failures.
   const visibleNotice = managedTerminal ? null : activeNotice
   const visibleCrashTrace = managedTerminal ? null : terminalContent.crashTrace
@@ -7293,6 +7362,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const state = appStore.getState()
     const canonical = resolveCanonicalPaneSession(state, terminalContent)
     const sessionId = canonical?.sessionId ?? sessionRef.sessionId
+    const tabCheckpointWorkspace = state.tabs.tabs.find((candidate) => candidate.id === tabId)
+    const carriesThisSession = tabCheckpointWorkspace?.sessionRef?.provider === sessionRef.provider
+      && tabCheckpointWorkspace.sessionRef.sessionId === sessionRef.sessionId
+    const checkpointWorkspace = findCheckpointWorkspaceForSession(state, {
+      provider: sessionRef.provider,
+      sessionId: sessionRef.sessionId,
+    }) ?? (carriesThisSession ? tabCheckpointWorkspace?.checkpointWorkspace : undefined)
     dispatch(updatePaneContent({
       tabId,
       paneId,
@@ -7300,6 +7376,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         sessionType,
         sessionId,
         cwd: terminalContent.initialCwd,
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
         ...(providerSettings ? { freshAgentProviderSettings: providerSettings } : {}),
       }),
     }))
@@ -7308,25 +7385,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Managed recovery and owner divergence own the current decision. An old
   // launch failure must not add a competing alert or obsolete retry action.
   const typedLaunchFailure = !managedRecoveryDecision && freshAgentOwnerDivergence === null
-    ? terminalContent.launchFailure
+    ? storedLaunchFailure
     : undefined
 
   const retryLaunch = () => {
     if (managedRecoveryDecision) return
-    // The Relaunch discipline: a reconcile-driven respawn create re-fires
-    // the lifecycle effect (the reconcileEpoch bump is its ONLY re-fire
-    // signal — createRequestId is preserved, never re-minted).
+    // Preparation can fail before a session exists. Its explicit Retry
+    // starts that same create request without a resume identity; other
+    // launch failures retain the existing respawn behavior.
     dispatch(resetPaneForReconcileCreate({
       tabId,
       paneId,
-      intent: 'respawn',
+      intent: retainedManagedPreparationFailure(terminalContent) ? 'fresh' : 'respawn',
       sessionRef: terminalContent.sessionRef,
     }))
   }
 
   const attachToNamedTerminal = () => {
     if (managedRecoveryDecision) return
-    const terminalId = terminalContent.launchFailure?.terminalId
+    const terminalId = storedLaunchFailure?.terminalId
     if (!terminalId) return
     dispatch(applyReattachToLiveTerminal({ tabId, paneId, terminalId }))
   }

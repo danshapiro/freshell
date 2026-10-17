@@ -51,6 +51,88 @@ pub struct RuntimeClient {
 }
 
 impl RuntimeClient {
+    pub async fn bind_provider_path_inputs(
+        &self,
+        soul_id: SoulId,
+        generation_id: String,
+        inputs: freshell_runtime_protocol::ProviderPathInputs,
+    ) -> Result<(), ClientError> {
+        let request = freshell_runtime_protocol::BindProviderPathInputsRequest {
+            expected_control_epoch: Some(self.current_epoch().await?),
+            soul_id,
+            generation_id,
+            inputs,
+        };
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::BindProviderPathInputs(request),
+            )
+            .await?
+        {
+            AdminResult::ProviderPathInputsBound => Ok(()),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+    pub async fn reserve_provider_inputs(
+        &self,
+        soul_id: SoulId,
+        provider: String,
+        creation_seed_ref: String,
+    ) -> Result<freshell_runtime_protocol::ProviderInputReservation, ClientError> {
+        let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+            expected_control_epoch: Some(self.current_epoch().await?),
+            soul_id,
+            provider,
+            creation_seed_ref,
+        };
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::ReserveProviderInputs(request),
+            )
+            .await?
+        {
+            AdminResult::ProviderInputReservation(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+    pub async fn native_auth_lookup(
+        &self,
+        soul_id: SoulId,
+        attempt_authority: String,
+        keys: Vec<String>,
+    ) -> Result<freshell_runtime_protocol::NativeAuthValues, ClientError> {
+        let request = freshell_runtime_protocol::NativeAuthLookupRequest {
+            expected_control_epoch: Some(self.current_epoch().await?),
+            soul_id,
+            attempt_authority,
+            keys,
+        };
+        match self
+            .request(RequestId::new(), AdminCommand::NativeAuthLookup(request))
+            .await?
+        {
+            AdminResult::NativeAuthLookup(values) => Ok(values),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+    pub async fn observe_claude_sources(
+        &self,
+        mut request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
+    ) -> Result<freshell_runtime_protocol::ClaudeSourceObservation, ClientError> {
+        request.expected_control_epoch = Some(self.current_epoch().await?);
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::ObserveClaudeSources(Box::new(request)),
+            )
+            .await?
+        {
+            AdminResult::ClaudeSourceObservation(reply) => Ok(reply),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
     pub async fn from_secret_file(
         socket_path: impl Into<PathBuf>,
         secret_file: impl Into<PathBuf>,
@@ -627,6 +709,7 @@ impl RuntimeClient {
         soul_id: SoulId,
         text: String,
         settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<String>,
     ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
         let epoch = self.current_epoch().await?;
         match self
@@ -636,6 +719,7 @@ impl RuntimeClient {
                     soul_id,
                     text,
                     settings,
+                    checkpoint_logical_attempt_id,
                     expected_control_epoch: Some(epoch),
                 }),
             )
@@ -1119,6 +1203,59 @@ mod tests {
             control_epoch: 2,
             installation_id: InstallationId::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_send_preserves_checkpoint_identity_on_the_control_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let AdminCommand::FreshAgentSend(request) = &envelope.body else {
+                panic!("expected managed fresh-agent send: {envelope:?}");
+            };
+            assert_eq!(
+                request.soul_id,
+                SoulId::parse("checkpoint-send-soul").unwrap()
+            );
+            assert_eq!(request.text, "continue with the requested change");
+            assert_eq!(
+                request.checkpoint_logical_attempt_id.as_deref(),
+                Some("attempt-control-1")
+            );
+            assert_eq!(request.expected_control_epoch, Some(19));
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(AdminResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(19);
+
+        let state = client
+            .fresh_agent_send(
+                RequestId::parse("request-checkpoint-send").unwrap(),
+                SoulId::parse("checkpoint-send-soul").unwrap(),
+                "continue with the requested change".into(),
+                None,
+                Some("attempt-control-1".into()),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            state,
+            freshell_runtime_protocol::CommandState::ProviderAcked
+        );
     }
 
     fn source_snapshot(kind: FreshAgentReadKind) -> serde_json::Value {

@@ -120,6 +120,7 @@ async function captureCodexFlow(
 ): Promise<{ handle: ExternalServerHandle; capture: FreshAgentCapture }> {
   const handle = await startExternalServer({
     provider: 'freshagent-wireshape',
+    verbose: process.env.FRESHELL_ORACLE_VERBOSE === '1',
     env: {
       CODEX_CMD: fakeCodexPath,
       FAKE_CODEX_APP_SERVER_BEHAVIOR: codexBehaviorEnv(),
@@ -154,12 +155,17 @@ async function captureCodexFlow(
       sessionType: 'freshcodex',
       provider: 'codex',
     })
-    const created = await client.waitForServerMessage(
-      (m) => m.type === 'freshAgent.created'
+    const createOutcome = await client.waitForServerMessage(
+      (m) => (m.type === 'freshAgent.created' || m.type === 'freshAgent.create.failed')
         && (m.parsed as { requestId?: unknown }).requestId === 'wireshape-create-1',
       20_000,
-      'freshAgent.created',
+      'freshAgent.created or freshAgent.create.failed',
     )
+    expect(
+      createOutcome.type,
+      `fresh-agent create failed: ${JSON.stringify(createOutcome.parsed)}`,
+    ).toBe('freshAgent.created')
+    const created = createOutcome
     const sessionId = (created.parsed as { sessionId: string }).sessionId
     expect(sessionId, 'freshAgent.created must carry a non-empty sessionId').toBeTruthy()
 
@@ -267,7 +273,8 @@ describe('Fresh-agent wire-shape determinism (Rust, codex)', () => {
   it(
     'emits byte-identical freshAgent envelopes/inner-event shapes on create+send+attach',
     async () => {
-      sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wireshape-differential-'))
+      const executableTempDir = process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir()
+      sharedRoot = await fs.mkdtemp(path.join(executableTempDir, 'freshell-wireshape-differential-'))
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const firstRun = await captureCodexFlow(fakeCodexPath)

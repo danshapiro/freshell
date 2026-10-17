@@ -1,0 +1,1081 @@
+//! Owning service/recovery tests. Synthetic daemon and authenticated host IPC
+//! retain exact generation ownership across real registry/supervisor reopen.
+use super::*;
+use crate::backend::*;
+use crate::registry::OwnedRuntimeHandle;
+use async_trait::async_trait;
+use freshell_runtime_protocol::*;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+use tokio::net::UnixListener;
+
+#[derive(Default)]
+struct Daemon {
+    generations: BTreeSet<String>,
+    publishers: BTreeSet<String>,
+    running: BTreeSet<IncarnationId>,
+    events: Vec<String>,
+    fail: Option<&'static str>,
+    grants: usize,
+    host_tasks: Vec<tokio::task::JoinHandle<()>>,
+    reject_inputs: bool,
+    consumed_rejection: bool,
+    recovery_probes: Vec<String>,
+    recovery_probe_available: bool,
+    recovery_probe_gate: Option<Arc<RecoveryProbeGate>>,
+}
+#[derive(Default)]
+struct RecoveryProbeGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+struct Backend(Arc<Mutex<Daemon>>, std::path::PathBuf);
+
+fn generation(handle: &OwnedRuntimeHandle) -> String {
+    handle
+        .terminal()
+        .unwrap()
+        .provider_launch_context
+        .as_ref()
+        .unwrap()
+        .prepared_inputs
+        .as_ref()
+        .unwrap()
+        .generation_id
+        .clone()
+}
+
+fn context(soul: &SoulId, ordinal: usize) -> ProviderLaunchContext {
+    let generation_id = format!("grant-{ordinal}");
+    ProviderLaunchContext {
+        preparation: ProviderPreparation::Opencode {
+            project_config: vec![],
+            tui_config: None,
+            tui_source: None,
+            inline_config: false,
+        },
+        config: vec![],
+        mcp_capability: Some(McpCapabilityReference {
+            grant_id: generation_id.clone(),
+            endpoint: "http://host.docker.internal:4000".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        }),
+        prepared_inputs: Some(PreparedProviderInputs {
+            generation_id: generation_id.clone(),
+            initial_auth_reservation: None,
+            manifest: ProviderInputManifestReference {
+                relative_path: ".freshell/input-manifest.json".into(),
+                sha256: "a".repeat(64),
+                source_count: 1,
+                alias_count: 1,
+                recipe_count: 0,
+            },
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: Some(IndexedProviderFiles {
+                volume_name: indexed_provider_volume_name(soul, &generation_id),
+                aliases: vec![IndexedProviderFileAlias {
+                    source_id: 0,
+                    logical_destination: "/home/freshell/provider/.freshell/references/0".into(),
+                    effective_destination: "/home/freshell/provider/.freshell/references/0".into(),
+                }],
+                staged_source_paths: None,
+            }),
+        }),
+    }
+}
+
+fn references() -> Vec<ProviderSecretReference> {
+    vec![ProviderSecretReference {
+        profile: ProviderSecretProfile::OpencodeConfigurationFile,
+        source_path: "/synthetic/approved-source".into(),
+        provider_relative_path: Some(".freshell/references/0".into()),
+    }]
+}
+
+fn limits() -> RuntimeLimits {
+    RuntimeLimits {
+        cpu_milli: 500,
+        memory_bytes: 64 * 1024 * 1024,
+        swap_bytes: 0,
+        pids_max: 32,
+    }
+}
+
+#[async_trait]
+impl RuntimeBackend for Backend {
+    async fn observe_initial_auth_volume(
+        &self,
+        reservation: &crate::registry::OwnedInputReservation,
+    ) -> Result<InitialAuthVolumeObservation, BackendError> {
+        Ok(reservation
+            .prior_observation
+            .clone()
+            .unwrap_or(InitialAuthVolumeObservation::Absent {
+                daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
+            }))
+    }
+    async fn create_stopped(
+        &self,
+        spec: &CreateRuntimeSpec,
+    ) -> Result<BackendCreated, BackendError> {
+        let inputs = spec
+            .terminal
+            .as_ref()
+            .unwrap()
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .prepared_inputs
+            .as_ref()
+            .unwrap();
+        let mut state = self.0.lock().unwrap();
+        if !state.generations.contains(&inputs.generation_id) && state.generations.len() >= 2 {
+            return Err(BackendError::Unavailable(
+                "one active and one pending input generation already exist; preserve and reconcile"
+                    .into(),
+            ));
+        }
+        state.generations.insert(inputs.generation_id.clone());
+        state.publishers.insert(inputs.generation_id.clone());
+        state
+            .events
+            .push(format!("create:{}", inputs.generation_id));
+        Ok(BackendCreated {
+            daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
+            container_id: format!(
+                "{:x}",
+                sha2::Sha256::digest(spec.incarnation_id.as_str().as_bytes())
+            ),
+            immutable_config_digest: "a".repeat(64),
+        })
+    }
+    async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+        let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+        let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
+        let id = handle.incarnation_id().clone();
+        self.0.lock().unwrap().running.insert(id.clone());
+        let state = self.0.clone();
+        let task = tokio::spawn(async move {
+            let boot = HostBootId::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let envelope: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                let rejected = state.lock().unwrap().reject_inputs;
+                let consumed_rejection = state.lock().unwrap().consumed_rejection;
+                let result = match envelope.body {
+                    HostCommand::Hello {
+                        challenge,
+                        incarnation_id,
+                    } => HostResult::Hello {
+                        host_boot_id: boot.clone(),
+                        proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                        capabilities: vec![],
+                        effective_limits: limits(),
+                    },
+                    HostCommand::GrantExecution { .. } => {
+                        if state.lock().unwrap().reject_inputs {
+                            write_frame(
+                                &mut socket,
+                                &HostReply {
+                                    request_id: envelope.request_id,
+                                    result: Err(RuntimeError::new(
+                                        RuntimeErrorCode::ProviderInputsChanged,
+                                        "configuration reference selection changed",
+                                    )),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            continue;
+                        }
+                        state.lock().unwrap().grants += 1;
+                        HostResult::GrantAccepted {
+                            host_boot_id: boot.clone(),
+                            worker_pid: 1234,
+                            worker_launch_count: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            native_session_id: Some("ses_exact".into()),
+                        }
+                    }
+                    HostCommand::Status { .. } => HostResult::Status {
+                        host_boot_id: boot.clone(),
+                        worker_pid: if rejected { None } else { Some(1234) },
+                        worker_launch_count: u64::from(!rejected),
+                        max_control_epoch: 100,
+                        max_execution_generation: if rejected && !consumed_rejection {
+                            0
+                        } else {
+                            100
+                        },
+                        fixture_evidence: serde_json::json!({}),
+                        exited: false,
+                        native_session_id: if rejected {
+                            None
+                        } else {
+                            Some("ses_exact".into())
+                        },
+                    },
+                    HostCommand::ProbeRecovery {
+                        resume_spec: Some(spec),
+                        ..
+                    } => {
+                        let (available, gate) = {
+                            let mut state = state.lock().unwrap();
+                            state
+                                .recovery_probes
+                                .push(spec.provider_session.native_session_id.clone());
+                            (
+                                state.recovery_probe_available,
+                                state.recovery_probe_gate.take(),
+                            )
+                        };
+                        if let Some(gate) = gate {
+                            gate.entered.notify_one();
+                            gate.release.notified().await;
+                        }
+                        if available {
+                            HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                                evidence_revision: spec.evidence_revision,
+                                resume_spec: spec,
+                            })
+                        } else {
+                            HostResult::RecoveryProbe(RecoveryProbe::Blocked {
+                                path: RecoveryPath::NativeResume,
+                                reason: RecoveryBlockReason::StoreUnreadable,
+                                retry_hint: RetryHint {
+                                    automatic_after_ms: None,
+                                    manual_retry: true,
+                                    repair: None,
+                                },
+                                evidence: vec![
+                                    "synthetic provider store is temporarily unavailable".into(),
+                                ],
+                            })
+                        }
+                    }
+                    command => panic!("unexpected synthetic host command {command:?}"),
+                };
+                write_frame(
+                    &mut socket,
+                    &HostReply {
+                        request_id: envelope.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        self.0.lock().unwrap().host_tasks.push(task);
+        Ok(())
+    }
+    async fn discard_rejected_provider_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let mut state = self.0.lock().unwrap();
+        assert!(state.reject_inputs && !state.consumed_rejection);
+        assert!(!state.running.contains(handle.incarnation_id()));
+        state.generations.remove(&generation(handle));
+        state.publishers.remove(&generation(handle));
+        Ok(())
+    }
+    async fn commit_prepared_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let registry_path = self.1.join("runtime.sqlite3");
+        let conn = rusqlite::Connection::open(registry_path).unwrap();
+        let (running, live): (String, String) = conn.query_row("SELECT i.launch_state,s.recovery_state FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1", [handle.incarnation_id().as_str()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(running, "running");
+        assert_eq!(
+            live, "live",
+            "resumed B cannot complete before verified durable recovery success"
+        );
+        let mut state = self.0.lock().unwrap();
+        let generation = generation(handle);
+        state.events.push(format!("release:{generation}"));
+        if state.fail == Some("publisher") {
+            state.fail = None;
+            return Err(BackendError::Unavailable(
+                "synthetic publisher transient".into(),
+            ));
+        }
+        state.publishers.remove(&generation);
+        Ok(())
+    }
+    async fn retire_prior_prepared_inputs(
+        &self,
+        current: &OwnedRuntimeHandle,
+        prior: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let mut state = self.0.lock().unwrap();
+        assert!(
+            !state.running.contains(prior.incarnation_id()),
+            "never stop/delete uncertain live prior ownership"
+        );
+        assert!(state.running.contains(current.incarnation_id()));
+        state.events.push(format!(
+            "retire:{}:{}",
+            generation(current),
+            generation(prior)
+        ));
+        if state.fail == Some("retire") {
+            state.fail = None;
+            return Err(BackendError::Unavailable(
+                "synthetic retirement transient".into(),
+            ));
+        }
+        state.generations.remove(&generation(prior));
+        state.publishers.remove(&generation(prior));
+        Ok(())
+    }
+    async fn inspect(&self, h: &OwnedRuntimeHandle) -> Result<BackendInspection, BackendError> {
+        Ok(BackendInspection {
+            state: if self.0.lock().unwrap().running.contains(h.incarnation_id()) {
+                BackendRuntimeState::Running
+            } else {
+                BackendRuntimeState::Exited
+            },
+            configured_limits: limits(),
+        })
+    }
+    async fn request_stop(&self, handle: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+        let mut state = self.0.lock().unwrap();
+        assert!(
+            state.reject_inputs && !state.consumed_rejection,
+            "healthy or consumed retry must not stop a workload"
+        );
+        state.running.remove(handle.incarnation_id());
+        state
+            .events
+            .push(format!("stop-rejected:{}", generation(handle)));
+        Ok(())
+    }
+    async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+        panic!("healthy retry must not stop a workload")
+    }
+    async fn verify_empty(&self, h: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+        Ok(!self.0.lock().unwrap().running.contains(h.incarnation_id()))
+    }
+    async fn list_known(
+        &self,
+        handles: &[OwnedRuntimeHandle],
+    ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+        let mut result = vec![];
+        for h in handles {
+            result.push((h.incarnation_id().clone(), self.inspect(h).await?));
+        }
+        Ok(result)
+    }
+    async fn read_limits(&self, _: &OwnedRuntimeHandle) -> Result<RuntimeLimits, BackendError> {
+        Ok(limits())
+    }
+    async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
+
+async fn control_recover(
+    socket: &std::path::Path,
+    request: RecoverRequest,
+) -> Result<RecoveryResult, RuntimeError> {
+    let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+    let mut envelope = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::Recover(request),
+    );
+    envelope.auth = Some("synthetic-control-secret".into());
+    write_frame(&mut stream, &envelope).await.unwrap();
+    let reply: AdminReply = read_frame(&mut stream).await.unwrap();
+    match reply.result? {
+        AdminResult::Recovery(result) => Ok(result),
+        _ => panic!("unexpected actual control recovery reply"),
+    }
+}
+
+async fn control_listener(supervisor: &Supervisor) -> tokio::task::JoinHandle<()> {
+    let owner = supervisor.clone();
+    let path = supervisor.config.control_socket_path.clone();
+    let socket = path.clone();
+    let task = tokio::spawn(async move { serve_control(owner, &socket).await.unwrap() });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_opencode_probe_coalesces_failed_evidence_reads_then_recovers_before_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry_root = temp.path().join("registry");
+    let registry = Registry::open(&registry_root, None).unwrap();
+    let soul = SoulId::new();
+    let daemon = Arc::new(Mutex::new(Daemon::default()));
+    let runtime_root = temp.path().join("runtime");
+    let host_binary_path = temp.path().join("synthetic-host");
+    std::fs::create_dir_all(&runtime_root).unwrap();
+    std::fs::write(&host_binary_path, "synthetic-host-artifact").unwrap();
+
+    let config = SupervisorConfig {
+        runtime_root: runtime_root.clone(),
+        control_socket_path: temp.path().join("control.sock"),
+        host_binary_path: host_binary_path.clone(),
+        image_ref: format!("sha256:{}", "a".repeat(64)),
+        test_run_id: "live-resume-capture".into(),
+        control_secret: "synthetic-control-secret".into(),
+        lifecycle_log: temp.path().join("lifecycle.jsonl"),
+        admission: crate::admission::AdmissionPolicy::default(),
+    };
+    let lifecycle_log = config.lifecycle_log.clone();
+    let backend = Arc::new(Backend(daemon.clone(), registry_root));
+    let supervisor = Supervisor::new(registry.clone(), backend.clone(), config).unwrap();
+    let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+        "terminalId":"terminal-live-resume",
+        "streamId":"stream-live-resume",
+        "mode":"opencode",
+        "program":"opencode",
+        "args":[],
+        "env":{"HOME":"/home/freshell/provider"},
+        "cwd":temp.path(),
+        "runAsUid":65534,
+        "runAsGid":0,
+        "cols":80,
+        "rows":24,
+        "projectKey":"project-live-resume",
+        "workspacePath":temp.path(),
+        "providerLaunchContext":context(&soul, 1),
+        "providerSecretReferences":references()
+    }))
+    .unwrap();
+    let prepared = registry
+        .prepare_launch(crate::registry::LaunchPreparation {
+            soul_id: soul.clone(),
+            provider: "opencode".into(),
+            provider_store_id: "store-exact".into(),
+            native_session_id: None,
+            creation_seed_ref: "seed-live-resume".into(),
+            request_id: RequestId::new(),
+            payload_digest: "live-resume-capture".into(),
+            requested_limits: limits(),
+            profile: RuntimeProfile::Custom,
+            project_key: "project-live-resume".into(),
+            fixture: None,
+            terminal: Some(terminal),
+            fresh_agent: None,
+            view_intent: None,
+            admission: crate::admission::AdmissionPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let incarnation_id = prepared.incarnation_id.clone();
+    let runtime_dir = runtime_root.join(incarnation_id.as_str());
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::write(runtime_dir.join("secret"), b"synthetic-host-secret").unwrap();
+    registry
+        .commit_created(
+            incarnation_id.clone(),
+            crate::registry::BackendCreatedRecord {
+                daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
+                container_id: "d".repeat(64),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                runtime_dir: runtime_dir.clone(),
+                host_binary_path,
+                immutable_config_digest: "e".repeat(64),
+            },
+        )
+        .await
+        .unwrap();
+    let boot = HostBootId::new();
+    registry
+        .commit_execution_grant(incarnation_id.clone(), boot, limits())
+        .await
+        .unwrap();
+    registry.mark_running(incarnation_id.clone()).await.unwrap();
+    registry
+        .record_native_session(soul.clone(), incarnation_id.clone(), "ses_exact".into())
+        .await
+        .unwrap();
+    let handle = registry.owned_handle(incarnation_id).await.unwrap();
+    backend.start_host(&handle).await.unwrap();
+
+    let live = supervisor.probe_recovery(soul.clone()).await.unwrap();
+    assert!(matches!(live, RecoveryProbe::ReattachReady { .. }));
+    let after_first_probe = registry.recovery_context(soul.clone()).await.unwrap();
+    assert_eq!(
+        after_first_probe
+            .resume_spec
+            .as_ref()
+            .map(|spec| spec.provider_session.native_session_id.as_str()),
+        None,
+        "an unverified provider-store read must not become durable resume evidence"
+    );
+    assert_eq!(daemon.lock().unwrap().recovery_probes, ["ses_exact"]);
+    let count_live_resume_events = || {
+        std::fs::read_to_string(&lifecycle_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "supervisor.recovery.live_resume_evidence")
+            .count()
+    };
+    assert_eq!(count_live_resume_events(), 1);
+
+    let repeated_live = supervisor.probe_recovery(soul.clone()).await.unwrap();
+    assert!(matches!(repeated_live, RecoveryProbe::ReattachReady { .. }));
+    assert_eq!(
+        daemon.lock().unwrap().recovery_probes,
+        ["ses_exact"],
+        "unchanged live identity must not repeat a failing provider-store read on every poll"
+    );
+    assert_eq!(
+        count_live_resume_events(),
+        1,
+        "unchanged failures should not append duplicate lifecycle events"
+    );
+
+    tokio::time::sleep(
+        crate::recovery::LIVE_RESUME_EVIDENCE_RETRY_INTERVAL + Duration::from_millis(25),
+    )
+    .await;
+    let gate = Arc::new(RecoveryProbeGate::default());
+    {
+        let mut daemon = daemon.lock().unwrap();
+        daemon.recovery_probe_available = true;
+        daemon.recovery_probe_gate = Some(gate.clone());
+    }
+    let entered = gate.entered.notified();
+    let delayed_probe_supervisor = supervisor.clone();
+    let delayed_probe_soul = soul.clone();
+    let delayed_probe = tokio::spawn(async move {
+        delayed_probe_supervisor
+            .probe_recovery(delayed_probe_soul)
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("the successful provider-store read reaches its gate");
+
+    // A newer store observation wins while the older provider read is still
+    // in flight. Releasing the delayed result must leave this position intact.
+    let mut newer =
+        crate::resume_catalog::exact_resume_candidate(&after_first_probe, Some("ses_exact"))
+            .unwrap()
+            .expect("the observed native session has an exact candidate");
+    newer.durable_position.provider_cursor = Some("position-after-delayed-probe".into());
+    let newer = registry
+        .store_verified_resume_spec(soul.clone(), newer)
+        .await
+        .unwrap();
+    gate.release.notify_one();
+
+    let retried_live = tokio::time::timeout(Duration::from_secs(5), delayed_probe)
+        .await
+        .expect("the delayed provider-store read completes")
+        .unwrap();
+    assert!(matches!(retried_live, RecoveryProbe::ReattachReady { .. }));
+    let durable = registry.recovery_context(soul.clone()).await.unwrap();
+    assert_eq!(
+        durable
+            .resume_spec
+            .as_ref()
+            .map(|spec| spec.provider_session.native_session_id.as_str()),
+        Some("ses_exact"),
+        "a newer exact-session proof stays durable while an older read finishes"
+    );
+    let retained = durable.resume_spec.as_ref().expect("newer proof is saved");
+    assert_eq!(retained.evidence_revision, newer.evidence_revision);
+    assert_eq!(
+        retained.durable_position.provider_cursor.as_deref(),
+        Some("position-after-delayed-probe")
+    );
+    assert_eq!(
+        daemon.lock().unwrap().recovery_probes,
+        ["ses_exact", "ses_exact"]
+    );
+    assert_eq!(count_live_resume_events(), 2);
+
+    daemon
+        .lock()
+        .unwrap()
+        .running
+        .remove(durable.prior_handle.incarnation_id());
+    let after_exit = supervisor.probe_recovery(soul).await.unwrap();
+    assert!(matches!(
+        after_exit,
+        RecoveryProbe::ResumeReady { resume_spec, .. }
+            if resume_spec.provider_session.native_session_id == "ses_exact"
+    ));
+
+    let tasks = std::mem::take(&mut daemon.lock().unwrap().host_tasks);
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_accepted_completion_retries_after_registry_success_on_fresh_healthy_startup() {
+    for failure in ["controller", "publisher", "retire"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("registry");
+        let registry = Registry::open(&root, None).unwrap();
+        let soul = SoulId::new();
+        let daemon = Arc::new(Mutex::new(Daemon::default()));
+        let callback = UnixListener::bind(temp.path().join("mcp.sock")).unwrap();
+        let callback_daemon = daemon.clone();
+        let callback_soul = soul.clone();
+        let callback_task = tokio::spawn(async move {
+            let mut next = 1;
+            loop {
+                let (mut socket, _) = callback.accept().await.unwrap();
+                let mut raw = vec![];
+                socket.read_to_end(&mut raw).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                let response = if request["action"] == "issue" {
+                    next += 1;
+                    serde_json::to_vec(&PreparedProviderContext {
+                        provider_launch_context: context(&callback_soul, next),
+                        provider_secret_references: references(),
+                    })
+                    .unwrap()
+                } else {
+                    let mut state = callback_daemon.lock().unwrap();
+                    state.events.push(format!(
+                        "{}:{}",
+                        request["action"].as_str().unwrap(),
+                        request["grantId"].as_str().unwrap()
+                    ));
+                    if request["action"] == "commit" && state.fail == Some("controller") {
+                        state.fail = None;
+                        b"failed".to_vec()
+                    } else {
+                        b"ok".to_vec()
+                    }
+                };
+                socket.write_all(&response).await.unwrap();
+            }
+        });
+        let config = SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: temp.path().join("synthetic-host"),
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "provider-completion".into(),
+            control_secret: "synthetic-control-secret".into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        };
+        std::fs::write(&config.host_binary_path, "synthetic-host-artifact").unwrap();
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            Arc::new(Backend(daemon.clone(), root.clone())),
+            config.clone(),
+        )
+        .unwrap();
+        let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({"terminalId":"terminal","streamId":"stream","mode":"opencode","program":"opencode","args":[],"env":{"HOME":"/home/freshell/provider"},"cwd":temp.path(),"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project","workspacePath":temp.path(),"providerLaunchContext":context(&soul,1),"providerSecretReferences":references()})).unwrap();
+        let preparation = LaunchPreparation {
+            soul_id: soul.clone(),
+            provider: "opencode".into(),
+            provider_store_id: "store-exact".into(),
+            native_session_id: None,
+            creation_seed_ref: "seed".into(),
+            request_id: RequestId::new(),
+            payload_digest: "test-digest".into(),
+            requested_limits: limits(),
+            profile: RuntimeProfile::Custom,
+            project_key: "project".into(),
+            fixture: None,
+            terminal: Some(terminal.clone()),
+            fresh_agent: None,
+            view_intent: None,
+            admission: crate::admission::AdmissionPolicy::default(),
+        };
+        let prepared = registry.prepare_launch(preparation.clone()).await.unwrap();
+        daemon.lock().unwrap().fail = Some("publisher");
+        assert!(supervisor
+            .activate_prepared(
+                prepared.clone(),
+                LaunchWorkload {
+                    soul_id: soul.clone(),
+                    fixture: None,
+                    terminal: Some(terminal.clone()),
+                    fresh_agent: None,
+                    resume_spec: None
+                },
+                limits(),
+            )
+            .await
+            .is_err());
+        assert_eq!(daemon.lock().unwrap().grants, 1);
+        assert!(!daemon.lock().unwrap().publishers.is_empty());
+        let retried = registry.prepare_launch(preparation).await.unwrap();
+        assert_eq!(retried.state, LaunchState::Running);
+        let first = supervisor
+            .activate_prepared(
+                retried,
+                LaunchWorkload {
+                    soul_id: soul.clone(),
+                    fixture: None,
+                    terminal: Some(terminal.clone()),
+                    fresh_agent: None,
+                    resume_spec: None,
+                },
+                limits(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon.lock().unwrap().grants,
+            1,
+            "healthy initial retry does not dispatch twice"
+        );
+        assert!(
+            daemon.lock().unwrap().publishers.is_empty(),
+            "healthy initial retry completes publisher release"
+        );
+        let spec =
+            freshell_agent_runtime::build_resume_spec(freshell_agent_runtime::ResumeSpecInput {
+                provider: "opencode",
+                provider_store_id: "store-exact",
+                native_session_id: "ses_exact",
+                terminal: &terminal,
+                provider_version: Some("1.18.21".into()),
+                creation_seed_ref: "seed".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 0,
+                never_dispatched: false,
+            })
+            .unwrap();
+        registry
+            .store_verified_resume_spec(soul.clone(), spec)
+            .await
+            .unwrap();
+        daemon
+            .lock()
+            .unwrap()
+            .running
+            .remove(&first.view.incarnation_id);
+        daemon.lock().unwrap().fail = Some(failure);
+        let request = || RecoverRequest {
+            soul_id: soul.clone(),
+            trigger: RecoveryTrigger::HostUnreachable,
+            expected_intent_revision: None,
+            expected_control_epoch: None,
+        };
+        let control = control_listener(&supervisor).await;
+        let failed = control_recover(&supervisor.config.control_socket_path, request()).await;
+        assert!(
+            failed.is_err(),
+            "injected post-success completion failure must reach actual recovery owner"
+        );
+        let live = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+        let view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|v| v.incarnation_id == *live.incarnation_id())
+            .unwrap();
+        assert_eq!(view.launch_state, LaunchState::Running);
+        assert_eq!(view.recovery_state, RecoveryState::Live);
+        assert_eq!(view.native_session_id.as_deref(), Some("ses_exact"));
+        assert_eq!(daemon.lock().unwrap().generations.len(), 2);
+        assert_eq!(daemon.lock().unwrap().grants, 2);
+        control.abort();
+        let _ = control.await;
+        std::fs::remove_file(&supervisor.config.control_socket_path).unwrap();
+        drop(supervisor);
+        drop(registry);
+        let registry = Registry::open(&root, None).unwrap();
+        let cold = Supervisor::new(
+            registry.clone(),
+            Arc::new(Backend(daemon.clone(), root.clone())),
+            config,
+        )
+        .unwrap();
+        let startup = cold.reconcile_startup().await.unwrap();
+        assert!(startup.results.iter().all(|v| v.error.is_none()));
+        let after = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+        assert_eq!(after.incarnation_id(), live.incarnation_id());
+        assert_eq!(
+            daemon.lock().unwrap().grants,
+            2,
+            "accepted conversation must not be redispatched"
+        );
+        assert_eq!(
+            daemon.lock().unwrap().generations,
+            BTreeSet::from(["grant-2".into()]),
+            "healthy fresh startup must retire only prior A"
+        );
+        assert!(
+            daemon.lock().unwrap().publishers.is_empty(),
+            "accepted B publisher must be released"
+        );
+        let events_before = daemon.lock().unwrap().events.len();
+        let control = control_listener(&cold).await;
+        assert_eq!(
+            control_recover(&cold.config.control_socket_path, request())
+                .await
+                .unwrap()
+                .outcome,
+            RecoveryOutcome::Reattached
+        );
+        assert_eq!(
+            daemon.lock().unwrap().events.len(),
+            events_before,
+            "completed preparation is not retried on every healthy poll"
+        );
+        daemon
+            .lock()
+            .unwrap()
+            .running
+            .remove(after.incarnation_id());
+        let next = control_recover(&cold.config.control_socket_path, request())
+            .await
+            .unwrap();
+        assert_eq!(
+            next.outcome,
+            RecoveryOutcome::Replaced,
+            "next valid C must fit the unchanged active/pending bound"
+        );
+        assert_eq!(
+            daemon.lock().unwrap().generations,
+            BTreeSet::from(["grant-3".into()])
+        );
+        assert_eq!(daemon.lock().unwrap().grants, 3);
+        control.abort();
+        let _ = control.await;
+        drop(cold);
+        drop(registry);
+        callback_task.abort();
+        let _ = callback_task.await;
+        let tasks = std::mem::take(&mut daemon.lock().unwrap().host_tasks);
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_initial_changed_inputs_requires_unconsumed_host_and_settled_owned_cleanup() {
+    for consumed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("registry");
+        let registry = Registry::open(&root, None).unwrap();
+        let soul = SoulId::new();
+        let daemon = Arc::new(Mutex::new(Daemon {
+            reject_inputs: true,
+            consumed_rejection: consumed,
+            ..Default::default()
+        }));
+        daemon
+            .lock()
+            .unwrap()
+            .generations
+            .insert("prior-usable".into());
+        let callback = UnixListener::bind(temp.path().join("mcp.sock")).unwrap();
+        let callback_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = callback.accept().await.unwrap();
+                let mut raw = vec![];
+                stream.read_to_end(&mut raw).await.unwrap();
+                stream.write_all(b"ok").await.unwrap();
+            }
+        });
+        let config = SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: temp.path().join("synthetic-host"),
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "provider-initial-replan".into(),
+            control_secret: "synthetic-control-secret".into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        };
+        std::fs::write(&config.host_binary_path, "synthetic-host-artifact").unwrap();
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            Arc::new(Backend(daemon.clone(), root)),
+            config.clone(),
+        )
+        .unwrap();
+        let reservation = registry
+            .reserve_initial_inputs(
+                ReserveProviderInputsRequest {
+                    expected_control_epoch: Some(registry.control_epoch()),
+                    soul_id: soul.clone(),
+                    provider: "opencode".into(),
+                    creation_seed_ref: "seed".into(),
+                },
+                config.image_ref.clone(),
+                config.host_binary_path.clone(),
+            )
+            .await
+            .unwrap();
+        let receipt = registry
+            .record_initial_observation(
+                reservation,
+                InitialAuthVolumeObservation::Absent {
+                    daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut input = context(&soul, 1);
+        input
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .initial_auth_reservation = Some(receipt.reservation_id.clone());
+        let terminal:TerminalLaunchSpec=serde_json::from_value(serde_json::json!({"terminalId":"terminal","streamId":"stream","mode":"opencode","program":"opencode","args":[],"env":{},"cwd":temp.path(),"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project","workspacePath":temp.path(),"providerLaunchContext":input,"providerSecretReferences":references()})).unwrap();
+        let preparation = LaunchPreparation {
+            soul_id: soul.clone(),
+            provider: "opencode".into(),
+            provider_store_id: "store-exact".into(),
+            native_session_id: None,
+            creation_seed_ref: "seed".into(),
+            request_id: RequestId::new(),
+            payload_digest: "replan-test".into(),
+            requested_limits: limits(),
+            profile: RuntimeProfile::Custom,
+            project_key: "project".into(),
+            fixture: None,
+            terminal: Some(terminal.clone()),
+            fresh_agent: None,
+            view_intent: None,
+            admission: crate::admission::AdmissionPolicy::default(),
+        };
+        let prepared = registry.prepare_launch(preparation.clone()).await.unwrap();
+        let error = supervisor
+            .activate_prepared(
+                prepared.clone(),
+                LaunchWorkload {
+                    soul_id: soul.clone(),
+                    fixture: None,
+                    terminal: Some(terminal),
+                    fresh_agent: None,
+                    resume_spec: None,
+                },
+                limits(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if consumed {
+                RuntimeErrorCode::HostUnreachable
+            } else {
+                RuntimeErrorCode::ProviderInputsChanged
+            }
+        );
+        let view = registry.inventory().await.unwrap().pop().unwrap();
+        assert_eq!(
+            view.launch_state,
+            if consumed {
+                LaunchState::Starting
+            } else {
+                LaunchState::Stopped
+            }
+        );
+        assert!(daemon.lock().unwrap().generations.contains("prior-usable"));
+        assert_eq!(
+            daemon.lock().unwrap().generations.contains("grant-1"),
+            consumed,
+            "only positively rejected generation can be retired"
+        );
+        assert_eq!(daemon.lock().unwrap().grants, 0);
+        if !consumed {
+            for ordinal in 2..=3 {
+                let reserved = registry
+                    .reserve_initial_inputs(
+                        ReserveProviderInputsRequest {
+                            expected_control_epoch: Some(registry.control_epoch()),
+                            soul_id: soul.clone(),
+                            provider: "opencode".into(),
+                            creation_seed_ref: "seed".into(),
+                        },
+                        config.image_ref.clone(),
+                        config.host_binary_path.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reserved.id, receipt.reservation_id,
+                    "replan reuses exact creation authority"
+                );
+                let retained = reserved.prior_observation.clone().unwrap();
+                assert!(
+                    matches!(&retained,InitialAuthVolumeObservation::OwnedUndispatched {incarnation_id,..} if incarnation_id==&prepared.incarnation_id)
+                );
+                registry
+                    .record_initial_observation(reserved, retained)
+                    .await
+                    .unwrap();
+                let mut next = preparation.clone();
+                next.request_id = RequestId::new();
+                next.payload_digest = format!("replan-{ordinal}");
+                let mut next_context = context(&soul, ordinal);
+                next_context
+                    .prepared_inputs
+                    .as_mut()
+                    .unwrap()
+                    .initial_auth_reservation = Some(receipt.reservation_id.clone());
+                next.terminal.as_mut().unwrap().provider_launch_context = Some(next_context);
+                let workload = LaunchWorkload {
+                    soul_id: soul.clone(),
+                    fixture: None,
+                    terminal: next.terminal.clone(),
+                    fresh_agent: None,
+                    resume_spec: None,
+                };
+                let prepared = registry.prepare_launch(next).await.unwrap();
+                assert_eq!(
+                    supervisor
+                        .activate_prepared(prepared, workload, limits())
+                        .await
+                        .unwrap_err()
+                        .code,
+                    RuntimeErrorCode::ProviderInputsChanged
+                );
+                assert_eq!(
+                    daemon.lock().unwrap().generations,
+                    BTreeSet::from(["prior-usable".to_string()]),
+                    "each rejected generation is settled while prior input remains"
+                );
+            }
+            assert!(
+                registry
+                    .reserve_initial_inputs(
+                        ReserveProviderInputsRequest {
+                            expected_control_epoch: Some(registry.control_epoch()),
+                            soul_id: soul.clone(),
+                            provider: "opencode".into(),
+                            creation_seed_ref: "seed".into()
+                        },
+                        config.image_ref.clone(),
+                        config.host_binary_path.clone()
+                    )
+                    .await
+                    .is_err(),
+                "two pre-dispatch replans are the complete bound"
+            );
+        }
+        let tasks = std::mem::take(&mut daemon.lock().unwrap().host_tasks);
+        for task in tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        callback_task.abort();
+        assert!(callback_task.await.unwrap_err().is_cancelled());
+    }
+}

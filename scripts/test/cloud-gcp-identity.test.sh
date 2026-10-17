@@ -409,6 +409,10 @@ if [[ "$*" == *"auth print-access-token"* ]]; then echo stub-token; exit 0; fi
 if [[ "$*" == *"executions list"* ]]; then echo "green-exec-1"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "  1 passed (1.0s)"; exit 0; fi
 if [[ "$*" == *"logging read"* ]]; then
+  if [[ "$*" == *"textPayload =~"* ]]; then
+    printf '[{"labels":{"run.googleapis.com/execution_name":"green-exec-1","run.googleapis.com/task_index":"0"},"textPayload":"  1 passed (1.0s)"}]\n'
+    exit 0
+  fi
   # Structured retry-receipt reconciliation for the green single-task
   # execution this stub reports. Without this branch the e2e wrapper fails
   # closed on receipt evidence before the identity-ladder behavior under

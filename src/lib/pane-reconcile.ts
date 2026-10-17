@@ -37,6 +37,7 @@ import {
   setPaneRestoreError,
   setReconcileWarming,
 } from '@/store/panesSlice'
+import { retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { clearSessionLost } from '@/store/freshAgentSlice'
 import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
@@ -147,7 +148,16 @@ function effectiveReconcileSessionRef(
 function toReconcilePane(tabId: string, paneId: string, content: TerminalPaneContent): ReconcilePane | null {
   // Panes without a createRequestId cannot be reconciled — skip.
   if (!content.createRequestId) return null
+  // A failed managed preparation never registered a backend terminal. Its
+  // retained error is the durable result; asking the server to reconcile the
+  // same createRequestId would classify it as fresh and silently retry it.
+  if (retainedManagedPreparationFailure(content)) return null
   const sessionRef = effectiveReconcileSessionRef(content.sessionRef, content.resumeSessionId, content.mode)
+  // A managed runtime may still be starting or blocked before its native
+  // provider session exists. In that state, generic reconciliation would
+  // label the pane `fresh` and clear its retained terminal handle. Managed
+  // inventory owns that lifecycle until a durable provider identity exists.
+  if (content.soulId && !sessionRef) return null
   return {
     paneKey: paneKeyFor(tabId, paneId),
     kind: 'terminal',
@@ -173,6 +183,10 @@ function toFreshAgentReconcilePane(
   // Panes without a createRequestId cannot be reconciled — skip.
   if (!content.createRequestId) return null
   const sessionRef = effectiveReconcileSessionRef(content.sessionRef, content.resumeSessionId, content.provider)
+  // As with managed terminals, a soul without a native session identity has
+  // no safe generic reconcile verdict. Keep its supervisor-owned recovery
+  // projection intact and let managed inventory decide its state.
+  if (content.soulId && !sessionRef) return null
   return {
     paneKey: paneKeyFor(tabId, paneId),
     kind: 'fresh-agent',

@@ -10,6 +10,8 @@ import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import type { BackgroundTerminal } from '@/store/types'
+import { isRetainedManagedTerminal, managedTerminalPaneStatus, managedTerminalProjection } from '@/lib/managed-terminal.js'
+import ManagedTerminalRecoveryDetails from './ManagedTerminalRecoveryDetails.js'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
@@ -47,7 +49,7 @@ export default function BackgroundSessions() {
     }
   }, [refresh])
 
-  const detachedRunning = terminals.filter((t) => t.status === 'running' && !t.hasClients)
+  const detachedRunning = terminals.filter((t) => (t.status === 'running' || isRetainedManagedTerminal(t)) && !t.hasClients)
 
   // b8ke fence-heal (fix b): detached terminals have NO mounted
   // TerminalView to consume their typed kill refusal — fold it HERE so
@@ -97,7 +99,7 @@ export default function BackgroundSessions() {
 
       {detachedRunning.length === 0 ? (
         <div className="pt-2 text-xs text-muted-foreground">
-          No detached running terminals. Close a tab to detach it, or kill it with Shift+Close.
+          No detached terminals. Close a tab to detach it, or kill it with Shift+Close.
         </div>
       ) : (
         <div className="pt-2 flex flex-col gap-2">
@@ -114,6 +116,7 @@ export default function BackgroundSessions() {
                 >
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium truncate">{t.title}</div>
+                    <ManagedTerminalRecoveryDetails terminal={t} />
                     <div className="text-xs text-muted-foreground truncate">
                       {t.cwd ? t.cwd + ' • ' : ''}idle {formatAge(idleMs)}
                     </div>
@@ -125,10 +128,12 @@ export default function BackgroundSessions() {
                       const tabId = nanoid()
                       const mode = ((t.mode as any) || 'shell') as string
                       const initialCwd = typeof t.cwd === 'string' && t.cwd.trim() ? t.cwd : undefined
+                      const status = managedTerminalPaneStatus(t, t.status === 'exited' ? 'exited' : 'running')
                       dispatch(addTab({
                         id: tabId,
                         title: t.title,
-                        status: 'running',
+                        status,
+                        ...managedTerminalProjection(t),
                         mode: mode as any,
                         sessionRef: t.sessionRef,
                         ...(initialCwd ? { initialCwd } : {}),
@@ -139,7 +144,8 @@ export default function BackgroundSessions() {
                           kind: 'terminal',
                           mode: mode as any,
                           terminalId: t.terminalId,
-                          status: 'running',
+                          status,
+                          ...managedTerminalProjection(t),
                           sessionRef: t.sessionRef,
                           ...(initialCwd ? { initialCwd } : {}),
                         },

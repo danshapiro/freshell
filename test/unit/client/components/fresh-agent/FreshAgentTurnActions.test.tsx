@@ -49,6 +49,41 @@ describe('FreshAgentTurnActions', () => {
 
     expect(onForkFromTurn).toHaveBeenCalledWith('codex-display:v1:opaque-user-row')
   })
+
+  it('disables rewind and shows the per-message failure reason', () => {
+    const turn: FreshAgentTurn = {
+      id: 'user-turn',
+      turnId: 'user-turn',
+      role: 'user',
+      summary: 'prompt',
+      items: [{ id: 'user-text', kind: 'text', text: 'prompt' }],
+    }
+    const reason = 'Select a project folder to save code rewind.'
+    const onRewindToTurn = vi.fn()
+    const callbacks = {
+      canFork: false,
+      onRewindToTurn,
+      getRewindAvailability: () => ({ status: 'unavailable' as const, reason }),
+    }
+
+    const rewind = buildTurnActionItems(turn, callbacks).find((item) => item.label.startsWith('Rewind unavailable:'))
+    expect(rewind).toMatchObject({ label: `Rewind unavailable: ${reason}`, disabled: true })
+
+    render(
+      <FreshAgentTurnActions
+        turn={turn}
+        canFork={false}
+        onRewindToTurn={onRewindToTurn}
+        getRewindAvailability={callbacks.getRewindAvailability}
+      />,
+    )
+
+    const button = screen.getByRole('button', { name: 'Rewind unavailable for this message' })
+    expect(button).toBeDisabled()
+    expect(button).toHaveAttribute('title', `Rewind unavailable: ${reason}`)
+    fireEvent.click(button)
+    expect(onRewindToTurn).not.toHaveBeenCalled()
+  })
 })
 
 describe('rollback affordance (kata 1wxv decisions 3, 8)', () => {

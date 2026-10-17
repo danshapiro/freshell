@@ -54,6 +54,10 @@ export const SessionDirectoryItemSchema = z.object({
   provider: z.string().min(1),
   projectPath: z.string().min(1),
   checkoutPath: z.string().optional(),
+  checkpointWorkspace: z.object({
+    path: z.string().min(1).max(4096),
+    provenance: z.literal('directory-picker'),
+  }).optional(),
   title: z.string().optional(),
   summary: z.string().optional(),
   snippet: z.string().optional(),

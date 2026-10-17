@@ -188,6 +188,13 @@ fn locate_thread_rollout(
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
+/// Codex history is sometimes behind the turn-completion notification. Keep
+/// reconciling for a bounded settlement window after the target turn retires;
+/// each read is capped by the same deadline even though the app-server's normal
+/// snapshot timeout is longer.
+const CHECKPOINT_IDENTITY_SETTLE_WINDOW: Duration = Duration::from_secs(30);
+const CHECKPOINT_IDENTITY_PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const CHECKPOINT_IDENTITY_COMPLETION_POLL_DELAY: Duration = Duration::from_millis(100);
 
 enum CodexStopMode {
     Close,
@@ -362,6 +369,10 @@ pub struct FreshCodexState {
     /// post-construction by `freshell-server` (precedent:
     /// `TerminalRegistry::set_activity_observer`).
     identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
+    /// Server-owned durable path for checkpoint events. When present, accepted
+    /// turn ids and final history identities are persisted before their public
+    /// broadcast so a server exit cannot strand a one-shot receipt in memory.
+    checkpoint_event_sink: crate::CheckpointEventSink,
     /// The per-sessionRef create/resume lease (D8 for fresh agents, Task 12) —
     /// ALWAYS ON at this runtime seam (never capability-gated). `main.rs` replaces the
     /// default with the ONE server-wide shared map via [`Self::set_session_leases`].
@@ -554,6 +565,9 @@ struct CodexSession {
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946). Cleared back to `false`
     /// once a respawn succeeds.
     exited: Arc<AtomicBool>,
+    /// Cancels checkpoint identity probes when this session is explicitly stopped. A live
+    /// turn may never emit its normal completion notification after teardown.
+    checkpoint_probe_cancelled: Arc<AtomicBool>,
     /// b8ke focused round-2 review R2-1: the sidecar child's pid + `/proc`
     /// ownership tag — the recorded identity `kill_for_handoff` condemns
     /// BEFORE its first cancellable await, so the handoff watcher's
@@ -638,6 +652,17 @@ struct CodexSession {
     /// site filters hollow `Some`s away (focused-ep1-r5 Finding 2): a
     /// partially initialized client's hello never lands here.
     provenance: Option<crate::BindProvenance>,
+}
+
+struct CodexCheckpointIdentityProbe {
+    client: Arc<CodexAppServerClient>,
+    session_id: String,
+    submitted_turn_id: String,
+    request_id: String,
+    logical_attempt_id: String,
+    active_turn: Arc<StdMutex<Option<String>>>,
+    exited: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -780,6 +805,7 @@ impl FreshCodexState {
             dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
+            checkpoint_event_sink: crate::CheckpointEventSink::default(),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             ownership: None,
             ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -799,6 +825,15 @@ impl FreshCodexState {
     pub fn with_sidecar_launch_context(mut self, context: CodexSidecarLaunchContext) -> Self {
         self.sidecar_launch_context = context;
         self
+    }
+
+    /// Wire the server-owned durable checkpoint-event path before this state is
+    /// cloned into routers and session consumers.
+    pub fn set_checkpoint_event_persister(
+        &mut self,
+        persister: crate::CheckpointEventPersister,
+    ) -> Result<(), &'static str> {
+        self.checkpoint_event_sink.set_persister(persister)
     }
 
     /// The configured wedged-sidecar quiet window, in milliseconds.
@@ -1806,6 +1841,32 @@ impl FreshCodexState {
         if let Ok(frame) = serde_json::to_string(msg) {
             let _ = self.broadcast_tx.send(frame);
         }
+    }
+
+    async fn persist_checkpoint_frame(
+        &self,
+        msg: &ServerMessage,
+        require_match: bool,
+    ) -> Result<String, String> {
+        let Ok(frame) = serde_json::to_string(msg) else {
+            return Err("checkpoint event could not be serialized".to_string());
+        };
+        self.checkpoint_event_sink
+            .persist_before_broadcast(&frame, require_match)
+            .await?;
+        Ok(frame)
+    }
+
+    async fn broadcast_checkpoint_event(
+        &self,
+        msg: &ServerMessage,
+        require_match: bool,
+    ) -> Result<(), String> {
+        let frame = serde_json::to_string(msg)
+            .map_err(|_| "checkpoint event could not be serialized".to_string())?;
+        self.checkpoint_event_sink
+            .broadcast(&self.broadcast_tx, frame, require_match)
+            .await
     }
 
     // ── freshAgent.create (WS) ───────────────────────────────────────────────
@@ -2829,6 +2890,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -3259,6 +3321,12 @@ impl FreshCodexState {
     /// self-healed crash.
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
+        let checkpoint_identity_request = msg.checkpoint_intent.as_ref().and_then(|intent| {
+            request_id
+                .as_deref()
+                .filter(|request_id| !request_id.trim().is_empty())
+                .map(|request_id| (request_id.to_string(), intent.logical_attempt_id.clone()))
+        });
         let mut session_id = msg.session_id.clone();
         let cwd = msg.cwd.clone();
         // b8ke ext r8 F5: the send's delayed-request fence (the new
@@ -3350,6 +3418,7 @@ impl FreshCodexState {
                     s.event_emission_gate.clone(),
                     s.quiet_deadman.clone(),
                     s.exited.clone(),
+                    s.checkpoint_probe_cancelled.clone(),
                 )
             })
         };
@@ -3362,6 +3431,7 @@ impl FreshCodexState {
             event_emission_gate,
             quiet_deadman,
             exited,
+            checkpoint_probe_cancelled,
         )) = looked_up
         else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
@@ -3378,6 +3448,36 @@ impl FreshCodexState {
         // this lock, the send simply waits, then proceeds and destroys redo
         // ("send waits, rollback wins, then destroys").
         let _turn = turn_lock.lock().await;
+
+        // The checkpoint workspace barrier can park a send outside this
+        // handler while ownership changes. Recheck the captured wire fence
+        // after the turn lock so a delayed send cannot reach a replacement
+        // owner of the same thread id. Keep the coordinator guard through the
+        // turn/start request; ordinary legacy sends without a fence retain
+        // their existing behavior.
+        let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
+            let owner_key = self.resolve_ownership_key(&session_id);
+            match crate::ownership_lane::arm_reclaimless_op_guard(
+                &self.ownership,
+                PROVIDER,
+                &owner_key,
+                &format!("send-{}", uuid::Uuid::new_v4()),
+                send_fence,
+                "freshcodex/send",
+            ) {
+                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneOpGuard::Unwired => None,
+                crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %session_id, request_id = ?request_id,
+                        "fresh_agent_send_refused: ownership guard refused");
+                    self.send_error(&request_id, "SESSION_RESERVED", &message);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         // Read defaults after acquiring the turn lock: a queued send inherits the
         // last accepted settings, while this message's explicit choices win.
@@ -3524,6 +3624,7 @@ impl FreshCodexState {
                 return;
             }
         };
+        drop(ownership_guard);
 
         // Only persist choices once the provider has accepted them. Failed sends
         // keep the previous working settings for resume and retry.
@@ -3638,20 +3739,173 @@ impl FreshCodexState {
         );
 
         // Broadcast freshAgent.send.accepted (ws-handler.ts:3487). turnAccepted edge.
-        self.broadcast(&ServerMessage::FreshAgentSendAccepted(
-            freshell_protocol::FreshAgentSendAccepted {
+        let accepted =
+            ServerMessage::FreshAgentSendAccepted(freshell_protocol::FreshAgentSendAccepted {
                 provider: PROVIDER.to_string(),
-                request_id: request_id.unwrap_or_default(),
-                session_id,
+                request_id: request_id.clone().unwrap_or_default(),
+                session_id: session_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
                 cwd: turn_cwd,
-                submitted_turn_id: Some(submitted_turn_id),
-            },
-        ));
+                submitted_turn_id: Some(submitted_turn_id.clone()),
+            });
+        if checkpoint_identity_request.is_some() {
+            if let Err(error) = self.broadcast_checkpoint_event(&accepted, true).await {
+                tracing::error!(target: "freshell_freshagent::codex",
+                    session_id = %session_id,
+                    request_id = request_id.as_deref().unwrap_or_default(),
+                    cause = %error,
+                    "freshagent.codex.checkpoint_accepted_persist_failed"
+                );
+                // The provider accepted the turn, so keep the acknowledgement
+                // flowing, but withhold the unpersisted native ID. The exact
+                // identity probe below will publish only if its own durable
+                // write succeeds.
+                if let ServerMessage::FreshAgentSendAccepted(mut fallback) = accepted {
+                    fallback.submitted_turn_id = None;
+                    self.broadcast(&ServerMessage::FreshAgentSendAccepted(fallback));
+                }
+            }
+        } else {
+            self.broadcast(&accepted);
+        }
+
+        if let Some((request_id, logical_attempt_id)) = checkpoint_identity_request {
+            drop(
+                self.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+                    client,
+                    session_id,
+                    submitted_turn_id,
+                    request_id,
+                    logical_attempt_id,
+                    active_turn,
+                    exited,
+                    cancelled: checkpoint_probe_cancelled,
+                }),
+            );
+        }
+    }
+
+    fn spawn_checkpoint_identity_probe(
+        &self,
+        probe: CodexCheckpointIdentityProbe,
+    ) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let CodexCheckpointIdentityProbe {
+                client,
+                session_id,
+                submitted_turn_id,
+                request_id,
+                logical_attempt_id,
+                active_turn,
+                exited,
+                cancelled,
+            } = probe;
+            // Wait for the accepted turn to retire before treating its projected
+            // row ids as final. A live turn may contain only the user row today,
+            // then gain assistant rows that change its display id. After retirement,
+            // the bounded read/retry window covers the provider-history persistence
+            // lag without abandoning the receipt after a handful of fast empty reads.
+            while active_turn.lock().expect("active_turn mutex").as_deref()
+                == Some(submitted_turn_id.as_str())
+                && !exited.load(Ordering::SeqCst)
+                && !cancelled.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(CHECKPOINT_IDENTITY_COMPLETION_POLL_DELAY).await;
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let deadline = tokio::time::Instant::now() + CHECKPOINT_IDENTITY_SETTLE_WINDOW;
+            let mut identity = None;
+            let mut attempt = 0;
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    return;
+                }
+                attempt += 1;
+                match tokio::time::timeout_at(deadline, client.read_thread(&session_id, true)).await
+                {
+                    Ok(Ok(raw_thread)) => {
+                        identity = checkpoint_codex_turn_identity(&raw_thread, &submitted_turn_id);
+                        if identity.is_some() {
+                            break;
+                        }
+                        tracing::debug!(target: "freshell_freshagent::codex",
+                            session_id = %session_id,
+                            submitted_turn_id = %submitted_turn_id,
+                            request_id = %request_id,
+                            attempt,
+                            "freshagent.codex.checkpoint_identity_row_not_yet_observed"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            session_id = %session_id,
+                            submitted_turn_id = %submitted_turn_id,
+                            request_id = %request_id,
+                            attempt,
+                            error = %error,
+                            "freshagent.codex.checkpoint_identity_read_failed"
+                        );
+                    }
+                    Err(_) => break,
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                tokio::time::sleep(
+                    CHECKPOINT_IDENTITY_PROBE_RETRY_DELAY
+                        .min(deadline.saturating_duration_since(now)),
+                )
+                .await;
+            }
+            let Some((native_turn_id, display_turn_id)) = identity else {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %session_id,
+                    submitted_turn_id = %submitted_turn_id,
+                    request_id = %request_id,
+                    attempts = attempt,
+                    "freshagent.codex.checkpoint_identity_settlement_expired"
+                );
+                return;
+            };
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Err(error) = state
+                .broadcast_checkpoint_event(
+                    &ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: json!({
+                            "type": "checkpointTurnIdentity",
+                            "logicalAttemptId": logical_attempt_id,
+                            "requestId": request_id,
+                            "sessionId": session_id,
+                            "nativeTurnId": native_turn_id,
+                            "displayTurnId": display_turn_id,
+                        }),
+                        provider: PROVIDER.to_string(),
+                        session_id,
+                        session_type: SESSION_TYPE.to_string(),
+                    }),
+                    true,
+                )
+                .await
+            {
+                tracing::error!(target: "freshell_freshagent::codex",
+                    request_id = %request_id,
+                    cause = %error,
+                    "freshagent.codex.checkpoint_identity_persist_failed"
+                );
+            }
+        })
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
@@ -5554,6 +5808,14 @@ impl FreshCodexState {
         self.clear_controls(&session_id).await;
 
         let removed = self.sessions.lock().await.remove(&session_id);
+        if let Some(session) = removed.as_ref() {
+            // Requested teardown ends the probe's wait even when the provider never
+            // emits turn/completed. Signal before closing the client so an in-flight
+            // history read can settle and the probe exits promptly.
+            session
+                .checkpoint_probe_cancelled
+                .store(true, Ordering::SeqCst);
+        }
         let removed_ownership_id = removed
             .as_ref()
             .map(|session| session.sidecar_ownership_id.clone());
@@ -6613,6 +6875,7 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
                     sidecar_ownership_id,
                     quiet_deadman,
@@ -6913,6 +7176,7 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                     sidecar_pid,
                     sidecar_ownership_id,
                     quiet_deadman,
@@ -7047,8 +7311,8 @@ impl FreshCodexState {
         let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
         let session_name = naming_projection.map(|(_, record)| record);
 
-        self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
-            FreshAgentSessionMaterialized {
+        let materialized =
+            ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
                 previous_session_id: old_session_id.to_string(),
                 provider: PROVIDER.to_string(),
                 session_id: new_thread_id.clone(),
@@ -7059,8 +7323,16 @@ impl FreshCodexState {
                 }),
                 name_ref,
                 session_name,
-            },
-        ));
+            });
+        if let Err(error) = self.persist_checkpoint_frame(&materialized, false).await {
+            tracing::error!(target: "freshell_freshagent::codex",
+                old_session_id = %old_session_id,
+                new_session_id = %new_thread_id,
+                cause = %error,
+                "freshagent.codex.checkpoint_alias_persist_failed"
+            );
+        }
+        self.broadcast(&materialized);
 
         // P1.13 §2.6b (Task 6): memory loss must be user-visible, not server-log-only.
         // Emitted AFTER the materialized broadcast above -- the frozen client re-keys
@@ -7164,6 +7436,16 @@ impl FreshCodexState {
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
+        #[cfg(target_os = "linux")]
+        if self.sidecar_launch_context.provider_exec_profile {
+            let additional = if codex_program == "/usr/bin/setpriv" {
+                &["codex"][..]
+            } else {
+                &[]
+            };
+            freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
+                .map_err(|error| error.to_string())?;
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
@@ -8663,6 +8945,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -8756,6 +9039,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -9544,6 +9828,9 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
     }
 
     let row_count = rows.len();
+    let unique_user_row = (rows.iter().filter(|row| row.role == "user").count() == 1)
+        .then(|| rows.iter().position(|row| row.role == "user"))
+        .flatten();
     let turns = rows
         .into_iter()
         .enumerate()
@@ -9556,7 +9843,7 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
                 format!("{turn_id}:row-{row_index}")
             };
             let (summary, summary_kind) = summarize_codex_items(&row.items);
-            json!({
+            let mut turn = json!({
                 "id": row_turn_id,
                 "turnId": row_turn_id,
                 "ordinal": ordinal,
@@ -9565,11 +9852,49 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
                 "summary": summary,
                 "summaryKind": summary_kind,
                 "items": row.items,
-            })
+            });
+            if unique_user_row == Some(row_index) && !turn_id.is_empty() {
+                turn["nativeTurnId"] = json!(turn_id);
+            }
+            turn
         })
         .collect();
 
     Ok(turns)
+}
+
+fn checkpoint_codex_turn_identity(
+    raw_thread: &Value,
+    submitted_turn_id: &str,
+) -> Option<(String, String)> {
+    let raw_turns = raw_thread.get("thread")?.get("turns")?.as_array()?;
+    let mut matching = raw_turns
+        .iter()
+        .filter(|turn| turn.get("id").and_then(Value::as_str) == Some(submitted_turn_id));
+    let raw_turn = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    if !matches!(
+        raw_turn.get("status").and_then(Value::as_str),
+        Some("completed" | "interrupted" | "failed")
+    ) {
+        return None;
+    }
+    let projected = build_codex_turn_json(raw_turn, 0).ok()?;
+    let mut user_rows = projected
+        .iter()
+        .filter(|turn| turn.get("role").and_then(Value::as_str) == Some("user"));
+    let user_row = user_rows.next()?;
+    if user_rows.next().is_some() {
+        return None;
+    }
+    let native_turn_id = user_row.get("nativeTurnId")?.as_str()?;
+    if native_turn_id != submitted_turn_id {
+        return None;
+    }
+    let display_turn_id = user_row.get("turnId")?.as_str()?;
+    Some((native_turn_id.to_string(), display_turn_id.to_string()))
 }
 
 /// Watch an owned sidecar child to completion. Two ways out:
@@ -11016,8 +11341,7 @@ fn codex_turn_plain_text(turn: &Value) -> String {
 /// the ledger) and the pane is told the two histories may disagree until the
 /// next refresh. Explicit RPC-rejection legs instead compensate (the provider
 /// ANSWERED, so the revert provably did not apply).
-const CODEX_UNCERTAIN_ROLLBACK_COPY: &str =
-    "Undo state could not be confirmed — conversation and undo history may disagree until the next refresh.";
+const CODEX_UNCERTAIN_ROLLBACK_COPY: &str = "Undo state could not be confirmed — conversation and undo history may disagree until the next refresh.";
 
 /// LBC-1: a pre-feature LEGACY thread — `thread/revert` answered
 /// `-32600 "…only supports paginated threads"`. Structured on the RPC code
@@ -11148,7 +11472,9 @@ fn normalize_codex_permission(
     }
     match permission.as_deref() {
         None | Some("untrusted" | "on-failure" | "on-request" | "never") => Ok(()),
-        _ => Err("Choose a supported Codex approval policy: untrusted, on-failure, on-request, or never."),
+        _ => Err(
+            "Choose a supported Codex approval policy: untrusted, on-failure, on-request, or never.",
+        ),
     }
 }
 
@@ -11773,6 +12099,7 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -11881,6 +12208,7 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
@@ -12311,6 +12639,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         }
     }
 
@@ -13891,6 +14220,7 @@ pub(crate) mod tests {
                 kill_tx: None,
                 watcher,
                 exited,
+                checkpoint_probe_cancelled: Arc::new(AtomicBool::new(false)),
                 quiet_deadman: QuietDeadman::new_shared(),
                 turn_in_flight: Arc::new(AtomicBool::new(false)),
                 retired_turn_id: Arc::new(StdMutex::new(None)),
@@ -15276,6 +15606,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -15421,6 +15752,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -15540,6 +15872,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -20643,7 +20976,9 @@ pub(crate) mod tests {
         assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
         assert_eq!(
             frames[0]["event"]["message"],
-            json!("Redo is not supported for freshcodex (codex history revert is destructive; there is no redo primitive).")
+            json!(
+                "Redo is not supported for freshcodex (codex history revert is destructive; there is no redo primitive)."
+            )
         );
         assert!(
             fake.rollbacks.lock().unwrap().is_empty(),
@@ -21079,6 +21414,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -21431,6 +21767,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -21559,6 +21896,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -24174,6 +24512,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24257,6 +24596,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24352,6 +24692,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24428,6 +24769,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24726,6 +25068,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
         });
@@ -25331,7 +25674,8 @@ pub(crate) mod tests {
                     "no broadcast error may target the discarded old id: {frame}"
                 );
                 assert_eq!(
-                    frame["sessionId"], json!("parent-new-mint"),
+                    frame["sessionId"],
+                    json!("parent-new-mint"),
                     "the degradation frame rides the new id, like the crate's own keying invariant: {frame}"
                 );
             }
@@ -26616,6 +26960,322 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn checkpoint_turn_identity_codex_binds_native_id_only_to_one_actual_user_row() {
+        let raw_turn = json!({
+            "id": "turn-native-1",
+            "status": "completed",
+            "items": [
+                { "id": "user-item-1", "type": "userMessage", "content": [{ "type": "text", "text": "same prompt" }] },
+                { "id": "assistant-item-1", "type": "agentMessage", "text": "answer" }
+            ]
+        });
+
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+        let user_rows: Vec<_> = turns.iter().filter(|turn| turn["role"] == "user").collect();
+        assert_eq!(user_rows.len(), 1);
+        assert_eq!(user_rows[0]["id"], "turn-native-1:row-0");
+        assert_eq!(user_rows[0]["turnId"], "turn-native-1:row-0");
+        assert_eq!(user_rows[0]["nativeTurnId"], "turn-native-1");
+        assert!(turns
+            .iter()
+            .filter(|turn| turn["role"] != "user")
+            .all(|turn| turn.get("nativeTurnId").is_none()));
+        let raw_thread = json!({"thread":{"turns":[raw_turn.clone()]}});
+        assert_eq!(
+            checkpoint_codex_turn_identity(&raw_thread, "turn-native-1"),
+            Some((
+                "turn-native-1".to_string(),
+                "turn-native-1:row-0".to_string()
+            )),
+            "the receipt identity comes from the unique provider-persisted user row"
+        );
+        assert_eq!(
+            checkpoint_codex_turn_identity(&raw_thread, "some-other-turn"),
+            None,
+            "a snapshot row from another send cannot satisfy this request"
+        );
+        let mut in_progress_turn = raw_turn.clone();
+        in_progress_turn["status"] = json!("inProgress");
+        assert_eq!(
+            checkpoint_codex_turn_identity(
+                &json!({"thread":{"turns":[in_progress_turn]}}),
+                "turn-native-1"
+            ),
+            None,
+            "an in-progress turn's row id can still change when Codex adds its assistant row"
+        );
+
+        let ambiguous = json!({
+            "id": "turn-native-ambiguous",
+            "status": "completed",
+            "items": [
+                { "id": "u1", "type": "userMessage", "content": [{ "type": "text", "text": "same prompt" }] },
+                { "id": "a1", "type": "agentMessage", "text": "answer" },
+                { "id": "u2", "type": "userMessage", "content": [{ "type": "text", "text": "same prompt" }] }
+            ]
+        });
+        let turns = build_codex_turn_json(&ambiguous, 0).expect("ambiguous turn still builds");
+        assert_eq!(
+            turns.iter().filter(|turn| turn["role"] == "user").count(),
+            2
+        );
+        assert!(turns.iter().all(|turn| turn.get("nativeTurnId").is_none()));
+        assert_eq!(
+            checkpoint_codex_turn_identity(
+                &json!({"thread":{"turns":[ambiguous]}}),
+                "turn-native-ambiguous"
+            ),
+            None,
+            "an ambiguous multi-user provider turn cannot emit a native identity receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_probe_retries_until_delayed_user_row_is_persisted() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let (state, mut rx) = state_with_bus();
+        let active_turn = Arc::new(StdMutex::new(Some("turn-persisted-user".to_string())));
+        drop(
+            state.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+                client: Arc::new(client),
+                session_id: "thread-checkpoint-receipt".to_string(),
+                submitted_turn_id: "turn-persisted-user".to_string(),
+                request_id: "request-checkpoint-1".to_string(),
+                logical_attempt_id: "logical-checkpoint-1".to_string(),
+                active_turn: active_turn.clone(),
+                exited: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer.expect_request())
+                .await
+                .is_err(),
+            "identity reads wait until the accepted turn has retired"
+        );
+        *active_turn.lock().expect("active turn mutex") = None;
+
+        let (initialize_id, initialize_method, _) = peer.expect_request().await;
+        assert_eq!(initialize_method, "initialize");
+        peer.respond(
+            &initialize_id,
+            json!({ "userAgent": "test", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+        for attempt in 1..=12 {
+            let (read_id, read_method, read_params) =
+                tokio::time::timeout(Duration::from_secs(2), peer.expect_request())
+                    .await
+                    .expect("probe should continue while the user row is not persisted");
+            assert_eq!(read_method, "thread/read", "attempt {attempt}");
+            assert_eq!(read_params["threadId"], "thread-checkpoint-receipt");
+            assert_eq!(read_params["includeTurns"], true);
+            peer.respond(
+                &read_id,
+                json!({
+                    "thread": {
+                        "id": "thread-checkpoint-receipt",
+                        "status": "running",
+                        "turns": []
+                    }
+                }),
+            );
+        }
+
+        let (persisted_read_id, persisted_read_method, persisted_read_params) =
+            tokio::time::timeout(Duration::from_secs(2), peer.expect_request())
+                .await
+                .expect("probe should continue after twelve empty history reads");
+        assert_eq!(persisted_read_method, "thread/read");
+        assert_eq!(
+            persisted_read_params["threadId"],
+            "thread-checkpoint-receipt"
+        );
+        assert_eq!(persisted_read_params["includeTurns"], true);
+        peer.respond(
+            &persisted_read_id,
+            json!({
+                "thread": {
+                    "id": "thread-checkpoint-receipt",
+                    "status": "idle",
+                    "turns": [{
+                        "id": "turn-persisted-user",
+                        "status": "completed",
+                        "items": [
+                            { "id": "user-row", "type": "userMessage", "content": [
+                                { "type": "text", "text": "prompt is not copied into receipt" }
+                            ] },
+                            { "id": "assistant-row", "type": "agentMessage", "text": "answer" }
+                        ]
+                    }]
+                }
+            }),
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("provider identity receipt was broadcast")
+            .expect("broadcast bus remains open");
+        let frame: Value = serde_json::from_str(&frame).expect("receipt is JSON");
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionId"], "thread-checkpoint-receipt");
+        assert_eq!(frame["event"]["type"], "checkpointTurnIdentity");
+        assert_eq!(frame["event"]["requestId"], "request-checkpoint-1");
+        assert_eq!(frame["event"]["logicalAttemptId"], "logical-checkpoint-1");
+        assert_eq!(frame["event"]["nativeTurnId"], "turn-persisted-user");
+        assert_eq!(frame["event"]["displayTurnId"], "turn-persisted-user:row-0");
+        assert!(
+            frame["event"].get("text").is_none(),
+            "checkpoint identity receipts never carry prompt text"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_probe_retries_after_a_thread_read_error() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let (state, mut rx) = state_with_bus();
+        drop(
+            state.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+                client: Arc::new(client),
+                session_id: "thread-checkpoint-read-retry".to_string(),
+                submitted_turn_id: "turn-persisted-after-retry".to_string(),
+                request_id: "request-checkpoint-retry".to_string(),
+                logical_attempt_id: "logical-checkpoint-retry".to_string(),
+                active_turn: Arc::new(StdMutex::new(None)),
+                exited: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+
+        let (initialize_id, initialize_method, _) = peer.expect_request().await;
+        assert_eq!(initialize_method, "initialize");
+        peer.respond(
+            &initialize_id,
+            json!({ "userAgent": "test", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+        let (first_read_id, first_read_method, _) = peer.expect_request().await;
+        assert_eq!(first_read_method, "thread/read");
+        peer.respond_error(&first_read_id, -32000, "temporary history read failure");
+
+        let (second_read_id, second_read_method, _) = peer.expect_request().await;
+        assert_eq!(second_read_method, "thread/read");
+        peer.respond(
+            &second_read_id,
+            json!({
+                "thread": {
+                    "id": "thread-checkpoint-read-retry",
+                    "status": "idle",
+                    "turns": [{
+                        "id": "turn-persisted-after-retry",
+                        "status": "completed",
+                        "items": [
+                            { "id": "user-row", "type": "userMessage", "content": [
+                                { "type": "text", "text": "prompt is excluded" }
+                            ] },
+                            { "id": "assistant-row", "type": "agentMessage", "text": "answer" }
+                        ]
+                    }]
+                }
+            }),
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("retry emitted the provider identity receipt")
+            .expect("broadcast bus remains open");
+        let frame: Value = serde_json::from_str(&frame).expect("receipt is JSON");
+        assert_eq!(frame["event"]["type"], "checkpointTurnIdentity");
+        assert_eq!(frame["event"]["requestId"], "request-checkpoint-retry");
+        assert_eq!(
+            frame["event"]["logicalAttemptId"],
+            "logical-checkpoint-retry"
+        );
+        assert_eq!(frame["event"]["nativeTurnId"], "turn-persisted-after-retry");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_probe_stops_when_its_session_is_killed_mid_turn() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (state, _rx) = state_with_bus();
+        let active_turn = Arc::new(StdMutex::new(Some("turn-stopped".to_string())));
+        insert_fake_session(
+            &state,
+            "thread-stopped-checkpoint",
+            client.clone(),
+            active_turn.clone(),
+            spawn_sleeper(),
+            "codex-sidecar-checkpoint-stop",
+        )
+        .await;
+        let (cancelled, exited) = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get("thread-stopped-checkpoint")
+                .expect("fixture session inserted");
+            (
+                session.checkpoint_probe_cancelled.clone(),
+                session.exited.clone(),
+            )
+        };
+        let mut probe = state.spawn_checkpoint_identity_probe(CodexCheckpointIdentityProbe {
+            client,
+            session_id: "thread-stopped-checkpoint".to_string(),
+            submitted_turn_id: "turn-stopped".to_string(),
+            request_id: "request-stopped".to_string(),
+            logical_attempt_id: "logical-stopped".to_string(),
+            active_turn,
+            exited,
+            cancelled: cancelled.clone(),
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer.expect_request())
+                .await
+                .is_err(),
+            "the probe should wait for the in-flight turn before reading history"
+        );
+        // Closing the client drains its reader task; dropping the fake provider lets its
+        // receive future finish so the fixture's transport close can complete.
+        drop(peer);
+
+        state
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "thread-stopped-checkpoint".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+
+        let probe_stopped = tokio::time::timeout(Duration::from_secs(1), &mut probe)
+            .await
+            .is_ok();
+        if !probe_stopped {
+            // Keep this regression leak-free while it is red: the pre-fix kill path
+            // leaves the probe polling, so explicitly release it after the assertion
+            // window and then verify that it settles.
+            cancelled.store(true, Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(1), &mut probe)
+                .await
+                .expect("test cleanup releases the probe")
+                .expect("probe task joins");
+        }
+        assert!(
+            probe_stopped,
+            "killing a session must cancel its checkpoint probe instead of retaining it forever"
+        );
+    }
+
+    #[test]
     fn build_codex_turn_json_empty_response_synthetic_row_also_carries_assistant_role() {
         // A completed turn with ONLY user-role items and no assistant output gets a synthetic
         // "empty-response" row appended (`normalize.ts:642-652`) -- also role `assistant`,
@@ -27062,6 +27722,7 @@ pub(crate) mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         };
 
         // First send carries the initial pair.
@@ -27303,6 +27964,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: Some(before.epoch),
             observed_generation: Some(before.generation),
+            checkpoint_intent: None,
         })
         .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -27327,6 +27989,73 @@ pub(crate) mod tests {
                 "the stale send never answered typed: {frame}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_send_with_stale_fence_is_refused_for_an_already_running_codex_session() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        let before = registry.observe(PROVIDER, &thread_id);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            &thread_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-checkpoint-send-generation-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail(
+            PROVIDER,
+            &thread_id,
+            "op-checkpoint-send-generation-bump",
+            generation,
+            true,
+        );
+        let after = registry.observe(PROVIDER, &thread_id);
+        assert!(after.generation > before.generation);
+        assert!(matches!(
+            after.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        while rx.try_recv().is_ok() {}
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-stale-checkpoint-codex".into()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id,
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "delayed checkpoint prompt".into(),
+            images: None,
+            cwd: None,
+            settings: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "stale-codex-attempt".into(),
+                workspace: None,
+            }),
+        })
+        .await;
+
+        let mut saw_reserved = false;
+        let mut saw_accepted = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("event frame JSON");
+            saw_reserved |= frame.to_string().contains("SESSION_RESERVED");
+            saw_accepted |= frame.to_string().contains("freshAgent.send.accepted");
+        }
+        assert!(saw_reserved, "the stale owner fence is refused typed");
+        assert!(
+            !saw_accepted,
+            "the stale prompt is never accepted for dispatch"
+        );
     }
 
     /// b8ke ext r21 F2: a reconnect-replayed stale-fence COMPACT arriving
@@ -28289,6 +29018,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: Some(7),
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -28763,5 +29493,67 @@ pub(crate) mod tests {
             ),
             "the live session's owner record is untouched"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provider_exec_tests {
+    use super::*;
+    #[tokio::test]
+    async fn provider_exec_profile_rejects_actual_managed_fresh_codex_spawn() {
+        const CASE: &str = "FRESHELL_CODEX_EXEC_PROFILE_CHILD";
+        if let Ok(case) = std::env::var(CASE) {
+            let count = if case == "large" { 17 } else { 1 };
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let state = FreshCodexState::new(
+                Arc::new("synthetic-token".into()),
+                Arc::new(tx),
+                serde_json::json!({"freshAgent":{"enabled":false}}),
+            )
+            .with_sidecar_launch_context(
+                freshell_codex::launch_plan::CodexSidecarLaunchContext {
+                    provider_exec_profile: true,
+                    config_args: vec![],
+                    env: (0..count)
+                        .map(|i| (format!("FRESHELL_EXEC_FIXTURE_{i}"), "x".repeat(64 * 1024)))
+                        .collect(),
+                },
+            );
+            std::env::set_var(
+                "CODEX_CMD",
+                format!(
+                    "node {}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+            );
+            let mut result = state.spawn_sidecar_notifying(None, None).await;
+            if let Ok((_, _, _, child)) = &mut result {
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+            }
+            if case == "large" {
+                assert!(
+                    matches!(result,Err(ref cause) if cause.contains("provider exec profile")),
+                    "managed fresh Codex must reject its actual full argv+env before spawn"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "valid selected fresh Codex inputs must execute the actual app-server handshake"
+                );
+            }
+            return;
+        }
+        for case in ["large", "small"] {
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).env_clear()
+            .env("PATH","/usr/local/bin:/usr/bin:/bin").env(CASE,case)
+            .args(["--exact","codex::provider_exec_tests::provider_exec_profile_rejects_actual_managed_fresh_codex_spawn","--nocapture"])
+            .output().unwrap();
+            assert!(
+                output.status.success(),
+                "actual fresh Codex exec fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

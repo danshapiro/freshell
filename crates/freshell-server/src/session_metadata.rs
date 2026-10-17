@@ -163,6 +163,27 @@ impl SessionMetadataStore {
         session_type: &str,
         session_type_source: Option<&str>,
     ) -> std::io::Result<bool> {
+        self.set_with_checkpoint_workspace(
+            provider,
+            session_id,
+            session_type,
+            session_type_source,
+            None,
+        )
+        .await
+    }
+
+    /// Merge the explicit workspace provenance selected when a fresh-agent
+    /// session was created. Later flavor-only writes pass `None`, preserving
+    /// this field along with the other metadata already stored for the session.
+    pub async fn set_with_checkpoint_workspace(
+        &self,
+        provider: &str,
+        session_id: &str,
+        session_type: &str,
+        session_type_source: Option<&str>,
+        checkpoint_workspace: Option<&Value>,
+    ) -> std::io::Result<bool> {
         let mut guard = self.inner.lock().await;
         let mut data = Self::load_locked(&mut guard, &self.path).await;
 
@@ -195,6 +216,9 @@ impl SessionMetadataStore {
         // one (matching the JS spread: an absent key in `entry` never touches `next`).
         let mut next = existing.clone();
         next.insert("sessionType".to_string(), json!(session_type));
+        if let Some(workspace) = checkpoint_workspace {
+            next.insert("checkpointWorkspace".to_string(), workspace.clone());
+        }
 
         if let Some(source) = session_type_source {
             let existing_type = existing.get("sessionType").and_then(Value::as_str);
@@ -398,15 +422,18 @@ async fn post_session_metadata(
             })),
         )
             .into_response(),
-        Ok((provider, session_id, session_type, session_type_source)) => {
-            match apply_session_metadata(
+        Ok(post) => {
+            match apply_session_metadata_with_checkpoint_workspace(
                 &state.store,
                 &state.broadcast_tx,
                 &state.sessions_revision,
-                &provider,
-                &session_id,
-                &session_type,
-                session_type_source.as_deref(),
+                SessionMetadataUpdate {
+                    provider: &post.provider,
+                    session_id: &post.session_id,
+                    session_type: &post.session_type,
+                    session_type_source: post.session_type_source.as_deref(),
+                    checkpoint_workspace: post.checkpoint_workspace.as_ref(),
+                },
             )
             .await
             {
@@ -435,11 +462,60 @@ pub async fn apply_session_metadata(
     session_type: &str,
     session_type_source: Option<&str>,
 ) -> std::io::Result<bool> {
-    let changed = store
-        .set(provider, session_id, session_type, session_type_source)
-        .await?;
+    apply_session_metadata_with_checkpoint_workspace(
+        store,
+        broadcast_tx,
+        sessions_revision,
+        SessionMetadataUpdate {
+            provider,
+            session_id,
+            session_type,
+            session_type_source,
+            checkpoint_workspace: None,
+        },
+    )
+    .await
+}
+
+struct SessionMetadataUpdate<'a> {
+    provider: &'a str,
+    session_id: &'a str,
+    session_type: &'a str,
+    session_type_source: Option<&'a str>,
+    checkpoint_workspace: Option<&'a Value>,
+}
+
+async fn apply_session_metadata_with_checkpoint_workspace(
+    store: &SessionMetadataStore,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    sessions_revision: &std::sync::atomic::AtomicI64,
+    update: SessionMetadataUpdate<'_>,
+) -> std::io::Result<bool> {
+    let changed = match update.checkpoint_workspace {
+        Some(workspace) => {
+            store
+                .set_with_checkpoint_workspace(
+                    update.provider,
+                    update.session_id,
+                    update.session_type,
+                    update.session_type_source,
+                    Some(workspace),
+                )
+                .await?
+        }
+        None => {
+            store
+                .set(
+                    update.provider,
+                    update.session_id,
+                    update.session_type,
+                    update.session_type_source,
+                )
+                .await?
+        }
+    };
     // W5 fix-forward: broadcast `sessions.changed` directly for a
-    // metadata write that actually changed the persisted `sessionType`
+    // metadata write that actually changed the persisted entry
     // (mirroring `sessions::patch_session`'s GAP-1 fix). Guarded on
     // `changed` -- the store's own no-op comparison (semantic `Map`
     // equality, see `SessionMetadataStore::set`'s doc comment) is the
@@ -458,9 +534,15 @@ pub async fn apply_session_metadata(
 /// zod-issue-shaped `{path, message}` objects on failure (schema-approximate — the
 /// reference's exact zod issue shape is not part of any client contract this port must
 /// match; the client only reads the top-level `error` string on a 400).
-fn validate_post_body(
-    body: &Value,
-) -> Result<(String, String, String, Option<String>), Vec<Value>> {
+struct ValidatedSessionMetadataPost {
+    provider: String,
+    session_id: String,
+    session_type: String,
+    session_type_source: Option<String>,
+    checkpoint_workspace: Option<Value>,
+}
+
+fn validate_post_body(body: &Value) -> Result<ValidatedSessionMetadataPost, Vec<Value>> {
     let mut issues = Vec::new();
 
     let provider = body.get("provider").and_then(Value::as_str);
@@ -496,18 +578,50 @@ fn validate_post_body(
             .push(json!({ "path": ["sessionTypeSource"], "message": "Invalid sessionTypeSource" }));
     }
 
+    let checkpoint_workspace = body.get("checkpointWorkspace");
+    let checkpoint_workspace_value = match checkpoint_workspace {
+        None => None,
+        Some(Value::Object(workspace)) => {
+            let path = workspace.get("path").and_then(Value::as_str);
+            let provenance = workspace.get("provenance").and_then(Value::as_str);
+            if path.is_some_and(|path| {
+                !path.is_empty() && path.encode_utf16().count() <= 4096 && !path.contains('\0')
+            }) && provenance == Some("directory-picker")
+            {
+                Some(json!({
+                    "path": path.unwrap(),
+                    "provenance": "directory-picker",
+                }))
+            } else {
+                issues.push(json!({
+                    "path": ["checkpointWorkspace"],
+                    "message": "Expected a bounded directory-picker workspace",
+                }));
+                None
+            }
+        }
+        Some(_) => {
+            issues.push(json!({
+                "path": ["checkpointWorkspace"],
+                "message": "Expected a bounded directory-picker workspace",
+            }));
+            None
+        }
+    };
+
     if !issues.is_empty() {
         return Err(issues);
     }
 
-    Ok((
-        provider.unwrap().to_string(),
-        session_id.unwrap().to_string(),
-        session_type.unwrap().to_string(),
-        session_type_source
+    Ok(ValidatedSessionMetadataPost {
+        provider: provider.unwrap().to_string(),
+        session_id: session_id.unwrap().to_string(),
+        session_type: session_type.unwrap().to_string(),
+        session_type_source: session_type_source
             .and_then(Value::as_str)
             .map(str::to_string),
-    ))
+        checkpoint_workspace: checkpoint_workspace_value,
+    })
 }
 
 #[cfg(test)]
@@ -767,6 +881,64 @@ mod tests {
         // And it actually persisted.
         let entry = store.get("codex", "sess-1").await.unwrap();
         assert_eq!(entry["sessionType"], json!("freshcodex"));
+    }
+
+    #[tokio::test]
+    async fn explicit_checkpoint_workspace_survives_later_materialized_metadata_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionMetadataStore::new(dir.path());
+        let workspace = json!({
+            "path": "/tmp/non-git-workspace",
+            "provenance": "directory-picker",
+        });
+        let mut selected = valid_body();
+        selected["checkpointWorkspace"] = workspace.clone();
+        let selected_response = post_session_metadata(
+            State(state(store.clone())),
+            headers_with_token("tok"),
+            Json(selected),
+        )
+        .await;
+        assert_eq!(selected_response.status(), StatusCode::OK);
+        assert_eq!(
+            store.get("codex", "sess-1").await.unwrap()["checkpointWorkspace"],
+            workspace
+        );
+
+        let mut refreshed = valid_body();
+        refreshed["sessionTypeSource"] = json!("materialized");
+        let _ = post_session_metadata(
+            State(state(store.clone())),
+            headers_with_token("tok"),
+            Json(refreshed),
+        )
+        .await;
+        assert_eq!(
+            store.get("codex", "sess-1").await.unwrap()["checkpointWorkspace"],
+            workspace
+        );
+        let reloaded = SessionMetadataStore::new(dir.path());
+        assert_eq!(
+            reloaded.get("codex", "sess-1").await.unwrap()["checkpointWorkspace"],
+            workspace
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_workspace_rejects_non_picker_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = valid_body();
+        body["checkpointWorkspace"] = json!({
+            "path": "/tmp/project",
+            "provenance": "resolved-project",
+        });
+        let response = post_session_metadata(
+            State(state(SessionMetadataStore::new(dir.path()))),
+            headers_with_token("tok"),
+            Json(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

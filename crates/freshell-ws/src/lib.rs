@@ -37,6 +37,7 @@ pub fn ready_build_id() -> Option<String> {
 pub mod activity;
 pub mod auto_resume;
 pub mod backpressure;
+pub mod checkpoint_barrier;
 pub mod claude_signal;
 pub mod claude_truth;
 pub mod codex_association;
@@ -259,6 +260,10 @@ pub struct WsState {
     /// gain exactly one `host_stats: Default::default()` arm each (the plan's
     /// >~6-site sweep rule). See [`crate::host_stats_collector`].
     pub host_stats: crate::host_stats_collector::WsHostStatsState,
+    /// Server-owned pre-turn checkpoint capture barrier. The server wires the
+    /// same service here and into its managed fresh-agent gateway; test
+    /// states leave it absent so legacy sends keep their existing behavior.
+    pub checkpoint_send: crate::checkpoint_barrier::WsCheckpointState,
     /// The handler-scoped monotonic `terminals.changed` revision counter
     /// (`ws-handler.ts:566` `terminalsRevision`). SHARED with the REST
     /// `/api/terminals` PATCH/DELETE broadcasts (`terminals::TerminalsState`),
@@ -1065,6 +1070,7 @@ async fn send_error(
     message: &str,
 ) -> Result<(), axum::Error> {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -1117,6 +1123,7 @@ pub(crate) fn test_ws_state() -> WsState {
         screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
         subagent_interest: Default::default(),
         host_stats: Default::default(),
+        checkpoint_send: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(Vec::new()),

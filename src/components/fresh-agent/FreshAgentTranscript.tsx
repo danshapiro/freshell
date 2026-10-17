@@ -19,6 +19,7 @@ import {
   buildTurnActionItems,
   FreshAgentTurnActions,
   turnPlainText,
+  type FreshAgentTurnRewindAvailability,
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
 import { FreshAgentTranscriptMinimap } from './FreshAgentTranscriptMinimap'
@@ -799,6 +800,7 @@ type TurnActionProps = {
   canFork: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  getRewindAvailability?: (turn: FreshAgentTurn) => FreshAgentTurnRewindAvailability | undefined
   /** kata 1wxv: the per-turn "undo to here" affordance (decision 3). */
   canRollback?: boolean
   rollbackBusy?: boolean
@@ -878,6 +880,7 @@ function FreshAgentTurnArticle({
   // coarse→fine pointer flip stops advertising/handling long-press even though
   // the instance persists for the article's lifetime.
   const longPress = actions.onOpenActions ? longPressRef.current : null
+  const rewindAvailability = actions.getRewindAvailability?.(actionTurn)
   return (
     <article
       className={cn(
@@ -924,8 +927,31 @@ function FreshAgentTurnArticle({
         onForkFromTurn={actions.onForkFromTurn}
         onRollbackToTurn={actions.onRollbackToTurn}
         onRewindToTurn={actions.onRewindToTurn}
+        getRewindAvailability={actions.getRewindAvailability}
         onOpenActions={actions.onOpenActions}
       />
+      {rewindAvailability ? (
+        <div
+          role={rewindAvailability.status === 'unavailable' ? 'note' : 'status'}
+          aria-label={rewindAvailability.status === 'unavailable'
+            ? 'Code rewind unavailable for this message'
+            : rewindAvailability.status === 'pending'
+              ? 'Saving code rewind checkpoint for this message'
+              : 'Code rewind available for this message'}
+          className={cn(
+            'px-1 pb-1 text-xs',
+            rewindAvailability.status === 'unavailable'
+              ? 'text-amber-700 dark:text-amber-400'
+              : 'text-muted-foreground',
+          )}
+        >
+          {rewindAvailability.status === 'unavailable'
+            ? `Code rewind unavailable for this message: ${rewindAvailability.reason}`
+            : rewindAvailability.status === 'pending'
+              ? 'Saving the code state from before this message.'
+              : 'Code rewind is available for this message.'}
+        </div>
+      ) : null}
       {showHeader ? (
         <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
           <span>{turnLabel}</span>
@@ -1022,6 +1048,7 @@ export type FreshAgentTranscriptProps = {
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  getRewindAvailability?: (turn: FreshAgentTurn) => FreshAgentTurnRewindAvailability | undefined
   /** kata 1wxv: rollback affordances on live turns feed TurnActionProps; the
    * marker bucket + its per-row redo feed the rolled-back section (decision 6). */
   canRollback?: boolean
@@ -1059,6 +1086,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
+  getRewindAvailability,
   canRollback = false,
   rollbackBusy = false,
   onRollbackToTurn,
@@ -1168,11 +1196,12 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     canFork,
     onForkFromTurn,
     onRewindToTurn,
+    getRewindAvailability,
     canRollback,
     rollbackBusy,
     onRollbackToTurn,
     onOpenActions: coarsePointer ? handleOpenActions : undefined,
-  }), [canFork, canRollback, coarsePointer, handleOpenActions, onForkFromTurn, onRewindToTurn, onRollbackToTurn, rollbackBusy])
+  }), [canFork, canRollback, coarsePointer, getRewindAvailability, handleOpenActions, onForkFromTurn, onRewindToTurn, onRollbackToTurn, rollbackBusy])
 
   // Desktop right-click surface: the global ContextMenuProvider owns every
   // fresh-agent contextmenu gesture and asks this pane's registered builder
@@ -1193,9 +1222,10 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
         onForkFromTurn,
         onRollbackToTurn,
         onRewindToTurn,
+        getRewindAvailability,
       })
     })
-  }, [paneId, displayTurns, lineEndIndex, canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn])
+  }, [paneId, displayTurns, lineEndIndex, canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn, getRewindAvailability])
 
   useImperativeHandle(ref, () => ({
     scrollByLine: (direction) => {
@@ -1367,7 +1397,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
       {sheetTurn ? (
         <FreshAgentActionSheet
           title={turnPlainText(sheetTurn).slice(0, 80) || getTurnLabel(sheetTurn, agentLabel)}
-          items={buildTurnActionItems(sheetTurn, { canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn })}
+          items={buildTurnActionItems(sheetTurn, { canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn, getRewindAvailability })}
           onClose={() => setSheetTurn(null)}
         />
       ) : null}

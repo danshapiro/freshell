@@ -35,6 +35,7 @@ function buildStore(): RootState['panes'] extends never ? never : ReturnType<typ
 function seedRekeyedPane(
   store: ReturnType<typeof buildStore>,
   status: 'idle' | 'creating' | 'starting' = 'idle',
+  checkpointWorkspace?: { path: string; provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint' },
 ) {
   store.dispatch(addTab({ id: 'tab-1' }))
   store.dispatch(initLayout({
@@ -47,6 +48,7 @@ function seedRekeyedPane(
       createRequestId: 'req-handoff',
       sessionRef: { provider: 'claude', sessionId: OLD_SESSION_ID },
       status,
+      ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
     },
   }))
   // The rekey mirror pair: the OLD key's record carries the canonical
@@ -118,7 +120,8 @@ describe('b8ke ext F1: the direct handoff navigates the rekey alias chain', () =
 
   it('records the server-answered canonical owner sessionId on the fresh-agent arm', async () => {
     const store = buildStore()
-    seedRekeyedPane(store)
+    const checkpointWorkspace = { path: '/projects/explicit', provenance: 'directory-picker' as const }
+    seedRekeyedPane(store, 'idle', checkpointWorkspace)
     requestSessionHandoffMock.mockResolvedValue({
       ok: true,
       operationId: 'ho-2',
@@ -141,6 +144,8 @@ describe('b8ke ext F1: the direct handoff navigates the rekey alias chain', () =
     expect(layout.content).toMatchObject({ kind: 'fresh-agent' })
     expect((layout.content as { sessionRef?: { sessionId: string } }).sessionRef)
       .toEqual({ provider: 'claude', sessionId: NEW_SESSION_ID })
+    expect((layout.content as { checkpointWorkspace?: typeof checkpointWorkspace }).checkpointWorkspace)
+      .toEqual(checkpointWorkspace)
   })
 })
 

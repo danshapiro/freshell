@@ -17,7 +17,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 10;
+mod input_reservation;
+pub(crate) use input_reservation::binary_digest;
+pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
 #[derive(Debug, thiserror::Error)]
@@ -161,6 +164,15 @@ pub struct OwnedRuntimeHandle {
     provider_volume_name: String,
 }
 
+/// Read-only association to the last committed terminal incarnation. This is
+/// deliberately not an OwnedRuntimeHandle and cannot authorize input or stop.
+pub(crate) struct RetainedOutputSource {
+    pub incarnation_id: IncarnationId,
+    pub runtime_dir: PathBuf,
+    pub terminal: TerminalLaunchSpec,
+    pub native_session_id: Option<String>,
+}
+
 impl OwnedRuntimeHandle {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_registry(
@@ -270,6 +282,7 @@ pub struct RecoveryContext {
     pub requested_limits: RuntimeLimits,
     pub accepted_command_count: u64,
     pub completed_command_count: u64,
+    pub dispatched_command_count: u64,
     pub never_dispatched: bool,
     pub recovery_window_started_at: Option<i64>,
     pub successful_recoveries_in_window: u64,
@@ -438,6 +451,7 @@ impl Registry {
                 }
                 let incarnation_id = IncarnationId::parse(incarnation_raw)
                     .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+                input_reservation::check_bound_reference(&tx, &input, &incarnation_id)?;
                 let row = load_prepared_row(&tx, &incarnation_id)?;
                 tx.commit()?;
                 return Ok(PreparedLaunch { existing_request: true, ..row });
@@ -520,6 +534,7 @@ impl Registry {
                 }
                 let incarnation_id = IncarnationId::parse(incarnation_raw)
                     .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+                input_reservation::check_bound_reference(&tx, &input, &incarnation_id)?;
                 tx.execute(
                     "INSERT INTO commands (soul_id,request_id,payload_digest,protected_payload_ref,state,provider_ack_id,incarnation_id,event_cursor,created_at,updated_at) VALUES (?1,?2,?3,NULL,'running',NULL,?4,0,?5,?5)",
                     params![input.soul_id.as_str(), input.request_id.as_str(), input.payload_digest, incarnation_id.as_str(), now],
@@ -542,6 +557,7 @@ impl Registry {
             }
 
             let incarnation_id = IncarnationId::new();
+            input_reservation::bind_in_transaction(&tx, &input, &incarnation_id)?;
             let launch_nonce = LaunchNonce::new();
             let limits_json = serde_json::to_string(&input.requested_limits)?;
             let terminal_json = input.terminal.as_ref().map(serde_json::to_string).transpose()?;
@@ -655,16 +671,52 @@ impl Registry {
     }
 
     pub async fn mark_running(&self, incarnation_id: IncarnationId) -> Result<(), RegistryError> {
+        self.mark_running_with_provider_preparation(incarnation_id, false)
+            .await
+    }
+
+    /// Initial/pristine acceptance is proved by the owning service. A resumed
+    /// generation is armed by the exact recovery-success transaction instead.
+    pub(crate) async fn mark_running_with_provider_preparation(
+        &self,
+        incarnation_id: IncarnationId,
+        preparation_accepted: bool,
+    ) -> Result<(), RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now_millis();
             let changed = tx.execute(
-                "UPDATE incarnations SET launch_state='running',updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
-                params![now, incarnation_id.as_str()],
+                "UPDATE incarnations SET launch_state='running',provider_preparation_pending=?3,updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
+                params![now, incarnation_id.as_str(), preparation_accepted],
             )?;
             if changed != 1 { return Err(RegistryError::InvalidState(format!("cannot mark RUNNING for {incarnation_id}"))); }
             tx.execute("UPDATE commands SET state='running',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
             tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn provider_preparation_is_pending(
+        &self,
+        incarnation: IncarnationId,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1 AND i.provider_preparation_pending=1 AND i.launch_state='running' AND s.desired_state='running' AND s.recovery_state='live')",
+                params![incarnation.as_str()], |row| row.get(0),
+            )?)
+        }).await
+    }
+
+    pub(crate) async fn mark_provider_preparation_complete(
+        &self,
+        incarnation: IncarnationId,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "UPDATE incarnations SET provider_preparation_pending=0 WHERE incarnation_id=?1 AND provider_preparation_pending=1",
+                params![incarnation.as_str()],
+            )?;
             Ok(())
         }).await
     }
@@ -676,6 +728,29 @@ impl Registry {
         let installation = self.installation_id().clone();
         self.run_blocking(move |conn| load_owned_handle(&conn, installation, &incarnation_id))
             .await
+    }
+
+    pub(crate) async fn prior_provider_owner(
+        &self,
+        incarnation: IncarnationId,
+    ) -> Result<Option<OwnedRuntimeHandle>, RegistryError> {
+        let installation = self.installation_id().clone();
+        self.run_blocking(move |conn| {
+            let prior: Option<String> = conn.query_row(
+                "SELECT prior_incarnation_id FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation.as_str()],
+                |row| row.get(0),
+            )?;
+            prior
+                .map(|raw| {
+                    let prior = IncarnationId::parse(raw).map_err(|_| {
+                        RegistryError::Integrity("invalid prior provider owner".into())
+                    })?;
+                    load_owned_handle(&conn, installation, &prior)
+                })
+                .transpose()
+        })
+        .await
     }
 
     pub async fn active_handle_for_soul(
@@ -695,6 +770,40 @@ impl Registry {
             let incarnation = IncarnationId::parse(raw)
                 .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
             load_owned_handle(&conn, installation, &incarnation)
+        })
+        .await
+    }
+
+    pub(crate) async fn retained_output_source(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<RetainedOutputSource, RegistryError> {
+        let installation = self.installation_id().clone();
+        self.run_blocking(move |mut conn| {
+            // Read one registry snapshot. Recovery's current control handle
+            // can be an unaccepted replacement; retained reads instead follow
+            // the last successful acceptance, independently of launch state.
+            let tx = conn.transaction()?;
+            let native_session_id: Option<String> = tx
+                .query_row(
+                    "SELECT native_session_id FROM souls WHERE soul_id=?1",
+                    [soul_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+            let incarnation_id = load_retained_incarnation(&tx, &soul_id)?;
+            let handle = load_owned_handle(&tx, installation, &incarnation_id)?;
+            let source = RetainedOutputSource {
+                incarnation_id,
+                runtime_dir: handle.runtime_dir().to_path_buf(),
+                terminal: handle.terminal().cloned().ok_or_else(|| {
+                    RegistryError::InvalidState("soul has no retained terminal".into())
+                })?,
+                native_session_id,
+            };
+            tx.commit()?;
+            Ok(source)
         })
         .await
     }
@@ -1245,8 +1354,42 @@ impl Registry {
     pub async fn store_verified_resume_spec(
         &self,
         soul_id: SoulId,
-        mut resume_spec: ResumeSpec,
+        resume_spec: ResumeSpec,
     ) -> Result<ResumeSpec, RegistryError> {
+        self.store_verified_resume_spec_inner(soul_id, resume_spec, None)
+            .await?
+            .ok_or_else(|| {
+                RegistryError::Integrity(
+                    "unfenced resume evidence update was unexpectedly superseded".into(),
+                )
+            })
+    }
+
+    /// Store provider-store evidence only if the incarnation and evidence
+    /// revision observed before the read are still current. An incarnation may
+    /// remain usable for a retry after its soul is blocked, including when a
+    /// failed cleanup left it stopping; `None` means its source or state changed.
+    pub async fn store_verified_resume_spec_for_live_incarnation(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        expected_evidence_revision: u64,
+        resume_spec: ResumeSpec,
+    ) -> Result<Option<ResumeSpec>, RegistryError> {
+        self.store_verified_resume_spec_inner(
+            soul_id,
+            resume_spec,
+            Some((incarnation_id, expected_evidence_revision)),
+        )
+        .await
+    }
+
+    async fn store_verified_resume_spec_inner(
+        &self,
+        soul_id: SoulId,
+        mut resume_spec: ResumeSpec,
+        expected_live_source: Option<(IncarnationId, u64)>,
+    ) -> Result<Option<ResumeSpec>, RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (provider, store, native, evidence, existing): (
@@ -1271,6 +1414,17 @@ impl Registry {
                 )
                 .optional()?
                 .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+            if let Some((incarnation_id, expected_revision)) = expected_live_source.as_ref() {
+                let current: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE s.soul_id=?1 AND i.incarnation_id=?2 AND (i.launch_state='running' OR (i.launch_state='stopping' AND s.recovery_state='blocked')) AND s.desired_state='running' AND s.recovery_state IN ('live','blocked') AND s.recovery_attempt_id IS NULL AND s.evidence_revision=?3)",
+                    params![soul_id.as_str(), incarnation_id.as_str(), expected_revision],
+                    |row| row.get(0),
+                )?;
+                if !current {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+            }
             if provider != resume_spec.provider_session.provider
                 || store != resume_spec.provider_session.provider_store_id
                 || native.as_deref() != Some(resume_spec.provider_session.native_session_id.as_str())
@@ -1288,7 +1442,7 @@ impl Registry {
                     && existing.durable_position == resume_spec.durable_position
                 {
                     tx.commit()?;
-                    return Ok(existing);
+                    return Ok(Some(existing));
                 }
             }
             let next_evidence = evidence
@@ -1314,7 +1468,7 @@ impl Registry {
                 ],
             )?;
             tx.commit()?;
-            Ok(resume_spec)
+            Ok(Some(resume_spec))
         })
         .await
     }
@@ -1410,12 +1564,14 @@ impl Registry {
                 return Err(RegistryError::RecoveryInProgress(soul_id));
             }
             let now = now_millis();
+            let persisted_reason: Option<String> = tx.query_row("SELECT recovery_reason FROM souls WHERE soul_id=?1", [soul_id.as_str()], |row| row.get(0))?;
+            let sticky_budget = matches!(persisted_reason.as_deref(), Some("RETRY_BUDGET" | "BLOCKED_RETRY_BUDGET"));
             let budget_available = freshell_agent_runtime::successful_recovery_budget_available(
                 context.recovery_window_started_at,
                 context.successful_recoveries_in_window,
                 now,
             );
-            if !budget_available && trigger != RecoveryTrigger::ManualRetry {
+            if (!budget_available || sticky_budget) && trigger != RecoveryTrigger::ManualRetry {
                 let reason = "BLOCKED_RETRY_BUDGET";
                 tx.execute(
                     "UPDATE souls SET recovery_state='blocked',recovery_reason=?1,updated_at=?2 WHERE soul_id=?3",
@@ -1427,7 +1583,7 @@ impl Registry {
                     reason: reason.into(),
                 });
             }
-            if !budget_available && trigger == RecoveryTrigger::ManualRetry {
+            if (!budget_available || sticky_budget) && trigger == RecoveryTrigger::ManualRetry {
                 // A deliberate user retry is the explicit rearm operation. It
                 // clears the persisted flap window but keeps identity/history
                 // intact and still runs through the same fenced transaction.
@@ -1458,6 +1614,20 @@ impl Registry {
             Ok(RecoveryStart { attempt_id, context })
         })
         .await
+    }
+
+    pub(crate) async fn validate_auth_lookup_attempt(
+        &self,
+        start: RecoveryStart,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |conn| {
+            let current:bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM souls WHERE soul_id=?1 AND desired_state='running' AND recovery_state='recovering' AND intent_revision=?2 AND recovery_attempt_id=?3)",
+                params![start.context.soul_id.as_str(),start.context.intent_revision,start.attempt_id.as_str()],
+                |row|row.get(0),
+            )?;
+            Ok(current)
+        }).await
     }
 
     pub async fn prepare_replacement(
@@ -1634,8 +1804,12 @@ impl Registry {
                 params![next_window, next_successes, now, soul_id.as_str()],
             )?;
             tx.execute(
-                "UPDATE recovery_attempts SET verdict='succeeded',finished_at=?1 WHERE attempt_id=?2",
-                params![now, attempt_id.as_str()],
+                "UPDATE recovery_attempts SET verdict='succeeded',finished_at=?1,evidence_ref=?3 WHERE attempt_id=?2",
+                params![now, attempt_id.as_str(), serde_json::to_string(&vec![format!("{ACCEPTED_INCARNATION_REF}{}", incarnation_id.as_str())])?],
+            )?;
+            tx.execute(
+                "UPDATE incarnations SET provider_preparation_pending=1 WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()],
             )?;
             tx.commit()?;
             Ok(())
@@ -1930,6 +2104,7 @@ fn create_schema(
             fresh_agent_spec TEXT,
             prior_incarnation_id TEXT,
             recovery_attempt_id TEXT,
+            provider_preparation_pending INTEGER NOT NULL DEFAULT 0,
             exit_code INTEGER,
             oom_killed INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
@@ -2103,6 +2278,7 @@ fn create_schema(
         CREATE TRIGGER view_intents_inventory_update AFTER UPDATE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
         CREATE TRIGGER view_intents_inventory_delete AFTER DELETE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
     "#))?;
+    input_reservation::create_table(&tx)?;
     tx.execute("INSERT INTO installation (singleton,installation_id,schema_version,control_epoch,inventory_revision,initial_scan_state) VALUES (1,?1,?2,0,0,'pending')", params![installation_id.as_str(), SCHEMA_VERSION])?;
     tx.execute(
         "INSERT INTO rollout_state (singleton,mode,updated_at) VALUES (1,'legacy',?1)",
@@ -2365,6 +2541,34 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.commit()?;
         schema = 7;
     }
+    if schema == 7 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        input_reservation::create_table(&tx)?;
+        tx.execute_batch("UPDATE installation SET schema_version=8 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 8;
+    }
+    if schema == 8 {
+        let add_provider = !column_exists(conn, "provider_input_preparations", "provider")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if add_provider {
+            tx.execute_batch("ALTER TABLE provider_input_preparations ADD COLUMN provider TEXT NOT NULL DEFAULT 'opencode';")?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=9 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 9;
+    }
+    if schema == 9 {
+        let add_pending = !column_exists(conn, "incarnations", "provider_preparation_pending")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if add_pending {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN provider_preparation_pending INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        // Legacy Running does not prove resumed native acceptance.
+        tx.execute_batch("UPDATE installation SET schema_version=10 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 10;
+    }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
             "unsupported older schema {schema}"
@@ -2417,6 +2621,80 @@ fn load_prepared_row(
         intent_revision: raw.3,
         existing_request: true,
     })
+}
+
+const ACCEPTED_INCARNATION_REF: &str = "accepted-incarnation://";
+
+fn load_retained_incarnation(
+    conn: &Connection,
+    soul_id: &SoulId,
+) -> Result<IncarnationId, RegistryError> {
+    type AcceptedAttempt = (String, String, Option<String>, i64, i64);
+    let accepted: Option<AcceptedAttempt> = conn.query_row(
+        "SELECT attempt_id,prior_incarnation_id,evidence_ref,started_at,finished_at FROM recovery_attempts WHERE soul_id=?1 AND verdict='succeeded' AND finished_at IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+        [soul_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    let candidates = if let Some((attempt, prior, evidence, started, finished)) = accepted {
+        let exact = evidence
+            .map(|value| serde_json::from_str::<Vec<String>>(&value))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|value| {
+                value
+                    .strip_prefix(ACCEPTED_INCARNATION_REF)
+                    .map(str::to_owned)
+            });
+        if let Some(exact) = exact {
+            let belongs: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incarnations WHERE incarnation_id=?1 AND soul_id=?2 AND prior_incarnation_id=?3)",
+                params![exact, soul_id.as_str(), prior], |row| row.get(0),
+            )?;
+            if !belongs {
+                return Err(RegistryError::Integrity(
+                    "accepted retained incarnation relationship is missing".into(),
+                ));
+            }
+            vec![exact]
+        } else {
+            // Older success rows lack the acceptance reference. Their original
+            // attempt link is sufficient when preserved. begin_recovery can
+            // overwrite that link on the accepted prior, so otherwise require
+            // one child created within this successful attempt's interval.
+            // Spool existence and current launch state are never acceptance.
+            let mut stmt = conn.prepare("SELECT incarnation_id FROM incarnations WHERE soul_id=?1 AND prior_incarnation_id=?2 AND recovery_attempt_id=?3")?;
+            let linked = stmt
+                .query_map(params![soul_id.as_str(), prior, attempt], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if linked.is_empty() {
+                let mut stmt = conn.prepare("SELECT incarnation_id FROM incarnations WHERE soul_id=?1 AND prior_incarnation_id=?2 AND created_at BETWEEN ?3 AND ?4")?;
+                let candidates = stmt
+                    .query_map(params![soul_id.as_str(), prior, started, finished], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                candidates
+            } else {
+                linked
+            }
+        }
+    } else {
+        let mut stmt = conn.prepare("SELECT incarnation_id FROM incarnations WHERE soul_id=?1 AND prior_incarnation_id IS NULL")?;
+        let candidates = stmt
+            .query_map([soul_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        candidates
+    };
+    let [raw] = candidates.as_slice() else {
+        return Err(RegistryError::InvalidState(
+            "retained output acceptance is missing or ambiguous; preserve runtime data and inspect the successful recovery attempt".into(),
+        ));
+    };
+    IncarnationId::parse(raw.clone())
+        .map_err(|_| RegistryError::Integrity("invalid retained incarnation id".into()))
 }
 
 pub(crate) fn load_owned_handle(
@@ -2558,7 +2836,17 @@ fn load_recovery_context(
         .11
         .map(|value| serde_json::from_str(&value))
         .transpose()?;
-    let never_dispatched = dispatched_count == 0 && row.2.is_none();
+    // Coding providers may create a conversation while handling the initial
+    // execution grant, before an input row or native-ID acknowledgement exists.
+    // Only the existing settled rejection transaction proves an issued grant
+    // was unconsumed. Shell has no implicit provider initialization turn.
+    let requires_native = freshell_agent_runtime::recovery_paths(&row.0)
+        .is_some_and(|paths| paths.contains(&RecoveryPath::NativeResume));
+    let initialization_uncertain: bool = requires_native && conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM incarnations i WHERE i.soul_id=?1 AND i.grant_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=i.incarnation_id AND c.state='provider_inputs_changed'))",
+        [soul_id.as_str()], |row| row.get(0),
+    )?;
+    let never_dispatched = dispatched_count == 0 && row.2.is_none() && !initialization_uncertain;
     Ok(RecoveryContext {
         soul_id: soul_id.clone(),
         provider: row.0,
@@ -2585,6 +2873,7 @@ fn load_recovery_context(
             .unwrap_or_else(|| prior_handle.requested_limits()),
         accepted_command_count,
         completed_command_count,
+        dispatched_command_count: dispatched_count,
         never_dispatched,
         recovery_window_started_at: row.14,
         successful_recoveries_in_window: row.15,
@@ -2819,6 +3108,146 @@ pub(crate) fn failpoint(_name: &'static str) -> Result<(), RegistryError> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn recovery_initialization_grant_before_identity_is_not_pristine() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let mut launch = prep(soul.clone(), RequestId::new(), "startup");
+        launch.provider = "opencode".into();
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "a".repeat(64),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: dir.path().join("runtime"),
+                    host_binary_path: dir.path().join("host"),
+                    immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .never_dispatched
+        );
+        registry
+            .commit_execution_grant(prepared.incarnation_id, HostBootId::new(), limits())
+            .await
+            .unwrap();
+        let ctx = registry.recovery_context(soul).await.unwrap();
+        assert!(ctx.native_session_id.is_none());
+        assert_eq!(ctx.accepted_command_count, 0);
+        assert!(!ctx.never_dispatched, "an issued initialization grant has uncertain provider execution even before input/native-ID capture");
+    }
+
+    #[tokio::test]
+    async fn recovery_five_natural_successes_exhaust_durable_budget_until_manual_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        materialize_test_runtime(&registry, soul.clone()).await;
+        for expected in 1..=5 {
+            let start = registry
+                .begin_recovery(
+                    soul.clone(),
+                    RecoveryTrigger::ProviderExit,
+                    RecoveryPath::PristineSeed,
+                )
+                .await
+                .unwrap();
+            registry
+                .mark_stop_outcome(
+                    start.context.prior_handle.incarnation_id().clone(),
+                    StopOutcome::VerifiedEmpty,
+                )
+                .await
+                .unwrap();
+            let attempt = start.attempt_id.clone();
+            let replacement = registry
+                .prepare_replacement(start, None, None, None, RecoveryPath::PristineSeed)
+                .await
+                .unwrap();
+            let id = replacement.prepared.incarnation_id.clone();
+            registry
+                .commit_created(
+                    id.clone(),
+                    BackendCreatedRecord {
+                        daemon_id: DockerDaemonId::new(),
+                        container_id: format!("{expected:064x}"),
+                        image_ref: format!("sha256:{}", "b".repeat(64)),
+                        runtime_dir: dir.path().join(format!("runtime-{expected}")),
+                        host_binary_path: dir.path().join("host"),
+                        immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                    },
+                )
+                .await
+                .unwrap();
+            registry
+                .commit_execution_grant(id.clone(), HostBootId::new(), limits())
+                .await
+                .unwrap();
+            registry.mark_running(id.clone()).await.unwrap();
+            registry
+                .mark_recovery_success(soul.clone(), id, attempt)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap()
+                    .successful_recoveries_in_window,
+                expected
+            );
+        }
+        assert!(matches!(
+            registry
+                .begin_recovery(
+                    soul.clone(),
+                    RecoveryTrigger::ProviderExit,
+                    RecoveryPath::PristineSeed
+                )
+                .await,
+            Err(RegistryError::RecoveryBlocked { .. })
+        ));
+        drop(registry);
+        let cold = Registry::open(dir.path(), None).unwrap();
+        assert!(matches!(
+            cold.begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::StartupReconcile,
+                RecoveryPath::PristineSeed
+            )
+            .await,
+            Err(RegistryError::RecoveryBlocked { .. })
+        ));
+        let manual = cold
+            .begin_recovery(
+                soul,
+                RecoveryTrigger::ManualRetry,
+                RecoveryPath::PristineSeed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manual.context.successful_recoveries_in_window, 5,
+            "pre-rearm context preserves history"
+        );
+        assert_eq!(
+            cold.recovery_context(manual.context.soul_id)
+                .await
+                .unwrap()
+                .successful_recoveries_in_window,
+            0
+        );
+    }
     use super::*;
 
     fn limits() -> RuntimeLimits {
@@ -2848,6 +3277,439 @@ mod tests {
             view_intent: None,
             admission: AdmissionPolicy::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn provider_preparation_migration_preserves_unproved_running_and_accepted_pending_state()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let registry = Registry::open(&root, None).unwrap();
+        let prepared = registry
+            .prepare_launch(prep(SoulId::new(), RequestId::new(), "pending"))
+            .await
+            .unwrap();
+        let id = prepared.incarnation_id.clone();
+        let conn = Connection::open(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET launch_state='running' WHERE incarnation_id=?1",
+            params![id.as_str()],
+        )
+        .unwrap();
+        assert!(
+            !registry
+                .provider_preparation_is_pending(id.clone())
+                .await
+                .unwrap(),
+            "generic Running has no native acceptance proof"
+        );
+        conn.execute_batch("ALTER TABLE incarnations DROP COLUMN provider_preparation_pending; UPDATE installation SET schema_version=9;").unwrap();
+        drop(conn);
+        drop(registry);
+        let migrated = Registry::open(&root, None).unwrap();
+        assert!(
+            !migrated
+                .provider_preparation_is_pending(id.clone())
+                .await
+                .unwrap(),
+            "legacy Running remains uncertain after migration"
+        );
+        let conn = Connection::open(&migrated.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET launch_state='starting' WHERE incarnation_id=?1",
+            params![id.as_str()],
+        )
+        .unwrap();
+        migrated
+            .mark_running_with_provider_preparation(id.clone(), true)
+            .await
+            .unwrap();
+        assert!(migrated
+            .provider_preparation_is_pending(id.clone())
+            .await
+            .unwrap());
+        // Idempotent upgrades preserve a real previously accepted pending proof.
+        conn.execute_batch("UPDATE installation SET schema_version=9;")
+            .unwrap();
+        drop(conn);
+        drop(migrated);
+        let reopened = Registry::open(&root, None).unwrap();
+        assert!(reopened
+            .provider_preparation_is_pending(id.clone())
+            .await
+            .unwrap());
+        reopened
+            .mark_provider_preparation_complete(id.clone())
+            .await
+            .unwrap();
+        assert!(!reopened.provider_preparation_is_pending(id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn provider_initial_reservation_migration_retains_legacy_opencode_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("synthetic-host");
+        std::fs::write(&binary, "synthetic artifact").unwrap();
+        let root = dir.path().join("registry");
+        let registry = Registry::open(&root, None).unwrap();
+        let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+            expected_control_epoch: None,
+            soul_id: SoulId::new(),
+            provider: "opencode".into(),
+            creation_seed_ref: "seed".into(),
+        };
+        let image = format!("sha256:{}", "a".repeat(64));
+        let reservation = registry
+            .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+            .await
+            .unwrap();
+        let observation = freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+            daemon_id: DockerDaemonId::new(),
+        };
+        let expected = registry
+            .record_initial_observation(reservation, observation.clone())
+            .await
+            .unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute_batch("ALTER TABLE provider_input_preparations DROP COLUMN provider; UPDATE installation SET schema_version=8;").unwrap();
+        drop(conn);
+        drop(registry);
+        let restored = Registry::open(&root, None).unwrap();
+        let reservation = restored
+            .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .record_initial_observation(reservation, observation)
+                .await
+                .unwrap(),
+            expected
+        );
+        let mut changed = request;
+        changed.provider = "codex".into();
+        assert!(
+            matches!(
+                restored
+                    .reserve_initial_inputs(changed, image, binary)
+                    .await,
+                Err(RegistryError::RequestConflict)
+            ),
+            "legacy OpenCode reservations retain exact provider identity on reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_kilroy_ordinary_authority_cannot_bind_the_other_claude_flavor() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("synthetic-host");
+        std::fs::write(&binary, "synthetic artifact").unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+            expected_control_epoch: Some(registry.control_epoch()),
+            soul_id: soul.clone(),
+            provider: "kilroy".into(),
+            creation_seed_ref: "seed".into(),
+        };
+        let reservation = registry
+            .reserve_initial_inputs(
+                request.clone(),
+                format!("sha256:{}", "a".repeat(64)),
+                binary.clone(),
+            )
+            .await
+            .expect("the existing Kilroy flavor requires its distinct creation authority");
+        let mut wrong = request;
+        wrong.provider = "claude".into();
+        assert!(matches!(
+            registry
+                .reserve_initial_inputs(wrong, format!("sha256:{}", "a".repeat(64)), binary)
+                .await,
+            Err(RegistryError::RequestConflict)
+        ));
+        let receipt = registry
+            .record_initial_observation(
+                reservation,
+                freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                    daemon_id: DockerDaemonId::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.provider, "kilroy");
+        let mut launch = prep(soul, RequestId::new(), "kilroy-owned-inputs");
+        launch.provider = "kilroy".into();
+        launch.terminal = None;
+        launch.fresh_agent = Some(serde_json::from_value(serde_json::json!({
+            "sessionId":"synthetic-fresh", "provider":"kilroy", "sessionType":"kilroy",
+            "runtimeVariant":"kilroy-claude-agent-sdk", "providerStoreId":"test-store",
+            "cwd":"/synthetic/workspace", "workspacePath":"/synthetic/workspace", "runAsUid":65534,"runAsGid":0,
+            "providerLaunchContext": {
+                "preparation":{"claude":{"mcp_args":[]}},
+                "mcpCapability":{"grantId":"grant-ordinary", "endpoint":"http://host.docker.internal:3001/api/mcp", "providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":"grant-ordinary", "initialAuthReservation":receipt.reservation_id,
+                    "manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            }
+        })).unwrap());
+        let mut other = launch.clone();
+        other.provider = "claude".into();
+        let fresh = other.fresh_agent.as_mut().unwrap();
+        fresh.provider = freshell_runtime_protocol::FreshProvider::Claude;
+        fresh.session_type = "freshclaude".into();
+        fresh.runtime_variant = "claude-agent-sdk".into();
+        assert!(matches!(
+            registry.prepare_launch(other).await,
+            Err(RegistryError::RequestConflict)
+        ));
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        let bound = registry
+            .bound_input_reservation(prepared.incarnation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.reservation.provider, "kilroy");
+    }
+
+    #[tokio::test]
+    async fn provider_ordinary_initial_reservation_preserves_provider_identity() {
+        for provider in ["codex", "claude", "amplifier"] {
+            for native_session_id in [None, Some("fixture-native-session".to_string())] {
+                let dir = tempfile::tempdir().unwrap();
+                let binary = dir.path().join("synthetic-host");
+                std::fs::write(&binary, "synthetic artifact").unwrap();
+                let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+                let soul = SoulId::new();
+                let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+                    expected_control_epoch: Some(registry.control_epoch()),
+                    soul_id: soul.clone(),
+                    provider: provider.into(),
+                    creation_seed_ref: "seed".into(),
+                };
+                let image = format!("sha256:{}", "a".repeat(64));
+                let reserved = registry
+                    .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+                    .await
+                    .expect(
+                        "ordinary selected inputs require their own provider's creation authority",
+                    );
+                let retry = registry
+                    .reserve_initial_inputs(request.clone(), image.clone(), binary.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(reserved.id, retry.id);
+                let mut foreign = request.clone();
+                foreign.provider = "opencode".into();
+                assert!(matches!(
+                    registry
+                        .reserve_initial_inputs(foreign, image, binary)
+                        .await,
+                    Err(RegistryError::RequestConflict)
+                ));
+                let receipt = registry
+                    .record_initial_observation(
+                        reserved,
+                        freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                            daemon_id: DockerDaemonId::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.provider, provider);
+                let mut launch = prep(soul.clone(), RequestId::new(), "ordinary-reserved-inputs");
+                launch.provider = provider.into();
+                launch.native_session_id = native_session_id.clone();
+                // Reservation binding protects actual workload preparation, regardless
+                // of which finite provider's selected ordinary resources it owns.
+                launch.terminal = Some(serde_json::from_value(serde_json::json!({
+                "terminalId":"synthetic-terminal", "streamId":"synthetic-stream", "projectKey":"test-project", "mode":provider,
+                "program":provider,"args":[],"env":{},"resumeSessionId":native_session_id, "cwd":"/synthetic/workspace",
+                "workspacePath":"/synthetic/workspace","cols":80,"rows":24,"runAsUid":65534,"runAsGid":0,
+                "providerLaunchContext": {
+                    "preparation":match provider {
+                        "codex" => serde_json::json!({"codex":{"tui_args":[],"sidecar_args":[]}}),
+                        "claude" => serde_json::json!({"claude":{"mcp_args":[]}}),
+                        "amplifier" => serde_json::json!({"amplifier":{"bundle":"default","resume_args":[]}}),
+                        _ => unreachable!(),
+                    },
+                    "mcpCapability":{"grantId":"grant-ordinary", "endpoint":"http://host.docker.internal:3001/api/mcp", "providerRelativePath":".freshell/mcp-capability.json"},
+                    "preparedInputs":{"generationId":"grant-ordinary", "initialAuthReservation":receipt.reservation_id,
+                        "manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
+                }
+            })).unwrap());
+                let mut wrong = launch.clone();
+                wrong.provider = "opencode".into();
+                let workload = wrong.terminal.as_mut().unwrap();
+                workload.mode = "opencode".into();
+                workload
+                    .provider_launch_context
+                    .as_mut()
+                    .unwrap()
+                    .preparation = freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    project_config: vec![],
+                    tui_config: None,
+                    tui_source: None,
+                    inline_config: false,
+                };
+                let wrong_result = registry.prepare_launch(wrong.clone()).await;
+                assert!(
+                    matches!(wrong_result, Err(RegistryError::RequestConflict)),
+                    "foreign provider bind outcome: {wrong_result:?}"
+                );
+                let prepared = registry.prepare_launch(launch.clone()).await.unwrap();
+                assert_eq!(
+                    registry
+                        .prepare_launch(launch.clone())
+                        .await
+                        .unwrap()
+                        .incarnation_id,
+                    prepared.incarnation_id
+                );
+                assert!(matches!(registry.prepare_launch(wrong).await, Err(RegistryError::RequestConflict)),
+                "a bound reservation retry cannot change provider even when its caller reuses the payload digest");
+                let mut changed_seed = launch;
+                changed_seed.creation_seed_ref = "changed-creation-seed".into();
+                assert!(
+                    matches!(
+                        registry.prepare_launch(changed_seed).await,
+                        Err(RegistryError::RequestConflict)
+                    ),
+                    "a bound reservation retry cannot change its creation seed"
+                );
+                let bound = registry
+                    .bound_input_reservation(prepared.incarnation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(bound.reservation.soul_id, soul);
+                assert!(registry
+                    .initial_input_reservation(soul, receipt.reservation_id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_initial_input_reservation_binds_to_first_prepared_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("synthetic-host");
+        std::fs::write(&binary, "synthetic artifact").unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let reserved = registry
+            .reserve_initial_inputs(
+                freshell_runtime_protocol::ReserveProviderInputsRequest {
+                    expected_control_epoch: Some(registry.control_epoch()),
+                    soul_id: soul.clone(),
+                    provider: "opencode".into(),
+                    creation_seed_ref: "seed".into(),
+                },
+                format!("sha256:{}", "a".repeat(64)),
+                binary,
+            )
+            .await
+            .unwrap();
+        let observation = freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+            daemon_id: DockerDaemonId::new(),
+        };
+        let receipt = registry
+            .record_initial_observation(reserved.clone(), observation.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .record_initial_observation(reserved.clone(), observation)
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert!(
+            registry
+                .record_initial_observation(
+                    reserved,
+                    freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                        daemon_id: DockerDaemonId::new()
+                    }
+                )
+                .await
+                .is_err(),
+            "a repeated reserve cannot overwrite the original daemon observation"
+        );
+        let mut launch = prep(soul.clone(), RequestId::new(), "reserved-inputs");
+        launch.provider = "opencode".into();
+        launch.fresh_agent = Some(serde_json::from_value(serde_json::json!({
+            "sessionId":"synthetic-session", "provider":"opencode", "sessionType":"freshopencode",
+            "runtimeVariant":"opencode", "providerStoreId":"store", "cwd":"/synthetic/workspace",
+            "workspacePath":"/synthetic/workspace", "runAsUid":65534, "runAsGid":0,
+            "providerLaunchContext": {
+                "preparation":{"opencode":{"project_config":[],"tui_config":null}},
+                "mcpCapability":{"grantId":"grant-reservation", "endpoint":"http://host.docker.internal:3001/api/mcp",
+                    "providerRelativePath":".config/opencode/freshell-mcp.json"},
+                "preparedInputs":{"generationId":"grant-reservation", "initialAuthReservation":receipt.reservation_id,
+                    "manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),
+                        "sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            }
+        })).expect("the complete prepared context must carry its initial auth reservation"));
+        let mut existing_native = launch.clone();
+        existing_native.native_session_id = Some("preexisting-opencode-session".into());
+        assert!(
+            matches!(
+                registry.prepare_launch(existing_native).await,
+                Err(RegistryError::RequestConflict)
+            ),
+            "OpenCode initial native-auth authority must remain identity-free"
+        );
+        let first = registry.prepare_launch(launch.clone()).await.unwrap();
+        let replay = registry.prepare_launch(launch.clone()).await.unwrap();
+        assert_eq!(first.incarnation_id, replay.incarnation_id);
+        assert!(
+            registry
+                .bound_input_reservation(first.incarnation_id.clone())
+                .await
+                .unwrap()
+                .is_some(),
+            "creation authority remains available after the soul row is created"
+        );
+        assert!(registry
+            .bound_input_reservation(IncarnationId::new())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            registry
+                .initial_input_reservation(soul.clone(), receipt.reservation_id.clone())
+                .await
+                .unwrap()
+                .is_none(),
+            "bound authority must no longer be reusable for a pre-soul absence lookup"
+        );
+        launch
+            .fresh_agent
+            .as_mut()
+            .unwrap()
+            .provider_launch_context
+            .as_mut()
+            .unwrap()
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .initial_auth_reservation = None;
+        assert!(matches!(registry.prepare_launch(launch).await,Err(RegistryError::RequestConflict)),
+            "a pending retry cannot remove or swap creation authority even with the same semantic digest");
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let consumed: i64 = conn
+            .query_row(
+                "SELECT consumed FROM provider_input_preparations WHERE soul_id=?1",
+                params![soul.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            consumed, 1,
+            "preparing the workload must atomically bind, not leave reusable pre-soul authority"
+        );
     }
 
     async fn materialize_test_runtime(registry: &Registry, soul_id: SoulId) -> PreparedLaunch {
@@ -3044,11 +3906,13 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: keys.to_string_lossy().into_owned(),
                 profile:
                     freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
             provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation: freshell_runtime_protocol::ProviderPreparation::Amplifier {
                     bundle: "default".into(),
                     resume_args: Vec::new(),
@@ -3157,6 +4021,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                prepared_inputs: None,
                 preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
                     project_config: Vec::new(),
                     tui_config: None,
@@ -3692,6 +4557,133 @@ mod tests {
         assert_eq!(state, "recovering");
         assert_eq!(count, 0);
         assert_eq!(native, None);
+    }
+
+    #[tokio::test]
+    async fn live_resume_evidence_rejects_superseded_incarnation_and_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_test_runtime(&registry, soul.clone()).await;
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='opencode',native_session_id='exact-session' WHERE soul_id=?1",
+            params![soul.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut delayed = crate::checkpoints::tests::spec("opencode");
+        delayed.durable_position.provider_cursor = Some("older-position".into());
+        let mut newer = delayed.clone();
+        newer.durable_position.provider_cursor = Some("newer-position".into());
+
+        let first = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                0,
+                delayed.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("the initial live incarnation and evidence revision are current");
+        assert_eq!(first.evidence_revision, 1);
+
+        let wrong_incarnation = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                IncarnationId::new(),
+                first.evidence_revision,
+                delayed.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_incarnation.is_none(),
+            "a probe from another incarnation cannot publish evidence"
+        );
+
+        registry
+            .mark_stop_outcome(
+                prepared.incarnation_id.clone(),
+                StopOutcome::TerminationUnconfirmed,
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_recovery_blocked(
+                soul.clone(),
+                None,
+                RecoveryBlockReason::ProviderUnavailable,
+                vec!["synthetic provider store outage".into()],
+            )
+            .await
+            .unwrap();
+        let newer = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                first.evidence_revision,
+                newer,
+            )
+            .await
+            .unwrap()
+            .expect("a retry can publish evidence after blocked cleanup of the same incarnation");
+        assert_eq!(
+            newer.durable_position.provider_cursor.as_deref(),
+            Some("newer-position")
+        );
+
+        let late = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                0,
+                delayed.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(late.is_none(), "a late probe cannot replace newer evidence");
+
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let retained = context.resume_spec.expect("newer evidence remains saved");
+        assert_eq!(retained.evidence_revision, newer.evidence_revision);
+        assert_eq!(
+            retained.durable_position.provider_cursor.as_deref(),
+            Some("newer-position")
+        );
+
+        let start = registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        let during_recovery = registry
+            .store_verified_resume_spec_for_live_incarnation(
+                soul.clone(),
+                start.context.prior_handle.incarnation_id().clone(),
+                newer.evidence_revision,
+                delayed,
+            )
+            .await
+            .unwrap();
+        assert!(
+            during_recovery.is_none(),
+            "an active recovery attempt cannot publish proof"
+        );
+        let final_context = registry.recovery_context(soul).await.unwrap();
+        assert_eq!(final_context.recovery_state, RecoveryState::Recovering);
+        assert_eq!(
+            final_context
+                .resume_spec
+                .as_ref()
+                .and_then(|spec| spec.durable_position.provider_cursor.as_deref()),
+            Some("newer-position")
+        );
     }
 
     #[tokio::test]

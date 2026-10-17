@@ -87,6 +87,95 @@ const SESSION_TYPE: &str = "freshopencode";
 const PROVIDER: &str = "opencode";
 /// `DEFAULT_TURN_TIMEOUT_MS` (`adapter.ts:35`).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_millis(600_000);
+/// OpenCode may publish a prompt response before `/session/:id/message` reflects it.
+/// Keep reconciliation to one initial read plus three short retries.
+const CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS: usize = 4;
+const CHECKPOINT_IDENTITY_HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const CHECKPOINT_IDENTITY_HISTORY_RETRY_DELAY: Duration = Duration::from_millis(75);
+
+#[derive(Clone, Debug)]
+struct CheckpointTurnIdentity {
+    logical_attempt_id: String,
+    request_id: String,
+    native_message_id: String,
+}
+
+/// Derive a stable OpenCode-native message ID only for a modern attempt with a
+/// valid v4 logical identity and request correlation. The same ID is regenerated
+/// when a send waits behind compact, so queue/drain preserves the exact identity.
+fn checkpoint_turn_identity(send: &FreshAgentSend) -> Option<CheckpointTurnIdentity> {
+    let intent = send.checkpoint_intent.as_ref()?;
+    let logical_attempt_id = intent.logical_attempt_id.trim();
+    if logical_attempt_id.is_empty() {
+        return None;
+    }
+    let request_id = send
+        .request_id
+        .as_deref()
+        .filter(|request_id| !request_id.trim().is_empty())?;
+    Some(CheckpointTurnIdentity {
+        logical_attempt_id: logical_attempt_id.to_string(),
+        request_id: request_id.to_string(),
+        // The client currently uses a 21-character URL-safe nanoid for logical
+        // attempts. Hash that stable value into OpenCode's native message-ID shape;
+        // do not constrain the protocol correlation to UUID syntax.
+        native_message_id: format!(
+            "msg_{}",
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, logical_attempt_id.as_bytes()).simple()
+        ),
+    })
+}
+
+/// Observe the native user row for a checkpointed OpenCode send. History reads are
+/// read-only and no session lock is held here; cancelling this future drops only the
+/// current GET or retry delay. No receipt is emitted unless one bounded read confirms
+/// the exact native id on exactly one role=user row.
+async fn observe_checkpoint_turn_identity(
+    manager: &OpencodeServeManager,
+    session_id: &str,
+    route: &Option<String>,
+    identity: &CheckpointTurnIdentity,
+) -> Option<String> {
+    let mut last_failure = None;
+    for attempt in 1..=CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS {
+        let read = tokio::time::timeout(
+            CHECKPOINT_IDENTITY_HISTORY_REQUEST_TIMEOUT,
+            manager.list_messages(session_id, route),
+        )
+        .await;
+        match read {
+            Ok(Ok(messages)) => {
+                if let Some(native_id) = freshell_opencode::observed_user_message_id(
+                    &messages,
+                    &identity.native_message_id,
+                ) {
+                    return Some(native_id);
+                }
+                last_failure = Some("matching role=user row is not visible yet".to_string());
+            }
+            Ok(Err(error)) => last_failure = Some(error.to_string()),
+            Err(_) => {
+                last_failure = Some(format!(
+                    "message-history read exceeded {}ms",
+                    CHECKPOINT_IDENTITY_HISTORY_REQUEST_TIMEOUT.as_millis()
+                ));
+            }
+        }
+
+        if attempt < CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS {
+            tokio::time::sleep(CHECKPOINT_IDENTITY_HISTORY_RETRY_DELAY).await;
+        }
+    }
+
+    tracing::warn!(target: "freshell_freshagent::opencode",
+        session_id,
+        request_id = %identity.request_id,
+        logical_attempt_id = %identity.logical_attempt_id,
+        attempts = CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS,
+        error = last_failure.as_deref().unwrap_or("history row was not observed"),
+        "checkpoint_turn_identity_unobserved");
+    None
+}
 
 /// Shared, cheaply-cloneable freshopencode WS state (mergeable into `WsState`).
 #[derive(Clone)]
@@ -1135,6 +1224,41 @@ impl FreshOpencodeState {
         self.fresh_agent.broadcast(msg);
     }
 
+    async fn broadcast_materialized(&self, msg: &ServerMessage) {
+        if let Ok(frame) = serde_json::to_string(msg) {
+            if let Err(error) = self
+                .fresh_agent
+                .persist_checkpoint_frame(&frame, false)
+                .await
+            {
+                tracing::error!(target: "freshell_freshagent::opencode",
+                    cause = %error,
+                    "freshagent.opencode.checkpoint_alias_persist_failed"
+                );
+            }
+        }
+        self.broadcast(msg);
+    }
+
+    async fn broadcast_checkpoint_frame(&self, msg: &ServerMessage) {
+        let Ok(frame) = serde_json::to_string(msg) else {
+            tracing::error!(target: "freshell_freshagent::opencode",
+                "freshagent.opencode.checkpoint_identity_serialize_failed"
+            );
+            return;
+        };
+        if let Err(error) = self
+            .fresh_agent
+            .broadcast_checkpoint_frame(frame, true)
+            .await
+        {
+            tracing::error!(target: "freshell_freshagent::opencode",
+                cause = %error,
+                "freshagent.opencode.checkpoint_identity_persist_failed"
+            );
+        }
+    }
+
     /// The shared P1.13 binding-row write (materialization row, settings refresh,
     /// resume refresh, forked child): AWAITED (durable-before-answer), and a write
     /// failure surfaces as a user-visible `LEDGER_WRITE_FAILED` `freshAgent.error`
@@ -1261,6 +1385,7 @@ impl FreshOpencodeState {
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
@@ -2009,6 +2134,39 @@ impl FreshOpencodeState {
                 }
             };
 
+        // The checkpoint workspace barrier can park this request before it
+        // reaches the provider lane. For an already-materialized session, arm
+        // against its captured owner pair only after this session lock is held,
+        // so an old send cannot be redirected to a reattached owner of the same
+        // durable id. A first send to a placeholder still uses the materialize
+        // claim below; a queued send releases this guard here and the drain
+        // re-arms it immediately before dispatch.
+        let mut checkpoint_send_guard =
+            if msg.checkpoint_intent.is_some() && session.real_session_id.is_some() {
+                let owner_key = self.resolve_ownership_key(&session_id);
+                match crate::ownership_lane::arm_reclaimless_op_guard(
+                    &self.fresh_agent.ownership,
+                    PROVIDER,
+                    &owner_key,
+                    &format!("send-{}", uuid::Uuid::new_v4()),
+                    send_fence,
+                    "freshopencode/send",
+                ) {
+                    crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                    crate::ownership_lane::LaneOpGuard::Unwired => None,
+                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                        drop(session);
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, request_id = ?request_id,
+                        "fresh_agent_send_refused: checkpoint ownership guard refused");
+                        self.send_error(&request_id, "SESSION_RESERVED", &message);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
         // send-during-compact queue: a send arriving while a COMPACT is in
         // flight — including the compact's settling tail (the tail is
         // still the compact's FIFO turn; Task 3's settling-flag gate
@@ -2034,6 +2192,7 @@ impl FreshOpencodeState {
                 .real_session_id
                 .clone()
                 .unwrap_or_else(|| session.placeholder_id.clone());
+            drop(checkpoint_send_guard.take());
             self.broadcast_send_accepted(&real_id, &msg.request_id, &session.cwd);
             session.pending_sends.push_back(msg.clone());
             tracing::warn!(target: "freshell_freshagent::opencode",
@@ -2053,13 +2212,14 @@ impl FreshOpencodeState {
             return;
         }
 
+        let op_guard = checkpoint_send_guard.take();
         self.send_locked(
             &session_arc,
             &mut session,
             msg,
             session_id,
             send_fence,
-            None,
+            op_guard,
             false,
         )
         .await;
@@ -2091,6 +2251,7 @@ impl FreshOpencodeState {
         already_accepted: bool,
     ) {
         let request_id = msg.request_id.clone();
+        let checkpoint_identity = checkpoint_turn_identity(&msg);
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
         // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and
         // the serve-stream bridge flips `turn_errored` if the turn reports an error.
@@ -2457,12 +2618,13 @@ impl FreshOpencodeState {
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&materialized_frame(
+            self.broadcast_materialized(&materialized_frame(
                 &session.placeholder_id,
                 &durable_id,
                 name_ref,
                 session_name,
-            ));
+            ))
+            .await;
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
@@ -2634,16 +2796,36 @@ impl FreshOpencodeState {
             // settled outcome below (or a confirmed abort) may disarm it.
             let mut op_guard = op_guard; // Option<AttachGuard>, owned here
             let dispatch_witness = prompt_dispatched.clone();
-            let mut turn_fut = Box::pin(manager.run_turn(
-                &real_id,
-                &text,
-                model.as_deref(),
-                effort.as_deref(),
-                DEFAULT_TURN_TIMEOUT,
-                route.clone(),
-                Some(daemon_turn_accepted.clone()),
-                Some(dispatch_witness),
-            ));
+            let mut turn_fut = Box::pin(async {
+                if let Some(identity) = checkpoint_identity.as_ref() {
+                    manager
+                        .run_turn_with_message_id(
+                            &real_id,
+                            &text,
+                            model.as_deref(),
+                            effort.as_deref(),
+                            Some(&identity.native_message_id),
+                            DEFAULT_TURN_TIMEOUT,
+                            route.clone(),
+                            Some(daemon_turn_accepted.clone()),
+                            Some(dispatch_witness),
+                        )
+                        .await
+                } else {
+                    manager
+                        .run_turn(
+                            &real_id,
+                            &text,
+                            model.as_deref(),
+                            effort.as_deref(),
+                            DEFAULT_TURN_TIMEOUT,
+                            route.clone(),
+                            Some(daemon_turn_accepted.clone()),
+                            Some(dispatch_witness),
+                        )
+                        .await
+                }
+            });
             // The compact drive's own guard-release discipline: race the
             // fresh dispatch witness against the drive. The guard releases
             // at the DISPATCH boundary — the prompt POST's request leg —
@@ -2683,6 +2865,29 @@ impl FreshOpencodeState {
                 // (fail closed: the stop path would rather issue one redundant
                 // abort than miss a live daemon-side writer).
                 Err(_) => {}
+            }
+
+            // A prompt ID is only a candidate until provider history shows that exact
+            // ID on a role=user row. Observe after dispatch; never join by text/order.
+            if prompt_dispatched.load(Ordering::SeqCst) {
+                if let Some(identity) = checkpoint_identity.as_ref() {
+                    if let Some(native_id) =
+                        observe_checkpoint_turn_identity(&manager, &real_id, &route, identity).await
+                    {
+                        this.broadcast_checkpoint_frame(&event_frame(
+                            &real_id,
+                            json!({
+                                "type": "checkpointTurnIdentity",
+                                "logicalAttemptId": identity.logical_attempt_id,
+                                "requestId": identity.request_id,
+                                "sessionId": real_id,
+                                "nativeTurnId": native_id,
+                                "displayTurnId": identity.native_message_id,
+                            }),
+                        ))
+                        .await;
+                    }
+                }
             }
 
             settle_turn_outcome(
@@ -2805,38 +3010,37 @@ impl FreshOpencodeState {
             // Drain-time fence re-validation (the user constraint): the
             // entry's captured pair is validated ATOMICALLY via the
             // lane's op guard — never a bare unlocked observe-then-act
-            // (the exact TOCTOU the guard's docs exist to close). FENCED
-            // entries only: an unfenced entry keeps the direct send
+            // (the exact TOCTOU the guard's docs exist to close). Fenced
+            // entries and checkpoint-intent entries are guarded; an ordinary unfenced entry keeps the direct send
             // path's parse-only tolerance (the queue re-enters the send
             // path; it is not stricter than the path it re-enters — the
             // no-laundering discipline binds the history-restructuring
             // lanes, not the append-a-turn send lane).
-            let op_guard = match send_fence {
-                None => None, // unfenced: direct-path tolerance
-                Some(fence) => {
-                    let op_id = format!("send-drain-{}", uuid::Uuid::new_v4());
-                    match crate::ownership_lane::arm_reclaimless_op_guard(
-                        &self.fresh_agent.ownership,
-                        PROVIDER,
-                        &real_id,
-                        &op_id,
-                        Some(fence),
-                        "freshopencode/send-drain",
-                    ) {
-                        crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
-                        crate::ownership_lane::LaneOpGuard::Unwired => None,
-                        crate::ownership_lane::LaneOpGuard::Refused { message } => {
-                            session.pending_sends.pop_front();
-                            tracing::warn!(target: "freshell_freshagent::opencode",
-                                session_id = %lookup_id, request_id = ?msg.request_id,
-                                observed_epoch = fence.epoch,
-                                observed_generation = fence.generation,
-                                "fresh_agent_send_drain_refused: ownership guard refused");
-                            self.send_error(&msg.request_id, "SESSION_RESERVED", &message);
-                            continue;
-                        }
+            let op_guard = if send_fence.is_some() || msg.checkpoint_intent.is_some() {
+                let op_id = format!("send-drain-{}", uuid::Uuid::new_v4());
+                match crate::ownership_lane::arm_reclaimless_op_guard(
+                    &self.fresh_agent.ownership,
+                    PROVIDER,
+                    &real_id,
+                    &op_id,
+                    send_fence,
+                    "freshopencode/send-drain",
+                ) {
+                    crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                    crate::ownership_lane::LaneOpGuard::Unwired => None,
+                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                        session.pending_sends.pop_front();
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %lookup_id, request_id = ?msg.request_id,
+                            observed_epoch = send_fence.map(|fence| fence.epoch),
+                            observed_generation = send_fence.map(|fence| fence.generation),
+                            "fresh_agent_send_drain_refused: ownership guard refused");
+                        self.send_error(&msg.request_id, "SESSION_RESERVED", &message);
+                        continue;
                     }
                 }
+            } else {
+                None // ordinary unfenced sends retain their direct-path tolerance
             };
             session.pending_sends.pop_front();
             self.send_locked(
@@ -6973,12 +7177,13 @@ impl FreshOpencodeState {
                 let projection = self.created_projection_for(real_id).await;
                 let name_ref = projection.as_ref().map(|(r, _)| r.clone());
                 let session_name = projection.map(|(_, record)| record);
-                self.broadcast(&materialized_frame(
+                self.broadcast_materialized(&materialized_frame(
                     &msg.session_id,
                     real_id,
                     name_ref,
                     session_name,
-                ));
+                ))
+                .await;
             }
         }
 
@@ -9662,7 +9867,31 @@ mod tests {
             settings: None,
             observed_epoch,
             observed_generation,
+            checkpoint_intent: None,
         }
+    }
+
+    #[test]
+    fn checkpoint_turn_identity_opencode_message_id_is_stable_for_nanoid_attempt() {
+        let logical_attempt_id = "V1StGXR8_Z5jdHi6B-myT";
+        let mut send = send_msg("ses_identity", "first request");
+        send.request_id = Some("request-first".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: logical_attempt_id.into(),
+            workspace: None,
+        });
+        let first = checkpoint_turn_identity(&send).expect("modern send has identity");
+        send.request_id = Some("request-retry".into());
+        let retry = checkpoint_turn_identity(&send).expect("retry preserves logical identity");
+
+        assert_eq!(first.logical_attempt_id, logical_attempt_id);
+        assert_eq!(first.request_id, "request-first");
+        assert_eq!(retry.request_id, "request-retry");
+        assert_eq!(first.native_message_id, retry.native_message_id);
+        assert_eq!(
+            first.native_message_id,
+            "msg_55c25d96e4445f67b35ea116686e169c"
+        );
     }
 
     // ── tests ────────────────────────────────────────────────────────────
@@ -10419,6 +10648,141 @@ mod tests {
                         && generation == before.generation + 1,
             ),
             "the fresh-agent owner stays authoritative at the bumped generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_send_with_stale_fence_is_refused_for_an_already_materialized_session() {
+        let (mut st, mut rx) = state_with_durable_serve_session().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        let initial = registry.observe(PROVIDER, DURABLE_ID);
+        let mut attach = attach_msg(DURABLE_ID);
+        attach.observed_epoch = Some(initial.epoch);
+        attach.observed_generation = Some(initial.generation);
+        st.handle_attach(attach).await;
+        let before = registry.observe(PROVIDER, DURABLE_ID);
+        assert!(matches!(
+            before.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            DURABLE_ID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-checkpoint-send-generation-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail(
+            PROVIDER,
+            DURABLE_ID,
+            "op-checkpoint-send-generation-bump",
+            generation,
+            true,
+        );
+        let after = registry.observe(PROVIDER, DURABLE_ID);
+        assert!(after.generation > before.generation);
+        assert!(matches!(
+            after.state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        while rx.try_recv().is_ok() {}
+
+        let mut send = send_msg_fenced(
+            DURABLE_ID,
+            "delayed checkpoint prompt",
+            Some(before.epoch),
+            Some(before.generation),
+        );
+        send.request_id = Some("req-stale-checkpoint-opencode".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "stale-opencode-attempt".into(),
+            workspace: None,
+        });
+        st.handle_send(send).await;
+
+        let mut saw_reserved = false;
+        let mut saw_accepted = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).expect("event frame JSON");
+            saw_reserved |= frame.to_string().contains("SESSION_RESERVED");
+            saw_accepted |= frame.to_string().contains("freshAgent.send.accepted");
+        }
+        assert!(saw_reserved, "the stale owner fence is refused typed");
+        assert!(
+            !saw_accepted,
+            "the stale prompt is never accepted for dispatch"
+        );
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get(DURABLE_ID)
+            .cloned()
+            .expect("the resumed session remains mapped");
+        assert!(
+            session_arc.lock().await.turn_task.is_none(),
+            "a stale checkpoint prompt never starts a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_send_can_materialize_a_new_opencode_session() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-checkpoint-first-send"), None)
+            .await;
+        let placeholder = "freshopencode-req-checkpoint-first-send";
+        let observation = registry.observe(PROVIDER, placeholder);
+        let mut send = send_msg_fenced(
+            placeholder,
+            "first checkpoint prompt",
+            Some(observation.epoch),
+            Some(observation.generation),
+        );
+        send.request_id = Some("req-checkpoint-first-send-prompt".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "first-opencode-checkpoint-attempt".into(),
+            workspace: None,
+        });
+        st.handle_send(send).await;
+
+        let sessions = st.sessions.lock().await;
+        let session = sessions
+            .get(placeholder)
+            .expect("placeholder remains mapped after materialization")
+            .lock()
+            .await;
+        let durable_id = session
+            .real_session_id
+            .as_deref()
+            .expect("the checkpoint send materializes the provider session");
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        assert!(
+            session.turn_task.is_some(),
+            "the first prompt is dispatched"
+        );
+        let frames = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.contains("freshAgent.session.materialized")),
+            "the normal materialization event is emitted"
         );
     }
 
@@ -16695,6 +17059,11 @@ mod tests {
         next_session: AtomicUsize,
         requests: StdMutex<Vec<RecordedRequest>>,
         busy_budget: StdMutex<std::collections::HashMap<String, usize>>,
+        persisted_message_history: StdMutex<std::collections::HashMap<String, Vec<Value>>>,
+        message_history_misses: StdMutex<usize>,
+        message_history_errors: StdMutex<usize>,
+        message_history_reads: AtomicUsize,
+        message_history_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
         summarize_outcome: SummarizeOutcome,
         config_body: Vec<u8>,
         bus_probe: StdMutex<tokio::sync::broadcast::Receiver<String>>,
@@ -16773,6 +17142,11 @@ mod tests {
                 next_session: AtomicUsize::new(0),
                 requests: StdMutex::new(Vec::new()),
                 busy_budget: StdMutex::new(std::collections::HashMap::new()),
+                persisted_message_history: StdMutex::new(std::collections::HashMap::new()),
+                message_history_misses: StdMutex::new(0),
+                message_history_errors: StdMutex::new(0),
+                message_history_reads: AtomicUsize::new(0),
+                message_history_gate: StdMutex::new(None),
                 summarize_outcome,
                 config_body,
                 bus_probe: StdMutex::new(bus_probe),
@@ -16792,6 +17166,15 @@ mod tests {
 
         fn recorded(&self) -> Vec<RecordedRequest> {
             self.requests.lock().expect("requests mutex").clone()
+        }
+
+        fn arm_message_history_gate(&self) -> Arc<tokio::sync::Notify> {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            *self
+                .message_history_gate
+                .lock()
+                .expect("message history gate mutex") = Some(gate.clone());
+            gate
         }
 
         /// send-during-compact queue (Task 3): arm the one-shot prompt
@@ -16947,7 +17330,7 @@ mod tests {
                 .push(RecordedRequest {
                     method: method.clone(),
                     url: req.url.clone(),
-                    body: body_value,
+                    body: body_value.clone(),
                 });
 
             if req.url.contains("/global/health") {
@@ -17109,6 +17492,19 @@ mod tests {
                     .and_then(|rest| rest.split(['/', '?']).next())
                     .unwrap_or("")
                     .to_string();
+                if let Some(message_id) = body_value
+                    .as_ref()
+                    .and_then(|body| body.get("messageID"))
+                    .and_then(Value::as_str)
+                {
+                    self.persisted_message_history
+                        .lock()
+                        .expect("persisted message history mutex")
+                        .insert(
+                            id.clone(),
+                            vec![json!({"info": {"id": message_id, "role": "user"}})],
+                        );
+                }
                 self.busy_budget
                     .lock()
                     .expect("busy budget mutex")
@@ -17119,6 +17515,73 @@ mod tests {
                         gate.notified().await;
                     }
                     Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                });
+            }
+            if method == "GET" && req.url.contains("/message") {
+                self.message_history_reads.fetch_add(1, Ordering::SeqCst);
+                let history_missing = {
+                    let mut remaining = self
+                        .message_history_misses
+                        .lock()
+                        .expect("message history misses mutex");
+                    if *remaining == 0 {
+                        false
+                    } else {
+                        *remaining -= 1;
+                        true
+                    }
+                };
+                if history_missing {
+                    return Box::pin(
+                        async move { Ok(ServeHttpResponse::new(200, b"[]".to_vec())) },
+                    );
+                }
+                let history_error = {
+                    let mut remaining = self
+                        .message_history_errors
+                        .lock()
+                        .expect("message history errors mutex");
+                    if *remaining == 0 {
+                        false
+                    } else {
+                        *remaining -= 1;
+                        true
+                    }
+                };
+                if history_error {
+                    return Box::pin(async move {
+                        Err(ServeHttpError::Ambiguous(
+                            "transient message-history read failure by the test knob".to_string(),
+                        ))
+                    });
+                }
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                let messages = self
+                    .persisted_message_history
+                    .lock()
+                    .expect("persisted message history mutex")
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                let history_gate = self
+                    .message_history_gate
+                    .lock()
+                    .expect("message history gate mutex")
+                    .take();
+                return Box::pin(async move {
+                    if let Some(gate) = history_gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&messages).expect("history encodes as JSON"),
+                    ))
                 });
             }
             if method == "GET" && req.url.contains("/session/status") {
@@ -21933,6 +22396,7 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         }
     }
 
@@ -24893,6 +25357,183 @@ mod tests {
             idle_ix[1] < running_ix[2],
             "the first send's trailing idle precedes the second queued send's running"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_turn_identity_opencode_checkpoint_message_id_survives_compact_queue() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_checkpoint_queue", Some("prov/model")).await;
+        *http
+            .message_history_misses
+            .lock()
+            .expect("message history misses mutex") = 1;
+        *http
+            .message_history_errors
+            .lock()
+            .expect("message history errors mutex") = 1;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_checkpoint_queue")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+
+        let logical_attempt_id = "V1StGXR8_Z5jdHi6B-myT";
+        let expected_message_id = "msg_55c25d96e4445f67b35ea116686e169c";
+        let mut send = send_msg("ses_checkpoint_queue", "queued checkpoint send");
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: logical_attempt_id.into(),
+            workspace: None,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), st.handle_send(send))
+            .await
+            .expect("checkpoint send queues behind compact");
+        let accepted_frames = frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.send.accepted"
+                && frame["requestId"] == "req-queued checkpoint send"
+        })
+        .await;
+        let accepted = accepted_frames
+            .iter()
+            .find(|frame| frame["type"] == "freshAgent.send.accepted")
+            .expect("send acceptance is present");
+        assert!(accepted["submittedTurnId"].is_null());
+        assert!(
+            drain_frames(&mut rx)
+                .iter()
+                .all(|frame| { frame["event"]["type"] != "checkpointTurnIdentity" }),
+            "queue acknowledgement remains pending until the provider persists the user row"
+        );
+
+        summarize_gate.notify_waiters();
+        await_prompt_posted(&http, "queued checkpoint send").await;
+        let prompt = http
+            .recorded()
+            .into_iter()
+            .find(|request| {
+                request.url.contains("prompt_async")
+                    && r_body_contains(request, "queued checkpoint send")
+            })
+            .expect("queued prompt drains through the provider transport");
+        assert_eq!(prompt.body.unwrap()["messageID"], expected_message_id);
+        // The compact that was already in flight has its own completion edge;
+        // drain it before waiting for the queued send's completion and identity.
+        let _compact_frames = frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        let settled_frames = frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert_eq!(
+            http.message_history_reads.load(Ordering::SeqCst),
+            3,
+            "identity reconciliation retries both an initially absent row and a transient history error before settling"
+        );
+
+        let receipt = settled_frames
+            .iter()
+            .find(|frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "checkpointTurnIdentity"
+            })
+            .expect("checkpoint identity receipt is present");
+        assert_eq!(receipt["sessionId"], "ses_checkpoint_queue");
+        assert_eq!(receipt["event"]["logicalAttemptId"], logical_attempt_id);
+        assert_eq!(receipt["event"]["requestId"], "req-queued checkpoint send");
+        assert_eq!(receipt["event"]["nativeTurnId"], expected_message_id);
+        assert_eq!(receipt["event"]["displayTurnId"], expected_message_id);
+        assert!(receipt["event"].get("text").is_none());
+        st.fresh_agent.ensure_manager().await.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_turn_identity_opencode_history_retry_cancels_without_leaking_reads() {
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let manager = st.fresh_agent.ensure_manager().await;
+        let _history_gate = http.arm_message_history_gate();
+        let identity = CheckpointTurnIdentity {
+            logical_attempt_id: "attempt-cancel".into(),
+            request_id: "request-cancel".into(),
+            native_message_id: "msg_0123456789abcdef0123456789abcdef".into(),
+        };
+        let route = None;
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            observe_checkpoint_turn_identity(
+                &task_manager,
+                "ses_checkpoint_cancel",
+                &route,
+                &identity,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while http.message_history_reads.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bounded history read starts");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the aborted reconciliation task settles")
+                .is_cancelled(),
+            "cancellation drops the in-flight read instead of leaving a retry task behind"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(http.message_history_reads.load(Ordering::SeqCst), 1);
+        assert!(drain_frames(&mut rx).iter().all(|frame| {
+            frame["type"] != "freshAgent.event"
+                || frame["event"]["type"] != "checkpointTurnIdentity"
+        }));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_turn_identity_opencode_history_retry_stops_at_attempt_limit() {
+        let (st, http, _rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let manager = st.fresh_agent.ensure_manager().await;
+        *http
+            .message_history_errors
+            .lock()
+            .expect("message history errors mutex") = CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS;
+        let identity = CheckpointTurnIdentity {
+            logical_attempt_id: "attempt-bounded".into(),
+            request_id: "request-bounded".into(),
+            native_message_id: "msg_0123456789abcdef0123456789abcdef".into(),
+        };
+
+        let observed =
+            observe_checkpoint_turn_identity(&manager, "ses_checkpoint_bounded", &None, &identity)
+                .await;
+
+        assert_eq!(
+            observed, None,
+            "failed history reads never bind a candidate id"
+        );
+        assert_eq!(
+            http.message_history_reads.load(Ordering::SeqCst),
+            CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS,
+            "history reconciliation performs one initial read and only the configured retries"
+        );
+        manager.shutdown().await;
     }
 
     // ── merged from the send-during-compact-queue branch ──

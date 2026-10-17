@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
+  getFreshAgentCheckpointOutcomePage,
   getFreshAgentModelCapabilities,
   refreshFreshAgentModelCapabilities,
   getFreshAgentThreadSnapshot,
@@ -219,6 +220,34 @@ describe('visible-first read-model helpers', () => {
         signal,
         headers: expect.any(Headers),
       }),
+    )
+  })
+
+  it('loads a typed checkpoint outcome page for one provider session', async () => {
+    const signal = new AbortController().signal
+    const outcome = {
+      type: 'freshAgent.checkpoint.outcome',
+      logicalAttemptId: 'attempt-reopened',
+      requestId: 'request-reopened',
+      provider: 'codex',
+      sessionId: 'thread/one',
+      sessionType: 'freshcodex',
+      status: 'available',
+      checkpointId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      nativeTurnId: 'native-turn-1',
+      displayTurnId: 'native-turn-1:row-0',
+    }
+    mockFetch.mockResolvedValueOnce(mockJson({ outcomes: [outcome], nextCursor: 'cursor+/' }))
+
+    await expect(getFreshAgentCheckpointOutcomePage({
+      provider: 'codex',
+      sessionId: 'thread/one',
+      sessionType: 'freshcodex',
+      cursor: 'cursor+/',
+    }, { signal })).resolves.toEqual({ outcomes: [outcome], nextCursor: 'cursor+/' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/fresh-agent/checkpoints/outcomes?provider=codex&sessionId=thread%2Fone&sessionType=freshcodex&limit=200&cursor=cursor%2B%2F',
+      expect.objectContaining({ signal, headers: expect.any(Headers) }),
     )
   })
 
@@ -983,6 +1012,144 @@ describe('searchSessions cursor pagination', () => {
     expect(response.hasMore).toBe(false)
   })
 
+  it('preserves an explicitly picked linked-worktree subdirectory from snapshots and search', async () => {
+    const checkoutPath = '/repo/.worktrees/feature-a'
+    const workspace = {
+      path: `${checkoutPath}/nested`,
+      provenance: 'directory-picker' as const,
+    }
+    mockFetch
+      .mockResolvedValueOnce(mockJson({
+        items: [{
+          sessionId: 'session-worktree',
+          provider: 'codex',
+          projectPath: '/repo',
+          checkoutPath,
+          checkpointWorkspace: workspace,
+          cwd: '/home/user',
+          isRunning: false,
+          lastActivityAt: 1_000,
+        }],
+        nextCursor: null,
+        revision: 1,
+      }))
+      .mockResolvedValueOnce(mockJson({
+        items: [{
+          sessionId: 'session-worktree',
+          provider: 'codex',
+          projectPath: '/repo',
+          checkoutPath,
+          checkpointWorkspace: workspace,
+          cwd: '/home/user',
+          matchedIn: 'title',
+          isRunning: false,
+          lastActivityAt: 1_000,
+        }],
+        nextCursor: null,
+        revision: 2,
+      }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'worktree' })
+
+    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(search.results[0]?.checkpointWorkspace).toEqual(workspace)
+  })
+
+  it('uses the resolved project path when an ordinary session launch cwd differs', async () => {
+    const items = [
+      {
+        sessionId: 'session-ordinary',
+        provider: 'codex',
+        projectPath: '/repo',
+        cwd: '/home/user',
+        isRunning: false,
+        lastActivityAt: 1_000,
+      },
+      {
+        sessionId: 'session-unknown',
+        provider: 'codex',
+        projectPath: 'unknown',
+        isRunning: false,
+        lastActivityAt: 900,
+      },
+      {
+        sessionId: 'terminal-only',
+        provider: 'codex',
+        projectPath: 'terminal:term-42',
+        liveTerminalOnly: true,
+        isRunning: true,
+        lastActivityAt: 800,
+      },
+    ]
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items, nextCursor: null, revision: 1 }))
+      .mockResolvedValueOnce(mockJson({ items, nextCursor: null, revision: 2 }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'ordinary' })
+    const ordinarySnapshot = snapshot.projects
+      .flatMap((project) => project.sessions)
+      .find((session) => session.sessionId === 'session-ordinary')
+    const terminalSearch = search.results.find((session) => session.sessionId === 'terminal-only')
+
+    expect(ordinarySnapshot?.checkpointWorkspace).toEqual({ path: '/repo', provenance: 'resolved-project' })
+    expect(search.results.find((session) => session.sessionId === 'session-ordinary')?.checkpointWorkspace)
+      .toEqual({ path: '/repo', provenance: 'resolved-project' })
+    expect(snapshot.projects.flatMap((project) => project.sessions)
+      .find((session) => session.sessionId === 'session-unknown')?.checkpointWorkspace).toBeUndefined()
+    expect(terminalSearch?.checkpointWorkspace).toBeUndefined()
+  })
+
+  it('restores an explicitly selected non-Git workspace from snapshots and search', async () => {
+    const checkoutPath = '/repo/.worktrees/feature-a'
+    const workspace = { path: '/tmp/non-git-workspace', provenance: 'directory-picker' as const }
+    const item = {
+      sessionId: 'session-non-git',
+      provider: 'codex',
+      projectPath: '/repo',
+      checkoutPath,
+      checkpointWorkspace: workspace,
+      cwd: checkoutPath,
+      isRunning: false,
+      lastActivityAt: 1_000,
+    }
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 1 }))
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 2 }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'non-git' })
+
+    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(search.results[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(snapshot.projects[0]?.sessions[0]?.checkoutPath).toBe(checkoutPath)
+    expect(search.results[0]?.checkoutPath).toBe(checkoutPath)
+  })
+
+  it('does not treat a cwd-fallback checkoutPath as proof that a picked workspace belongs to Git', async () => {
+    const workspace = { path: '/home/user/non-git-project', provenance: 'directory-picker' as const }
+    const item = {
+      sessionId: 'session-cwd-fallback',
+      provider: 'codex',
+      projectPath: '/repo',
+      checkoutPath: '/home/user',
+      checkpointWorkspace: workspace,
+      cwd: '/home/user',
+      isRunning: false,
+      lastActivityAt: 1_000,
+    }
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 1 }))
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 2 }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'cwd fallback' })
+
+    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(search.results[0]?.checkpointWorkspace).toEqual(workspace)
+  })
+
   it('forwards the cursor to the session-directory request when paginating a search', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],
@@ -1047,6 +1214,28 @@ describe('setSessionMetadata()', () => {
           sessionId: 'ses_real_1',
           sessionType: 'freshopencode',
           sessionTypeSource: 'materialized',
+        }),
+      }),
+    )
+  })
+
+  it('persists an explicitly selected checkpoint workspace with materialized session metadata', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, text: () => Promise.resolve('') })
+
+    await setSessionMetadata('codex', 'session-non-git', 'freshcodex', {
+      sessionTypeSource: 'materialized',
+      checkpointWorkspace: { path: '/tmp/non-git-workspace', provenance: 'directory-picker' },
+    })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/session-metadata',
+      expect.objectContaining({
+        body: JSON.stringify({
+          provider: 'codex',
+          sessionId: 'session-non-git',
+          sessionType: 'freshcodex',
+          sessionTypeSource: 'materialized',
+          checkpointWorkspace: { path: '/tmp/non-git-workspace', provenance: 'directory-picker' },
         }),
       }),
     )

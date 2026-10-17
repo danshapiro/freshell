@@ -1046,6 +1046,247 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
+  it('keeps a verified final managed handle during the inventory census', async () => {
+    const store=createStore({tabs:[{id:'retained-tab',mode:'shell',status:'exited'}],panes:{layouts:{
+      'retained-tab':{type:'leaf',id:'retained-pane',content:{kind:'terminal',mode:'shell',status:'exited',
+        terminalId:'retained-managed',streamId:'retained-epoch',createRequestId:'retained-create',soulId:'soul-retained'}}},
+      activePane:{'retained-tab':'retained-pane'}}})
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(()=>expect(messageHandler).toBeTypeOf('function'))
+    act(()=>messageHandler?.({type:'terminal.inventory',terminals:[{terminalId:'retained-managed',mode:'shell',status:'exited',
+      runtimeStatus:'exited',soulId:'soul-retained',incarnationId:'inc-retained',title:'Shell',createdAt:1,lastActivityAt:2}]}))
+    const layout=store.getState().panes.layouts['retained-tab']
+    expect(layout.type).toBe('leaf')
+    if(layout.type!=='leaf') throw new Error('expected leaf')
+    expect(layout.content).toMatchObject({terminalId:'retained-managed',streamId:'retained-epoch',createRequestId:'retained-create',status:'exited'})
+  })
+
+  it('clears a stale managed launch failure when inventory confirms the retained terminal is live', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-live-tab', mode: 'opencode', status: 'error' }],
+      panes: {
+        layouts: {
+          'inventory-live-tab': {
+            type: 'leaf', id: 'inventory-live-pane', content: {
+              kind: 'terminal', mode: 'opencode', status: 'error',
+              terminalId: 'inventory-live-terminal', streamId: 'inventory-live-stream',
+              createRequestId: 'inventory-live-create', soulId: 'inventory-live-soul',
+              launchFailure: { code: 'LAUNCH_FAILED', message: 'old launch failed', retryable: true },
+            },
+          },
+        },
+        activePane: { 'inventory-live-tab': 'inventory-live-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    act(() => messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [{
+        terminalId: 'inventory-live-terminal', mode: 'opencode', status: 'running',
+        runtimeStatus: 'running', soulId: 'inventory-live-soul', incarnationId: 'inventory-live-incarnation',
+      }],
+    }))
+
+    const layout = store.getState().panes.layouts['inventory-live-tab']
+    expect(layout.type).toBe('leaf')
+    if (layout.type !== 'leaf') throw new Error('expected a leaf pane')
+    expect(layout.content).toMatchObject({ status: 'running', runtimeStatus: 'running' })
+    expect(layout.content.launchFailure).toBeUndefined()
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-live-tab')?.status).toBe('running')
+  })
+
+  it.each([
+    { recoveryState: 'blocked', runtimeStatus: 'blocked', expectedStatus: 'error' },
+    { recoveryState: 'lost', runtimeStatus: 'exited', expectedStatus: 'error' },
+    { recoveryState: 'stopped', runtimeStatus: 'exited', expectedStatus: 'exited' },
+  ] as const)(
+    'persists the final $recoveryState managed status from a disconnected terminal inventory',
+    async ({ recoveryState, runtimeStatus, expectedStatus }) => {
+      const store = createStore({
+        tabs: [{ id: `inventory-${recoveryState}-tab`, mode: 'opencode', status: 'running' }],
+        panes: {
+          layouts: {
+            [`inventory-${recoveryState}-tab`]: {
+              type: 'leaf', id: `inventory-${recoveryState}-pane`, content: {
+                kind: 'terminal', mode: 'opencode', status: 'running',
+                terminalId: `inventory-${recoveryState}-terminal`,
+                streamId: `inventory-${recoveryState}-stream`,
+                createRequestId: `inventory-${recoveryState}-create`,
+                soulId: `inventory-${recoveryState}-soul`,
+              },
+            },
+          },
+          activePane: { [`inventory-${recoveryState}-tab`]: `inventory-${recoveryState}-pane` },
+        },
+      })
+      render(<Provider store={store}><App /></Provider>)
+      await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+      act(() => messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [{
+          terminalId: `inventory-${recoveryState}-terminal`, mode: 'opencode', status: 'exited',
+          runtimeStatus, soulId: `inventory-${recoveryState}-soul`, incarnationId: `inventory-${recoveryState}-incarnation`,
+          recoverySummary: {
+            desiredState: recoveryState === 'stopped' ? 'stopped' : 'running',
+            recoveryState,
+            durabilityState: 'live_only',
+            allocationState: 'degraded',
+          },
+        }],
+      }))
+
+      const layout = store.getState().panes.layouts[`inventory-${recoveryState}-tab`]
+      expect(layout.type).toBe('leaf')
+      if (layout.type !== 'leaf') throw new Error('expected a leaf pane')
+      expect(layout.content.status).toBe(expectedStatus)
+      expect(store.getState().tabs.tabs.find(tab => tab.id === `inventory-${recoveryState}-tab`)?.status)
+        .toBe(expectedStatus)
+    },
+  )
+
+  it('summarizes mixed managed pane outcomes independent of terminal inventory order', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-mixed-tab', mode: 'opencode', status: 'running' }],
+      panes: {
+        layouts: {
+          'inventory-mixed-tab': {
+            type: 'split', id: 'inventory-mixed-split', direction: 'horizontal', sizes: [50, 50], children: [
+              {
+                type: 'leaf', id: 'inventory-mixed-lost-pane', content: {
+                  kind: 'terminal', mode: 'opencode', status: 'running', terminalId: 'inventory-mixed-lost-terminal',
+                  streamId: 'inventory-mixed-lost-stream', createRequestId: 'inventory-mixed-lost-create',
+                  soulId: 'inventory-mixed-lost-soul',
+                },
+              },
+              {
+                type: 'leaf', id: 'inventory-mixed-live-pane', content: {
+                  kind: 'terminal', mode: 'opencode', status: 'running', terminalId: 'inventory-mixed-live-terminal',
+                  streamId: 'inventory-mixed-live-stream', createRequestId: 'inventory-mixed-live-create',
+                  soulId: 'inventory-mixed-live-soul',
+                },
+              },
+            ],
+          },
+        },
+        activePane: { 'inventory-mixed-tab': 'inventory-mixed-live-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    const lost = {
+      terminalId: 'inventory-mixed-lost-terminal', mode: 'opencode', status: 'exited', runtimeStatus: 'exited',
+      soulId: 'inventory-mixed-lost-soul', incarnationId: 'inventory-mixed-lost-incarnation',
+      recoverySummary: {
+        desiredState: 'running', recoveryState: 'lost', durabilityState: 'live_only', allocationState: 'degraded',
+      },
+    }
+    const live = {
+      terminalId: 'inventory-mixed-live-terminal', mode: 'opencode', status: 'running', runtimeStatus: 'running',
+      soulId: 'inventory-mixed-live-soul', incarnationId: 'inventory-mixed-live-incarnation',
+    }
+    const deliver = (terminals: Array<typeof lost | typeof live>) =>
+      act(() => messageHandler?.({ type: 'terminal.inventory', terminals }))
+
+    deliver([lost, live])
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-mixed-tab')?.status).toBe('error')
+    deliver([live, lost])
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-mixed-tab')?.status).toBe('error')
+  })
+
+  it('keeps an exited managed inventory row exited when runtime metadata is absent', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-exited-metadata-tab', mode: 'opencode', status: 'running' }],
+      panes: {
+        layouts: {
+          'inventory-exited-metadata-tab': {
+            type: 'leaf', id: 'inventory-exited-metadata-pane', content: {
+              kind: 'terminal', mode: 'opencode', status: 'running',
+              terminalId: 'inventory-exited-metadata-terminal',
+              streamId: 'inventory-exited-metadata-stream',
+              createRequestId: 'inventory-exited-metadata-create',
+              soulId: 'inventory-exited-metadata-soul',
+              launchFailure: { code: 'LAUNCH_FAILED', message: 'old launch failed', retryable: true },
+            },
+          },
+        },
+        activePane: { 'inventory-exited-metadata-tab': 'inventory-exited-metadata-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    act(() => messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [{
+        terminalId: 'inventory-exited-metadata-terminal', mode: 'opencode', status: 'exited',
+        soulId: 'inventory-exited-metadata-soul',
+      }],
+    }))
+
+    const layout = store.getState().panes.layouts['inventory-exited-metadata-tab']
+    expect(layout.type).toBe('leaf')
+    if (layout.type !== 'leaf') throw new Error('expected a leaf pane')
+    expect(layout.content.status).toBe('exited')
+    expect(layout.content.launchFailure).toEqual({ code: 'LAUNCH_FAILED', message: 'old launch failed', retryable: true })
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-exited-metadata-tab')?.status).toBe('exited')
+  })
+
+  it('recomputes the tab summary after inventory clears a stale sibling pane', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-stale-sibling-tab', mode: 'opencode', status: 'error' }],
+      panes: {
+        layouts: {
+          'inventory-stale-sibling-tab': {
+            type: 'split', id: 'inventory-stale-sibling-split', direction: 'horizontal', sizes: [50, 50], children: [
+              {
+                type: 'leaf', id: 'inventory-stale-managed-pane', content: {
+                  kind: 'terminal', mode: 'opencode', status: 'error',
+                  terminalId: 'inventory-stale-managed-terminal',
+                  streamId: 'inventory-stale-managed-stream',
+                  createRequestId: 'inventory-stale-managed-create',
+                  soulId: 'inventory-stale-managed-soul',
+                },
+              },
+              {
+                type: 'leaf', id: 'inventory-stale-sibling-pane', content: {
+                  kind: 'terminal', mode: 'shell', status: 'error', shell: 'system',
+                  terminalId: 'inventory-stale-sibling-terminal',
+                  streamId: 'inventory-stale-sibling-stream',
+                  createRequestId: 'inventory-stale-sibling-create',
+                },
+              },
+            ],
+          },
+        },
+        activePane: { 'inventory-stale-sibling-tab': 'inventory-stale-managed-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    act(() => messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [{
+        terminalId: 'inventory-stale-managed-terminal', mode: 'opencode', status: 'running',
+        runtimeStatus: 'running', soulId: 'inventory-stale-managed-soul',
+        incarnationId: 'inventory-stale-managed-incarnation',
+      }],
+    }))
+
+    const layout = store.getState().panes.layouts['inventory-stale-sibling-tab']
+    expect(layout.type).toBe('split')
+    if (layout.type !== 'split') throw new Error('expected a split pane')
+    const staleSibling = layout.children[1]
+    expect(staleSibling.type).toBe('leaf')
+    if (staleSibling.type !== 'leaf') throw new Error('expected a stale sibling leaf')
+    expect(staleSibling.content.status).toBe('creating')
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-stale-sibling-tab')?.status).toBe('running')
+  })
+
   it('recovers an OpenCode sessionRef from inventory before clearing a stale live handle', async () => {
     const store = createStore({
       tabs: [{

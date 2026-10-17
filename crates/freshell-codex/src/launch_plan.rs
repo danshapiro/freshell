@@ -324,6 +324,8 @@ pub fn codex_remote_args(proxy_ws_url: &str) -> Result<[String; 4], CodexRemoteA
 /// child process environment and are intentionally redacted from [`fmt::Debug`].
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct CodexSidecarLaunchContext {
+    /// The managed soul host requests final argv/env validation before spawn.
+    pub provider_exec_profile: bool,
     pub config_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -331,6 +333,7 @@ pub struct CodexSidecarLaunchContext {
 impl fmt::Debug for CodexSidecarLaunchContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CodexSidecarLaunchContext")
+            .field("provider_exec_profile", &self.provider_exec_profile)
             .field("config_args", &self.config_args)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .finish()
@@ -748,6 +751,7 @@ mod tests {
     #[test]
     fn sidecar_spawn_spec_places_context_before_app_server_and_redacts_values() {
         let context = CodexSidecarLaunchContext {
+            provider_exec_profile: false,
             config_args: vec![
                 "-c".to_string(),
                 "mcp_servers.freshell.command=\"node\"".to_string(),

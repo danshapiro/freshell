@@ -120,6 +120,10 @@ function nextMessageSequence(db, sessionId) {
   return next
 }
 
+function isValidMessageId(messageId) {
+  return typeof messageId === 'string' && /^msg_[0-9a-f]{32}$/i.test(messageId)
+}
+
 function sessionModel() {
   return JSON.stringify({ providerID: 'opencode', modelID: 'fake-opencode' })
 }
@@ -333,7 +337,9 @@ function appendTuiParityMessages(input) {
     const sequence = nextMessageSequence(db, input.sessionId)
     const userTime = Date.now()
     const assistantTime = userTime + 1
-    const userMessageId = `msg_${input.sessionId}_${sequence}_user`
+    const userMessageId = isValidMessageId(input.messageId)
+      ? input.messageId
+      : `msg_${input.sessionId}_${sequence}_user`
     const assistantMessageId = `msg_${input.sessionId}_${sequence + 1}_assistant`
     insertMessage(db, { messageId: userMessageId, sessionId: input.sessionId, role: 'user', now: userTime })
     insertPart(db, {
@@ -404,7 +410,7 @@ function appendTuiParityMessages(input) {
     })
     db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(assistantTime, input.sessionId)
     seedTuiParityChildSessions({ parentSessionId: input.sessionId, directory: existing.directory })
-    return { promptText: input.promptText, userMessageId, assistantMessageId, assistantTime }
+    return { promptText: input.promptText, userMessageId, assistantMessageId, assistantTime, sequence }
   } finally {
     db.close()
   }
@@ -999,7 +1005,9 @@ function appendPromptMessages(input) {
       .filter(Boolean)
       .join('\n')
     const responseText = process.env.FAKE_OPENCODE_RESPONSE_TEXT || `Fake OpenCode response: ${promptText}`
-    const userMessageId = `msg_${input.sessionId}_${sequence}_user`
+    const userMessageId = isValidMessageId(input.messageId)
+      ? input.messageId
+      : `msg_${input.sessionId}_${sequence}_user`
     const assistantMessageId = `msg_${input.sessionId}_${sequence + 1}_assistant`
     insertTextMessage(db, {
       sessionId: input.sessionId,
@@ -1061,7 +1069,7 @@ function appendPromptMessages(input) {
         data: { type: 'reasoning', text: 'waiting for the provider response' },
       })
       db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(erroredTime, input.sessionId)
-      return { promptText, responseText, userMessageId, assistantMessageId, assistantTime: erroredTime }
+      return { promptText, responseText, userMessageId, assistantMessageId, assistantTime: erroredTime, sequence }
     }
     insertTextMessage(db, {
       sessionId: input.sessionId,
@@ -1072,7 +1080,7 @@ function appendPromptMessages(input) {
       now: assistantTime,
     })
     db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(assistantTime, input.sessionId)
-    return { promptText, responseText, userMessageId, assistantMessageId, assistantTime }
+    return { promptText, responseText, userMessageId, assistantMessageId, assistantTime, sequence }
   } finally {
     db.close()
   }
@@ -1314,12 +1322,13 @@ const server = http.createServer(async (req, res) => {
       const appended = tuiParityEnabled
         ? appendTuiParityMessages({
             sessionId,
+            messageId: body.messageID,
             promptText: parts
               .map((part) => typeof part?.text === 'string' ? part.text : '')
               .filter(Boolean)
               .join('\n'),
           })
-        : appendPromptMessages({ sessionId, parts })
+        : appendPromptMessages({ sessionId, parts, messageId: body.messageID })
       if (!appended) {
         emitSessionIdle(sessionId, {
           routeDirectory: directory,
@@ -1334,7 +1343,7 @@ const server = http.createServer(async (req, res) => {
       // so the rollback spec reverts a PATCH-CARRYING turn and proves the
       // working tree stays byte-identical (conversation-only rollback).
       const patchTurn = Number.parseInt(process.env.FAKE_OPENCODE_PATCH_TURN ?? '', 10)
-      const userSeq = Number(/^msg_.+_(\d+)_user$/.exec(appended.userMessageId)?.[1])
+      const userSeq = appended.sequence
       if (Number.isInteger(patchTurn) && patchTurn > 0 && (userSeq + 1) / 2 === patchTurn) {
         const patchPath = path.join(session.directory, 'patch-target.txt')
         fs.writeFileSync(patchPath, `fake patch from turn ${patchTurn} (${appended.userMessageId})\n`)

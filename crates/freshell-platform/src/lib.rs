@@ -51,16 +51,27 @@
 //! injected source ([`Env`], [`FileProbe`], [`path::WslPathResolver`]). Thin `*_live`
 //! wrappers at the edges perform the real reads and delegate to the pure core.
 
+pub mod amplifier_inputs;
+pub mod claude_inputs;
 pub mod cli_launch;
 pub mod clock;
+pub mod codex_inputs;
 pub mod detect;
 pub mod git_meta;
 pub mod host_stats_readers;
 pub mod managed_child_secrets;
 pub mod mcp_inject;
+pub mod native_auth_exchange;
 pub mod opencode_config;
 pub mod opencode_plugin;
+pub mod opencode_recipe;
 pub mod path;
+pub mod provider_environment;
+pub mod provider_environment_grants;
+pub mod provider_exec;
+pub mod provider_input_exchange;
+pub mod provider_input_profiles;
+pub mod provider_mountpoints;
 pub mod resume_gate;
 pub mod spawn;
 

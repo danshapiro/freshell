@@ -22,6 +22,12 @@ managed-runtime-v1 = [
   "dep:freshell-agent-runtime",
   "dep:freshell-runtime-client",
   "dep:freshell-runtime-protocol",
+  "dep:toml",
+  "dep:saphyr",
+  "dep:saphyr-parser",
+  "dep:semver",
+  "dep:tempfile",
+  "dep:glob",
 ]
 managed-provider-qualification = [
   "managed-runtime-v1",
@@ -73,6 +79,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "proces
 axum = "0.8"
 async-trait = "0.1"
 serde_json = { workspace = true }
+toml = { version = "=0.9.12", optional = true }
+saphyr = { version = "=0.0.11", default-features = false, optional = true }
+saphyr-parser = { version = "=0.0.11", optional = true }
+semver = { version = "=1.0.28", optional = true }
+# Managed preparation journals use private temporary files before atomic publication.
+tempfile = { version = "3", optional = true }
+glob = { version = "0.3.3", optional = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }
 # The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`) forwards to a
@@ -122,6 +135,7 @@ socket2 = { version = "0.6", features = ["all"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service"] }
 tower = { version = "0.5", features = ["util"] }
+futures-util = "0.3"
 # The from-the-first-byte redaction scrub (DIAG-03): matches `"...token...":"…"`
 # and `"cookie":"…"` JSON fields (and a raw `Cookie:`/`Set-Cookie:` header
 # fragment, belt-and-braces) regardless of which call site produced them.
@@ -129,6 +143,7 @@ tower = { version = "0.5", features = ["util"] }
 # `tracing-subscriber`'s own `env-filter` via `matchers`); declared directly
 # here because `logging.rs` uses it explicitly, not just transitively.
 regex = "1"
+unicode-normalization = "=0.1.25"
 
 [target.'cfg(unix)'.dependencies]
 # `flock(2)` for `settings_store.rs`'s advisory cross-process config lock
@@ -137,6 +152,22 @@ regex = "1"
 # this direct dependency adds no new download -- unix-only, matching the
 # lock's own unix-only implementation.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Checkpoint Git children are started suspended, assigned to a kill-on-close
+# Job Object, and only then resumed. This owns filters/hooks and other child
+# processes through timeout settlement on native Windows.
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Environment",
+  "Win32_System_Registry",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+] }
 
 [target.'cfg(unix)'.dev-dependencies]
 freshell-supervisor = { path = "../freshell-supervisor" }
@@ -154,7 +185,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # against the compiled binary (same version freshell-ws's own tests already
 # use, `crates/freshell-ws/Cargo.toml`) — no mock, the actual wire protocol.
 tokio-tungstenite = "0.24"
-futures-util = "0.3"
 # NET-09: black-box config-preservation test requires reqwest with json encoding
 # (main [dependencies] reqwest is feature-gated for stream+rustls only).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

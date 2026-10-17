@@ -25,6 +25,7 @@ const ZOD_BACKED_SERVER_MESSAGES = [
   'claude.activity.updated',
   'codex.activity.list.response',
   'codex.activity.updated',
+  'freshAgent.checkpoint.outcome',
   'hoststats.refresh.response',
   'hoststats.snapshot',
   'opencode.activity.list.response',

@@ -155,6 +155,54 @@ account_flag() {
   fi
 }
 
+cloud_duration_seconds() {
+  node "$ROOT/scripts/e2e-cloud-duration.mjs" "$1"
+}
+
+write_cloud_dispatch_receipt() {
+  local receipt_path="${FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT:-}"
+  [ -n "$receipt_path" ] || return 0
+  if ! [[ "$RUN_JOB_NAME" =~ ^[a-z][a-z0-9-]{0,48}$ && "$execution_id" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+    echo "[e2e-cloud] ERROR: cannot write a dispatch receipt for an invalid job or execution name." >&2
+    return 1
+  fi
+  local temporary="${receipt_path}.tmp.$$"
+  local accepted_at
+  accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! (umask 077; printf '{"jobName":"%s","executionName":"%s","acceptedAt":"%s"}\n' \
+    "$RUN_JOB_NAME" "$execution_id" "$accepted_at" > "$temporary") \
+    || ! mv -f "$temporary" "$receipt_path"; then
+    rm -f "$temporary"
+    echo "[e2e-cloud] ERROR: could not publish the accepted Cloud Run execution receipt." >&2
+    return 1
+  fi
+  return 0
+}
+
+wait_for_cloud_execution_completion() {
+  local timeout_seconds="$1" task_timeout="$2" completion_time deadline describe_failures=0
+  # Allow five minutes for Cloud Run's terminal status to settle after the
+  # configured per-task deadline.
+  deadline=$((SECONDS + timeout_seconds + 300))
+  echo "[e2e-cloud] Waiting for execution $execution_id to complete (task deadline: $task_timeout)."
+  while (( SECONDS <= deadline )); do
+    if completion_time=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
+      --format="value(status.completionTime)" 2>/dev/null); then
+      describe_failures=0
+      if [ -n "$completion_time" ] && [ "$completion_time" != "(unset)" ]; then return 0; fi
+    else
+      describe_failures=$((describe_failures + 1))
+      if [ "$describe_failures" -ge 5 ]; then
+        echo "[e2e-cloud] ERROR: failed to query execution $execution_id status five consecutive times." >&2
+        return 1
+      fi
+    fi
+    sleep 3
+  done
+  echo "[e2e-cloud] ERROR: execution $execution_id did not reach a terminal state within its task timeout and status-settlement margin." >&2
+  return 1
+}
+
 # kata e83z: cheap live-credential check at lane start — fails in seconds,
 # before any build/submit work, when the resolved identity cannot mint a token.
 # The error names the resolved identity and its source so the failure path is
@@ -382,6 +430,7 @@ cmd_run() {
   local local_build_flag=false
   local shards=1
   local timeout="60m"
+  local timeout_seconds
   local -a pw_args=()
 
   while [[ $# -gt 0 ]]; do
@@ -469,6 +518,22 @@ cmd_run() {
   done
   pw_args=("${normalized[@]}")
 
+  # External browser targets are a closed fixture/project pair. Validate before
+  # identity, image lookup or paid dispatch; ordinary lanes remain unchanged.
+  local external_handoff=false
+  if [ -n "${FRESHELL_E2E_EXTERNAL_FIXTURE_KIND:-}${FRESHELL_MANAGED_ENVIRONMENT_FIXTURE:-}${FRESHELL_CODE_CHECKPOINT_FIXTURE:-}" ]; then
+    external_handoff=true
+  fi
+  for arg in "${pw_args[@]}"; do
+    case "$arg" in
+      --project=chromium-external-target|*managed-provider-environment-external.spec.ts|*code-checkpoint-workspace-external.spec.ts)
+        external_handoff=true ;;
+    esac
+  done
+  if $external_handoff; then
+    (cd "$ROOT" && pnpm exec tsx scripts/testing/e2e-external-target.ts validate "${pw_args[@]}")
+  fi
+
   # The container entrypoint treats --dry-run as a diagnostic-only request: it
   # calculates and prints shard assignments, then exits before Playwright runs.
   # Such a task has no completion/retry receipt by design, so keep Cloud Run's
@@ -509,6 +574,15 @@ cmd_run() {
     exec pnpm exec playwright test \
       --config test/e2e-browser/playwright.config.ts \
       "${pw_args[@]}"
+  fi
+
+  # Parse and bound the completion-wait budget before any Cloud API call or
+  # job creation. Cloud Run accepts decimal and ISO-8601 duration forms; a
+  # post-dispatch parse failure would otherwise leave an accepted execution
+  # without a valid local wait deadline.
+  if ! timeout_seconds=$(cloud_duration_seconds "$timeout"); then
+    echo "[e2e-cloud] ERROR: unsupported Cloud Run task timeout duration '$timeout'." >&2
+    exit 1
   fi
 
   # Identity ladder (run lane): resolve before the image describe / build /
@@ -647,6 +721,9 @@ cmd_run() {
   trap cleanup_run_job EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  if $external_handoff; then
+    (cd "$ROOT" && pnpm exec tsx scripts/testing/e2e-external-target.ts append-env "$RUN_ENV_FILE" "${pw_args[@]}")
+  fi
 
   # 4 CPU / 4Gi (the coordinator's pre-authorized escalation for the
   # unified-agent-names acceptance lane): the 2-CPU instances' cold-attempt
@@ -663,22 +740,22 @@ cmd_run() {
     --memory=4Gi \
     --cpu=4
 
-  # Execute this run's job and wait for completion, capturing the exit
-  # status: an execute failure (quota, permissions, template error) MAY NOT
-  # masquerade as a test outcome.
+  # Start this run's job and capture the accepted execution ID immediately.
+  # The external managed-environment target uses the dispatch receipt below
+  # to start its browser acceptance window after cold image build and job
+  # setup, while this wrapper still waits for the exact execution to finish.
   echo "[e2e-cloud] Executing Cloud Run Job..."
   local execute_output
   local execute_exit=0
   local execution_id=""
-  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$RUN_JOB_NAME" --wait 2>&1) || execute_exit=$?
+  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$RUN_JOB_NAME" --async 2>&1) || execute_exit=$?
   echo "$execute_output"
 
   # Extract the execution ID from the execute output. gcloud prints
-  # `Execution [NAME] has successfully completed.` — brackets are literal and,
-  # on color-capable captures, the name is wrapped in ANSI SGR codes — so strip
-  # escapes and allow the bracket form. (A bare `Execution \K[^ ]+` captured
-  # the bracket+escapes; downstream describe/logs then addressed a nonexistent
-  # execution and the `|| echo 0` masking below reported succeeded=0 forever.)
+  # `Execution [NAME] has successfully started running.` — brackets are
+  # literal and may contain ANSI SGR codes — so strip escapes and allow the
+  # bracket form. A bare `Execution \K[^ ]+` captured the bracket+escapes,
+  # making downstream describe/logs address a nonexistent execution.
   execution_id=$(echo "$execute_output" \
     | sed -E 's/\x1b\[[0-9;]*m//g' \
     | grep -oP 'Execution \[?\K[A-Za-z0-9][A-Za-z0-9-]*' \
@@ -703,17 +780,77 @@ cmd_run() {
     exit 1
   fi
 
+  if [ -z "$execution_id" ]; then
+    echo "[e2e-cloud] ERROR: Cloud Run accepted the execute request but returned no execution ID." >&2
+    exit 1
+  fi
+  if ! write_cloud_dispatch_receipt; then
+    exit 1
+  fi
+  echo "[e2e-cloud] Cloud Run execution accepted: $execution_id"
+  if ! wait_for_cloud_execution_completion "$timeout_seconds" "$timeout"; then
+    exit 1
+  fi
+
   # Fetch logs (requires beta track for logs read).
   # Capture to a variable so we can print the full output AND extract a
   # per-shard summary, even when some shards fail.
   echo "[e2e-cloud] Fetching logs..."
-  local log_output
-  if ! log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
+  local log_output="" summary_lines="" display_log_unavailable=false task_summaries_complete=false
+  local task_summary_query task_summary_logs task_summary_receipts="" task_summary_error=""
+  local -a task_summary_account_args=()
+  local summary_attempt
+  if [ -n "${GCP_ACCOUNT:-}" ]; then
+    task_summary_account_args=(--account="$GCP_ACCOUNT")
+  fi
+  # Cloud Run's raw textPayload can begin with cursor-control ANSI sequences,
+  # so the Logging filter intentionally matches the status phrase unanchored;
+  # the parser strips ANSI and confirms that the normalized line is a footer.
+  task_summary_query="resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"${execution_id}\" AND (textPayload =~ \"[0-9]+ (failed|passed|skipped|interrupted)\" OR textPayload=\"[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt.\")"
+  for summary_attempt in 1 2 3 4 5; do
+    if log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
+      summary_lines=$(printf '%s\n' "$log_output" | node "$ROOT/scripts/testing/e2e-cloud-log-summary.mjs")
+      display_log_unavailable=false
+    else
+      log_output=""
+      display_log_unavailable=true
+    fi
+
+    task_summaries_complete=false
+    task_summary_error=""
+    if $playwright_dry_run; then
+      break
+    fi
+    if task_summary_logs=$(gcloud logging read "$task_summary_query" "${task_summary_account_args[@]}" \
+      --project="$GCP_PROJECT" --format=json --limit=1000 2>&1); then
+      if task_summary_receipts=$(printf '%s' "$task_summary_logs" \
+        | node "$ROOT/scripts/e2e-cloud-task-summaries.mjs" "$execution_id" "$shards" 2>&1); then
+        task_summaries_complete=true
+      else
+        task_summary_error="$task_summary_receipts"
+      fi
+    else
+      task_summary_error="$task_summary_logs"
+    fi
+    if $task_summaries_complete; then
+      if [ "$(jq -r '.hasPassedTest' <<< "$task_summary_receipts")" = "true" ]; then
+        break
+      fi
+      task_summary_error="task-indexed summaries are complete, but no passed Playwright footer has arrived yet"
+    fi
+    if [ "$summary_attempt" -lt 5 ]; then
+      echo "[e2e-cloud] Waiting for task-indexed Playwright summary evidence (attempt ${summary_attempt}/5): ${task_summary_error}" >&2
+      sleep 3
+    fi
+  done
+  if $display_log_unavailable; then
     # This human formatter exposes textPayload only. It remains useful for
     # display, but never decides whether retry evidence exists; that decision
     # comes from the required jsonPayload query below.
-    echo "[e2e-cloud] WARNING: could not read display logs: $log_output" >&2
-    log_output=""
+    echo "[e2e-cloud] WARNING: could not read display logs after five attempts." >&2
+  fi
+  if ! $task_summaries_complete && ! $playwright_dry_run; then
+    echo "[e2e-cloud] WARNING: task-indexed Playwright footer or empty-shard evidence for all ${shards} task(s) was not present in Cloud Logging after five attempts." >&2
   fi
 
   # Print logs from every shard. Retry traces are retained as bounded base64
@@ -772,13 +909,16 @@ cmd_run() {
     fi
   fi
 
-  # Extract and display a per-shard summary from the Playwright output.
-  # Each shard's entrypoint prints "Shard X/Y assignment" and Playwright's
-  # line reporter prints a final "  N passed (duration)" or
-  # "  N failed, M passed (duration)" summary line.
+  # Display only the summary rows whose raw textPayload entries were validated
+  # against this execution's Cloud Run task indexes. The formatted logs above
+  # can lag independently, so they are not a reliable source for this section.
   echo ""
   echo "[e2e-cloud] Per-shard summary:"
-  echo "$log_output" | grep -E '(\[e2e-entrypoint\] Shard [0-9]+/[0-9]+ assignment|^\s+[0-9]+ (passed|failed))' || true
+  if $playwright_dry_run; then
+    printf '%s\n' "$summary_lines"
+  elif $task_summaries_complete; then
+    jq -r '.summaries[] | "[Cloud Run task \(.taskIndex)]\n\(.text)"' <<< "$task_summary_receipts"
+  fi
 
   # Check execution status — transient describe errors right after
   # `execute --wait` are a real flake class, so retry briefly; a PERMANENT
@@ -821,6 +961,17 @@ cmd_run() {
   if [ "$succeeded" != "$shards" ]; then
     echo "[e2e-cloud] ERROR: expected $shards succeeded task(s), got $succeeded."
     exit 1
+  fi
+
+  if ! $playwright_dry_run; then
+    if ! $task_summaries_complete; then
+      echo "[e2e-cloud] ERROR: required task-indexed Playwright summary evidence was not present after five attempts: ${task_summary_error}" >&2
+      exit 1
+    fi
+    if [ "$(jq -r '.hasPassedTest' <<< "$task_summary_receipts")" != "true" ]; then
+      echo "[e2e-cloud] ERROR: Cloud execution completed with no passed Playwright tests; skipped tests and empty shards do not count." >&2
+      exit 1
+    fi
   fi
 
   # Playwright retries are useful diagnostics, but a task that passes only on

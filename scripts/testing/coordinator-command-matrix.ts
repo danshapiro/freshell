@@ -109,12 +109,13 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
 
 function isRetiredServerConfigSelector(arg: string): boolean {
   const normalized = arg.replaceAll('\\', '/')
-  // These integration specs exercise the Rust server through owned
-  // Docker/WebSocket fixtures, despite living in the retired Node-server tree.
+  // These specs exercise owned tooling or Rust Docker/WebSocket fixtures,
+  // despite living in the retired Node-server test trees.
   if ([
     'test/integration/server/managed-provider-parity.test.ts',
     'test/integration/server/fresh-agent-parity.test.ts',
     'test/integration/server/provider-parity-contract.test.ts',
+    'test/unit/server/e2e-cloud-external-target.test.ts',
   ].includes(normalized.replace(/^\.\//, ''))) {
     return false
   }

@@ -26,6 +26,10 @@ interface TabConfig {
     provider: string
     sessionId: string
   }
+  checkpointWorkspace?: {
+    path: string
+    provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint'
+  }
   sessionMetadataByKey?: Record<string, unknown>
 }
 
@@ -58,6 +62,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           codingCliSessionId: (t as any).codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
           sessionRef: t.sessionRef,
+          checkpointWorkspace: t.checkpointWorkspace,
           sessionMetadataByKey: t.sessionMetadataByKey,
           createRequestId: 'req-1',
         })),
@@ -190,6 +195,7 @@ describe('TabContent', () => {
     })
 
     it('restores fresh-agent default content for shell-mode no-layout tabs using persisted codingCliProvider metadata', () => {
+      const checkpointWorkspace = { path: '/selected/repo', provenance: 'directory-picker' as const }
       const store = createStore([
         {
           id: 'tab-1',
@@ -199,6 +205,7 @@ describe('TabContent', () => {
             provider: 'claude',
             sessionId: '550e8400-e29b-41d4-a716-446655440001',
           },
+          checkpointWorkspace,
           sessionMetadataByKey: {
             'claude:550e8400-e29b-41d4-a716-446655440001': {
               sessionType: 'freshclaude',
@@ -224,6 +231,7 @@ describe('TabContent', () => {
               provider: 'claude',
               sessionId: '550e8400-e29b-41d4-a716-446655440001',
             },
+            checkpointWorkspace,
           }),
         }),
         expect.anything(),

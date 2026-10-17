@@ -31,7 +31,8 @@ impl ManagedTerminalController for Controller {
     fn launch<'a>(
         &'a self,
         _: ManagedTerminalLaunch,
-    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, ManagedTerminalLaunchError>>
+    {
         panic!("output recovery must not launch a provider")
     }
     fn input<'a>(
@@ -94,6 +95,8 @@ fn fixture() -> (TerminalRegistry, Arc<Controller>) {
         calls: AtomicUsize::new(0),
         observed: Mutex::new(Vec::new()),
         response: Mutex::new(ManagedOutputRead {
+            lifecycle: None,
+            completion: None,
             stream_epoch: Some("epoch-new".into()),
             incarnation_id: Some("incarnation-new".into()),
             reset_required: true,
@@ -118,6 +121,13 @@ fn fixture() -> (TerminalRegistry, Arc<Controller>) {
     });
     registry.set_managed_controller(Some(controller.clone()));
     (registry, controller)
+}
+
+fn collect_messages() -> (FrameSink, Arc<std::sync::Mutex<Vec<ServerMessage>>>) {
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&messages);
+    let sink: FrameSink = Arc::new(move |frame| captured.lock().unwrap().push(frame));
+    (sink, messages)
 }
 
 #[test]
@@ -259,4 +269,356 @@ fn managed_opencode_same_runtime_accepts_a_signaled_session_switch() {
         Some("ses_Switched")
     );
     assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(206));
+}
+
+#[test]
+fn managed_output_shell_terminal_ended_final_tail() {
+    let (registry, controller) = fixture();
+    {
+        let mut inner = registry.inner.lock().unwrap();
+        let handle = inner.terminals.get_mut("terminal-stable").unwrap();
+        handle.managed.as_mut().unwrap().mode = "shell".into();
+        handle.shared.lock().unwrap().mode = "shell".into();
+    }
+    {
+        let mut response = controller.response.lock().unwrap();
+        response.stream_epoch = Some("epoch-old".into());
+        response.incarnation_id = Some("incarnation-old".into());
+        response.reset_required = false;
+        response.retained_from_seq = 206;
+        response.head_seq = 208;
+        response.exit_code = Some(17);
+        response.chunks = vec![ManagedOutputChunk {
+            seq_start: 207,
+            seq_end: 207,
+            data: "x".repeat(65536),
+        }];
+    }
+    immediate(registry.refresh_managed_output("terminal-stable", 65536)).unwrap();
+    assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(207));
+    assert_eq!(registry.inventory()[0].status, TerminalRunStatus::Running);
+    controller.response.lock().unwrap().chunks = vec![ManagedOutputChunk {
+        seq_start: 208,
+        seq_end: 208,
+        data: "final tail".into(),
+    }];
+    immediate(registry.refresh_managed_output("terminal-stable", 65536)).unwrap();
+    registry.finish_managed_exit("terminal-stable", 17);
+    assert_eq!(registry.inventory()[0].status, TerminalRunStatus::Exited);
+    assert!(registry.exists("terminal-stable"));
+    assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(208));
+    assert!(
+        registry
+            .live_managed_owner_for_session("shell", "native-original")
+            .is_some(),
+        "retained managed membership continues to dominate ordinary recreation after exit"
+    );
+    assert!(registry.directory()[0].snapshot.ends_with("final tail"));
+}
+
+#[test]
+fn managed_output_paced_exit_preserves_explicit_code_availability() {
+    for code in [None, Some(-1)] {
+        let (registry, _) = fixture();
+        immediate(registry.refresh_managed_output("terminal-stable", 65536)).unwrap();
+        registry.set_paced_page_max_bytes(0);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let start = registry
+            .attach(
+                "terminal-stable",
+                77,
+                Arc::new(move |frame| sink.lock().unwrap().push(frame)),
+                Some("explicit-availability".into()),
+                0,
+                false,
+                true,
+                None,
+                None,
+                None,
+                PacedAttachOptions::default(),
+            )
+            .paced
+            .expect("managed retained tail uses paced replay");
+        assert!(registry.finish_managed_completion("terminal-stable", code));
+        let mut cursor = start.session.page_end;
+        loop {
+            match registry.complete_paced_tail(
+                "terminal-stable",
+                77,
+                "explicit-availability",
+                cursor,
+                2,
+                0,
+            ) {
+                PacedTailCompletion::Handoff { end_seq, .. } => cursor = end_seq,
+                PacedTailCompletion::Completed { .. } => break,
+                other => panic!("unexpected completion: {other:?}"),
+            }
+        }
+        let frames = captured.lock().unwrap();
+        let exits: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ServerMessage::TerminalExit(exit) => Some(exit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].managed_retained, Some(true));
+        assert_eq!(exits[0].exit_code_available, Some(code.is_some()));
+        assert_eq!(exits[0].exit_code, code.unwrap_or(-1));
+        assert_eq!(registry.managed_attached_to(77), vec!["terminal-stable"]);
+    }
+}
+
+fn lifecycle_with_recovery_state(
+    state: ManagedLifecycleState,
+    recovery_state: &str,
+    desired_state: &str,
+) -> ManagedLifecycle {
+    ManagedLifecycle {
+        state,
+        recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
+            desired_state: desired_state.into(),
+            recovery_state: recovery_state.into(),
+            reason: Some("fixture final recovery state".into()),
+            attempt_id: Some("attempt-fixture".into()),
+            incident_id: Some("incident-fixture".into()),
+            durability_state: "retained".into(),
+            allocation_state: "retained".into(),
+        }),
+    }
+}
+
+#[test]
+fn final_managed_lifecycle_marks_facade_exited_without_inventing_exit_code() {
+    for (state, recovery_state, desired_state, runtime_status) in [
+        (
+            ManagedLifecycleState::Blocked,
+            "blocked",
+            "running",
+            freshell_protocol::RuntimeStatus::Blocked,
+        ),
+        (
+            ManagedLifecycleState::Ended,
+            "lost",
+            "running",
+            freshell_protocol::RuntimeStatus::Exited,
+        ),
+        (
+            ManagedLifecycleState::Ended,
+            "stopped",
+            "stopped",
+            freshell_protocol::RuntimeStatus::Exited,
+        ),
+    ] {
+        let (registry, _) = fixture();
+        assert!(registry.ingest_managed_output(
+            "terminal-stable",
+            207,
+            207,
+            "retained final output".into(),
+        ));
+        registry.publish_managed_lifecycle(
+            "terminal-stable",
+            Some(lifecycle_with_recovery_state(
+                state,
+                recovery_state,
+                desired_state,
+            )),
+        );
+
+        let row = &registry.inventory()[0];
+        assert_eq!(row.status, TerminalRunStatus::Exited);
+        assert_eq!(row.runtime_status, Some(runtime_status));
+        assert_eq!(
+            row.recovery_summary
+                .as_ref()
+                .map(|summary| summary.recovery_state.as_str()),
+            Some(recovery_state)
+        );
+        assert!(!registry.is_live("terminal-stable"));
+        assert!(registry.exists("terminal-stable"));
+        assert!(registry.directory()[0]
+            .snapshot
+            .contains("retained final output"));
+
+        let (sink, seen) = collect_messages();
+        assert!(
+            registry
+                .attach(
+                    "terminal-stable",
+                    77,
+                    sink,
+                    Some("final-lifecycle-attach".into()),
+                    0,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    PacedAttachOptions::default(),
+                )
+                .found
+        );
+        let frames = seen.lock().unwrap();
+        assert!(frames.iter().any(|frame| matches!(frame,
+            ServerMessage::TerminalOutput(output) if output.data.contains("retained final output"))));
+        assert!(frames.iter().any(|frame| matches!(frame,
+            ServerMessage::TerminalExit(exit)
+                if exit.managed_retained == Some(true)
+                    && exit.exit_code == -1
+                    && exit.exit_code_available == Some(false))));
+    }
+}
+
+#[test]
+fn managed_completion_after_ended_lifecycle_publishes_the_observed_exit_code() {
+    let (registry, _) = fixture();
+    let (sink, seen) = collect_messages();
+    assert!(
+        registry
+            .attach(
+                "terminal-stable",
+                78,
+                sink,
+                Some("completion-after-lifecycle".into()),
+                206,
+                false,
+                false,
+                None,
+                None,
+                None,
+                PacedAttachOptions::default(),
+            )
+            .found
+    );
+    seen.lock().unwrap().clear();
+
+    registry.publish_managed_lifecycle(
+        "terminal-stable",
+        Some(lifecycle_with_recovery_state(
+            ManagedLifecycleState::Ended,
+            "lost",
+            "running",
+        )),
+    );
+    assert!(!registry.is_live("terminal-stable"));
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, ServerMessage::TerminalExit(_))));
+
+    assert!(registry.finish_managed_exit("terminal-stable", 17));
+    assert!(seen.lock().unwrap().iter().any(|frame| matches!(frame,
+        ServerMessage::TerminalExit(exit)
+            if exit.exit_code == 17
+                && exit.exit_code_available == Some(true)
+                && exit.managed_retained == Some(true))));
+}
+
+#[test]
+fn managed_unknown_completion_after_ended_lifecycle_notifies_attached_viewer_once() {
+    let (registry, _) = fixture();
+    let (sink, seen) = collect_messages();
+    assert!(
+        registry
+            .attach(
+                "terminal-stable",
+                79,
+                sink,
+                Some("unknown-completion-after-lifecycle".into()),
+                206,
+                false,
+                false,
+                None,
+                None,
+                None,
+                PacedAttachOptions::default(),
+            )
+            .found
+    );
+    seen.lock().unwrap().clear();
+
+    registry.publish_managed_lifecycle(
+        "terminal-stable",
+        Some(lifecycle_with_recovery_state(
+            ManagedLifecycleState::Ended,
+            "lost",
+            "running",
+        )),
+    );
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, ServerMessage::TerminalExit(_))));
+
+    assert!(registry.finish_managed_completion("terminal-stable", None));
+    {
+        let frames = seen.lock().unwrap();
+        assert!(frames.iter().any(|frame| matches!(frame,
+            ServerMessage::TerminalExit(exit)
+                if exit.exit_code == -1
+                    && exit.exit_code_available == Some(false)
+                    && exit.managed_retained == Some(true))));
+    }
+
+    seen.lock().unwrap().clear();
+    assert!(registry.finish_managed_completion("terminal-stable", None));
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, ServerMessage::TerminalExit(_))));
+}
+
+#[test]
+fn managed_blocked_lifecycle_can_transition_through_recovery_back_to_running() {
+    let (registry, _) = fixture();
+    registry.publish_managed_lifecycle(
+        "terminal-stable",
+        Some(lifecycle_with_recovery_state(
+            ManagedLifecycleState::Blocked,
+            "blocked",
+            "running",
+        )),
+    );
+    assert!(!registry.is_live("terminal-stable"));
+
+    registry.publish_managed_lifecycle(
+        "terminal-stable",
+        Some(lifecycle_with_recovery_state(
+            ManagedLifecycleState::Recovering,
+            "recovering",
+            "running",
+        )),
+    );
+    assert!(registry.is_live("terminal-stable"));
+    assert_eq!(
+        registry.inventory()[0].runtime_status,
+        Some(freshell_protocol::RuntimeStatus::Recovering)
+    );
+
+    registry.publish_managed_lifecycle(
+        "terminal-stable",
+        Some(lifecycle_with_recovery_state(
+            ManagedLifecycleState::Running,
+            "live",
+            "running",
+        )),
+    );
+    let row = &registry.inventory()[0];
+    assert!(registry.is_live("terminal-stable"));
+    assert_eq!(row.status, TerminalRunStatus::Running);
+    assert_eq!(
+        row.runtime_status,
+        Some(freshell_protocol::RuntimeStatus::Running)
+    );
+    assert_eq!(
+        row.recovery_summary.as_ref().unwrap().recovery_state,
+        "live"
+    );
 }

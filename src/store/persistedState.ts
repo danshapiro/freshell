@@ -20,7 +20,12 @@ import {
   stripScopedPaneTitleMetadata,
   stripSessionOwnedTabFreezeFlags,
 } from '@/lib/session-name-migration'
-import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
+import {
+  freshAgentCheckpointConversationKeyForContent,
+  normalizeFreshAgentCheckpointWorkspace,
+  normalizeFreshAgentCheckpointOutcomes,
+  normalizeFreshAgentPaneModelSelection,
+} from './paneTypes'
 import { createLogger } from '@/lib/client-logger'
 import { isValidMachineIdStamp } from '@/lib/machine-identity'
 
@@ -51,6 +56,13 @@ const zSanitizedOptionalString = z.preprocess(
 
 const zTabMode = zSanitizedOptionalString
 const zCodingCliProvider = zSanitizedOptionalString
+const zCheckpointWorkspace = z.preprocess(
+  (value) => normalizeFreshAgentCheckpointWorkspace(value),
+  z.object({
+    path: z.string().min(1),
+    provenance: z.enum(['directory-picker', 'resolved-project', 'legacy-checkpoint']),
+  }).optional(),
+)
 
 const zTab = z.object({
   id: z.string().min(1),
@@ -61,6 +73,7 @@ const zTab = z.object({
   mode: zTabMode,
   codingCliProvider: zCodingCliProvider,
   resumeSessionId: z.string().optional(),
+  checkpointWorkspace: zCheckpointWorkspace,
 }).passthrough()
 
 // The tabs array is validated per-element (see `salvageTabs`) rather than atomically via
@@ -337,11 +350,17 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
 }
 
 function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
+  const checkpointOutcomes = normalizeFreshAgentCheckpointOutcomes(
+    content.checkpointOutcomes,
+    typeof content.createRequestId === 'string' ? content.createRequestId : undefined,
+    freshAgentCheckpointConversationKeyForContent(content),
+  )
   const existingRestoreError = readRestoreError(content.restoreError)
   if (existingRestoreError) {
     const {
       sessionRef: _legacySessionRef,
       restoreError: _legacyRestoreError,
+      checkpointOutcomes: _legacyCheckpointOutcomes,
       // Vestigial per-pane display overrides (no writer since 2026-04):
       // dropped during rehydration, never constructed into pane content.
       showThinking: _legacyShowThinking,
@@ -364,6 +383,7 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
     return {
       ...rest,
       restoreError: existingRestoreError,
+      ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
     }
   }
 
@@ -383,6 +403,7 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
   const {
     sessionRef: _legacySessionRef,
     restoreError: _legacyRestoreError,
+    checkpointOutcomes: _legacyCheckpointOutcomes,
     // Vestigial per-pane display overrides (no writer since 2026-04):
     // dropped during rehydration, never constructed into pane content.
     showThinking: _legacyShowThinking,
@@ -410,6 +431,7 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
 
   return {
     ...restWithNormalizedModel,
+    ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
     ...(('restoreError' in durableState && durableState.restoreError) || existingRestoreError
       ? { restoreError: ('restoreError' in durableState && durableState.restoreError) || existingRestoreError }

@@ -307,7 +307,7 @@ function createStoreWithSession() {
   })
 }
 
-function createStoreWithSidebarWindowAgentSession() {
+function createStoreWithSidebarWindowAgentSession(checkpointWorkspace?: { path: string; provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint' }) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -408,6 +408,7 @@ function createStoreWithSidebarWindowAgentSession() {
                     updatedAt: 2000,
                     nameRef: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
                     sessionName: 'Sidebar Agent Session',
+                    ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
                   },
                 ],
               },
@@ -559,6 +560,7 @@ function createStoreWithOverlappingSessionWindows() {
                   {
                     sessionId: VALID_SESSION_ID,
                     provider: 'claude',
+                    sessionType: 'freshclaude',
                     title: 'History Terminal Session',
                     cwd: '/shared/project/history',
                     createdAt: 1000,
@@ -2168,6 +2170,21 @@ describe('ContextMenuProvider', () => {
   it('uses the sidebar session window for sidebar actions and preserves fresh-agent session type', async () => {
     const user = userEvent.setup()
     const store = createStoreWithSidebarWindowAgentSession()
+    const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-existing-checkpoint-scope',
+        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: { provider: 'claude', sessionId: VALID_SESSION_ID },
+        status: 'idle',
+        checkpointWorkspace,
+      },
+    }))
     render(
       <Provider store={store}>
         <ContextMenuProvider
@@ -2204,6 +2221,7 @@ describe('ContextMenuProvider', () => {
           provider: 'claude',
           sessionType: 'freshclaude',
           resumeSessionId: VALID_SESSION_ID,
+          checkpointWorkspace,
           sessionRef: {
             provider: 'claude',
             sessionId: VALID_SESSION_ID,
@@ -2440,8 +2458,9 @@ describe('ContextMenuProvider', () => {
     expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
       type: 'leaf',
       content: {
-        kind: 'terminal',
-        mode: 'claude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         initialCwd: '/shared/project/history',
         sessionRef: {
           provider: 'claude',
@@ -2452,9 +2471,108 @@ describe('ContextMenuProvider', () => {
     })
   })
 
+  it('preserves the matching pane checkpoint workspace when opening that session in a new tab', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSidebarWindowAgentSession()
+    const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-checkpoint-scope',
+        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: { provider: 'claude', sessionId: VALID_SESSION_ID },
+        status: 'idle',
+        checkpointWorkspace,
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Sidebar Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in new tab'))
+
+    const openedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'tab-1')
+    expect(openedTab).toBeTruthy()
+    expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
+      type: 'leaf',
+      content: { kind: 'fresh-agent', checkpointWorkspace },
+    })
+  })
+
+  it('preserves a session-provided checkpoint workspace when opening it in a new tab', async () => {
+    const user = userEvent.setup()
+    const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+    const store = createStoreWithSidebarWindowAgentSession(checkpointWorkspace)
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Sidebar Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in new tab'))
+
+    const openedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'tab-1')
+    expect(openedTab?.checkpointWorkspace).toEqual(checkpointWorkspace)
+    expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
+      type: 'leaf',
+      content: { kind: 'fresh-agent', checkpointWorkspace },
+    })
+  })
+
   it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {
     const user = userEvent.setup()
     const store = createStoreWithOverlappingSessionWindows()
+    const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-existing-checkpoint-scope',
+        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: { provider: 'claude', sessionId: VALID_SESSION_ID },
+        status: 'idle',
+        checkpointWorkspace,
+      },
+    }))
     render(
       <Provider store={store}>
         <ContextMenuProvider
@@ -2483,6 +2601,13 @@ describe('ContextMenuProvider', () => {
       'History Terminal Session',
       'History Extra Session',
     ])
+    const resumedLayout = openedTabs
+      .map((tab) => store.getState().panes.layouts[tab.id])
+      .find((layout) => layout?.type === 'leaf' && layout.content.kind === 'fresh-agent')
+    expect(resumedLayout).toMatchObject({
+      type: 'leaf',
+      content: { kind: 'fresh-agent', checkpointWorkspace },
+    })
   })
 
   it('copies resume command from sidebar session context menu', async () => {

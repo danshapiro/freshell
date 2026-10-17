@@ -728,13 +728,31 @@ async fn directory_items(state: &TerminalsState) -> Vec<Value> {
             obj.insert(
                 "status".into(),
                 Value::String(
-                    match e.status {
-                        TerminalRunStatus::Running => "running",
-                        TerminalRunStatus::Exited => "exited",
+                    match e.runtime_status {
+                        Some(freshell_protocol::RuntimeStatus::Blocked) => "blocked",
+                        Some(freshell_protocol::RuntimeStatus::Recovering) => "recovering",
+                        Some(freshell_protocol::RuntimeStatus::Running) => "running",
+                        Some(freshell_protocol::RuntimeStatus::Exited) => "exited",
+                        None => match e.status {
+                            TerminalRunStatus::Running => "running",
+                            TerminalRunStatus::Exited => "exited",
+                        },
                     }
                     .to_string(),
                 ),
             );
+            if let Some(status) = e.runtime_status {
+                obj.insert("runtimeStatus".into(), json!(status));
+            }
+            if let Some(summary) = e.recovery_summary {
+                obj.insert("recoverySummary".into(), json!(summary));
+            }
+            if let Some(soul) = e.soul_id {
+                obj.insert("soulId".into(), json!(soul));
+            }
+            if let Some(incarnation) = e.incarnation_id {
+                obj.insert("incarnationId".into(), json!(incarnation));
+            }
             obj.insert("hasClients".into(), Value::Bool(e.has_clients));
             if resume_target_is_subagent {
                 obj.insert("resumeTargetIsSubagent".into(), Value::Bool(true));
@@ -1452,6 +1470,63 @@ mod title_scope_tests {
         assert_eq!(resp["titleOverride"], json!("Shell Renamed"));
         assert!(state.settings.session_overrides().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(all(test, feature = "managed-runtime-v1"))]
+mod managed_fixture_denies_host_pty {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn http_cli_fallback() {
+        let registry = TerminalRegistry::new().with_managed_environment_fixture_only(true);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let state = freshell_freshagent::FreshAgentState::new(
+            Arc::new("fixture-token".into()),
+            Arc::new(tx),
+        )
+        .with_terminal_registry(registry.clone());
+        // CLI and MCP create-tab requests use this production authenticated route.
+        let response = freshell_freshagent::router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tabs")
+                    .header("x-auth-token", "fixture-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"shell","cwd":"/tmp"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = registry.directory();
+        let pids: Vec<_> = rows
+            .iter()
+            .filter_map(|row| registry.pid_of(&row.terminal_id))
+            .collect();
+        for row in &rows {
+            registry.kill(&row.terminal_id);
+        }
+        assert!(rows.is_empty(), "ordinary rows must be absent: {rows:?}");
+        assert!(
+            pids.is_empty(),
+            "ordinary child PIDs must be absent: {pids:?}"
+        );
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("managed environment fixture denies host PTY"),
+            "{body}"
+        );
     }
 }
 

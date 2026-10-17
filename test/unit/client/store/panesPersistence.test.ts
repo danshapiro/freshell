@@ -29,6 +29,8 @@ import {
 } from '../../../../src/store/persistMiddleware'
 import { PANES_SCHEMA_VERSION } from '../../../../src/store/persistedState'
 import { isWellFormedPaneTree } from '../../../../src/store/paneTreeValidation'
+import { flushPersistedLayoutNow } from '../../../../src/store/persistControl'
+import type { LaunchFailure, TerminalPaneContent } from '../../../../src/store/paneTypes'
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout
 // key (freshell.layout.v3.<layoutWindowId>) and its per-window pre-
@@ -57,6 +59,41 @@ describe('Panes Persistence Integration', () => {
   afterEach(() => {
     vi.useRealTimers()
   })
+
+  it.each(['managed-preparation', 'ordinary', 'owner-stamped', 'reserved'] as const)(
+    'restores only the safe managed preparation failure across a real flush/load: %s', (kind) => {
+      const failure: LaunchFailure = Object.assign({ code: kind === 'reserved' ? 'SESSION_RESERVED' as const : 'LAUNCH_FAILED' as const,
+        message: kind === 'managed-preparation' ? 'arbitrary-secret-config-marker' : 'ordinary transient failure',
+        retryable: true }, kind === 'managed-preparation' ? {
+          providerPreparationFailure: { code: 'SELECTED_REFERENCE_UNAVAILABLE' as const, stage: 'configuration' as const, operation: 'resolve' as const, workspace: '/workspace', declaringConfig: '/workspace/opencode.json',
+            selectedPath: '/workspace/missing-selected.txt',
+            cause: 'not_found' as const },
+        } : kind === 'owner-stamped' ? { ownerKind: 'terminal' as const, ownerGeneration: 7 } : {})
+      const store = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer },
+        middleware: getDefault => getDefault().concat(persistMiddleware as any) })
+      store.dispatch(addTab({ mode: 'opencode' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'opencode',
+        status: 'error', createRequestId: 'same-failed-managed-request', launchFailure: failure } satisfies TerminalPaneContent }))
+      store.dispatch(flushPersistedLayoutNow())
+      resetPersistedLayoutCacheForTests()
+      resetPersistedPanesCacheForTests()
+      const loaded = loadPersistedPanes()
+      expect(loaded).toBeTruthy()
+      const restored = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
+      restored.dispatch(hydratePanes(loaded))
+      const content = (restored.getState().panes.layouts[tabId] as any).content
+      expect(content.createRequestId).toBe('same-failed-managed-request')
+      expect(content.terminalId).toBeUndefined()
+      expect(content.soulId).toBeUndefined()
+      expect(content.sessionRef).toBeUndefined()
+      if (kind === 'managed-preparation') {
+        expect(content.launchFailure).toEqual({ ...failure,
+          message: 'Configuration blocked: /workspace/missing-selected.txt: referenced file was not found' })
+        expect(JSON.stringify(localStorageMock._getStore())).not.toContain('arbitrary-secret-config-marker')
+      } else expect(content.launchFailure).toBeUndefined()
+    },
+  )
 
   it('persists and restores panes across page refresh', () => {
     // 1. Create a store (simulates initial page load)

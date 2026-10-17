@@ -12,7 +12,10 @@ type DirectoryPickerProps = {
   defaultCwd?: string
   tabDirectories?: string[]
   globalDefault?: string
-  onConfirm: (cwd: string) => void
+  onConfirm: (
+    cwd: string,
+    checkpointWorkspace?: { path: string; provenance: 'directory-picker' },
+  ) => void
   onBack: () => void
   paneId?: string
   focusEligible?: boolean
@@ -193,13 +196,22 @@ export default function DirectoryPicker({
     const validationId = validationRequestIdRef.current
 
     try {
-      const result = await api.post<{ valid: boolean; resolvedPath?: string }>('/api/files/validate-dir', { path: nextPath })
+      const result = await api.post<{
+        valid: boolean
+        resolvedPath?: string
+        checkpointWorkspaceEligible?: boolean
+      }>('/api/files/validate-dir', { path: nextPath })
       if (validationRequestIdRef.current !== validationId) return
       if (!result.valid) {
         setError('directory not found')
         return
       }
-      onConfirm(result.resolvedPath || nextPath)
+      const resolvedPath = result.resolvedPath || nextPath
+      if (result.checkpointWorkspaceEligible === true) {
+        onConfirm(resolvedPath, { path: resolvedPath, provenance: 'directory-picker' })
+      } else {
+        onConfirm(resolvedPath)
+      }
     } catch (error) {
       if (validationRequestIdRef.current !== validationId) return
       if (isApiError(error) && error.status === 403) {
@@ -229,7 +241,23 @@ export default function DirectoryPicker({
     try {
       const result = await api.post<{ created: boolean; existed?: boolean; resolvedPath?: string }>('/api/files/mkdir', { path: nextPath })
       if (createRequestIdRef.current !== createId) return
-      onConfirm(result.resolvedPath || nextPath)
+      const resolvedPath = result.resolvedPath || nextPath
+      const validation = await api.post<{
+        valid: boolean
+        resolvedPath?: string
+        checkpointWorkspaceEligible?: boolean
+      }>('/api/files/validate-dir', { path: resolvedPath })
+      if (createRequestIdRef.current !== createId) return
+      if (!validation.valid) {
+        setError('directory not found')
+        return
+      }
+      const validatedPath = validation.resolvedPath || resolvedPath
+      if (validation.checkpointWorkspaceEligible === true) {
+        onConfirm(validatedPath, { path: validatedPath, provenance: 'directory-picker' })
+      } else {
+        onConfirm(validatedPath)
+      }
     } catch (error) {
       if (createRequestIdRef.current !== createId) return
       if (isApiError(error) && error.status === 403) {
