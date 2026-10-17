@@ -10526,6 +10526,52 @@ pub(crate) mod automatic_retry_tests {
         assert_eq!(backend.count("retained-stops"), 0);
     }
 
+    #[tokio::test]
+    async fn retained_live_worker_captures_missing_evidence_and_reattaches_in_one_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed_retained_opencode(&supervisor, dir.path()).await;
+        std::fs::remove_file(dir.path().join("retained/retained-store-unreadable")).unwrap();
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert!(before.resume_spec.is_none());
+        let journals = attempts(dir.path());
+        let result = supervisor
+            .recover(RecoverRequest {
+                soul_id: soul.clone(),
+                trigger: RecoveryTrigger::StartupReconcile,
+                expected_intent_revision: Some(before.intent_revision),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            })
+            .await;
+        close_retry_hosts(&backend).await;
+        let result = result.expect("one recovery call must save missing evidence and reattach");
+        assert_eq!(result.outcome, RecoveryOutcome::Reattached);
+        assert_eq!(
+            result.view.incarnation_id,
+            *before.prior_handle.incarnation_id()
+        );
+        assert_eq!(result.view.recovery_state, RecoveryState::Live);
+        let after = supervisor.registry.recovery_context(soul).await.unwrap();
+        assert_eq!(after.evidence_revision, before.evidence_revision + 1);
+        let saved = after
+            .resume_spec
+            .expect("verified native evidence must be saved");
+        assert_eq!(saved.evidence_revision, after.evidence_revision);
+        assert_eq!(saved.provider_session.native_session_id, "retry-root");
+        let settled = attempts(dir.path());
+        assert_eq!(&settled[..journals.len()], journals.as_slice());
+        assert_eq!(settled.len(), journals.len() + 1);
+        assert_eq!(settled.last().unwrap().1, "reattached");
+        assert_eq!(backend.count("retained-probes"), 1);
+        assert_eq!(backend.count("creates"), 0);
+        assert_eq!(backend.count("retained-grants"), 0);
+        assert_eq!(backend.count("retained-stops"), 0);
+    }
+
     async fn retained_unreadable_no_new_attempt_case(manual: bool) {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, _) = open(dir.path(), 0);
