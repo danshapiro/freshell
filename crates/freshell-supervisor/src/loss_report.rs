@@ -290,7 +290,16 @@ impl LostDecision {
         ) {
             return Err(LossDecisionError::AlreadyTerminal);
         }
-        if context.allocation_state != freshell_runtime_protocol::AllocationState::VerifiedDurable {
+        // Shell never materializes a provider-native identity. Its durable
+        // dispatch journal, together with the reattach/seed path inventory,
+        // qualifies a non-resumable terminal end instead of native loss.
+        if context.provider == "shell" {
+            if context.dispatched_command_count == 0 {
+                return Err(LossDecisionError::PristineSeedAvailable);
+            }
+        } else if context.allocation_state
+            != freshell_runtime_protocol::AllocationState::VerifiedDurable
+        {
             return Err(LossDecisionError::UnverifiedMaterialization);
         }
         if context.provider != "shell"
@@ -524,12 +533,24 @@ fn validate_loss_capture(
         || (recovery_state == "lost"
             && current_incident.as_deref() == Some(certificate.incident_id.as_str())
             && recovery_attempt_id.is_none());
-    if capture.allocation_state != freshell_runtime_protocol::AllocationState::VerifiedDurable
-        || (provider != "shell"
+    let materialization_qualified = if provider == "shell" {
+        // Recheck the real journal in the incident-before-cleanup transaction;
+        // a shell's allocated state alone never authorizes a terminal end.
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM input_commands WHERE soul_id=?1 AND state IN ('dispatching','completed','ambiguous'))",
+            params![certificate.soul_id.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?
+    } else {
+        capture.allocation_state == freshell_runtime_protocol::AllocationState::VerifiedDurable
             && native_session_id
                 .as_deref()
-                .is_none_or(|id| id.trim().is_empty()))
-        || allocation_state != "verified_durable"
+                .is_some_and(|id| !id.trim().is_empty())
+    };
+    let allocation_state: freshell_runtime_protocol::AllocationState =
+        serde_json::from_value(serde_json::Value::String(allocation_state))?;
+    if !materialization_qualified
+        || allocation_state != capture.allocation_state
         || control_epoch != capture.control_epoch
         || identity_revision != capture.identity_revision
         || evidence_revision != capture.evidence_revision
