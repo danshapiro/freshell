@@ -1842,9 +1842,9 @@ impl Supervisor {
             .probe_recovery_context(&mut context, &mut transient)
             .await?;
         let probe = match probe {
-            RecoveryProbe::ResumeReady { resume_spec, .. }
-                if context.resume_spec.as_ref() != Some(&*resume_spec) =>
-            {
+            RecoveryProbe::ResumeReady { resume_spec, .. } => {
+                // Validate even an unchanged proof against the current attempt;
+                // the recovery capture is idempotent after checking its fence.
                 let stored = self
                     .registry
                     .store_verified_recovery_resume_spec_fenced(
@@ -2112,7 +2112,8 @@ impl Supervisor {
                         Ok(candidate) => candidate,
                         Err(probe) => return Ok(probe),
                     };
-                    let store_fence = context.write_fence();
+                    // classify_recovery captures native proof once, under the
+                    // current recovery fence, after this probe has completed.
                     let store_probe = self.probe_host_store(&*context, &host, candidate).await?;
                     crate::service::append_event(
                         &self.config.lifecycle_log,
@@ -2123,39 +2124,6 @@ impl Supervisor {
                             "probe": store_probe,
                         }),
                     );
-                    let captured = match store_probe {
-                        RecoveryProbe::ResumeReady { resume_spec, .. } => {
-                            let stored = self
-                                .registry
-                                .store_verified_resume_spec_for_live_incarnation_fenced(
-                                    context.soul_id.clone(),
-                                    context.prior_handle.incarnation_id().clone(),
-                                    context.evidence_revision,
-                                    *resume_spec,
-                                    store_fence,
-                                )
-                                .await
-                                .map_err(map_registry)?;
-                            let Some(stored) = stored else {
-                                return Ok(blocked(
-                                    RecoveryPath::NativeResume,
-                                    RecoveryBlockReason::ProviderUnavailable,
-                                    "provider-store evidence was superseded by a newer incarnation or recovery state; retry the probe",
-                                    Some(2_000),
-                                ));
-                            };
-                            context.evidence_revision =
-                                context.evidence_revision.max(stored.evidence_revision);
-                            context.resume_spec = Some(stored.clone());
-                            context.allocation_state = stored.allocation_state;
-                            RecoveryProbe::ResumeReady {
-                                evidence_revision: stored.evidence_revision,
-                                resume_spec: Box::new(stored),
-                            }
-                        }
-                        other => other,
-                    };
-
                     // A loader may emit its native root before later restoration
                     // fails. Re-read the current child after the independent store
                     // read, then persist only that still-live current observation.
@@ -2195,7 +2163,7 @@ impl Supervisor {
                         && !deterministic_fresh_fixture(context)
                         && !native_observation_qualified
                         && matches!(
-                            &captured,
+                            &store_probe,
                             RecoveryProbe::ResumeReady { .. }
                                 | RecoveryProbe::PristineSeedReady { .. }
                         )
@@ -2215,7 +2183,7 @@ impl Supervisor {
                             host_boot_id: status.host_boot_id,
                             container_id: context.prior_handle.container_id().to_owned(),
                         },
-                        after_native_probe(context, captured),
+                        after_native_probe(context, store_probe),
                         context.provider != "shell"
                             && context.fixture.is_none()
                             && !deterministic_fresh_fixture(context),
@@ -8500,7 +8468,7 @@ pub(crate) mod automatic_retry_tests {
             let retained_blocker = runtime.join("retained-store-unreadable");
             let retained_probe_failure = runtime.join("retained-probe-unreachable");
             let retained_post_read_failure = runtime.join("retained-fault-after-ready");
-            let retained_worker_exited = runtime.join("retained-worker-exited");
+            let worker_exited = runtime.join("retained-worker-exited");
             let retained_provider = self.root.join("native-reader-fixture").exists()
                 && (handle
                     .terminal()
@@ -8520,7 +8488,9 @@ pub(crate) mod automatic_retry_tests {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
-                    if (retained_observation.exists() || baseline_stop.is_some())
+                    if (retained_observation.exists()
+                        || baseline_stop.is_some()
+                        || worker_exited.exists())
                         && !matches!(&request.body, HostCommand::Hello { .. })
                     {
                         assert_eq!(
@@ -8765,7 +8735,7 @@ pub(crate) mod automatic_retry_tests {
                                 max_control_epoch: 1,
                                 max_execution_generation: generation,
                                 fixture_evidence: serde_json::json!({}),
-                                exited: retained_worker_exited.exists(),
+                                exited: worker_exited.exists(),
                                 native_session_id: observation
                                     .as_ref()
                                     .map(|observation| observation.native_session_id.clone())
@@ -8809,7 +8779,9 @@ pub(crate) mod automatic_retry_tests {
                                     continue;
                                 }
                             }
-                            if native_file.exists() {
+                            if native_file.exists()
+                                || provider_home.join("native-session-state.json").exists()
+                            {
                                 assert!(matches!(
                                     freshell_agent_runtime::probe_provider_store(
                                         &provider_home,
@@ -10890,6 +10862,152 @@ pub(crate) mod automatic_retry_tests {
                 && v.recovery_reason
                     .as_deref()
                     .is_some_and(|r| r.contains("RETRY_BUDGET"))));
+    }
+
+    #[test]
+    fn reserved_retry_recovers_exited_worker_in_running_enclosure() {
+        reserved_exited_worker_retry_case(false, true);
+    }
+
+    #[test]
+    fn reserved_retry_recovers_exited_worker_after_backend_outage() {
+        reserved_exited_worker_retry_case(true, true);
+    }
+
+    #[test]
+    fn reserved_retry_recovers_exited_worker_without_saved_proof() {
+        reserved_exited_worker_retry_case(false, false);
+    }
+
+    fn reserved_exited_worker_retry_case(prior_backend_outage: bool, saved_proof: bool) {
+        // The complete running-host recovery path exceeds libtest's small
+        // default stack in debug builds. Optimized verification deliberately
+        // uses the ordinary 2 MiB stack; failed assertions propagate via join.
+        std::thread::Builder::new()
+            .name("reserved-native-retry".into())
+            .stack_size(if cfg!(debug_assertions) { 16 } else { 2 } * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(Box::pin(run_reserved_exited_worker_retry_case(
+                        prior_backend_outage,
+                        saved_proof,
+                    )));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn run_reserved_exited_worker_retry_case(prior_backend_outage: bool, saved_proof: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let runtime = dir.path().join("running-prior");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        std::fs::write(
+            runtime.join("fixture-object"),
+            before.prior_handle.container_id(),
+        )
+        .unwrap();
+        if !saved_proof {
+            Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .execute(
+                    "UPDATE souls SET resume_spec=NULL,allocation_state='materializing',durability_state='live_only' WHERE soul_id=?1",
+                    [soul.as_str()],
+                )
+                .unwrap();
+        }
+        std::fs::write(runtime.join("fixture-started"), b"started").unwrap();
+        std::fs::write(runtime.join("fixture-generation"), b"1").unwrap();
+        std::fs::write(runtime.join("retained-worker-exited"), b"exited").unwrap();
+        Connection::open(supervisor.registry.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE incarnations SET runtime_dir=?1,execution_generation=1 WHERE incarnation_id=?2",
+                rusqlite::params![runtime.to_str().unwrap(), before.prior_handle.incarnation_id().as_str()],
+            )
+            .unwrap();
+        let provider_home = dir.path().join("provider");
+        std::fs::create_dir(&provider_home).unwrap();
+        std::fs::write(
+            provider_home.join("native-session-state.json"),
+            b"{\"sessionId\":\"retry-root\",\"history\":[\"stored native turn\"],\"checkpointRevision\":0}",
+        )
+        .unwrap();
+
+        if prior_backend_outage {
+            backend.unavailable(true);
+            let report = supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(report.results.len(), 1);
+            assert_eq!(report.results[0].outcome, Some(RecoveryOutcome::Blocked));
+            assert_eq!(due(dir.path()), Some(2_000));
+            assert_eq!(backend.count("creates"), 0);
+            backend.unavailable(false);
+            clock.store(2_000, Ordering::SeqCst);
+        }
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state(&context.prior_handle),
+            BackendRuntimeState::Running
+        );
+        let result = Box::pin(supervisor.recover(RecoverRequest {
+            soul_id: soul.clone(),
+            trigger: if prior_backend_outage {
+                RecoveryTrigger::StartupReconcile
+            } else {
+                RecoveryTrigger::ProviderExit
+            },
+            expected_intent_revision: Some(context.intent_revision),
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            result.outcome,
+            RecoveryOutcome::Replaced,
+            "valid native readiness must survive the current reservation: {result:?}"
+        );
+        assert_eq!(result.view.recovery_state, RecoveryState::Live);
+        assert_eq!(
+            result.expected_native_session_id.as_deref(),
+            Some("retry-root")
+        );
+        assert_eq!(
+            result.observed_native_session_id.as_deref(),
+            Some("retry-root")
+        );
+        assert_ne!(
+            result.view.incarnation_id,
+            *before.prior_handle.incarnation_id()
+        );
+        assert_eq!(
+            attempts(dir.path()).len(),
+            1 + usize::from(prior_backend_outage)
+        );
+        assert_eq!(backend.count("creates"), 1);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+        assert_eq!(due(dir.path()), None);
+        let recovered = supervisor.registry.recovery_context(soul).await.unwrap();
+        assert!(recovered.recovery_attempt_id.is_none());
+        assert_eq!(
+            recovered.evidence_revision,
+            before.evidence_revision + u64::from(!saved_proof),
+            "a newly captured proof advances evidence exactly once; idempotent proof stays current"
+        );
     }
 
     #[tokio::test]
