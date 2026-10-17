@@ -27,7 +27,7 @@ function ownerIdentity(soul: ManagedRuntimeSoul) {
   }
 }
 
-/** Only this fixture's exact same-owner durability advance may change a layout payload. */
+/** Keep the exact owner and layout while its completed turn's metadata settles. */
 export function assertManagedHistoryContinuity(before: HistoryState, after: HistoryState, allocations: OwnedHistoryAllocation[]) {
   expect(Number.isSafeInteger(before.managedRuntime.revision)).toBe(true)
   expect(before.managedRuntime.revision).toBeGreaterThanOrEqual(0)
@@ -92,6 +92,13 @@ export function assertManagedHistoryContinuity(before: HistoryState, after: Hist
       return { content, soul, view, pair }
     }
     const prior = bind(before), current = bind(after)
+    const baselineLeaf = leaves(expected[allocation.tabId]).find(candidate => candidate.id === allocation.paneId)!
+    if (baselineLeaf.content.kind !== 'fresh-agent') throw new Error('baseline fresh-agent History leaf required')
+    // FreshAgentView publishes these asynchronously through the pane reducer,
+    // which owns their validation. They do not change the pane or conversation.
+    if (current.content.checkpointOutcomes !== undefined) {
+      baselineLeaf.content.checkpointOutcomes = structuredClone(current.content.checkpointOutcomes)
+    } else delete baselineLeaf.content.checkpointOutcomes
     expect(ownerIdentity(current.soul), 'History must retain the exact allocated runtime owner').toEqual(ownerIdentity(prior.soul))
     if (prior.soul.nativeSessionId !== undefined) {
       expect(current.soul.nativeSessionId, 'History cannot forget an established authoritative native identity').toBe(prior.soul.nativeSessionId)
@@ -103,17 +110,14 @@ export function assertManagedHistoryContinuity(before: HistoryState, after: Hist
       // pane or its runtime owner. Admit only the busy-to-idle completion edge.
       expect(prior.content.status, 'Only a completed pane may settle during History').toBe('running')
       expect(current.content.status, 'A completed pane must settle to idle').toBe('idle')
-      const leaf = leaves(expected[allocation.tabId]).find(candidate => candidate.id === allocation.paneId)!
-      if (leaf.content.kind !== 'fresh-agent') throw new Error('baseline fresh-agent History leaf required')
-      leaf.content.status = current.content.status
+      baselineLeaf.content.status = current.content.status
     }
     if (prior.pair[0] !== current.pair[0] || prior.pair[1] !== current.pair[1]) {
       expect(prior.pair).toEqual(['materializing', 'unknown'])
       expect(current.pair).toEqual(['verified_durable', 'resume_captured'])
-      const leaf = leaves(expected[allocation.tabId]).find(candidate => candidate.id === allocation.paneId)!
-      if (leaf.content.kind !== 'fresh-agent' || !leaf.content.recoverySummary) throw new Error('baseline recovery summary required')
-      leaf.content.recoverySummary.allocationState = 'verified_durable'
-      leaf.content.recoverySummary.durabilityState = 'resume_captured'
+      if (!baselineLeaf.content.recoverySummary) throw new Error('baseline recovery summary required')
+      baselineLeaf.content.recoverySummary.allocationState = 'verified_durable'
+      baselineLeaf.content.recoverySummary.durabilityState = 'resume_captured'
     }
   }
   // Keep every other field, including all background panes and split geometry.

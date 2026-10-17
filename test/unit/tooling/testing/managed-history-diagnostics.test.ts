@@ -4,8 +4,9 @@ import type { TestCase, TestResult } from '@playwright/test/reporter'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
 import { buildManagedRuntimeMergePlan } from '../../../../src/lib/recovery/managed-runtime-recovery.js'
 import { EventEmitter } from 'node:events'
-import panesReducer, { materializeFreshAgentSession, updatePaneContent } from '../../../../src/store/panesSlice.js'
+import panesReducer, { materializeFreshAgentSession, mergePaneContent, updatePaneContent } from '../../../../src/store/panesSlice.js'
 import managedRuntimeReducer, { managedRuntimeSnapshotReceived } from '../../../../src/store/managedRuntimeSlice.js'
+import { freshAgentCheckpointConversationKeyForContent } from '../../../../src/store/paneTypes.js'
 
 const original = vi.hoisted(() => ({
   cases: new Map<string, (context: any) => Promise<void>>(),
@@ -592,6 +593,89 @@ describe('managed History checked continuity', () => {
   }
   const soul = (state: any, item: any) => state.managedRuntime.souls.find((row: any) => row.soulId === item.view.soulId)
   const view = (state: any, item: any) => state.managedRuntime.viewIntents.find((row: any) => row.soulId === item.view.soulId)
+
+  const publishCheckpoint = (state: any, item: any) => {
+    const pane = content(state, item)
+    const outcome = { version: 1 as const, requestId: `checkpoint-${item.paneId}`,
+      conversationRequestId: pane.createRequestId,
+      conversationSessionKey: freshAgentCheckpointConversationKeyForContent(pane),
+      status: 'available' as const, checkpointId: `saved-${item.paneId}`, workspace: pane.checkpointWorkspace }
+    state.panes = structuredClone(panesReducer(state.panes, mergePaneContent({ tabId: item.tabId,
+      paneId: item.paneId, updates: { checkpointOutcomes: [outcome] } })))
+  }
+
+  it('accepts asynchronous checkpoint publication while the original History case reuses each existing pane', async () => {
+    const events: any[] = [], publications: any[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      events.push(...external.parseManagedHistoryDiagnosticText(String(chunk))); return true
+    })
+    const { run, allocated, sends } = await historyCallback(undefined, 'native', undefined, undefined, {
+      advance: true, split: true, mutate: (state, item) => {
+        expect(content(state, item).checkpointOutcomes).toBeUndefined()
+        publishCheckpoint(state, item)
+        if (item.tabId !== 'tab-0') state.panes.layouts['tab-0'].children[0].content.checkpointOutcomes[0].nativeTurnId = 'background-native-turn'
+        publications.push(content(state, item).checkpointOutcomes)
+      },
+    })
+    await expect(run).resolves.toBeUndefined()
+    expect(publications).toHaveLength(4)
+    expect(publications.every(outcomes => outcomes[0].status === 'available')).toBe(true)
+    expect(allocated).toHaveLength(4)
+    expect(sends()).toBe(4)
+    expectAllHistoryPhases(events)
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
+
+  it.each(['turn-metadata', 'available-after-unavailable'] as const)(
+    'accepts checkpoint hydration progress (%s) without replacing a pane', async progress => {
+      vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+      const observed = new Set<string>()
+      const { run, allocated, sends } = await historyCallback(undefined, 'native', undefined, undefined, {
+        mutateSnapshot: (state, item) => {
+          if (observed.has(item.paneId)) return
+          observed.add(item.paneId)
+          publishCheckpoint(state, item)
+          const outcome = content(state, item).checkpointOutcomes[0]
+          if (progress === 'available-after-unavailable') {
+            outcome.status = 'unavailable'; outcome.code = 'capture_pending'; outcome.reason = 'Capture is settling'
+            delete outcome.checkpointId
+          }
+        },
+        mutate: (state, item) => {
+          publishCheckpoint(state, item)
+          if (progress === 'turn-metadata') content(state, item).checkpointOutcomes[0].nativeTurnId = 'native-turn'
+        },
+      })
+      await expect(run).resolves.toBeUndefined()
+      expect(allocated).toHaveLength(4)
+      expect(sends()).toBe(4)
+      expect(original.stop).toHaveBeenCalledOnce()
+    },
+  )
+
+  it.each(['sessionId', 'model', 'split-sizes', 'extra-terminal'] as const)(
+    'still rejects %s when checkpoint publication also occurs', async fault => {
+      const failures: string[] = []
+      vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+        failures.push(...external.parseManagedHistoryDiagnosticText(String(chunk)).filter(event => event.state === 'failed').map(event => event.phase!)); return true
+      })
+      const { run, allocated, sends } = await historyCallback(undefined, 'native', undefined, undefined, {
+        split: true, mutate: (state, item) => {
+          publishCheckpoint(state, item)
+          if (fault === 'split-sizes') state.panes.layouts[item.tabId].sizes = [50, 50]
+          else if (fault === 'extra-terminal') state.panes.layouts[item.tabId].children.push({
+            type: 'leaf', id: 'unexpected-terminal', content: { kind: 'terminal', terminalId: 'unexpected' },
+          })
+          else content(state, item)[fault] = 'unexpected-' + fault
+        },
+      })
+      await expect(run).rejects.toThrow()
+      expect(failures).toEqual(['history-layout'])
+      expect(allocated).toHaveLength(1)
+      expect(sends()).toBe(1)
+      expect(original.stop).toHaveBeenCalledOnce()
+    },
+  )
   it.each(['wrong-native', 'durable-missing', 'durable-baseline-missing', 'pending-disappeared'] as const)(
     'rejects %s authority while retaining the exact native pane', async fault => {
       const failures: string[] = [], snapshots: any[] = []
