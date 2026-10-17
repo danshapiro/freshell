@@ -2,6 +2,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
@@ -9,7 +11,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
-import { prepareProviderParityUserRoots } from '../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots } from '../../helpers/provider-parity-environment.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [
@@ -69,8 +71,11 @@ class FreshWire {
 
 describe('hosted fresh-agent provider inputs', () => {
   let rig: ManagedRuntimeBrowserRig
-  let opencodeProject: string
+  let workspaceDir: string
   let homeDir: string
+  let fixturePlugin: string
+  let guestProbe: string
+  let parityFixture: string
   let onecli: ReturnType<typeof fakeOnecliGrants>
   let restoreOnecliEnvironment: (() => void) | undefined
   const wires: FreshWire[] = []
@@ -91,37 +96,71 @@ describe('hosted fresh-agent provider inputs', () => {
       fixtureFreshAgentModes: providers.map(row => row.sessionType),
     }, homeDir)
     await rig.start()
-    opencodeProject = fs.mkdtempSync(path.join(root, '.opencode-parity-'))
-    fs.mkdirSync(path.join(opencodeProject, '.opencode'), { recursive: true })
-    fs.writeFileSync(path.join(opencodeProject, '.opencode/opencode.json'), JSON.stringify({
+    workspaceDir = path.join(rig.runtime.testRoot, 'workspace')
+    fs.mkdirSync(workspaceDir, { recursive: true })
+    execFileSync('git', ['init', '--shared=0644', '--quiet', workspaceDir])
+    fs.writeFileSync(path.join(workspaceDir, 'package.json'), JSON.stringify({ private: true, type: 'module' }))
+    const probes = path.join(workspaceDir, '.fixture-probes')
+    fs.mkdirSync(probes)
+    guestProbe = path.join(probes, 'fresh-provider-input-probe.mjs')
+    parityFixture = path.join(probes, 'parity-provider.mjs')
+    for (const destination of [guestProbe, parityFixture]) {
+      fs.copyFileSync(path.join(root, 'test/fixtures/providers', path.basename(destination)), destination)
+    }
+    fs.mkdirSync(path.join(workspaceDir, '.opencode'), { recursive: true })
+    fixturePlugin = path.join(workspaceDir, 'fixture-plugin')
+    fs.mkdirSync(path.join(fixturePlugin, '.claude-plugin'), { recursive: true })
+    fs.writeFileSync(path.join(fixturePlugin, '.claude-plugin/plugin.json'),
+      JSON.stringify({ name: 'fixture-plugin', version: '1.0.0' }))
+    fs.writeFileSync(path.join(fixturePlugin, 'package.json'), JSON.stringify({ type: 'commonjs' }))
+    fs.writeFileSync(path.join(fixturePlugin, 'asset'), 'fixture-plugin-resource')
+    fs.writeFileSync(path.join(fixturePlugin, 'command'),
+      "#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(__dirname+'/asset','utf8'))\n",
+      { mode: 0o751 })
+    const userMcp = path.join(fixturePlugin, 'user-mcp.cjs')
+    fs.writeFileSync(userMcp, `const readline=require('node:readline');
+readline.createInterface({input:process.stdin}).on('line',line=>{
+  const request=JSON.parse(line); if(request.id==null)return;
+  const result=request.method==='initialize'
+    ? {protocolVersion:'2025-06-18',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
+    : request.method==='tools/list' ? {tools:[{name:'fixture',inputSchema:{type:'object'}}]}
+    : {content:[{type:'text',text:JSON.stringify({source:process.argv[2]})}]};
+  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\\n');
+});\n`)
+    const globalPlugin = path.join(homeDir, 'custom-xdg/opencode/global-plugin.ts')
+    const projectPlugin = path.join(workspaceDir, '.opencode/project-plugin.ts')
+    fs.writeFileSync(globalPlugin, 'export const Global = async () => ({})\n')
+    fs.writeFileSync(projectPlugin, 'export const Project = async () => ({})\n')
+    fs.writeFileSync(path.join(workspaceDir, '.opencode/opencode.json'), JSON.stringify({
       provider: { project_fixture: { name: 'project fixture' } },
-      mcp: { project_fixture: { type: 'local', command: ['project-mcp'] } },
+      mcp: { project_fixture: { type: 'local', command: ['node', userMcp, 'project'] } },
     }))
-    fs.writeFileSync(path.join(opencodeProject, '.opencode/opencode.jsonc'),
-      '{ // project JSONC remains a user source\n "plugin": ["file:///project-plugin.ts",], "theme": "project", }')
+    fs.writeFileSync(path.join(workspaceDir, '.opencode/opencode.jsonc'),
+      `{ // project JSONC remains a user source\n "plugin": [${JSON.stringify(pathToFileURL(projectPlugin).href)},], "theme": "project", }`)
     for (const row of providers) {
       const file = path.join(rig.info.homeDir, row.config)
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 })
       const contents = row.provider === 'codex'
-        ? 'fixture_setting = true\n\n[mcp_servers.user_fixture]\ncommand = "user-fixture-mcp"\n'
+        ? `fixture_setting = true\n\n[mcp_servers.user_fixture]\ncommand = "node"\nargs = ${JSON.stringify([userMcp, 'user'])}\n`
         : row.provider === 'opencode'
-          ? '{ // global JSONC\n "provider":{"global_fixture":{"name":"global fixture"}}, "mcp":{"user_fixture":{"type":"local","command":["user-fixture-mcp"]}}, "plugin":["file:///global-plugin.ts",], }'
-        : JSON.stringify({ fixtureSetting: true, mcpServers: { user_fixture: { command: 'user-fixture-mcp' } } }) + '\n'
+          ? `{ // global JSONC\n "provider":{"global_fixture":{"name":"global fixture"}}, "mcp":{"user_fixture":{"type":"local","command":${JSON.stringify(['node', userMcp, 'user'])}}}, "plugin":[${JSON.stringify(pathToFileURL(globalPlugin).href)},], }`
+        : JSON.stringify({ fixtureSetting: true, mcpServers: { user_fixture: { command: 'node', args: [userMcp, 'user'] } } }) + '\n'
       fs.writeFileSync(file, contents)
       fs.chmodSync(path.dirname(file), 0o755)
       fs.chmodSync(file, 0o644)
     }
     fs.writeFileSync(path.join(rig.info.homeDir, 'custom-xdg/opencode/opencode.json'), JSON.stringify({
-      mcp: { other_global: { type: 'local', command: ['other-global-mcp'] } },
+      mcp: { other_global: { type: 'local', command: ['node', userMcp, 'other-global'] } },
     }))
     const opencodePlugin = path.join(rig.info.homeDir, 'custom-xdg/opencode/plugin')
     fs.mkdirSync(opencodePlugin, { recursive: true, mode: 0o755 })
     fs.writeFileSync(path.join(opencodePlugin, 'user-plugin.ts'), 'export const User = async () => ({})\n')
+    makeProviderParityResourcesReadable(workspaceDir)
   }, 900_000)
 
   afterAll(() => cleanupProviderParity({
     connections: wires, rig, restoreOnecliEnvironment,
-    directories: [opencodeProject, homeDir, onecli?.directory],
+    directories: [workspaceDir, homeDir, onecli?.directory],
   }), 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {
@@ -129,19 +168,29 @@ describe('hosted fresh-agent provider inputs', () => {
     wires.push(wire)
     const requestId = `fresh-parity-${randomUUID()}`
     const namingHandle = `nh-${randomUUID()}`
-    const cwd = row.provider === 'opencode' ? opencodeProject : root
+    const cwd = workspaceDir
     const createRequest = {
       type: 'freshAgent.create', requestId, sessionType: row.sessionType,
       provider: row.provider, cwd, model: 'fixture-model',
       modelSelection: { kind: 'exact', modelId: 'fixture-model' },
       effort: 'low', permissionMode: 'default', sandbox: 'workspace-write',
-      plugins: ['fixture-plugin'], namingHandle, tabId: `tab-${requestId}`,
+      plugins: [fixturePlugin], namingHandle, tabId: `tab-${requestId}`,
     }
     wire.send(createRequest)
     const created = await wire.wait(frame => frame.requestId === requestId
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
     if (created.type === 'freshAgent.create.failed') {
-      throw new Error(`${JSON.stringify(created)}; inventory=${JSON.stringify(await rig.inventory())}; web=${JSON.stringify(rig.web.capturedOutput())}; supervisor=${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-6000)}`)
+      let providerInputs: unknown[] = []
+      try {
+        providerInputs = fs.readFileSync(path.join(rig.info.homeDir, '.freshell/logs/rust-server.jsonl'), 'utf8')
+          .split('\n').flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
+          .filter(row => ['WARN', 'ERROR'].includes(row.level)).slice(-16)
+          .map(row => Object.fromEntries(['event', 'msg', 'reason', 'error', 'provider', 'runtime_code']
+            .filter(key => typeof row[key] === 'string').map(key => [key,
+              row[key].replace(/fixture-secret-byte(?:-[a-z]+)?/g, '<redacted>')])))
+      } catch { /* The original create failure remains the primary diagnostic. */ }
+      rig.runtime.writeIncident(`fresh-parity-${row.provider}-create-failure`, { providerInputs })
+      throw new Error(`${JSON.stringify(created)}; providerInputs=${JSON.stringify(providerInputs)}; inventory=${JSON.stringify(await rig.inventory())}; web=${JSON.stringify(rig.web.capturedOutput())}; supervisor=${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-6000)}`)
     }
     expect(created.type, JSON.stringify(created)).toBe('freshAgent.created')
     expect(created.nameRef).toEqual({ kind: 'pending', id: namingHandle })
@@ -157,13 +206,16 @@ describe('hosted fresh-agent provider inputs', () => {
     expect(profile).toMatchObject({
       provider: row.provider, cwd, model: 'fixture-model', effort: 'low',
       permissionMode: 'default', sandbox: 'workspace-write',
-      plugins: ['fixture-plugin'],
+      plugins: [fixturePlugin],
       modelSelection: { kind: 'exact', modelId: 'fixture-model' },
     })
-    expect(profile.providerLaunchContext.config.length).toBeGreaterThan(0)
+    const context = profile.providerLaunchContext
+    expect(context.preparedInputs.generationId).toBe(context.mcpCapability.grantId)
     expect(profile.providerLaunchContext.mcpCapability.grantId).toMatch(/^grant-/)
-    expect(profile.providerSecretReferences).toHaveLength(1)
-    for (const reference of profile.providerSecretReferences) {
+    const onecliReferences = profile.providerSecretReferences.filter((reference: any) =>
+      reference.profile.startsWith(`${row.provider}_onecli_`))
+    expect(onecliReferences).toHaveLength(1)
+    for (const reference of onecliReferences) {
       expect(reference.sourcePath).toMatch(/onecli/)
       expect(reference.profile).toMatch(new RegExp(`^${row.provider}_onecli_`))
     }
@@ -178,45 +230,29 @@ describe('hosted fresh-agent provider inputs', () => {
     expect(childObservation.env[onecli.childKeys[row.provider]]).toBe(onecli.childDigests[row.provider])
     expect(childObservation.onecliControlPresent).toBe(false)
     expect(JSON.stringify(recorded)).not.toContain('fixture-secret-byte')
+    const consumed = JSON.parse(rig.ownedContainerExec(view.containerId!, [
+      'bun', guestProbe,
+      JSON.stringify({ provider: row.provider, context, cwd, fixturePlugin,
+        parityFixture }),
+    ]))
+    expect(consumed.configCount).toBeGreaterThan(0)
+    expect(consumed.userMcp.user_fixture).toEqual({ source: 'user' })
+    expect(consumed.mcpHealth).toEqual(row.provider === 'codex' ? [true, true] : [true])
     const preparation = profile.providerLaunchContext.preparation
     if (row.provider === 'claude') {
-      expect(preparation.claude?.mcp_args).toEqual([])
-    } else if (row.provider === 'codex') {
-      expect(preparation.codex).toMatchObject({ tui_args: [], sidecar_args: [] })
-    } else {
+      expect(consumed.selectedExecutable).toBe('fixture-plugin-resource')
+    } else if (row.provider === 'opencode') {
       expect(preparation.opencode).toMatchObject({ inline_config: false, tui_config: null })
-      expect(JSON.stringify(preparation)).not.toContain('freshell-mcp')
       expect(preparation.opencode.project_config.map((source: any) => source.relativePath)).toEqual(
         expect.arrayContaining([
-          `${path.basename(opencodeProject)}/.opencode/opencode.json`,
-          `${path.basename(opencodeProject)}/.opencode/opencode.jsonc`,
+          '.opencode/opencode.json',
+          '.opencode/opencode.jsonc',
         ]),
       )
-      const tuiConfig = (await rig.ownedProviderExec(view.containerId!, [
-        'cat', '/home/freshell/provider/.freshell/opencode/tui.json',
-      ]))
-      expect(JSON.parse(tuiConfig).plugin).toEqual([
-        expect.stringContaining('freshell-rebind-plugin.ts'),
-      ])
-    }
-    for (const config of profile.providerLaunchContext.config) {
-      if (config.format === 'directory') {
-        if (row.provider === 'opencode' && config.relativePath === 'plugin') {
-          expect((await rig.ownedProviderExec(view.containerId!, [
-            'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath, 'user-plugin.ts'),
-          ]))).toContain('export const User')
-        }
-        continue
-      }
-      const contents = (await rig.ownedProviderExec(view.containerId!, [
-        'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath),
-      ]))
-      if (row.provider === 'opencode') {
-        expect(contents).toMatch(/global_fixture|other_global|project_fixture|project JSONC/)
-      } else {
-        expect(contents).toContain(row.provider === 'codex' ? 'fixture_setting' : 'fixtureSetting')
-        expect(contents).toContain('user-fixture-mcp')
-      }
+      expect(consumed.userMcp.other_global).toEqual({ source: 'other-global' })
+      expect(consumed.userMcp.project_fixture).toEqual({ source: 'project' })
+      expect(consumed.pluginResults).toEqual({ Global: {}, Project: {}, User: {} })
+      expect(consumed.rebind).toMatchObject({ hello: true, sessionId: 'ses_parity' })
     }
 
     const sendId = `send-${randomUUID()}`
@@ -262,12 +298,12 @@ describe('hosted fresh-agent provider inputs', () => {
       ]) expect(material).not.toContain(sentinel)
       fs.writeFileSync(path.join(evidenceDir, `fresh-hosted-${row.provider}.json`), JSON.stringify({
         provider: row.provider, nativeSessionId: recorded.nativeSessionId,
-        configCount: profile.providerLaunchContext.config.length,
+        configCount: consumed.configCount,
         plugin: profile.plugins,
         secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
         onecli: {
-          reference: { provider: row.provider, profile: profile.providerSecretReferences[0].profile,
-            sourcePath: profile.providerSecretReferences[0].sourcePath,
+          reference: { provider: row.provider, profile: onecliReferences[0].profile,
+            sourcePath: onecliReferences[0].sourcePath,
             environmentKey: onecli.childKeys[row.provider], grantValueSha256: onecli.childDigests[row.provider] },
           child: { provider: row.provider, argv: childObservation.argv,
             environmentKey: onecli.childKeys[row.provider],
