@@ -331,6 +331,48 @@ fn historical(mut native: OpencodeActivityBatch) -> OpencodeActivityBatch {
 }
 
 #[tokio::test]
+async fn historical_unbound_permission_end_does_not_ring_on_spontaneous_exit() {
+    let (tx, mut frames) = tokio::sync::broadcast::channel(32);
+    let hub = ActivityHub::new(Arc::new(tx), None);
+    (hub.registry_observer())(ActivityEvent::Created {
+        terminal_id: "managed-native".into(),
+        mode: "opencode".into(),
+        resume_session_id: None,
+        at: now_ms(),
+    });
+    hub.note_managed_opencode_activity(
+        "managed-native",
+        "surviving-host",
+        None,
+        historical(batch(vec![
+            OpencodeLaneEvent::Snapshot {
+                statuses: vec![("ses_native".into(), OpencodeStatus::Busy)],
+            },
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses_native".into(),
+                permission_id: "finished-permission".into(),
+            },
+            status(OpencodeStatus::Idle),
+        ])),
+    );
+    flush(&hub).await;
+    (hub.registry_observer())(ActivityEvent::Exit {
+        terminal_id: "managed-native".into(),
+        at: now_ms(),
+        spontaneous: true,
+    });
+    flush(&hub).await;
+    for frame in std::iter::from_fn(|| frames.try_recv().ok()) {
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_ne!(
+            frame["type"], "terminal.idle",
+            "an ended historical permission must not engage a later exit: {frame}"
+        );
+        assert_ne!(frame["type"], "terminal.turn.complete");
+    }
+}
+
+#[tokio::test]
 async fn historical_native_completion_is_silent_but_later_live_turn_still_completes() {
     let hub = managed();
     let mut frames = hub.broadcast_tx.subscribe();

@@ -223,7 +223,9 @@ impl OpencodeActivityTracker {
             return Vec::new();
         };
         if let Ownership::AwaitingAssociation { previous_known, .. } = &state.ownership {
-            // A later identity bind must not release a historical completion.
+            // Retire the ended episode's pause with its deferred completion:
+            // neither may affect a later live turn or spontaneous exit.
+            state.pending_permissions.clear();
             state.ownership = Ownership::Quiet {
                 known_session_id: previous_known.clone(),
             };
@@ -1289,6 +1291,72 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn unbound_busy_history() -> OpencodeActivityTracker {
+        let mut history = OpencodeActivityTracker::new();
+        history.track_terminal("t1", None, 0);
+        history.note_snapshot("t1", &[("ses-r".into(), OpencodeStatus::Busy)], 1, 1, 100);
+        history
+    }
+
+    #[test]
+    fn historical_unbound_permission_end_does_not_swallow_the_next_completion() {
+        let mut history = unbound_busy_history();
+        history.note_permission_asked("t1", "ses-r", "perm-old", 150);
+        history.note_session_idle("t1", "ses-r", 1, 1, 200);
+
+        let mut tracker = OpencodeActivityTracker::new();
+        assert_eq!(
+            tracker.seed_terminal_from_history("t1", history, 300),
+            vec![remove()]
+        );
+        assert!(tracker.list_latest_completions().is_empty());
+        assert!(tracker.bind_session("t1", "ses-r", 310).is_empty());
+        assert_eq!(
+            tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 2, 1, 400),
+            vec![upsert(rec(Some("ses-r"), 400))]
+        );
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 2, 1, 500),
+            vec![remove(), turn_complete("ses-r", 500, 1)]
+        );
+        assert!(!tracker.has_pending_permissions("t1"));
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 2, 1, 510)
+            .is_empty());
+    }
+
+    #[test]
+    fn historical_unbound_busy_and_pending_permission_remain_actionable() {
+        for paused in [false, true] {
+            let mut history = unbound_busy_history();
+            if paused {
+                history.note_permission_asked("t1", "ses-r", "perm-current", 150);
+            }
+            let mut tracker = OpencodeActivityTracker::new();
+            assert_eq!(
+                tracker.seed_terminal_from_history("t1", history, 300),
+                if paused {
+                    vec![remove()]
+                } else {
+                    vec![upsert(rec(Some("ses-r"), 100))]
+                }
+            );
+            assert_eq!(tracker.has_pending_permissions("t1"), paused);
+            assert!(tracker.list_latest_completions().is_empty());
+            if paused {
+                assert_eq!(
+                    tracker.note_permission_replied("t1", "perm-current", 350),
+                    vec![upsert(rec(Some("ses-r"), 350))]
+                );
+            }
+            tracker.bind_session("t1", "ses-r", 400);
+            assert_eq!(
+                tracker.note_session_idle("t1", "ses-r", 1, 1, 500),
+                vec![remove(), turn_complete("ses-r", 500, 1)]
+            );
+        }
     }
 
     #[test]
