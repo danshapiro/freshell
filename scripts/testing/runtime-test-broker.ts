@@ -8,6 +8,7 @@ import { TASK007_BATCH_STORE_PROBE } from './runtime-sandbox.js'
 const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
 const INDEXED_TMPFS_OPTIONS = 'size=64m,mode=0700,uid=65534,gid=0,nr_inodes=1024,nosuid,nodev,noexec'
+const CLAUDE_SOURCE_FLAVORS = new Set(['claude', 'kilroy'])
 
 class PreparedInputTargetError extends Error {
   constructor(readonly targetPath: string, readonly preparationStageRoot: string) {
@@ -1431,7 +1432,7 @@ export class RestrictedDockerBroker {
           const binding = this.fixtureMetadata(bindingFile).value
           const capability = this.fixtureMetadata(path.join(control, 'mcp-capabilities', `${grant}.json`), 128 * 1024).value
           const owner = [...this.initialProviderVolumes.values()].find(owner => owner.soulId === binding.soulId && owner.soulId === capability.soulId)
-          if (!owner || capability.incarnationId != null || binding.version !== 1 || binding.provider !== 'claude'
+          if (!owner || capability.incarnationId != null || binding.version !== 1 || !CLAUDE_SOURCE_FLAVORS.has(binding.provider)
             || binding.generationId !== grant || binding.intentRevision !== 1 || binding.registryAttemptId != null
             || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(binding.initialReservationId ?? '')) continue
           phase = 'prepared_metadata'
@@ -1543,7 +1544,7 @@ export class RestrictedDockerBroker {
           if (candidate) {
             phase = 'candidate_binding'
             const binding = this.fixtureMetadata(path.join(stageRoot, '.freshell/claude-candidate-binding.json')).value
-            if (binding.version !== 1 || binding.provider !== 'claude' || binding.soulId !== owner.soulId
+            if (binding.version !== 1 || !CLAUDE_SOURCE_FLAVORS.has(binding.provider) || binding.soulId !== owner.soulId
               || binding.generationId !== grant || binding.intentRevision !== 1 || binding.registryAttemptId != null
               || binding.initialReservationId !== inputs.initialAuthReservation
               || binding.initialReservationId !== labels['com.freshell.source-reservation-id']

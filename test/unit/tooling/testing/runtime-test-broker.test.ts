@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import fs from 'node:fs/promises'
 import http from 'node:http'
@@ -8,6 +9,7 @@ import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 
 import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
+import { findInitialProviderVolume, type InitialProviderRegistrySource } from '../../../../scripts/testing/initial-provider-volume.js'
 import { buildRunOwnedRuntimeImage } from '../../../../scripts/testing/runtime-sandbox.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
 import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
@@ -1676,7 +1678,7 @@ describe('fixed indexed publisher broker',()=>{
       }, undefined, true)
     },
   )
-  it('probes actual candidate absence before creation only with a qualified owned publication', async () => {
+  it.each(['claude', 'kilroy'])('probes actual %s candidate absence before creation only with a qualified owned publication', async provider => {
     await withHttpBroker(async ({ directory, request, forwarded, broker: instance, replaceCandidateVolumeInspection, clearCandidateVolumeInspection }) => {
       const input = candidateAuthorization()
       const binary = Buffer.from('candidate absence host artifact')
@@ -1685,7 +1687,7 @@ describe('fixed indexed publisher broker',()=>{
       input.binarySha256 = createHash('sha256').update(binary).digest('hex')
       input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
       const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
-      const binding = { version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+      const binding = { version: 1, provider, soulId: input.soulId, generationId: input.generationId,
         initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
         authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'), workspacePath: input.workspacePath, cwd: input.cwd,
         gitCommonDir: null,
@@ -1773,7 +1775,7 @@ describe('fixed indexed publisher broker',()=>{
       expect(exists).toBe(false)
     }, undefined, true)
   })
-  it('registers the exact owned published Claude candidate before its ordinary volume request', async () => {
+  it.each(['claude', 'kilroy'])('registers the exact owned published %s candidate before its ordinary volume request', async provider => {
     await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
       const input = candidateAuthorization()
       input.workspacePath = '/workspace/project'
@@ -1788,7 +1790,7 @@ describe('fixed indexed publisher broker',()=>{
       instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath, binarySha256: input.binarySha256 })
       const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
       await fs.writeFile(path.join(metadata, 'claude-candidate-binding.json'), JSON.stringify({
-        version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        version: 1, provider, soulId: input.soulId, generationId: input.generationId,
         initialReservationId: input.reservationId, intentRevision: 1,
         workspacePath: input.workspacePath, cwd: input.cwd, gitCommonDir: null,
         manifestSha256: context.preparedInputs.manifest.sha256,
@@ -1798,7 +1800,7 @@ describe('fixed indexed publisher broker',()=>{
       const volume = { Name: `freshell-claude-candidate-${input.requestId}`, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) }
       const bindingPath = path.join(metadata, 'claude-candidate-binding.json')
       const originalBinding = await fs.readFile(bindingPath)
-      for (const field of ['soulId', 'generationId', 'initialReservationId', 'gitCommonDir', 'preparedContextSha256', 'preparedResultSha256', 'manifestSha256']) {
+      for (const field of ['provider', 'soulId', 'generationId', 'initialReservationId', 'gitCommonDir', 'preparedContextSha256', 'preparedResultSha256', 'manifestSha256']) {
         const changed = JSON.parse(originalBinding.toString())
         changed[field] = 'foreign'
         await fs.writeFile(bindingPath, JSON.stringify(changed))
@@ -1819,7 +1821,7 @@ describe('fixed indexed publisher broker',()=>{
       expect(forwarded).toHaveLength(before)
     }, undefined, true)
   })
-  it.each(['candidate', 'retained', 'workload'] as const)('carries published ancestor policy and imported files into the %s reader', async consumer => {
+  it.each(['claude', 'kilroy'].flatMap(provider => ['candidate', 'retained', 'workload'].map(consumer => ({ provider, consumer }))))('carries published $provider ancestor policy and imported files into the $consumer reader', async ({ provider, consumer }) => {
     await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
       const input = { ...candidateAuthorization(), gitCommonDir: '/workspace-git' }
       input.configurationBinds[0].effectiveDestination = '/workspace/.claude/settings.json'
@@ -1835,7 +1837,7 @@ describe('fixed indexed publisher broker',()=>{
       instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath, binarySha256: input.binarySha256 })
       const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
       await fs.writeFile(path.join(metadata, 'claude-candidate-binding.json'), JSON.stringify({
-        version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        version: 1, provider, soulId: input.soulId, generationId: input.generationId,
         initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
         authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'),
         workspacePath: input.workspacePath, cwd: input.cwd, gitCommonDir: input.gitCommonDir,
@@ -2385,6 +2387,35 @@ it('admits only an exact owned published initial provider volume before its firs
     expect((await request('GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`)).status).toBe(403)
     expect(forwarded.map(operation => operation.url)).toEqual([`/v1.47/volumes/${owner.providerVolumeName}`, '/v1.47/volumes/create'])
   }, { initialProviderVolumeLookup: lookup })
+})
+
+it('authorizes Kilroy initial source observation from its actual committed registry row', async () => {
+  const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
+  let source: InitialProviderRegistrySource | undefined
+  await withHttpBroker(async ({ directory, request, forwarded }) => {
+    const owner = sourceAuthorization()
+    source = { ...owner, registryPath: path.join(directory, 'runtime.sqlite3') }
+    const db = new DatabaseSync(source.registryPath)
+    try {
+      db.exec(`CREATE TABLE provider_input_preparations (
+        soul_id TEXT, provider TEXT, image_ref TEXT, host_binary_path TEXT, host_binary_sha256 TEXT,
+        intent_revision INTEGER, consumed INTEGER, bound_incarnation_id TEXT)`)
+      const url = `/v1.47/volumes/${owner.providerVolumeName}`
+      expect((await request('GET', url)).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      db.prepare('INSERT INTO provider_input_preparations VALUES(?,?,?,?,?,?,?,?)').run(
+        owner.soulId, 'kilroy', owner.imageRef, owner.hostBinaryPath, owner.binarySha256, 1, 0, null)
+      expect((await request('GET', url)).status).toBe(200)
+      const before = forwarded.length
+      expect((await request('GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+    } finally { db.close() }
+  }, { initialProviderVolumeLookup: name => source && findInitialProviderVolume(name, [source]) })
 })
 
 it('refuses a changed owner returned by initial provider volume discovery', async () => {

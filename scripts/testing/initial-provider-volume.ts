@@ -21,7 +21,7 @@ export function findInitialProviderVolume(
       const rows = db.prepare(`SELECT soul_id FROM provider_input_preparations
         WHERE image_ref=? AND host_binary_path=? AND host_binary_sha256=?
         AND intent_revision=1 AND consumed=0 AND bound_incarnation_id IS NULL
-        AND provider IN ('claude','codex','opencode','amplifier') LIMIT 1001`)
+        AND provider IN ('claude','kilroy','codex','opencode','amplifier') LIMIT 1001`)
         .all(source.imageRef, source.hostBinaryPath, source.binarySha256)
       if (rows.length > 1000) throw new Error('owned provider preparation lookup exceeds its finite bound')
       for (const row of rows) {

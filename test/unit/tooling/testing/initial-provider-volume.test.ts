@@ -35,10 +35,10 @@ function publish(overrides: Partial<Record<string, string | number | null>> = {}
 }
 
 describe('owned initial provider publication', () => {
-  it('resolves only the exact volume after the native reservation is committed', () => {
+  it.each(['claude', 'kilroy', 'codex', 'opencode', 'amplifier'])('resolves only the exact %s volume after the native reservation is committed', provider => {
     const name = volume(source.installationId)
     expect(findInitialProviderVolume(name, [source])).toBeUndefined()
-    publish()
+    publish({ provider })
     const { registryPath: _registry, ...owner } = source
     expect(findInitialProviderVolume(name, [source])).toEqual({ ...owner, soulId: soul, providerVolumeName: name })
     expect(findInitialProviderVolume(volume('foreign-installation'), [source])).toBeUndefined()
