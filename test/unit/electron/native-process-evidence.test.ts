@@ -68,7 +68,7 @@ describe('exact native process evidence', () => {
       platform: 'linux', native,
       linux: {
         runner: { pid: 100, startTicks: '1000' },
-        main: { pid: 101, startTicks: '1010', processType: 'main' },
+        main: { pid: 101, startTicks: '1010', processType: null },
         renderer: { pid: 102, startTicks: '1020', processType: 'renderer',
           noNewPrivs: 1, capEff: '0000000000000000', seccomp: 2 },
       },
@@ -87,7 +87,7 @@ describe('exact native process evidence', () => {
       platform: 'linux', native,
       linux: {
         runner: { pid: 100, executable: '/public/electron', startTicks: '1000' },
-        main: { pid: 101, executable: '/public/electron', startTicks: '1010', processType: 'main' },
+        main: { pid: 101, executable: '/public/electron', startTicks: '1010', processType: null },
         renderer: {
           pid: 102, executable: null,
           executableUnavailable: { reason: 'permission-denied', code: 'EACCES', errno: -13 },
@@ -124,6 +124,16 @@ describe('exact native process evidence', () => {
   it('keeps the public process reader strict even for a renderer executable denial', () => {
     const { reader, denied } = procFixture('permission-denied')
     expect(() => readLinuxNativeProcess(102, reader)).toThrow(denied)
+  })
+
+  it.each([
+    ['--type=renderer\0--type=utility\0', 'renderer'],
+    ['--type=utility\0--type=renderer\0', 'utility'],
+    ['--type=\0--type=renderer\0', ''],
+  ])('retains the first recognized command-line type hint in %j', (hints, expected) => {
+    const { files, reader } = procFixture()
+    files.set('/proc/102/cmdline', `electron\0${hints}`)
+    expect(readLinuxNativeProcess(102, reader).processType).toBe(expected)
   })
 
   it.each(['ENOENT', 'ESRCH', 'EIO', 'EPERM', undefined])('rejects unexpected renderer executable error %s', async code => {
@@ -182,6 +192,53 @@ describe('exact native process evidence', () => {
   })
 
   describe.each(rendererExecutables)('capture with renderer executable %s', rendererExecutable => {
+    it('accepts explicit command-line hints that agree with the native main and renderer roles', async () => {
+      const { files, reader } = procFixture(rendererExecutable)
+      files.set('/proc/101/cmdline', 'electron\0--type=main\0')
+      const snapshot = vi.fn(async () => ({ ...native }))
+      const evidence = await captureNativeWindowEvidence(snapshot, 101, {
+        platform: 'linux', runnerPid: 100, reader,
+      })
+      expect(evidence.linux).toMatchObject({
+        main: { processType: 'main' }, renderer: { processType: 'renderer' },
+      })
+      expect(snapshot).toHaveBeenCalledTimes(2)
+    })
+
+    it('accepts the native renderer role without a command-line type hint and completes both snapshots', async () => {
+      const { files, reader } = procFixture(rendererExecutable)
+      files.set('/proc/102/cmdline', files.get('/proc/102/cmdline')!.replace('--type=renderer\0', ''))
+      const snapshot = vi.fn(async () => ({ ...native }))
+      const evidence = await captureNativeWindowEvidence(snapshot, 101, {
+        platform: 'linux', runnerPid: 100, reader,
+      })
+      expect(evidence).toMatchObject({
+        native,
+        linux: {
+          main: { pid: 101, startTicks: '1010', processType: null },
+          renderer: {
+            pid: 102, startTicks: '1020', processType: null,
+            executable: rendererExecutable === 'readable' ? '/public/electron' : null,
+            noNewPrivs: 1, capEff: '0000000000000000', seccomp: 2,
+          },
+        },
+      })
+      expect(snapshot).toHaveBeenCalledTimes(2)
+      expect(JSON.stringify(evidence)).not.toContain('must-not-appear')
+    })
+
+    it.each([
+      [101, 'renderer'], [101, 'utility'], [101, ''], [101, 'null'],
+      [102, 'main'], [102, 'utility'], [102, ''], [102, 'null'],
+    ])('rejects an explicit conflicting command-line hint for PID %s: %j', async (pid, hint) => {
+      const { files, reader } = procFixture(rendererExecutable)
+      const expectedType = pid === 101 ? 'main' : 'renderer'
+      files.set(`/proc/${pid}/cmdline`, `electron\0--type=${hint}\0--type=${expectedType}\0`)
+      await expect(captureNativeWindowEvidence(async () => native, 101, {
+        platform: 'linux', runnerPid: 100, reader,
+      })).rejects.toThrow(/native process security/)
+    })
+
     it.each([100, 101])('rejects executable permission denial for required PID %s', async pid => {
       const { reader, denied } = procFixture(rendererExecutable)
       const link = reader.link

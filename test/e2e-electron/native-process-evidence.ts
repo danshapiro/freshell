@@ -28,7 +28,8 @@ export interface LinuxProcessEvidence {
   startTicks: string
   parentPid: number
   executable: string
-  processType: string
+  /** First --type= suffix, or null when absent; the native PID mapping supplies the role. */
+  processType: string | null
   uid: number[]
   gid: number[]
   cgroup: string
@@ -98,7 +99,7 @@ function readLinuxProcess(pid: number, reader: ProcessReader, allowRendererExecu
   const evidence: LinuxRendererProcessEvidence = {
     pid, ...before,
     ...executable,
-    processType: args.find(arg => arg.startsWith('--type='))?.slice('--type='.length) ?? 'main',
+    processType: args.find(arg => arg.startsWith('--type='))?.slice('--type='.length) ?? null,
     uid: ids('Uid'), gid: ids('Gid'),
     cgroup: reader.text(`/proc/${pid}/cgroup`).trim(),
     disablingSwitches: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-seccomp-filter-sandbox']
@@ -140,7 +141,8 @@ export async function captureNativeWindowEvidence(
     if (![runner, main, renderer].every(item => sameUser(item) && item.cgroup === runner.cgroup)
       || !runner.cgroup || !main.executable
       || (renderer.executable !== null && renderer.executable !== main.executable)
-      || main.processType !== 'main' || renderer.processType !== 'renderer'
+      || (main.processType !== null && main.processType !== 'main')
+      || (renderer.processType !== null && renderer.processType !== 'renderer')
       || main.disablingSwitches.length || renderer.disablingSwitches.length
       || renderer.noNewPrivs !== 1 || !/^0+$/.test(renderer.capEff) || renderer.seccomp !== 2) {
       throw new Error('native process security: unsafe or foreign main/renderer facts')
