@@ -230,6 +230,12 @@ type DockerResponse = {
   body: Buffer
 }
 
+type TransportPhases = {
+  socketAssignedMs: number | null; socketConnectMs: number | null; requestFinishedMs: number | null
+  responseHeadersMs: number | null; responseEndMs: number | null
+  reusedSocket: boolean; socketConnectingAtAssignment: boolean | null
+}
+
 export class RestrictedDockerBroker {
   private readonly claudeCandidates = new Map<string, ClaudeCandidateAuthorization>()
   private readonly candidateVolumes = new Set<string>()
@@ -1989,6 +1995,13 @@ export class RestrictedDockerBroker {
     if (this.drainExpired) return Promise.reject(new Error('broker cleanup deadline expired'))
     const requestId = `${this.policy.testRunId}:${++this.transportSequence}`
     const started = performance.now()
+    const elapsed = () => Math.max(0, performance.now() - started)
+    const transportPhases: TransportPhases = {
+      socketAssignedMs: null, socketConnectMs: null,
+      requestFinishedMs: null, responseHeadersMs: null,
+      responseEndMs: null, reusedSocket: false,
+      socketConnectingAtAssignment: null,
+    }
     const address = { requestId, method: request.method ?? 'GET', ...transportAddress(request.url ?? '/') }
     this.recordTransport('request_started', 'info', address)
     return new Promise((resolve, reject) => {
@@ -2000,20 +2013,31 @@ export class RestrictedDockerBroker {
         method: request.method,
         headers: sanitizeHeaders(request.headers, body.length),
       }, (upstreamResponse) => {
+        transportPhases.responseHeadersMs = elapsed()
         const chunks: Buffer[] = []
         upstreamResponse.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
-        upstreamResponse.once('end', () => { result = { statusCode: upstreamResponse.statusCode ?? 500, headers: upstreamResponse.headers, body: Buffer.concat(chunks) } })
+        upstreamResponse.once('end', () => {
+          transportPhases.responseEndMs = elapsed()
+          result = { statusCode: upstreamResponse.statusCode ?? 500, headers: upstreamResponse.headers, body: Buffer.concat(chunks) }
+        })
         const failResponse = () => { failure ??= 'upstream_response_incomplete'; upstream.destroy() }
         upstreamResponse.once('aborted', failResponse)
         upstreamResponse.once('error', failResponse)
         upstreamResponse.once('close', () => { if (!upstreamResponse.complete) failResponse() })
       })
       this.upstreamRequests.add(upstream)
+      upstream.once('socket', socket => {
+        transportPhases.socketAssignedMs = elapsed()
+        transportPhases.reusedSocket = upstream.reusedSocket
+        transportPhases.socketConnectingAtAssignment = socket.connecting
+        if (socket.connecting) socket.once('connect', () => { transportPhases.socketConnectMs = elapsed() })
+      })
+      upstream.once('finish', () => { transportPhases.requestFinishedMs = elapsed() })
       upstream.once('error', () => { failure ??= this.drainExpired ? 'cleanup_deadline' : 'upstream_request_failed' })
       upstream.once('close', () => {
         this.upstreamRequests.delete(upstream)
         this.recordTransport('request_completed', result && !failure ? 'info' : 'warn', {
-          ...address, durationMs: Math.max(0, performance.now() - started),
+          ...address, durationMs: elapsed(), transportPhases,
           ...(result && !failure ? { statusCode: result.statusCode } : { errorCategory: failure ?? 'upstream_response_incomplete' }),
         })
         if (result && !failure) { resolve(result); return }
@@ -2036,6 +2060,7 @@ export class RestrictedDockerBroker {
   /** Transport diagnostics do not enter the ownership/cleanup receipt stream. */
   private recordTransport(phase: 'request_started' | 'request_completed', severity: 'info' | 'warn', fields: {
     requestId: string; method: string; route: string; containerId?: string; stopGraceSeconds?: number; durationMs?: number; statusCode?: number; errorCategory?: string
+    transportPhases?: TransportPhases
   }): void {
     const entry = { at: new Date().toISOString(), severity, event: `runtime.broker.${phase}`, ...fields }
     try {
