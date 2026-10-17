@@ -1838,7 +1838,7 @@ impl Supervisor {
         ),
         RuntimeError,
     > {
-        let (probe, context, transient) = self.classify_recovery(soul_id).await?;
+        let (probe, context, transient) = Box::pin(self.classify_recovery(soul_id)).await?;
         self.log_recovery_preflight(&context, &probe);
         Ok((probe, context, transient))
     }
@@ -1860,9 +1860,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         let mut transient = None;
-        let probe = self
-            .probe_recovery_context(&mut context, &mut transient)
-            .await?;
+        let probe = Box::pin(self.probe_recovery_context(&mut context, &mut transient)).await?;
         let probe = match probe {
             RecoveryProbe::ResumeReady { resume_spec, .. } => {
                 // Validate even an unchanged proof against the current attempt;
@@ -3197,6 +3195,12 @@ impl Supervisor {
                     )
                     .await
                     .map_err(map_registry)?;
+                let owned = self
+                    .registry
+                    .owned_handle(handle.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?;
+                self.complete_pending_provider_preparation(&owned).await?;
                 self.release_pending_native_permissions_after_live(
                     request.soul_id.clone(),
                     handle.incarnation_id.clone(),
@@ -3874,7 +3878,7 @@ impl Supervisor {
 
         if requires_native {
             let (current_probe, current, transient) =
-                self.probe_recovery_for_attempt(soul_id.clone()).await?;
+                Box::pin(self.probe_recovery_for_attempt(soul_id.clone())).await?;
             let ready = matches!(&current_probe,RecoveryProbe::ReattachReady {handle,..}
                 if handle.incarnation_id==prepared.prepared.incarnation_id);
             verdict_fence = current.write_fence_for_attempt(attempt_id.clone());
@@ -5464,7 +5468,18 @@ impl Supervisor {
         incarnation_id: &freshell_runtime_protocol::IncarnationId,
     ) {
         if let Ok(handle) = self.registry.owned_handle(incarnation_id.clone()).await {
-            let _ = self.terminate_owned_for_recovery(&handle).await;
+            if self.terminate_owned_for_recovery(&handle).await == Ok(StopOutcome::VerifiedEmpty) {
+                if let Err(error) = self.backend.discard_stopped_provider_inputs(&handle).await {
+                    crate::service::append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.recovery.failed_inputs_cleanup_deferred",
+                        serde_json::json!({"severity":"warn", "soulId":handle.soul_id(),
+                        "incarnationId":handle.incarnation_id(), "backendErrorKind":match error {
+                            BackendError::OwnershipMismatch(_) => "ownership_mismatch", _ => "unavailable",
+                        }}),
+                    );
+                }
+            }
         }
     }
 
