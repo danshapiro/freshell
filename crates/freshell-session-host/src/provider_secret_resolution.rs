@@ -159,8 +159,8 @@ fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<BTreeSet<String>, 
     match provider {
         "codex" => {
             // Codex 0.147 infers the mode for older auth files. Account identity
-            // and refresh metadata are optional; externally managed tokens may
-            // have an empty refresh token.
+            // is optional, but native bearer-token extraction needs last_refresh.
+            // Externally managed tokens may have an empty refresh token.
             let mode = if native["auth_mode"].is_null() {
                 if native["OPENAI_API_KEY"].is_null() {
                     "chatgpt"
@@ -179,12 +179,11 @@ fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<BTreeSet<String>, 
                         && native["tokens"]["refresh_token"].is_string()
                         && (native["tokens"]["account_id"].is_null()
                             || native["tokens"]["account_id"].is_string())
-                        && (native["last_refresh"].is_null()
-                            || native["last_refresh"].is_string()) =>
+                        && string(&native, "last_refresh") =>
                 {
                     Ok(BTreeSet::from(["openai".into()]))
                 }
-                "apikey" | "api_key" if string(&native, "OPENAI_API_KEY") => Ok(BTreeSet::new()),
+                "apikey" if string(&native, "OPENAI_API_KEY") => Ok(BTreeSet::new()),
                 _ => Err(invalid()),
             }
         }
@@ -615,14 +614,20 @@ mod tests {
         )
     }
 
+    fn codex_oauth_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "last_refresh":"2099-01-01T00:00:00Z",
+            "tokens": {
+                "id_token":"e30.eyJlbWFpbCI6ImZpeHR1cmVAZXhhbXBsZS50ZXN0In0.signature",
+                "access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.signature",
+                "refresh_token":"synthetic-refresh"
+            }
+        })
+    }
+
     #[test]
     fn typed_codex_native_api_key_accepts_inferred_and_explicit_modes() {
-        for mode in [
-            None,
-            Some(serde_json::Value::Null),
-            Some("apikey".into()),
-            Some("api_key".into()),
-        ] {
+        for mode in [None, Some(serde_json::Value::Null), Some("apikey".into())] {
             let mut auth = serde_json::json!({"OPENAI_API_KEY": "synthetic-native-key"});
             if let Some(mode) = mode {
                 auth["auth_mode"] = mode;
@@ -638,23 +643,20 @@ mod tests {
     }
 
     #[test]
-    fn typed_codex_native_oauth_accepts_optional_mode_and_metadata() {
+    fn typed_codex_native_oauth_accepts_optional_mode_and_account_id() {
         for mode in [
             None,
             Some(serde_json::Value::Null),
             Some("chatgpt".into()),
             Some("chatgptAuthTokens".into()),
         ] {
-            for metadata in [false, true] {
-                let mut auth = serde_json::json!({"tokens": {
-                    "id_token": "e30.eyJlbWFpbCI6ImZpeHR1cmVAZXhhbXBsZS50ZXN0In0.signature",
-                    "access_token": "synthetic-access", "refresh_token": ""
-                }});
+            for null_account_id in [false, true] {
+                let mut auth = codex_oauth_fixture();
+                auth["tokens"]["refresh_token"] = "".into();
                 if let Some(mode) = mode.clone() {
                     auth["auth_mode"] = mode;
                 }
-                if metadata {
-                    auth["last_refresh"] = serde_json::Value::Null;
+                if null_account_id {
                     auth["tokens"]["account_id"] = serde_json::Value::Null;
                 }
                 let resolved =
@@ -673,12 +675,41 @@ mod tests {
     }
 
     #[test]
+    fn typed_codex_native_oauth_rejects_missing_refresh_state_before_publication() {
+        // Codex get_token_data requires last_refresh even when the access
+        // token is unexpired. Deserializing optional metadata is insufficient.
+        for mode in [None, Some("chatgpt"), Some("chatgptAuthTokens")] {
+            for refresh in [None, Some(serde_json::Value::Null), Some("".into())] {
+                let mut auth = codex_oauth_fixture();
+                auth.as_object_mut().unwrap().remove("last_refresh");
+                if let Some(mode) = mode {
+                    auth["auth_mode"] = mode.into();
+                }
+                if let Some(refresh) = refresh {
+                    auth["last_refresh"] = refresh;
+                }
+                let error = resolve_codex_fixture(&auth, "HTTPS_PROXY=http://192.0.2.10:10255\n")
+                    .err()
+                    .expect("a native grant without usable token state must not be published");
+                assert_eq!(
+                    error,
+                    "OneCLI typed native auth has an unsupported provider shape"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn typed_codex_native_auth_rejects_invalid_and_conflicting_modes_without_secret_values() {
+        let mut conflicting_modes = codex_oauth_fixture();
+        conflicting_modes["auth_mode"] = "chatgpt".into();
+        conflicting_modes["OPENAI_API_KEY"] = "synthetic-private-key".into();
         for auth in [
             serde_json::json!({"auth_mode": "unknown", "OPENAI_API_KEY": "synthetic-private-key"}),
+            serde_json::json!({"auth_mode": "api_key", "OPENAI_API_KEY": "synthetic-private-key"}),
             serde_json::json!({"auth_mode": "apikey"}),
             serde_json::json!({"OPENAI_API_KEY": 42}),
-            serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": "synthetic-private-key", "tokens": {"id_token":"synthetic-id", "access_token":"synthetic-access", "refresh_token":"synthetic-refresh"}}),
+            conflicting_modes,
             serde_json::json!({"tokens": {"access_token":"synthetic-access"}}),
             serde_json::json!({"auth_mode": 42, "OPENAI_API_KEY":"synthetic-private-key"}),
         ] {
