@@ -19,6 +19,7 @@ import { stopOwnedServerAndVerify } from './owned-server-teardown.js'
 import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixture-cleanup.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 import { navigateToUnavailableEndpoint } from './renderer-outage-navigation.js'
+import { captureNativeWindowEvidence } from './native-process-evidence.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const electronProcesses = new WeakMap<ElectronApplication, ChildProcess>()
@@ -255,7 +256,25 @@ test.describe('Renderer crash recovery', () => {
     expect(bounds.height).toBeGreaterThan(0)
     expect(bounds.x + bounds.width).toBeLessThanOrEqual(workArea.x + workArea.width)
     expect(bounds.y + bounds.height).toBeLessThanOrEqual(workArea.y + workArea.height)
-    return nativeWindowState(application, page)
+    const state = await nativeWindowState(application, page)
+    await recordNativeSecurity(application, page, 'before', state)
+    return state
+  }
+
+  async function recordNativeSecurity(
+    application: ElectronApplication,
+    page: Page,
+    phase: 'before' | 'after',
+    expected: Awaited<ReturnType<typeof nativeWindowState>>,
+  ) {
+    const mainPid = electronProcesses.get(application)?.pid
+    if (!mainPid) throw new Error('native security capture requires the launch-owned Electron PID')
+    const evidence = await captureNativeWindowEvidence(() => nativeWindowState(application, page), mainPid)
+    expect(evidence.native).toMatchObject({ id: expected.id, webContentsId: expected.webContentsId,
+      mainPid: expected.mainPid, rendererPid: expected.rendererPid })
+    await test.info().attach(`renderer-recovery-native-security-${phase}.json`, {
+      body: JSON.stringify(evidence), contentType: 'application/json',
+    })
   }
 
   async function expectNativeRecovery(application: ElectronApplication, page: Page, before: Awaited<ReturnType<typeof nativeWindowState>>) {
@@ -269,6 +288,7 @@ test.describe('Renderer crash recovery', () => {
     expect(after.webContentsId).not.toBe(webContentsId)
     expect(after.rendererPid).not.toBe(rendererPid)
     expect(after.rendererPid).toBeGreaterThan(0)
+    await recordNativeSecurity(application, page, 'after', after)
     await test.info().attach('renderer-recovery-native-window.json', {
       body: JSON.stringify({ before, after }), contentType: 'application/json',
     })
