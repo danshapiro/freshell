@@ -7555,7 +7555,7 @@ pub(crate) mod tests {
         .unwrap();
         conn.execute("INSERT INTO input_commands (soul_id,request_id,payload_digest,protected_payload,incarnation_id,state,created_at,updated_at) VALUES (?1,'dispatched','test',X'00',?2,'completed',1,1)", rusqlite::params![soul.as_str(),launch.incarnation_id.as_str()]).unwrap();
         let context = registry.recovery_context(soul).await.unwrap();
-        let probe = after_native_probe(&context, freshell_agent_runtime::unverified_native_probe());
+        let probe = offline_probe(&context).unwrap();
         assert!(
             matches!(probe, RecoveryProbe::DefinitivelyUnavailable { .. }),
             "{probe:?}"
@@ -8500,6 +8500,7 @@ pub(crate) mod automatic_retry_tests {
             let retained_blocker = runtime.join("retained-store-unreadable");
             let retained_probe_failure = runtime.join("retained-probe-unreachable");
             let retained_post_read_failure = runtime.join("retained-fault-after-ready");
+            let retained_worker_exited = runtime.join("retained-worker-exited");
             let retained_provider = self.root.join("native-reader-fixture").exists()
                 && (handle
                     .terminal()
@@ -8764,7 +8765,7 @@ pub(crate) mod automatic_retry_tests {
                                 max_control_epoch: 1,
                                 max_execution_generation: generation,
                                 fixture_evidence: serde_json::json!({}),
-                                exited: false,
+                                exited: retained_worker_exited.exists(),
                                 native_session_id: observation
                                     .as_ref()
                                     .map(|observation| observation.native_session_id.clone())
@@ -9918,6 +9919,14 @@ pub(crate) mod automatic_retry_tests {
         soul
     }
 
+    async fn seed_retained_exited_opencode(supervisor: &Supervisor, root: &Path) -> SoulId {
+        let soul = seed_retained_opencode(supervisor, root).await;
+        // The enclosure remains healthy, but its worker has ended. This is the
+        // production branch that needs the independent retained store reader.
+        std::fs::write(root.join("retained/retained-worker-exited"), b"exited").unwrap();
+        soul
+    }
+
     async fn seed_completed_opencode_import(supervisor: &Supervisor, root: &Path) -> SoulId {
         let soul = seed_retained_opencode(supervisor, root).await;
         let context = supervisor
@@ -10288,10 +10297,43 @@ pub(crate) mod automatic_retry_tests {
         }
     }
 
-    async fn retained_unreadable_no_new_attempt_case(manual: bool) {
+    #[tokio::test]
+    async fn retained_live_worker_reattaches_without_requiring_unreadable_store() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, _) = open(dir.path(), 0);
         let soul = seed_retained_opencode(&supervisor, dir.path()).await;
+        let before = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let result = supervisor
+            .recover(RecoverRequest {
+                soul_id: soul,
+                trigger: RecoveryTrigger::StartupReconcile,
+                expected_intent_revision: Some(before.intent_revision),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        close_retry_hosts(&backend).await;
+        assert_eq!(result.outcome, RecoveryOutcome::Reattached);
+        assert_eq!(
+            result.view.incarnation_id,
+            *before.prior_handle.incarnation_id()
+        );
+        // A best-effort capture of missing saved resume evidence reads once;
+        // its refusal must not gate authenticated healthy reattachment.
+        assert_eq!(backend.count("retained-probes"), 1);
+        assert_eq!(backend.count("creates"), 0);
+        assert_eq!(backend.count("retained-grants"), 0);
+        assert_eq!(backend.count("retained-stops"), 0);
+    }
+
+    async fn retained_unreadable_no_new_attempt_case(manual: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed_retained_exited_opencode(&supervisor, dir.path()).await;
         let before = supervisor
             .registry
             .recovery_context(soul.clone())
@@ -10446,9 +10488,10 @@ pub(crate) mod automatic_retry_tests {
         close_retry_hosts(&backend).await;
         assert_eq!(attempts(dir.path()), journals);
         assert_eq!(due(dir.path()), None);
-        // Repair only the owned reader condition and require fresh qualified
-        // host/store truth before reattaching the same retained writer.
+        // Restore a healthy retained worker as well as its reader, then require
+        // fresh authenticated live truth before reattaching the same writer.
         std::fs::remove_file(dir.path().join("retained/retained-store-unreadable")).unwrap();
+        std::fs::remove_file(dir.path().join("retained/retained-worker-exited")).unwrap();
         let current = supervisor
             .registry
             .recovery_context(soul.clone())
@@ -10490,7 +10533,7 @@ pub(crate) mod automatic_retry_tests {
     async fn retained_unreadable_existing_reservation_keeps_its_journal() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, _) = open(dir.path(), 0);
-        let soul = seed_retained_opencode(&supervisor, dir.path()).await;
+        let soul = seed_retained_exited_opencode(&supervisor, dir.path()).await;
         let before = supervisor
             .registry
             .recovery_context(soul.clone())
@@ -10544,7 +10587,7 @@ pub(crate) mod automatic_retry_tests {
         for host_failure in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (supervisor, backend, clock) = open(dir.path(), 0);
-            let soul = seed_retained_opencode(&supervisor, dir.path()).await;
+            let soul = seed_retained_exited_opencode(&supervisor, dir.path()).await;
             if host_failure {
                 std::fs::write(
                     dir.path().join("retained/retained-probe-unreachable"),
@@ -10597,7 +10640,7 @@ pub(crate) mod automatic_retry_tests {
     async fn retained_unreadable_is_rechecked_after_successful_unreserved_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, _) = open(dir.path(), 0);
-        let soul = seed_retained_opencode(&supervisor, dir.path()).await;
+        let soul = seed_retained_exited_opencode(&supervisor, dir.path()).await;
         let before = supervisor
             .registry
             .recovery_context(soul.clone())
@@ -10652,7 +10695,7 @@ pub(crate) mod automatic_retry_tests {
     async fn retained_unreadable_cancels_existing_due_retry_without_refunding_history() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, clock) = open(dir.path(), 0);
-        let soul = seed_retained_opencode(&supervisor, dir.path()).await;
+        let soul = seed_retained_exited_opencode(&supervisor, dir.path()).await;
         backend.unavailable(true);
         supervisor.reconcile_startup().await.unwrap();
         let journals = attempts(dir.path());
@@ -10693,7 +10736,7 @@ pub(crate) mod automatic_retry_tests {
         for intent in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (supervisor, backend, _) = open(dir.path(), 0);
-            let soul = seed_retained_opencode(&supervisor, dir.path()).await;
+            let soul = seed_retained_exited_opencode(&supervisor, dir.path()).await;
             let journals = attempts(dir.path());
             let (probe, observed, _) = supervisor.classify_recovery(soul.clone()).await.unwrap();
             assert!(matches!(
