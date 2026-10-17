@@ -112,6 +112,15 @@ pub fn private_file_mode(source_mode: u32) -> u32 {
 pub fn provider_read_stage_mode(source_mode: u32) -> u32 {
     0o640 | (source_mode & 0o111)
 }
+/// Canonical aliases retained through the separately mounted workspace.
+pub fn is_workspace_mount_alias(source: &Path, workspace: &Path) -> bool {
+    source == workspace
+        || source.parent() == Some(workspace)
+        || (source.starts_with(workspace)
+            && source
+                .file_name()
+                .is_some_and(|name| name == "node_modules"))
+}
 fn valid_relative(path: &Path) -> bool {
     !path.as_os_str().is_empty() && path.components().all(|part| matches!(part,Component::Normal(name) if name.len()<=255 && !name.to_string_lossy().chars().any(char::is_control)))
 }
@@ -166,7 +175,7 @@ impl Plan {
         if self
             .excluded_subtree
             .as_ref()
-            .is_some_and(|excluded| source == excluded || source.starts_with(excluded))
+            .is_some_and(|excluded| source != excluded && source.starts_with(excluded))
         {
             self.included_subtree_resources.insert(source.to_owned());
         }
@@ -177,15 +186,20 @@ impl Plan {
         destination: PathBuf,
         depth: usize,
     ) -> Result<(), CopyError> {
+        // A declared selection takes precedence over the ambient workspace
+        // mount, including links between independent resource units.
+        if let Some(mapped) = self.mapped(&source)? {
+            return self.claim(destination, Node::Link(mapped));
+        }
         if self.is_alias_into_excluded_subtree(&source)
             && self
                 .excluded_subtree
                 .as_deref()
-                .is_some_and(|excluded| source == excluded || source.parent() == Some(excluded))
+                .is_some_and(|excluded| is_workspace_mount_alias(&source, excluded))
         {
             // The managed runtime mounts the workspace at its original absolute
-            // path. Keep root aliases pointed at that mount instead of
-            // materializing an unbounded workspace as a package dependency.
+            // path. Keep root aliases and installed Node lookup contexts on that
+            // mount instead of copying an unrelated workspace installation.
             return self.claim(destination, Node::MountedLink(source));
         }
         let mapped = self.external_resource(&source, &destination, depth)?;
@@ -458,8 +472,11 @@ impl Plan {
                     .map_err(|cause| io_error(path, "resolve_lookup_context", cause))?;
                 let destination = Path::new(".freshell/resources/tree")
                     .join(modules.strip_prefix("/").unwrap_or(&modules));
-                self.include_selected_subtree_resource(&canonical);
-                self.directory_mapping(&canonical, &destination, depth)?;
+                if self.is_alias_into_excluded_subtree(&canonical) {
+                    self.materialize_excluded_subtree_alias(canonical, destination, depth)?;
+                } else {
+                    self.directory_mapping(&canonical, &destination, depth)?;
+                }
             }
             let package = ancestor.join("package.json");
             if package.is_file() {
@@ -530,6 +547,9 @@ impl Plan {
                 if !fs::metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
                     continue;
                 }
+                // This parent is explicitly selected too; its alias may be
+                // visited before that parent's own selection in source order.
+                self.include_selected_subtree_resource(&target);
                 if self.excluded(&target) {
                     return Err(error(
                         &destination,
@@ -2390,9 +2410,9 @@ fn copy_environment_with_account_home(
 
 /// Copies a selected resource while omitting one nested tree. Symlink aliases
 /// into bounded subresources are materialized at the alias path; aliases to the
-/// excluded tree root or one of its top-level files remain absolute links to its
-/// separately mounted workspace. A child selected directly remains bounded to
-/// that child. All other exclusions still apply.
+/// excluded tree root, its top-level files, or installed Node lookup directories
+/// remain absolute links to its separately mounted workspace. A child selected
+/// directly remains bounded to that child. All other exclusions still apply.
 pub fn copy_environment_excluding_subtree(
     selections: &[CopySelection],
     destination_root: &Path,
@@ -4672,6 +4692,75 @@ mod tests {
                 .exists(),
             "the nested-tree allowance must not override another exclusion"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_skill_alias_uses_mounted_node_lookup_without_copying_unrelated_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let skill = workspace.join(".claude/skills/probe");
+        let skills = workspace.join(".codex/skills");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&skills).unwrap();
+        fs::create_dir_all(workspace.join("node_modules/probe-dependency")).unwrap();
+        fs::write(skill.join("SKILL.md"), "selected skill").unwrap();
+        fs::write(
+            skill.join("run.cjs"),
+            "process.stdout.write(require('probe-dependency'));",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("node_modules/probe-dependency/index.js"),
+            "module.exports='mounted-dependency-nonce';",
+        )
+        .unwrap();
+        fs::write(workspace.join("node_modules/unrelated-binary"), [0u8; 2048]).unwrap();
+        symlink("../../.claude/skills/probe", skills.join("probe")).unwrap();
+        let stage = root.path().join("stage");
+        let limits = CopyLimits {
+            max_file_bytes: 1024,
+            ..Default::default()
+        };
+
+        let report = copy_environment_excluding_subtree(
+            &[selection(&skills, "skills")],
+            &stage,
+            &[],
+            &workspace,
+            limits,
+        )
+        .unwrap();
+
+        assert!(
+            report.bytes < 1024,
+            "unrelated installed bytes stay mounted"
+        );
+        let output = Command::new("node")
+            .arg(stage.join("skills/probe/run.cjs"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"mounted-dependency-nonce");
+
+        let home = root.path().join("home");
+        copy_environment_excluding_subtree(
+            &[
+                selection(&stage.join("skills"), "skills"),
+                selection(&stage.join(".freshell/resources"), ".freshell/resources"),
+            ],
+            &home,
+            &[],
+            &workspace,
+            limits,
+        )
+        .unwrap();
+        let output = Command::new("node")
+            .arg(home.join("skills/probe/run.cjs"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"mounted-dependency-nonce");
     }
 
     #[cfg(unix)]

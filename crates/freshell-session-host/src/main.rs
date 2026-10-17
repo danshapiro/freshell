@@ -5033,7 +5033,7 @@ fn copy_provider_config_references_with_ownership(
     } else {
         Vec::new()
     };
-    let report = if provider == "opencode" {
+    let report = if matches!(provider, "opencode" | "codex") {
         copy_environment_with_events_excluding_subtree_for_mounts(
             "session_host",
             provider,
@@ -6499,7 +6499,11 @@ fn refresh_provider_config_in_stage_locked(
     )
     .map_err(|_| "provider reference alias metadata write failed")?;
     allow_provider_read_stage(stage.path(), unsafe { libc::getegid() })?;
-    apply_staged_provider_config_locked(stage.path(), provider_home)
+    let workspace = matches!(provider, "opencode" | "codex")
+        .then(|| std::fs::canonicalize(workspace))
+        .transpose()
+        .map_err(|_| "provider refresh mounted workspace is unavailable")?;
+    apply_staged_provider_config_locked(stage.path(), provider_home, workspace.as_deref())
 }
 
 #[cfg(test)]
@@ -6836,10 +6840,14 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     let _projection_lock = lock_provider_projection(provider_home)?;
     recover_provider_projection_transactions(provider_home)?;
     cleanup_orphaned_provider_refresh_stages(provider_home, None)?;
-    apply_staged_provider_config_locked(stage, provider_home)
+    apply_staged_provider_config_locked(stage, provider_home, None)
 }
 
-fn apply_staged_provider_config_locked(stage: &Path, provider_home: &Path) -> Result<(), String> {
+fn apply_staged_provider_config_locked(
+    stage: &Path,
+    provider_home: &Path,
+    workspace: Option<&Path>,
+) -> Result<(), String> {
     let destinations: Vec<String> = serde_json::from_slice(
         &read_projection_metadata(stage, "manifest.json")?
             .ok_or("provider projection destinations unavailable")?,
@@ -6986,6 +6994,7 @@ fn apply_staged_provider_config_locked(stage: &Path, provider_home: &Path) -> Re
     }
     publish_provider_projection(ProviderProjection {
         provider: &provider,
+        workspace,
         selections: &selections,
         home: provider_home,
         previous: &previous,
@@ -6999,6 +7008,7 @@ fn apply_staged_provider_config_locked(stage: &Path, provider_home: &Path) -> Re
 
 struct ProviderProjection<'a> {
     provider: &'a str,
+    workspace: Option<&'a Path>,
     selections: &'a [freshell_platform::provider_environment::CopySelection],
     home: &'a Path,
     previous: &'a std::collections::BTreeSet<String>,
@@ -7024,6 +7034,7 @@ fn publish_provider_projection_with_manifest(
 ) -> Result<(), String> {
     let ProviderProjection {
         provider,
+        workspace,
         selections,
         home,
         previous,
@@ -7083,13 +7094,28 @@ fn publish_provider_projection_with_manifest(
     let backup = transaction_path.join("backup");
     fs::create_dir(&backup).map_err(|error| error.to_string())?;
     let staged = (|| {
-        let report = copy_environment_with_events(
-            "provider_publication",
-            provider,
-            selections,
-            &desired,
-            &[],
-        )
+        let report = if let Some(workspace) = workspace {
+            copy_environment_with_events_excluding_subtree_for_mounts(
+                "provider_publication",
+                provider,
+                selections,
+                &desired,
+                &[],
+                workspace,
+                MountedResourceOptions {
+                    mounted_roots: &[],
+                    preserve_existing_mounted_files: &[],
+                },
+            )
+        } else {
+            copy_environment_with_events(
+                "provider_publication",
+                provider,
+                selections,
+                &desired,
+                &[],
+            )
+        }
         .map_err(|error| error.to_string())?;
         let actual = report
             .projected_paths
@@ -7115,9 +7141,21 @@ fn publish_provider_projection_with_manifest(
             {
                 let target = fs::read_link(&source).map_err(|error| error.to_string())?;
                 let physical = fs::canonicalize(&source).map_err(|error| error.to_string())?;
-                let target_relative = physical
-                    .strip_prefix(&desired)
-                    .map_err(|_| "staged resource link escapes its complete projection")?;
+                let target_relative = match physical.strip_prefix(&desired) {
+                    Ok(relative) => relative,
+                    Err(_)
+                        if workspace.is_some_and(|workspace| {
+                            freshell_platform::provider_environment::is_workspace_mount_alias(
+                                &physical, workspace,
+                            )
+                        }) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err("staged resource link escapes its complete projection".into())
+                    }
+                };
                 if mounted.iter().any(|root| {
                     Path::new(relative).starts_with(root) && !target_relative.starts_with(root)
                 }) {
@@ -16286,6 +16324,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             let _ = publish_provider_projection_with_manifest(
                 ProviderProjection {
                     provider: "codex",
+                    workspace: None,
                     selections: &selections,
                     home: &home,
                     previous: &previous,
@@ -16490,6 +16529,84 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         )
         .unwrap();
         assert!(!destination.join(".claude/settings.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_codex_keeps_workspace_node_lookup_mounted_across_refresh() {
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
+        let root = executable_fixture();
+        let workspace = root.path().join("workspace");
+        let modules = workspace.join("packages/tool/node_modules");
+        let controller = root.path().join("controller");
+        let skill = controller.join("skills/probe");
+        let home = root.path().join("provider");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::create_dir_all(modules.join("probe-dependency")).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "selected skill").unwrap();
+        std::fs::write(
+            skill.join("run.cjs"),
+            "process.stdout.write(require('probe-dependency'));",
+        )
+        .unwrap();
+        std::fs::write(
+            modules.join("probe-dependency/index.js"),
+            "module.exports='mounted-dependency-nonce';",
+        )
+        .unwrap();
+        std::fs::File::create(modules.join("unrelated-binary"))
+            .unwrap()
+            .set_len(
+                freshell_platform::provider_environment::CopyLimits::default().max_file_bytes + 1,
+            )
+            .unwrap();
+        std::os::unix::fs::symlink(&modules, skill.join("node_modules")).unwrap();
+        let context = ProviderLaunchContext {
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "skills".into(),
+                provider_relative_path: ".codex/skills".into(),
+                format: "directory".into(),
+            }],
+            preparation: ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+            mcp_capability: None,
+            prepared_inputs: None,
+        };
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        copy_provider_config_references(
+            &context,
+            "codex",
+            &workspace,
+            &controller,
+            &home,
+            uid,
+            gid,
+        )
+        .expect("a mounted dependency lookup must not copy unrelated workspace packages");
+        for _ in 0..2 {
+            refresh_provider_config_references(
+                &context,
+                "codex",
+                &workspace,
+                &controller,
+                &home,
+                uid,
+                gid,
+            )
+            .unwrap();
+            let output = std::process::Command::new("node")
+                .arg(home.join(".codex/skills/probe/run.cjs"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"mounted-dependency-nonce");
+        }
     }
 
     #[cfg(unix)]
@@ -17952,6 +18069,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         let result = publish_provider_projection_with_manifest(
             ProviderProjection {
                 provider: "codex",
+                workspace: None,
                 selections: &selections,
                 home: &home,
                 previous: &previous,
@@ -18081,6 +18199,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         let result = publish_provider_projection_with_manifest(
             ProviderProjection {
                 provider: "opencode",
+                workspace: None,
                 selections: &selections,
                 home: &home,
                 previous: &previous,
