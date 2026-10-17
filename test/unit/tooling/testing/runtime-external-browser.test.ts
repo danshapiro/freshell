@@ -5538,13 +5538,14 @@ describe('actual Cloud launcher browser image binding', () => {
       await fsp.mkdir(path.join(scripts, 'lib'), { recursive: true })
       await fsp.mkdir(bin)
       await fsp.copyFile('scripts/e2e-cloud.sh', path.join(scripts, 'e2e-cloud.sh'))
+      await fsp.copyFile('scripts/e2e-cloud-duration.mjs', path.join(scripts, 'e2e-cloud-duration.mjs'))
       await fsp.copyFile('scripts/lib/gcp-identity.sh', path.join(scripts, 'lib/gcp-identity.sh'))
       const command = `#!${process.execPath}\nconst fs=require('node:fs');const path=require('node:path');const args=process.argv.slice(2);const name=path.basename(process.argv[1]);
 fs.appendFileSync(process.env.TEST_CALLS,JSON.stringify({name,args})+'\\n');
 if(name==='git'){if(args.includes('status'))process.exit(0);console.log(args.includes('--short=12')?'aaaaaaaaaaaa':'${'a'.repeat(40)}');process.exit(0)}
 if(name==='pnpm'){
   if(args.some(x=>x.includes('cleanupOwnedExternalCloudJob')))JSON.parse(fs.readFileSync(0,'utf8'));
-  if(args.some(x=>x.includes('externalCloudMetadata'))&&process.env.TEST_EXTERNAL==='1')console.log('FRESHELL_RUNTIME_EXTERNAL_RUN_ID: "${descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID}"');
+  if(args.includes('cloud-metadata')&&process.env.TEST_EXTERNAL==='1')console.log('FRESHELL_RUNTIME_EXTERNAL_RUN_ID: "${descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID}"');
   process.exit(0);
 }
 if(args[0]==='info')process.exit(0);
@@ -5646,7 +5647,7 @@ process.exit(0);\n`
     const image = `us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e@${digest}`
     const result = await launch(true, digest)
     const create = result.operations.find(row => row.name === 'gcloud' && row.args.includes('create'))
-    expect(create?.args).toContain(`--image=${image}`)
+    expect(create?.args, result.child.stderr).toContain(`--image=${image}`)
     expect(result.events.find(row => row.event === 'managed_external_job_created')).toMatchObject({ image, imageDigest: digest })
     expect(result.events.find(row => row.event === 'managed_external_job_execution')).toMatchObject({ image, imageDigest: digest })
     expect(result.operations.some(row => row.args.includes('execute'))).toBe(true)
