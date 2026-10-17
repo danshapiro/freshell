@@ -181,7 +181,8 @@ export function providerParityFailureLogTail(logs: string, secrets: readonly str
       const fields = row.fields && typeof row.fields === 'object' ? row.fields : row
       const severity = String(row.level ?? row.severity ?? '').toLowerCase()
       if (!['warn', 'warning', 'error'].includes(severity)) return []
-      const text = (value: unknown) => typeof value === 'string' ? value.slice(0, 4096) : undefined
+      const text = (value: unknown) => typeof value === 'string'
+        ? redactNativeDiagnostic(value, secrets).slice(0, 4096) : undefined
       return [JSON.parse(redactNativeDiagnostic(JSON.stringify({
         severity, event: text(row.event ?? fields.message), timestamp: text(row.timestamp ?? row.at),
         target: text(row.target), error: text(fields.error ?? fields.cause),
