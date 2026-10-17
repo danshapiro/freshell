@@ -11653,6 +11653,102 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     }
 
     #[tokio::test]
+    async fn managed_provider_paired_native_auth_transport_reaches_prepared_publication() {
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let raw = r#"{"instructions":["{file:{env:NODE_EXTRA_CA_CERTS}}"]}"#;
+        std::fs::write(workspace.join("opencode.json"), raw).unwrap();
+        let grant = owned.path().join("environment.env");
+        let auth = owned.path().join("auth.json");
+        let ca = owned.path().join("ca.pem");
+        std::fs::write(&grant, "HTTPS_PROXY=http://192.0.2.10:10255\nNODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem\nNODE_USE_ENV_PROXY=1\n").unwrap();
+        std::fs::write(
+            &auth,
+            r#"{"openai":{"type":"api","key":"synthetic-native-key"}}"#,
+        )
+        .unwrap();
+        std::fs::write(&ca, "synthetic-ca-nonce").unwrap();
+        for path in [&grant, &auth, &ca] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let references = [
+            (&grant, ProviderSecretProfile::OpencodeOnecliEnvironment),
+            (&auth, ProviderSecretProfile::OpencodeOnecliAuthFile),
+            (&ca, ProviderSecretProfile::OpencodeOnecliCaFile),
+        ]
+        .map(|(path, profile)| ProviderSecretReference {
+            source_path: path.to_str().unwrap().into(),
+            profile,
+            provider_relative_path: None,
+        });
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        // No broker is listening: typed auth must not request a fallback lookup.
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
+            crate::managed_provider_references::OpencodePreparation {
+                client: &client,
+                soul: &soul,
+                creation_seed: "fixture-existing-soul",
+                home: &home,
+                cwd: &workspace,
+                workspace: &workspace,
+                original: &|_| None,
+                references: references.to_vec(),
+                auth_authority: Some("fixture-owned-attempt"),
+                selected_sources: None,
+                accepted_global_root: None,
+                selected_resource_roots: None,
+                native_source_flags: None,
+                rebind_enabled: None,
+                inherited_inline: None,
+                inline_edits: None,
+            },
+            |soul, home, context, input| {
+                assert!(input.frozen_inputs.unwrap().is_empty());
+                assert_eq!(&input.secret_references.unwrap()[..3], &references);
+                let capability = store.issue(
+                    soul.clone(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", home, &context.config)),
+                    OpencodeEphemeralInput {
+                        launch_context: Some(context),
+                        ..input
+                    },
+                    None,
+                )?;
+                read_prepared_context(&directory, &capability)
+            },
+        )
+        .await
+        .expect("ENV before native AUTH must reach actual prepared-input publication");
+        let inputs = prepared.context.prepared_inputs.as_ref().unwrap();
+        inputs.validate_references(&prepared.references).unwrap();
+        assert!(prepared.references.iter().any(|reference| reference.profile
+            == ProviderSecretProfile::OpencodeConfigurationFile
+            && reference.source_path == ca.to_str().unwrap()));
+        assert_eq!(&prepared.references[..3], &references);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("opencode.json")).unwrap(),
+            raw
+        );
+        assert!(!serde_json::to_string(&prepared.context)
+            .unwrap()
+            .contains("synthetic-native-key"));
+    }
+
+    #[tokio::test]
     async fn managed_provider_explicit_native_source_selection_survives_preparation() {
         use freshell_runtime_protocol::*;
         let owned = tempfile::tempdir().unwrap();

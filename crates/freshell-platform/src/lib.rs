@@ -72,6 +72,7 @@ pub mod provider_exec;
 pub mod provider_input_exchange;
 pub mod provider_input_profiles;
 pub mod provider_mountpoints;
+pub mod provider_native_auth;
 pub mod resume_gate;
 pub mod spawn;
 
