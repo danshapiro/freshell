@@ -6500,12 +6500,21 @@ fn refresh_provider_config_in_stage_locked(
         reference_alias_metadata,
     )
     .map_err(|_| "provider reference alias metadata write failed")?;
-    allow_provider_read_stage(stage.path(), unsafe { libc::getegid() })?;
     let workspace = matches!(provider, "opencode" | "codex")
         .then(|| std::fs::canonicalize(workspace))
         .transpose()
         .map_err(|_| "provider refresh mounted workspace is unavailable")?;
-    apply_staged_provider_config_locked(stage.path(), provider_home, workspace.as_deref())
+    // This process already prepared the complete graph as the provider UID.
+    // Keep its private modes and consume that owned stage in the transaction.
+    apply_staged_provider_config_locked(
+        stage.path(),
+        provider_home,
+        workspace.as_deref(),
+        Some(PreparedProviderProjection {
+            root: projection,
+            projected_paths: current,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -6740,34 +6749,6 @@ fn provider_identity_args(uid: u32, gid: u32) -> Vec<String> {
     ]
 }
 
-fn allow_provider_read_stage(path: &Path, gid: u32) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-
-    set_owner(path, unsafe { libc::geteuid() }, gid)?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        set_mode(path, 0o750)?;
-        for entry in std::fs::read_dir(path).map_err(|error| error.to_string())? {
-            allow_provider_read_stage(&entry.map_err(|error| error.to_string())?.path(), gid)?;
-        }
-    } else if metadata.is_file() {
-        {
-            use std::os::unix::fs::PermissionsExt;
-            set_mode(
-                path,
-                freshell_platform::provider_environment::provider_read_stage_mode(
-                    metadata.permissions().mode(),
-                ),
-            )?;
-        }
-    } else {
-        return Err("staged provider config must be a regular file or directory".into());
-    }
-    Ok(())
-}
-
 fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
     if args.len() == 2 && args[0] == "--recover" {
         let provider_home = Path::new(&args[1]);
@@ -6842,13 +6823,14 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     let _projection_lock = lock_provider_projection(provider_home)?;
     recover_provider_projection_transactions(provider_home)?;
     cleanup_orphaned_provider_refresh_stages(provider_home, None)?;
-    apply_staged_provider_config_locked(stage, provider_home, None)
+    apply_staged_provider_config_locked(stage, provider_home, None, None)
 }
 
 fn apply_staged_provider_config_locked(
     stage: &Path,
     provider_home: &Path,
     workspace: Option<&Path>,
+    prepared: Option<PreparedProviderProjection>,
 ) -> Result<(), String> {
     let destinations: Vec<String> = serde_json::from_slice(
         &read_projection_metadata(stage, "manifest.json")?
@@ -6858,6 +6840,12 @@ fn apply_staged_provider_config_locked(
     let projection = stage.join("projection");
     let previous = read_projection_manifest(provider_home)?;
     let current = read_projection_manifest(&projection)?;
+    if prepared
+        .as_ref()
+        .is_some_and(|prepared| prepared.root != projection || prepared.projected_paths != current)
+    {
+        return Err("prepared provider projection does not match its completed stage".into());
+    }
     let mut protected: std::collections::BTreeSet<String> =
         match read_projection_metadata(stage, "private-mountpoints.json")? {
             Some(bytes) => {
@@ -7000,18 +6988,22 @@ fn apply_staged_provider_config_locked(
     }) {
         return Err("preserved writable resource metadata has an invalid exact file".into());
     }
-    publish_provider_projection(ProviderProjection {
-        provider: &provider,
-        workspace,
-        selections: &selections,
-        home: provider_home,
-        previous: &previous,
-        current: &current,
-        protected: &protected,
-        mounted: &mounted,
-        preserve_existing_mounted_files: &preserve_existing_mounted_files,
-        reference_aliases,
-    })
+    publish_provider_projection(
+        ProviderProjection {
+            provider: &provider,
+            workspace,
+            selections: &selections,
+            home: provider_home,
+            previous: &previous,
+            current: &current,
+            protected: &protected,
+            mounted: &mounted,
+            preserve_existing_mounted_files: &preserve_existing_mounted_files,
+            reference_aliases,
+        },
+        prepared,
+        |source, destination| std::fs::rename(source, destination),
+    )
 }
 
 struct ProviderProjection<'a> {
@@ -7027,17 +7019,25 @@ struct ProviderProjection<'a> {
     reference_aliases: ProviderResourceReferenceAliasPlan,
 }
 
+struct PreparedProviderProjection {
+    root: PathBuf,
+    projected_paths: std::collections::BTreeSet<String>,
+}
+
 // One provider-owned transaction covers replacement, stale removal and manifest
 // publication. Its private stage and backups live on HOME's filesystem; only
 // exact manifest leaves move, so shared directories keep native children.
-fn publish_provider_projection(projection: ProviderProjection<'_>) -> Result<(), String> {
-    publish_provider_projection_with_manifest(projection, |source, destination| {
-        std::fs::rename(source, destination)
-    })
-}
-
+#[cfg(test)]
 fn publish_provider_projection_with_manifest(
     projection: ProviderProjection<'_>,
+    publish_manifest: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    publish_provider_projection(projection, None, publish_manifest)
+}
+
+fn publish_provider_projection(
+    projection: ProviderProjection<'_>,
+    prepared: Option<PreparedProviderProjection>,
     publish_manifest: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
     let ProviderProjection {
@@ -7102,34 +7102,50 @@ fn publish_provider_projection_with_manifest(
     let backup = transaction_path.join("backup");
     fs::create_dir(&backup).map_err(|error| error.to_string())?;
     let staged = (|| {
-        let report = if let Some(workspace) = workspace {
-            copy_environment_with_events_excluding_subtree_for_mounts(
-                "provider_publication",
-                provider,
-                selections,
-                &desired,
-                &[],
-                workspace,
-                MountedResourceOptions {
-                    mounted_roots: &[],
-                    preserve_existing_mounted_files: &[],
-                },
-            )
+        let actual = if let Some(prepared) = prepared {
+            if &prepared.projected_paths != current {
+                return Err("prepared provider projection paths changed before publication".into());
+            }
+            // The complete private tree was copied and validated under this
+            // HOME's projection lock. Move it into the existing transaction;
+            // its final data/directory flushes and rollback remain below.
+            fs::rename(&prepared.root, &desired)
+                .map_err(|error| format!("provider transaction consume prepared stage: {error}"))?;
+            emit_environment_event(serde_json::json!({
+                "severity":"info","event":"provider.projection.prepared.reused",
+                "provider":provider,"stage":"stage","entries":prepared.projected_paths.len()
+            }));
+            prepared.projected_paths
         } else {
-            copy_environment_with_events(
-                "provider_publication",
-                provider,
-                selections,
-                &desired,
-                &[],
-            )
-        }
-        .map_err(|error| error.to_string())?;
-        let actual = report
-            .projected_paths
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect::<std::collections::BTreeSet<_>>();
+            let report = if let Some(workspace) = workspace {
+                copy_environment_with_events_excluding_subtree_for_mounts(
+                    "provider_publication",
+                    provider,
+                    selections,
+                    &desired,
+                    &[],
+                    workspace,
+                    MountedResourceOptions {
+                        mounted_roots: &[],
+                        preserve_existing_mounted_files: &[],
+                    },
+                )
+            } else {
+                copy_environment_with_events(
+                    "provider_publication",
+                    provider,
+                    selections,
+                    &desired,
+                    &[],
+                )
+            }
+            .map_err(|error| error.to_string())?;
+            report
+                .projected_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
         if &actual != current {
             return Err(
                 "provider projection manifest does not describe the complete selected environment"
@@ -18364,6 +18380,165 @@ console.log('actual library export/import/full-row reader and Node semantic bind
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("second refresh proceeds after the first releases the lock");
         second.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_provider_projection_reuses_payload_and_retains_transaction_guarantees() {
+        use std::{
+            collections::BTreeSet,
+            ffi::CString,
+            fs,
+            io::Read,
+            os::{fd::FromRawFd, unix::fs::PermissionsExt},
+        };
+
+        for fail_manifest in [false, true] {
+            let root = executable_fixture();
+            let home = root.path().join("home");
+            let selected = root.path().join("selected");
+            fs::create_dir_all(home.join("skills")).unwrap();
+            fs::create_dir(&selected).unwrap();
+            fs::write(home.join("skills/command"), b"prior command").unwrap();
+            fs::write(home.join("skills/stale"), b"prior selected resource").unwrap();
+            fs::write(home.join("skills/native-session"), b"native history").unwrap();
+            fs::write(selected.join("dependency"), b"new-resource").unwrap();
+            fs::write(
+                selected.join("command"),
+                "#!/bin/sh\ncat \"$(dirname \"$0\")/dependency\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(selected.join("command"), fs::Permissions::from_mode(0o751))
+                .unwrap();
+            std::os::unix::fs::symlink("command", selected.join("alias")).unwrap();
+            let previous = BTreeSet::from([
+                "skills".into(),
+                "skills/command".into(),
+                "skills/stale".into(),
+            ]);
+            write_projection_manifest(&home, &previous).unwrap();
+            let prior_manifest = fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap();
+            let prepared = home.join("prepared");
+            let report = freshell_platform::provider_environment::copy_environment(
+                &[freshell_platform::provider_environment::CopySelection {
+                    source: selected,
+                    destination_relative: "skills".into(),
+                }],
+                &prepared,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            let current = report
+                .projected_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>();
+            // Observe real payload reads, including cached reads. Filesystem
+            // access-time policy cannot hide a redundant second copy.
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            assert!(fd >= 0);
+            let mut observer = unsafe { fs::File::from_raw_fd(fd) };
+            let payload = CString::new(
+                prepared
+                    .join("skills/dependency")
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            )
+            .unwrap();
+            assert!(unsafe { libc::inotify_add_watch(fd, payload.as_ptr(), libc::IN_ACCESS) } >= 0);
+            let selections = [freshell_platform::provider_environment::CopySelection {
+                source: prepared.join("skills"),
+                destination_relative: "skills".into(),
+            }];
+            let result = publish_provider_projection(
+                ProviderProjection {
+                    provider: "amplifier",
+                    workspace: None,
+                    selections: &selections,
+                    home: &home,
+                    previous: &previous,
+                    current: &current,
+                    protected: &BTreeSet::new(),
+                    mounted: &[],
+                    preserve_existing_mounted_files: &[],
+                    reference_aliases: Default::default(),
+                },
+                Some(PreparedProviderProjection {
+                    root: prepared,
+                    projected_paths: current.clone(),
+                }),
+                |source, destination| {
+                    assert!(!home.join("skills/stale").exists());
+                    assert!(home.join("skills/dependency").exists());
+                    if fail_manifest {
+                        Err(std::io::Error::other(
+                            "injected manifest publication failure",
+                        ))
+                    } else {
+                        fs::rename(source, destination)
+                    }
+                },
+            );
+            let mut events = [0u8; 4096];
+            match observer.read(&mut events) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(length) => {
+                    let mut offset = 0;
+                    while offset + 16 <= length {
+                        let mask =
+                            u32::from_ne_bytes(events[offset + 4..offset + 8].try_into().unwrap());
+                        let name_length = u32::from_ne_bytes(
+                            events[offset + 12..offset + 16].try_into().unwrap(),
+                        );
+                        assert_eq!(
+                            mask & libc::IN_ACCESS,
+                            0,
+                            "publication must reuse prepared payload, including during rollback"
+                        );
+                        offset += 16 + name_length as usize;
+                    }
+                    assert_eq!(offset, length);
+                }
+                other => panic!("owned payload read observer failed: {other:?}"),
+            }
+            assert_eq!(
+                fs::read(home.join("skills/native-session")).unwrap(),
+                b"native history"
+            );
+            if fail_manifest {
+                assert!(result.unwrap_err().contains("publish manifest"));
+                assert_eq!(
+                    fs::read(home.join("skills/command")).unwrap(),
+                    b"prior command"
+                );
+                assert_eq!(
+                    fs::read(home.join("skills/stale")).unwrap(),
+                    b"prior selected resource"
+                );
+                assert!(!home.join("skills/dependency").exists());
+                assert_eq!(
+                    fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+                    prior_manifest
+                );
+            } else {
+                result.unwrap();
+                let consumer = std::process::Command::new(home.join("skills/alias"))
+                    .output()
+                    .unwrap();
+                assert!(consumer.status.success());
+                assert_eq!(consumer.stdout, b"new-resource");
+                assert_eq!(
+                    fs::metadata(home.join("skills/command"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o711
+                );
+                assert_eq!(read_projection_manifest(&home).unwrap(), current);
+            }
+        }
     }
 
     #[test]
