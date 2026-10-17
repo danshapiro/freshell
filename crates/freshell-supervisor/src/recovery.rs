@@ -315,6 +315,28 @@ fn deterministic_fresh_fixture(context: &RecoveryContext) -> bool {
     })
 }
 
+fn current_fixture_native_session<'a>(
+    context: &RecoveryContext,
+    status: &'a crate::service::HostStatus,
+) -> Option<&'a str> {
+    // Named fixtures expose synthetic roots, never real-provider proof.
+    if !((context.provider == "native-session-fixture"
+        && context.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession))
+        || deterministic_fresh_fixture(context))
+        || status.exited
+        || context
+            .native_identity_launch
+            .as_ref()
+            .is_none_or(|launch| launch.execution_generation != status.max_execution_generation)
+    {
+        return None;
+    }
+    status
+        .native_session_id
+        .as_deref()
+        .filter(|root| !root.is_empty() && context.native_session_id.as_deref() == Some(*root))
+}
+
 pub(crate) fn current_native_observation<'a>(
     context: &RecoveryContext,
     status: &'a crate::service::HostStatus,
@@ -2046,6 +2068,7 @@ impl Supervisor {
                     };
                     let native_observation_qualified = context.fixture.is_some()
                         || context.provider == "shell"
+                        || current_fixture_native_session(context, &status).is_some()
                         || retained_status_observed(context, &host, &status);
                     if let Some(native_session_id) = status
                         .native_session_id
@@ -2080,7 +2103,10 @@ impl Supervisor {
                                 )
                                 .await;
                         }
-                        if context.provider != "shell" && context.fixture.is_none() {
+                        if context.provider != "shell"
+                            && context.fixture.is_none()
+                            && !deterministic_fresh_fixture(context)
+                        {
                             self.registry
                                 .record_native_identity_observation(
                                     context.soul_id.clone(),
@@ -2093,7 +2119,10 @@ impl Supervisor {
                                 .await
                                 .map_err(map_registry)?;
                         }
-                        if context.provider != "shell" && context.resume_spec.is_none() {
+                        if context.provider != "shell"
+                            && context.resume_spec.is_none()
+                            && !deterministic_fresh_fixture(context)
+                        {
                             self.capture_live_resume_evidence(context, &host, &status)
                                 .await;
                         }
@@ -5338,27 +5367,9 @@ impl Supervisor {
                     }
                 }
             };
-            // This named lifecycle fixture exercises replacement and storage,
-            // but never produces a real-provider qualification observation.
-            if ((current.provider == "native-session-fixture"
-                && current.fixture == Some(freshell_runtime_protocol::FixtureKind::NativeSession))
-                || deterministic_fresh_fixture(&current))
-                && !status.exited
-                && current
-                    .native_identity_launch
-                    .as_ref()
-                    .is_some_and(|launch| {
-                        launch.execution_generation == status.max_execution_generation
-                    })
-                && status.native_session_id.as_deref().is_some_and(|root| {
-                    !root.is_empty() && current.native_session_id.as_deref() == Some(root)
-                })
-            {
+            if let Some(native_session_id) = current_fixture_native_session(&current, &status) {
                 return NativeIdentityWait::Observed {
-                    native_session_id: status
-                        .native_session_id
-                        .clone()
-                        .expect("checked fixture root"),
+                    native_session_id: native_session_id.into(),
                     elapsed_ms,
                 };
             }
@@ -6556,6 +6567,219 @@ pub(crate) mod tests {
         assert!(
             stopped_repair_resume_observation_fault(&ordinary, &status, true, true, 17).is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn retained_fresh_fixture_reattaches_same_worker_after_supervisor_restart() {
+        use freshell_runtime_protocol::{
+            host_proof, read_frame, write_frame, Envelope, HostBootId, HostReply,
+            NativeIdentityLaunch, RecoveryState,
+        };
+        for case in [
+            "ordinary-provider",
+            "wrong-mode",
+            "wrong-provider",
+            "missing-root",
+            "wrong-root",
+            "wrong-generation",
+            "current-fixture",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry =
+                crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("owned-host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let native = "fixture-native-codex-current";
+            let mut agent = serde_json::json!({
+                "sessionId":"owned-fixture", "provider":"codex", "sessionType":"freshcodex",
+                "runtimeVariant":"fixture-test", "providerStoreId":"owned-store",
+                "cwd":dir.path(), "workspacePath":dir.path(), "runAsUid":65534,
+                "runAsGid":0, "fixtureTransport":"deterministic", "nativeSessionId":native
+            });
+            match case {
+                "ordinary-provider" => {
+                    agent.as_object_mut().unwrap().remove("fixtureTransport");
+                }
+                "wrong-mode" => agent["sessionType"] = "freshopencode".into(),
+                "wrong-provider" => agent["provider"] = "opencode".into(),
+                _ => {}
+            }
+            let conn = rusqlite::Connection::open(registry.database_path()).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='codex',resume_spec=NULL WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+            conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fixture_kind=NULL,fresh_agent_spec=?2 WHERE incarnation_id=?3",
+                rusqlite::params![runtime.to_string_lossy(),agent.to_string(),prepared.incarnation_id.as_str()]).unwrap();
+            drop(conn);
+            registry
+                .record_native_session(soul.clone(), prepared.incarnation_id.clone(), native.into())
+                .await
+                .unwrap();
+            let before = registry.recovery_context(soul.clone()).await.unwrap();
+            registry
+                .bind_native_identity_launch(NativeIdentityLaunch {
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: before.prior_handle.launch_nonce().as_str().into(),
+                    evidence_revision: before.evidence_revision,
+                    execution_generation: 1,
+                    requested_native_session_id: Some(native.into()),
+                })
+                .await
+                .unwrap();
+            let old_epoch = registry.control_epoch();
+            let limits = before.requested_limits;
+            let hosted_incarnation = prepared.incarnation_id.clone();
+            let listener = tokio::net::UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let (close_host, mut host_closed) = tokio::sync::oneshot::channel::<()>();
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let (mut socket, _) = tokio::select! {
+                        _ = &mut host_closed => break,
+                        accepted = listener.accept() => accepted.unwrap(),
+                    };
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    if !matches!(&request.body, HostCommand::Hello { .. }) {
+                        assert_eq!(
+                            request.auth,
+                            Some(host_proof(
+                                b"synthetic-secret",
+                                "command-auth",
+                                &boot,
+                                &hosted_incarnation
+                            ))
+                        );
+                    }
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: vec![
+                                "native-identity-observation-v1".into(),
+                                "owned-provider-config-v1".into(),
+                                "provider-store-probe-v1".into(),
+                            ],
+                            effective_limits: limits,
+                        },
+                        HostCommand::Status { .. } => HostResult::Status {
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: old_epoch,
+                            max_execution_generation: if case == "wrong-generation" {
+                                2
+                            } else {
+                                1
+                            },
+                            fixture_evidence: serde_json::json!({"workload":"fresh-agent"}),
+                            exited: false,
+                            native_session_id: match case {
+                                "missing-root" => None,
+                                "wrong-root" => Some("fixture-native-other".into()),
+                                _ => Some(native.into()),
+                            },
+                            // Deterministic transport identity is never native proof.
+                            native_identity_observation: None,
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        },
+                        other => {
+                            panic!("reattach must not dispatch or replace the worker: {other:?}")
+                        }
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            // Reopen only the controller registry. The authenticated host and
+            // its one existing worker survive with their original identity.
+            drop(registry);
+            let registry =
+                crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+            assert!(registry.control_epoch() > old_epoch);
+            let supervisor =
+                supervisor_with_runtime_state(&dir, registry, BackendRuntimeState::Running);
+            let result = supervisor
+                .recover(RecoverRequest {
+                    soul_id: soul.clone(),
+                    trigger: RecoveryTrigger::StartupReconcile,
+                    expected_intent_revision: Some(before.intent_revision),
+                    expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                })
+                .await
+                .unwrap();
+            close_host.send(()).unwrap();
+            responder.await.unwrap();
+            if case == "current-fixture" {
+                assert_eq!(
+                    result.outcome,
+                    RecoveryOutcome::Reattached,
+                    "{case}: {result:?}"
+                );
+                assert_eq!(result.view.recovery_state, RecoveryState::Live);
+            } else {
+                assert_eq!(
+                    result.outcome,
+                    RecoveryOutcome::Blocked,
+                    "{case}: {result:?}"
+                );
+                assert!(
+                    matches!(
+                        result.probe,
+                        Some(RecoveryProbe::Blocked {
+                            reason: RecoveryBlockReason::CapabilityPending,
+                            ..
+                        })
+                    ),
+                    "{case}: {result:?}"
+                );
+            }
+            let after = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                after.prior_handle.incarnation_id(),
+                before.prior_handle.incarnation_id()
+            );
+            assert_eq!(
+                after.prior_handle.container_id(),
+                before.prior_handle.container_id()
+            );
+            assert_eq!(after.native_session_id.as_deref(), Some(native));
+            assert!(
+                after.resume_spec.is_none(),
+                "a synthetic root cannot establish durable native proof"
+            );
+            let conn = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+            let (incarnations, observations): (u64, u64) = conn.query_row(
+                "SELECT count(*),count(native_identity_observation) FROM incarnations WHERE soul_id=?1",
+                [soul.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!((incarnations, observations), (1, 0), "{case}");
+        }
     }
 
     #[tokio::test]
