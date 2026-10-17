@@ -5371,10 +5371,10 @@ describe('run-owned workload image build', () => {
       expect((await fsp.readFile(calls, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as string[])
         .every(args => !args.includes('build') && !args.includes('rm'))).toBe(true)
       await fsp.writeFile(imageFile, JSON.stringify([{ ...image, Config: { Labels: { ...image.Config.Labels,
-        'com.freshell.runtime-test-candidate': 'f'.repeat(40) } } }]))
+        'org.freshell.runtime-test-candidate': 'f'.repeat(40) } } }]))
       expect(() => (second as any).ensureRuntimeImage()).toThrow(/candidate|source/)
       await fsp.writeFile(imageFile, JSON.stringify([{ ...image, Config: { Labels: { ...image.Config.Labels,
-        'com.freshell.runtime-test-source-state': `${candidateSha}:dirty` } } }]))
+        'org.freshell.runtime-test-source-state': `${candidateSha}:dirty` } } }]))
       expect(() => (second as any).ensureRuntimeImage()).toThrow(/candidate|source/)
       await fsp.writeFile(imageFile, JSON.stringify([{ ...image, Id: `sha256:${'d'.repeat(64)}` }]))
       expect(() => (second as any).ensureRuntimeImage()).toThrow(/digest|image/)
@@ -5402,8 +5402,8 @@ describe('run-owned workload image build', () => {
       const build = actual.find(args => args[0] === 'build')!
       const tag = build[build.indexOf('-t') + 1]
       expect(tag).toBe(`freshell-managed-runtime:task008-${runtime.candidateSha.slice(0, 12)}-${runId}`)
-      expect(build).toContain(`com.freshell.runtime-test-run-id=${runId}`)
-      expect(build).toContain(`com.freshell.runtime-test-candidate=${runtime.candidateSha}`)
+      expect(build).toContain(`org.freshell.runtime-test-run-id=${runId}`)
+      expect(build).toContain(`org.freshell.runtime-test-candidate=${runtime.candidateSha}`)
       expect(actual.filter(args => args[0] === 'image')).toEqual([
         ['image', 'inspect', tag, '--format', '{{.Id}}'], ['image', 'inspect', digest, '--format', '{{.Id}}'],
       ])
@@ -5426,7 +5426,7 @@ describe('run-owned workload image build', () => {
     expect(result.digest).toBe(`sha256:${'c'.repeat(64)}`)
     expect(result.tag).toContain(runId)
     expect(child).toHaveBeenNthCalledWith(1, 'docker', expect.arrayContaining(['build', '-t', result.tag,
-      '--label', `com.freshell.runtime-test-candidate=${fixtureCandidateSha}`]), expect.objectContaining({ cwd: fixtureRepoRoot }))
+      '--label', `org.freshell.runtime-test-candidate=${fixtureCandidateSha}`]), expect.objectContaining({ cwd: fixtureRepoRoot }))
     expect(child).toHaveBeenNthCalledWith(2, 'docker', ['image', 'inspect', result.tag, '--format', '{{.Id}}'], expect.objectContaining({ encoding: 'utf8' }))
     expect(child.mock.calls.flatMap(call => call[1] ?? [])).not.toContain(owner.PHASE2_RUNTIME_IMAGE_TAG)
   })
@@ -5438,8 +5438,8 @@ describe('run-owned workload image build', () => {
     const context = { tag: 'freshell-managed-runtime:owned-test', runId: handle.runId,
       candidateSha: handle.candidateSha, digest: `sha256:${'c'.repeat(64)}` }
     const image = { Id: context.digest, RepoTags: [context.tag], Config: { Labels: {
-      'com.freshell.runtime-test-run-id': context.runId,
-      'com.freshell.runtime-test-candidate': context.candidateSha,
+      'org.freshell.runtime-test-run-id': context.runId,
+      'org.freshell.runtime-test-candidate': context.candidateSha,
     } } }
     expect(() => owner.assertRunOwnedRuntimeImage([image], context)).not.toThrow()
     expect(() => owner.assertRunOwnedRuntimeImage([{ ...image, Id: `sha256:${'d'.repeat(64)}` }], context)).toThrow(/owned/)
@@ -5450,8 +5450,8 @@ describe('run-owned workload image build', () => {
     const context = { tag: 'freshell-managed-runtime:owned-test', runId: handle.runId,
       candidateSha: handle.candidateSha, digest: `sha256:${'c'.repeat(64)}` }
     const image = { Id: context.digest, RepoTags: [context.tag], Config: { Labels: {
-      'com.freshell.runtime-test-run-id': context.runId,
-      'com.freshell.runtime-test-candidate': context.candidateSha,
+      'org.freshell.runtime-test-run-id': context.runId,
+      'org.freshell.runtime-test-candidate': context.candidateSha,
     } } }
     let removed = false
     const execute = vi.fn<typeof execFileSync>().mockImplementation((_command, args) => {
