@@ -9,6 +9,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
+import { prepareProviderParityUserRoots } from '../../helpers/provider-parity-environment.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [
@@ -79,6 +80,7 @@ describe('hosted fresh-agent provider inputs', () => {
     onecli = fakeOnecliGrants(providers.map(row => row.provider))
     restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     const xdgConfigHome = path.join(homeDir, 'custom-xdg')
+    prepareProviderParityUserRoots(homeDir, xdgConfigHome)
     rig = new ManagedRuntimeBrowserRig(root, 2, {
       FRESHELL_BIND_HOST: '0.0.0.0', XDG_CONFIG_HOME: xdgConfigHome,
       ...onecli.serverEnv,
