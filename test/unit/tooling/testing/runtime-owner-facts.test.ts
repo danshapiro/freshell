@@ -525,14 +525,22 @@ process.stdout.write(result.stdout || ''); process.stderr.write(stderr || ''); p
     const directory = path.join(fixtureRepoRoot, 'fake-cleanup-daemon')
     await fsp.mkdir(directory)
     await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst a=process.argv.slice(2);if(a[0]!=='ps'&&!(a[0]==='volume'&&a[1]==='ls'))process.exitCode=9;\n`, { mode: 0o700 })
-    Object.defineProperty(harness, 'broker', { value: { historyHelperNames: () => [], receipts: () => [], eventsSnapshot: () => [],
-      awaitPendingRequests: async () => uncertain ? [{ reason: 'controlled_unknown_allocation', method: 'POST', url: '/containers/create', allocationUnknown: true }] : [] } })
+    harness.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused',
+      proxySocketPath: path.join(directory, 'unused.sock'), runtimeRootPrefix: harness.testRoot,
+      allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: harness.runId,
+      logPath: path.join(directory, 'unused-broker.jsonl') })
+    vi.spyOn(harness.broker, 'awaitPendingRequests').mockResolvedValue(uncertain
+      ? [{ reason: 'controlled_unknown_allocation', method: 'POST', url: '/containers/create', allocationUnknown: true }] : [])
     vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
     try {
       const result = await harness.cleanup()
       expect(result.ok).toBe(!uncertain)
       expect(fs.existsSync(harness.nativeHistoryBuildDir)).toBe(uncertain)
-    } finally { vi.unstubAllEnvs() }
+      const receipt = JSON.parse(await fsp.readFile(path.join(harness.evidenceDir, 'cleanup.json'), 'utf8'))
+      expect(receipt).toMatchObject({ ok: !uncertain, verifiedKnownResourcesAbsent: true,
+        verifiedResourcesAbsent: !uncertain, brokerSettlementComplete: true })
+      expect(receipt.brokerSettlementFailures).toHaveLength(uncertain ? 1 : 0)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs() }
   })
 
   it.each((['claude', 'amplifier'] as const).flatMap(provider =>
