@@ -214,6 +214,7 @@ impl Host {
             fresh_agent: Some(Box::new(launch)),
             resume_spec: None,
             native_identity_launch: None,
+            provider_path_inputs: Default::default(),
         }
     }
 }
@@ -271,6 +272,7 @@ fn selected_context(provider: &str, destination: &str) -> ProviderLaunchContext 
             }
         },
         mcp_capability: None,
+        prepared_inputs: None,
         config: vec![ProviderConfigReference {
             root: ProviderConfigRoot::Workspace,
             relative_path: "selected-config".into(),
@@ -283,6 +285,11 @@ fn selected_context(provider: &str, destination: &str) -> ProviderLaunchContext 
 async fn fresh_retry(provider: &str) {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    // Actor startup creates this journal before invoking the native transport.
+    // The read-only root stops the repaired grant after config preparation,
+    // without requiring a provider executable or credential.
+    let actor_error = fs::create_dir("/run/freshell-host-actor").unwrap_err();
+    assert_eq!(actor_error.raw_os_error(), Some(libc::EROFS));
     let home = Path::new(PROVIDER_HOME);
     let home_inode = fs::metadata(home).unwrap().ino();
     let prefix = if provider == "codex" {
@@ -311,8 +318,7 @@ async fn fresh_retry(provider: &str) {
         "providerStoreId":"retry-store", "cwd":root.path(), "workspacePath":root.path(),
         "runAsUid":PROVIDER_UID, "runAsGid":PROVIDER_GID,
         "providerBootstrapFiles":[{"sourcePath":"synthetic-only", "providerRelativePath":bootstrap}],
-        "providerLaunchContext":selected_context(provider, &config),
-        "providerSecretReferences":[{"sourcePath":"/private/synthetic-missing.env","profile":format!("{provider}_onecli_environment")}]
+        "providerLaunchContext":selected_context(provider, &config)
     })).unwrap();
     assert!(launch.native_session_id.is_none());
     let soul = SoulId::new();
@@ -364,8 +370,11 @@ async fn fresh_retry(provider: &str) {
         .send(replacement.grant(&soul, launch))
         .await
         .unwrap_err();
-    assert_eq!(retry.diagnostic_code, Some(RuntimeDiagnosticCode::ProviderSecretResolutionFailed),
-        "a repaired startup must finish config preparation before refusing the deliberately absent synthetic secret: {retry:?}");
+    assert_eq!(
+        retry.diagnostic_code,
+        Some(RuntimeDiagnosticCode::FreshAgentOpenFailed),
+        "a repaired startup must finish config preparation before refusing the unavailable actor journal: {retry:?}"
+    );
     assert_eq!(
         provider_command(&["cat", home.join(config).to_str().unwrap()]),
         fs::read(source).unwrap()
@@ -450,6 +459,7 @@ async fn opencode_transfer_retry_requires_selected_config_before_advancing_prefl
         fresh_agent: None,
         resume_spec: None,
         native_identity_launch: None,
+        provider_path_inputs: Default::default(),
     };
     let first = host.send(grant.clone()).await.unwrap_err();
     assert!(
