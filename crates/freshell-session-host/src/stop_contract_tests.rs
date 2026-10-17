@@ -113,6 +113,8 @@ async fn create_capabilities(root: &Path, fresh: bool) -> Vec<String> {
         fresh_agent: agent,
         opencode_transfer_dir: None,
         provider_volume_name: "freshell-provider-stop-contract".into(),
+        initial_input_reservation: None,
+        prior_provider_owner: None,
     };
     DockerEngineBackend::new(&socket)
         .create_stopped(&spec)
@@ -205,6 +207,7 @@ async fn child(capabilities: &[String], evidence: &Path) {
         state.incarnation_id.clone(),
         &launch(evidence),
         BTreeMap::new(),
+        None,
         None,
         None,
     )
