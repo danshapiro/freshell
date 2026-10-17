@@ -43,8 +43,12 @@ function createStore(tabsState: any, panesState: any) {
     preloadedState: {
       tabs: tabsState,
       panes: panesState,
-      connection: { status: 'connected', error: null, reconnectAttempts: 0 },
+      connection: {
+        ...connectionReducer(undefined, { type: '@@INIT' }),
+        status: 'connected' as const,
+      },
       settings: {
+        ...settingsReducer(undefined, { type: '@@INIT' }),
         settings: defaultSettings,
         loaded: true,
       },
@@ -128,22 +132,28 @@ describe('TabBar accessibility', () => {
     }, plan)
 
     const projectedLayout = store.getState().panes.layouts['config-tab']
+    // A blocked recovery needs manual retry; it is not actively recovering.
+    const expectedBlockedProjection = {
+      soulId: 'config-soul',
+      incarnationId: 'config-incarnation',
+      viewIntentId: 'config-view',
+      status: 'error',
+      runtimeStatus: 'blocked',
+      recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'STORE_UNREADABLE' },
+      sessionRef: { provider: 'opencode', sessionId: 'ses_config_fixture' },
+    }
     expect(projectedLayout).toMatchObject({
       type: 'leaf',
       id: 'config-pane',
-      content: {
-        soulId: 'config-soul',
-        viewIntentId: 'config-view',
-        status: 'recovering',
-        recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'STORE_UNREADABLE' },
-        sessionRef: { provider: 'opencode', sessionId: 'ses_config_fixture' },
-      },
+      content: expectedBlockedProjection,
     })
+    const projectedTabRecord = store.getState().tabs.tabs.find(tab => tab.id === 'config-tab')
+    expect(projectedTabRecord).toMatchObject(expectedBlockedProjection)
     expect(store.getState().tabs.activeTabId).toBe('local-tab')
 
     render(<Provider store={store}><TabBar /></Provider>)
 
-    const projectedTab = screen.getByRole('tab', { name: 'synthetic config-blocked exact retry', exact: true })
+    const projectedTab = screen.getByRole('tab', { name: 'synthetic config-blocked exact retry' })
     expect(projectedTab).toBeVisible()
     expect(projectedTab).toHaveAttribute('data-tab-id', 'config-tab')
     expect(projectedTab).toHaveAttribute('aria-selected', 'false')
@@ -159,6 +169,7 @@ describe('TabBar accessibility', () => {
     expect(store.getState().tabs.activeTabId).toBe('config-tab')
     expect(store.getState().panes.activePane['config-tab']).toBe('config-pane')
     expect(store.getState().panes.layouts[store.getState().tabs.activeTabId!]).toEqual(projectedLayout)
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'config-tab')).toEqual(projectedTabRecord)
 
     const nameRef = projectedLayout.type === 'leaf' ? resolvePaneNameRef(projectedLayout.content) : undefined
     expect(nameRef).toBeDefined()
@@ -177,7 +188,7 @@ describe('TabBar accessibility', () => {
     })
     expect(within(tablist).getByRole('tab', { name: 'Canonical managed name', selected: true }))
       .toHaveAttribute('data-tab-id', 'config-tab')
-    expect(within(tablist).queryByRole('tab', { name: 'synthetic config-blocked exact retry', exact: true }))
+    expect(within(tablist).queryByRole('tab', { name: 'synthetic config-blocked exact retry' }))
       .not.toBeInTheDocument()
   })
 
