@@ -278,7 +278,7 @@ export class RestrictedDockerBroker {
     const uuid = (value: string) => /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value)
     const fixture = path.dirname(this.policy.runtimeRootPrefix)
     const relative = path.relative(fixture, input.stageRoot)
-    const destination = (value: string) => typeof value === 'string' && path.isAbsolute(value)
+    const destination = (value: string, publishedResource = false) => typeof value === 'string' && path.isAbsolute(value)
       && path.normalize(value) === value && !/[\x00-\x1f\x7f]/.test(value)
       && (value === input.workspacePath || isStrictDescendant(value, input.workspacePath)
         || mappedProviderDestination(value)
@@ -286,7 +286,7 @@ export class RestrictedDockerBroker {
         // The owned controller publication already selected and froze ordinary
         // ancestor policy files and their imports. These are exact container
         // destinations; their sources remain generation-owned stage units.
-        || (published && !value.startsWith('/home/freshell/provider/'))
+        || (publishedResource && !value.startsWith('/home/freshell/provider/'))
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const unit = (value: string, prefix: string, file = false) => typeof value === 'string'
       && new RegExp(`^${prefix}/[a-zA-Z0-9_-]{1,128}${file ? '/source' : ''}$`).test(value)
@@ -310,8 +310,8 @@ export class RestrictedDockerBroker {
       const targets = new Set<string>()
       // Retained logical origins are metadata only: the helper receives their
       // frozen stage files, rather than mounts at those original destinations.
-      const claim = (value: string) => {
-        const valid = profile === input ? destination(value) : typeof value === 'string' && path.isAbsolute(value) && path.normalize(value) === value && !/[\x00-\x1f\x7f]/.test(value)
+      const claim = (value: string, publishedResource = false) => {
+        const valid = profile === input ? destination(value, publishedResource) : typeof value === 'string' && path.isAbsolute(value) && path.normalize(value) === value && !/[\x00-\x1f\x7f]/.test(value)
         if (!valid || targets.has(value)) throw new Error('Claude candidate selected target is invalid')
         targets.add(value)
       }
@@ -323,7 +323,7 @@ export class RestrictedDockerBroker {
         if (!['file','directory'].includes(mount.kind)
           || !unit(mount.stageRelativePath, '\\.freshell/resource-units', mount.kind === 'file')
           || !unit(mount.providerRelativePath, '\\.freshell/provider-roots', mount.kind === 'file')) throw new Error('Claude candidate resource source is invalid')
-        claim(mount.effectiveDestination)
+        claim(mount.effectiveDestination, published)
       }
     }
   }
