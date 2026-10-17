@@ -18,7 +18,7 @@ use crate::{
         StoppedRepairOwnerCandidate, StoppedRepairRootReceipt,
     },
     resume_catalog,
-    service::{LaunchWorkload, Supervisor},
+    service::{map_backend, LaunchWorkload, Supervisor},
 };
 use freshell_agent_runtime::{classify_provider_failure, recovery_paths};
 use freshell_runtime_protocol::{
@@ -3497,6 +3497,61 @@ impl Supervisor {
             });
         }
 
+        let prior_has_indexed_inputs = start
+            .context
+            .prior_handle
+            .terminal()
+            .and_then(|spec| spec.provider_launch_context.as_ref())
+            .or_else(|| {
+                start
+                    .context
+                    .prior_handle
+                    .fresh_agent()
+                    .and_then(|spec| spec.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .is_some_and(|inputs| inputs.indexed_files.is_some());
+        if prior_has_indexed_inputs
+            && self
+                .registry
+                .is_stopped_unaccepted_replacement(prior_incarnation_id.clone())
+                .await
+                .map_err(map_registry)?
+        {
+            // The previous failed start can still own this retained input
+            // generation after a transient cleanup failure. Release its exact
+            // stopped ownership before a successor is prepared or published.
+            if let Err(error) = self
+                .discard_failed_replacement_inputs(&start.context.prior_handle)
+                .await
+            {
+                let reason = RecoveryBlockReason::ProviderUnavailable;
+                self.registry
+                    .mark_recovery_blocked_with_retry(
+                        soul_id.clone(),
+                        Some(attempt_id.clone()),
+                        reason,
+                        vec![error.message.clone()],
+                        verdict_fence.clone(),
+                        Some(TransientRecoveryFailure::Preparation),
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                return Ok(RecoveryResult {
+                    outcome: RecoveryOutcome::Blocked,
+                    view: self.view_for(&prior_incarnation_id).await?,
+                    probe: Some(blocked(path, reason, &error.message, Some(2_000))),
+                    prior_incarnation_id: Some(prior_incarnation_id),
+                    attempt_id: Some(attempt_id),
+                    expected_native_session_id: resume_spec
+                        .as_ref()
+                        .map(|spec| spec.provider_session.native_session_id.clone()),
+                    observed_native_session_id: None,
+                    incident_id: None,
+                });
+            }
+        }
+
         let replacement_terminal = if resume_spec.is_some() {
             terminal_without_first_boot_state(start.context.terminal.clone())
         } else {
@@ -5469,18 +5524,26 @@ impl Supervisor {
     ) {
         if let Ok(handle) = self.registry.owned_handle(incarnation_id.clone()).await {
             if self.terminate_owned_for_recovery(&handle).await == Ok(StopOutcome::VerifiedEmpty) {
-                if let Err(error) = self.backend.discard_stopped_provider_inputs(&handle).await {
-                    crate::service::append_event(
-                        &self.config.lifecycle_log,
-                        "supervisor.recovery.failed_inputs_cleanup_deferred",
-                        serde_json::json!({"severity":"warn", "soulId":handle.soul_id(),
-                        "incarnationId":handle.incarnation_id(), "backendErrorKind":match error {
-                            BackendError::OwnershipMismatch(_) => "ownership_mismatch", _ => "unavailable",
-                        }}),
-                    );
-                }
+                let _ = self.discard_failed_replacement_inputs(&handle).await;
             }
         }
+    }
+
+    async fn discard_failed_replacement_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), RuntimeError> {
+        self.backend.discard_stopped_provider_inputs(handle).await.map_err(|error| {
+            crate::service::append_event(
+                &self.config.lifecycle_log,
+                "supervisor.recovery.failed_inputs_cleanup_deferred",
+                serde_json::json!({"severity":"warn", "soulId":handle.soul_id(),
+                    "incarnationId":handle.incarnation_id(), "backendErrorKind":match &error {
+                        BackendError::OwnershipMismatch(_) => "ownership_mismatch", _ => "unavailable",
+                    }}),
+            );
+            map_backend(error)
+        })
     }
 
     async fn view_for(
