@@ -5933,6 +5933,7 @@ export class ManagedRuntimeOwner {
     if (!beforeStart) this.runtime.removeContainerExact(previous.containerId)
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: previous.scenarioId,
+      operatorHome: this.resolvedOperatorHome,
       volumeName: previous.volumeName,
       binaryKind: previous.binaryKind,
       ...(beforeStart ? { waitForHealth: false } : {}),

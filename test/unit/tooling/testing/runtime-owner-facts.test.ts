@@ -2935,6 +2935,41 @@ describe('current running fresh-session lookup', () => {
   })
 })
 
+describe('operator home across supervisor replacement', () => {
+  it.each((['graceful', 'abrupt'] as const).flatMap(mode =>
+    [undefined, 'operator-home', '/controlled/operator-home'].map(operatorHome => ({ mode, operatorHome })),
+  ))('preserves $operatorHome through $mode replacement', async ({ mode, operatorHome }) => {
+    const info = { baseUrl: 'http://127.0.0.1:1', wsUrl: 'ws://127.0.0.1:1/ws', token: 'unused-fixture-token', homeDir: '/controlled/web-home' }
+    const rig = new owner.ManagedRuntimeOwner(() => ({ info, start: async () => info }) as owner.RuntimeWebHandle,
+      fixtureRepoRoot, 2, {}, {}, 'release', { enabledProviders: [] }, undefined, { bootstrapProviders: [] }, operatorHome)
+    const expectedHome = operatorHome === undefined ? undefined
+      : path.isAbsolute(operatorHome) ? operatorHome : path.join(rig.runtime.testRoot, operatorHome)
+    const previous: owner.SupervisorInstance = { scenarioId: 'browser-managed-runtime', containerId: 'a'.repeat(64),
+      volumeName: 'owned-volume', runtimeRoot: '/controlled/runtime', controlSocket: '/controlled/socket',
+      controlSecret: 'unused-fixture-secret', controlSecretFile: '/controlled/secret', binaryKind: 'release' }
+    const replacement = { ...previous, containerId: 'b'.repeat(64) }
+    const prepare = vi.spyOn(rig.runtime, 'prepare').mockResolvedValue(undefined)
+    vi.spyOn(rig as any, 'buildQualificationSupervisor').mockReturnValue(undefined)
+    vi.spyOn(rig as any, 'buildManagedServer').mockReturnValue('/controlled/unused-server')
+    vi.spyOn(rig.runtime, 'recordProviderQualificationBuild').mockImplementation(() => undefined)
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValueOnce(previous).mockResolvedValueOnce(replacement)
+    const stop = vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    const kill = vi.spyOn(rig.runtime, 'killTrackedContainerExact').mockImplementation(() => undefined)
+    const remove = vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    try {
+      await expect(rig.start()).resolves.toEqual(info)
+      expect(prepare).toHaveBeenCalledWith(expectedHome === undefined ? {} : { operatorHome: expectedHome })
+      expect(launch.mock.calls[0][0]).toHaveProperty('operatorHome', expectedHome)
+      await expect(mode === 'graceful' ? rig.restartSupervisor() : rig.restartSupervisorAbrupt()).resolves.toEqual(replacement)
+      expect(launch.mock.calls[1][0].operatorHome).toBe(expectedHome)
+      expect(launch.mock.calls[1][0]).toMatchObject({ volumeName: previous.volumeName, reuseSecret: true })
+      expect(remove).toHaveBeenCalledWith(previous.containerId)
+      if (mode === 'graceful') { expect(stop).toHaveBeenCalledWith(previous); expect(kill).not.toHaveBeenCalled() }
+      else { expect(kill).toHaveBeenCalledWith(previous.containerId); expect(stop).not.toHaveBeenCalled() }
+    } finally { vi.restoreAllMocks() }
+  })
+})
+
 describe('startup replacement fixture observes bounded automatic recovery', () => {
   it.each(['scheduled', 'blocked', 'unrelated-live', 'late-live', 'deadline-live', 'pending', 'near-deadline'] as const)('observes %s inventory without forcing or rearming recovery', async scenario => {
     const { exercisePhase3StartupReplacementCrash } = await import('../../../runtime/gates/phase-3.test.js')
