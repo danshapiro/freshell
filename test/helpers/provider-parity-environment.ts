@@ -19,6 +19,26 @@ export function prepareProviderParityUserRoots(home: string, xdgConfigHome: stri
   fs.mkdirSync(path.join(xdgConfigHome, 'opencode'), { recursive: true })
 }
 
+/** Restore user-owned OpenCode inputs between shuffled recovery cases. */
+export function resetProviderParityOpenCodeInputs(workspace: string, xdgConfigHome: string, inputs: {
+  tui: string
+  project: string
+  user: string
+}): void {
+  const projectConfig = path.join(workspace, '.opencode')
+  const userConfig = path.join(xdgConfigHome, 'opencode')
+  fs.writeFileSync(path.join(userConfig, 'tui.jsonc'), inputs.tui)
+  // Recovery removes the original selected directory to exercise refresh.
+  fs.mkdirSync(projectConfig, { recursive: true })
+  fs.writeFileSync(path.join(projectConfig, 'opencode.json'), inputs.project)
+  // Every provider observes this shared project file. Prepare the selected
+  // owned subtree for the provider user independently of shuffled case order.
+  makeProviderParityResourcesReadable(projectConfig)
+  fs.writeFileSync(path.join(userConfig, 'opencode.jsonc'), inputs.user)
+  fs.rmSync(path.join(userConfig, 'new-provider.jsonc'), { force: true })
+  fs.writeFileSync(path.join(userConfig, 'plugins/parity-plugin.js'), 'export default { name: "parity" }\n')
+}
+
 const providerFailureOperations = [
   ['provider transaction backup ', 'backup'], ['provider transaction install ', 'install'],
   ['provider transaction create ', 'create'], ['provider transaction remove directory ', 'remove_directory'],

@@ -11,7 +11,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
-import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, resetProviderParityOpenCodeInputs, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
 import { authorizeProviderParityRequest } from '../../helpers/provider-parity-broker.js'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
 import { providerParitySqliteHygieneScript } from '../../helpers/provider-parity-sqlite-hygiene.js'
@@ -599,15 +599,9 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
   beforeEach(() => {
     // Vitest shuffles cases. Each case sees the same user-owned inputs even
     // when a prior recovery case edited them to exercise refresh semantics.
-    fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), homeTuiConfig())
-    fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), projectOpencodeConfig())
-    // Every provider observes this shared project file. Prepare the selected
-    // owned subtree for the provider user independently of shuffled case order.
-    makeProviderParityResourcesReadable(path.join(workspace, '.opencode'))
-    const userConfig = path.join(xdgConfigHome, 'opencode')
-    fs.writeFileSync(path.join(userConfig, 'opencode.jsonc'), userOpencodeConfig())
-    fs.rmSync(path.join(userConfig, 'new-provider.jsonc'), { force: true })
-    fs.writeFileSync(path.join(userConfig, 'plugins/parity-plugin.js'), 'export default { name: "parity" }\n')
+    resetProviderParityOpenCodeInputs(workspace, xdgConfigHome, {
+      tui: homeTuiConfig(), project: projectOpencodeConfig(), user: userOpencodeConfig(),
+    })
   })
 
   afterAll(() => cleanupProviderParity({
