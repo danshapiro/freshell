@@ -1950,15 +1950,20 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             ));
         }
     }
-    if let Some(terminal) = handle.terminal() {
-        let expected = docker::terminal_mounts_for_adoption(terminal)
-            .map_err(BackendError::OwnershipMismatch)?;
-        verify_workload_mounts(mounts, &expected)?;
-    }
-    if let Some(agent) = handle.fresh_agent() {
-        let expected = docker::fresh_agent_mounts_for_adoption(agent)
-            .map_err(BackendError::OwnershipMismatch)?;
-        verify_workload_mounts(mounts, &expected)?;
+    // Existing-object checks share the accepted mount plan. Current input
+    // availability is a creation precondition, not existing-container identity.
+    let workload = handle
+        .terminal()
+        .map(docker::terminal_mounts_for_adoption)
+        .or_else(|| {
+            handle
+                .fresh_agent()
+                .map(docker::fresh_agent_mounts_for_adoption)
+        })
+        .transpose()
+        .map_err(BackendError::OwnershipMismatch)?;
+    if let Some(expected) = &workload {
+        verify_workload_mounts(mounts, expected)?;
     }
     // Each declared destination occurs once. Required source/access checks
     // above still determine ownership; this rejects extra/duplicate enclosures.
@@ -1976,12 +1981,6 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
     if handle.fresh_agent().is_some() {
         destinations.insert(HOST_ACTOR_STATE_MOUNT.into());
     }
-    let workload = handle
-        .terminal()
-        .map(docker::terminal_mounts)
-        .or_else(|| handle.fresh_agent().map(docker::fresh_agent_mounts))
-        .transpose()
-        .map_err(BackendError::OwnershipMismatch)?;
     if let Some(workload) = workload {
         for descriptor in
             prepared_inputs::mount_descriptors(&workload, handle.provider_volume_name())?
@@ -3632,6 +3631,226 @@ pub(crate) mod tests {
             "Mounts": mounts,
         });
         (handle, inspected)
+    }
+
+    #[test]
+    fn verify_inspect_config_keeps_terminal_owned_after_selected_workspace_input_deletion() {
+        assert_owned_after_selected_workspace_input_deletion(
+            false,
+            "backend::tests::verify_inspect_config_keeps_terminal_owned_after_selected_workspace_input_deletion",
+        );
+    }
+
+    #[test]
+    fn verify_inspect_config_keeps_fresh_agent_owned_after_selected_workspace_input_deletion() {
+        assert_owned_after_selected_workspace_input_deletion(
+            true,
+            "backend::tests::verify_inspect_config_keeps_fresh_agent_owned_after_selected_workspace_input_deletion",
+        );
+    }
+
+    fn assert_owned_after_selected_workspace_input_deletion(fresh: bool, test_name: &str) {
+        use freshell_runtime_protocol::{
+            McpCapabilityReference, PreparedProviderInputs, ProviderInputManifestReference,
+            ProviderLaunchContext, ProviderPreparation, ProviderResourceKind,
+            ProviderResourceMount,
+        };
+
+        // Capability and HOME selection are process-wide. Isolate them from
+        // other ownership tests, as the mount adoption tests do.
+        const CHILD: &str = "FRESHELL_WORKSPACE_INPUT_INSPECTION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=1s", "20s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated owned-input inspection failed");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (original, mut inspected) = terminal_runtime_fixture(root.path(), None);
+        let workspace = Path::new(&original.terminal().unwrap().workspace_path);
+        std::env::set_var("HOME", workspace);
+        std::env::remove_var("FRESHELL_SUPERVISOR_OPERATOR_HOME");
+        let selected = workspace.join(".opencode");
+        let capabilities = root.path().join("mcp-capabilities");
+        let stage = root.path().join("provider-roots/grant-owned-input");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("provider-owned-state"), b"keep").unwrap();
+        std::fs::create_dir(&capabilities).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/resource-units/project")).unwrap();
+        let manifest = b"{\"sources\":[]}";
+        std::fs::write(stage.join(".freshell/input-manifest.json"), manifest).unwrap();
+        let grant = capabilities.join("grant-owned-input.json");
+        std::fs::write(&grant, b"{}").unwrap();
+        std::fs::set_permissions(&grant, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", capabilities);
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            config: vec![],
+            mcp_capability: Some(McpCapabilityReference {
+                grant_id: "grant-owned-input".into(),
+                endpoint: "http://host.docker.internal:4000".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            }),
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: "grant-owned-input".into(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: format!("{:x}", Sha256::digest(manifest)),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/project".into(),
+                    provider_relative_path: ".freshell/provider-roots/project".into(),
+                    logical_destination: selected.to_string_lossy().into_owned(),
+                    effective_destination: selected.to_string_lossy().into_owned(),
+                    kind: ProviderResourceKind::Directory,
+                    writable: false,
+                    reference_aliases: vec![],
+                    retired_reference_aliases: vec![],
+                }],
+                indexed_files: None,
+            }),
+        };
+        let (terminal, agent, mounts) = if fresh {
+            let agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
+                "sessionId":"owned-input", "provider":"opencode", "sessionType":"freshopencode",
+                "runtimeVariant":"opencode", "providerStoreId":"store",
+                "cwd":workspace,"workspacePath":workspace,"runAsUid":65534,"runAsGid":0,
+                "providerLaunchContext":context
+            }))
+            .unwrap();
+            let mounts = docker::fresh_agent_mounts(&agent).unwrap();
+            (None, Some(agent), mounts)
+        } else {
+            let mut terminal = original.terminal().unwrap().clone();
+            terminal.mode = "opencode".into();
+            terminal.program = "opencode".into();
+            terminal.provider_launch_context = Some(context);
+            let mounts = docker::terminal_mounts(&terminal).unwrap();
+            (Some(terminal), None, mounts)
+        };
+        let handle = OwnedRuntimeHandle::from_registry(
+            original.installation_id().clone(),
+            original.soul_id().clone(),
+            original.provider_store_id().into(),
+            original.incarnation_id().clone(),
+            original.launch_nonce().clone(),
+            original.daemon_id().clone(),
+            original.container_id().into(),
+            original.image_ref().into(),
+            original.runtime_dir().into(),
+            original.host_binary_path().into(),
+            original.immutable_config_digest().into(),
+            original.requested_limits(),
+            None,
+            terminal,
+            agent,
+            original.provider_volume_name().into(),
+        );
+        inspected["Config"]["Env"] =
+            json!(runtime_host_environment(handle.terminal(), handle.fresh_agent(), None).unwrap());
+        inspected["HostConfig"]["Tmpfs"] = json!(runtime_tmpfs(Some("opencode")));
+        let reported = inspected["Mounts"].as_array_mut().unwrap();
+        for (source, destination) in [
+            (
+                mounts.provider_user_root.as_ref().unwrap(),
+                "/run/freshell-private/user-provider",
+            ),
+            (
+                mounts.mcp_capability_file.as_ref().unwrap(),
+                "/run/freshell/mcp-capability.json",
+            ),
+        ] {
+            reported.push(json!({"Source":source,"Destination":destination,"RW":false}));
+        }
+        reported.push(json!({"Type":"volume","Name":handle.provider_volume_name(),
+            "Source":"/docker/owned-provider","Destination":selected,"RW":true}));
+        if fresh {
+            let actor =
+                host_actor_state_dir(root.path(), handle.installation_id(), handle.soul_id());
+            std::fs::create_dir_all(&actor).unwrap();
+            std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700)).unwrap();
+            reported.push(json!({"Source":actor,"Destination":HOST_ACTOR_STATE_MOUNT,"RW":true}));
+        }
+        inspected["HostConfig"]["Mounts"] =
+            json!(
+                prepared_inputs::mount_descriptors(&mounts, handle.provider_volume_name()).unwrap()
+            );
+        let volumes = BTreeMap::from([(
+            handle.provider_volume_name().to_owned(),
+            json!({"Name":handle.provider_volume_name(),"Driver":"local","Mountpoint":"/docker/owned-provider"}),
+        )]);
+        let verify = |value: &Value| {
+            verify_inspect_config(&handle, value)?;
+            prepared_inputs::verify(value, &mounts, handle.provider_volume_name(), &volumes)
+        };
+        verify(&inspected).expect("prepared owned mount configuration is valid before deletion");
+
+        std::fs::remove_dir_all(&selected).unwrap();
+        verify(&inspected)
+            .expect("original input deletion must not revoke existing mount ownership");
+        let create = handle
+            .terminal()
+            .map(docker::terminal_mounts)
+            .or_else(|| handle.fresh_agent().map(docker::fresh_agent_mounts))
+            .unwrap();
+        assert_eq!(
+            create.unwrap_err(),
+            "selected workspace input mountpoint is unavailable",
+            "a new runtime still requires current prepared input topology"
+        );
+
+        for changed in [
+            {
+                let mut value = inspected.clone();
+                value["Config"]["Labels"]["com.freshell.soul-id"] = json!("foreign");
+                value
+            },
+            {
+                let mut value = inspected.clone();
+                value["Mounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"Source":"/foreign","Destination":"/foreign","RW":true}));
+                value
+            },
+            {
+                let mut value = inspected.clone();
+                value["HostConfig"]["Mounts"][0]["VolumeOptions"]["Subpath"] = json!("foreign");
+                value
+            },
+            {
+                let mut value = inspected.clone();
+                value["Mounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|mount| mount["Destination"] == json!(selected))
+                    .unwrap()["Name"] = json!("foreign-volume");
+                value
+            },
+        ] {
+            assert!(
+                matches!(verify(&changed), Err(BackendError::OwnershipMismatch(_))),
+                "input deletion must not permit changed container ownership or mounted state"
+            );
+        }
     }
 
     #[test]
