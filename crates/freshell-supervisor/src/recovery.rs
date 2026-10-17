@@ -9497,6 +9497,10 @@ pub(crate) mod automatic_retry_tests {
 
     #[tokio::test]
     async fn offline_amplifier_captures_durable_store_before_exact_replacement() {
+        Box::pin(offline_amplifier_capture_case()).await;
+    }
+
+    async fn offline_amplifier_capture_case() {
         // Capability-directory configuration is process-global. Keep this
         // wholly fictional replacement protocol isolated from other tests.
         const CHILD: &str = "FRESHELL_OFFLINE_AMPLIFIER_TEST_CHILD";
@@ -9562,14 +9566,14 @@ pub(crate) mod automatic_retry_tests {
             )
             .unwrap();
         let listener = tokio::net::UnixListener::bind(root.path().join("mcp.sock")).unwrap();
-        let response =
-            serde_json::to_vec(&freshell_runtime_protocol::ProviderReplacementPreparation {
-                context: launch_context,
-                secret_references: vec![],
-            })
-            .unwrap();
+        let response = serde_json::to_vec(&freshell_runtime_protocol::PreparedProviderContext {
+            provider_launch_context: launch_context,
+            provider_secret_references: vec![],
+        })
+        .unwrap();
         let callback = tokio::spawn(async move {
-            for action in ["issue", "activate"] {
+            let mut activated_incarnation = None;
+            for action in ["issue", "activate", "commit"] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = vec![];
                 stream.read_to_end(&mut request).await.unwrap();
@@ -9580,9 +9584,16 @@ pub(crate) mod automatic_retry_tests {
                     stream.write_all(&response).await.unwrap();
                 } else {
                     assert_eq!(request["grantId"], "grant-offline-fixture");
+                    let incarnation = request["incarnationId"].as_str().unwrap();
+                    if let Some(activated) = &activated_incarnation {
+                        assert_eq!(incarnation, activated);
+                    } else {
+                        activated_incarnation = Some(incarnation.to_owned());
+                    }
                     stream.write_all(b"ok").await.unwrap();
                 }
             }
+            activated_incarnation.unwrap()
         });
         assert!(before.resume_spec.is_none());
         let result = Box::pin(supervisor.recover(RecoverRequest {
@@ -9593,21 +9604,30 @@ pub(crate) mod automatic_retry_tests {
         }))
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), callback)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
             result.outcome,
             RecoveryOutcome::Replaced,
             "probe={:?}",
             result.probe
         );
+        let committed_incarnation = tokio::time::timeout(Duration::from_secs(5), callback)
+            .await
+            .unwrap()
+            .unwrap();
         let after = supervisor
             .registry
             .recovery_context(soul.clone())
             .await
             .unwrap();
+        assert_eq!(
+            after.prior_handle.incarnation_id().as_str(),
+            committed_incarnation
+        );
+        assert!(!supervisor
+            .registry
+            .provider_preparation_is_pending(after.prior_handle.incarnation_id().clone())
+            .await
+            .unwrap());
         let saved = after.resume_spec.unwrap();
         assert_eq!(saved.provider_session.native_session_id, "retry-root");
         assert_eq!(
@@ -9662,7 +9682,23 @@ pub(crate) mod automatic_retry_tests {
                     root.path().join("unmounted-store"),
                 )
                 .unwrap(),
-                "missing_history" => std::fs::remove_file(store.join("transcript.jsonl")).unwrap(),
+                "missing_history" => {
+                    // No recorded turn, event history or transcript may still
+                    // establish materialization independently of the missing
+                    // primary file. Empty backup artifacts remain incomplete.
+                    std::fs::remove_file(store.join("transcript.jsonl")).unwrap();
+                    std::fs::remove_file(store.join("events.jsonl")).unwrap();
+                    let mut metadata: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(store.join("metadata.json")).unwrap(),
+                    )
+                    .unwrap();
+                    metadata.as_object_mut().unwrap().remove("turn_count");
+                    std::fs::write(
+                        store.join("metadata.json"),
+                        serde_json::to_vec(&metadata).unwrap(),
+                    )
+                    .unwrap();
+                }
                 "unreadable" => {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(
@@ -9678,7 +9714,7 @@ pub(crate) mod automatic_retry_tests {
                 .unwrap(),
                 "truncated" => std::fs::write(
                     store.join("events.jsonl"),
-                    b"{\"event\":\"cleanup:store_end\",\"session_id\":\"retry-root\"}",
+                    b"{\"event\":\"cleanup:store_end\",\"session_id\":\"retry-root\"",
                 )
                 .unwrap(),
                 "ambiguous" => std::fs::create_dir_all(
@@ -11549,13 +11585,12 @@ pub(crate) mod automatic_retry_tests {
                 } else {
                     response.mcp_capability = None;
                 }
-                let response = serde_json::to_vec(
-                    &freshell_runtime_protocol::ProviderReplacementPreparation {
-                        context: response,
-                        secret_references: vec![],
-                    },
-                )
-                .unwrap();
+                let response =
+                    serde_json::to_vec(&freshell_runtime_protocol::PreparedProviderContext {
+                        provider_launch_context: response,
+                        provider_secret_references: vec![],
+                    })
+                    .unwrap();
                 Some(tokio::spawn(async move {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut request = vec![];
@@ -11577,7 +11612,7 @@ pub(crate) mod automatic_retry_tests {
             );
             let journals = attempts(dir.path());
             assert_eq!(journals.len(), 1);
-            assert_eq!(journals[0].1, "blocked");
+            assert_eq!(journals[0].1, "blocked", "{case}: {report:?}");
             let unfinished: u64 = Connection::open(supervisor.registry.database_path())
                 .unwrap()
                 .query_row(

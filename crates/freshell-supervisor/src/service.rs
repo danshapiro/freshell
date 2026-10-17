@@ -3538,12 +3538,16 @@ impl Supervisor {
                     "capability_pending: server returned an invalid exact provider preparation",
                 )
             })?;
-        prepared.validate(provider).map_err(|_| {
-            RuntimeError::new(
+        // This callback refreshes an existing execution capability. A valid
+        // generic preparation without one cannot satisfy that operation.
+        if prepared.provider_launch_context.mcp_capability.is_none()
+            || prepared.validate(provider).is_err()
+        {
+            return Err(RuntimeError::new(
                 RuntimeErrorCode::RecoveryBlocked,
                 "capability_pending: server returned an invalid exact provider preparation",
-            )
-        })?;
+            ));
+        }
         Ok(prepared)
     }
 
