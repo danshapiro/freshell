@@ -40,9 +40,28 @@ describe('initMainProcess', () => {
     expect(deps.createMainWindow).toHaveBeenCalled()
   })
 
+  it('disposes recovery once at quit initiation before waiting for the server', async () => {
+    const order: string[] = []
+    let release!: () => void
+    deps.disposeRendererRecovery = vi.fn(() => { order.push('dispose') })
+    deps.stopServer = vi.fn(() => { order.push('stop'); return new Promise<void>(done => { release = done }) })
+    await initMainProcess(deps)
+    const close = mockWindow.on.mock.calls.find(([event]: [string]) => event === 'close')![1]
+    close({ preventDefault: vi.fn() })
+    expect(deps.disposeRendererRecovery).not.toHaveBeenCalled()
+    app.emit('before-quit', { preventDefault: vi.fn() })
+    app.emit('before-quit', { preventDefault: vi.fn() })
+    expect(order).toEqual(['dispose', 'stop'])
+    expect(app.quit).not.toHaveBeenCalled()
+    release()
+    await vi.waitFor(() => expect(app.quit).toHaveBeenCalledTimes(1))
+  })
+
   it('quits when single instance lock fails', async () => {
     ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+    deps.disposeRendererRecovery = vi.fn()
     await initMainProcess(deps)
+    expect(deps.disposeRendererRecovery).toHaveBeenCalledOnce()
     expect(app.quit).toHaveBeenCalled()
     expect(deps.createMainWindow).not.toHaveBeenCalled()
   })

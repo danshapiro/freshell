@@ -193,34 +193,112 @@ test.describe('Renderer crash recovery', () => {
   let server: RustServer | undefined
   let serverInfo: E2eServerInfo | undefined
   let tmpHome: string | undefined
+  let serverHome: string | undefined
+
+  function recoveryEvents(): Array<Record<string, any>> {
+    if (!tmpHome) return []
+    const logs = path.join(tmpHome, '.freshell', 'logs')
+    if (!fs.existsSync(logs)) return []
+    return fs.readdirSync(logs).filter(name => /^electron-main\..*\.jsonl$/.test(name))
+      .flatMap(name => fs.readFileSync(path.join(logs, name), 'utf8').split('\n'))
+      .filter(Boolean).map(line => JSON.parse(line))
+  }
 
   test.afterEach(async () => {
     const appToClose = app
     const serverToStop = server
     const infoToVerify = serverInfo
     const homeToRemove = tmpHome
-    app = undefined
+    const serverHomeToRemove = serverHome
+    try {
+      await test.info().attach('renderer-recovery-events.jsonl', {
+        body: recoveryEvents().map(event => JSON.stringify(event)).join('\n'),
+        contentType: 'application/x-ndjson',
+      })
+    } finally {
+      app = undefined
+      server = undefined
+      serverInfo = undefined
+      tmpHome = undefined
+      serverHome = undefined
+      const removeOwnedHomes = async () => {
+        const ownedHomes = [homeToRemove, serverHomeToRemove].filter((home): home is string => typeof home === 'string')
+        await Promise.all(ownedHomes.map(home => fs.promises.rm(home, { recursive: true, force: true })))
+      }
+      await cleanupElectronFixture({
+        app: appToClose,
+        electronProcess: appToClose ? electronProcesses.get(appToClose) : undefined,
+        restoreOpenExternal: appToClose
+          ? async () => {
+            await appToClose.evaluate(() => {
+              ;(globalThis as any).__restoreOpenExternal?.()
+            })
+          }
+          : undefined,
+        stopServer: serverToStop && infoToVerify
+          ? () => stopOwnedServerAndVerify(serverToStop, infoToVerify)
+          : serverToStop
+            ? () => serverToStop.stop().then(() => {
+              throw new Error('renderer-recovery fixture stopped without an owned PID/port receipt')
+            })
+            : undefined,
+        removeHome: removeOwnedHomes,
+      })
+      await test.info().attach('renderer-recovery-cleanup.json', {
+        body: JSON.stringify({ electronPid: appToClose ? electronProcesses.get(appToClose)?.pid : undefined,
+          serverPid: infoToVerify?.pid, port: infoToVerify?.port,
+          homes: [homeToRemove, serverHomeToRemove].filter(Boolean).map(home => ({ path: home, absent: !fs.existsSync(home!) })),
+          outcome: 'exact-owned-teardown-verified' }),
+        contentType: 'application/json',
+      })
+    }
+  })
+
+  test('recovers autonomously when an endpoint returns after the real cooldown', async () => {
+    test.setTimeout(240_000)
+    serverHome = fs.mkdtempSync(path.join(os.tmpdir(), 'electron-outage-server-'))
+    server = new RustServer({ homeDir: serverHome, preserveHomeOnStop: true,
+      expectedBuildCommit: requireElectronE2eBuildId(), expectedBuildDirty: false })
+    serverInfo = await server.start()
+    tmpHome = createTempHome(remoteConfig(serverInfo))
+    app = await launchApp(tmpHome, true)
+    const initial = await app.firstWindow()
+    await expect(initial.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
+    const savedUrl = `${serverInfo.baseUrl}/?token=${encodeURIComponent(serverInfo.token)}`
+    const receipt = serverInfo
+    const token = serverInfo.token, port = serverInfo.port
+    await stopOwnedServerAndVerify(server, receipt)
     server = undefined
     serverInfo = undefined
-    tmpHome = undefined
-    await cleanupElectronFixture({
-      app: appToClose,
-      electronProcess: appToClose ? electronProcesses.get(appToClose) : undefined,
-      restoreOpenExternal: appToClose
-        ? async () => {
-          await appToClose.evaluate(() => {
-            ;(globalThis as any).__restoreOpenExternal?.()
-          })
-        }
-        : undefined,
-      stopServer: serverToStop && infoToVerify
-        ? () => stopOwnedServerAndVerify(serverToStop, infoToVerify)
-        : serverToStop
-          ? () => serverToStop.stop().then(() => {
-            throw new Error('renderer-recovery fixture stopped without an owned PID/port receipt')
-          })
-          : undefined,
-      removeHome: homeToRemove ? async () => { fs.rmSync(homeToRemove, { recursive: true, force: true }) } : undefined,
+    const logOffset = recoveryEvents().length
+    const outageStarted = Date.now()
+    await app.evaluate(async ({ BrowserWindow }, target) => {
+      await BrowserWindow.getAllWindows()[0].loadURL(target).catch(() => {})
+    }, savedUrl)
+    await expect.poll(() => recoveryEvents().slice(logOffset)
+      .some(e => e.event === 'main_window_recovery_circuit_open'), { timeout: 60_000 }).toBe(true)
+    await expect.poll(() => recoveryEvents().slice(logOffset)
+      .filter(e => e.event === 'main_window_recovery_started').length,
+    { timeout: 90_000 }).toBeGreaterThanOrEqual(4)
+    await expect.poll(() => Date.now() - outageStarted, { timeout: 15_000 }).toBeGreaterThan(65_000)
+    expect(recoveryEvents().slice(logOffset).filter(e => e.event === 'main_window_recovery_succeeded')).toEqual([])
+    const restoredAt = Date.now()
+    server = new RustServer({ port, token, homeDir: serverHome, preserveHomeOnStop: true,
+      expectedBuildCommit: requireElectronE2eBuildId(), expectedBuildDirty: false })
+    serverInfo = await server.start()
+    // No client navigation, crash event, reload, or restart is supplied after endpoint restoration.
+    await expect.poll(() => recoveryEvents().slice(logOffset)
+      .some(e => e.event === 'main_window_recovery_succeeded'), { timeout: 75_000 }).toBe(true)
+    const recovered = await waitForWindowUrl(app,
+      new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`), 15_000)
+    await expect(recovered.locator('text=New Tab').first()).toBeVisible({ timeout: 15_000 })
+    await recovered.locator('button[title^="Settings"]').click()
+    await expect(recovered.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible()
+    await test.info().attach('renderer-outage-timing.json', {
+      body: JSON.stringify({ outageStarted, restoredAt, recoveredAt: Date.now(),
+        offlineMs: restoredAt - outageStarted, postRestoreClientTrigger: false,
+        successWhileOffline: 0, sourceCommit: requireElectronE2eBuildId() }),
+      contentType: 'application/json',
     })
   })
 

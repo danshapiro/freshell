@@ -91,6 +91,7 @@ function createDefaultContext(overrides: Partial<StartupContext> = {}): StartupC
     createBrowserWindow: vi.fn().mockReturnValue(createMockWindow()),
     createTray: vi.fn(),
     discoverLaunchCandidates: vi.fn().mockResolvedValue([]),
+    rendererRecoveryVerifier: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   }
 }
@@ -102,6 +103,58 @@ describe('runStartup', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('observes synchronous initial navigation failure and retries the immutable encoded destination', async () => {
+    const window = createMockWindowWithWebContents()
+    const loads = window.loadURL as ReturnType<typeof vi.fn>
+    loads.mockImplementationOnce(async (url: string) => {
+      window.webContents.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', url, true)
+      throw new Error('offline')
+    }).mockResolvedValue(undefined)
+    const verifier = vi.fn(async () => {})
+    const ctx = createDefaultContext({ createBrowserWindow: () => window,
+      mainProcessLogger: { log: vi.fn() }, rendererRecoveryVerifier: verifier,
+      readEnvToken: async () => 'a+b&c#d' })
+    let result: Awaited<ReturnType<typeof runStartup>> | undefined
+    try {
+      result = await runStartup(ctx)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(result.type).toBe('main')
+      expect(loads.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(new Set(loads.mock.calls.map(([url]) => url)).size).toBe(1)
+      expect(loads.mock.calls[0][0]).toContain('token=a%2Bb%26c%23d')
+      expect(verifier).toHaveBeenCalledWith(window, loads.mock.calls[0][0])
+      expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
+      expect(ctx.serverSpawner.stop).not.toHaveBeenCalled()
+    } finally {
+      if (result?.type === 'main') { result.disposeRendererRecovery?.(); clearTimeout(result.updateCheckTimer) }
+    }
+  })
+
+  it('disposes controller listeners and native work once on logical close, leaving tray hiding recoverable', async () => {
+    const window = createMockWindowWithWebContents()
+    window.cancelRecovery = vi.fn()
+    const ctx = createDefaultContext({ createBrowserWindow: () => window, mainProcessLogger: { log: vi.fn() } })
+    const result = await runStartup(ctx)
+    if (result.type !== 'main') throw new Error('expected main window')
+    try {
+      window.hide()
+      window.webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(window.webContents.reload).toHaveBeenCalledOnce()
+      const closed = (window.on as ReturnType<typeof vi.fn>).mock.calls.find(([event]) => event === 'closed')![1]
+      closed()
+      result.disposeRendererRecovery()
+      window.webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(window.cancelRecovery).toHaveBeenCalledOnce()
+      expect(window.webContents.listenerCount('render-process-gone')).toBe(0)
+      expect(window.webContents.reload).toHaveBeenCalledOnce()
+    } finally {
+      result.disposeRendererRecovery()
+      clearTimeout(result.updateCheckTimer)
+    }
   })
 
   it('returns wizard signal when setup not completed', async () => {

@@ -21,6 +21,11 @@ export interface BrowserWindowLike {
   on(event: string, callback: (...args: any[]) => void): void
   getBounds?(): { x: number; y: number; width: number; height: number }
   isMaximized?(): boolean
+  isMinimized?(): boolean
+  isDestroyed?(): boolean
+  restore?(): void
+  verifyRendererReady?(loadUrl: string): Promise<void>
+  cancelRecovery?(): void
   webContents?: RecoverableWebContents
 }
 
@@ -48,7 +53,7 @@ export interface StartupContext {
   readEnvToken?: (envPath: string) => Promise<string | undefined>
   discoverLaunchCandidates?: () => Promise<LaunchServerCandidate[]>
   mainProcessLogger?: ElectronMainLogger
-  rendererRecoveryVerifier?: () => Promise<void>
+  rendererRecoveryVerifier?: (window: BrowserWindowLike, loadUrl: string) => Promise<void>
   /**
    * An explicit chooser selection to honor for this launch. When set, startup
    * skips discovery and policy and performs exactly this action.
@@ -120,7 +125,7 @@ export function resolveDesktopRuntimeResources(
 export type StartupResult =
   | { type: 'wizard' }
   | { type: 'chooser'; candidates: LaunchServerCandidate[]; reason: string }
-  | { type: 'main'; serverUrl: string; window: BrowserWindowLike; updateCheckTimer: ReturnType<typeof setTimeout> }
+  | { type: 'main'; serverUrl: string; window: BrowserWindowLike; updateCheckTimer: ReturnType<typeof setTimeout>; disposeRendererRecovery(): void }
 
 async function defaultDiscoverLaunchCandidates(ctx: StartupContext): Promise<LaunchServerCandidate[]> {
   const urls = buildLocalProbeUrls(ctx.desktopConfig)
@@ -218,7 +223,33 @@ async function loadMainWindow(
     window.maximize()
   }
 
+  let recoveryDisposed = false
+  let disposeController = () => {}
+  const disposeRendererRecovery = () => {
+    if (recoveryDisposed) return
+    recoveryDisposed = true
+    disposeController()
+    window.cancelRecovery?.()
+  }
+  if (ctx.mainProcessLogger) {
+    if (window.webContents) {
+      disposeController = registerRendererRecovery({
+        window, loadUrl, serverUrl, logger: ctx.mainProcessLogger,
+        verifyRecovered: () => {
+          if (ctx.rendererRecoveryVerifier) return ctx.rendererRecoveryVerifier(window, loadUrl)
+          if (!window.verifyRendererReady) throw new Error('native renderer readiness verifier unavailable')
+          return window.verifyRendererReady(loadUrl)
+        },
+        setTimeout, clearTimeout,
+      })
+    } else {
+      ctx.mainProcessLogger.log({ severity: 'warn', event: 'main_window_recovery_unavailable', serverUrl, loadUrl })
+    }
+  }
+  window.on('closed', disposeRendererRecovery)
+
   void window.loadURL(loadUrl).catch((err) => {
+    if (recoveryDisposed) return
     if (ctx.mainProcessLogger) {
       ctx.mainProcessLogger.log({
         severity: 'error',
@@ -279,28 +310,7 @@ async function loadMainWindow(
     void ctx.updateManager.checkForUpdates()
   }, 10_000)
 
-  if (ctx.mainProcessLogger) {
-    if (window.webContents) {
-      registerRendererRecovery({
-        window,
-        loadUrl,
-        serverUrl,
-        logger: ctx.mainProcessLogger,
-        verifyRecovered: ctx.rendererRecoveryVerifier,
-        setTimeout,
-        clearTimeout,
-      })
-    } else {
-      ctx.mainProcessLogger.log({
-        severity: 'warn',
-        event: 'main_window_recovery_unavailable',
-        serverUrl,
-        loadUrl,
-      })
-    }
-  }
-
-  return { type: 'main', serverUrl, window, updateCheckTimer }
+  return { type: 'main', serverUrl, window, updateCheckTimer, disposeRendererRecovery }
 }
 
 async function startAppBoundServer(ctx: StartupContext, port: number): Promise<string> {

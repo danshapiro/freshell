@@ -15,6 +15,7 @@ export interface MainProcessDeps {
   app: ElectronApp
   createMainWindow: () => Promise<any>
   stopServer: () => Promise<void>
+  disposeRendererRecovery?: () => void
   minimizeToTray: boolean
   platform: NodeJS.Platform
   /** Structured lifecycle observability, supplied by the real entry point. */
@@ -44,6 +45,7 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
   // Single-instance lock
   const gotLock = app.requestSingleInstanceLock()
   if (!gotLock) {
+    deps.disposeRendererRecovery?.()
     app.quit()
     return
   }
@@ -116,7 +118,10 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
     if (quitContinuationStarted) return
 
     event?.preventDefault()
-    isQuitting = true
+    if (!isQuitting) {
+      isQuitting = true
+      deps.disposeRendererRecovery?.()
+    }
     if (serverStopInProgress) return
 
     try {
