@@ -4091,6 +4091,7 @@ fn prepare_fresh_provider_state_with_files_at(
     prepare_fresh_provider_context_at(launch, paths)
 }
 
+#[cfg(test)]
 fn prepare_fresh_provider_state_at(
     launch: &FreshAgentLaunchSpec,
     paths: &ProviderConfigPaths,
