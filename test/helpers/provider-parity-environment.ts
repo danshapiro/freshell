@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { redactNativeDiagnostic } from '../../scripts/testing/opencode-restoration-rehearsal.js'
 
 /** Select each managed environment scenario's own relative configuration. */
 export function managedEnvironmentOpencodeSelection(): Record<string, string> {
@@ -169,4 +170,22 @@ export function providerParityCommands(workspace: string): Record<string, string
     ...commands,
     OPENCODE_CONFIG: path.join(workspace, 'opencode.jsonc'),
   }
+}
+
+/** Preserve the owning process's bounded warning/error details only on failure. */
+export function providerParityFailureLogTail(logs: string, secrets: readonly string[]) {
+  return logs.slice(-256 * 1024).split('\n').flatMap(line => {
+    try {
+      const row = JSON.parse(line)
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return []
+      const fields = row.fields && typeof row.fields === 'object' ? row.fields : row
+      const severity = String(row.level ?? row.severity ?? '').toLowerCase()
+      if (!['warn', 'warning', 'error'].includes(severity)) return []
+      const text = (value: unknown) => typeof value === 'string' ? value.slice(0, 4096) : undefined
+      return [JSON.parse(redactNativeDiagnostic(JSON.stringify({
+        severity, event: text(row.event ?? fields.message), timestamp: text(row.timestamp ?? row.at),
+        target: text(row.target), error: text(fields.error ?? fields.cause),
+      }), secrets))]
+    } catch { return [] }
+  }).slice(-32)
 }

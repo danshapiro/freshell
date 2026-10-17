@@ -6,12 +6,12 @@ import http from 'node:http'
 import { execFileSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
-import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, resetProviderParityOpenCodeInputs, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, providerParityFailureLogTail, resetProviderParityOpenCodeInputs, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
 import { authorizeProviderParityRequest } from '../../helpers/provider-parity-broker.js'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
 import { providerParitySqliteHygieneScript } from '../../helpers/provider-parity-sqlite-hygiene.js'
@@ -601,6 +601,18 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     // when a prior recovery case edited them to exercise refresh semantics.
     resetProviderParityOpenCodeInputs(workspace, xdgConfigHome, {
       tui: homeTuiConfig(), project: projectOpencodeConfig(), user: userOpencodeConfig(),
+    })
+  })
+
+  afterEach(context => {
+    if (context.task.result?.state !== 'fail' || !rig?.web) return
+    const web = rig.web.capturedOutput()
+    rig.runtime.writeIncident(`provider-parity-${context.task.name}-web-failure`, {
+      test: context.task.name,
+      events: providerParityFailureLogTail(`${web.stdout}\n${web.stderr}`, [
+        rig.info.token, rig.supervisor.controlSecret, nestedSecretMarker,
+        ...providers.map(provider => `fixture-secret-byte-${provider}`),
+      ]),
     })
   })
 
