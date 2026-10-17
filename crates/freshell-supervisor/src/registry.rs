@@ -2539,8 +2539,13 @@ impl Registry {
         soul_id: SoulId,
     ) -> Result<RecoveryContext, RegistryError> {
         let installation = self.installation_id().clone();
-        self.run_blocking(move |conn| load_recovery_context(&conn, installation, &soul_id))
-            .await
+        // Keep the large context out of Tokio's blocking-task return storage
+        // and its initialization temporaries on the recovery caller's stack.
+        self.run_blocking(move |conn| {
+            load_recovery_context(&conn, installation, &soul_id).map(Box::new)
+        })
+        .await
+        .map(|context| *context)
     }
 
     /// Validate and durably register one exact stopped-repair batch before
