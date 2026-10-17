@@ -3533,7 +3533,7 @@ impl Supervisor {
                         reason,
                         vec![error.message.clone()],
                         verdict_fence.clone(),
-                        Some(TransientRecoveryFailure::Preparation),
+                        TransientRecoveryFailure::from_runtime(&error),
                     )
                     .await
                     .map_err(map_registry)?;
