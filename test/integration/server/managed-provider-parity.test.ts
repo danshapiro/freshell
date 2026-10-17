@@ -503,6 +503,7 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     fs.chmodSync(path.join(workspace, '.opencode'), 0o777)
     for (const [source, target] of [
       [fixture, 'parity-provider.mjs'],
+      [path.join(root, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'), 'opencode_schema_v1_18_21.sql'],
       [path.join(root, 'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs'), 'fake-app-server.mjs'],
       [path.join(root, 'test/e2e-browser/fixtures/fake-codex-terminal.mjs'), 'fake-codex-terminal.mjs'],
       [path.join(root, 'test/e2e-browser/fixtures/fake-opencode-terminal.mjs'), 'fake-opencode-terminal.mjs'],

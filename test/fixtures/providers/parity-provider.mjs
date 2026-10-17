@@ -6,7 +6,6 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const provider = path.basename(process.argv[1]).replace(/^parity-/, '')
 const argv = process.argv.slice(2)
@@ -184,6 +183,23 @@ function parseJsonc(raw) {
   return JSON.parse(withoutTrailingCommas.join(''))
 }
 
+// Self-contained because the controlled TUI runs this resolver in its child.
+async function resolveOpenCodeTuiEntry(specs) {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { fileURLToPath, pathToFileURL } = await import('node:url');
+  const spec = specs?.find(value => typeof value === 'string'
+    && (value.endsWith('/freshell-rebind-plugin.ts') || value.endsWith('/.freshell/opencode')));
+  if (!spec) return null;
+  let entry = fileURLToPath(spec);
+  if (fs.statSync(entry).isDirectory()) {
+    const target = JSON.parse(fs.readFileSync(path.join(entry, 'package.json'), 'utf8'))?.exports?.['./tui'];
+    if (target !== './freshell-rebind-plugin.ts') throw new Error('selected TUI package entrypoint unavailable');
+    entry = path.join(entry, target);
+  }
+  return { spec, entry, url: pathToFileURL(entry).href };
+}
+
 export async function observeOpenCodeParitySelection(providerHome, workspace, tuiPath, bridgeRecipe) {
   const projected = path.join(providerHome, "project/.opencode/opencode.json");
   const hasProjection = fs.existsSync(projected);
@@ -197,23 +213,16 @@ export async function observeOpenCodeParitySelection(providerHome, workspace, tu
   }
   const tuiConfig = tuiPath ? fs.readFileSync(tuiPath, 'utf8') : null;
   const tui = tuiConfig ? parseJsonc(tuiConfig) : null;
-  const spec = tui?.plugin?.find(value => typeof value === 'string'
-    && (value.endsWith('/freshell-rebind-plugin.ts') || value.endsWith('/.freshell/opencode')));
+  const selected = await resolveOpenCodeTuiEntry(tui?.plugin);
   let rebindPlugin = null;
-  if (spec) {
-    let entry = fileURLToPath(spec);
-    if (fs.statSync(entry).isDirectory()) {
-      const target = readJson(path.join(entry, 'package.json'))?.exports?.['./tui'];
-      if (target !== './freshell-rebind-plugin.ts') throw new Error('selected TUI package entrypoint unavailable');
-      entry = path.join(entry, target);
-    }
-    const plugin = await import(pathToFileURL(entry).href);
+  if (selected) {
+    const plugin = await import(selected.url);
     const emitted = [];
     const deps = { env: { HOME: providerHome, FRESHELL_TERMINAL_ID: 'parity-tui-probe' },
       writeFile: (_directory, _name, body) => emitted.push(JSON.parse(body)), now: () => 1 };
     plugin.emitHello(deps);
     plugin.createEmitter(deps)({ sessionID: 'ses_parity' });
-    rebindPlugin = { spec, entrypoint: path.basename(entry),
+    rebindPlugin = { spec: selected.spec, entrypoint: path.basename(selected.entry),
       hello: emitted.some(value => value.hello === true && value.source === 'opencode-tui-plugin'),
       sessionId: emitted.find(value => value.source === 'opencode-tui-plugin' && value.session_id)?.session_id ?? null };
   }
@@ -445,7 +454,7 @@ const opencodePinnedMigrations = [
   "20260622202450_simplify_session_input"
 ]
 
-async function controlledOpenCodeTui(schemaPath, migrations) {
+async function controlledOpenCodeTui(schemaPath, migrations, resolveTuiEntry) {
   // This function runs in a child with Node's TypeScript transform enabled:
   // the installed TUI plugin contains parameter properties. All native and
   // hydrated reads below come from the same real controlled SQLite store.
@@ -454,9 +463,9 @@ async function controlledOpenCodeTui(schemaPath, migrations) {
   const { randomUUID, createHash } = await import('node:crypto')
   const { DatabaseSync } = await import('node:sqlite')
   const config = JSON.parse(fs.readFileSync(process.env.OPENCODE_TUI_CONFIG, 'utf8'))
-  const pluginPath = config.plugin.find(value => value.endsWith('/freshell-rebind-plugin.ts'))
-  if (!pluginPath) throw new Error('configured native TUI plugin missing')
-  const plugin = (await import(pluginPath)).default
+  const selectedPlugin = await resolveTuiEntry(config.plugin)
+  if (!selectedPlugin) throw new Error('configured native TUI plugin missing')
+  const plugin = (await import(selectedPlugin.url)).default
   const dataHome = path.join(process.env.HOME, '.local/share/opencode')
   fs.mkdirSync(dataHome, { recursive: true })
   const db = new DatabaseSync(path.join(dataHome, 'opencode.db'))
@@ -586,13 +595,13 @@ async function controlledOpenCodeTui(schemaPath, migrations) {
 
 if (provider === 'amplifier') await configuredAmplifierStartup()
 if (provider === 'opencode' && process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) {
-  // The parity harness copies this fixture into a workspace directly under
-  // its worktree, which is also the source mount available to the child.
-  const schemaPath = path.resolve(import.meta.dirname, '../crates/freshell-sessions/src/opencode_schema_v1_18_21.sql')
+  // The owned workspace carries the unchanged pinned schema with this fixture.
+  const schemaPath = path.join(import.meta.dirname, 'opencode_schema_v1_18_21.sql')
   const terminal = spawn(process.execPath, ['--experimental-transform-types', '--input-type=module', '-e',
     `const argv = process.argv.slice(1); await (${controlledOpenCodeTui.toString()})(
       ${JSON.stringify(schemaPath)},
-      ${JSON.stringify(opencodePinnedMigrations)})`, '--', ...argv],
+      ${JSON.stringify(opencodePinnedMigrations)},
+      (${resolveOpenCodeTuiEntry.toString()}))`, '--', ...argv],
   { env: process.env, cwd, stdio: 'inherit' })
   terminal.once('exit', code => { process.exitCode = code ?? 1 })
 } else if (provider === 'codex' || provider === 'opencode') {
