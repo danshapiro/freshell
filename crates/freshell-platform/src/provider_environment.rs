@@ -494,7 +494,12 @@ impl Plan {
                     self.enqueue(canonical, destination, depth)?;
                 }
             }
-            if self.account_home.as_deref() == Some(ancestor) {
+            // Retain the workspace's own lookup and package scope, then stop.
+            // A linked workspace resource does not select a parent checkout's
+            // otherwise unrelated installation.
+            if self.account_home.as_deref() == Some(ancestor)
+                || self.excluded_subtree.as_deref() == Some(ancestor)
+            {
                 break;
             }
         }
@@ -4691,6 +4696,104 @@ mod tests {
                 .join("package/node_modules/local-package")
                 .exists(),
             "the nested-tree allowance must not override another exclusion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_workspace_lookup_excludes_parent_install_and_keeps_selected_external_dependencies() {
+        let root = executable_fixture();
+        let repository = root.path().join("parent-repository");
+        let workspace = repository.join(".worktrees/workspace");
+        let skill = workspace.join(".claude/skills/probe");
+        let skills = workspace.join(".codex/skills");
+        let external = root.path().join("external-installation");
+        let package = external.join("suite/skills/external");
+        for directory in [
+            &skill,
+            &skills,
+            &workspace.join("node_modules/workspace-dependency"),
+            &repository.join("node_modules"),
+            &package,
+            &external.join("node_modules/external-dependency"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(workspace.join("package.json"), r#"{"type":"commonjs"}"#).unwrap();
+        fs::write(repository.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            repository.join("node_modules/unrelated-binary"),
+            [0u8; 2048],
+        )
+        .unwrap();
+        fs::write(skill.join("SKILL.md"), "selected workspace skill").unwrap();
+        fs::write(
+            skill.join("run.cjs"),
+            "process.stdout.write(require('workspace-dependency'));",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("node_modules/workspace-dependency/index.js"),
+            "module.exports='workspace-dependency-nonce';",
+        )
+        .unwrap();
+        fs::write(package.join("SKILL.md"), "selected external skill").unwrap();
+        fs::write(external.join("suite/package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            package.join("run.js"),
+            "import value from 'external-dependency'; process.stdout.write(value);",
+        )
+        .unwrap();
+        fs::write(
+            external.join("node_modules/external-dependency/index.js"),
+            "module.exports='external-dependency-nonce';",
+        )
+        .unwrap();
+        symlink("../../.claude/skills/probe", skills.join("probe")).unwrap();
+        symlink(&package, skills.join("external")).unwrap();
+        let stage = root.path().join("stage");
+        let limits = CopyLimits {
+            max_file_bytes: 1024,
+            ..Default::default()
+        };
+        copy_environment_excluding_subtree(
+            &[selection(&skills, "skills")],
+            &stage,
+            &[],
+            &workspace,
+            limits,
+        )
+        .expect("the workspace boundary must stop unrelated parent installation lookup");
+        let hidden = root.path().join("external-hidden");
+        fs::rename(&external, &hidden).unwrap();
+        let home = root.path().join("home");
+        copy_environment_excluding_subtree(
+            &[
+                selection(&stage.join("skills"), "skills"),
+                selection(&stage.join(".freshell/resources"), ".freshell/resources"),
+            ],
+            &home,
+            &[],
+            &workspace,
+            limits,
+        )
+        .unwrap();
+        for (script, expected) in [
+            ("skills/probe/run.cjs", "workspace-dependency-nonce"),
+            ("skills/external/run.js", "external-dependency-nonce"),
+        ] {
+            let output = Command::new("node")
+                .arg(home.join(script))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, expected.as_bytes());
+        }
+        assert_eq!(
+            fs::metadata(repository.join("node_modules/unrelated-binary"))
+                .unwrap()
+                .len(),
+            2048
         );
     }
 

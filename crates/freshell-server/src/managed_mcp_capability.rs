@@ -8514,64 +8514,84 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     #[test]
     #[cfg(unix)]
     fn managed_provider_codex_workspace_skill_does_not_copy_the_workspace_install() {
-        let owned = tempfile::tempdir().unwrap();
-        let home = owned.path().join("home");
-        let workspace = owned.path().join("workspace");
-        let skills = workspace.join(".codex/skills");
-        let skill = workspace.join(".claude/skills/probe");
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::create_dir_all(&skills).unwrap();
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::create_dir(workspace.join(".git")).unwrap();
-        std::fs::create_dir(workspace.join("node_modules")).unwrap();
-        std::fs::write(skill.join("SKILL.md"), "workspace-skill-nonce").unwrap();
-        std::os::unix::fs::symlink("../../.claude/skills/probe", skills.join("probe")).unwrap();
-        std::fs::File::create(workspace.join("node_modules/unrelated-binary"))
+        for nested in [false, true] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let repository = owned.path().join("parent-repository");
+            let workspace = if nested {
+                repository.join(".worktrees/workspace")
+            } else {
+                owned.path().join("workspace")
+            };
+            let skills = workspace.join(".codex/skills");
+            let skill = workspace.join(".claude/skills/probe");
+            std::fs::create_dir_all(home.join(".codex")).unwrap();
+            std::fs::create_dir_all(&skills).unwrap();
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::create_dir(workspace.join(".git")).unwrap();
+            std::fs::create_dir(workspace.join("node_modules")).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "workspace-skill-nonce").unwrap();
+            std::os::unix::fs::symlink("../../.claude/skills/probe", skills.join("probe")).unwrap();
+            std::fs::File::create(workspace.join("node_modules/unrelated-binary"))
+                .unwrap()
+                .set_len(
+                    freshell_platform::provider_environment::CopyLimits::default().max_file_bytes
+                        + 1,
+                )
+                .unwrap();
+            if nested {
+                std::fs::create_dir_all(repository.join("node_modules")).unwrap();
+                std::fs::write(repository.join("package.json"), r#"{"type":"module"}"#).unwrap();
+                std::fs::File::create(repository.join("node_modules/unrelated-parent-binary"))
+                    .unwrap()
+                    .set_len(
+                        freshell_platform::provider_environment::CopyLimits::default()
+                            .max_file_bytes
+                            + 1,
+                    )
+                    .unwrap();
+            }
+            let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+                "codex", &workspace, &home, None,
+            )
             .unwrap()
-            .set_len(
-                freshell_platform::provider_environment::CopyLimits::default().max_file_bytes + 1,
-            )
             .unwrap();
-        let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
-            "codex", &workspace, &home, None,
-        )
-        .unwrap()
-        .unwrap();
-        let directory = owned.path().join("control/mcp-capabilities");
-        std::fs::create_dir_all(&directory).unwrap();
-        let store = CapabilityStore::default();
-        let capability = store
-            .issue(
-                SoulId::new(),
-                &directory,
-                "http://host.docker.internal:4000".into(),
-                Some(("codex", &home, &context.config)),
-                OpencodeEphemeralInput {
-                    cwd: Some(&workspace),
-                    workspace: Some(&workspace),
-                    launch_context: Some(&context),
-                    ..Default::default()
-                },
-                None,
-            )
-            .expect("a mounted workspace install must not block selected skill staging");
-        let accepted = read_prepared_context(&directory, &capability).unwrap();
-        let inputs = accepted.prepared_inputs.unwrap();
-        let mount = inputs
-            .resource_mounts
-            .iter()
-            .find(|mount| mount.logical_destination == skills.to_str().unwrap())
-            .unwrap();
-        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
-        assert_eq!(
-            std::fs::read(
-                stage
-                    .join(&mount.stage_relative_path)
-                    .join("probe/SKILL.md")
-            )
-            .unwrap(),
-            b"workspace-skill-nonce"
-        );
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = CapabilityStore::default();
+            let capability = store
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("codex", &home, &context.config)),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        launch_context: Some(&context),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("a mounted workspace install must not block selected skill staging");
+            let accepted = read_prepared_context(&directory, &capability).unwrap();
+            let inputs = accepted.prepared_inputs.unwrap();
+            let mount = inputs
+                .resource_mounts
+                .iter()
+                .find(|mount| mount.logical_destination == skills.to_str().unwrap())
+                .unwrap();
+            let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+            assert_eq!(
+                std::fs::read(
+                    stage
+                        .join(&mount.stage_relative_path)
+                        .join("probe/SKILL.md")
+                )
+                .unwrap(),
+                b"workspace-skill-nonce"
+            );
+        }
     }
 
     #[test]

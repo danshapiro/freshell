@@ -16534,6 +16534,114 @@ console.log('actual library export/import/full-row reader and Node semantic bind
 
     #[cfg(unix)]
     #[test]
+    fn provider_config_codex_nested_workspace_does_not_inherit_parent_install_on_refresh() {
+        use freshell_platform::provider_environment::{
+            copy_environment_excluding_subtree, CopySelection,
+        };
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
+        let root = executable_fixture();
+        let repository = root.path().join("parent-repository");
+        let workspace = repository.join(".worktrees/workspace");
+        let skills = workspace.join(".codex/skills");
+        let skill = workspace.join(".claude/skills/probe");
+        let controller = root.path().join("controller");
+        let home = root.path().join("provider");
+        for directory in [
+            &skills,
+            &skill,
+            &workspace.join("node_modules/probe-dependency"),
+            &repository.join("node_modules"),
+            &home,
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(skill.join("SKILL.md"), "selected workspace skill").unwrap();
+        std::fs::write(
+            skill.join("run.cjs"),
+            "process.stdout.write(require('probe-dependency'));",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("node_modules/probe-dependency/index.js"),
+            "module.exports='workspace-dependency-nonce';",
+        )
+        .unwrap();
+        std::fs::File::create(repository.join("node_modules/unrelated-parent-binary"))
+            .unwrap()
+            .set_len(
+                freshell_platform::provider_environment::CopyLimits::default().max_file_bytes + 1,
+            )
+            .unwrap();
+        std::os::unix::fs::symlink("../../.claude/skills/probe", skills.join("probe")).unwrap();
+        copy_environment_excluding_subtree(
+            &[CopySelection {
+                source: skills,
+                destination_relative: "skills".into(),
+            }],
+            &controller,
+            &[],
+            &workspace,
+            Default::default(),
+        )
+        .expect("the prepared generation must not import the enclosing repository's modules");
+        let context = ProviderLaunchContext {
+            config: [
+                ("skills", ".codex/skills"),
+                (".freshell/resources", ".freshell/resources"),
+            ]
+            .into_iter()
+            .map(|(source, destination)| ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: source.into(),
+                provider_relative_path: destination.into(),
+                format: "directory".into(),
+            })
+            .collect(),
+            preparation: ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+            mcp_capability: None,
+            prepared_inputs: None,
+        };
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        copy_provider_config_references(
+            &context,
+            "codex",
+            &workspace,
+            &controller,
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        let sibling = home.join(".codex/skills/provider-created");
+        std::fs::write(&sibling, "durable-sibling-nonce").unwrap();
+        for _ in 0..2 {
+            refresh_provider_config_references(
+                &context,
+                "codex",
+                &workspace,
+                &controller,
+                &home,
+                uid,
+                gid,
+            )
+            .unwrap();
+            let output = std::process::Command::new("node")
+                .arg(home.join(".codex/skills/probe/run.cjs"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"workspace-dependency-nonce");
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"durable-sibling-nonce");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_config_codex_keeps_workspace_node_lookup_mounted_across_refresh() {
         use freshell_runtime_protocol::{
             ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
