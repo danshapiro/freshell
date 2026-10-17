@@ -361,7 +361,7 @@ async fn recovery_host(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<usize>,
 ) {
-    recovery_host_status(ctx, probe, true, Some(123)).await
+    recovery_host_status(ctx, probe, true, Some(123), None).await
 }
 
 async fn recovery_host_status(
@@ -369,6 +369,7 @@ async fn recovery_host_status(
     probe: RecoveryProbe,
     exited: bool,
     worker_pid: Option<u32>,
+    native_observation: Option<freshell_runtime_protocol::NativeIdentityObservation>,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<usize>,
@@ -379,6 +380,15 @@ async fn recovery_host_status(
     let listener = tokio::net::UnixListener::bind(runtime.join("host.sock")).unwrap();
     let boot = freshell_runtime_protocol::HostBootId::new();
     let native_session_id = ctx.native_session_id.clone();
+    let capabilities = if native_observation.is_some() {
+        vec![
+            "owned-provider-config-v1".to_string(),
+            "provider-store-probe-v1".to_string(),
+            "native-identity-observation-v1".to_string(),
+        ]
+    } else {
+        vec![]
+    };
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut native_probes = 0;
@@ -401,11 +411,11 @@ async fn recovery_host_status(
                         &boot,
                         &incarnation_id,
                     ),
-                    capabilities: vec![],
+                    capabilities: capabilities.clone(),
                     effective_limits: checkpoints::tests::limits(),
                 },
                 HostCommand::Status { .. } => HostResult::Status {
-                    native_identity_observation: None,
+                    native_identity_observation: native_observation.clone(),
                     opencode_adoption:
                         freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
                     opencode_transfer_receipt: None,
@@ -458,7 +468,7 @@ async fn recovery_online_without_worker_does_not_claim_live() {
             },
             evidence: vec!["unrecorded worker".into()],
         };
-        let (shutdown, task) = recovery_host_status(&ctx, probe, false, worker_pid).await;
+        let (shutdown, task) = recovery_host_status(&ctx, probe, false, worker_pid, None).await;
         let result = supervisor
             .recover(RecoverRequest {
                 soul_id: ctx.soul_id.clone(),
@@ -682,11 +692,7 @@ async fn recovery_inspected_sqlite_absence_certifies_loss_and_preserves_output()
     let temp = tempfile::tempdir().unwrap();
     let (registry, ctx) = checkpoints::tests::context(temp.path(), "opencode", true).await;
     let db = temp.path().join("effective.db");
-    let connection = rusqlite::Connection::open(&db).unwrap();
-    connection
-        .execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
-        .unwrap();
-    drop(connection);
+    checkpoints::tests::create_empty_opencode_store(&db);
     let mut spec = checkpoints::tests::spec("opencode");
     spec.environment
         .insert("OPENCODE_DB".into(), db.display().to_string());
@@ -745,7 +751,18 @@ async fn recovery_inspected_sqlite_absence_certifies_loss_and_preserves_output()
     .unwrap();
     let output = ctx.prior_handle.runtime_dir().join("retained-output");
     std::fs::write(&output, b"last-provider-diagnostic").unwrap();
-    let (shutdown, task) = recovery_host(&ctx, probe).await;
+    let observation = supervisor
+        .registry
+        .inventory()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.soul_id == ctx.soul_id)
+        .unwrap()
+        .native_identity_observation
+        .expect("valid dispatched fixture must retain its actual admitted observation");
+    let (shutdown, task) =
+        recovery_host_status(&ctx, probe, true, Some(123), Some(observation)).await;
     let result = supervisor
         .recover(RecoverRequest {
             soul_id: ctx.soul_id,
@@ -755,7 +772,7 @@ async fn recovery_inspected_sqlite_absence_certifies_loss_and_preserves_output()
         })
         .await;
     shutdown.send(()).unwrap();
-    assert!(task.await.unwrap() > 0);
+    assert!(task.await.unwrap() > 0, "{result:?}");
     let result = result.unwrap();
     assert_eq!(result.outcome, RecoveryOutcome::Lost);
     let certificate = supervisor
@@ -767,7 +784,36 @@ async fn recovery_inspected_sqlite_absence_certifies_loss_and_preserves_output()
         certificate.decision.state,
         freshell_runtime_protocol::LossDecisionState::Lost
     );
-    assert_eq!(certificate.recovery_paths.len(), 4);
+    assert_eq!(certificate.recovery_paths.len(), 5);
+    for path in [
+        RecoveryPath::Reattach,
+        RecoveryPath::NativeResume,
+        RecoveryPath::CheckpointRestore,
+        RecoveryPath::PristineSeed,
+        RecoveryPath::NativeImport,
+    ] {
+        let row = certificate
+            .recovery_paths
+            .iter()
+            .find(|row| row.path == path)
+            .unwrap_or_else(|| panic!("loss must account for the {path:?} recovery path"));
+        assert_eq!(
+            row.verdict,
+            freshell_runtime_protocol::RecoveryEvidenceVerdict::DefinitiveNegative
+        );
+        assert!(!row.reason_code.is_empty());
+        assert!(!row.evidence_refs.is_empty());
+    }
+    let import = certificate
+        .recovery_paths
+        .iter()
+        .find(|row| row.path == RecoveryPath::NativeImport)
+        .unwrap();
+    assert_eq!(import.store_state, EvidenceStoreState::NotApplicable);
+    assert_eq!(
+        import.reason_code,
+        "native_import_definitive_negative_not_applicable"
+    );
     assert!(certificate
         .recovery_paths
         .iter()
