@@ -1421,6 +1421,19 @@ fn current_store_verification_rejects_a_row_matching_only_an_older_event() {
     .unwrap();
     append_messages_with_events_starting_at(&fixture, 1, 1);
     let connection = Connection::open(&fixture.destination_database).unwrap();
+    let old_data: serde_json::Value = connection
+        .query_row(
+            "SELECT data FROM message WHERE id='msg_append_000'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|data| serde_json::from_str(&data).unwrap())
+        .unwrap();
+    let mut new_data = old_data.clone();
+    new_data["time"]["completed"] = serde_json::json!(3);
+    let mut info = new_data.as_object().unwrap().clone();
+    info.insert("id".into(), "msg_append_000".into());
+    info.insert("sessionID".into(), "ses_root".into());
     append_durable_event(
         &connection,
         2,
@@ -1428,14 +1441,27 @@ fn current_store_verification_rejects_a_row_matching_only_an_older_event() {
         "message.updated.1",
         serde_json::json!({
             "sessionID":"ses_root",
-            "info":{
-                "id":"msg_append_000",
-                "sessionID":"ses_root",
-                "role":"assistant",
-                "time":{"created":2,"updated":3}
-            }
+            "info":serde_json::Value::Object(info)
         }),
     );
+    connection
+        .execute(
+            "UPDATE message SET data=?1,time_updated=3 WHERE id='msg_append_000'",
+            [new_data.to_string()],
+        )
+        .unwrap();
+    verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("a row matching the newest event must be accepted before testing stale ordering");
+    connection
+        .execute(
+            "UPDATE message SET data=?1,time_updated=2 WHERE id='msg_append_000'",
+            [old_data.to_string()],
+        )
+        .unwrap();
     drop(connection);
 
     assert!(verify_current_store(
@@ -1468,7 +1494,8 @@ fn current_store_verification_rejects_a_part_matching_only_an_older_event() {
     let current_data = serde_json::Value::Object(current_data);
     connection
         .execute(
-            "UPDATE part SET data=?1 WHERE id='part_one'",
+            "INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+             VALUES('prt_ordering','msg_one','ses_root',1,1,?1)",
             [current_data.to_string()],
         )
         .unwrap();
@@ -1477,7 +1504,7 @@ fn current_store_verification_rejects_a_part_matching_only_an_older_event() {
         (2, "evt_part_update_new", baseline_data),
     ] {
         let mut part = data.as_object().unwrap().clone();
-        part.insert("id".into(), "part_one".into());
+        part.insert("id".into(), "prt_ordering".into());
         part.insert("sessionID".into(), "ses_root".into());
         part.insert("messageID".into(), "msg_one".into());
         append_durable_event(
@@ -1491,6 +1518,16 @@ fn current_store_verification_rejects_a_part_matching_only_an_older_event() {
                 "time":1
             }),
         );
+        if sequence == 1 {
+            verify_current_store(
+                &fixture.descriptor,
+                &fixture.destination_database,
+                &fixture.workspace,
+            )
+            .expect(
+                "a part matching its latest event must be accepted before adding a newer event",
+            );
+        }
     }
     drop(connection);
 
