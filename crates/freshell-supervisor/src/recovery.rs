@@ -12587,25 +12587,29 @@ pub(crate) mod automatic_retry_tests {
 
     #[tokio::test]
     async fn retired_unowned_replacement_settles_dependency_failure_across_reopen() {
+        Box::pin(retired_unowned_dependency_failure_case()).await;
+    }
+
+    async fn retired_unowned_dependency_failure_case() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, _) = open(dir.path(), 0);
-        let soul = seed_native(&supervisor, dir.path()).await;
+        let soul = Box::pin(seed_native(&supervisor, dir.path())).await;
         let original = supervisor
             .registry
             .recovery_context(soul.clone())
             .await
             .unwrap();
         let (incarnation, runtime, container) =
-            uncommitted_replacement(&supervisor, &backend, &soul).await;
+            Box::pin(uncommitted_replacement(&supervisor, &backend, &soul)).await;
         drop(supervisor);
         drop(backend);
 
         let (supervisor, backend, clock) = open(dir.path(), 1_000);
-        supervisor.reconcile_startup().await.unwrap();
+        Box::pin(supervisor.reconcile_startup()).await.unwrap();
         assert_eq!(due(dir.path()), Some(3_000));
         backend.unavailable(true);
         clock.store(3_000, Ordering::SeqCst);
-        let report = supervisor.reconcile_startup().await.unwrap();
+        let report = Box::pin(supervisor.reconcile_startup()).await.unwrap();
         assert!(
             report.results.iter().all(|result| result.error.is_none()),
             "{report:?}"
@@ -12644,8 +12648,8 @@ pub(crate) mod automatic_retry_tests {
         drop(backend);
 
         let (supervisor, backend, clock) = open(dir.path(), 4_000);
-        supervisor.reconcile_startup().await.unwrap();
-        supervisor.observe_once().await.unwrap();
+        Box::pin(supervisor.reconcile_startup()).await.unwrap();
+        Box::pin(supervisor.observe_once()).await.unwrap();
         assert_eq!(attempts(dir.path()), journals);
         assert_eq!(
             supervisor
@@ -12659,7 +12663,7 @@ pub(crate) mod automatic_retry_tests {
         assert_eq!(backend.count("creates"), 1);
         backend.unavailable(false);
         clock.store(13_000, Ordering::SeqCst);
-        supervisor.observe_once().await.unwrap();
+        Box::pin(supervisor.observe_once()).await.unwrap();
         let recovered = supervisor
             .registry
             .recovery_context(soul.clone())
