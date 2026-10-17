@@ -302,13 +302,21 @@ export const CONTROL_PROTOCOL_VERSION = 2
 
 type RunOwnedRuntimeImage = { tag: string; runId: string; candidateSha: string; digest?: string }
 
+// Docker inherits image labels into containers. Keep image provenance outside
+// the com.freshell.* namespace used to validate exact container ownership.
+const RUNTIME_IMAGE_LABELS = {
+  runId: 'org.freshell.runtime-test-run-id',
+  candidate: 'org.freshell.runtime-test-candidate',
+  sourceState: 'org.freshell.runtime-test-source-state',
+} as const
+
 export function assertRunOwnedRuntimeImage(observed: unknown, context: RunOwnedRuntimeImage): void {
   const parsed = z.array(z.object({ Id: z.string().regex(/^sha256:[a-f0-9]{64}$/),
     RepoTags: z.array(z.string()), Config: z.object({ Labels: z.record(z.string(), z.string()) }) })).length(1).safeParse(observed)
   const image = parsed.success ? parsed.data[0] : undefined
   if (!image || (context.digest && image.Id !== context.digest) || !image.RepoTags.includes(context.tag)
-    || image.Config.Labels['com.freshell.runtime-test-run-id'] !== context.runId
-    || image.Config.Labels['com.freshell.runtime-test-candidate'] !== context.candidateSha) {
+    || image.Config.Labels[RUNTIME_IMAGE_LABELS.runId] !== context.runId
+    || image.Config.Labels[RUNTIME_IMAGE_LABELS.candidate] !== context.candidateSha) {
     throw new Error('runtime image is not the exact owned artifact')
   }
 }
@@ -335,8 +343,8 @@ export function buildRunOwnedRuntimeImage(
   const tag = runOwnedRuntimeImageTag(runId, candidateSha)
   const source = captureRuntimeCandidate(repoRoot)
   execute('docker', ['build', '--pull=false', '--provenance=false', '--sbom=false',
-    '--label', `com.freshell.runtime-test-run-id=${runId}`, '--label', `com.freshell.runtime-test-candidate=${candidateSha}`,
-    '--label', `com.freshell.runtime-test-source-state=${source.sha}:${source.dirty ? 'dirty' : 'clean'}`,
+    '--label', `${RUNTIME_IMAGE_LABELS.runId}=${runId}`, '--label', `${RUNTIME_IMAGE_LABELS.candidate}=${candidateSha}`,
+    '--label', `${RUNTIME_IMAGE_LABELS.sourceState}=${source.sha}:${source.dirty ? 'dirty' : 'clean'}`,
     '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: repoRoot, stdio: 'inherit' })
   const digest = String(execute('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
   if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('run-owned runtime image has no pinned digest')
@@ -4501,8 +4509,8 @@ export class RuntimeHarness {
           .length(1).safeParse(JSON.parse(docker(['image', 'inspect', selected])))
         if (!inspected.success) throw new Error('selected workload image does not resolve to its exact digest')
         const labels = inspected.data[0]!.Config.Labels
-        if (labels['com.freshell.runtime-test-candidate'] !== this.candidateSha
-          || labels['com.freshell.runtime-test-source-state'] !== `${this.candidateSha}:clean`) {
+        if (labels[RUNTIME_IMAGE_LABELS.candidate] !== this.candidateSha
+          || labels[RUNTIME_IMAGE_LABELS.sourceState] !== `${this.candidateSha}:clean`) {
           throw new Error('selected workload image candidate or source differs')
         }
         // A selected digest is borrowed. Only the original builder owns its tag.

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { spawn, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import os from 'node:os'
 import fs from 'node:fs/promises'
 import http from 'node:http'
@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 
 import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
+import { buildRunOwnedRuntimeImage } from '../../../../scripts/testing/runtime-sandbox.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
 import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
 
@@ -1413,6 +1414,63 @@ async function publishControllerPreparation(directory: string, input: Pick<Prepa
 }
 
 describe('fixed indexed publisher broker',()=>{
+  it.each(['mountpoints', 'publisher'] as const)('keeps run-owned image provenance compatible with exact %s helper cleanup', async role => {
+    const imageLabels: Record<string, string> = {}
+    await withHttpBroker(async ({ directory, request, broker: instance }) => {
+      const project = path.join(directory, 'project')
+      await fs.mkdir(project)
+      execFileSync('git', ['init', '--quiet'], { cwd: project })
+      execFileSync('git', ['-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+        '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'Synthetic image source'], { cwd: project })
+      const candidate = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: project, encoding: 'utf8' }).trim()
+      const digest = `sha256:${'b'.repeat(64)}`
+      const execute = vi.fn<typeof execFileSync>().mockImplementation((_command, args) => {
+        if (args?.[0] === 'build') {
+          for (let index = 0; index < args.length; index++) {
+            if (args[index] !== '--label') continue
+            const label = String(args[index + 1])
+            const separator = label.indexOf('=')
+            imageLabels[label.slice(0, separator)] = label.slice(separator + 1)
+          }
+          return ''
+        }
+        return digest
+      })
+      const image = buildRunOwnedRuntimeImage(project, '11111111-1111-4111-8111-111111111111', candidate, execute)
+      const input = { ...publisherAuthorization(), imageRef: image.digest }
+      instance.authorizePreparedInputs(input)
+      const body = publisherBody(input)
+      let name = `${input.indexedFiles!.volumeName}-publisher`
+      if (role === 'mountpoints') {
+        name = 'freshell-mountpoints-11111111-1111-4111-8111-111111111111'
+        body.User = '0:0'
+        body.Cmd = ['prepare-provider-mountpoints']
+        body.Labels = { 'com.freshell.installation-id': input.installationId,
+          'com.freshell.soul-id': input.soulId, 'com.freshell.incarnation-id': input.incarnationId }
+        body.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
+        body.HostConfig.Mounts[1] = { Type: 'volume', Source: input.providerVolumeName,
+          Target: '/home/freshell/provider', ReadOnly: false, VolumeOptions: { NoCopy: true } }
+      } else {
+        expect((await request('POST', '/v1.47/volumes/create', { Name: input.indexedFiles!.volumeName,
+          Driver: 'local', DriverOpts: indexedOptions, Labels: publisherLabels(input) })).status).toBe(201)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
+      const inspected = await request('GET', `/v1.47/containers/${helperId}/json`)
+      expect(inspected.status).toBe(200)
+      expect(JSON.parse(inspected.body).Config.Labels).toMatchObject(imageLabels)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      if (role === 'mountpoints') {
+        expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      }
+      expect((await request('DELETE', `/v1.47/containers/${name}?force=1`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+      if (role === 'publisher') {
+        expect((await request('DELETE', `/v1.47/volumes/${input.indexedFiles!.volumeName}`)).status).toBe(204)
+      }
+      expect(instance.unsafeAttempts()).toEqual([])
+    }, { imageLabels })
+  })
+
   it('settles an indexed publisher without a runtime receipt after draining while refusing new work', async () => {
     await withHttpBroker(async ({ directory, request, broker: instance }) => {
       const input = publisherAuthorization()
@@ -2011,7 +2069,7 @@ describe('fixed indexed publisher broker',()=>{
   });
 });
 
-async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gatewaysOrOptions?:Set<string> | { allowTask2LegacyNegativeFixtures?: boolean; delayHelperWait?: boolean; gitWorkspace?: string; initialProviderVolumeLookup?: (volume: string) => ReturnType<typeof sourceAuthorization> | undefined }, physicalStage = false,
+async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gatewaysOrOptions?:Set<string> | { allowTask2LegacyNegativeFixtures?: boolean; delayHelperWait?: boolean; gitWorkspace?: string; imageLabels?: Record<string, string>; initialProviderVolumeLookup?: (volume: string) => ReturnType<typeof sourceAuthorization> | undefined }, physicalStage = false,
   allowedProviderInputRoots = new Set<string>()) {
   const gateways = gatewaysOrOptions instanceof Set ? gatewaysOrOptions : undefined
   const options = gatewaysOrOptions instanceof Set ? {} : (gatewaysOrOptions ?? {})
@@ -2030,6 +2088,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   let candidateVolumeAckUnavailable = false
   let candidateHelperDeleted = false
   let waitingResponse: http.ServerResponse | undefined
+  const privateHelperCommands = ['observe-claude-sources-private', 'publish-provider-inputs', 'prepare-provider-mountpoints']
   const upstream = http.createServer(async (req, res) => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
@@ -2064,13 +2123,14 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly
       res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'foreign'}:inspected,HostConfig:inspected.HostConfig}));return
     }
-    if (req.method==='GET' && (req.url?.includes('-publisher/json') || req.url?.includes('/freshell-claude-source-')
-      || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some((operation)=>['observe-claude-sources-private','publish-provider-inputs'].includes(operation.body?.Cmd?.[0]))))) {
+    const privateHelper = forwarded.findLast(operation => privateHelperCommands.includes(operation.body?.Cmd?.[0])
+      && (req.url === `/v1.47/containers/${helperId}/json`
+        || req.url === `${operation.url.replace('/containers/create?name=', '/containers/')}/json`))
+    if (req.method==='GET' && privateHelper) {
       if (sourceHelperDeleted) { res.statusCode=404;res.end('{}');return }
-      const command=req.url?.includes('-publisher/json') || (req.url===`/v1.47/containers/${helperId}/json` && forwarded.some(operation=>operation.body?.Cmd?.[0]==='publish-provider-inputs'))?'publish-provider-inputs':'observe-claude-sources-private';
-      const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]===command)!.body;
-      const inspected=structuredClone(config);
+      const inspected=structuredClone(privateHelper.body);
       inspected.Labels['org.opencontainers.image.version']='24.04';
+      inspected.Labels = { ...options.imageLabels, ...inspected.Labels };
       // Docker reports an empty Tmpfs object as null on the retained reader.
       if (inspected.HostConfig.Tmpfs && Object.keys(inspected.HostConfig.Tmpfs).length === 0) inspected.HostConfig.Tmpfs = null;
       for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly;
@@ -2099,7 +2159,9 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     if (req.method === 'DELETE' || req.url?.endsWith('/start') || req.url?.endsWith('/update')) {
       if (req.method === 'DELETE' && req.url?.startsWith('/v1.47/volumes/freshell-inputs-')) indexedVolumeMetadata = undefined
       if (req.method==='DELETE' && candidateCreation && req.url===`/v1.47/containers/${helperId}?force=1`) candidateHelperDeleted=true
-      if (req.method==='DELETE' && (req.url===`/v1.47/containers/${helperId}?force=1` || req.url===`/v1.47/containers/${sourceName}?force=1`)) sourceHelperDeleted=true
+      if (req.method==='DELETE' && (req.url===`/v1.47/containers/${helperId}?force=1` || req.url===`/v1.47/containers/${sourceName}?force=1`
+        || forwarded.some(operation => privateHelperCommands.includes(operation.body?.Cmd?.[0])
+          && req.url === `${operation.url.replace('/containers/create?name=', '/containers/')}?force=1`))) sourceHelperDeleted=true
       if (req.method === 'DELETE') waitingResponse?.destroy()
       res.statusCode = 204
       res.end()
