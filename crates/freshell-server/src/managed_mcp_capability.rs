@@ -985,6 +985,7 @@ async fn confirm_claude_callback_candidate(
             observation_request: source,
         },
         true,
+        Some(binding),
     )?;
     let source = request.observation_request.clone();
     let reply = client.observe_claude_sources(request).await.map_err(|_| {
@@ -3432,7 +3433,7 @@ fn bind_claude_candidate_request(
     directory: &Path,
     request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
 ) -> Result<freshell_runtime_protocol::ObserveClaudeSourcesRequest, String> {
-    bind_claude_candidate_request_and_plan(store, directory, request, false)
+    bind_claude_candidate_request_and_plan(store, directory, request, false, None)
         .map(|(request, _)| request)
 }
 
@@ -3441,6 +3442,7 @@ fn bind_claude_candidate_request_and_plan(
     directory: &Path,
     mut request: freshell_runtime_protocol::ObserveClaudeSourcesRequest,
     use_frozen_revision: bool,
+    recovery: Option<&freshell_runtime_protocol::ClaudeRecoverySourceBinding>,
 ) -> Result<
     (
         freshell_runtime_protocol::ObserveClaudeSourcesRequest,
@@ -3481,7 +3483,7 @@ fn bind_claude_candidate_request_and_plan(
         ".freshell/claude-candidate-binding.json",
         MAX_CONTROL_FRAME_BYTES,
     )?;
-    let publication: ClaudeCandidatePublication =
+    let mut publication: ClaudeCandidatePublication =
         serde_json::from_slice(&published).map_err(|_| blocked())?;
     if use_frozen_revision {
         // A fresh baseline has no prepared revision yet. Same-scope replay
@@ -3529,6 +3531,56 @@ fn bind_claude_candidate_request_and_plan(
     {
         return Err(blocked());
     }
+    // The frozen files can survive a failed reader or replacement. Their
+    // original callback scope cannot authorize the next recovery attempt.
+    // Reconcile only this owned pending generation after current baseline
+    // observation and complete frozen-payload validation above.
+    let published = if let Some(recovery) = recovery {
+        recovery.validate().map_err(|_| blocked())?;
+        let owned = store.grants.lock().unwrap();
+        let grant = owned.get(&generation).ok_or_else(blocked)?;
+        let pending = grant.preparation.as_ref().ok_or_else(blocked)?;
+        if pending.phase == InputPreparationPhase::Committed
+            || grant.soul_id != request.soul_id
+            || (recovery.prior_generation_id != generation
+                && !pending
+                    .prior_grant_ids
+                    .contains(&recovery.prior_generation_id))
+            || publication.initial_reservation_id.is_some()
+            || publication.soul_id != request.soul_id
+            || publication.provider != recovery.provider
+            || publication.intent_revision != recovery.intent_revision
+            || publication.workspace_path != request.workspace_path
+            || publication.git_common_dir != recovery.git_common_dir
+            || recovery.authority_sha256
+                != format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(&request.authority, MAX_CONTROL_FRAME_BYTES)
+                            .map_err(|_| blocked())?
+                    )
+                )
+        {
+            return Err(blocked());
+        }
+        drop(owned);
+        publication.authority_sha256 = recovery.authority_sha256.clone();
+        publication.registry_attempt_id = Some(recovery.registry_attempt_id.clone());
+        publication.prior_generation_id = Some(recovery.prior_generation_id.clone());
+        let rebound =
+            bounded_json_bytes(&publication, MAX_CONTROL_FRAME_BYTES).map_err(|_| blocked())?;
+        if rebound != published {
+            let path = root.join(".freshell/claude-candidate-binding.json");
+            replace_staged_private_bytes(&path, &rebound)?;
+            allow_controller_stage_read(&path)?;
+            tracing::info!(event="provider.inputs.claude_candidate.reconciled", soul_id=%request.soul_id,
+                generation_id=%generation, attempt_id=%recovery.registry_attempt_id,
+                "Retained Claude candidate bound to current recovery attempt");
+        }
+        rebound
+    } else {
+        published
+    };
     let binding = CandidateBinding {
         soul_id: publication.soul_id.as_str().into(),
         generation_id: generation,
@@ -8971,6 +9023,9 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "digest",
             "identity",
             "none",
+            "candidate_unavailable",
+            "new_attempt",
+            "different_intent",
             "pending_selection_drift",
             "replacement",
             "candidate_digest",
@@ -8982,7 +9037,28 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 read_frame, write_frame, AdminCommand, AdminReply, AdminResult, Envelope,
                 InstallationId,
             };
-            let current_callback = if fault == "replacement" {
+            let current_callback = if matches!(fault, "new_attempt" | "different_intent") {
+                let mut value: serde_json::Value = serde_json::from_slice(&callback).unwrap();
+                let authority = ClaudeSourceAuthority::RecoveryAttempt {
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                };
+                let ClaudeSourceAuthority::RecoveryAttempt { attempt_id } = &authority else {
+                    unreachable!()
+                };
+                value["authLookupAuthority"] = serde_json::json!(attempt_id);
+                value["claudeRecoverySource"]["authoritySha256"] = serde_json::json!(format!(
+                    "{:x}",
+                    Sha256::digest(
+                        bounded_json_bytes(&authority, MAX_CONTROL_FRAME_BYTES).unwrap()
+                    )
+                ));
+                value["claudeRecoverySource"]["registryAttemptId"] =
+                    serde_json::to_value(RecoveryAttemptId::new()).unwrap();
+                if fault == "different_intent" {
+                    value["claudeRecoverySource"]["intentRevision"] = serde_json::json!(3);
+                }
+                serde_json::to_vec(&value).unwrap()
+            } else if fault == "replacement" {
                 store
                     .abort_preparation(&replacement.grant_id, &soul, &directory)
                     .unwrap();
@@ -9005,7 +9081,11 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             };
             let socket_path = owned.path().join(format!("source-{fault}.sock"));
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-            let expected_scope = scope.clone();
+            let expected_scope = serde_json::from_slice::<serde_json::Value>(&current_callback)
+                .unwrap()["authLookupAuthority"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             let expected_soul = soul.clone();
             let expected_cwd = if matches!(fault, "replacement" | "candidate_digest") {
                 resumed.clone()
@@ -9057,7 +9137,10 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                             },
                             _ => panic!("unexpected scoped source callback request"),
                         };
-                        write_frame(&mut socket, &AdminReply { request_id: request.request_id, result: Ok(result) }).await.unwrap();
+                        let result = if fault == "candidate_unavailable" && matches!(&result, AdminResult::ClaudeSourceObservation(_)) && observations.last() == Some(&true) {
+                            Err(freshell_runtime_protocol::RuntimeError::new(freshell_runtime_protocol::RuntimeErrorCode::HostUnreachable, "synthetic candidate reader failure"))
+                        } else { Ok(result) };
+                        write_frame(&mut socket, &AdminReply { request_id: request.request_id, result }).await.unwrap();
                     }
                     observations
                 }).await.unwrap()
@@ -9078,9 +9161,14 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             let observations = reader.await.unwrap();
             if matches!(
                 fault,
-                "none" | "replacement" | "candidate_digest" | "pending_selection_drift"
+                "none"
+                    | "candidate_unavailable"
+                    | "new_attempt"
+                    | "replacement"
+                    | "candidate_digest"
+                    | "pending_selection_drift"
             ) {
-                assert_eq!(observations, vec![false, true], "both pending replay and new replacement must confirm their actual candidate before any consumer");
+                assert_eq!(observations, vec![false, true], "both pending replay and new replacement must confirm their actual candidate before any consumer; fault={fault}, result={result:?}");
             } else {
                 assert_eq!(
                     observations,
@@ -9088,7 +9176,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                     "failed current source evidence must stop before candidate work"
                 );
             }
-            if fault == "none" {
+            if matches!(fault, "none" | "new_attempt") {
                 assert_eq!(
                     serde_json::from_slice::<serde_json::Value>(&result.unwrap()).unwrap(),
                     serde_json::from_slice::<serde_json::Value>(&pending_before).unwrap()
@@ -9150,7 +9238,13 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             );
             if matches!(
                 fault,
-                "digest" | "identity" | "none" | "pending_selection_drift"
+                "digest"
+                    | "identity"
+                    | "none"
+                    | "candidate_unavailable"
+                    | "new_attempt"
+                    | "different_intent"
+                    | "pending_selection_drift"
             ) {
                 assert_eq!(
                     std::fs::read(pending_stage.join(".freshell/prepared-result.json")).unwrap(),
