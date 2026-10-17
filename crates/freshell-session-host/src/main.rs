@@ -6412,7 +6412,8 @@ fn refresh_provider_config_in_stage_locked(
     stage: tempfile::TempDir,
 ) -> Result<(), String> {
     let projection = stage.path().join("projection");
-    std::fs::create_dir(&projection).map_err(|error| error.to_string())?;
+    // This is a new private tree. Let the copier publish it as one root;
+    // precreating it selects per-leaf durable replacement of an existing HOME.
     copy_provider_config_references_with_ownership(
         context,
         provider,
