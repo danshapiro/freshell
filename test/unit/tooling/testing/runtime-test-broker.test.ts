@@ -3222,4 +3222,7 @@ it('retains bounded redacted structured callback diagnostics for failed provider
   expect(JSON.stringify(retained)).not.toContain(secret)
   expect(JSON.stringify(retained)).not.toContain('private provider bytes')
   expect(JSON.stringify(retained)).not.toContain('hidden-token')
+  const boundary = providerParityFailureLogTail(JSON.stringify({ severity: 'error', event: 'callback_failed',
+    error: 'x'.repeat(4080) + secret }), [secret])
+  expect(JSON.stringify(boundary)).not.toContain(secret.slice(0, 12))
 })
