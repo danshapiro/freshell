@@ -339,7 +339,7 @@ describe('Phase 5 loss receipt validation', () => {
     } finally { log.mockRestore(); error.mockRestore(); vi.unstubAllEnvs() }
   })
 
-  it('builds and validates actual socket broker diagnostics without weakening decisions', async () => {
+  it.each(['success', 'connection failure'] as const)('builds and validates actual socket broker diagnostics without weakening decisions (%s)', async (outcome) => {
     const fx = createFixture()
     const upstream = http.createServer((request, response) => { request.resume(); response.end('OK') })
     const socket = path.join(fx.repoRoot, 'up.sock')
@@ -349,22 +349,58 @@ describe('Phase 5 loss receipt validation', () => {
       runtimeRootPrefix: fx.repoRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
       testRunId: runId, logPath })
     try {
-      await new Promise<void>(resolve => upstream.listen(socket, resolve))
+      if (outcome === 'success') await new Promise<void>(resolve => upstream.listen(socket, resolve))
       await broker.start()
-      await new Promise<void>((resolve, reject) => {
+      const transportOutcome = await new Promise<number | string>((resolve) => {
         const request = http.get({ socketPath: proxy, path: '/_ping' }, response => {
-          response.resume(); response.once('end', resolve)
+          response.resume(); response.once('end', () => resolve(response.statusCode!))
         })
-        request.once('error', reject)
+        request.once('error', (error: NodeJS.ErrnoException) => resolve(error.code!))
       })
+      expect(transportOutcome).toBe(outcome === 'success' ? 200 : 'ECONNRESET')
       const bytes = fs.readFileSync(logPath, 'utf8')
       const rows = bytes.trim().split('\n').map(line => JSON.parse(line))
       expect(rows.filter(row => row.event)).toHaveLength(2)
-      expect(broker.eventsSnapshot()).toMatchObject([{ decision: 'forward', destructive: false, unsafeAttempt: false }])
+      expect(broker.eventsSnapshot()).toMatchObject(outcome === 'success'
+        ? [{ decision: 'forward', destructive: false, unsafeAttempt: false }]
+        : [
+          { decision: 'block', reason: 'upstream_request_failed', allocationUnknown: false, destructive: false, unsafeAttempt: false },
+          { decision: 'block', reason: 'owner_request_failed', destructive: false, unsafeAttempt: false },
+        ])
+      const completed = rows.find(row => row.event === 'runtime.broker.request_completed')
+      expect(completed).toMatchObject(outcome === 'success'
+        ? { severity: 'info', statusCode: 200 }
+        : { severity: 'warn', errorCategory: 'upstream_request_failed' })
+      const timingFields = ['socketAssignedMs', 'socketConnectMs', 'requestFinishedMs', 'responseHeadersMs', 'responseEndMs']
+      expect(completed.transportPhases).toEqual({
+        socketAssignedMs: expect.any(Number),
+        socketConnectMs: outcome === 'success' ? expect.any(Number) : null,
+        requestFinishedMs: outcome === 'success' ? expect.any(Number) : null,
+        responseHeadersMs: outcome === 'success' ? expect.any(Number) : null,
+        responseEndMs: outcome === 'success' ? expect.any(Number) : null,
+        reusedSocket: false, socketConnectingAtAssignment: true,
+      })
       const build = () => buildPhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage: runtimeImage, receiptRunId: runId,
         candidateBefore: fx.receipt.candidateIntegrity.before, candidateAfter: fx.receipt.candidateIntegrity.after })
       const receipt = build()
       expect(validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage: runtimeImage, receipt }).summary).toEqual(fx.receipt.summary)
+      for (const mutation of [
+        (row: any) => { delete row.transportPhases },
+        (row: any) => {
+          for (const key of timingFields) row.transportPhases[key] = null
+          row.transportPhases.socketConnectingAtAssignment = null
+        },
+        (row: any) => {
+          row.transportPhases.reusedSocket = true
+          row.transportPhases.socketConnectingAtAssignment = false
+          row.transportPhases.socketConnectMs = null
+        },
+      ]) {
+        const modified = structuredClone(rows)
+        mutation(modified.find(row => row.event === 'runtime.broker.request_completed'))
+        fs.writeFileSync(logPath, modified.map(row => JSON.stringify(row)).join('\n') + '\n')
+        expect(build().summary).toEqual(receipt.summary)
+      }
       for (const mutation of [
         (row: any) => { row.event = 'runtime.broker.unknown' },
         (row: any) => { row.durationMs = -1 },
@@ -373,11 +409,35 @@ describe('Phase 5 loss receipt validation', () => {
         (row: any) => { delete row.requestId },
         (row: any) => { row.unsafeAttempt = true },
         (row: any) => { row.privatePayload = 'unexpected' },
+        (row: any) => { row.transportPhases = null },
+        (row: any) => { row.transportPhases = [] },
+        (row: any) => { row.transportPhases.privatePayload = 'unexpected' },
+        (row: any) => { row.transportPhases.reusedSocket = null },
+        (row: any) => { row.transportPhases.reusedSocket = 'false' },
+        (row: any) => { row.transportPhases.socketConnectingAtAssignment = 0 },
+        (row: any) => { row.transportPhases.socketConnectingAtAssignment = 'true' },
+        ...[...timingFields, 'reusedSocket', 'socketConnectingAtAssignment'].map(key =>
+          (row: any) => { delete row.transportPhases[key] }),
+        ...timingFields.flatMap(key => [
+          (row: any) => { row.transportPhases[key] = -1 },
+          (row: any) => { row.transportPhases[key] = '0' },
+          (row: any) => { row.transportPhases[key] = false },
+        ]),
       ]) {
         const modified = structuredClone(rows)
         mutation(modified.find(row => row.event === 'runtime.broker.request_completed'))
         fs.writeFileSync(logPath, modified.map(row => JSON.stringify(row)).join('\n') + '\n')
         expect(build).toThrow(/broker/)
+      }
+      const withStartPhases = structuredClone(rows)
+      withStartPhases.find(row => row.event === 'runtime.broker.request_started').transportPhases = completed.transportPhases
+      fs.writeFileSync(logPath, withStartPhases.map(row => JSON.stringify(row)).join('\n') + '\n')
+      expect(build).toThrow(/broker/)
+      for (const allocationUnknown of [true, null, 'false', 0]) {
+        const modified = structuredClone(rows)
+        modified.find(row => row.url === '/_ping').allocationUnknown = allocationUnknown
+        fs.writeFileSync(logPath, modified.map(row => JSON.stringify(row)).join('\n') + '\n')
+        expect(build).toThrow(/broker.*allocation/)
       }
       fs.writeFileSync(logPath, rows.filter(row => row.event).map(row => JSON.stringify(row)).join('\n') + '\n')
       expect(build).toThrow(/broker.*decision/)

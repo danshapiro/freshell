@@ -320,7 +320,7 @@ function validateBroker(rows: Record<string, any>[]): void {
     const label = `broker evidence row ${index + 1}`
     if ('event' in row) { validateBrokerDiagnostic(row, label); continue }
     const required = ['at', 'method', 'url', 'decision', 'destructive', 'unsafeAttempt']
-    const optional = ['reason', 'containerId', 'severity']
+    const optional = ['reason', 'containerId', 'severity', 'allocationUnknown']
     const unknown = Object.keys(row).filter((key) => !required.includes(key) && !optional.includes(key))
     const missing = required.filter((key) => !(key in row))
     if (unknown.length || missing.length) throw new Error(`${label} does not match the strict broker schema`)
@@ -330,6 +330,9 @@ function validateBroker(rows: Record<string, any>[]): void {
     if (!['forward', 'block', 'inject_failure'].includes(row.decision)) throw new Error(`${label}.decision is invalid`)
     if (typeof row.destructive !== 'boolean' || row.unsafeAttempt !== false) {
       throw new Error('broker evidence contains an unsafe attempt or ambiguous row')
+    }
+    if ('allocationUnknown' in row && row.allocationUnknown !== false) {
+      throw new Error('broker evidence contains an unknown or ambiguous allocation')
     }
     if (row.severity !== undefined && !['info', 'warn'].includes(row.severity)) throw new Error(`${label}.severity is invalid`)
     if (row.reason !== undefined) nonEmptyString(row.reason, `${label}.reason`)
@@ -344,7 +347,7 @@ function validateBrokerDiagnostic(row: Record<string, any>, label: string): void
   const completed = row.event === 'runtime.broker.request_completed'
   if (!completed && row.event !== 'runtime.broker.request_started') throw new Error(`${label}.event is invalid`)
   const required = ['at', 'severity', 'event', 'requestId', 'method', 'route', ...(completed ? ['durationMs'] : [])]
-  const optional = ['containerId', 'stopGraceSeconds', ...(completed ? ['statusCode', 'errorCategory'] : [])]
+  const optional = ['containerId', 'stopGraceSeconds', ...(completed ? ['statusCode', 'errorCategory', 'transportPhases'] : [])]
   if (Object.keys(row).some(key => !required.includes(key) && !optional.includes(key)) || required.some(key => !(key in row))) {
     throw new Error(`${label} does not match the strict broker diagnostic schema`)
   }
@@ -366,11 +369,30 @@ function validateBrokerDiagnostic(row: Record<string, any>, label: string): void
     return
   }
   if (!Number.isFinite(row.durationMs) || row.durationMs < 0) throw new Error(`${label}.durationMs is invalid`)
+  // Earlier broker logs omit phases; present measurements must use the complete typed shape.
+  if ('transportPhases' in row) {
+    validateBrokerTransportPhases(row.transportPhases, `${label}.transportPhases`)
+  }
   if (('statusCode' in row) === ('errorCategory' in row)) throw new Error(`${label} must contain exactly one transport outcome`)
   if ('statusCode' in row) {
     if (!Number.isInteger(row.statusCode) || row.statusCode < 100 || row.statusCode > 599 || row.severity !== 'info') throw new Error(`${label}.statusCode is invalid`)
   } else if (!['upstream_request_failed', 'upstream_response_incomplete', 'cleanup_deadline'].includes(row.errorCategory) || row.severity !== 'warn') {
     throw new Error(`${label}.errorCategory is invalid`)
+  }
+}
+
+function validateBrokerTransportPhases(value: unknown, label: string): void {
+  const phases = object(value, label)
+  const timings = ['socketAssignedMs', 'socketConnectMs', 'requestFinishedMs', 'responseHeadersMs', 'responseEndMs']
+  exactKeys(phases, [...timings, 'reusedSocket', 'socketConnectingAtAssignment'], label)
+  for (const key of timings) {
+    if (phases[key] !== null && (!Number.isFinite(phases[key]) || phases[key] < 0)) {
+      throw new Error(`${label}.${key} is invalid`)
+    }
+  }
+  if (typeof phases.reusedSocket !== 'boolean') throw new Error(`${label}.reusedSocket is invalid`)
+  if (phases.socketConnectingAtAssignment !== null && typeof phases.socketConnectingAtAssignment !== 'boolean') {
+    throw new Error(`${label}.socketConnectingAtAssignment is invalid`)
   }
 }
 
