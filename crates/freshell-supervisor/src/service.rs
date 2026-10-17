@@ -7333,7 +7333,7 @@ mod opencode_transfer_restart_tests {
         use freshell_runtime_protocol::{
             NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryProbe,
         };
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path().join("registry"), None).unwrap();
         let soul = SoulId::new();
@@ -7380,10 +7380,12 @@ mod opencode_transfer_restart_tests {
         let parent_proof = proof("native-parent", 7);
         let child_proof = proof("native-child", 8);
         let current_proof = Arc::new(std::sync::Mutex::new(Some(child_proof.clone())));
+        let worker_present = Arc::new(AtomicBool::new(true));
         let inputs = Arc::new(AtomicUsize::new(0));
         let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
         let responder = {
             let current_proof = current_proof.clone();
+            let worker_present = worker_present.clone();
             let inputs = inputs.clone();
             tokio::spawn(async move {
                 let boot = HostBootId::new();
@@ -7417,7 +7419,7 @@ mod opencode_transfer_restart_tests {
                                     .map(|proof| proof.native_session_id.clone()),
                                 native_identity_observation: observation,
                                 host_boot_id: boot.clone(),
-                                worker_pid: None,
+                                worker_pid: worker_present.load(Ordering::SeqCst).then_some(123),
                                 worker_launch_count: 1,
                                 max_control_epoch: 1,
                                 max_execution_generation: 1,
@@ -7532,6 +7534,23 @@ mod opencode_transfer_restart_tests {
             CommandState::ProviderAcked
         );
         assert_eq!(inputs.load(Ordering::SeqCst), 1);
+        worker_present.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            supervisor
+                .probe_recovery_locked(soul.clone())
+                .await
+                .unwrap(),
+            RecoveryProbe::Blocked {
+                path: freshell_runtime_protocol::RecoveryPath::Reattach,
+                reason: freshell_runtime_protocol::RecoveryBlockReason::ProviderUnavailable,
+                retry_hint: freshell_runtime_protocol::RetryHint {
+                    automatic_after_ms: Some(2_000),
+                    ..
+                },
+                ..
+            }
+        ));
+        worker_present.store(true, Ordering::SeqCst);
         for stale in [Some(parent_proof), None] {
             *current_proof.lock().unwrap() = stale;
             assert!(supervisor

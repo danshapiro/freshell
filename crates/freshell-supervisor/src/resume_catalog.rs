@@ -938,6 +938,13 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn repaired_opencode_resume_and_blocked_retry_select_executable_native_temp_directory() {
+        let interpreter = std::process::Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .expect("resolve Node before clearing the native resolver's environment");
+        assert!(interpreter.status.success());
+        let node = PathBuf::from(String::from_utf8(interpreter.stdout).unwrap().trim());
+        assert!(node.is_absolute());
         for legacy_tmpdir in [None, Some("/tmp")] {
             let mut context = completed_import_context();
             let terminal = context.terminal.as_mut().unwrap();
@@ -950,7 +957,7 @@ pub(crate) mod tests {
             let baseline = resume.opencode_adoption_baseline.clone().unwrap();
             let launch =
                 freshell_agent_runtime::prepare_terminal_for_resume(&original, &resume).unwrap();
-            assert_native_temp_directory(&launch);
+            assert_native_temp_directory(&node, &launch);
             assert_eq!(context.terminal, Some(original.clone()));
 
             // A persisted legacy candidate must be upgraded on Retry as well,
@@ -974,7 +981,7 @@ pub(crate) mod tests {
                 &retry,
             )
             .unwrap();
-            assert_native_temp_directory(&launch);
+            assert_native_temp_directory(&node, &launch);
             assert_eq!(retry.opencode_adoption_baseline, Some(baseline));
             assert_eq!(retry.provider_session, resume.provider_session);
             assert_eq!(retry.evidence_revision, context.evidence_revision);
@@ -983,10 +990,10 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_native_temp_directory(launch: &TerminalLaunchSpec) {
+    fn assert_native_temp_directory(node: &std::path::Path, launch: &TerminalLaunchSpec) {
         // Run the child process's native temporary-directory resolver with the
         // actual resume adapter environment, without ambient host fallbacks.
-        let child = std::process::Command::new("node")
+        let child = std::process::Command::new(node)
             .args(["-e", "process.stdout.write(require('node:os').tmpdir())"])
             .env_clear()
             .envs(&launch.env)

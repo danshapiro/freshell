@@ -9216,7 +9216,18 @@ pub(crate) mod tests {
             "UPDATE souls SET provider='opencode',native_session_id='ses_exact',native_import_state='completed',native_import_source_store_id=?1,native_import_root_session_id='ses_exact',native_import_source_generation=?2,native_import_schema_fingerprint=?3,native_import_migration_fingerprint=?4 WHERE soul_id=?5",
             params![store, "e".repeat(64), census.schema_fingerprint(), census.migration_fingerprint(), soul.as_str()],
         ).unwrap();
+        let input = RequestId::new();
+        registry
+            .begin_input(soul.clone(), input.clone(), b"synthetic input", None)
+            .await
+            .unwrap();
+        registry
+            .mark_input_dispatching(soul.clone(), input)
+            .await
+            .unwrap();
         let captured = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(captured.dispatched_command_count, 1);
+        assert_eq!(captured.native_session_id.as_deref(), Some("ses_exact"));
         let absent = registry
             .refresh_native_import_inventory(&captured, Ok(inventory.clone()))
             .await
