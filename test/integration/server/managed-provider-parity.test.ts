@@ -14,6 +14,7 @@ import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../..
 import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
 import { authorizeProviderParityRequest } from '../../helpers/provider-parity-broker.js'
 import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
+import { providerParitySqliteHygieneScript } from '../../helpers/provider-parity-sqlite-hygiene.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -850,7 +851,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
       const providerLogs = rig.runtime.containerLogs(managedView)
       rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
-        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){const value=fs.readFileSync(p+'/'+f);if(['${nestedSecretMarker}','fixture-secret-byte'].some(marker=>value.includes(marker)))process.exit(4)}`,
+        'node', '-e', providerParitySqliteHygieneScript('/var/lib/freshell-supervisor', [nestedSecretMarker, 'fixture-secret-byte']),
       ])
       for (const material of [inspect, supervisorLogs, providerLogs, fs.readFileSync(rig.runtime.evidenceDir + '/lifecycle.jsonl', 'utf8')]) {
         expect(material).not.toContain(nestedSecretMarker)
