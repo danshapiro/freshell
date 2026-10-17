@@ -713,6 +713,9 @@ const CLEANUP_CONTENT: &[u8] = b"cleanup-started\n";
 const OLD_FILES_DIR: &str = ".old";
 const MAX_JOURNAL_BYTES: u64 = 160 * 1024 * 1024;
 
+#[cfg(all(test, unix))]
+type MaterializedFileSyncObserver = Box<dyn FnMut(&Path)>;
+
 #[cfg(test)]
 thread_local! {
     static PUBLICATION_RECOVERY_EVENTS: std::cell::RefCell<Vec<serde_json::Value>> = const {
@@ -729,6 +732,10 @@ thread_local! {
     };
     static PUBLICATION_SYNC_FAILURE_PATHS: std::cell::RefCell<Vec<PathBuf>> = const {
         std::cell::RefCell::new(Vec::new())
+    };
+    #[cfg(unix)]
+    static MATERIALIZED_FILE_SYNC_OBSERVER: std::cell::RefCell<Option<MaterializedFileSyncObserver>> = const {
+        std::cell::RefCell::new(None)
     };
     static PUBLICATION_ROLLBACK_RESTORE_FAILURE_PATH: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
@@ -2865,6 +2872,8 @@ fn stage_environment_projection(
                     ));
                 }
                 mode(&destination, private_file_mode(*source_mode), relative)?;
+                // Non-Unix flush APIs can require this original writable handle.
+                #[cfg(not(unix))]
                 output
                     .sync_all()
                     .map_err(|cause| io_error(relative, "sync_file", cause))?;
@@ -2897,6 +2906,51 @@ fn stage_environment_projection(
                     "symbolic resource projection requires Unix",
                 ));
             }
+        }
+    }
+    // Submit this private tree's data before the per-file durability checks.
+    // Otherwise Linux serializes tiny dependency writes and journal waits at
+    // each fsync. Range submission does not replace those final full flushes.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        for (relative, node) in &plan.nodes {
+            if matches!(node, Node::File(..)) {
+                let file = File::open(temporary.0.join(relative))
+                    .map_err(|cause| io_error(relative, "sync_file", cause))?;
+                if unsafe {
+                    libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
+                } != 0
+                {
+                    let cause = std::io::Error::last_os_error();
+                    // Some filesystems do not support range submission. Their
+                    // ordinary fsync below remains the durability barrier.
+                    if matches!(
+                        cause.raw_os_error(),
+                        Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
+                    ) {
+                        break;
+                    }
+                    return Err(io_error(relative, "sync_file", cause));
+                }
+            }
+        }
+    }
+    // Keep one read-only handle at a time and flush every physical file (with
+    // its final mode) before any provider-visible publication starts.
+    #[cfg(unix)]
+    for (relative, node) in &plan.nodes {
+        if matches!(node, Node::File(..)) {
+            let staged = temporary.0.join(relative);
+            #[cfg(test)]
+            MATERIALIZED_FILE_SYNC_OBSERVER.with(|observer| {
+                if let Some(observe) = observer.borrow_mut().as_mut() {
+                    observe(&staged);
+                }
+            });
+            File::open(&staged)
+                .and_then(|file| file.sync_all())
+                .map_err(|cause| io_error(relative, "sync_file", cause))?;
         }
     }
     let mut rollback = None;
@@ -3297,6 +3351,127 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
     use std::{fs, path::Path};
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_flushes_complete_staged_files_before_publication() {
+        use std::{cell::RefCell, rc::Rc};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        fs::create_dir(&source).unwrap();
+        for index in 0..128 {
+            fs::write(
+                source.join(format!("entry-{index:03}")),
+                format!("payload-{index}"),
+            )
+            .unwrap();
+        }
+        fs::set_permissions(source.join("entry-000"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(source.join("entry-127"), fs::Permissions::from_mode(0o751)).unwrap();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let copies = observed.clone();
+        MATERIALIZED_FILE_SYNC_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |path| {
+                copies.borrow_mut().push((0..128).all(|index| {
+                    fs::read_to_string(path.parent().unwrap().join(format!("entry-{index:03}")))
+                        .is_ok_and(|bytes| bytes == format!("payload-{index}"))
+                }));
+            }));
+        });
+        let result = copy_environment(
+            &[CopySelection {
+                source,
+                destination_relative: "resource".into(),
+            }],
+            &home,
+            &[],
+            Default::default(),
+        );
+        MATERIALIZED_FILE_SYNC_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        result.unwrap();
+        assert_eq!(
+            observed.borrow().len(),
+            128,
+            "every staged physical file must be flushed"
+        );
+        assert!(
+            observed.borrow().iter().all(|complete| *complete),
+            "all staged writes must precede the first payload flush"
+        );
+        for index in 0..128 {
+            let file = home.join(format!("resource/entry-{index:03}"));
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!("payload-{index}")
+            );
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                if index == 127 { 0o711 } else { 0o600 }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_file_flush_open_failure_preserves_home_and_cleans_stage() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&home).unwrap();
+        for name in ["first", "last"] {
+            fs::write(source.join(name), format!("selected-{name}")).unwrap();
+            fs::write(home.join(name), format!("retained-{name}")).unwrap();
+        }
+        fs::write(home.join("native-state"), "provider-created").unwrap();
+        let before = ["first", "last", "native-state"].map(|name| {
+            let path = home.join(name);
+            let metadata = fs::metadata(&path).unwrap();
+            (
+                name,
+                metadata.ino(),
+                metadata.mode(),
+                fs::read(path).unwrap(),
+            )
+        });
+        MATERIALIZED_FILE_SYNC_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(|staged| {
+                fs::remove_file(staged).unwrap();
+            }));
+        });
+        let result = copy_environment(
+            &[
+                selection(&source.join("first"), "first"),
+                selection(&source.join("last"), "last"),
+            ],
+            &home,
+            &[],
+            Default::default(),
+        );
+        MATERIALIZED_FILE_SYNC_OBSERVER.with(|observer| {
+            observer.borrow_mut().take();
+        });
+        let failure = result.unwrap_err();
+        assert_eq!(failure.operation, "sync_file");
+        for (name, inode, mode, bytes) in before {
+            let path = home.join(name);
+            let metadata = fs::metadata(&path).unwrap();
+            assert_eq!((metadata.ino(), metadata.mode()), (inode, mode));
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        for name in ["first", "last"] {
+            assert_eq!(
+                fs::read_to_string(source.join(name)).unwrap(),
+                format!("selected-{name}")
+            );
+        }
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 3);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    }
 
     #[cfg(unix)]
     #[test]
