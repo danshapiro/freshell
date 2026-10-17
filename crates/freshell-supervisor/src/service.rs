@@ -3039,42 +3039,56 @@ impl Supervisor {
         // identity. Its bookkeeping is not ownership of already accepted output.
         let observation_fence = self.registry.recovery_write_fence(soul_id.clone()).await;
         timing.phase("host_read");
-        let live = async {
-            let host = self
-                .authenticate_host(&source.incarnation_id, &source.runtime_dir)
-                .await?;
-            self.send_authenticated_host_command(
-                source.incarnation_id.clone(),
-                &source.runtime_dir,
-                &host,
-                HostCommand::TerminalReadOutput {
-                    incarnation_id: source.incarnation_id.clone(),
-                    after_seq,
-                    max_bytes,
-                    expected_stream_epoch: expected_stream_epoch.clone(),
-                },
+        // A read starting after Stop reads accepted spool bytes directly.
+        // Stop intent alone is not EOF; only an actual completion record or
+        // the exact incarnation's persisted verified-empty state can end it.
+        let retained_only = source.stopped || source.verified_empty;
+        let live = if retained_only {
+            None
+        } else {
+            Some(
+                async {
+                    let host = self
+                        .authenticate_host(&source.incarnation_id, &source.runtime_dir)
+                        .await?;
+                    self.send_authenticated_host_command(
+                        source.incarnation_id.clone(),
+                        &source.runtime_dir,
+                        &host,
+                        HostCommand::TerminalReadOutput {
+                            incarnation_id: source.incarnation_id.clone(),
+                            after_seq,
+                            max_bytes,
+                            expected_stream_epoch: expected_stream_epoch.clone(),
+                        },
+                    )
+                    .await
+                }
+                .await,
             )
-            .await
-        }
-        .await;
+        };
         let output = match live {
-            Ok(HostResult::TerminalOutput(output)) => output,
-            Ok(_) => {
+            Some(Ok(HostResult::TerminalOutput(output))) => output,
+            Some(Ok(_)) => {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::HostAuthenticationFailed,
                     "unexpected terminal output reply",
                 ));
             }
-            Err(_) => {
+            None | Some(Err(_)) => {
                 timing.phase("retained_fallback");
                 // This capability is used only for read-only emptiness
                 // verification, never input, kill or replacement dispatch.
-                let handle = self
-                    .registry
-                    .owned_handle(source.incarnation_id.clone())
-                    .await
-                    .map_err(map_registry)?;
-                let verified_empty = self.backend.verify_empty(&handle).await.unwrap_or(false);
+                let verified_empty = if retained_only {
+                    source.verified_empty
+                } else {
+                    let handle = self
+                        .registry
+                        .owned_handle(source.incarnation_id.clone())
+                        .await
+                        .map_err(map_registry)?;
+                    self.backend.verify_empty(&handle).await.unwrap_or(false)
+                };
                 let retained_source = source.clone();
                 tokio::task::spawn_blocking(move || {
                     crate::retained_output::read(
