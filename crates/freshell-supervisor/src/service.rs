@@ -3027,14 +3027,23 @@ impl Supervisor {
         max_bytes: u64,
         expected_stream_epoch: Option<String>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
-        let source = self
-            .registry
-            .retained_output_source(soul_id.clone())
-            .await
-            .map_err(map_registry)?;
+        let (source, observation_context) = {
+            // Recovery temporarily reserves a write fence even when it only
+            // reattaches the same worker. Capture after that lifecycle work
+            // settles, so its temporary attempt cannot become the read's
+            // baseline. Host IO remains outside lifecycle custody.
+            let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+            let _guard = lifecycle_lock.lock().await;
+            let source = self
+                .registry
+                .retained_output_source(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            let context = self.registry.recovery_context(soul_id.clone()).await;
+            (source, context)
+        };
         crate::retained_output::validate_source(&source, &self.config.runtime_root)
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::OwnershipMismatch, error))?;
-        let observation_context = self.registry.recovery_context(soul_id.clone()).await;
         let source_incarnation = source.incarnation_id.clone();
         // This independent capability is used only for exact read-only backend
         // emptiness verification, never input, kill, or replacement dispatch.
@@ -11218,6 +11227,26 @@ mod native_observation_ipc_tests {
     }
 
     #[tokio::test]
+    async fn terminal_output_waits_for_healthy_reattach_before_capturing_its_owner() {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pending_terminal_output_case(false, None, "settled_recovery"),
+        )
+        .await
+        .expect("same-owner reattach must leave output readable");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_read_before_healthy_reattach_revalidates_after_settlement() {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pending_terminal_output_case(false, None, "settled_recovery_after_read"),
+        )
+        .await
+        .expect("a healthy reattach during host IO must leave output readable");
+    }
+
+    #[tokio::test]
     async fn terminal_output_without_identity_still_revalidates_every_captured_fence() {
         for change in [
             "intent_revision",
@@ -11225,6 +11254,7 @@ mod native_observation_ipc_tests {
             "evidence_revision",
             "native_import_revision",
             "recovery_attempt_id",
+            "stop_intent",
             "reply_incarnation",
             "unchanged",
         ] {
@@ -11241,14 +11271,18 @@ mod native_observation_ipc_tests {
         let registry = Registry::open(dir.path().join("registry"), None).unwrap();
         let soul = SoulId::new();
         let old = crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
-        let runtime = dir.path().join("host");
-        std::fs::create_dir(&runtime).unwrap();
+        let runtime = dir.path().join("runtime").join(old.incarnation_id.as_str());
+        std::fs::create_dir_all(&runtime).unwrap();
         std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
         Connection::open(registry.database_path())
             .unwrap()
             .execute(
-                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
-                params![runtime.to_string_lossy(), old.incarnation_id.as_str()],
+                "UPDATE incarnations SET runtime_dir=?1,terminal_spec=?2 WHERE incarnation_id=?3",
+                params![runtime.to_string_lossy(), serde_json::json!({
+                    "terminalId":"terminal-old", "streamId":"epoch-old", "mode":"shell", "program":"/bin/sh",
+                    "cwd":"/synthetic", "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24,
+                    "projectKey":"synthetic", "workspacePath":"/synthetic"
+                }).to_string(), old.incarnation_id.as_str()],
             )
             .unwrap();
         let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
@@ -11258,8 +11292,9 @@ mod native_observation_ipc_tests {
             .unwrap()
             .requested_limits;
         let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
-        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let (pending_tx, mut pending_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut release_tx = Some(release_tx);
         let responder = tokio::spawn(async move {
             let boot = HostBootId::new();
             let (mut hello, _) = listener.accept().await.unwrap();
@@ -11326,37 +11361,77 @@ mod native_observation_ipc_tests {
                         opencode_activity: None,
                         stream_epoch: "epoch-old".into(),
                         retained_from_seq: 0,
-                        head_seq: 0,
+                        head_seq: 4,
                         reset_required: false,
                         truncated: false,
                         exited: false,
                         exit_code: None,
                         native_session_id,
-                        frames: vec![],
+                        frames: vec![freshell_runtime_protocol::RuntimeOutputFrame {
+                            terminal_id: "terminal-old".into(),
+                            stream_epoch: "epoch-old".into(),
+                            seq_start: 0,
+                            seq_end: 4,
+                            data: "live".into(),
+                        }],
                     })),
                 },
             )
             .await
             .unwrap();
         });
-        let read = {
+        let mut responder = Some(responder);
+        let settling_lifecycle = supervisor.lifecycle_lock(&soul).await;
+        let settling_guard = if change == "settled_recovery" {
+            let guard = settling_lifecycle.lock().await;
+            reserve_output_reattach(&registry, &soul).await;
+            Some(guard)
+        } else {
+            None
+        };
+        let mut read = {
             let supervisor = supervisor.clone();
             let soul = soul.clone();
             tokio::spawn(async move { supervisor.terminal_read_output(soul, 0, 4096, None).await })
         };
-        pending_rx.await.unwrap();
+        if let Some(guard) = settling_guard {
+            // Old code can reach the host with the temporary reservation in
+            // its captured fence. Correct capture waits for this lifecycle
+            // operation; either path must finish with the same valid output.
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut pending_rx).await;
+            settle_output_reattach(&registry, &soul, &old.incarnation_id).await;
+            drop(guard);
+        } else {
+            pending_rx.await.unwrap();
+        }
         let lifecycle = supervisor.lifecycle_lock(&soul).await;
         let replacement_guard =
             tokio::time::timeout(Duration::from_millis(250), lifecycle.lock()).await;
         let replacement_was_unblocked = replacement_guard.is_ok();
         if let Ok(_guard) = replacement_guard {
-            if change == "incarnation" {
+            if change == "settled_recovery_after_read" {
+                reserve_output_reattach(&registry, &soul).await;
+                release_tx.take().unwrap().send(()).unwrap();
+                responder.take().unwrap().await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut read)
+                        .await
+                        .is_err(),
+                    "a completed host reply must await lifecycle settlement before validation"
+                );
+                settle_output_reattach(&registry, &soul, &old.incarnation_id).await;
+            } else if change == "stop_intent" {
+                registry.begin_stop(soul.clone()).await.unwrap();
+            } else if change == "incarnation" {
                 registry
                     .mark_stop_outcome(old.incarnation_id.clone(), StopOutcome::VerifiedEmpty)
                     .await
                     .unwrap();
                 crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
-            } else if change != "unchanged" && change != "reply_incarnation" {
+            } else if !matches!(
+                change,
+                "unchanged" | "reply_incarnation" | "settled_recovery"
+            ) {
                 let update = match change {
                     "intent_revision" => "intent_revision=intent_revision+1",
                     "identity_revision" => "identity_revision=identity_revision+1",
@@ -11374,22 +11449,37 @@ mod native_observation_ipc_tests {
                     .unwrap();
             }
         }
-        release_tx.send(()).unwrap();
+        if let Some(release) = release_tx {
+            release.send(()).unwrap();
+        }
         let result = tokio::time::timeout(Duration::from_secs(5), read)
             .await
             .unwrap()
             .unwrap();
-        responder.await.unwrap();
+        if let Some(responder) = responder {
+            responder.await.unwrap();
+        }
         assert!(
             replacement_was_unblocked,
             "read-only host IO must not retain lifecycle custody (hello={stall_hello})"
         );
-        if change == "unchanged" {
+        if matches!(
+            change,
+            "unchanged" | "settled_recovery" | "settled_recovery_after_read"
+        ) {
             let output = result.unwrap();
             assert_eq!(output.incarnation_id, old.incarnation_id);
             assert_eq!(output.stream_epoch, "epoch-old");
+            assert_eq!(output.head_seq, 4);
+            assert_eq!(output.frames.len(), 1);
+            assert_eq!(output.frames[0].data, "live");
+            assert_eq!(output.frames[0].seq_end, 4);
         } else {
-            assert!(result.is_err(), "changed {change} output must be refused");
+            assert_eq!(
+                result.unwrap_err().code,
+                RuntimeErrorCode::OwnershipMismatch,
+                "changed {change} output must be refused after actual host IPC"
+            );
         }
         assert_eq!(
             registry
@@ -11402,6 +11492,32 @@ mod native_observation_ipc_tests {
         );
     }
 
+    async fn reserve_output_reattach(registry: &Registry, soul: &SoulId) {
+        let before = registry.recovery_context(soul.clone()).await.unwrap();
+        let retry = registry
+            .reserve_due_recovery_retry(soul.clone(), before.intent_revision, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retry.reserved_attempt_id.is_some());
+    }
+
+    async fn settle_output_reattach(
+        registry: &Registry,
+        soul: &SoulId,
+        incarnation: &IncarnationId,
+    ) {
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        assert!(context.recovery_attempt_id.is_some());
+        registry
+            .mark_recovery_live(soul.clone(), incarnation.clone(), context.write_fence())
+            .await
+            .unwrap();
+        let settled = registry.recovery_context(soul.clone()).await.unwrap();
+        assert!(settled.recovery_attempt_id.is_none());
+        assert_eq!(settled.prior_handle.incarnation_id(), incarnation);
+    }
+
     #[tokio::test]
     async fn delayed_terminal_ipc_cannot_reverse_identity_or_bind_an_old_incarnation() {
         for replace_incarnation in [false, true] {
@@ -11410,13 +11526,20 @@ mod native_observation_ipc_tests {
             let soul = SoulId::new();
             let prepared =
                 crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
-            let runtime = dir.path().join("host");
-            std::fs::create_dir(&runtime).unwrap();
+            let runtime = dir
+                .path()
+                .join("runtime")
+                .join(prepared.incarnation_id.as_str());
+            std::fs::create_dir_all(&runtime).unwrap();
             std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
             let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
             conn.execute(
-                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
-                params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+                "UPDATE incarnations SET runtime_dir=?1,terminal_spec=?2 WHERE incarnation_id=?3",
+                params![runtime.to_string_lossy(), serde_json::json!({
+                    "terminalId":"terminal", "streamId":"stream", "mode":"shell", "program":"/bin/sh",
+                    "cwd":"/synthetic", "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24,
+                    "projectKey":"synthetic", "workspacePath":"/synthetic"
+                }).to_string(), prepared.incarnation_id.as_str()],
             )
             .unwrap();
             if !replace_incarnation {
