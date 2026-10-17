@@ -6,6 +6,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE_TAG=freshell-sandbox:latest
+CALLER_UID="$(id -u)"
+CALLER_GID="$(id -g)"
 FIXTURE="$(mktemp -d -t freshell-sandbox-startup.XXXXXXXX)"
 export FRESHELL_SANDBOX_CACHE_PREFIX="freshell-startup-${FIXTURE##*.}"
 CACHE_VOLUMES=()
@@ -17,6 +19,15 @@ cleanup() {
   rm -rf "${FIXTURE}"
 }
 trap cleanup EXIT
+
+assert_fixture_ownership() {
+  local foreign_entry
+  foreign_entry="$(find "${FIXTURE}" \( ! -uid "${CALLER_UID}" -o ! -gid "${CALLER_GID}" \) -printf '%p (%U:%G)\n' -quit)"
+  if [ -n "${foreign_entry}" ]; then
+    echo "FAIL: fixture preparation changed caller ownership: ${foreign_entry}" >&2
+    exit 1
+  fi
+}
 
 docker image inspect "${IMAGE_TAG}" >/dev/null
 bash "${REPO_ROOT}/scripts/test/sandbox-readonly-root.test.sh"
@@ -47,11 +58,25 @@ fn dependency_is_available_offline() {
 }
 RUST
 
+# Match the caller's bind-mount ownership inside this daemon's user namespace.
+# In rootless Docker the host caller maps to container 0, while a rootful
+# daemon preserves the host UID/GID. The probe cannot write the fixture.
+FIXTURE_CONTAINER_OWNER="$(docker run --rm --network none --user sandbox \
+  --cap-drop ALL --security-opt no-new-privileges --entrypoint stat \
+  -v "${FIXTURE}:/fixture:ro" "${IMAGE_TAG}" -c '%u:%g' /fixture)"
+
 # Lock generation is separate from the empty caches given to the wrapper.
-docker run --rm --network freshell-sandbox --entrypoint bash \
-  -v "${FIXTURE}:/fixture" "${IMAGE_TAG}" \
-  -c 'cd /fixture && pnpm install --lockfile-only && cargo generate-lockfile'
-chmod -R a+rX "${FIXTURE}"
+# Bypassing the entrypoint requires an explicit owner and writable, private
+# package/cache locations; otherwise a rootful daemon leaves root-owned locks.
+generate_fixture_locks() {
+  docker run --rm --network freshell-sandbox --entrypoint bash \
+    --user "${FIXTURE_CONTAINER_OWNER}" --cap-drop ALL --security-opt no-new-privileges \
+    -e HOME=/tmp -e CARGO_HOME=/tmp/cargo -e npm_config_store_dir=/tmp/pnpm-store \
+    -v "${FIXTURE}:/fixture" --workdir /fixture "${IMAGE_TAG}" -euc "$1"
+  assert_fixture_ownership
+  chmod -R a+rX "${FIXTURE}"
+}
+generate_fixture_locks 'pnpm install --lockfile-only && cargo generate-lockfile'
 
 cat >"${FIXTURE}/check-runtime.sh" <<'SH'
 #!/usr/bin/env bash
@@ -98,10 +123,7 @@ run_runtime 'test -f node_modules/reuse-marker && bash check-runtime.sh 2.1.3'
 echo 'PASS: warm dependencies are reused'
 
 write_node_manifest 2.1.2
-docker run --rm --network freshell-sandbox --entrypoint bash \
-  -v "${FIXTURE}:/fixture" "${IMAGE_TAG}" \
-  -c 'cd /fixture && pnpm install --lockfile-only'
-chmod -R a+rX "${FIXTURE}"
+generate_fixture_locks 'pnpm install --lockfile-only'
 run_runtime 'test ! -e node_modules/reuse-marker && bash check-runtime.sh 2.1.2'
 echo 'PASS: stale dependencies are refreshed before restricted execution'
 
@@ -126,4 +148,5 @@ write_node_manifest 2.1.2
 STATUS=0
 run_runtime 'exit 23' || STATUS=$?
 test "${STATUS}" -eq 23
+assert_fixture_ownership
 echo 'PASS: caller exit status is preserved'
