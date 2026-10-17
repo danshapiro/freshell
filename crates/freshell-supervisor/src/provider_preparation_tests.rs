@@ -24,6 +24,10 @@ struct Daemon {
     recovery_probe_available: bool,
     recovery_probe_gate: Option<Arc<RecoveryProbeGate>>,
     seeded_host: Option<(HostBootId, NativeIdentityLaunch)>,
+    unsettled_replacement_gate: Option<Arc<RecoveryProbeGate>>,
+    cleanup_failures: usize,
+    cleanup_owners: Vec<IncarnationId>,
+    termination_unavailable: bool,
 }
 #[derive(Default)]
 struct RecoveryProbeGate {
@@ -351,7 +355,21 @@ impl RuntimeBackend for Backend {
     ) -> Result<(), BackendError> {
         let mut state = self.0.lock().unwrap();
         assert!(!state.running.contains(handle.incarnation_id()));
+        if let Some(owner) = state.publishers.get(&generation(handle)) {
+            assert_eq!(
+                owner,
+                handle.incarnation_id(),
+                "cleanup must retain exact publisher ownership"
+            );
+        }
+        state.cleanup_owners.push(handle.incarnation_id().clone());
         state.events.push(format!("discard:{}", generation(handle)));
+        if state.cleanup_failures > 0 {
+            state.cleanup_failures -= 1;
+            return Err(BackendError::Unavailable(
+                "synthetic cleanup transient".into(),
+            ));
+        }
         state.generations.remove(&generation(handle));
         state.publishers.remove(&generation(handle));
         Ok(())
@@ -410,6 +428,32 @@ impl RuntimeBackend for Backend {
         Ok(())
     }
     async fn inspect(&self, h: &OwnedRuntimeHandle) -> Result<BackendInspection, BackendError> {
+        let gate = {
+            let mut state = self.0.lock().unwrap();
+            if state.running.contains(h.incarnation_id()) && generation(h) == "grant-2" {
+                state.unsettled_replacement_gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            {
+                let conn = rusqlite::Connection::open(self.1.join("runtime.sqlite3")).unwrap();
+                let running: bool = conn
+                    .query_row(
+                        "SELECT launch_state='running' FROM incarnations WHERE incarnation_id=?1",
+                        [h.incarnation_id().as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    running,
+                    "interrupt only after the replacement is durably RUNNING"
+                );
+            }
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         Ok(BackendInspection {
             state: if self.0.lock().unwrap().running.contains(h.incarnation_id()) {
                 BackendRuntimeState::Running
@@ -421,6 +465,11 @@ impl RuntimeBackend for Backend {
     }
     async fn request_stop(&self, handle: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
         let mut state = self.0.lock().unwrap();
+        if state.termination_unavailable {
+            return Err(BackendError::Unavailable(
+                "synthetic termination unavailable".into(),
+            ));
+        }
         assert!(
             !state.consumed_rejection,
             "healthy or consumed retry must not stop a workload"
@@ -435,6 +484,11 @@ impl RuntimeBackend for Backend {
         panic!("healthy retry must not stop a workload")
     }
     async fn verify_empty(&self, h: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+        if self.0.lock().unwrap().termination_unavailable {
+            return Err(BackendError::Unavailable(
+                "synthetic emptiness unavailable".into(),
+            ));
+        }
         Ok(!self.0.lock().unwrap().running.contains(h.incarnation_id()))
     }
     async fn list_known(
@@ -755,6 +809,11 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_completion_recovers_running_unsettled_replacement_on_fresh_startup() {
+    Box::pin(provider_completion_fixture("unsettled")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_replacement_replays_preparation_into_next_incarnation_and_commits() {
     const CHILD: &str = "FRESHELL_PROVIDER_HANDOFF_TIMEOUT_CHILD";
     if std::env::var(CHILD).as_deref() != Ok("1") {
@@ -770,9 +829,12 @@ async fn failed_replacement_replays_preparation_into_next_incarnation_and_commit
         return;
     }
     Box::pin(provider_completion_fixture("grant")).await;
+    Box::pin(provider_completion_fixture("cleanup")).await;
 }
 
 async fn provider_completion_fixture(failure: &'static str) {
+    let interrupted_settlement = failure == "unsettled";
+    let transient_cleanup_failure = failure == "cleanup";
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("registry");
     let registry = Registry::open(&root, None).unwrap();
@@ -918,7 +980,15 @@ async fn provider_completion_fixture(failure: &'static str) {
         .unwrap()
         .running
         .remove(&first.view.incarnation_id);
-    daemon.lock().unwrap().fail = Some(failure);
+    let failed_grant = matches!(failure, "grant" | "cleanup");
+    daemon.lock().unwrap().fail = Some(if failed_grant { "grant" } else { failure });
+    let unsettled_gate = Arc::new(RecoveryProbeGate::default());
+    if interrupted_settlement {
+        daemon.lock().unwrap().unsettled_replacement_gate = Some(unsettled_gate.clone());
+    }
+    if transient_cleanup_failure {
+        daemon.lock().unwrap().cleanup_failures = 2;
+    }
     daemon.lock().unwrap().recovery_probe_available = true;
     let request = || RecoverRequest {
         soul_id: soul.clone(),
@@ -926,17 +996,39 @@ async fn provider_completion_fixture(failure: &'static str) {
         expected_intent_revision: None,
         expected_control_epoch: None,
     };
-    let control = control_listener(&supervisor).await;
-    let failed = control_recover(&supervisor.config.control_socket_path, request()).await;
-    if failure == "grant" {
-        assert_eq!(failed.unwrap().outcome, RecoveryOutcome::Blocked);
+    let mut control = control_listener(&supervisor).await;
+    if interrupted_settlement {
+        let socket = supervisor.config.control_socket_path.clone();
+        let request = request();
+        let client = tokio::spawn(async move { control_recover(&socket, request).await });
+        tokio::time::timeout(Duration::from_secs(5), unsettled_gate.entered.notified())
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(context.recovery_state, RecoveryState::Recovering);
+        let conn = rusqlite::Connection::open(registry.database_path()).unwrap();
+        let (pending, unfinished): (bool, bool) = conn.query_row("SELECT i.provider_preparation_pending,a.finished_at IS NULL AND a.verdict='replacement_prepared' FROM incarnations i JOIN recovery_attempts a ON a.attempt_id=i.recovery_attempt_id WHERE i.incarnation_id=?1", [context.prior_handle.incarnation_id().as_str()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert!(!pending);
+        assert!(unfinished);
+        drop(conn);
+        // Dropping the authenticated dispatch cancels its recovery future at
+        // the real post-launch inspection boundary, before registry settlement.
+        control.abort();
+        let _ = (&mut control).await;
+        client.abort();
+        let _ = client.await;
     } else {
-        assert!(
-            failed.is_err(),
-            "injected completion failure must reach actual recovery owner: {failed:?}"
-        );
+        let failed = control_recover(&supervisor.config.control_socket_path, request()).await;
+        if failed_grant {
+            assert_eq!(failed.unwrap().outcome, RecoveryOutcome::Blocked);
+        } else {
+            assert!(
+                failed.is_err(),
+                "injected completion failure must reach actual recovery owner: {failed:?}"
+            );
+        }
     }
-    if failure == "grant" {
+    if failed_grant {
         let failed = registry
             .recovery_context(soul.clone())
             .await
@@ -947,6 +1039,65 @@ async fn provider_completion_fixture(failure: &'static str) {
             .unwrap()
             .running
             .contains(failed.incarnation_id()));
+        if transient_cleanup_failure {
+            assert_eq!(
+                daemon.lock().unwrap().cleanup_owners,
+                vec![failed.incarnation_id().clone()]
+            );
+            assert_eq!(
+                daemon.lock().unwrap().publishers.get("grant-2"),
+                Some(failed.incarnation_id())
+            );
+            let events_before = daemon.lock().unwrap().events.clone();
+            daemon.lock().unwrap().termination_unavailable = true;
+            let refused = control_recover(
+                &supervisor.config.control_socket_path,
+                RecoverRequest {
+                    trigger: RecoveryTrigger::ManualRetry,
+                    ..request()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused.outcome, RecoveryOutcome::Blocked);
+            assert_eq!(
+                daemon.lock().unwrap().events,
+                events_before,
+                "unverified termination cannot discard inputs or create a successor"
+            );
+            assert_eq!(
+                daemon.lock().unwrap().cleanup_owners,
+                vec![failed.incarnation_id().clone()]
+            );
+            daemon.lock().unwrap().termination_unavailable = false;
+            let refused = control_recover(
+                &supervisor.config.control_socket_path,
+                RecoverRequest {
+                    trigger: RecoveryTrigger::ManualRetry,
+                    ..request()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused.outcome, RecoveryOutcome::Blocked);
+            assert_eq!(
+                daemon.lock().unwrap().cleanup_owners,
+                vec![
+                    failed.incarnation_id().clone(),
+                    failed.incarnation_id().clone()
+                ]
+            );
+            assert_eq!(
+                daemon.lock().unwrap().publishers.get("grant-2"),
+                Some(failed.incarnation_id()),
+                "another cleanup error must preserve the failed publisher for a later retry"
+            );
+            assert_eq!(
+                daemon.lock().unwrap().events.last().unwrap(),
+                "discard:grant-2",
+                "cleanup failure must refuse before successor publication"
+            );
+        }
         let retried = control_recover(
             &supervisor.config.control_socket_path,
             RecoverRequest {
@@ -967,8 +1118,23 @@ async fn provider_completion_fixture(failure: &'static str) {
             generation(&registry.active_handle_for_soul(soul.clone()).await.unwrap()),
             generation(&failed)
         );
+        if transient_cleanup_failure {
+            assert_eq!(
+                daemon.lock().unwrap().cleanup_owners,
+                vec![
+                    failed.incarnation_id().clone(),
+                    failed.incarnation_id().clone(),
+                    failed.incarnation_id().clone()
+                ],
+                "cleanup must retry against the failed owner before publication moves"
+            );
+        }
     }
-    let live = registry.active_handle_for_soul(soul.clone()).await.unwrap();
+    let live = registry
+        .recovery_context(soul.clone())
+        .await
+        .unwrap()
+        .prior_handle;
     let view = registry
         .inventory()
         .await
@@ -977,15 +1143,24 @@ async fn provider_completion_fixture(failure: &'static str) {
         .find(|v| v.incarnation_id == *live.incarnation_id())
         .unwrap();
     assert_eq!(view.launch_state, LaunchState::Running);
-    assert_eq!(view.recovery_state, RecoveryState::Live);
+    assert_eq!(
+        view.recovery_state,
+        if interrupted_settlement {
+            RecoveryState::Recovering
+        } else {
+            RecoveryState::Live
+        }
+    );
     assert_eq!(view.native_session_id.as_deref(), Some("ses_exact"));
     assert_eq!(
         daemon.lock().unwrap().generations.len(),
-        if failure == "grant" { 1 } else { 2 }
+        if failed_grant { 1 } else { 2 }
     );
     assert_eq!(daemon.lock().unwrap().grants, 2);
-    control.abort();
-    let _ = control.await;
+    if !interrupted_settlement {
+        control.abort();
+        let _ = control.await;
+    }
     std::fs::remove_file(&supervisor.config.control_socket_path).unwrap();
     drop(supervisor);
     drop(registry);
@@ -1014,6 +1189,21 @@ async fn provider_completion_fixture(failure: &'static str) {
         daemon.lock().unwrap().publishers.is_empty(),
         "accepted B publisher must be released"
     );
+    for event in [
+        "commit:grant-2",
+        "release:grant-2",
+        "retire:grant-2:grant-1",
+    ] {
+        assert!(
+            daemon
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|observed| observed == event),
+            "healthy reopen must finish {event}"
+        );
+    }
     let events_before = daemon.lock().unwrap().events.len();
     let control = control_listener(&cold).await;
     assert_eq!(
@@ -1046,6 +1236,14 @@ async fn provider_completion_fixture(failure: &'static str) {
         BTreeSet::from(["grant-3".into()])
     );
     assert_eq!(daemon.lock().unwrap().grants, 3);
+    assert!(
+        !daemon
+            .lock()
+            .unwrap()
+            .cleanup_owners
+            .contains(live.incarnation_id()),
+        "an accepted earlier generation must use retirement, never failed-start cleanup"
+    );
     control.abort();
     let _ = control.await;
     drop(cold);

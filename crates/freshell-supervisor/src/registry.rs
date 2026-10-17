@@ -1433,6 +1433,25 @@ impl Registry {
         .await
     }
 
+    pub(crate) async fn is_stopped_unaccepted_replacement(
+        &self,
+        incarnation: IncarnationId,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |conn| {
+            let soul: Option<String> = conn.query_row(
+                "SELECT soul_id FROM incarnations WHERE incarnation_id=?1 AND prior_incarnation_id IS NOT NULL AND launch_state='stopped' AND cleanup_state='verified_empty'",
+                [incarnation.as_str()], |row| row.get(0),
+            ).optional()?;
+            let Some(soul) = soul else { return Ok(false); };
+            let soul = SoulId::parse(soul)
+                .map_err(|_| RegistryError::Integrity("invalid failed replacement soul".into()))?;
+            // Acceptance survives later attempts overwriting the incarnation's
+            // attempt link. Never classify the retained conversation as a
+            // disposable failed start from its current launch state alone.
+            Ok(load_retained_incarnation(&conn, &soul)? != incarnation)
+        }).await
+    }
+
     pub async fn active_handle_for_soul(
         &self,
         soul_id: SoulId,
@@ -3690,7 +3709,11 @@ impl Registry {
             validate_live_native_observation(&tx,&soul_id,&incarnation_id)?;
             if let Some(attempt) = fence.recovery_attempt_id.as_ref() {
                 let replacement: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM recovery_attempts a JOIN incarnations i ON i.recovery_attempt_id=a.attempt_id WHERE a.attempt_id=?1 AND a.verdict='replacement_prepared' AND a.finished_at IS NULL AND i.incarnation_id=?2 AND i.prior_incarnation_id=a.prior_incarnation_id)", params![attempt.as_str(),incarnation_id.as_str()],|r|r.get(0))?;
-                if replacement { charge_successful_recovery(&tx, &soul_id, now_millis())?; }
+                if replacement {
+                    charge_successful_recovery(&tx, &soul_id, now_millis())?;
+                    tx.execute("UPDATE incarnations SET provider_preparation_pending=1 WHERE incarnation_id=?1", [incarnation_id.as_str()])?;
+                    tx.execute("UPDATE recovery_attempts SET evidence_ref=?1 WHERE attempt_id=?2", params![serde_json::to_string(&vec![format!("{ACCEPTED_INCARNATION_REF}{}", incarnation_id.as_str())])?, attempt.as_str()])?;
+                }
                 tx.execute("UPDATE recovery_attempts SET verdict=?1,finished_at=?2 WHERE attempt_id=?3 AND finished_at IS NULL",params![if replacement {"succeeded"} else {"reattached"},now_millis(),attempt.as_str()])?;
                 settle_recovery_retry_tx(&tx, &soul_id, fence.intent_revision, attempt, now_millis(), RetrySettlement::Recovered)?;
             }
