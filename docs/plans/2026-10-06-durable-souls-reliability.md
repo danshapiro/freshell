@@ -17,6 +17,7 @@ Fix all known durable-souls problems, complete ordinary use in the four selected
 - Use the easiest already authorized Codex account path and existing OneCLI references. Do not change shared credentials without separate approval.
 - Use actual error diagnostics to investigate failures. Protect secret values; the earlier blanket restriction on reading diagnostic output was not a user requirement.
 - For Stage 5 Fresh Eyes, use the runner's `--gpt` option because other models are unavailable; this is the user's explicit exception to the different-model-family preference.
+- For the complete Stage 5 review, the independent GPT reviewer may use up to three independent GPT helpers and produce one integrated verdict. This is an exception only to the prohibition on secondary reviewers; the severity rubric, review limit and independence requirements remain unchanged.
 - Do not make changes to the rubric while its example wording remains under discussion.
 - The user approved local execution for the selected live specs because they are excluded from Cloud; keep the configured backends for other checks.
 - Review the entire change, including recovery behavior and integration between components. Track actual file coverage and review subsequent repairs; do not count a failed reviewer launch as code-review evidence.
