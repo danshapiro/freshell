@@ -2933,10 +2933,14 @@ impl CapabilityStore {
         let Some((id, pending_endpoint, prior_ids)) = candidate else {
             return Ok(None);
         };
+        // Recovery follows the failed replacement once it has been published
+        // in the registry. Its context names this pending generation itself.
         if pending_endpoint != endpoint
             || prior
                 .and_then(|context| context.mcp_capability.as_ref())
-                .is_some_and(|reference| !prior_ids.contains(&reference.grant_id))
+                .is_some_and(|reference| {
+                    reference.grant_id != id && !prior_ids.contains(&reference.grant_id)
+                })
         {
             return Err(
                 "pending complete provider preparation requires exact ownership reconciliation"
@@ -9731,6 +9735,20 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         let context = read_prepared_context(&directory, &prior).unwrap();
         assert!(context.prepared_inputs.is_some());
         let prior_inputs = context.prepared_inputs.clone().unwrap();
+        let endpoint = "http://host.docker.internal:4000";
+        let initial_incarnation = IncarnationId::new();
+        store
+            .activate(
+                &prior.grant_id,
+                soul.clone(),
+                initial_incarnation.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&prior.grant_id, &soul, &initial_incarnation, &directory)
+            .unwrap();
         std::fs::rename(&home, owned.path().join("unavailable-home")).unwrap();
         let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,"provider":"amplifier","workspace":workspace,"cwd":workspace,"priorContext":context,"providerSecretReferences":[]})).unwrap();
         let client = freshell_runtime_client::RuntimeClient::new(
@@ -9803,6 +9821,61 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         assert_eq!(inputs.config_binds, prior_inputs.config_binds);
         assert_eq!(inputs.resource_mounts, prior_inputs.resource_mounts);
         assert_ne!(inputs.generation_id, prior_inputs.generation_id);
+        // A dispatched replacement can fail after binding its preparation.
+        // Registry recovery then follows that failed incarnation and supplies
+        // its accepted context, whose capability is the pending generation.
+        let pending_id = ready
+            .provider_launch_context
+            .mcp_capability
+            .as_ref()
+            .unwrap()
+            .grant_id
+            .clone();
+        store
+            .activate(
+                &pending_id,
+                soul.clone(),
+                IncarnationId::new(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        let retry_callback = |context: &ProviderLaunchContext| {
+            serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control",
+                "soulId":soul,"provider":"amplifier","workspace":workspace,"cwd":workspace,
+                "priorContext":context,"providerSecretReferences":ready.provider_secret_references}))
+                .unwrap()
+        };
+        let mut unrelated = ready.provider_launch_context.clone();
+        unrelated.mcp_capability.as_mut().unwrap().grant_id =
+            format!("grant-{}", uuid::Uuid::new_v4());
+        assert!(apply_prepared_callback(
+            &retry_callback(&unrelated),
+            "fixture-control",
+            &store,
+            &directory,
+            endpoint,
+            &wrong,
+            &client,
+        )
+        .await
+        .unwrap_err()
+        .contains("exact ownership reconciliation"));
+        let retried = apply_prepared_callback(
+            &retry_callback(&ready.provider_launch_context),
+            "fixture-control",
+            &store,
+            &directory,
+            endpoint,
+            &wrong,
+            &client,
+        )
+        .await
+        .expect("failed replacement recovery must replay its own bound preparation without rescanning originals");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retried).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&repeated).unwrap()
+        );
         let projected = inputs
             .resource_mounts
             .iter()
@@ -9835,6 +9908,39 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         .err()
         .expect("changed retained manifest must block preparation")
         .contains("manifest changed"));
+        assert_eq!(
+            std::fs::read(
+                stage
+                    .join(&projected.stage_relative_path)
+                    .join("amplifier-local-0/resource")
+            )
+            .unwrap(),
+            b"retained-bundle-resource"
+        );
+        let successor = IncarnationId::new();
+        store
+            .activate(
+                &pending_id,
+                soul.clone(),
+                successor.clone(),
+                &directory,
+                endpoint,
+            )
+            .unwrap();
+        store
+            .commit_preparation(&pending_id, &soul, &successor, &directory)
+            .unwrap();
+        assert!(
+            !prior_stage.exists(),
+            "acceptance retires only the prior inputs"
+        );
+        assert!(
+            stage.is_dir(),
+            "the accepted replacement inputs remain available"
+        );
+        let accepted = read_stored_capability(&directory, &pending_id).unwrap();
+        assert_eq!(accepted.incarnation_id, Some(successor));
+        assert!(accepted.preparation.unwrap().phase == InputPreparationPhase::Committed);
         assert_eq!(
             std::fs::read(
                 stage
