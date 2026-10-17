@@ -194,7 +194,7 @@ describe('browser selection non-vacuity', () => {
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
   })
 
-  it('creates Rust fixtures and selects the supported cloud projects', async () => {
+  it('creates Rust fixtures and resolves the supported cloud projects', async () => {
     const server = await createE2eServerHandle({})
     expect(server).toBeInstanceOf(RustServer)
     expect(typeof server.start).toBe('function')
@@ -214,7 +214,11 @@ describe('browser selection non-vacuity', () => {
     expect(cloudProjects.map((project) => project.name)).toEqual(['chromium'])
     expect(new Set(CLOUD_SKIP_SPECS).size).toBe(CLOUD_SKIP_SPECS.length)
     for (const localOnly of LOCAL_ONLY_SPECS) expect(CLOUD_SKIP_SPECS).toContain(localOnly.spec)
+  })
 
+  // Each discovery launches and joins a real Playwright child. Keep the
+  // independent selection contracts within their own test deadline.
+  it('discovers cloud cases while excluding local-only specs and titles', () => {
     const cloud = listedProjects(cleanEnvironment(), cloudConfig)
     expect(cloud.labels).toEqual(['chromium'])
     expect(cloud.output).toContain('[chromium]')
@@ -232,7 +236,9 @@ describe('browser selection non-vacuity', () => {
     for (const title of CLOUD_SKIP_TITLES) {
       expect(cloud.output, `cloud lane must not list excluded title: ${title.source}`).not.toMatch(title)
     }
+  })
 
+  it('intersects mixed positional file selectors with cloud exclusions', () => {
     // Explicit positional file args are an INTERSECTION with testIgnore,
     // never a bypass (Playwright 1.58.2 cliFileMatcher semantics): a mixed
     // focused invocation must keep its cloud-legal member and silently drop
@@ -245,7 +251,9 @@ describe('browser selection non-vacuity', () => {
     expect(mixed.output).toContain('host-stats-pane.spec.ts')
     expect(mixed.output).not.toContain('truly-idle-alerting')
     expect(mixed.files).toBe(1)
+  })
 
+  it('rejects positional file selectors containing only cloud exclusions', () => {
     // An ALL-skip focused invocation fails LOUDLY (exit 1, "No tests
     // found") instead of silently reading as a green zero-test run — a
     // vacuous focused cloud proof can never masquerade as coverage.
@@ -258,7 +266,9 @@ describe('browser selection non-vacuity', () => {
     ], { cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8' })
     expect(allSkip.status).toBe(1)
     expect(`${allSkip.stdout}\n${allSkip.stderr}`).toContain('No tests found')
+  })
 
+  it('discovers the supported migrated Rust browser cases', () => {
     const migrated = listedProjects(cleanEnvironment(), cloudConfig, [
       'test/e2e-browser/specs/server-build-mismatch-rust.spec.ts',
       'test/e2e-browser/specs/tabs-client-retire.spec.ts',
