@@ -800,7 +800,7 @@ pub fn translate_serve_event(event: &ParsedServeEvent) -> Option<OpencodeLaneEve
             // "MessageAbortedError", always BEFORE idle. Error-less
             // message.updated is routine message churn -> None. Both abort
             // signals feed the same SessionError lane event (D1).
-            let session_id = props.get("sessionID")?.as_str()?.to_string();
+            let session_id = event.session_id.clone()?;
             let error_name = props
                 .get("info")?
                 .get("error")?
