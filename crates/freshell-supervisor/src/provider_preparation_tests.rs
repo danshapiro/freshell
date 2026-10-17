@@ -6,7 +6,10 @@ use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
 use freshell_runtime_protocol::*;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc, Mutex,
+};
 use tokio::net::UnixListener;
 
 #[derive(Default)]
@@ -815,29 +818,192 @@ async fn provider_completion_recovers_running_unsettled_replacement_on_fresh_sta
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_replacement_replays_preparation_into_next_incarnation_and_commits() {
-    const CHILD: &str = "FRESHELL_PROVIDER_HANDOFF_TIMEOUT_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        let output = tokio::task::spawn_blocking(|| std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "service::provider_preparation_tests::failed_replacement_replays_preparation_into_next_incarnation_and_commits", "--nocapture"])
-            .env(CHILD, "1").env(HOST_COMMAND_TIMEOUT_ENV, "100").output().unwrap()).await.unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if handoff_timeout_child("service::provider_preparation_tests::failed_replacement_replays_preparation_into_next_incarnation_and_commits").await {
         return;
     }
     Box::pin(provider_completion_fixture("grant")).await;
     Box::pin(provider_completion_fixture("cleanup")).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_replacement_cleanup_preserves_automatic_retry_after_second_transient_failure() {
+    if handoff_timeout_child("service::provider_preparation_tests::failed_replacement_cleanup_preserves_automatic_retry_after_second_transient_failure").await {
+        return;
+    }
+    Box::pin(provider_completion_fixture("cleanup-automatic")).await;
+}
+
+async fn handoff_timeout_child(test_name: &'static str) -> bool {
+    const CHILD: &str = "FRESHELL_PROVIDER_HANDOFF_TIMEOUT_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD, "1")
+                .env(HOST_COMMAND_TIMEOUT_ENV, "100")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return true;
+    }
+    false
+}
+
+async fn automatic_provider_cleanup_retry(
+    supervisor: &Supervisor,
+    soul: &SoulId,
+    failed: &OwnedRuntimeHandle,
+    daemon: &Mutex<Daemon>,
+    clock: &AtomicI64,
+    intent_revision: u64,
+) -> IncarnationId {
+    let retry = supervisor
+        .registry
+        .recovery_retry(soul.clone(), intent_revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.attempt_count, 1);
+    assert_eq!(retry.next_due_at_ms, Some(2_000));
+    assert!(retry.reserved_attempt_id.is_none());
+    assert_eq!(
+        daemon.lock().unwrap().cleanup_owners,
+        vec![failed.incarnation_id().clone()]
+    );
+    assert_eq!(
+        daemon.lock().unwrap().publishers.get("grant-2"),
+        Some(failed.incarnation_id())
+    );
+
+    clock.store(2_000, Ordering::SeqCst);
+    // The production observer owns and joins each scheduled recovery task.
+    // Awaiting the pass proves settlement before inspecting its durable row.
+    Box::pin(supervisor.observe_once()).await.unwrap();
+    assert_eq!(
+        supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .recovery_state,
+        RecoveryState::Blocked
+    );
+    assert_eq!(
+        daemon.lock().unwrap().cleanup_owners,
+        vec![failed.incarnation_id().clone(); 2]
+    );
+    assert_eq!(
+        daemon.lock().unwrap().publishers.get("grant-2"),
+        Some(failed.incarnation_id()),
+        "another cleanup error must preserve the exact failed publisher"
+    );
+    assert_eq!(
+        daemon.lock().unwrap().events.last().unwrap(),
+        "discard:grant-2",
+        "cleanup failure must refuse before successor publication"
+    );
+
+    let retry = supervisor
+        .registry
+        .recovery_retry(soul.clone(), intent_revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retry.attempt_count, 2,
+        "the second cleanup failure must settle an actual reserved automatic attempt"
+    );
+    assert!(retry.reserved_attempt_id.is_none());
+    assert_eq!(
+        retry.next_due_at_ms,
+        Some(12_000),
+        "another transient cleanup failure must preserve its bounded automatic retry deadline"
+    );
+    assert_eq!(retry.last_reason, "backend_unavailable");
+    let events_before = daemon.lock().unwrap().events.clone();
+    clock.store(11_999, Ordering::SeqCst);
+    assert!(supervisor
+        .registry
+        .due_recovery_retries(11_999)
+        .await
+        .unwrap()
+        .is_empty());
+    Box::pin(supervisor.observe_once()).await.unwrap();
+    assert_eq!(
+        supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .recovery_state,
+        RecoveryState::Blocked
+    );
+    assert_eq!(
+        daemon.lock().unwrap().events,
+        events_before,
+        "scheduled recovery must wait for its persisted deadline"
+    );
+
+    clock.store(12_000, Ordering::SeqCst);
+    assert_eq!(
+        supervisor
+            .registry
+            .due_recovery_retries(12_000)
+            .await
+            .unwrap(),
+        vec![(soul.clone(), intent_revision)]
+    );
+    Box::pin(supervisor.observe_once()).await.unwrap();
+    let recovered = supervisor
+        .registry
+        .recovery_context(soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(recovered.recovery_state, RecoveryState::Live);
+    assert_eq!(
+        recovered.intent_revision, intent_revision,
+        "automatic recovery must not rearm intent through ManualRetry"
+    );
+    assert!(
+        supervisor
+            .registry
+            .recovery_retry(soul.clone(), intent_revision)
+            .await
+            .unwrap()
+            .is_none(),
+        "accepted scheduled recovery must settle its retry record"
+    );
+    let accepted = supervisor
+        .registry
+        .active_handle_for_soul(soul.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.incarnation_id(),
+        recovered.prior_handle.incarnation_id()
+    );
+    accepted.incarnation_id().clone()
+}
+
 async fn provider_completion_fixture(failure: &'static str) {
     let interrupted_settlement = failure == "unsettled";
-    let transient_cleanup_failure = failure == "cleanup";
+    let automatic_cleanup = failure == "cleanup-automatic";
+    let transient_cleanup_failure = matches!(failure, "cleanup" | "cleanup-automatic");
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("registry");
-    let registry = Registry::open(&root, None).unwrap();
+    let mut registry = Registry::open(&root, None).unwrap();
+    let clock = Arc::new(AtomicI64::new(0));
+    if automatic_cleanup {
+        registry.retry_clock = Some(clock.clone());
+    }
     let soul = SoulId::new();
     let daemon = Arc::new(Mutex::new(Daemon::default()));
     let callback = UnixListener::bind(temp.path().join("mcp.sock")).unwrap();
@@ -980,7 +1146,7 @@ async fn provider_completion_fixture(failure: &'static str) {
         .unwrap()
         .running
         .remove(&first.view.incarnation_id);
-    let failed_grant = matches!(failure, "grant" | "cleanup");
+    let failed_grant = failure == "grant" || transient_cleanup_failure;
     daemon.lock().unwrap().fail = Some(if failed_grant { "grant" } else { failure });
     let unsettled_gate = Arc::new(RecoveryProbeGate::default());
     if interrupted_settlement {
@@ -1039,7 +1205,7 @@ async fn provider_completion_fixture(failure: &'static str) {
             .unwrap()
             .running
             .contains(failed.incarnation_id()));
-        if transient_cleanup_failure {
+        if transient_cleanup_failure && !automatic_cleanup {
             assert_eq!(
                 daemon.lock().unwrap().cleanup_owners,
                 vec![failed.incarnation_id().clone()]
@@ -1098,22 +1264,35 @@ async fn provider_completion_fixture(failure: &'static str) {
                 "cleanup failure must refuse before successor publication"
             );
         }
-        let retried = control_recover(
-            &supervisor.config.control_socket_path,
-            RecoverRequest {
-                trigger: RecoveryTrigger::ManualRetry,
-                ..request()
-            },
-        )
-        .await
-        .expect("the retained preparation must pass the next incarnation's publisher boundary");
-        assert_eq!(
-            retried.outcome,
-            RecoveryOutcome::Replaced,
-            "{retried:?}; {:?}",
-            daemon.lock().unwrap().events
-        );
-        assert_ne!(&retried.view.incarnation_id, failed.incarnation_id());
+        let retried_incarnation = if automatic_cleanup {
+            Box::pin(automatic_provider_cleanup_retry(
+                &supervisor,
+                &soul,
+                &failed,
+                &daemon,
+                &clock,
+                first.view.intent_revision,
+            ))
+            .await
+        } else {
+            let retried = control_recover(
+                &supervisor.config.control_socket_path,
+                RecoverRequest {
+                    trigger: RecoveryTrigger::ManualRetry,
+                    ..request()
+                },
+            )
+            .await
+            .expect("the retained preparation must pass the next incarnation's publisher boundary");
+            assert_eq!(
+                retried.outcome,
+                RecoveryOutcome::Replaced,
+                "{retried:?}; {:?}",
+                daemon.lock().unwrap().events
+            );
+            retried.view.incarnation_id
+        };
+        assert_ne!(&retried_incarnation, failed.incarnation_id());
         assert_eq!(
             generation(&registry.active_handle_for_soul(soul.clone()).await.unwrap()),
             generation(&failed)
