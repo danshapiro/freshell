@@ -846,78 +846,69 @@ fn blocks_unknown_sqlite_schema_tables() {
     );
 }
 
-#[test]
-fn blocks_unrecognized_columns_and_migration_ids() {
-    let fixture = TestDir::new("unrecognized-ddl");
+fn assert_one_defect_blocks_export(label: &str, mutation: &str) {
+    let fixture = TestDir::new(label);
     let database = fixture.path().join("opencode.db");
     let source = create_synthetic_source(&database);
-    source
-        .execute_batch("ALTER TABLE session ADD COLUMN plugin_private TEXT;")
-        .unwrap();
-    let inventory = HostOpenCodeInventory::new(fixture.path().join("default.db"))
-        .with_channel_database(database.clone());
-    let schema_result = export_exact_session(
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+    export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(fixture.path().join("extract-schema")),
-    );
-    assert!(matches!(schema_result, Err(TransferError::Blocked(_))));
+        ExportOptions::new(fixture.path().join("valid-extract")),
+    )
+    .expect("fresh fixture exports before its one-defect mutation");
 
-    source
-        .execute(
-            "INSERT INTO migration (id, time_completed) VALUES ('20990101000000_future', 999)",
-            [],
-        )
-        .unwrap();
-    let migration_result = export_exact_session(
-        &inventory,
-        "ses_root",
-        ExportOptions::new(fixture.path().join("extract-migration")),
+    source.execute_batch(mutation).unwrap();
+    assert!(
+        matches!(
+            export_exact_session(
+                &inventory,
+                "ses_root",
+                ExportOptions::new(fixture.path().join("invalid-extract")),
+            ),
+            Err(TransferError::Blocked(_))
+        ),
+        "{label} must independently block export"
     );
-    assert!(matches!(migration_result, Err(TransferError::Blocked(_))));
+}
+
+#[test]
+fn blocks_unrecognized_columns_and_migration_ids() {
+    for (label, mutation) in [
+        (
+            "unrecognized-column",
+            "ALTER TABLE session ADD COLUMN plugin_private TEXT;",
+        ),
+        (
+            "unrecognized-migration",
+            "INSERT INTO migration (id, time_completed) VALUES ('20990101000000_future', 999);",
+        ),
+    ] {
+        assert_one_defect_blocks_export(label, mutation);
+    }
 }
 
 #[test]
 fn blocks_cross_owned_parts_and_session_workspace_links() {
-    let fixture = TestDir::new("cross-owned-edges");
-    let database = fixture.path().join("opencode.db");
-    let source = create_synthetic_source(&database);
-    source
-        .execute(
+    for (label, mutation) in [
+        (
+            "cross-owned-part",
             "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-             VALUES ('part_cross_owned', 'msg_ses_root', 'ses_unrelated', 50, 50, '{}')",
-            [],
-        )
-        .unwrap();
-    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
-        .with_channel_database(database.clone());
-    assert!(matches!(
-        export_exact_session(
-            &inventory,
-            "ses_root",
-            ExportOptions::new(fixture.path().join("cross-part-extract")),
+             VALUES ('part_cross_owned', 'msg_ses_root', 'ses_unrelated', 50, 50, '{}');",
         ),
-        Err(TransferError::Blocked(_))
-    ));
-
-    source
-        .execute_batch(
+        (
+            "cross-owned-workspace",
             "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
              VALUES ('prj_other', '/synthetic/other', 2, 2, '[]');
              INSERT INTO workspace (id, type, name, project_id, time_used)
              VALUES ('wrk_other', 'directory', 'other', 'prj_other', 2);
              UPDATE session SET project_id = 'prj_other', workspace_id = 'wrk_kept'
              WHERE id = 'ses_child';",
-        )
-        .unwrap();
-    assert!(matches!(
-        export_exact_session(
-            &inventory,
-            "ses_root",
-            ExportOptions::new(fixture.path().join("cross-workspace-extract")),
         ),
-        Err(TransferError::Blocked(_))
-    ));
+    ] {
+        assert_one_defect_blocks_export(label, mutation);
+    }
 }
 
 #[test]
