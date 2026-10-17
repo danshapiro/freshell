@@ -207,6 +207,12 @@ export type ClaudeCandidateAuthorization = InitialProviderVolumeAuthorization & 
   retained?: Pick<ClaudeCandidateAuthorization, 'generationId' | 'stageRoot' | 'configurationBinds' | 'resourceMounts'> & { attemptId: string }
 }
 
+function claudeGitCommonMounts(input: Pick<ClaudeCandidateAuthorization, 'workspacePath' | 'gitCommonDir'>): Record<string, any>[] {
+  return input.gitCommonDir && input.gitCommonDir !== input.workspacePath && !isStrictDescendant(input.gitCommonDir, input.workspacePath)
+    ? [{ Type: 'bind', Source: input.gitCommonDir, Target: input.gitCommonDir, ReadOnly: true }]
+    : []
+}
+
 function candidateVolumeName(input: ClaudeCandidateAuthorization): string {
   return `freshell-claude-candidate-${input.requestId}`
 }
@@ -255,14 +261,18 @@ export class RestrictedDockerBroker {
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
   authorizeClaudeCandidate(input: ClaudeCandidateAuthorization): void {
-    this.validateClaudeCandidateAuthorization(input)
+    this.registerClaudeCandidate(input)
+  }
+
+  private registerClaudeCandidate(input: ClaudeCandidateAuthorization, published = false): void {
+    this.validateClaudeCandidateAuthorization(input, published)
     const key = candidateVolumeName(input), previous = this.claudeCandidates.get(key)
     if (previous && JSON.stringify(previous) !== JSON.stringify(input)) throw new Error('Claude candidate request changed')
     if (!previous && this.claudeCandidates.size >= 6) throw new Error('closed Claude fixture exceeds its two routes and two replans')
     this.claudeCandidates.set(key, structuredClone(input))
   }
 
-  private validateClaudeCandidateAuthorization(input: ClaudeCandidateAuthorization): void {
+  private validateClaudeCandidateAuthorization(input: ClaudeCandidateAuthorization, published = false): void {
     const initial = this.initialProviderVolumes.get(input.providerVolumeName)
     const uuid = (value: string) => /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value)
     const fixture = path.dirname(this.policy.runtimeRootPrefix)
@@ -272,6 +282,10 @@ export class RestrictedDockerBroker {
       && (value === input.workspacePath || isStrictDescendant(value, input.workspacePath)
         || mappedProviderDestination(value)
         || this.isAllowedProviderInputPath(value)
+        // The owned controller publication already selected and froze ordinary
+        // ancestor policy files and their imports. These are exact container
+        // destinations; their sources remain generation-owned stage units.
+        || (published && !value.startsWith('/home/freshell/provider/'))
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const unit = (value: string, prefix: string, file = false) => typeof value === 'string'
       && new RegExp(`^${prefix}/[a-zA-Z0-9_-]{1,128}${file ? '/source' : ''}$`).test(value)
@@ -282,7 +296,8 @@ export class RestrictedDockerBroker {
       || !this.isAllowedWorkspacePath(input.workspacePath) || !destination(input.cwd)
       || !(input.cwd === input.workspacePath || isStrictDescendant(input.cwd, input.workspacePath))
       || (input.gitCommonDir !== undefined && (!path.isAbsolute(input.gitCommonDir) || path.normalize(input.gitCommonDir) !== input.gitCommonDir
-        || /[\x00-\x1f\x7f]/.test(input.gitCommonDir) || !(input.gitCommonDir === input.workspacePath || isStrictDescendant(input.gitCommonDir, input.workspacePath) || isStrictDescendant(input.gitCommonDir, fixture))))
+        || /[\x00-\x1f\x7f]/.test(input.gitCommonDir) || !(input.gitCommonDir === input.workspacePath || isStrictDescendant(input.gitCommonDir, input.workspacePath)
+          || isStrictDescendant(input.gitCommonDir, fixture) || this.policy.allowedWorkspaceRoots?.has(input.gitCommonDir))))
       || input.manifestRelativePath !== '.freshell/input-manifest.json'
       || !Array.isArray(input.configurationBinds) || !Array.isArray(input.resourceMounts)
       || Buffer.byteLength(JSON.stringify(input)) > 1024 * 1024) throw new Error('initial Claude candidate is outside this fixture request')
@@ -348,21 +363,26 @@ export class RestrictedDockerBroker {
     if (Buffer.byteLength(JSON.stringify(input)) >= 1024 * 1024) throw new Error('prepared input metadata exceeds control profile')
     const unit = (value: string, prefix: string) => value.startsWith(prefix)
       && /^[a-zA-Z0-9_-]{1,128}$/.test(value.slice(prefix.length))
-    const destination = (value: string) => path.isAbsolute(value) && path.normalize(value) === value
+    const candidate = [...this.claudeCandidates.values()].find(candidate =>
+      ['installationId', 'soulId', 'imageRef', 'hostBinaryPath', 'providerVolumeName', 'stageRoot', 'generationId']
+        .every(key => candidate[key as keyof ClaudeCandidateAuthorization] === input[key as keyof PreparedInputAuthorization]))
+    const destination = (value: string, selected = false) => path.isAbsolute(value) && path.normalize(value) === value
       && !/[\x00-\x1f\x7f]/.test(value)
       && (this.isAllowedWorkspacePath(value)
         || this.isAllowedProviderInputPath(value)
         || mappedProviderDestination(value)
+        || selected
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const targets = new Set<string>()
-    const claim = (value: string) => {
-      if (!destination(value)) throw new PreparedInputTargetError(value, input.stageRoot)
+    const claim = (value: string, selected = false) => {
+      if (!destination(value, selected)) throw new PreparedInputTargetError(value, input.stageRoot)
       if (targets.has(value)) throw new Error('prepared input target is duplicated')
       targets.add(value)
     }
     for (const bind of input.configurationBinds) {
       if (!unit(bind.sourceRelativePath, '.freshell/templates/')) throw new Error('prepared template source is invalid')
-      claim(bind.effectiveDestination)
+      claim(bind.effectiveDestination, candidate?.configurationBinds.some(selected => selected.sourceRelativePath === bind.sourceRelativePath
+        && selected.effectiveDestination === bind.effectiveDestination))
     }
     for (const mount of input.resourceMounts) {
       const relative=mount.kind==='file' && mount.providerRelativePath.endsWith('/source') ? mount.providerRelativePath.slice(0,-'/source'.length) : mount.providerRelativePath;
@@ -370,7 +390,8 @@ export class RestrictedDockerBroker {
         || !['file', 'directory'].includes(mount.kind)
         || (mount.writable !== undefined && typeof mount.writable !== 'boolean')
         || (mount.kind !== 'file' && mount.writable === true)) throw new Error('prepared resource source is invalid')
-      claim(mount.effectiveDestination)
+      claim(mount.effectiveDestination, mount.writable !== true && candidate?.resourceMounts.some(selected => selected.providerRelativePath === mount.providerRelativePath
+        && selected.kind === mount.kind && selected.effectiveDestination === mount.effectiveDestination))
     }
     if (input.indexedFiles) {
       const expected = `freshell-inputs-${createHash('sha256').update(`${input.soulId}\0${input.generationId}`).digest('hex').slice(0,24)}`
@@ -1207,9 +1228,7 @@ export class RestrictedDockerBroker {
           ...input.retained.configurationBinds.map((bind) => bind.sourceRelativePath),...input.retained.resourceMounts.map((unit) => unit.stageRelativePath)])
         for (const relative of selected) expected.push({Type:'bind',Source:path.join(input.retained.stageRoot,relative),Target:path.join('/run/freshell-retained-inputs',relative),ReadOnly:true})
       }
-      if (input.gitCommonDir && input.gitCommonDir !== input.workspacePath && !isStrictDescendant(input.gitCommonDir, input.workspacePath)) {
-        expected.push({ Type: 'bind', Source: input.gitCommonDir, Target: input.gitCommonDir, ReadOnly: true })
-      }
+      expected.push(...claudeGitCommonMounts(input))
       for (const bind of input.configurationBinds) expected.push({ Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true })
       for (const mount of input.resourceMounts) expected.push({ Type: 'volume', Source: candidateVolumeName(input), Target: mount.effectiveDestination,
         ReadOnly: mount.kind === 'file', VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })
@@ -1272,13 +1291,22 @@ export class RestrictedDockerBroker {
         const expected = [binary,workspace,exchange,home,
           ...input.configurationBinds.map(bind => ({Type:'bind',Source:path.join(input.stageRoot,bind.sourceRelativePath),Target:bind.effectiveDestination,ReadOnly:true})),
           ...input.resourceMounts.map(unit => ({Type:'volume',Source:owner.providerVolumeName,Target:unit.effectiveDestination,ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:unit.providerRelativePath}})),
+          ...claudeGitCommonMounts(input),
         ]
         return mounts.length === expected.length && new Set(mounts.map(mount => mount.Target)).size === mounts.length
           && expected.every(wanted => mounts.some(actual => ['Type','Source','Target','ReadOnly'].every(key => actual[key] === wanted[key])
             && (wanted.Type === 'volume' ? equalRecord(actual.VolumeOptions,wanted.VolumeOptions) : actual.VolumeOptions === undefined)))
       })
       if (!matches) return false
-    } else if (mounts.length !== 3 || !equalRecord(host.Tmpfs, { '/home/freshell/provider': 'rw,nosuid,nodev,noexec,size=16m,uid=65534,gid=0,mode=0700' })) return false
+    } else {
+      // Linked checkouts also expose their separately selected Git common
+      // directory. The producer mounts it at the same path, read-only.
+      const common = mounts.filter(mount => ![binary, workspace, exchange].includes(mount))
+      if (common.length > 1 || common.some(mount => mount.Type !== 'bind' || mount.Source !== mount.Target
+        || !this.policy.allowedWorkspaceRoots?.has(mount.Source) || mount.Source === workspace.Source
+        || isStrictDescendant(mount.Source, workspace.Source) || mount.ReadOnly !== true || mount.VolumeOptions !== undefined)
+        || !equalRecord(host.Tmpfs, { '/home/freshell/provider': 'rw,nosuid,nodev,noexec,size=16m,uid=65534,gid=0,mode=0700' })) return false
+    }
     return typeof parsed.WorkingDir === 'string'
       && path.normalize(parsed.WorkingDir) === parsed.WorkingDir
       && (parsed.WorkingDir === workspace.Source || isStrictDescendant(parsed.WorkingDir, workspace.Source))
@@ -1427,7 +1455,7 @@ export class RestrictedDockerBroker {
           this.validateClaudeCandidateAuthorization({ ...owner, generationId: grant, stageRoot,
             requestId, reservationId: binding.initialReservationId, workspacePath: binding.workspacePath, cwd: binding.cwd,
             gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir, manifestRelativePath: inputs.manifest.relativePath,
-            configurationBinds: inputs.configBinds ?? [], resourceMounts: inputs.resourceMounts ?? [] })
+            configurationBinds: inputs.configBinds ?? [], resourceMounts: inputs.resourceMounts ?? [] }, true)
           return undefined
         }
       }
@@ -1523,12 +1551,12 @@ export class RestrictedDockerBroker {
               || binding.preparedContextSha256 !== sha256Hex(contextDocument.bytes)
               || binding.preparedResultSha256 !== sha256Hex(resultDocument.bytes)) continue
             phase = 'candidate_authorization'
-            this.authorizeClaudeCandidate({ ...owner, generationId: grant, stageRoot,
+            this.registerClaudeCandidate({ ...owner, generationId: grant, stageRoot,
               reservationId: binding.initialReservationId, requestId: labels['com.freshell.source-request-id'],
               workspacePath: binding.workspacePath, cwd: binding.cwd, gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir,
               manifestRelativePath: inputs.manifest.relativePath, configurationBinds: inputs.configBinds ?? [],
               resourceMounts: inputs.resourceMounts ?? [],
-            })
+            }, true)
           } else {
             if (initial ? inputs.initialAuthReservation !== reservation!.reservationId
               : inputs.initialAuthReservation != null) continue

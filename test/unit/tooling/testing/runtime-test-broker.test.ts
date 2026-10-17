@@ -913,6 +913,9 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
     { Type: 'bind', Source: input.workspacePath, Target: input.workspacePath, ReadOnly: true },
     { Type: 'bind', Source: `${exchange}/ordinary-stage`, Target: '/run/freshell-candidate-inputs', ReadOnly: true },
   )
+  if (input.gitCommonDir && input.gitCommonDir !== input.workspacePath && !input.gitCommonDir.startsWith(`${input.workspacePath}/`)) {
+    body.HostConfig.Mounts.push({ Type: 'bind', Source: input.gitCommonDir, Target: input.gitCommonDir, ReadOnly: true })
+  }
   const selected = new Set(['.freshell/claude-candidate-binding.json', '.freshell/prepared-context.json', '.freshell/prepared-result.json', input.manifestRelativePath,
     ...input.configurationBinds.map((bind) => bind.sourceRelativePath), ...input.resourceMounts.map((mount) => mount.stageRelativePath)])
   for (const relative of selected) body.HostConfig.Mounts.push({ Type: 'bind', Source: `${input.stageRoot}/${relative}`, Target: `/run/freshell-candidate-inputs/${relative}`, ReadOnly: true })
@@ -931,9 +934,38 @@ function candidateHelperBody(input: ClaudeCandidateAuthorization, role: 'mountpo
 }
 
 describe('fixed initial Claude candidate broker', () => {
-  it('observes retained sources through the exact frozen ordinary aliases and read-only owned HOME', async () => {
+  it('qualifies a linked checkout candidate using only its selected Git common directory', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const input = { ...candidateAuthorization(), gitCommonDir: '/workspace-git' }
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      expect(() => instance.authorizeClaudeCandidate({ ...input, gitCommonDir: '/outside-git' })).toThrow()
+      instance.authorizeClaudeCandidate(input)
+      const volume = `freshell-claude-candidate-${input.requestId}`
+      expect((await request('POST', '/v1.47/volumes/create', { Name: volume, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(201)
+      const name = 'freshell-claude-candidate-reader-11111111-1111-4111-8111-111111111111'
+      const body = candidateHelperBody(input, 'reader'), before = forwarded.length
+      for (const mutation of ['outside', 'alias', 'writable', 'missing', 'duplicate']) {
+        const changed = structuredClone(body)
+        const common = changed.HostConfig.Mounts.find((mount: any) => mount.Source === input.gitCommonDir)
+        if (mutation === 'outside') common.Source = common.Target = '/outside-git'
+        if (mutation === 'alias') common.Target = '/workspace/.git'
+        if (mutation === 'writable') common.ReadOnly = false
+        if (mutation === 'missing') changed.HostConfig.Mounts = changed.HostConfig.Mounts.filter((mount: any) => mount !== common)
+        if (mutation === 'duplicate') changed.HostConfig.Mounts.push(structuredClone(common))
+        expect((await request('POST', `/v1.47/containers/create?name=${name}`, changed)).status, mutation).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('DELETE', `/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(404)
+      expect((await request('DELETE', `/v1.47/volumes/${volume}`)).status).toBe(204)
+    }, { gitWorkspace: '/workspace-git' })
+  })
+  it.each([undefined, '/workspace-git'])('observes retained sources through the exact frozen ordinary aliases and read-only owned HOME (%s)', async (gitCommonDir) => {
     await withHttpBroker(async ({request, forwarded, broker: instance}) => {
-      const input = candidateAuthorization(), body = sourceHelperBody()
+      const input = { ...candidateAuthorization(), gitCommonDir }, body = sourceHelperBody()
       instance.authorizeInitialProviderVolume(sourceAuthorization())
       instance.authorizeClaudeCandidate(input)
       body.HostConfig.Tmpfs = {}
@@ -942,16 +974,22 @@ describe('fixed initial Claude candidate broker', () => {
         ...input.configurationBinds.map(bind => ({Type:'bind',Source:`${input.stageRoot}/${bind.sourceRelativePath}`,Target:bind.effectiveDestination,ReadOnly:true})),
         ...input.resourceMounts.map(unit => ({Type:'volume',Source:input.providerVolumeName,Target:unit.effectiveDestination,ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:unit.providerRelativePath}})),
       )
+      if (gitCommonDir) body.HostConfig.Mounts.push({Type:'bind',Source:gitCommonDir,Target:gitCommonDir,ReadOnly:true})
       const before = forwarded.length
-      for (const mutation of ['home-write','foreign-home','alias-write','alias-subpath','alias-source','missing-alias','native-history']) {
+      for (const mutation of ['home-write','foreign-home','alias-write','alias-subpath','alias-source','missing-alias','native-history',
+        ...(gitCommonDir ? ['common-write','common-source','common-alias','missing-common'] : [])]) {
         const changed = structuredClone(body)
         if (mutation === 'home-write') changed.HostConfig.Mounts[3].ReadOnly = false
         if (mutation === 'foreign-home') changed.HostConfig.Mounts[3].Source = 'foreign-home'
-        if (mutation === 'alias-write') changed.HostConfig.Mounts.at(-1).ReadOnly = false
-        if (mutation === 'alias-subpath') changed.HostConfig.Mounts.at(-1).VolumeOptions.Subpath = '.claude/projects'
+        if (mutation === 'alias-write') changed.HostConfig.Mounts[5].ReadOnly = false
+        if (mutation === 'alias-subpath') changed.HostConfig.Mounts[5].VolumeOptions.Subpath = '.claude/projects'
         if (mutation === 'alias-source') changed.HostConfig.Mounts[4].Source = `${input.stageRoot}/.freshell/mcp-capability.json`
-        if (mutation === 'missing-alias') changed.HostConfig.Mounts.pop()
+        if (mutation === 'missing-alias') changed.HostConfig.Mounts.splice(5, 1)
         if (mutation === 'native-history') changed.HostConfig.Mounts.push({Type:'volume',Source:input.providerVolumeName,Target:'/history',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'.claude/projects'}})
+        if (mutation === 'common-write') changed.HostConfig.Mounts.at(-1).ReadOnly = false
+        if (mutation === 'common-source') changed.HostConfig.Mounts.at(-1).Source = '/outside-git'
+        if (mutation === 'common-alias') changed.HostConfig.Mounts.at(-1).Target = '/workspace/.git'
+        if (mutation === 'missing-common') changed.HostConfig.Mounts.pop()
         expect((await request('POST',`/v1.47/containers/create?name=${sourceName}`,changed)).status,mutation).toBe(403)
         expect(forwarded).toHaveLength(before)
       }
@@ -961,7 +999,7 @@ describe('fixed initial Claude candidate broker', () => {
       expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
       expect((await request('DELETE',`/v1.47/containers/${helperId}?force=1`)).status).toBe(204)
       expect((await request('GET',`/v1.47/containers/${helperId}/json`)).status).toBe(404)
-    })
+    }, { gitWorkspace: '/workspace-git' })
   })
   it('qualifies retained candidates only through selected frozen inputs and read-only owned HOME', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
@@ -1102,6 +1140,28 @@ describe('fixed initial Claude candidate broker', () => {
 })
 
 describe('scoped Claude source observer broker', () => {
+  it('allows the reserved reader selected Git common directory for a linked checkout', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      const body = sourceHelperBody()
+      body.HostConfig.Mounts.push({ Type: 'bind', Source: '/workspace-git', Target: '/workspace-git', ReadOnly: true })
+      for (const mutation of ['outside', 'alias', 'writable', 'volume-options', 'duplicate', 'extra']) {
+        const changed = structuredClone(body)
+        const common = changed.HostConfig.Mounts[3]
+        if (mutation === 'outside') common.Source = common.Target = '/outside-git'
+        if (mutation === 'alias') common.Target = '/workspace/.git'
+        if (mutation === 'writable') common.ReadOnly = false
+        if (mutation === 'volume-options') common.VolumeOptions = { NoCopy: true }
+        if (mutation === 'duplicate') changed.HostConfig.Mounts.push(structuredClone(common))
+        if (mutation === 'extra') changed.HostConfig.Mounts.push({ Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true })
+        expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, changed)).status, mutation).toBe(403)
+        expect(forwarded).toHaveLength(0)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, body)).status).toBe(201)
+      expect(forwarded).toHaveLength(1)
+    }, { gitWorkspace: '/workspace-git' })
+  })
+
   it.each(['source', 'mountpoints'] as const)('allows the producer %s exchange only directly under the owned shared root', async role => {
     await withHttpBroker(async ({ directory, request, forwarded, broker: instance }) => {
       const owner = { ...sourceAuthorization(), hostBinaryPath: path.join(directory, 'freshell-session-host') }
@@ -1758,6 +1818,96 @@ describe('fixed indexed publisher broker',()=>{
       expect((await request('POST', '/v1.47/volumes/create', changed)).status).toBe(403)
       expect(forwarded).toHaveLength(before)
     }, undefined, true)
+  })
+  it.each(['candidate', 'retained', 'workload'] as const)('carries published ancestor policy and imported files into the %s reader', async consumer => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
+      const input = { ...candidateAuthorization(), gitCommonDir: '/workspace-git' }
+      input.configurationBinds[0].effectiveDestination = '/workspace/.claude/settings.json'
+      input.resourceMounts = ['/home/operator/.claude/CLAUDE.md', '/home/operator/.codex/AGENTS.md'].map((effectiveDestination, index) => ({
+        stageRelativePath: `.freshell/resource-units/root-${index}/source`,
+        providerRelativePath: `.freshell/provider-roots/root-${index}/source`, effectiveDestination, kind: 'file',
+      }))
+      input.hostBinaryPath = path.join(directory, 'freshell-session-host')
+      const binary = Buffer.from('published ancestor policy reader')
+      await fs.writeFile(input.hostBinaryPath, binary)
+      input.binarySha256 = createHash('sha256').update(binary).digest('hex')
+      input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
+      instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath, binarySha256: input.binarySha256 })
+      const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
+      await fs.writeFile(path.join(metadata, 'claude-candidate-binding.json'), JSON.stringify({
+        version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
+        authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'),
+        workspacePath: input.workspacePath, cwd: input.cwd, gitCommonDir: input.gitCommonDir,
+        manifestSha256: context.preparedInputs.manifest.sha256,
+        preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
+        preparedResultSha256: createHash('sha256').update(resultBytes).digest('hex'),
+      }))
+      const volumeName = `freshell-claude-candidate-${input.requestId}`
+      expect((await request('GET', `/v1.47/volumes/${volumeName}`)).status).toBe(404)
+      expect((await request('POST', '/v1.47/volumes/create', { Name: volumeName, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) })).status).toBe(201)
+      let body: any, name: string
+      if (consumer === 'candidate') {
+        body = candidateHelperBody(input, 'reader')
+        name = 'freshell-claude-candidate-reader-11111111-1111-4111-8111-111111111111'
+      } else if (consumer === 'retained') {
+        body = sourceHelperBody()
+        body.HostConfig.Mounts[0].Source = input.hostBinaryPath
+        body.Labels['com.freshell.source-binary-sha256'] = input.binarySha256
+        body.HostConfig.Tmpfs = {}
+        body.HostConfig.Mounts.push(
+          { Type: 'bind', Source: input.gitCommonDir, Target: input.gitCommonDir, ReadOnly: true },
+          { Type: 'volume', Source: input.providerVolumeName, Target: '/home/freshell/provider', ReadOnly: true, VolumeOptions: { NoCopy: true } },
+          ...input.configurationBinds.map(bind => ({ Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true })),
+          ...input.resourceMounts.map(mount => ({ Type: 'volume', Source: input.providerVolumeName, Target: mount.effectiveDestination, ReadOnly: true, VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })),
+        )
+        name = sourceName
+      } else {
+        const prepared = { ...input, incarnationId: 'incarnation-one', indexedSecretSources: [] }
+        for (const mutation of ['unit', 'writable', 'generation', 'owner']) {
+          const changed = structuredClone(prepared)
+          if (mutation === 'unit') changed.resourceMounts[0].providerRelativePath = '.freshell/provider-roots/foreign/source'
+          if (mutation === 'writable') (changed.resourceMounts[0] as { writable?: boolean }).writable = true
+          if (mutation === 'generation') changed.generationId = 'grant-55555555-5555-4555-8555-555555555555'
+          if (mutation === 'owner') changed.soulId = 'foreign-soul'
+          expect(() => instance.authorizePreparedInputs(changed), mutation).toThrow()
+        }
+        expect((await request('POST', '/v1.47/volumes/create', { Name: input.providerVolumeName, Driver: 'local', Labels: {
+          'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId,
+          'freshell.input.reservation': input.reservationId, 'freshell.input.incarnation': 'incarnation-one', 'freshell.input.intent': '1',
+          'freshell.input.daemon': input.daemonId, 'freshell.input.image': input.imageRef, 'freshell.input.binary-sha256': input.binarySha256,
+        } })).status).toBe(201)
+        const runtimeBinds = ordinaryBinds.map(bind => bind.replace('/tmp/owned/freshell-session-host', input.hostBinaryPath)
+          .replace('/tmp/owned/r/scenario/x/incarnation-one', path.join(directory, 'r/scenario/x/incarnation-one'))
+          .replace(providerVolume, input.providerVolumeName))
+        const actor = path.join(directory, 'r/scenario/x/souls', createHash('sha256').update(`${input.installationId}\0${input.soulId}`).digest('hex'), 'actor')
+        body = JSON.parse(createBody([...runtimeBinds, `${actor}:/run/freshell-host-actor:rw`]).toString())
+        body.Labels['com.freshell.soul-id'] = input.soulId
+        body.HostConfig.Mounts = [
+          ...input.configurationBinds.map(bind => ({ Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true })),
+          ...input.resourceMounts.map(mount => ({ Type: 'volume', Source: input.providerVolumeName, Target: mount.effectiveDestination, ReadOnly: true, VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })),
+        ]
+        name = 'selected-ancestor-runtime'
+      }
+      const before = forwarded.length
+      for (const mutation of ['source', 'target', 'writable']) {
+        const changed = structuredClone(body)
+        const policy = changed.HostConfig.Mounts.find((mount: any) => mount.Target === '/home/operator/.claude/CLAUDE.md')
+        if (mutation === 'source') policy.Source = 'foreign-volume'
+        if (mutation === 'target') policy.Target = '/outside/unselected-policy'
+        if (mutation === 'writable') policy.ReadOnly = false
+        expect((await request('POST', `/v1.47/containers/create?name=${name}`, changed)).status, `${consumer}/${mutation}`).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status, JSON.stringify(instance.eventsSnapshot().slice(-3))).toBe(201)
+      const id = consumer === 'workload' ? ownedId : helperId
+      expect((await request('POST', `/v1.47/containers/${id}/start`)).status).toBe(204)
+      if (consumer !== 'workload') {
+        expect((await request('POST', `/v1.47/containers/${id}/wait?condition=not-running`)).status).toBe(200)
+        expect((await request('DELETE', `/v1.47/containers/${id}?force=1`)).status).toBe(204)
+        expect((await request('GET', `/v1.47/containers/${id}/json`)).status).toBe(404)
+      }
+    }, { gitWorkspace: '/workspace-git' }, true)
   })
   it('registers the exact owned published preparation before its indexed volume request', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
