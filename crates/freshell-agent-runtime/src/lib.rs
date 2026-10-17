@@ -1283,6 +1283,7 @@ fn probe_selected_provider_identity(
                 .unwrap_or_else(|| provider_home.join(".claude"))
                 .join("projects"),
             expected,
+            provider,
         ),
         "codex" => probe_bounded_tree(
             &selection
@@ -1292,6 +1293,7 @@ fn probe_selected_provider_identity(
                 .unwrap_or_else(|| provider_home.join(".codex"))
                 .join("sessions"),
             expected,
+            provider,
         ),
         "amplifier" => probe_amplifier(provider_home, expected),
         "opencode" => probe_opencode(provider_home, expected, selection),
@@ -1942,10 +1944,11 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                         )
                     }
                 };
-                // Exact materialized history needs readability, not a whole-file
-                // parse. Only metadata carries the bounded identity document.
+                // Metadata carries the bounded identity document. Inspect small
+                // histories for corruption; large histories need readability
+                // without an unbounded parse.
                 let inspection = if name.starts_with("metadata.json")
-                    || (name == "events.jsonl" && metadata.len() <= MAX_INSPECTED_METADATA_BYTES)
+                    || metadata.len() <= MAX_INSPECTED_METADATA_BYTES
                 {
                     if metadata.len() > MAX_INSPECTED_METADATA_BYTES {
                         return blocked(
@@ -1992,6 +1995,22 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                     }
                 }
                 if name.starts_with("transcript.jsonl") && metadata.len() > 0 {
+                    if metadata.len() <= MAX_INSPECTED_METADATA_BYTES
+                        && bytes
+                            .split(|byte| *byte == b'\n')
+                            .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+                            .any(|line| {
+                                !serde_json::from_slice::<serde_json::Value>(line)
+                                    .is_ok_and(|row| row.is_object())
+                            })
+                    {
+                        return blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            "Amplifier transcript contains an incomplete or malformed message",
+                            vec![path.display().to_string()],
+                            None,
+                        );
+                    }
                     materialized = true;
                 }
                 if name == "events.jsonl" && metadata.len() > MAX_INSPECTED_METADATA_BYTES {
@@ -2107,7 +2126,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     }
 }
 
-fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
+fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderStoreProbe {
     if let Err(probe) = inspect_native_path(Path::new(""), root) {
         return probe;
     }
@@ -2120,6 +2139,7 @@ fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
         );
     }
     let mut matches = Vec::new();
+    let mut incomplete_bodies = false;
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
     let mut visited = 0_usize;
     while let Some((path, depth)) = queue.pop_front() {
@@ -2134,68 +2154,162 @@ fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
         }
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            // Keep searching for an exact readable positive. No negative is
-            // emitted from this partial tree, including skipped candidates.
-            Err(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && depth == 0 => {
+                return inspected_absence(
+                    "selected provider native store is absent".into(),
+                    vec![root.display().to_string()],
+                    EvidenceStoreState::Missing,
+                    &[RecoveryPath::NativeResume],
+                );
+            }
+            Err(_) => {
+                return blocked(
+                    RecoveryBlockReason::StoreUnreadable,
+                    "provider native artifact could not be inspected",
+                    vec![path.display().to_string()],
+                    None,
+                );
+            }
         };
         if metadata.file_type().is_symlink() {
-            continue;
+            return blocked(
+                RecoveryBlockReason::AmbiguousIdentity,
+                "provider native store contains an unresolved symlink",
+                vec![path.display().to_string()],
+                None,
+            );
         }
         if metadata.is_dir() {
             if depth >= 8 {
-                continue;
+                return blocked(
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "provider native store exceeds the bounded directory inspection",
+                    vec![path.display().to_string()],
+                    None,
+                );
             }
             let entries = match fs::read_dir(&path) {
                 Ok(entries) => entries,
-                Err(_) => continue,
+                Err(_) => {
+                    return blocked(
+                        RecoveryBlockReason::StoreUnreadable,
+                        "provider native directory could not be read",
+                        vec![path.display().to_string()],
+                        None,
+                    );
+                }
             };
             for entry in entries {
                 match entry {
                     Ok(entry) => queue.push_back((entry.path(), depth + 1)),
-                    Err(_) => continue,
+                    Err(_) => {
+                        return blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            "provider native directory entry could not be inspected",
+                            vec![path.display().to_string()],
+                            None,
+                        );
+                    }
                 }
             }
             continue;
         }
         if !metadata.is_file() {
-            continue;
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "provider native artifact is not a regular file",
+                vec![path.display().to_string()],
+                None,
+            );
         }
-        let filename_match = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(expected));
-        if filename_match {
-            // Exact filename recovery needs readability, not a complete
-            // transcript scan. Keep this check bounded as transcripts grow.
-            if fs::File::open(&path)
-                .and_then(|mut file| file.read(&mut [0_u8; 1]))
-                .is_ok()
-            {
-                matches.push(path.display().to_string());
-            }
-            continue;
-        }
-        if metadata.len() > 1024 * 1024 {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
+        let Ok((owner, complete)) = read_native_rollout_owner(&path, provider) else {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "provider native artifact has no readable unambiguous owner",
+                vec![path.display().to_string()],
+                None,
+            );
         };
-        let content_match = bytes
-            .windows(expected.len())
-            .any(|w| w == expected.as_bytes());
-        if content_match {
+        incomplete_bodies |= !complete;
+        if owner == expected {
             matches.push(path.display().to_string());
         }
     }
+    matches.sort();
     match matches.len() {
-        0 => blocked(RecoveryBlockReason::AmbiguousIdentity,
-            "complete effective provider native/checkpoint stores are unrecorded; tree no-match is not absence",
-            vec![root.display().to_string()], None),
+        0 if incomplete_bodies => blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "provider native history exceeds the bounded complete absence inspection",
+            vec![root.display().to_string()],
+            None,
+        ),
+        0 => inspected_absence(
+            "selected provider native store has no matching owner".into(),
+            vec![root.display().to_string()],
+            EvidenceStoreState::PresentReadable,
+            &[RecoveryPath::NativeResume],
+        ),
         1 => ProviderStoreProbe::Ready { evidence: matches },
-        _ => blocked(RecoveryBlockReason::AmbiguousIdentity,
-            "provider identity has multiple candidate artifacts", matches, None),
+        _ => blocked(
+            RecoveryBlockReason::AmbiguousIdentity,
+            "provider identity has multiple candidate artifacts",
+            matches,
+            None,
+        ),
     }
+}
+
+fn read_native_rollout_owner(path: &Path, provider: &str) -> Result<(String, bool), ()> {
+    const MAX_INSPECTED_BYTES: u64 = 1024 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(MAX_INSPECTED_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|_| ())?;
+    let complete = bytes.len() as u64 <= MAX_INSPECTED_BYTES;
+    if !complete {
+        // Native owner metadata precedes a potentially large message body.
+        // Inspect complete prefix records for positives; a partial body can
+        // never establish absence.
+        let last_newline = bytes.iter().rposition(|byte| *byte == b'\n').ok_or(())?;
+        bytes.truncate(last_newline + 1);
+    }
+    let mut owner = None;
+    for (index, line) in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .enumerate()
+    {
+        let row: serde_json::Value = serde_json::from_slice(line).map_err(|_| ())?;
+        let identity = if provider == "codex" {
+            if row["type"] != "session_meta" {
+                if index == 0 {
+                    return Err(());
+                }
+                continue;
+            }
+            // `session_id`, fork ancestry, message text and filenames can all
+            // refer to other sessions. Only the native metadata id owns this
+            // rollout.
+            row.get("payload").and_then(|payload| payload.get("id"))
+        } else {
+            let Some(role @ ("user" | "assistant")) = row["type"].as_str() else {
+                continue;
+            };
+            if row["message"]["role"] != role || row["message"].get("content").is_none() {
+                return Err(());
+            }
+            row.get("sessionId")
+        };
+        let identity = identity
+            .and_then(serde_json::Value::as_str)
+            .filter(|identity| !identity.trim().is_empty())
+            .ok_or(())?;
+        if owner.as_deref().is_some_and(|owner| owner != identity) {
+            return Err(());
+        }
+        owner = Some(identity.to_string());
+    }
+    owner.map(|owner| (owner, complete)).ok_or(())
 }
 
 // Loss evidence is stricter than the independent best-effort stub GC policy.
@@ -2258,10 +2372,15 @@ fn qualified_amplifier_events(bytes: &[u8], expected: &str) -> Option<bool> {
         .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
     {
         let event: serde_json::Value = serde_json::from_slice(line).ok()?;
-        match event.get("event").and_then(serde_json::Value::as_str)? {
+        match event
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .filter(|event| !event.trim().is_empty())?
+        {
             "session:start" | "session:end" | "session:resume" => {}
-            "prompt:submit" => materialized = true,
-            _ => return None,
+            // Native event names are extensible hook names. Provider/tool and
+            // orchestrator activity is ordinary history, not a malformed stub.
+            _ => materialized = true,
         }
         if event
             .get("session_id")
@@ -2788,13 +2907,7 @@ mod tests {
         });
         fs::create_dir_all(&root).unwrap();
         let path = root.join("exact.jsonl");
-        fs::write(&path, br#"{"sessionId":"exact"}"#).unwrap();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(1024 * 1024 + 1)
-            .unwrap();
+        fs::write(&path, native_rollout_for_test(provider, "exact", true)).unwrap();
         let result = probe_provider_store(
             home.path(),
             &resume_spec_for_test(provider, "exact", home.path()),
@@ -2847,20 +2960,14 @@ mod tests {
             });
             fs::create_dir_all(&root).unwrap();
             let path = root.join("different.jsonl");
-            fs::write(&path, br#"{"sessionId":"exact"}"#).unwrap();
-            fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_len(1024 * 1024 + 1)
-                .unwrap();
+            fs::write(&path, native_rollout_for_test(provider, "another", true)).unwrap();
             assert!(matches!(
                 probe_provider_store(
                     home.path(),
                     &resume_spec_for_test(provider, "exact", home.path())
                 ),
                 ProviderStoreProbe::Blocked {
-                    reason: RecoveryBlockReason::AmbiguousIdentity,
+                    reason: RecoveryBlockReason::StoreUnreadable,
                     ..
                 }
             ));
@@ -2898,7 +3005,7 @@ mod tests {
                             &resume_spec_for_test(provider, "exact", home.path())
                         ),
                         ProviderStoreProbe::Blocked {
-                            reason: RecoveryBlockReason::AmbiguousIdentity,
+                            reason: RecoveryBlockReason::StoreUnreadable,
                             ..
                         }
                     ),
@@ -2918,8 +3025,11 @@ mod tests {
                 ".codex/sessions"
             });
             fs::create_dir_all(&root).unwrap();
-            let large = fs::File::create(root.join("oversized.jsonl")).unwrap();
-            large.set_len(1024 * 1024 + 1).unwrap();
+            fs::write(
+                root.join("oversized.jsonl"),
+                native_rollout_for_test(provider, "another", true),
+            )
+            .unwrap();
             let spec = resume_spec_for_test(provider, "exact", home.path());
             assert!(
                 matches!(
@@ -2928,7 +3038,11 @@ mod tests {
                 ),
                 "{provider}"
             );
-            fs::write(root.join("exact.jsonl"), br#"{"sessionId":"exact"}"#).unwrap();
+            fs::write(
+                root.join("exact.jsonl"),
+                native_rollout_for_test(provider, "exact", false),
+            )
+            .unwrap();
             assert!(
                 matches!(
                     probe_provider_store(home.path(), &spec),
@@ -3130,7 +3244,7 @@ mod tests {
         .unwrap();
         fs::write(
             session.session_dir.join("transcript.jsonl.backup"),
-            b"synthetic retained turn",
+            b"{\"role\":\"assistant\",\"content\":\"synthetic retained turn\"}\n",
         )
         .unwrap();
         assert!(matches!(
@@ -3205,32 +3319,19 @@ mod tests {
                     ".claude/projects/work"
                 });
                 fs::create_dir_all(&root).unwrap();
-                let rollout = |id: &str, large: bool| {
-                    let text = if large {
-                        "x".repeat(1024 * 1024 + 1)
-                    } else {
-                        "saved".into()
-                    };
-                    let rows = if provider == "codex" {
-                        vec![
-                            serde_json::json!({"timestamp":"2026-10-15T00:00:00.000Z","type":"session_meta","payload":{"id":id,"cwd":"/work"}}),
-                            serde_json::json!({"timestamp":"2026-10-15T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}}),
-                        ]
-                    } else {
-                        vec![
-                            serde_json::json!({"type":"user","sessionId":id,"message":{"role":"user","content":"saved"}}),
-                            serde_json::json!({"type":"assistant","sessionId":id,"message":{"role":"assistant","content":text}}),
-                        ]
-                    };
-                    rows.iter()
-                        .map(|row| format!("{row}\n"))
-                        .collect::<String>()
-                };
-                fs::write(root.join("exact.jsonl"), rollout(expected, large_exact)).unwrap();
+                fs::write(
+                    root.join("exact.jsonl"),
+                    native_rollout_for_test(provider, expected, large_exact),
+                )
+                .unwrap();
                 if !large_exact {
                     fs::write(
                         root.join("other.jsonl"),
-                        rollout("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", true),
+                        native_rollout_for_test(
+                            provider,
+                            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                            true,
+                        ),
                     )
                     .unwrap();
                 }
@@ -3257,6 +3358,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn native_rollout_for_test(provider: &str, id: &str, large: bool) -> String {
+        let text = if large {
+            "x".repeat(1024 * 1024 + 1)
+        } else {
+            "saved".into()
+        };
+        let rows = if provider == "codex" {
+            vec![
+                serde_json::json!({"timestamp":"2026-10-15T00:00:00.000Z","type":"session_meta","payload":{"id":id,"cwd":"/work"}}),
+                serde_json::json!({"timestamp":"2026-10-15T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}}),
+            ]
+        } else {
+            vec![
+                serde_json::json!({"type":"user","sessionId":id,"message":{"role":"user","content":"saved"}}),
+                serde_json::json!({"type":"assistant","sessionId":id,"message":{"role":"assistant","content":text}}),
+            ]
+        };
+        rows.iter().map(|row| format!("{row}\n")).collect()
     }
 
     #[test]
@@ -3339,6 +3460,37 @@ mod tests {
             ),
             "an uninspectable sibling owner must remain unresolved: {probe:?}"
         );
+    }
+
+    #[test]
+    fn native_probe_codex_decodes_owner_and_blocks_conflicting_native_headers() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        fs::write(
+            &path,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"saved-exact-\\u0072oot\"}}\n",
+        )
+        .unwrap();
+        let spec = resume_spec_for_test("codex", "saved-exact-root", home.path());
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::Ready { .. }
+        ));
+
+        fs::write(
+            &path,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"saved-exact-root\"}}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"another-root\"}}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::Blocked {
+                reason: RecoveryBlockReason::StoreUnreadable,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4353,8 +4505,9 @@ mod tests {
         .collect::<String>();
         fs::write(ensured.session_dir.join("events.jsonl"), events).unwrap();
         let spec = resume_spec_for_test("amplifier", expected, home.path());
-        assert!(matches!(probe_provider_store(home.path(), &spec), ProviderStoreProbe::Ready { .. }),
-            "a completed ordinary native save must not be classified using pristine-stub-only file/event rules");
+        let probe = probe_provider_store(home.path(), &spec);
+        assert!(matches!(probe, ProviderStoreProbe::Ready { .. }),
+            "a completed ordinary native save must not be classified using pristine-stub-only file/event rules: {probe:?}");
         let original_files = fs::read_dir(&ensured.session_dir)
             .unwrap()
             .map(|entry| {
@@ -4368,8 +4521,7 @@ mod tests {
             "wrong-event-root",
             "truncated-transcript",
             "partial-events",
-            "corrupt-backup",
-            "unknown-child",
+            "corrupt-metadata",
         ] {
             for (path, bytes) in &original_files {
                 fs::write(path, bytes).unwrap();
@@ -4382,10 +4534,12 @@ mod tests {
                 "wrong-event-root" => fs::write(ensured.session_dir.join("events.jsonl"),
                     b"{\"event\":\"llm:response\",\"session_id\":\"another-root\"}\n").unwrap(),
                 "truncated-transcript" => fs::write(ensured.session_dir.join("transcript.jsonl"),
-                    b"{\"role\":\"user\",\"content\":\"seed\"}\n{\"role\":\"assistant\",\"content\":\"stored\"}").unwrap(),
+                    b"{\"role\":\"user\",\"content\":\"seed\"}\n{\"role\":\"assistant\",\"content\":").unwrap(),
                 "partial-events" => fs::write(ensured.session_dir.join("events.jsonl"), b"{\"event\":").unwrap(),
-                "corrupt-backup" => fs::write(ensured.session_dir.join("metadata.json.backup"), b"null").unwrap(),
-                "unknown-child" => fs::write(ensured.session_dir.join("uninspected"), b"retained").unwrap(),
+                "corrupt-metadata" => {
+                    fs::write(&metadata_path, b"null").unwrap();
+                    fs::write(ensured.session_dir.join("metadata.json.backup"), b"null").unwrap();
+                }
                 _ => unreachable!(),
             }
             assert!(
@@ -4394,6 +4548,30 @@ mod tests {
                     ProviderStoreProbe::Blocked { .. }
                 ),
                 "{fault}"
+            );
+        }
+        for native_save in [
+            "no-final-newline",
+            "unused-invalid-backup",
+            "native-sidecars",
+        ] {
+            for (path, bytes) in &original_files {
+                fs::write(path, bytes).unwrap();
+            }
+            match native_save {
+                "no-final-newline" => fs::write(ensured.session_dir.join("transcript.jsonl"),
+                    b"{\"role\":\"user\",\"content\":\"seed\"}\n{\"role\":\"assistant\",\"content\":\"stored\"}").unwrap(),
+                "unused-invalid-backup" => fs::write(ensured.session_dir.join("metadata.json.backup"), b"null").unwrap(),
+                "native-sidecars" => {
+                    fs::write(ensured.session_dir.join("config.md"), b"native session configuration").unwrap();
+                    fs::write(ensured.session_dir.join("uninspected"), b"retained").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let probe = probe_provider_store(home.path(), &spec);
+            assert!(
+                matches!(probe, ProviderStoreProbe::Ready { .. }),
+                "{native_save}: {probe:?}"
             );
         }
     }
