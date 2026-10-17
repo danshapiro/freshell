@@ -9351,33 +9351,39 @@ pub(crate) mod automatic_retry_tests {
             .unwrap();
         soul
     }
-    async fn seed_native(supervisor: &Supervisor, root: &Path) -> SoulId {
-        let soul = seed(supervisor).await;
-        let context = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
+    fn seed_native<'a>(
+        supervisor: &'a Supervisor,
+        root: &'a Path,
+    ) -> impl std::future::Future<Output = SoulId> + Send + 'a {
+        // Keep the common native fixture's nested launch future off callers'
+        // default stacks, including the multi-reopen retry scenarios.
+        Box::pin(async move {
+            let soul = seed(supervisor).await;
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let provider_home = root.join("provider");
+            std::fs::create_dir_all(provider_home.join(".codex/sessions")).unwrap();
+            std::fs::write(
+                provider_home.join(".codex/sessions/rollout-retry-root.jsonl"),
+                b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"retry-root\"}}\n",
+            )
             .unwrap();
-        let provider_home = root.join("provider");
-        std::fs::create_dir_all(provider_home.join(".codex/sessions")).unwrap();
-        std::fs::write(
-            provider_home.join(".codex/sessions/rollout-retry-root.jsonl"),
-            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"retry-root\"}}\n",
-        )
-        .unwrap();
-        let agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            let agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
             "sessionId":"retry-fresh-codex", "provider":"codex", "sessionType":"freshcodex", "runtimeVariant":"codex-app-server-v1",
             "providerStoreId":context.provider_store_id, "cwd":root, "workspacePath":root,
             "runAsUid":65534, "runAsGid":0
         })).unwrap();
-        agent.validate().unwrap();
-        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
-        conn.execute(
-            "UPDATE souls SET provider='codex',resume_spec=NULL WHERE soul_id=?1",
-            [soul.as_str()],
-        )
-        .unwrap();
-        conn.execute(
+            agent.validate().unwrap();
+            let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='codex',resume_spec=NULL WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+            conn.execute(
             "UPDATE incarnations SET fixture_kind=NULL,fresh_agent_spec=?1 WHERE incarnation_id=?2",
             rusqlite::params![
                 serde_json::to_string(&agent).unwrap(),
@@ -9385,24 +9391,25 @@ pub(crate) mod automatic_retry_tests {
             ],
         )
         .unwrap();
-        let context = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        let spec = resume_catalog::exact_resume_candidate(&context, None)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            freshell_agent_runtime::probe_provider_store(&provider_home, &spec),
-            freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
-        ));
-        supervisor
-            .registry
-            .store_verified_resume_spec(soul.clone(), spec)
-            .await
-            .unwrap();
-        soul
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let spec = resume_catalog::exact_resume_candidate(&context, None)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                freshell_agent_runtime::probe_provider_store(&provider_home, &spec),
+                freshell_agent_runtime::ProviderStoreProbe::Ready { .. }
+            ));
+            supervisor
+                .registry
+                .store_verified_resume_spec(soul.clone(), spec)
+                .await
+                .unwrap();
+            soul
+        })
     }
     async fn seed_offline_amplifier(supervisor: &Supervisor, root: &Path) -> SoulId {
         let soul = seed(supervisor).await;
@@ -12378,79 +12385,83 @@ pub(crate) mod automatic_retry_tests {
         }
     }
 
-    async fn uncommitted_replacement(
-        supervisor: &Supervisor,
-        backend: &RetryBackend,
-        soul: &SoulId,
-    ) -> (IncarnationId, PathBuf, String) {
-        let original = supervisor
-            .registry
-            .recovery_context(soul.clone())
-            .await
-            .unwrap();
-        supervisor
-            .registry
-            .reserve_due_recovery_retry(
-                soul.clone(),
-                original.intent_revision,
-                supervisor.registry.recovery_now_ms(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let start = supervisor
-            .registry
-            .begin_recovery(
-                soul.clone(),
-                RecoveryTrigger::ProviderExit,
-                RecoveryPath::NativeResume,
-            )
-            .await
-            .unwrap();
-        supervisor
-            .registry
-            .mark_stop_outcome(
-                original.prior_handle.incarnation_id().clone(),
-                StopOutcome::VerifiedEmpty,
-            )
-            .await
-            .unwrap();
-        let replacement = supervisor
-            .registry
-            .prepare_replacement(
-                start,
-                original.terminal,
-                original.fresh_agent,
-                original.resume_spec,
-                RecoveryPath::NativeResume,
-            )
-            .await
-            .unwrap();
-        let incarnation = replacement.prepared.incarnation_id;
-        let runtime = supervisor.config.runtime_root.join(incarnation.as_str());
-        std::fs::create_dir_all(&runtime).unwrap();
-        let created = backend
-            .create_stopped(&CreateRuntimeSpec {
-                initial_input_reservation: None,
-                prior_provider_owner: None,
-                installation_id: supervisor.registry.installation_id().clone(),
-                soul_id: soul.clone(),
-                incarnation_id: incarnation.clone(),
-                image_ref: supervisor.config.image_ref.clone(),
-                host_binary_path: supervisor.config.host_binary_path.clone(),
-                runtime_dir: runtime.clone(),
-                limits: original.requested_limits,
-                test_run_id: "retry-uncommitted".into(),
-                terminal: None,
-                fresh_agent: None,
-                opencode_transfer_dir: None,
-                provider_volume_name: "retry-volume".into(),
-            })
-            .await
-            .unwrap();
-        // Model the exact persisted boundary without aborting a host process:
-        // create returned, but ownership was never committed to the registry.
-        (incarnation, runtime, created.container_id)
+    fn uncommitted_replacement<'a>(
+        supervisor: &'a Supervisor,
+        backend: &'a RetryBackend,
+        soul: &'a SoulId,
+    ) -> impl std::future::Future<Output = (IncarnationId, PathBuf, String)> + Send + 'a {
+        // Allocate this shared setup future before callers retain it across
+        // the recovery passes and reopen assertions on default test stacks.
+        Box::pin(async move {
+            let original = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            supervisor
+                .registry
+                .reserve_due_recovery_retry(
+                    soul.clone(),
+                    original.intent_revision,
+                    supervisor.registry.recovery_now_ms(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let start = supervisor
+                .registry
+                .begin_recovery(
+                    soul.clone(),
+                    RecoveryTrigger::ProviderExit,
+                    RecoveryPath::NativeResume,
+                )
+                .await
+                .unwrap();
+            supervisor
+                .registry
+                .mark_stop_outcome(
+                    original.prior_handle.incarnation_id().clone(),
+                    StopOutcome::VerifiedEmpty,
+                )
+                .await
+                .unwrap();
+            let replacement = supervisor
+                .registry
+                .prepare_replacement(
+                    start,
+                    original.terminal,
+                    original.fresh_agent,
+                    original.resume_spec,
+                    RecoveryPath::NativeResume,
+                )
+                .await
+                .unwrap();
+            let incarnation = replacement.prepared.incarnation_id;
+            let runtime = supervisor.config.runtime_root.join(incarnation.as_str());
+            std::fs::create_dir_all(&runtime).unwrap();
+            let created = backend
+                .create_stopped(&CreateRuntimeSpec {
+                    initial_input_reservation: None,
+                    prior_provider_owner: None,
+                    installation_id: supervisor.registry.installation_id().clone(),
+                    soul_id: soul.clone(),
+                    incarnation_id: incarnation.clone(),
+                    image_ref: supervisor.config.image_ref.clone(),
+                    host_binary_path: supervisor.config.host_binary_path.clone(),
+                    runtime_dir: runtime.clone(),
+                    limits: original.requested_limits,
+                    test_run_id: "retry-uncommitted".into(),
+                    terminal: None,
+                    fresh_agent: None,
+                    opencode_transfer_dir: None,
+                    provider_volume_name: "retry-volume".into(),
+                })
+                .await
+                .unwrap();
+            // Model the exact persisted boundary without aborting a host process:
+            // create returned, but ownership was never committed to the registry.
+            (incarnation, runtime, created.container_id)
+        })
     }
 
     fn assert_uncommitted_object_quarantined(
@@ -12529,6 +12540,7 @@ pub(crate) mod automatic_retry_tests {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, _) = open(dir.path(), 0);
         let soul = seed_native(&supervisor, dir.path()).await;
+
         let original = supervisor
             .registry
             .recovery_context(soul.clone())
@@ -12622,29 +12634,26 @@ pub(crate) mod automatic_retry_tests {
 
     #[tokio::test]
     async fn retired_unowned_replacement_settles_dependency_failure_across_reopen() {
-        Box::pin(retired_unowned_dependency_failure_case()).await;
-    }
-
-    async fn retired_unowned_dependency_failure_case() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, _) = open(dir.path(), 0);
-        let soul = Box::pin(seed_native(&supervisor, dir.path())).await;
+        let soul = seed_native(&supervisor, dir.path()).await;
+
         let original = supervisor
             .registry
             .recovery_context(soul.clone())
             .await
             .unwrap();
         let (incarnation, runtime, container) =
-            Box::pin(uncommitted_replacement(&supervisor, &backend, &soul)).await;
+            uncommitted_replacement(&supervisor, &backend, &soul).await;
         drop(supervisor);
         drop(backend);
 
         let (supervisor, backend, clock) = open(dir.path(), 1_000);
-        Box::pin(supervisor.reconcile_startup()).await.unwrap();
+        supervisor.reconcile_startup().await.unwrap();
         assert_eq!(due(dir.path()), Some(3_000));
         backend.unavailable(true);
         clock.store(3_000, Ordering::SeqCst);
-        let report = Box::pin(supervisor.reconcile_startup()).await.unwrap();
+        let report = supervisor.reconcile_startup().await.unwrap();
         assert!(
             report.results.iter().all(|result| result.error.is_none()),
             "{report:?}"
@@ -12683,8 +12692,8 @@ pub(crate) mod automatic_retry_tests {
         drop(backend);
 
         let (supervisor, backend, clock) = open(dir.path(), 4_000);
-        Box::pin(supervisor.reconcile_startup()).await.unwrap();
-        Box::pin(supervisor.observe_once()).await.unwrap();
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
         assert_eq!(attempts(dir.path()), journals);
         assert_eq!(
             supervisor
@@ -12698,7 +12707,7 @@ pub(crate) mod automatic_retry_tests {
         assert_eq!(backend.count("creates"), 1);
         backend.unavailable(false);
         clock.store(13_000, Ordering::SeqCst);
-        Box::pin(supervisor.observe_once()).await.unwrap();
+        supervisor.observe_once().await.unwrap();
         let recovered = supervisor
             .registry
             .recovery_context(soul.clone())
