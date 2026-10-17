@@ -1063,6 +1063,24 @@ struct TerminalHandle {
     pty: Option<PtyTerminal>,
     managed: Option<ManagedTerminalDescriptor>,
     managed_read_in_flight: Arc<AtomicBool>,
+    managed_geometry_in_flight: Arc<AtomicBool>,
+    managed_geometry_applied: Option<ManagedGeometry>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ManagedGeometry {
+    incarnation_id: String,
+    stream_id: String,
+    cols: u16,
+    rows: u16,
+}
+
+/// One bounded host projection per facade, independent of output reads.
+struct ManagedGeometryClaim(Arc<AtomicBool>);
+impl Drop for ManagedGeometryClaim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// A nonblocking per-facade claim. Coalescing refreshes prevents a slow old
@@ -2634,6 +2652,8 @@ impl TerminalRegistry {
                 pty: Some(pty),
                 managed: None,
                 managed_read_in_flight: Arc::new(AtomicBool::new(false)),
+                managed_geometry_in_flight: Arc::new(AtomicBool::new(false)),
+                managed_geometry_applied: None,
             },
         );
         inner.revision += 1;
@@ -4805,6 +4825,8 @@ impl TerminalRegistry {
                 pty: None,
                 managed: Some(descriptor),
                 managed_read_in_flight: Arc::new(AtomicBool::new(false)),
+                managed_geometry_in_flight: Arc::new(AtomicBool::new(false)),
+                managed_geometry_applied: None,
             },
         );
         inner.revision += 1;
@@ -4903,15 +4925,102 @@ impl TerminalRegistry {
         controller.input(terminal, data).await
     }
 
+    /// Reserve a single projection of accepted client geometry to the current
+    /// host. The websocket layer polls this from its existing attach/output
+    /// lifecycle and runs the returned bounded command independently of replay.
+    /// Secondary attach dimensions never enter this state: the ordinary atomic
+    /// first-viewer geometry decision remains its only attach-time writer.
+    pub fn managed_geometry_projection(
+        &self,
+        terminal_id: &str,
+    ) -> Option<ManagedTerminalFuture<'static, Result<(), String>>> {
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone()?;
+        let (terminal, geometry, claim) = {
+            let inner = self.inner.lock().expect("registry lock");
+            let handle = inner.terminals.get(terminal_id)?;
+            let terminal = handle.managed.clone()?;
+            let s = handle.shared.lock().expect("terminal lock");
+            if s.status != TerminalRunStatus::Running
+                || !s.has_client_geometry
+                || s.subscribers.is_empty()
+                || s.managed_lifecycle
+                    .as_ref()
+                    .is_some_and(|l| l.state != ManagedLifecycleState::Running)
+            {
+                return None;
+            }
+            let geometry = ManagedGeometry {
+                incarnation_id: terminal.incarnation_id.clone(),
+                stream_id: terminal.stream_id.clone(),
+                cols: s.cols,
+                rows: s.rows,
+            };
+            if handle.managed_geometry_applied.as_ref() == Some(&geometry) {
+                return None;
+            }
+            handle
+                .managed_geometry_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .ok()?;
+            (
+                terminal,
+                geometry,
+                ManagedGeometryClaim(handle.managed_geometry_in_flight.clone()),
+            )
+        };
+        let registry = self.clone();
+        let terminal_id = terminal_id.to_owned();
+        Some(Box::pin(async move {
+            let claim = claim;
+            let result = controller
+                .resize(terminal, geometry.cols, geometry.rows)
+                .await;
+            let mut inner = registry.inner.lock().expect("registry lock");
+            if let Some(handle) = inner.terminals.get_mut(&terminal_id) {
+                // A facade, accepted owner/stream, size, or lifecycle change
+                // during I/O cannot settle the successor's pending geometry.
+                if Arc::ptr_eq(&claim.0, &handle.managed_geometry_in_flight) {
+                    let s = handle.shared.lock().expect("terminal lock");
+                    let current = handle.managed.as_ref().is_some_and(|t| {
+                        t.incarnation_id == geometry.incarnation_id
+                            && t.stream_id == geometry.stream_id
+                    });
+                    handle.managed_geometry_applied = (result.is_ok()
+                        && current
+                        && s.cols == geometry.cols
+                        && s.rows == geometry.rows
+                        && s.status == TerminalRunStatus::Running
+                        && s.managed_lifecycle
+                            .as_ref()
+                            .is_none_or(|l| l.state == ManagedLifecycleState::Running))
+                    .then_some(geometry);
+                }
+            }
+            result
+        }))
+    }
+
     pub async fn managed_resize(
         &self,
         terminal_id: &str,
         cols: u16,
         rows: u16,
     ) -> Result<(), String> {
-        let terminal = self
-            .managed_descriptor(terminal_id)
-            .ok_or_else(|| "managed terminal not found".to_string())?;
+        let terminal = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            let handle = inner
+                .terminals
+                .get_mut(terminal_id)
+                .ok_or("managed terminal not found")?;
+            // Explicit requests retain their ordinary result. A pending older
+            // projection cannot make these new canonical dimensions look done.
+            handle.managed_geometry_applied = None;
+            handle.managed.clone().ok_or("managed terminal not found")?
+        };
         let controller = self
             .managed_controller
             .read()
@@ -5349,6 +5458,8 @@ impl TerminalRegistry {
                     pty: None,
                     managed: None,
                     managed_read_in_flight: Arc::new(AtomicBool::new(false)),
+                    managed_geometry_in_flight: Arc::new(AtomicBool::new(false)),
+                    managed_geometry_applied: None,
                 },
             );
             inner.revision += 1;
