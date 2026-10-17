@@ -5676,16 +5676,36 @@ mod tests {
 
     #[test]
     fn stopped_repair_request_rejects_caller_supplied_paths_and_payloads() {
-        let value = serde_json::json!({
+        let valid = serde_json::json!({
+            "scopeId": "a".repeat(64),
+            "source": {
+                "sourceStoreId": "b".repeat(64),
+                "rootSessionIds": ["ses_fixture_root"]
+            },
             "targets": (0..8).map(|_| serde_json::json!({
                 "soulId": SoulId::new(),
                 "incidentId": IncidentId::new(),
-                "expectedIntentRevision": 1,
-                "nativePath": "/must/not/be/accepted"
+                "expectedIntentRevision": 1
             })).collect::<Vec<_>>(),
             "expectedControlEpoch": 1
         });
-        assert!(serde_json::from_value::<RestoreLostSoulsRequest>(value).is_err());
+        let request: RestoreLostSoulsRequest = serde_json::from_value(valid.clone())
+            .expect("a request without caller-supplied paths or payloads must deserialize");
+        request.validate_payload().unwrap();
+        for (field, supplied) in [
+            ("nativePath", serde_json::json!("/must/not/be/accepted")),
+            (
+                "nativePayload",
+                serde_json::json!({"messages": [{"role": "user", "content": "caller supplied"}]}),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["targets"][0][field] = supplied;
+            assert!(
+                serde_json::from_value::<RestoreLostSoulsRequest>(invalid).is_err(),
+                "caller-supplied {field} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -5951,6 +5971,7 @@ mod tests {
     fn kilroy_accepts_only_its_native_claude_context_and_grants_without_changing_mode() {
         let mut launch = fresh_agent_launch(FreshProvider::Kilroy, "kilroy");
         launch.provider_launch_context = Some(ProviderLaunchContext {
+            prepared_inputs: None,
             preparation: ProviderPreparation::Claude {
                 mcp_args: Vec::new(),
             },
@@ -5961,10 +5982,12 @@ mod tests {
             ProviderSecretReference {
                 source_path: "/private/claude.env".into(),
                 profile: ProviderSecretProfile::ClaudeOnecliEnvironment,
+                provider_relative_path: None,
             },
             ProviderSecretReference {
                 source_path: "/private/claude-ca.pem".into(),
                 profile: ProviderSecretProfile::ClaudeOnecliCaFile,
+                provider_relative_path: None,
             },
         ];
         assert!(launch.validate().is_ok());
