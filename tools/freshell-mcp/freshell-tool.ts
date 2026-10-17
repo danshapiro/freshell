@@ -57,7 +57,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 
 ## Fresh agents (in-app)
 
-- Use new-tab with agent="opencode", optional model=, effort=, cwd=. For direct Claude or Codex terminals, use mode="claude" or mode="codex". Then drive the pane with send-keys and read it with capture-pane. Example:
+- Use new-tab or split-pane with agent="claude", "kilroy", "codex", or "opencode", optional model=, effort=, permissionMode=, cwd=. Resume an existing conversation with a provider-matched sessionRef; Kilroy uses provider "claude". Raw Codex resume IDs require canonical sessionRef. Then drive the pane with send-keys and read it with capture-pane. Example:
   new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Choosing the right action
@@ -357,8 +357,8 @@ function rejectRawCodexResume(
 }
 
 // Resume sugar (`resume`/`resumeSessionId`) on the fresh-agent shorthand path
-// (agent param, no mode): only opencode maps to a synthesized sessionRef -- it
-// is the only provider the REST resume endpoint honors. codex maps to 'codex'
+// (agent param, no mode): preserve opencode's existing synthesized sessionRef.
+// Other fresh families use an explicit provider-matched sessionRef. Codex maps to 'codex'
 // so the raw-resume refusal above fires with parity to mode=codex. Every other
 // value (claude/kilroy/unknown/non-string) returns undefined: no synthesis,
 // resume fields keep their dropped behavior, and explicit sessionRef (already
@@ -541,15 +541,16 @@ async function routeAction(
 
     // -- Pane actions --
     case 'split-pane': {
+      const { direction, browser, editor, mode, shell, cwd, target: _t, resume, sessionRef, ...rest } = params || {}
+      const resumeProvider = mode ?? agentResumeProvider(rest.agent)
+      const codexResumeError = rejectRawCodexResume(resumeProvider, resume, sessionRef)
+      if (codexResumeError) return codexResumeError
       const rawTarget = params?.target as string | undefined
       const resolved = await resolvePaneTarget(rawTarget)
       if (!resolved.pane) return { error: resolved.message || 'No pane found', hint: "Run action 'list-panes' to see available panes." }
       const paneId = resolved.pane.id
-      const { direction, browser, editor, mode, shell, cwd, target: _t, resume, sessionRef, ...rest } = params || {}
-      const codexResumeError = rejectRawCodexResume(mode, resume, sessionRef)
-      if (codexResumeError) return codexResumeError
-      const effectiveSessionRef = sessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
-        ? { provider: mode, sessionId: resume }
+      const effectiveSessionRef = sessionRef ?? (typeof resumeProvider === 'string' && resumeProvider !== 'codex' && typeof resume === 'string'
+        ? { provider: resumeProvider, sessionId: resume }
         : undefined)
       return c.post(`/api/panes/${encodeURIComponent(paneId)}/split`, {
         direction, browser, editor, mode, shell, cwd, ...(effectiveSessionRef ? { sessionRef: effectiveSessionRef } : {}), ...rest,

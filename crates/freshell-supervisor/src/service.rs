@@ -3,21 +3,25 @@ use crate::{
     backend::{
         host_actor_state_dir, BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
     },
+    opencode_transfer::{OpenCodeTransferStaging, StagingLimits},
     registry::{
         stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
-        InputJournalDisposition, LaunchPreparation, PreparedLaunch, Registry, RegistryError,
+        InputJournalDisposition, LaunchPreparation, PreparedLaunch, RecoveryWriteFence, Registry,
+        RegistryError,
     },
 };
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
-    HostResult, IncarnationId, LaunchResult, LaunchState, LimitApplication, RequestId, ResumeSpec,
-    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView,
-    SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
+    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RequestId,
+    ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch,
+    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult,
+    CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -31,6 +35,62 @@ use tokio::{
     sync::Mutex,
     time::{sleep, Duration, Instant},
 };
+
+/// Private cause information retained before the public runtime error projection.
+struct ClassifiedFailure {
+    error: RuntimeError,
+    category: &'static str,
+    http_status: Option<u16>,
+}
+
+impl ClassifiedFailure {
+    fn timeout(error: RuntimeError) -> Self {
+        Self {
+            error,
+            category: "timeout",
+            http_status: None,
+        }
+    }
+
+    fn backend(error: BackendError) -> Self {
+        let (category, http_status) = backend_failure_category(&error);
+        Self {
+            error: map_backend(error),
+            category,
+            http_status,
+        }
+    }
+}
+
+impl From<RuntimeError> for ClassifiedFailure {
+    fn from(error: RuntimeError) -> Self {
+        let category = match error.code {
+            RuntimeErrorCode::HostUnreachable | RuntimeErrorCode::BackendUnavailable => {
+                "unavailable"
+            }
+            RuntimeErrorCode::HostAuthenticationFailed => "authentication_failed",
+            RuntimeErrorCode::OwnershipMismatch => "ownership_mismatch",
+            _ => "runtime_error",
+        };
+        Self {
+            error,
+            category,
+            http_status: None,
+        }
+    }
+}
+
+fn backend_failure_category(error: &BackendError) -> (&'static str, Option<u16>) {
+    match error {
+        BackendError::Unavailable(_) => ("unavailable", None),
+        BackendError::OwnershipMismatch(_) => ("ownership_mismatch", None),
+        BackendError::PolicyMismatch(_) => ("policy_mismatch", None),
+        BackendError::DockerHttp { status, .. } => ("docker_http", Some(*status)),
+        BackendError::Malformed(_) => ("malformed_response", None),
+        BackendError::InvalidConfig(_) => ("invalid_config", None),
+        BackendError::StoppedRepair(_) => ("stopped_repair", None),
+    }
+}
 
 #[derive(Clone)]
 pub struct SupervisorConfig {
@@ -50,6 +110,19 @@ pub(crate) struct LaunchWorkload {
     pub(crate) terminal: Option<TerminalLaunchSpec>,
     pub(crate) fresh_agent: Option<FreshAgentLaunchSpec>,
     pub(crate) resume_spec: Option<ResumeSpec>,
+}
+
+impl LaunchWorkload {
+    // Ordinary and imported terminals share the native TUI loader. Choosing
+    // its readiness budget supplies no adoption or identity evidence.
+    pub(crate) fn opencode_tui_readiness_required(&self, provider: &str) -> bool {
+        provider == "opencode"
+            && self.fresh_agent.is_none()
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.mode == "opencode" && terminal.validate().is_ok())
+    }
 }
 
 struct McpCapabilityRequest<'a> {
@@ -109,9 +182,13 @@ pub struct Supervisor {
     pub(crate) registry: Registry,
     pub(crate) backend: Arc<dyn RuntimeBackend>,
     pub(crate) config: Arc<SupervisorConfig>,
+    pub(crate) opencode_transfer_staging: Arc<OpenCodeTransferStaging>,
+    /// Serializes a ready-stage launch claim plus registry preparation with
+    /// cleanup's registry snapshot and filesystem reclamation.
+    pub(crate) opencode_transfer_lifecycle_lock: Arc<Mutex<()>>,
     /// Recovery and input dispatch serialize per soul, while unrelated souls
-    /// remain independently recoverable. Stop intentionally does not take this
-    /// lock: its durable intent revision must be able to preempt recovery.
+    /// remain independently recoverable. Stop commits its durable intent before
+    /// waiting for this lock so it can invalidate an in-flight operation.
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Bounds repeated provider-store probes for an unchanged live identity.
     pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
@@ -154,6 +231,14 @@ impl Supervisor {
         let mut config = config;
         config.runtime_root = canonical_root;
         config.host_binary_path = canonical_binary;
+        let opencode_transfer_staging =
+            OpenCodeTransferStaging::new(&config.runtime_root, StagingLimits::production())
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RegistryFailure,
+                        format!("initialize OpenCode transfer staging: {error}"),
+                    )
+                })?;
         lifecycle_secrets()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -162,6 +247,8 @@ impl Supervisor {
             registry,
             backend,
             config: Arc::new(config),
+            opencode_transfer_staging: Arc::new(opencode_transfer_staging),
+            opencode_transfer_lifecycle_lock: Arc::new(Mutex::new(())),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
@@ -182,9 +269,126 @@ impl Supervisor {
         )
     }
 
+    /// Retry cleanup for receipt-confirmed stages after startup or a prior
+    /// cleanup interruption. The registry is the authority for active
+    /// prepared/retry references.
+    ///
+    /// The registry snapshot and filesystem removal are separate operations.
+    /// A concurrent launch cannot add a valid reference to the same ready
+    /// stage in between: its descriptor pins the transfer to a unique
+    /// incarnation, which the registry will not prepare twice. A different
+    /// descriptor reusing the transfer ID cannot consume the existing ready
+    /// bundle, and begin/reclaim serialize under the staging lock.
+    pub async fn cleanup_opencode_transfer_staging(&self) -> Result<usize, RuntimeError> {
+        let _lifecycle_guard = self.opencode_transfer_lifecycle_lock.lock().await;
+        self.recover_opencode_transfer_receipts().await;
+        let references = self
+            .registry
+            .opencode_transfer_stage_references()
+            .await
+            .map_err(map_registry)?;
+        let referenced_transfer_ids = references.keys().cloned().collect::<HashSet<_>>();
+        let staging = Arc::clone(&self.opencode_transfer_staging);
+        tokio::task::spawn_blocking(move || {
+            staging.reconcile_registering_ready(&references)?;
+            let abandoned = staging.reclaim_abandoned_partials()?;
+            let expired_ready = staging.reclaim_abandoned_ready(&referenced_transfer_ids)?;
+            let receipt_released = staging.reclaim_release_eligible(&referenced_transfer_ids)?;
+            Ok(abandoned + expired_ready + receipt_released)
+        })
+        .await
+        .map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorCode::RegistryFailure,
+                format!("OpenCode stage cleanup worker did not settle: {error}"),
+            )
+        })?
+        .map_err(map_opencode_transfer)
+    }
+
+    /// Recover the narrow crash window where the host persisted a receipt and
+    /// accepted the grant, but the supervisor stopped before writing its
+    /// release marker. Host status is authenticated with the same per-runtime
+    /// secret as grant delivery, and the marker remains pinned while the
+    /// registry still says the launch is starting.
+    async fn recover_opencode_transfer_receipts(&self) {
+        let candidates = match self.registry.opencode_transfer_receipt_candidates().await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.opencode_transfer_receipt_recovery_failed",
+                    serde_json::json!({"stage":"load_candidates","error":error.to_string()}),
+                );
+                return;
+            }
+        };
+        for incarnation_id in candidates {
+            let result = self
+                .recover_opencode_transfer_receipt(&incarnation_id)
+                .await;
+            if let Err(error) = result {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.opencode_transfer_receipt_recovery_deferred",
+                    serde_json::json!({"incarnationId":incarnation_id,"error":error.message}),
+                );
+            }
+        }
+    }
+
+    async fn recover_opencode_transfer_receipt(
+        &self,
+        incarnation_id: &IncarnationId,
+    ) -> Result<(), RuntimeError> {
+        let handle = self
+            .registry
+            .owned_handle(incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let Some(terminal) = handle.terminal() else {
+            return Ok(());
+        };
+        let Some(descriptor) = terminal.opencode_transfer.as_ref() else {
+            return Ok(());
+        };
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let status = self
+            .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
+            .await?;
+        let Some(receipt) = status.opencode_transfer_receipt else {
+            return Ok(());
+        };
+        let Some(receipt) = validate_opencode_transfer_receipt(
+            Some(descriptor),
+            Some((terminal.run_as_uid, terminal.run_as_gid)),
+            Some(receipt),
+        )?
+        else {
+            return Ok(());
+        };
+        let staging = Arc::clone(&self.opencode_transfer_staging);
+        let descriptor = descriptor.clone();
+        tokio::task::spawn_blocking(move || staging.mark_release_eligible(&descriptor, &receipt))
+            .await
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RegistryFailure,
+                    format!("OpenCode receipt recovery worker did not settle: {error}"),
+                )
+            })?
+            .map_err(map_opencode_transfer)?;
+        Ok(())
+    }
+
     pub async fn dispatch(&self, envelope: Envelope<AdminCommand>) -> AdminReply {
         let request_id = envelope.request_id.clone();
-        let result = self.dispatch_inner(envelope).await;
+        // The command switch retains provider/recovery futures of different
+        // sizes. Poll it on the heap rather than nesting that whole state in
+        // this outer reply future on the runtime worker's stack.
+        let result = Box::pin(self.dispatch_inner(envelope)).await;
         AdminReply { request_id, result }
     }
 
@@ -210,6 +414,25 @@ impl Supervisor {
                 "invalid web-control credential",
             ));
         }
+        match envelope.body {
+            AdminCommand::Recover(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                // Recovery must not retain the general command switch's
+                // unrelated provider futures on the worker's polling stack.
+                Box::pin(self.recover(request))
+                    .await
+                    .map(AdminResult::Recovery)
+            }
+            _ => Box::pin(self.dispatch_non_recovery(envelope)).await,
+        }
+    }
+
+    async fn dispatch_non_recovery(
+        &self,
+        envelope: Envelope<AdminCommand>,
+    ) -> Result<AdminResult, RuntimeError> {
         match envelope.body {
             AdminCommand::ReserveProviderInputs(request) => {
                 self.registry
@@ -312,6 +535,123 @@ impl Supervisor {
                 control_epoch: self.registry.control_epoch(),
                 installation_id: self.registry.installation_id().clone(),
             }),
+            AdminCommand::OpenCodeTransfer(action) => {
+                let result = match action {
+                    OpenCodeTransferAction::TargetInfo => OpenCodeTransferResult::TargetInfo {
+                        image_ref: self.config.image_ref.clone(),
+                        provider_schema: "opencode-1.18.21".into(),
+                        build_receipt: freshell_runtime_protocol::opencode_target_build_receipt(
+                            &self.config.image_ref,
+                            "opencode-1.18.21",
+                        ),
+                    },
+                    OpenCodeTransferAction::Begin {
+                        descriptor,
+                        attempt_id,
+                    } => {
+                        let _lifecycle_guard = self.opencode_transfer_lifecycle_lock.lock().await;
+                        if descriptor.target_image_ref != self.config.image_ref {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "OpenCode transfer target image does not match the supervisor runtime image",
+                            ));
+                        }
+                        if self
+                            .opencode_transfer_staging
+                            .ready_registration_needs_reconciliation(&descriptor.transfer_id)
+                            .map_err(map_opencode_transfer)?
+                        {
+                            let references = self
+                                .registry
+                                .opencode_transfer_stage_references()
+                                .await
+                                .map_err(map_registry)?;
+                            self.opencode_transfer_staging
+                                .reconcile_registering_ready(&references)
+                                .map_err(map_opencode_transfer)?;
+                        }
+                        match self
+                            .opencode_transfer_staging
+                            .begin_from_filesystem(&descriptor, &attempt_id)
+                            .map_err(map_opencode_transfer)?
+                        {
+                            crate::opencode_transfer::StagingStart::Started {
+                                next_sequence,
+                                file_offsets,
+                            } => OpenCodeTransferResult::Started {
+                                next_sequence,
+                                file_offsets,
+                            },
+                            crate::opencode_transfer::StagingStart::Queued => {
+                                OpenCodeTransferResult::Queued {
+                                    transfer_id: descriptor.transfer_id,
+                                }
+                            }
+                        }
+                    }
+                    OpenCodeTransferAction::WaitForCapacity {
+                        transfer_id,
+                        attempt_id,
+                    } => match self
+                        .opencode_transfer_staging
+                        .wait_for_capacity(&transfer_id, &attempt_id)
+                        .await
+                        .map_err(map_opencode_transfer)?
+                    {
+                        crate::opencode_transfer::StagingStart::Started {
+                            next_sequence,
+                            file_offsets,
+                        } => OpenCodeTransferResult::Started {
+                            next_sequence,
+                            file_offsets,
+                        },
+                        crate::opencode_transfer::StagingStart::Queued => {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RegistryFailure,
+                                "capacity wait returned before a queue entry was promoted",
+                            ));
+                        }
+                    },
+                    OpenCodeTransferAction::Chunk(chunk) => {
+                        let sequence = chunk.sequence;
+                        self.opencode_transfer_staging
+                            .write_chunk(&chunk)
+                            .map_err(map_opencode_transfer)?;
+                        OpenCodeTransferResult::ChunkStored { sequence }
+                    }
+                    OpenCodeTransferAction::Finalize {
+                        transfer_id,
+                        attempt_id,
+                    } => {
+                        self.opencode_transfer_staging
+                            .finalize(&transfer_id, &attempt_id)
+                            .map_err(map_opencode_transfer)?;
+                        OpenCodeTransferResult::Ready { transfer_id }
+                    }
+                    OpenCodeTransferAction::Abort {
+                        transfer_id,
+                        attempt_id,
+                    } => {
+                        let _lifecycle_guard = self.opencode_transfer_lifecycle_lock.lock().await;
+                        let references = self
+                            .registry
+                            .opencode_transfer_stage_references()
+                            .await
+                            .map_err(map_registry)?;
+                        let referenced_transfer_ids =
+                            references.keys().cloned().collect::<HashSet<_>>();
+                        self.opencode_transfer_staging
+                            .abort_with_references(
+                                &transfer_id,
+                                &attempt_id,
+                                &referenced_transfer_ids,
+                            )
+                            .map_err(map_opencode_transfer)?;
+                        OpenCodeTransferResult::Aborted { transfer_id }
+                    }
+                };
+                Ok(AdminResult::OpenCodeTransfer(result))
+            }
             AdminCommand::Inventory => Ok(AdminResult::Inventory(
                 self.registry.inventory().await.map_err(map_registry)?,
             )),
@@ -428,6 +768,19 @@ impl Supervisor {
                         .await
                         .map_err(map_registry)?,
                 ))
+            }
+            AdminCommand::PreflightLostSouls(request) => self
+                .preflight_lost_souls(request)
+                .await
+                .map(AdminResult::PreflightLostSouls),
+            AdminCommand::RestoreLostSouls(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                request.validate_payload()?;
+                self.restore_lost_souls(envelope.request_id, request)
+                    .await
+                    .map(AdminResult::RestoreLostSouls)
             }
             AdminCommand::MetricsSnapshot => Ok(AdminResult::MetricsSnapshot(
                 self.registry
@@ -606,7 +959,7 @@ impl Supervisor {
                         "saved native session identity unavailable",
                     )
                 })?;
-                let snapshot = self
+                let mut snapshot = self
                     .backend
                     .read_native_history(
                         handle,
@@ -631,6 +984,15 @@ impl Supervisor {
                         "native history identity mismatch",
                     ));
                 }
+                // Presentation context comes from the persisted owned launch.
+                // It does not assert provider identity, LIVE, or loss evidence.
+                snapshot["managedDirectory"] = serde_json::json!({
+                    "incarnationId": handle.incarnation_id(),
+                    "cwd": agent.cwd,
+                    "workspacePath": agent.workspace_path,
+                    "gitCommonDir": agent.git_common_dir,
+                    "sessionType": agent.session_type,
+                });
                 Ok(AdminResult::FreshAgentHistory(snapshot))
             }
             AdminCommand::FreshAgentReadEvents(request) => {
@@ -661,11 +1023,8 @@ impl Supervisor {
                     .await
                     .map(AdminResult::RecoveryProbe)
             }
-            AdminCommand::Recover(request) => {
-                self.registry
-                    .assert_epoch(request.expected_control_epoch)
-                    .map_err(map_registry)?;
-                self.recover(request).await.map(AdminResult::Recovery)
+            AdminCommand::Recover(_) => {
+                unreachable!("recovery is dispatched before the general command switch")
             }
         }
     }
@@ -877,15 +1236,15 @@ impl Supervisor {
         request_id: RequestId,
         request: freshell_runtime_protocol::LaunchRequest,
     ) -> Result<LaunchResult, RuntimeError> {
-        let lock = self.lifecycle_lock(&request.soul_id).await;
-        let _guard = lock.lock().await;
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
         let limits = request.limits.validate()?;
         request.validate_workload()?;
         if !release_qualified_workload(
             &request.provider,
             request.fixture.is_some(),
             request.terminal.is_some(),
-            request.fresh_agent.is_some(),
+            request.fresh_agent.as_ref(),
         ) {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::UnsupportedWorkload,
@@ -899,27 +1258,121 @@ impl Supervisor {
             RuntimeError::new(RuntimeErrorCode::InvalidRuntimeLimits, message)
         })?;
         let payload_digest = semantic_launch_digest(&request)?;
-        let prepared = self
-            .registry
-            .prepare_launch(LaunchPreparation {
-                soul_id: request.soul_id.clone(),
-                provider: request.provider.clone(),
-                provider_store_id: request.provider_store_id.clone(),
-                native_session_id: request.native_session_id.clone(),
-                creation_seed_ref: request.creation_seed_ref.clone(),
-                request_id: request_id.clone(),
-                payload_digest,
-                requested_limits: limits,
-                profile: request.profile,
-                project_key: request.project_key.clone(),
-                fixture: request.fixture,
-                terminal: request.terminal.clone(),
-                fresh_agent: request.fresh_agent.clone(),
-                view_intent: request.view_intent.clone(),
-                admission: self.config.admission,
+        let transfer_claim = request.terminal.as_ref().and_then(|terminal| {
+            terminal.opencode_transfer.as_ref().map(|descriptor| {
+                (
+                    descriptor.clone(),
+                    terminal.opencode_transfer_attempt_id.clone(),
+                )
+            })
+        });
+        let transfer_claim_guard = if transfer_claim.is_some() {
+            Some(self.opencode_transfer_lifecycle_lock.lock().await)
+        } else {
+            None
+        };
+        if let Some((descriptor, attempt_id)) = &transfer_claim {
+            let attempt_id = attempt_id.as_deref().ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "OpenCode transfer launch has no staging attempt",
+                )
+            })?;
+            let references = self
+                .registry
+                .opencode_transfer_stage_references()
+                .await
+                .map_err(map_registry)?;
+            let already_referenced = self
+                .opencode_transfer_staging
+                .has_exact_registry_reference(&references, descriptor)
+                .map_err(map_opencode_transfer)?;
+            let staging = Arc::clone(&self.opencode_transfer_staging);
+            let descriptor = descriptor.clone();
+            let attempt_id = attempt_id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                staging.mark_launch_registering(&descriptor, &attempt_id, already_referenced)
             })
             .await
-            .map_err(map_registry)?;
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RegistryFailure,
+                    format!("OpenCode launch-claim worker did not settle: {error}"),
+                )
+            })?
+            .map_err(map_opencode_transfer)?;
+        }
+
+        let preparation = LaunchPreparation {
+            soul_id: request.soul_id.clone(),
+            provider: request.provider.clone(),
+            provider_store_id: request.provider_store_id.clone(),
+            native_session_id: request.native_session_id.clone(),
+            creation_seed_ref: request.creation_seed_ref.clone(),
+            request_id: request_id.clone(),
+            payload_digest,
+            requested_limits: limits,
+            profile: request.profile,
+            project_key: request.project_key.clone(),
+            fixture: request.fixture,
+            terminal: request.terminal.clone(),
+            fresh_agent: request.fresh_agent.clone(),
+            view_intent: request.view_intent.clone(),
+            admission: self.config.admission,
+        };
+        let prepared = match self.registry.prepare_launch(preparation).await {
+            Ok(prepared) => {
+                if let Some((descriptor, attempt_id)) = &transfer_claim {
+                    let attempt_id = attempt_id
+                        .as_deref()
+                        .expect("validated OpenCode transfer has a staging attempt");
+                    let staging = Arc::clone(&self.opencode_transfer_staging);
+                    let descriptor = descriptor.clone();
+                    let attempt_id = attempt_id.to_owned();
+                    tokio::task::spawn_blocking(move || {
+                        staging.mark_launch_claimed(&descriptor, &attempt_id)
+                    })
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::RegistryFailure,
+                            format!("OpenCode registered-claim worker did not settle: {error}"),
+                        )
+                    })?
+                    .map_err(map_opencode_transfer)?;
+                }
+                prepared
+            }
+            Err(error) => {
+                if let Some((descriptor, attempt_id)) = &transfer_claim {
+                    if let Some(attempt_id) = attempt_id.as_deref() {
+                        if let Ok(references) =
+                            self.registry.opencode_transfer_stage_references().await
+                        {
+                            let staging = Arc::clone(&self.opencode_transfer_staging);
+                            let descriptor = descriptor.clone();
+                            let attempt_id = attempt_id.to_owned();
+                            if staging
+                                .has_exact_registry_reference(&references, &descriptor)
+                                .unwrap_or(false)
+                            {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    staging.mark_launch_claimed(&descriptor, &attempt_id)
+                                })
+                                .await;
+                            } else if !references.contains_key(&descriptor.transfer_id) {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    staging.restore_unregistered_pending(&descriptor, &attempt_id)
+                                })
+                                .await;
+                            }
+                        }
+                    }
+                }
+                return Err(map_registry(error));
+            }
+        };
+        drop(transfer_claim_guard);
         append_event(
             &self.config.lifecycle_log,
             "supervisor.launch_prepared",
@@ -947,6 +1400,23 @@ impl Supervisor {
         workload: LaunchWorkload,
         limits: RuntimeLimits,
     ) -> Result<LaunchResult, RuntimeError> {
+        let fence = self
+            .registry
+            .recovery_write_fence(workload.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        self.activate_prepared_observed(prepared, workload, limits, fence)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    pub(crate) async fn activate_prepared_observed(
+        &self,
+        prepared: PreparedLaunch,
+        workload: LaunchWorkload,
+        limits: RuntimeLimits,
+        mut fence: RecoveryWriteFence,
+    ) -> Result<(LaunchResult, RecoveryWriteFence), RuntimeError> {
         let mut state = prepared.state;
         if let Some(capability) = workload
             .terminal
@@ -976,6 +1446,19 @@ impl Supervisor {
             let runtime_dir = self.ensure_incarnation_dir(&prepared).map_err(|error| {
                 self.activation_failure(&prepared, state, "ensure_runtime_directory", error)
             })?;
+            let opencode_transfer_dir = workload
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.opencode_transfer.as_ref())
+                .map(|descriptor| {
+                    self.opencode_transfer_staging
+                        .verify_ready(descriptor)
+                        .map_err(map_opencode_transfer)
+                })
+                .transpose()
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "verify_opencode_transfer", error)
+                })?;
             if workload.fresh_agent.is_some() {
                 ensure_host_actor_state_dir(
                     &self.config.runtime_root,
@@ -1017,13 +1500,21 @@ impl Supervisor {
                     test_run_id: self.config.test_run_id.clone(),
                     terminal: workload.terminal.clone(),
                     fresh_agent: workload.fresh_agent.clone(),
+                    opencode_transfer_dir,
                     provider_volume_name: stable_provider_volume_name(
                         self.registry.installation_id(),
                         &prepared.soul_id,
                     ),
                 })
                 .await
-                .map_err(map_backend)
+                .map_err(|error| {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.activation_backend_failed",
+                        activation_backend_failure_data(&prepared, state, &error),
+                    );
+                    map_backend(error)
+                })
                 .map_err(|error| {
                     self.activation_failure(&prepared, state, "create_stopped_runtime", error)
                 })?;
@@ -1043,6 +1534,9 @@ impl Supervisor {
                         runtime_dir,
                         host_binary_path: self.config.host_binary_path.clone(),
                         immutable_config_digest: created.immutable_config_digest,
+                        launch_policy: Some(
+                            freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+                        ),
                     },
                 )
                 .await
@@ -1087,6 +1581,7 @@ impl Supervisor {
                     workload.soul_id.clone(),
                     authenticated,
                     status,
+                    fence,
                 )
                 .await
                 .map_err(|error| {
@@ -1153,7 +1648,7 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
             })?;
-        let accepted = match self
+        let mut accepted = match self
             .send_grant(&handle, &workload, &authenticated, &grant)
             .await
         {
@@ -1174,21 +1669,169 @@ impl Supervisor {
                 ));
             }
             Err(error) => {
+                let codex_pre_worker_failure = match error.diagnostic_code {
+                    Some(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::CodexAppServerStartFailed,
+                    ) => Some("CODEX_APP_SERVER_START_FAILED"),
+                    Some(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::CodexProxyStartFailed,
+                    ) => Some("CODEX_PROXY_START_FAILED"),
+                    Some(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::FreshAgentProviderStartFailed,
+                    ) if handle.fresh_agent().is_some_and(|agent| {
+                        agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+                    }) => Some("FRESH_AGENT_PROVIDER_START_FAILED"),
+                    _ => None,
+                };
+                if let Some(failure_reason) = codex_pre_worker_failure {
+                    self.settle_known_codex_pre_worker_failure(
+                        &prepared,
+                        &handle,
+                        &grant,
+                        failure_reason,
+                    )
+                    .await;
+                }
                 return Err(self.activation_failure(
                     &prepared,
                     state,
                     "deliver_execution_grant",
                     error,
-                ))
+                ));
             }
         };
+        let native_context = self
+            .registry
+            .recovery_context(workload.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let requires_native_observation = workload.fixture.is_none()
+            && matches!(
+                native_context.provider.as_str(),
+                "claude" | "kilroy" | "codex" | "opencode" | "amplifier"
+            )
+            && !workload.fresh_agent.as_ref().is_some_and(|agent| {
+                crate::registry::deterministic_fresh_agent_fixture(&native_context.provider, agent)
+            });
+        if requires_native_observation {
+            let wait = Box::pin(self.wait_for_native_startup(
+                &workload,
+                handle.incarnation_id(),
+                &native_context,
+                prepared.intent_revision,
+            ))
+            .await;
+            let observed = match wait {
+                crate::recovery::NativeIdentityWait::Observed {
+                    native_session_id, ..
+                } => native_session_id,
+                crate::recovery::NativeIdentityWait::HostUnavailable {
+                    transient: Some(_), ..
+                } => {
+                    return Err(self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "native startup host transport unavailable",
+                        ),
+                    ));
+                }
+                crate::recovery::NativeIdentityWait::StopIntent { .. }
+                | crate::recovery::NativeIdentityWait::IntentChanged { .. } => {
+                    return Err(self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::StaleIntentRevision,
+                            "durable intent changed during native startup",
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryBlocked,
+                            "current native provider startup observation is unavailable",
+                        ),
+                    ))
+                }
+            };
+            // Recheck the still-live current child before publication. This
+            // path retains the original write fence; waiting does not publish
+            // a root or adopt a newer revision on this activation's behalf.
+            let current = self
+                .registry
+                .recovery_context(workload.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            let status = self
+                .host_status(
+                    handle.incarnation_id().clone(),
+                    handle.runtime_dir(),
+                    &authenticated,
+                )
+                .await?;
+            let observation = crate::recovery::current_native_observation(&current, &status)
+                .filter(|observation| !status.exited && observation.native_session_id == observed)
+                .cloned()
+                .ok_or_else(|| {
+                    self.activation_failure(
+                        &prepared,
+                        state,
+                        "verify_native_startup",
+                        RuntimeError::new(
+                            RuntimeErrorCode::RecoveryBlocked,
+                            "current native provider changed during startup",
+                        ),
+                    )
+                })?;
+            accepted.native_session_id = Some(observed);
+            accepted.native_identity_observation = Some(observation);
+        }
+        if let (Some(terminal), Some(receipt)) = (
+            workload.terminal.as_ref(),
+            accepted.opencode_transfer_receipt.as_ref(),
+        ) {
+            if let Some(descriptor) = terminal.opencode_transfer.as_ref() {
+                let staging = Arc::clone(&self.opencode_transfer_staging);
+                let descriptor = descriptor.clone();
+                let transfer_id = descriptor.transfer_id.clone();
+                let receipt = receipt.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    staging.mark_release_eligible(&descriptor, &receipt)
+                })
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RegistryFailure,
+                        format!("OpenCode stage marker worker did not settle: {error}"),
+                    )
+                })
+                .and_then(|result| result.map_err(map_opencode_transfer))
+                {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.opencode_transfer_release_marker_deferred",
+                        serde_json::json!({"incarnationId":handle.incarnation_id(),"transferId":transfer_id,"error":error.message}),
+                    );
+                }
+            }
+        }
         crash_if("after_grant_delivery");
         if let Some(native_session_id) = accepted.native_session_id.as_ref() {
-            self.registry
-                .record_native_session(
+            fence = self
+                .registry
+                .record_native_session_fenced(
                     workload.soul_id.clone(),
                     handle.incarnation_id().clone(),
                     native_session_id.clone(),
+                    fence,
                 )
                 .await
                 .map_err(map_registry)
@@ -1196,9 +1839,33 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "record_native_identity", error)
                 })?;
         }
-        self.registry
-            .mark_running_with_provider_preparation(
+        if let Some(observation) =
+            accepted
+                .native_identity_observation
+                .as_ref()
+                .filter(|observation| {
+                    accepted.native_session_id.as_deref()
+                        == Some(observation.native_session_id.as_str())
+                })
+        {
+            self.registry
+                .record_native_identity_observation(
+                    workload.soul_id.clone(),
+                    observation.clone(),
+                    fence.clone(),
+                )
+                .await
+                .map_err(map_registry)
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "record_native_observation", error)
+                })?;
+        }
+        fence = self
+            .registry
+            .mark_running_observed_with_provider_preparation(
+                workload.soul_id.clone(),
                 handle.incarnation_id().clone(),
+                fence,
                 workload.resume_spec.is_none(),
             )
             .await
@@ -1206,6 +1873,13 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "commit_running_state", error)
             })?;
+        if let Err(error) = self.cleanup_opencode_transfer_staging().await {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.opencode_transfer_cleanup_deferred",
+                serde_json::json!({"incarnationId":handle.incarnation_id(),"error":error.message}),
+            );
+        }
         if workload.resume_spec.is_none() {
             self.complete_pending_provider_preparation(&handle)
                 .await
@@ -1223,14 +1897,17 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "load_running_view", error)
             })?;
-        Ok(LaunchResult {
-            view,
-            worker_pid: accepted.worker_pid,
-            worker_launch_count: accepted.worker_launch_count,
-            host_boot_id: accepted.host_boot_id,
-            effective_limits: authenticated.effective_limits,
-            fixture_evidence: accepted.fixture_evidence,
-        })
+        Ok((
+            LaunchResult {
+                view,
+                worker_pid: accepted.worker_pid,
+                worker_launch_count: accepted.worker_launch_count,
+                host_boot_id: accepted.host_boot_id,
+                effective_limits: authenticated.effective_limits,
+                fixture_evidence: accepted.fixture_evidence,
+            },
+            fence,
+        ))
     }
 
     async fn settle_rejected_initial_inputs(
@@ -1315,6 +1992,178 @@ impl Supervisor {
             activation_failure_data(prepared, state, stage, &error),
         );
         error
+    }
+
+    async fn settle_known_codex_pre_worker_failure(
+        &self,
+        prepared: &PreparedLaunch,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        grant: &ExecutionGrantRecord,
+        failure_reason: &'static str,
+    ) {
+        let codex_workload = handle
+            .terminal()
+            .is_some_and(|terminal| terminal.mode == "codex")
+            || handle.fresh_agent().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+            });
+        if !codex_workload || !self.stop_and_verify_empty_codex_runtime(handle).await {
+            return;
+        }
+
+        match self
+            .registry
+            .fail_codex_pre_worker_start(handle.clone(), prepared.intent_revision, grant.clone())
+            .await
+        {
+            Ok(()) => append_event(
+                &self.config.lifecycle_log,
+                "supervisor.codex_pre_worker_failure_settled",
+                serde_json::json!({
+                    "severity":"info",
+                    "soulId":handle.soul_id(),
+                    "incarnationId":handle.incarnation_id(),
+                    "intentRevision":prepared.intent_revision,
+                    "executionGeneration":grant.execution_generation,
+                    "controlEpoch":grant.control_epoch,
+                    "failureReason":failure_reason,
+                    "cleanup":"verified_empty",
+                }),
+            ),
+            Err(error) => {
+                let registry_error = map_registry(error);
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.codex_pre_worker_failure_settlement_deferred",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "soulId":handle.soul_id(),
+                        "incarnationId":handle.incarnation_id(),
+                        "intentRevision":prepared.intent_revision,
+                        "executionGeneration":grant.execution_generation,
+                        "controlEpoch":grant.control_epoch,
+                        "reason":"registry_fence_changed",
+                        "errorCode":registry_error.code,
+                        "cleanup":"verified_empty",
+                    }),
+                );
+            }
+        }
+    }
+
+    /// A classified Codex pre-worker provider-start failure is emitted before
+    /// the worker can be trusted to exist. Reclaim only that incarnation's
+    /// exact owned container, and only after a backend inspection proves it
+    /// empty. Docker stop/kill applies to every helper in that container too.
+    async fn stop_and_verify_empty_codex_runtime(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> bool {
+        let initial = self
+            .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
+            .await;
+        match initial {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(failure) => {
+                self.codex_cleanup_stage_failed(handle, "initial_empty_inspection", &failure);
+                return false;
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_secs(3), self.backend.request_stop(handle, 2))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.codex_cleanup_stage_failed(
+                handle,
+                "graceful_stop",
+                &ClassifiedFailure::backend(error),
+            ),
+            Err(_) => self.codex_cleanup_stage_failed(
+                handle,
+                "graceful_stop",
+                &ClassifiedFailure::timeout(RuntimeError::new(
+                    RuntimeErrorCode::BackendUnavailable,
+                    "Codex pre-worker cleanup stop timed out",
+                )),
+            ),
+        }
+
+        match self
+            .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
+            .await
+        {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(failure) => {
+                self.codex_cleanup_stage_failed(handle, "graceful_empty_inspection", &failure);
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_secs(3), self.backend.force_stop(handle)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.codex_cleanup_stage_failed(
+                handle,
+                "force_stop",
+                &ClassifiedFailure::backend(error),
+            ),
+            Err(_) => self.codex_cleanup_stage_failed(
+                handle,
+                "force_stop",
+                &ClassifiedFailure::timeout(RuntimeError::new(
+                    RuntimeErrorCode::BackendUnavailable,
+                    "Codex pre-worker cleanup force stop timed out",
+                )),
+            ),
+        }
+
+        match self
+            .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                self.codex_cleanup_stage_failed(
+                    handle,
+                    "force_empty_inspection",
+                    &ClassifiedFailure {
+                        error: RuntimeError::new(
+                            RuntimeErrorCode::BackendUnavailable,
+                            "runtime remained active after exact cleanup",
+                        ),
+                        category: "not_empty",
+                        http_status: None,
+                    },
+                );
+                false
+            }
+            Err(failure) => {
+                self.codex_cleanup_stage_failed(handle, "force_empty_inspection", &failure);
+                false
+            }
+        }
+    }
+
+    fn codex_cleanup_stage_failed(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        failure: &ClassifiedFailure,
+    ) {
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.codex_pre_worker_cleanup_stage_failed",
+            serde_json::json!({
+                "severity":"warning",
+                "soulId":handle.soul_id(),
+                "incarnationId":handle.incarnation_id(),
+                "stage":stage,
+                "errorCategory":failure.category,
+                "errorCode":failure.error.code,
+                "httpStatus":failure.http_status,
+            }),
+        );
     }
 
     async fn terminal_input(
@@ -1477,6 +2326,9 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
+        let host = self
+            .authenticate_current_fresh_host(&soul_id, &active)
+            .await?;
         let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
             Some(logical_attempt_id) => {
                 serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
@@ -1519,19 +2371,11 @@ impl Supervisor {
             .mark_input_dispatching(soul_id.clone(), request_id.clone())
             .await
             .map_err(map_registry)?;
-        let host = match self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+        let fence = self
+            .registry
+            .recovery_write_fence(soul_id.clone())
             .await
-        {
-            Ok(host) => host,
-            Err(error) => {
-                self.registry
-                    .mark_input_ambiguous(soul_id, request_id)
-                    .await
-                    .map_err(map_registry)?;
-                return Err(error);
-            }
-        };
+            .map_err(map_registry)?;
         let response = self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -1550,13 +2394,15 @@ impl Supervisor {
             Ok(HostResult::FreshAgentCommand {
                 state: CommandState::ProviderAcked | CommandState::Completed,
                 native_session_id,
+                ..
             }) => {
                 if let Some(native_session_id) = native_session_id {
                     self.registry
-                        .record_native_session(
+                        .record_native_session_fenced(
                             soul_id.clone(),
                             handle.incarnation_id().clone(),
                             native_session_id,
+                            fence,
                         )
                         .await
                         .map_err(map_registry)?;
@@ -1594,6 +2440,48 @@ impl Supervisor {
         }
     }
 
+    async fn authenticate_current_fresh_host(
+        &self,
+        soul_id: &SoulId,
+        active: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<AuthenticatedHost, RuntimeError> {
+        let host = self
+            .authenticate_host(active.incarnation_id(), active.runtime_dir())
+            .await?;
+        let status = self
+            .host_status(active.incarnation_id().clone(), active.runtime_dir(), &host)
+            .await?;
+        let current = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let fixture = current.fresh_agent.as_ref().is_some_and(|agent| {
+            crate::registry::deterministic_fresh_agent_fixture(&current.provider, agent)
+        });
+        if current.desired_state != freshell_runtime_protocol::DesiredState::Running
+            || current.prior_handle.incarnation_id() != active.incarnation_id()
+            || status.exited
+            || (!fixture
+                && (!host
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "native-identity-observation-v1")
+                    || crate::recovery::current_native_observation(&current, &status).is_none()))
+        {
+            append_event(
+                &self.config.lifecycle_log,
+                "fresh_agent.input_native_identity_unsettled",
+                serde_json::json!({"severity":"warn","soulId":soul_id,"incarnationId":active.incarnation_id()}),
+            );
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "fresh-agent input requires the current committed native identity",
+            ));
+        }
+        Ok(host)
+    }
+
     async fn fresh_agent_fork(
         &self,
         request_id: RequestId,
@@ -1614,6 +2502,7 @@ impl Supervisor {
                 "fresh-agent native identity is not materialized",
             )
         })?;
+        let fence = context.write_fence();
         let handle = context.prior_handle;
         if handle.fresh_agent().is_none() {
             return Err(RuntimeError::new(
@@ -1649,23 +2538,61 @@ impl Supervisor {
         let already_applied = classify_fresh_agent_fork_transition(&parent_native, &transition)?;
         if !already_applied {
             self.registry
-                .transition_native_session(
+                .transition_native_session_fenced(
                     soul_id.clone(),
                     handle.incarnation_id().clone(),
                     &parent_native,
                     &transition.child_session_id,
+                    fence,
                 )
                 .await
                 .map_err(map_registry)?;
         }
         // Re-materialize exact resume evidence for the child immediately. A
         // successful fork never leaves the soul recoverable only as its parent.
-        let _ = self.probe_recovery(soul_id).await;
+        self.observe_fresh_native_transition(
+            &soul_id,
+            handle.incarnation_id(),
+            context.intent_revision,
+        )
+        .await?;
+        let _ = self.probe_recovery_locked(soul_id).await;
         Ok(freshell_runtime_protocol::FreshAgentForkResult {
             parent_session_id: presentation_parent_session_id,
             child_session_id: transition.child_session_id,
             parent_retired_by_runtime: true,
         })
+    }
+
+    async fn observe_fresh_native_transition(
+        &self,
+        soul_id: &SoulId,
+        incarnation_id: &IncarnationId,
+        intent_revision: u64,
+    ) -> Result<(), RuntimeError> {
+        use crate::recovery::NativeIdentityWait;
+        let wait = self
+            .wait_for_native_identity(
+                soul_id,
+                incarnation_id,
+                intent_revision,
+                crate::recovery::native_identity_wait_timeout(false),
+                true,
+            )
+            .await;
+        match wait {
+            NativeIdentityWait::Observed { .. } => Ok(()),
+            NativeIdentityWait::StopIntent { .. } | NativeIdentityWait::IntentChanged { .. } => {
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "durable intent changed during native root transition",
+                ))
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "current native child observation is unavailable after the acknowledged transition",
+            )),
+        }
     }
 
     async fn fresh_agent_compact(
@@ -1679,7 +2606,7 @@ impl Supervisor {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let handle = self
             .registry
-            .active_handle_for_soul(soul_id)
+            .active_handle_for_soul(soul_id.clone())
             .await
             .map_err(map_registry)?;
         if handle.fresh_agent().is_none() {
@@ -1689,8 +2616,18 @@ impl Supervisor {
             ));
         }
         let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .authenticate_current_fresh_host(&soul_id, &handle)
             .await?;
+        let fence = self
+            .registry
+            .recovery_write_fence(soul_id.clone())
+            .await
+            .map_err(map_registry)?
+            .for_incarnation(handle.incarnation_id().clone());
+        self.registry
+            .disable_claude_fork_recovery_fenced(soul_id.clone(), fence)
+            .await
+            .map_err(map_registry)?;
         match self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -1727,6 +2664,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         let prior_native = context.native_session_id.clone();
+        let fence = context.write_fence();
         let handle = context.prior_handle;
         if handle.fresh_agent().is_none() {
             return Err(RuntimeError::new(
@@ -1756,6 +2694,7 @@ impl Supervisor {
             HostResult::FreshAgentCommand {
                 state,
                 native_session_id,
+                claude_fork,
             } => {
                 let identity_update = classify_fresh_agent_operation_identity(
                     prior_native.as_deref(),
@@ -1765,19 +2704,20 @@ impl Supervisor {
                     FreshAgentNativeIdentityUpdate::Unchanged => {}
                     FreshAgentNativeIdentityUpdate::Record => {
                         self.registry
-                            .record_native_session(
+                            .record_native_session_fenced(
                                 soul_id.clone(),
                                 handle.incarnation_id().clone(),
                                 native_session_id
                                     .clone()
                                     .expect("record classification requires identity"),
+                                fence,
                             )
                             .await
                             .map_err(map_registry)?;
                     }
                     FreshAgentNativeIdentityUpdate::Transition => {
                         self.registry
-                            .transition_native_session(
+                            .transition_native_session_with_claude_fork_fenced(
                                 soul_id.clone(),
                                 handle.incarnation_id().clone(),
                                 prior_native
@@ -1786,6 +2726,8 @@ impl Supervisor {
                                 native_session_id
                                     .as_deref()
                                     .expect("transition classification requires child"),
+                                fence,
+                                claude_fork,
                             )
                             .await
                             .map_err(map_registry)?;
@@ -1794,7 +2736,13 @@ impl Supervisor {
                 if identity_update != FreshAgentNativeIdentityUpdate::Unchanged {
                     // The old resume/checkpoint proof names the pre-operation
                     // branch. Re-materialize exact evidence before replacement.
-                    let _ = self.probe_recovery(soul_id).await;
+                    self.observe_fresh_native_transition(
+                        &soul_id,
+                        handle.incarnation_id(),
+                        context.intent_revision,
+                    )
+                    .await?;
+                    let _ = self.probe_recovery_locked(soul_id).await;
                 }
                 Ok(state)
             }
@@ -1919,12 +2867,22 @@ impl Supervisor {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let handle = self
             .registry
-            .active_handle_for_soul(soul_id)
+            .active_handle_for_soul(soul_id.clone())
             .await
             .map_err(map_registry)?;
         let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .authenticate_current_fresh_host(&soul_id, &handle)
             .await?;
+        let fence = self
+            .registry
+            .recovery_write_fence(soul_id.clone())
+            .await
+            .map_err(map_registry)?
+            .for_incarnation(handle.incarnation_id().clone());
+        self.registry
+            .disable_claude_fork_recovery_fenced(soul_id.clone(), fence)
+            .await
+            .map_err(map_registry)?;
         match self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -1982,11 +2940,15 @@ impl Supervisor {
         after_sequence: u64,
         max_events: u32,
     ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
-        let handle = self
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let context = self
             .registry
-            .active_handle_for_soul(soul_id.clone())
+            .recovery_context(soul_id.clone())
             .await
             .map_err(map_registry)?;
+        let handle = context.prior_handle.clone();
+        let mut fence = context.write_fence();
         let host = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await?;
@@ -2008,11 +2970,13 @@ impl Supervisor {
                     if let freshell_runtime_protocol::AgentEvent::Started { native_session_id } =
                         &event.event
                     {
-                        self.registry
-                            .record_native_session(
+                        fence = self
+                            .registry
+                            .record_native_session_fenced(
                                 soul_id.clone(),
                                 handle.incarnation_id().clone(),
                                 native_session_id.clone(),
+                                fence,
                             )
                             .await
                             .map_err(map_registry)?;
@@ -2020,8 +2984,15 @@ impl Supervisor {
                         // fresh agents. Materialize recovery evidence at the
                         // same boundary instead of waiting for a terminal
                         // output read that these workloads never perform.
-                        let _ = self.probe_recovery(soul_id.clone()).await;
                     }
+                }
+                if events.events.iter().any(|event| {
+                    matches!(
+                        event.event,
+                        freshell_runtime_protocol::AgentEvent::Started { .. }
+                    )
+                }) {
+                    let _ = self.probe_recovery_locked(soul_id.clone()).await;
                 }
                 Ok(events)
             }
@@ -2046,6 +3017,8 @@ impl Supervisor {
             .map_err(map_registry)?;
         crate::retained_output::validate_source(&source, &self.config.runtime_root)
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::OwnershipMismatch, error))?;
+        let observation_context = self.registry.recovery_context(soul_id.clone()).await;
+        let source_incarnation = source.incarnation_id.clone();
         // This independent capability is used only for exact read-only backend
         // emptiness verification, never input, kill, or replacement dispatch.
         let handle = self
@@ -2097,53 +3070,38 @@ impl Supervisor {
         };
         match reply {
             HostResult::TerminalOutput(output) => {
+                // A web read may be abandoned while its host is unreachable.
+                // Keep read-only IPC outside lifecycle custody so those reads
+                // cannot queue ahead of recovery or Stop. Revalidate every
+                // captured fence before publishing output or recording identity.
+                let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+                let _guard = lifecycle_lock.lock().await;
+                let current = self.registry.recovery_context(soul_id.clone()).await;
+                let changed = match (observation_context.as_ref(), current.as_ref()) {
+                    (Ok(before), Ok(current)) => before.write_fence() != current.write_fence(),
+                    (Ok(_), Err(_)) => true,
+                    _ => false,
+                };
+                if changed || &output.incarnation_id != handle.incarnation_id() {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "terminal output owner changed during host read",
+                    ));
+                }
                 if let Some(native_session_id) = output.native_session_id.as_ref() {
-                    match self
-                        .registry
-                        .record_native_session(
-                            soul_id.clone(),
-                            handle.incarnation_id().clone(),
-                            native_session_id.clone(),
-                        )
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(RegistryError::NativeIdentityConflict) => {
-                            let view = self
-                                .registry
-                                .inventory()
-                                .await
-                                .map_err(map_registry)?
-                                .into_iter()
-                                .find(|view| view.soul_id == soul_id)
-                                .ok_or_else(|| {
-                                    RuntimeError::new(
-                                        RuntimeErrorCode::InvalidRequest,
-                                        "terminal soul disappeared",
-                                    )
-                                })?;
-                            let prior = view
-                                .native_session_id
-                                .as_deref()
-                                .filter(|_| view.terminal_mode.as_deref() == Some("opencode"))
-                                .ok_or_else(|| {
-                                    map_registry(RegistryError::NativeIdentityConflict)
-                                })?;
-                            self.registry
-                                .transition_native_session(
-                                    soul_id.clone(),
-                                    handle.incarnation_id().clone(),
-                                    prior,
-                                    native_session_id,
-                                )
-                                .await
-                                .map_err(map_registry)?;
+                    if let Ok(context) = observation_context.as_ref() {
+                        if context.prior_handle.incarnation_id() == &source_incarnation {
+                            record_terminal_identity_observation(
+                                &self.registry,
+                                context,
+                                native_session_id,
+                            )
+                            .await?;
                         }
-                        Err(error) => return Err(map_registry(error)),
                     }
                     // Materialize durable resume evidence while the soul-local
                     // store is still reachable. Repeated probes are idempotent.
-                    let _ = self.probe_recovery(soul_id.clone()).await;
+                    let _ = self.probe_recovery_locked(soul_id.clone()).await;
                 }
                 Ok(output)
             }
@@ -2226,7 +3184,7 @@ impl Supervisor {
             .await?;
         if response != b"ok" {
             return Err(RuntimeError::new(
-                RuntimeErrorCode::HostUnreachable,
+                RuntimeErrorCode::RecoveryBlocked,
                 "capability_pending: server rejected scoped grant",
             ));
         }
@@ -2482,11 +3440,16 @@ impl Supervisor {
         let prepared: freshell_runtime_protocol::PreparedProviderContext =
             serde_json::from_slice(&response).map_err(|_| {
                 RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    "capability_pending: server returned an invalid scoped grant reference",
+                    RuntimeErrorCode::RecoveryBlocked,
+                    "capability_pending: server returned an invalid exact provider preparation",
                 )
             })?;
-        prepared.validate(provider)?;
+        prepared.validate(provider).map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::RecoveryBlocked,
+                "capability_pending: server returned an invalid exact provider preparation",
+            )
+        })?;
         Ok(prepared)
     }
 
@@ -2547,7 +3510,16 @@ impl Supervisor {
             })?
             .map_err(|error| {
                 RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Other
+                            | std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::InvalidData
+                    ) {
+                        RuntimeErrorCode::RecoveryBlocked
+                    } else {
+                        RuntimeErrorCode::HostUnreachable
+                    },
                     format!("capability_pending: server callback unavailable: {error}"),
                 )
             })?;
@@ -2559,104 +3531,338 @@ impl Supervisor {
         soul_id: SoulId,
         expected_intent_revision: Option<u64>,
     ) -> Result<(StopOutcome, RuntimeView), RuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        // The durable stop intent is committed before any IPC or Docker signal.
+        // Intent (including retry cancellation) commits before waiting for
+        // provider work. The returned handle carries that transaction's fence.
         let handle = self
             .registry
             .begin_stop_expected(soul_id.clone(), expected_intent_revision)
             .await
             .map_err(map_registry)?;
+        self.stop_event("supervisor.stop_committed", &handle, "info", "stop_intent");
+        self.stop_event(
+            "supervisor.recovery_retry.cancelled",
+            &handle,
+            "info",
+            "stop_intent",
+        );
+        stop_crash_boundary("ordinary_stop_after_intent");
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let outcome = self.finish_stop_handle(&handle).await?;
+        let view = find_view(&self.registry, handle.incarnation_id()).await?;
+        Ok((outcome, view))
+    }
+
+    fn stop_event(
+        &self,
+        event: &str,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        severity: &str,
+        reason: &str,
+    ) {
+        let fence = handle.stop_fence().ok();
         append_event(
             &self.config.lifecycle_log,
-            "supervisor.stop_committed",
-            serde_json::json!({"soulId":soul_id,"incarnationId":handle.incarnation_id(),"containerId":handle.container_id()}),
+            event,
+            serde_json::json!({
+                "severity":severity, "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                "intentRevision":fence.map(|fence| fence.intent_revision),
+                "executionGeneration":fence.map(|fence| fence.execution_generation),
+                "controlEpoch":self.registry.control_epoch(), "reason":reason,
+            }),
         );
+    }
 
-        if let Ok(authenticated) = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await
-        {
-            let _ = self
-                .send_host_stop(
-                    handle.incarnation_id().clone(),
-                    handle.runtime_dir(),
-                    &authenticated,
-                )
-                .await;
-        }
-
-        let outcome = match self.backend.request_stop(&handle, 2).await {
-            Ok(()) => match self
-                .verify_empty_with_budget(&handle, Duration::from_secs(3))
-                .await
-            {
-                Ok(true) => StopOutcome::VerifiedEmpty,
-                Ok(false) => match self.backend.force_stop(&handle).await {
-                    Ok(()) => match self
-                        .verify_empty_with_budget(&handle, Duration::from_secs(3))
-                        .await
-                    {
-                        Ok(true) => StopOutcome::VerifiedEmpty,
-                        Ok(false) => StopOutcome::TerminationUnconfirmed,
-                        Err(error) if error.code == RuntimeErrorCode::OwnershipMismatch => {
-                            StopOutcome::BlockedOwnership
-                        }
-                        Err(_) => StopOutcome::TerminationUnconfirmed,
-                    },
-                    Err(BackendError::OwnershipMismatch(_)) => StopOutcome::BlockedOwnership,
-                    Err(_) => StopOutcome::TerminationUnconfirmed,
-                },
-                Err(error) if error.code == RuntimeErrorCode::OwnershipMismatch => {
-                    StopOutcome::BlockedOwnership
-                }
-                Err(_) => StopOutcome::TerminationUnconfirmed,
-            },
-            Err(BackendError::OwnershipMismatch(_)) => StopOutcome::BlockedOwnership,
-            // A request that reached Docker but failed is not proof that the
-            // workload stopped. Preserve ownership evidence as unconfirmed;
-            // reserve BackendUnavailable for callers that cannot reach the
-            // backend even for inspection/retry semantics.
-            Err(BackendError::DockerHttp { .. }) => StopOutcome::TerminationUnconfirmed,
-            Err(BackendError::Unavailable(_)) => StopOutcome::BackendUnavailable,
-            Err(_) => StopOutcome::TerminationUnconfirmed,
-        };
-        self.registry
-            .mark_stop_outcome(handle.incarnation_id().clone(), outcome)
+    /// The caller owns the lifecycle lock. This continues the captured Stop;
+    /// it never commits another intent or enters Running recovery.
+    pub(crate) async fn finish_stop_handle(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<StopOutcome, RuntimeError> {
+        let progress = self
+            .registry
+            .stop_progress(handle)
             .await
             .map_err(map_registry)?;
+        if progress.settled {
+            return progress.outcome.ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RegistryFailure,
+                    "settled Stop has no outcome",
+                )
+            });
+        }
+        self.stop_event(
+            "supervisor.stop_continuation",
+            handle,
+            "info",
+            "pending_stop",
+        );
+        let outcome = if progress.outcome == Some(StopOutcome::VerifiedEmpty) {
+            StopOutcome::VerifiedEmpty
+        } else {
+            let outcome = self.terminate_for_ordinary_stop(handle).await?;
+            if outcome == StopOutcome::VerifiedEmpty {
+                stop_crash_boundary("ordinary_stop_after_empty");
+            }
+            // The same transaction persists the typed outcome, releases the
+            // writer, and records the exact pending revoke before external IO.
+            self.registry
+                .record_ordinary_stop_outcome(handle, outcome)
+                .await
+                .map_err(map_registry)?;
+            stop_crash_boundary("ordinary_stop_after_outcome");
+            outcome
+        };
         if outcome == StopOutcome::VerifiedEmpty {
-            if let Some(capability) = handle
-                .terminal()
-                .and_then(|terminal| terminal.provider_launch_context.as_ref())
-                .or_else(|| {
-                    handle
-                        .fresh_agent()
-                        .and_then(|agent| agent.provider_launch_context.as_ref())
-                })
-                .and_then(|context| context.mcp_capability.as_ref())
-            {
-                if let Err(error) = self
-                    .notify_mcp_capability(
-                        "revoke",
-                        &capability.endpoint,
-                        &soul_id,
-                        handle.incarnation_id(),
-                        &capability.grant_id,
-                    )
-                    .await
-                {
-                    tracing::warn!(soul_id = %soul_id, error = ?error, "supervisor.mcp_capability_revoke_failed");
+            let current = self
+                .registry
+                .stop_progress(handle)
+                .await
+                .map_err(map_registry)?;
+            if !current.settled {
+                if let Some((endpoint, grant)) = current.capability {
+                    match self
+                        .notify_mcp_capability(
+                            "revoke",
+                            &endpoint,
+                            handle.soul_id(),
+                            handle.incarnation_id(),
+                            &grant,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            self.registry
+                                .acknowledge_stop_revoke(handle, &endpoint, &grant)
+                                .await
+                                .map_err(map_registry)?;
+                            self.stop_event(
+                                "supervisor.stop_revoke_settled",
+                                handle,
+                                "info",
+                                "acknowledged",
+                            );
+                        }
+                        Err(error) => {
+                            self.stop_event(
+                                "supervisor.stop_revoke_pending",
+                                handle,
+                                "warning",
+                                &format!("{:?}", error.code),
+                            );
+                        }
+                    }
                 }
             }
         }
+        self.stop_event(
+            "supervisor.stop_outcome",
+            handle,
+            if outcome == StopOutcome::VerifiedEmpty {
+                "info"
+            } else {
+                "warning"
+            },
+            match outcome {
+                StopOutcome::VerifiedEmpty => "verified_empty",
+                StopOutcome::BackendUnavailable => "backend_unavailable",
+                StopOutcome::TerminationUnconfirmed => "termination_unconfirmed",
+                StopOutcome::BlockedOwnership => "blocked_ownership",
+            },
+        );
+        Ok(outcome)
+    }
+
+    async fn terminate_for_ordinary_stop(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> Result<StopOutcome, RuntimeError> {
+        // Qualified absence is sufficient; a failed inspection never is.
+        self.registry
+            .stop_progress(handle)
+            .await
+            .map_err(map_registry)?;
+        match self
+            .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
+            .await
+        {
+            Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
+            Ok(false) => {}
+            Err(error) => {
+                self.stop_runtime_stage_failed(handle, "initial_empty_inspection", &error);
+                return Ok(stop_verification_outcome(error.error));
+            }
+        }
+        match self
+            .authenticate_host_classified(handle.incarnation_id(), handle.runtime_dir())
+            .await
+        {
+            Ok(authenticated) => {
+                self.registry
+                    .stop_progress(handle)
+                    .await
+                    .map_err(map_registry)?;
+                if let Err(error) = self
+                    .send_host_stop_classified(
+                        handle.incarnation_id().clone(),
+                        handle.runtime_dir(),
+                        &authenticated,
+                    )
+                    .await
+                {
+                    self.stop_runtime_stage_failed(handle, "host_stop", &error);
+                }
+            }
+            Err(error) => self.stop_runtime_stage_failed(handle, "host_authentication", &error),
+        }
+        self.registry
+            .stop_progress(handle)
+            .await
+            .map_err(map_registry)?;
+        // Docker's grace parameter bounds termination inside Docker. Allow
+        // ownership inspection and HTTP overhead beyond that grace while
+        // keeping the whole future finite so silence releases our lock.
+        let grace_seconds = 2;
+        let request_budget = Duration::from_secs(grace_seconds) + Duration::from_secs(1);
+        let graceful = tokio::time::timeout(
+            request_budget,
+            self.backend.request_stop(handle, grace_seconds),
+        )
+        .await;
+        if let Err(error) =
+            self.stop_request_result(handle, "graceful_stop", graceful, "graceful Stop timed out")
+        {
+            // A concurrently removed exact enclosure can return 404 to Stop.
+            // It still needs the backend's qualified empty observation.
+            self.registry
+                .stop_progress(handle)
+                .await
+                .map_err(map_registry)?;
+            return Ok(
+                match self
+                    .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
+                    .await
+                {
+                    Ok(true) => StopOutcome::VerifiedEmpty,
+                    Err(inspection_error) => {
+                        self.stop_runtime_stage_failed(
+                            handle,
+                            "graceful_failure_empty_inspection",
+                            &inspection_error,
+                        );
+                        if inspection_error.error.code == RuntimeErrorCode::OwnershipMismatch {
+                            StopOutcome::BlockedOwnership
+                        } else {
+                            stop_backend_outcome(error)
+                        }
+                    }
+                    Ok(false) => stop_backend_outcome(error),
+                },
+            );
+        }
+        stop_crash_boundary("ordinary_stop_after_graceful");
+        match self
+            .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
+            .await
+        {
+            Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
+            Ok(false) => {}
+            Err(error) => {
+                self.stop_runtime_stage_failed(handle, "graceful_empty_inspection", &error);
+                return Ok(stop_verification_outcome(error.error));
+            }
+        }
+        self.registry
+            .stop_progress(handle)
+            .await
+            .map_err(map_registry)?;
+        let forced =
+            tokio::time::timeout(Duration::from_secs(3), self.backend.force_stop(handle)).await;
+        if let Err(error) =
+            self.stop_request_result(handle, "force_stop", forced, "force Stop timed out")
+        {
+            return Ok(stop_backend_outcome(error));
+        }
+        Ok(
+            match self
+                .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
+                .await
+            {
+                Ok(true) => StopOutcome::VerifiedEmpty,
+                Ok(false) => {
+                    self.stop_stage_failed(
+                        handle,
+                        "force_empty_inspection",
+                        "not_empty",
+                        None,
+                        None,
+                    );
+                    StopOutcome::TerminationUnconfirmed
+                }
+                Err(error) => {
+                    self.stop_runtime_stage_failed(handle, "force_empty_inspection", &error);
+                    stop_verification_outcome(error.error)
+                }
+            },
+        )
+    }
+
+    fn stop_stage_failed(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        category: &str,
+        code: Option<RuntimeErrorCode>,
+        status: Option<u16>,
+    ) {
+        let fence = handle.stop_fence().ok();
         append_event(
             &self.config.lifecycle_log,
-            "supervisor.stop_outcome",
-            serde_json::json!({"soulId":soul_id,"incarnationId":handle.incarnation_id(),"outcome":outcome}),
+            "supervisor.stop_stage_failed",
+            serde_json::json!({
+                "severity":"warning", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                "intentRevision":fence.map(|f| f.intent_revision), "executionGeneration":fence.map(|f| f.execution_generation),
+                "controlEpoch":self.registry.control_epoch(), "stage":stage, "errorCategory":category,
+                "errorCode":code, "httpStatus":status,
+            }),
         );
-        let view = find_view(&self.registry, handle.incarnation_id()).await?;
-        Ok((outcome, view))
+    }
+
+    fn stop_runtime_stage_failed(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        failure: &ClassifiedFailure,
+    ) {
+        self.stop_stage_failed(
+            handle,
+            stage,
+            failure.category,
+            Some(failure.error.code),
+            failure.http_status,
+        );
+    }
+
+    fn stop_request_result(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        result: Result<Result<(), BackendError>, tokio::time::error::Elapsed>,
+        timeout_message: &str,
+    ) -> Result<(), BackendError> {
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                let (category, status) = backend_failure_category(&error);
+                self.stop_stage_failed(handle, stage, category, None, status);
+                Err(error)
+            }
+            Err(_) => {
+                self.stop_stage_failed(handle, stage, "timeout", None, None);
+                Err(BackendError::Unavailable(timeout_message.into()))
+            }
+        }
     }
 
     pub(crate) async fn verify_empty_with_budget(
@@ -2664,24 +3870,48 @@ impl Supervisor {
         handle: &crate::registry::OwnedRuntimeHandle,
         budget: Duration,
     ) -> Result<bool, RuntimeError> {
+        self.verify_empty_with_budget_classified(handle, budget)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn verify_empty_with_budget_classified(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        budget: Duration,
+    ) -> Result<bool, ClassifiedFailure> {
         let deadline = Instant::now() + budget;
         loop {
-            match self.backend.verify_empty(handle).await {
-                Ok(true) => return Ok(true),
-                Ok(false) => {}
-                Err(BackendError::OwnershipMismatch(message)) => {
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::OwnershipMismatch,
-                        message,
-                    ))
-                }
-                Err(error) => return Err(map_backend(error)),
+            if self
+                .verify_empty_before_classified(handle, deadline)
+                .await?
+            {
+                return Ok(true);
             }
+            tokio::time::sleep_until((Instant::now() + Duration::from_millis(100)).min(deadline))
+                .await;
             if Instant::now() >= deadline {
                 return Ok(false);
             }
-            sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    async fn verify_empty_before_classified(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        deadline: Instant,
+    ) -> Result<bool, ClassifiedFailure> {
+        // Every observation shares the remaining window. A hung read cannot
+        // outlive it, and repeated observations cannot renew the budget.
+        tokio::time::timeout_at(deadline, self.backend.verify_empty(handle))
+            .await
+            .map_err(|_| {
+                ClassifiedFailure::timeout(RuntimeError::new(
+                    RuntimeErrorCode::BackendUnavailable,
+                    "Stop empty inspection timed out",
+                ))
+            })?
+            .map_err(ClassifiedFailure::backend)
     }
 
     pub(crate) fn ensure_incarnation_dir(
@@ -2722,6 +3952,16 @@ impl Supervisor {
         incarnation_id: &IncarnationId,
         runtime_dir: &Path,
     ) -> Result<AuthenticatedHost, RuntimeError> {
+        self.authenticate_host_classified(incarnation_id, runtime_dir)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn authenticate_host_classified(
+        &self,
+        incarnation_id: &IncarnationId,
+        runtime_dir: &Path,
+    ) -> Result<AuthenticatedHost, ClassifiedFailure> {
         let socket = runtime_dir.join("host.sock");
         let secret = std::fs::read(runtime_dir.join("secret")).map_err(io_runtime)?;
         let challenge = uuid::Uuid::new_v4().to_string();
@@ -2743,13 +3983,14 @@ impl Supervisor {
                         },
                     );
                     let reply =
-                        exchange_host_frame(&mut stream, &envelope, budget, &socket).await?;
+                        exchange_host_frame_classified(&mut stream, &envelope, budget, &socket)
+                            .await?;
                     match reply.result? {
                         HostResult::Hello {
                             host_boot_id,
                             proof,
                             effective_limits,
-                            ..
+                            capabilities,
                         } => {
                             let expected =
                                 host_proof(&secret, &challenge, &host_boot_id, incarnation_id);
@@ -2757,19 +3998,22 @@ impl Supervisor {
                                 return Err(RuntimeError::new(
                                     RuntimeErrorCode::HostAuthenticationFailed,
                                     "session host challenge proof mismatch",
-                                ));
+                                )
+                                .into());
                             }
                             return Ok(AuthenticatedHost {
                                 host_boot_id,
                                 secret,
                                 effective_limits,
+                                capabilities,
                             });
                         }
                         _ => {
                             return Err(RuntimeError::new(
                                 RuntimeErrorCode::HostAuthenticationFailed,
                                 "unexpected hello reply",
-                            ))
+                            )
+                            .into())
                         }
                     }
                 }
@@ -2778,7 +4022,8 @@ impl Supervisor {
                     return Err(RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
                         format!("host socket {} unavailable: {error}", socket.display()),
-                    ))
+                    )
+                    .into())
                 }
             }
         }
@@ -2807,7 +4052,28 @@ impl Supervisor {
             &workload.soul_id,
             preparation.map(|inputs| inputs.generation_id.as_str()),
         );
+        let identity_context = self
+            .registry
+            .recovery_context(workload.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let native_identity_launch = self
+            .registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: incarnation_id.clone(),
+                launch_nonce: handle.launch_nonce().as_str().into(),
+                evidence_revision: identity_context.evidence_revision,
+                execution_generation: grant.execution_generation,
+                requested_native_session_id: workload
+                    .resume_spec
+                    .as_ref()
+                    .map(|spec| spec.provider_session.native_session_id.clone())
+                    .or(identity_context.native_session_id.clone()),
+            })
+            .await
+            .map_err(map_registry)?;
         let command = HostCommand::GrantExecution {
+            native_identity_launch: Some(native_identity_launch.clone()),
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),
             host_boot_id: grant.host_boot_id.clone(),
@@ -2825,23 +4091,125 @@ impl Supervisor {
             .await?
         {
             HostResult::GrantAccepted {
+                native_identity_observation,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
                 native_session_id,
-            } => Ok(AcceptedGrant {
-                host_boot_id,
-                worker_pid,
-                worker_launch_count,
-                fixture_evidence,
-                native_session_id,
-            }),
+                opencode_transfer_receipt,
+                ..
+            } => {
+                let observed_root = native_identity_observation
+                    .as_ref()
+                    .filter(|observation| {
+                        observation.matches_launch(&native_identity_launch)
+                            && observation.matches_provider(
+                                &identity_context.provider,
+                                workload.fresh_agent.is_some(),
+                            )
+                    })
+                    .map(|observation| observation.native_session_id.clone());
+                // Fixture roots are presentation identity only. Ordinary
+                // providers still need current matching native evidence.
+                let fixture_root = if native_identity_observation.is_none()
+                    && host_boot_id == host.host_boot_id
+                    && workload.fresh_agent.as_ref().is_some_and(|agent| {
+                        identity_context.fresh_agent.as_ref() == Some(agent)
+                            && crate::registry::deterministic_fresh_agent_fixture(
+                                &identity_context.provider,
+                                agent,
+                            )
+                    }) {
+                    native_session_id.filter(|root| {
+                        !root.is_empty()
+                            && !root.chars().any(char::is_control)
+                            && native_identity_launch
+                                .requested_native_session_id
+                                .as_deref()
+                                .is_none_or(|requested| requested == root)
+                    })
+                } else {
+                    None
+                };
+                Ok(AcceptedGrant {
+                    host_boot_id,
+                    worker_pid,
+                    worker_launch_count,
+                    fixture_evidence,
+                    native_session_id: observed_root.or(fixture_root),
+                    native_identity_observation,
+                    opencode_transfer_receipt: validate_opencode_transfer_receipt(
+                        workload
+                            .terminal
+                            .as_ref()
+                            .and_then(|terminal| terminal.opencode_transfer.as_ref()),
+                        workload.terminal.as_ref().and_then(|terminal| {
+                            terminal
+                                .opencode_transfer
+                                .as_ref()
+                                .map(|_| (terminal.run_as_uid, terminal.run_as_gid))
+                        }),
+                        opencode_transfer_receipt,
+                    )?,
+                })
+            }
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
                 "unexpected grant reply",
             )),
         }
+    }
+
+    async fn wait_for_native_startup(
+        &self,
+        workload: &LaunchWorkload,
+        incarnation_id: &IncarnationId,
+        context: &crate::registry::RecoveryContext,
+        intent_revision: u64,
+    ) -> crate::recovery::NativeIdentityWait {
+        use crate::recovery::NativeIdentityWait;
+        let opencode_readiness = workload.opencode_tui_readiness_required(&context.provider);
+        let result = self
+            .wait_for_native_identity(
+                &workload.soul_id,
+                incarnation_id,
+                intent_revision,
+                crate::recovery::native_identity_wait_timeout(opencode_readiness),
+                false,
+            )
+            .await;
+        let (outcome, adoption_pending, elapsed_ms) = match &result {
+            NativeIdentityWait::Observed { elapsed_ms, .. } => ("observed", false, elapsed_ms),
+            NativeIdentityWait::ProviderExited { elapsed_ms } => {
+                ("provider_exited", false, elapsed_ms)
+            }
+            NativeIdentityWait::HostUnavailable { elapsed_ms, .. } => {
+                ("host_unavailable", false, elapsed_ms)
+            }
+            NativeIdentityWait::TimedOut {
+                adoption_pending,
+                elapsed_ms,
+            } => ("timed_out", *adoption_pending, elapsed_ms),
+            NativeIdentityWait::StopIntent { elapsed_ms } => ("stop_intent", false, elapsed_ms),
+            NativeIdentityWait::IntentChanged { elapsed_ms } => {
+                ("intent_changed", false, elapsed_ms)
+            }
+        };
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.native_startup_wait_finished",
+            serde_json::json!({
+                "severity": if matches!(outcome, "observed" | "stop_intent" | "intent_changed") { "info" } else { "warning" },
+                "soulId": workload.soul_id, "incarnationId": incarnation_id, "provider": context.provider,
+                "intentRevision": intent_revision, "evidenceRevision": context.evidence_revision,
+                "executionGeneration": context.native_identity_launch.as_ref().map(|launch| launch.execution_generation),
+                "launchNonce": context.native_identity_launch.as_ref().map(|launch| &launch.launch_nonce),
+                "outcome": outcome, "reason": outcome, "adoptionPending": adoption_pending, "elapsedMs": elapsed_ms,
+                "waitClass": if opencode_readiness { "opencode_tui" } else { "ordinary" },
+            }),
+        );
+        result
     }
 
     pub(crate) async fn host_status(
@@ -2860,20 +4228,28 @@ impl Supervisor {
             .await?
         {
             HostResult::Status {
+                native_identity_observation,
+                max_execution_generation,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
                 exited,
                 native_session_id,
+                opencode_adoption,
+                opencode_transfer_receipt,
                 ..
             } => Ok(HostStatus {
+                native_identity_observation,
+                max_execution_generation,
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
                 exited,
                 native_session_id,
+                opencode_adoption,
+                opencode_transfer_receipt,
             }),
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
@@ -2888,9 +4264,20 @@ impl Supervisor {
         runtime_dir: &Path,
         host: &AuthenticatedHost,
     ) -> Result<(), RuntimeError> {
+        self.send_host_stop_classified(incarnation_id, runtime_dir, host)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn send_host_stop_classified(
+        &self,
+        incarnation_id: IncarnationId,
+        runtime_dir: &Path,
+        host: &AuthenticatedHost,
+    ) -> Result<(), ClassifiedFailure> {
         let view = find_view(&self.registry, &incarnation_id).await?;
         match self
-            .send_authenticated_host_command(
+            .send_authenticated_host_command_classified(
                 incarnation_id.clone(),
                 runtime_dir,
                 host,
@@ -2906,7 +4293,8 @@ impl Supervisor {
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
                 "unexpected stop reply",
-            )),
+            )
+            .into()),
         }
     }
 
@@ -2917,6 +4305,18 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, RuntimeError> {
+        self.send_authenticated_host_command_classified(incarnation_id, runtime_dir, host, command)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn send_authenticated_host_command_classified(
+        &self,
+        incarnation_id: IncarnationId,
+        runtime_dir: &Path,
+        host: &AuthenticatedHost,
+        command: HostCommand,
+    ) -> Result<HostResult, ClassifiedFailure> {
         let is_slow_fresh_agent_command = matches!(
             &command,
             HostCommand::FreshAgentSend { .. }
@@ -2943,8 +4343,10 @@ impl Supervisor {
         } else {
             host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref())
         };
-        let reply = request_host_reply(&runtime_dir.join("host.sock"), &envelope, budget).await?;
-        reply.result
+        let reply =
+            request_host_reply_classified(&runtime_dir.join("host.sock"), &envelope, budget)
+                .await?;
+        reply.result.map_err(Into::into)
     }
 
     pub(crate) async fn launch_result_from_status(
@@ -2953,7 +4355,8 @@ impl Supervisor {
         soul_id: SoulId,
         host: AuthenticatedHost,
         status: HostStatus,
-    ) -> Result<LaunchResult, RuntimeError> {
+        mut fence: RecoveryWriteFence,
+    ) -> Result<(LaunchResult, RecoveryWriteFence), RuntimeError> {
         if status.host_boot_id != host.host_boot_id {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
@@ -2967,21 +4370,69 @@ impl Supervisor {
             )
         })?;
         if let Some(native_session_id) = status.native_session_id.as_ref() {
-            self.registry
-                .record_native_session(soul_id, incarnation_id.clone(), native_session_id.clone())
+            fence = self
+                .registry
+                .record_native_session_fenced(
+                    soul_id,
+                    incarnation_id.clone(),
+                    native_session_id.clone(),
+                    fence,
+                )
                 .await
                 .map_err(map_registry)?;
         }
         let view = find_view(&self.registry, &incarnation_id).await?;
-        Ok(LaunchResult {
-            view,
-            worker_pid,
-            worker_launch_count: status.worker_launch_count,
-            host_boot_id: host.host_boot_id,
-            effective_limits: host.effective_limits,
-            fixture_evidence: status.fixture_evidence,
-        })
+        Ok((
+            LaunchResult {
+                view,
+                worker_pid,
+                worker_launch_count: status.worker_launch_count,
+                host_boot_id: host.host_boot_id,
+                effective_limits: host.effective_limits,
+                fixture_evidence: status.fixture_evidence,
+            },
+            fence,
+        ))
     }
+}
+
+pub(crate) async fn record_terminal_identity_observation(
+    registry: &Registry,
+    context: &crate::registry::RecoveryContext,
+    native_session_id: &str,
+) -> Result<(), RuntimeError> {
+    let incarnation = context.prior_handle.incarnation_id().clone();
+    let fence = context.write_fence();
+    if let Some(prior) = context
+        .native_session_id
+        .as_deref()
+        .filter(|prior| *prior != native_session_id)
+    {
+        if context.provider != "opencode" {
+            return Err(map_registry(RegistryError::NativeIdentityConflict));
+        }
+        registry
+            .transition_native_session_fenced(
+                context.soul_id.clone(),
+                incarnation,
+                prior,
+                native_session_id,
+                fence,
+            )
+            .await
+            .map_err(map_registry)?;
+    } else {
+        registry
+            .record_native_session_fenced(
+                context.soul_id.clone(),
+                incarnation,
+                native_session_id.into(),
+                fence,
+            )
+            .await
+            .map_err(map_registry)?;
+    }
+    Ok(())
 }
 
 fn ensure_host_actor_state_dir(
@@ -3036,27 +4487,42 @@ fn ensure_host_actor_state_dir(
 
 #[derive(Clone)]
 pub(crate) struct AuthenticatedHost {
+    pub(crate) capabilities: Vec<String>,
     host_boot_id: HostBootId,
     secret: Vec<u8>,
     effective_limits: RuntimeLimits,
 }
 pub(crate) struct AcceptedGrant {
+    native_identity_observation: Option<freshell_runtime_protocol::NativeIdentityObservation>,
     host_boot_id: HostBootId,
     worker_pid: u32,
     worker_launch_count: u64,
     fixture_evidence: serde_json::Value,
     native_session_id: Option<String>,
+    opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 pub(crate) struct HostStatus {
+    pub(crate) max_execution_generation: u64,
+    pub(crate) native_identity_observation:
+        Option<freshell_runtime_protocol::NativeIdentityObservation>,
     pub(crate) host_boot_id: HostBootId,
     pub(crate) worker_pid: Option<u32>,
     pub(crate) worker_launch_count: u64,
     pub(crate) fixture_evidence: serde_json::Value,
     pub(crate) exited: bool,
     pub(crate) native_session_id: Option<String>,
+    pub(crate) opencode_adoption: freshell_runtime_protocol::OpenCodeAdoptionStatus,
+    pub(crate) opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 
 pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result<(), String> {
+    if let Err(error) = supervisor.resume_pending_stopped_repair_withdrawals().await {
+        append_event(
+            &supervisor.config.lifecycle_log,
+            "supervisor.stopped_repair_withdrawal_startup_deferred",
+            serde_json::json!({"error":error.message}),
+        );
+    }
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -3070,6 +4536,32 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
         "supervisor.ready",
         serde_json::json!({"installationId":supervisor.registry.installation_id(),"controlEpoch":supervisor.registry.control_epoch(),"socket":socket_path}),
     );
+    let cleanup_supervisor = supervisor.clone();
+    tokio::spawn(async move {
+        if let Err(error) = cleanup_supervisor.cleanup_opencode_transfer_staging().await {
+            append_event(
+                &cleanup_supervisor.config.lifecycle_log,
+                "supervisor.opencode_transfer_startup_cleanup_deferred",
+                serde_json::json!({"error":error.message}),
+            );
+        }
+    });
+    let staging_cleanup_supervisor = supervisor.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(5 * 60)).await;
+            if let Err(error) = staging_cleanup_supervisor
+                .cleanup_opencode_transfer_staging()
+                .await
+            {
+                append_event(
+                    &staging_cleanup_supervisor.config.lifecycle_log,
+                    "supervisor.opencode_transfer_cleanup_deferred",
+                    serde_json::json!({"error":error.message}),
+                );
+            }
+        }
+    });
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
         let supervisor = supervisor.clone();
@@ -3143,16 +4635,40 @@ pub(crate) fn fresh_agent_command_budget(configured: Option<&str>) -> Duration {
         ))
 }
 
+fn map_host_frame_error(error: freshell_runtime_protocol::FrameError) -> RuntimeError {
+    let code = match error {
+        freshell_runtime_protocol::FrameError::Io(_) => RuntimeErrorCode::HostUnreachable,
+        _ => RuntimeErrorCode::HostAuthenticationFailed,
+    };
+    RuntimeError::new(code, error.to_string()).with_diagnostic_code(
+        freshell_runtime_protocol::RuntimeDiagnosticCode::HostCommandFrameFailed,
+    )
+}
+
 /// One bounded framed request/reply against a session host's control socket.
 /// Connect, write, and read all share the single budget so a host that accepts
 /// the connection and then goes silent cannot extend the wait.
-pub(crate) async fn request_host_reply(
+#[cfg(test)]
+async fn request_host_reply(
     socket_path: &Path,
     envelope: &Envelope<HostCommand>,
     budget: Duration,
 ) -> Result<HostReply, RuntimeError> {
-    let unreachable =
-        |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
+    request_host_reply_classified(socket_path, envelope, budget)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+async fn request_host_reply_classified(
+    socket_path: &Path,
+    envelope: &Envelope<HostCommand>,
+    budget: Duration,
+) -> Result<HostReply, ClassifiedFailure> {
+    let unreachable = |message: String| {
+        RuntimeError::new(RuntimeErrorCode::HostUnreachable, message).with_diagnostic_code(
+            freshell_runtime_protocol::RuntimeDiagnosticCode::HostSocketConnectFailed,
+        )
+    };
     let socket_display = socket_path.display().to_string();
     tokio::time::timeout(budget, async {
         let mut stream = UnixStream::connect(socket_path)
@@ -3160,7 +4676,7 @@ pub(crate) async fn request_host_reply(
             .map_err(|error| unreachable(error.to_string()))?;
         write_frame(&mut stream, envelope)
             .await
-            .map_err(|error| unreachable(error.to_string()))?;
+            .map_err(map_host_frame_error)?;
         let reply_limit = if matches!(envelope.body, HostCommand::FreshAgentReadSnapshot { .. }) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
@@ -3169,45 +4685,57 @@ pub(crate) async fn request_host_reply(
         let reply: HostReply =
             freshell_runtime_protocol::read_frame_with_limit(&mut stream, reply_limit)
                 .await
-                .map_err(|error| unreachable(error.to_string()))?;
-        Ok(reply)
+                .map_err(map_host_frame_error)?;
+        Ok::<_, ClassifiedFailure>(reply)
     })
     .await
     .unwrap_or_else(|_| {
-        Err(unreachable(format!(
-            "session host {socket_display} timed out after {}ms",
-            budget.as_millis()
-        )))
+        Err(ClassifiedFailure::timeout(
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                format!(
+                    "session host {socket_display} timed out after {}ms",
+                    budget.as_millis()
+                ),
+            )
+            .with_diagnostic_code(
+                freshell_runtime_protocol::RuntimeDiagnosticCode::HostCommandTimeout,
+            ),
+        ))
     })
 }
 
 /// Bounded write/read on an already-connected host stream. Connecting is the
 /// caller's business (the hello handshake retries a not-yet-bound socket);
 /// the conversation itself is bounded exactly like every other host command.
-pub(crate) async fn exchange_host_frame(
+async fn exchange_host_frame_classified(
     stream: &mut UnixStream,
     envelope: &Envelope<HostCommand>,
     budget: Duration,
     socket_path: &Path,
-) -> Result<HostReply, RuntimeError> {
-    let unreachable =
-        |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
+) -> Result<HostReply, ClassifiedFailure> {
     let socket_display = socket_path.display().to_string();
     tokio::time::timeout(budget, async {
         write_frame(stream, envelope)
             .await
-            .map_err(|error| unreachable(error.to_string()))?;
-        let reply: HostReply = read_frame(stream)
-            .await
-            .map_err(|error| unreachable(error.to_string()))?;
-        Ok(reply)
+            .map_err(map_host_frame_error)?;
+        let reply: HostReply = read_frame(stream).await.map_err(map_host_frame_error)?;
+        Ok::<_, ClassifiedFailure>(reply)
     })
     .await
     .unwrap_or_else(|_| {
-        Err(unreachable(format!(
-            "session host {socket_display} timed out after {}ms",
-            budget.as_millis()
-        )))
+        Err(ClassifiedFailure::timeout(
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                format!(
+                    "session host {socket_display} timed out after {}ms",
+                    budget.as_millis()
+                ),
+            )
+            .with_diagnostic_code(
+                freshell_runtime_protocol::RuntimeDiagnosticCode::HostCommandTimeout,
+            ),
+        ))
     })
 }
 
@@ -3270,11 +4798,345 @@ fn release_qualified_workload(
     provider: &str,
     is_fixture: bool,
     has_terminal: bool,
-    has_fresh_agent: bool,
+    fresh_agent: Option<&FreshAgentLaunchSpec>,
 ) -> bool {
     is_fixture
-        || has_fresh_agent
+        || fresh_agent.is_some_and(|agent| {
+            agent.provider.as_str() == provider
+                && (crate::registry::deterministic_fresh_agent_fixture(provider, agent)
+                    || freshell_agent_runtime::managed_native_fresh_agent_enabled(
+                        &agent.provider,
+                        &agent.session_type,
+                    ))
+        })
         || (has_terminal && freshell_agent_runtime::managed_provider_enabled(provider))
+}
+
+fn validate_opencode_transfer_receipt(
+    descriptor: Option<&freshell_runtime_protocol::OpenCodeTransferDescriptor>,
+    provider_identity: Option<(u32, u32)>,
+    receipt: Option<OpenCodeTransferReadinessReceipt>,
+) -> Result<Option<OpenCodeTransferReadinessReceipt>, RuntimeError> {
+    match (descriptor, provider_identity, receipt) {
+        (None, None, None) => Ok(None),
+        (Some(descriptor), Some((uid, gid)), Some(receipt))
+            if receipt.matches_descriptor(descriptor)
+                && receipt.provider_uid == uid
+                && receipt.provider_gid == gid =>
+        {
+            Ok(Some(receipt))
+        }
+        _ => Err(RuntimeError::new(
+            RuntimeErrorCode::HostAuthenticationFailed,
+            "host grant acknowledgement has no matching OpenCode readiness receipt",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod grant_identity_tests {
+    use super::*;
+    use freshell_runtime_protocol::{
+        FreshAgentFixtureTransport, FreshProvider, NativeIdentityObservation, NativeIdentitySource,
+    };
+    use rusqlite::{params, Connection};
+
+    #[tokio::test]
+    async fn authenticated_grant_root_preserves_native_proof_and_typed_fixture_binding() {
+        for case in [
+            "ordinary-raw",
+            "current-proof",
+            "wrong-nonce",
+            "wrong-revision",
+            "wrong-incarnation",
+            "wrong-source",
+            "wrong-proof-root",
+            "fixture",
+            "absent-root",
+            "empty-root",
+            "control-root",
+            "wrong-requested-root",
+            "wrong-mode",
+            "wrong-provider",
+            "wrong-profile",
+            "wrong-boot",
+            "fixture-stale-proof",
+            "untyped-evidence",
+            "bad-auth",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared = crate::registry::tests::materialize_fresh_runtime(
+                &registry,
+                soul.clone(),
+                dir.path(),
+            )
+            .await;
+            let runtime = dir.path().join("owned-host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let mut agent = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .fresh_agent
+                .unwrap();
+            let fixture = matches!(
+                case,
+                "fixture"
+                    | "absent-root"
+                    | "empty-root"
+                    | "control-root"
+                    | "wrong-requested-root"
+                    | "wrong-mode"
+                    | "wrong-provider"
+                    | "wrong-profile"
+                    | "wrong-boot"
+                    | "fixture-stale-proof"
+            );
+            agent.fixture_transport = fixture.then_some(FreshAgentFixtureTransport::Deterministic);
+            if case == "wrong-mode" {
+                agent.session_type = "freshcodex".into();
+            }
+            if case == "wrong-provider" {
+                agent.provider = FreshProvider::Codex;
+                agent.session_type = "freshcodex".into();
+            }
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute("UPDATE incarnations SET runtime_dir=?1,fresh_agent_spec=?2,fixture_kind=NULL,launch_state='created' WHERE incarnation_id=?3",
+                params![runtime.to_string_lossy(), serde_json::to_string(&agent).unwrap(), prepared.incarnation_id.as_str()]).unwrap();
+            if matches!(case, "wrong-requested-root" | "wrong-proof-root") {
+                conn.execute(
+                    "UPDATE souls SET native_session_id='requested-root' WHERE soul_id=?1",
+                    [soul.as_str()],
+                )
+                .unwrap();
+            }
+            let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+                &dir,
+                registry.clone(),
+                crate::backend::BackendRuntimeState::Running,
+            );
+            let handle = registry
+                .owned_handle(prepared.incarnation_id.clone())
+                .await
+                .unwrap();
+            let was_never_dispatched = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .never_dispatched;
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let expected_handle = handle.clone();
+            // Controlled proof shapes test admission, not native qualification.
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                let mut reply_observation = None;
+                for step in 0..if case == "bad-auth" { 1 } else { 2 } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.role, ControlRole::Supervisor);
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } if step == 0 => {
+                            assert_eq!(&incarnation_id, expected_handle.incarnation_id());
+                            HostResult::Hello {
+                                proof: if case == "bad-auth" {
+                                    "invalid-proof".into()
+                                } else {
+                                    host_proof(
+                                        b"synthetic-secret",
+                                        &challenge,
+                                        &boot,
+                                        &incarnation_id,
+                                    )
+                                },
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: expected_handle.requested_limits(),
+                            }
+                        }
+                        HostCommand::GrantExecution {
+                            incarnation_id,
+                            soul_id,
+                            host_boot_id,
+                            control_epoch,
+                            execution_generation,
+                            native_identity_launch,
+                            fresh_agent,
+                            ..
+                        } if step == 1 => {
+                            assert_eq!(&incarnation_id, expected_handle.incarnation_id());
+                            assert_eq!(&soul_id, expected_handle.soul_id());
+                            assert_eq!(host_boot_id, boot);
+                            assert!(control_epoch > 0 && execution_generation > 0);
+                            if case == "wrong-profile" {
+                                assert_ne!(fresh_agent.as_deref(), expected_handle.fresh_agent());
+                            } else {
+                                assert_eq!(fresh_agent.as_deref(), expected_handle.fresh_agent());
+                            }
+                            assert_eq!(
+                                request.auth.as_deref(),
+                                Some(
+                                    host_proof(
+                                        b"synthetic-secret",
+                                        "command-auth",
+                                        &boot,
+                                        &incarnation_id
+                                    )
+                                    .as_str()
+                                )
+                            );
+                            let launch = native_identity_launch.unwrap();
+                            assert_eq!(
+                                launch.launch_nonce,
+                                expected_handle.launch_nonce().as_str()
+                            );
+                            assert_eq!(launch.execution_generation, execution_generation);
+                            if case == "current-proof"
+                                || case == "fixture-stale-proof"
+                                || case.starts_with("wrong-") && !fixture
+                            {
+                                let mut observation = NativeIdentityObservation {
+                                    native_session_id: "proof-root".into(),
+                                    incarnation_id: incarnation_id.clone(),
+                                    launch_nonce: launch.launch_nonce,
+                                    evidence_revision: launch.evidence_revision,
+                                    source: NativeIdentitySource::FreshProviderHandshake,
+                                    evidence_digest: "a".repeat(64),
+                                };
+                                match case {
+                                    "wrong-nonce" | "fixture-stale-proof" => {
+                                        observation.launch_nonce = "another-launch".into()
+                                    }
+                                    "wrong-revision" => observation.evidence_revision += 1,
+                                    "wrong-incarnation" => {
+                                        observation.incarnation_id = IncarnationId::new()
+                                    }
+                                    "wrong-source" => {
+                                        observation.source = NativeIdentitySource::ClaudeNativeEvent
+                                    }
+                                    _ => {}
+                                }
+                                reply_observation = Some(observation);
+                            }
+                            HostResult::GrantAccepted {
+                                host_boot_id: if case == "wrong-boot" {
+                                    HostBootId::new()
+                                } else {
+                                    boot.clone()
+                                },
+                                worker_pid: 123,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({"fixtureTransport":"deterministic"}),
+                                native_session_id: match case {
+                                    "absent-root" => None,
+                                    "empty-root" => Some(String::new()),
+                                    "control-root" => Some("invalid\nroot".into()),
+                                    _ => Some("raw-root".into()),
+                                },
+                                native_identity_observation: reply_observation.clone(),
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        _ => panic!(
+                            "grant consumer must not dispatch input, Status or provider probes"
+                        ),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                reply_observation
+            });
+            let authenticated = supervisor
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                .await;
+            if case == "bad-auth" {
+                assert!(matches!(
+                    authenticated,
+                    Err(RuntimeError {
+                        code: RuntimeErrorCode::HostAuthenticationFailed,
+                        ..
+                    })
+                ));
+                tokio::time::timeout(Duration::from_secs(5), responder)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .native_identity_launch
+                    .is_none());
+                continue;
+            }
+            let host = authenticated.unwrap();
+            let grant = registry
+                .commit_execution_grant(
+                    handle.incarnation_id().clone(),
+                    host.host_boot_id.clone(),
+                    handle.requested_limits(),
+                )
+                .await
+                .unwrap();
+            if case == "wrong-profile" {
+                agent.model = Some("changed-unregistered-profile".into());
+            }
+            let workload = LaunchWorkload {
+                soul_id: soul.clone(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: Some(agent),
+                resume_spec: None,
+            };
+            let accepted = supervisor
+                .send_grant(&handle, &workload, &host, &grant)
+                .await
+                .unwrap();
+            let observation = tokio::time::timeout(Duration::from_secs(5), responder)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match case {
+                "fixture" => Some("raw-root"),
+                "current-proof" => Some("proof-root"),
+                _ => None,
+            };
+            assert_eq!(accepted.native_session_id.as_deref(), expected, "{case}");
+            assert_eq!(accepted.native_identity_observation, observation, "{case}");
+            let context = registry.recovery_context(soul).await.unwrap();
+            assert_eq!(context.never_dispatched, was_never_dispatched);
+            assert_eq!(context.accepted_command_count, 0);
+            assert_eq!(context.completed_command_count, 0);
+            assert!(UnixStream::connect(runtime.join("host.sock"))
+                .await
+                .is_err());
+            let mut stale_grant = grant.clone();
+            stale_grant.execution_generation += 1;
+            let stale = supervisor
+                .send_grant(&handle, &workload, &host, &stale_grant)
+                .await;
+            assert!(matches!(
+                stale,
+                Err(RuntimeError {
+                    code: RuntimeErrorCode::RegistryFailure,
+                    ..
+                })
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3334,6 +5196,98 @@ mod host_actor_storage_tests {
 }
 
 #[cfg(test)]
+mod opencode_transfer_receipt_tests {
+    use super::validate_opencode_transfer_receipt;
+    use freshell_runtime_protocol::{
+        OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferReadinessReceipt,
+        RuntimeErrorCode,
+    };
+
+    fn descriptor() -> OpenCodeTransferDescriptor {
+        OpenCodeTransferDescriptor {
+            transfer_id: "transfer-one".into(),
+            provider: "opencode".into(),
+            source_store_id: "a".repeat(64),
+            root_session_id: "root-session".into(),
+            source_generation: "b".repeat(64),
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint: "c".repeat(64),
+            migration_journal_fingerprint: "d".repeat(64),
+            destination_store_id: "soul-one".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_image_ref: "sha256:test".into(),
+            target_build_receipt: "e".repeat(64),
+            incarnation_id: "incarnation-one".into(),
+            manifest_json: "{}".into(),
+            files: vec![OpenCodeTransferFile {
+                index: 0,
+                relative_path: "manifest.json".into(),
+                size_bytes: 2,
+                sha256: "f".repeat(64),
+            }],
+            total_bytes: 2,
+            bundle_sha256: "0".repeat(64),
+        }
+    }
+
+    fn receipt() -> OpenCodeTransferReadinessReceipt {
+        OpenCodeTransferReadinessReceipt {
+            transfer_id: "transfer-one".into(),
+            destination_store_id: "soul-one".into(),
+            root_session_id: "root-session".into(),
+            source_generation: "b".repeat(64),
+            provider_uid: 1000,
+            provider_gid: 1000,
+            structural_sha256: "1".repeat(64),
+            reader_receipt_sha256: "2".repeat(64),
+        }
+    }
+
+    #[test]
+    fn grant_requires_exact_receipt_and_provider_identity_for_transfers() {
+        let descriptor = descriptor();
+        let accepted = validate_opencode_transfer_receipt(
+            Some(&descriptor),
+            Some((1000, 1000)),
+            Some(receipt()),
+        )
+        .expect("matching post-revalidation receipt should authorize release eligibility");
+        assert!(accepted.is_some());
+
+        for invalid in [
+            None,
+            Some(OpenCodeTransferReadinessReceipt {
+                transfer_id: "other-transfer".into(),
+                ..receipt()
+            }),
+            Some(OpenCodeTransferReadinessReceipt {
+                provider_uid: 1001,
+                ..receipt()
+            }),
+            Some(OpenCodeTransferReadinessReceipt {
+                provider_gid: 1001,
+                ..receipt()
+            }),
+        ] {
+            let error =
+                validate_opencode_transfer_receipt(Some(&descriptor), Some((1000, 1000)), invalid)
+                    .expect_err("missing or misbound receipt must reject grant acceptance");
+            assert_eq!(error.code, RuntimeErrorCode::HostAuthenticationFailed);
+        }
+    }
+
+    #[test]
+    fn receipt_without_a_transfer_descriptor_is_rejected() {
+        let error = validate_opencode_transfer_receipt(None, None, Some(receipt()))
+            .expect_err("unexpected transfer receipt must be rejected");
+        assert_eq!(error.code, RuntimeErrorCode::HostAuthenticationFailed);
+        assert!(validate_opencode_transfer_receipt(None, None, None)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[cfg(test)]
 mod host_ipc_timeout_tests {
     use super::{
         fresh_agent_command_budget, host_command_budget, request_host_reply,
@@ -3389,7 +5343,10 @@ mod host_ipc_timeout_tests {
                     matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentSnapshot(value) if value == expected)
                 );
             } else {
-                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::HostUnreachable);
+                assert_eq!(
+                    reply.unwrap_err().code,
+                    RuntimeErrorCode::HostAuthenticationFailed
+                );
             }
         }
     }
@@ -3555,11 +5512,12 @@ mod release_scope_tests {
 
     #[test]
     fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {
-        assert!(release_qualified_workload("shell", false, true, false));
-        assert!(release_qualified_workload("opencode", false, true, false));
-        for provider in ["claude", "codex", "amplifier", "gemini", "kimi"] {
+        for provider in ["shell", "claude", "codex", "opencode"] {
+            assert!(release_qualified_workload(provider, false, true, None));
+        }
+        for provider in ["amplifier", "gemini", "kimi"] {
             assert!(
-                !release_qualified_workload(provider, false, true, false),
+                !release_qualified_workload(provider, false, true, None),
                 "{provider}"
             );
         }
@@ -3567,9 +5525,126 @@ mod release_scope_tests {
             "native-session-fixture",
             true,
             false,
-            false
+            None
         ));
-        assert!(release_qualified_workload("claude", false, false, true));
+        for (provider, mode) in [
+            ("claude", "freshclaude"),
+            ("codex", "freshcodex"),
+            ("opencode", "freshopencode"),
+            ("kilroy", "kilroy"),
+        ] {
+            let mut agent: freshell_runtime_protocol::FreshAgentLaunchSpec =
+                serde_json::from_value(serde_json::json!({
+                    "sessionId":"public-test", "provider":provider, "sessionType":mode,
+                    "runtimeVariant":"owned-test-variant", "providerStoreId":"soul-test",
+                    "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,"runAsGid":0
+                }))
+                .unwrap();
+            assert_eq!(
+                release_qualified_workload(provider, false, false, Some(&agent)),
+                provider != "kilroy"
+            );
+            assert!(!release_qualified_workload(
+                "other",
+                false,
+                false,
+                Some(&agent)
+            ));
+            agent.fixture_transport =
+                Some(freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic);
+            assert!(release_qualified_workload(
+                provider,
+                false,
+                false,
+                Some(&agent)
+            ));
+            agent.session_type = "mismatched-mode".into();
+            assert!(!release_qualified_workload(
+                provider,
+                false,
+                false,
+                Some(&agent)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn release_qualified_workload_candidate_uses_normal_launch_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        for (provider, mode) in [
+            ("shell", None),
+            ("claude", None),
+            ("codex", None),
+            ("opencode", None),
+            ("claude", Some("freshclaude")),
+            ("codex", Some("freshcodex")),
+            ("opencode", Some("freshopencode")),
+            ("amplifier", None),
+            ("kilroy", Some("kilroy")),
+        ] {
+            let mut value = serde_json::json!({
+                "soulId":format!("soul-candidate-{}", mode.unwrap_or(provider)), "provider":provider,
+                "providerStoreId":"synthetic-store", "creationSeedRef":"synthetic-seed",
+                "profile":"default_agent",
+                "limits":{"cpuMilli":2000,"memoryBytes":1073741824,"swapBytes":0,"pidsMax":512}
+            });
+            if let Some(mode) = mode {
+                value["freshAgent"] = serde_json::json!({"sessionId":"synthetic-public", "provider":provider,
+                    "sessionType":mode, "runtimeVariant":"synthetic-runtime", "providerStoreId":"synthetic-store",
+                    "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,"runAsGid":0});
+            } else {
+                value["terminal"] = serde_json::json!({"terminalId":"synthetic-terminal", "streamId":"synthetic-stream",
+                    "mode":provider, "program":provider, "cwd":"/workspace", "workspacePath":"/workspace",
+                    "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"synthetic"});
+            }
+            let request = serde_json::from_value(value).unwrap();
+            let error = supervisor
+                .launch(freshell_runtime_protocol::RequestId::new(), request)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                if ["amplifier", "kilroy"].contains(&provider) {
+                    RuntimeErrorCode::UnsupportedWorkload
+                } else {
+                    // An admitted route must reach normal resource-profile validation.
+                    // The deliberate mismatch avoids starting any provider or backend.
+                    RuntimeErrorCode::InvalidRuntimeLimits
+                },
+                "{provider}/{mode:?}: {}",
+                error.message
+            );
+        }
+        assert!(registry.inventory().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_qualified_workload_rejects_native_kilroy_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        let request: freshell_runtime_protocol::LaunchRequest = serde_json::from_value(serde_json::json!({
+            "soulId":"soul-excluded-kilroy", "provider":"kilroy", "providerStoreId":"soul-excluded-kilroy",
+            "creationSeedRef":"excluded-kilroy", "limits":{"cpuMilli":2000,"memoryBytes":1073741824,"swapBytes":0,"pidsMax":512},
+            "freshAgent":{"sessionId":"public-kilroy", "provider":"kilroy", "sessionType":"kilroy",
+                "runtimeVariant":"kilroy-claude-agent-sdk", "providerStoreId":"soul-excluded-kilroy",
+                "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,"runAsGid":0}
+        })).unwrap();
+        let mut mismatched = request.clone();
+        mismatched.fresh_agent.as_mut().unwrap().session_type = "freshclaude".into();
+        let error = supervisor
+            .launch(freshell_runtime_protocol::RequestId::new(), mismatched)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::InvalidRequest);
+        let error = supervisor
+            .launch(freshell_runtime_protocol::RequestId::new(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::UnsupportedWorkload);
+        assert!(registry.inventory().await.unwrap().is_empty());
     }
 
     #[test]
@@ -3623,6 +5698,9 @@ mod release_scope_tests {
         let error = RuntimeError::new(
             RuntimeErrorCode::HostUnreachable,
             format!("prepare provider bootstrap failed: {secret}"),
+        )
+        .with_diagnostic_code(
+            freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderStatePrepareFailed,
         );
 
         append_event(
@@ -3644,14 +5722,1148 @@ mod release_scope_tests {
         assert_eq!(event["data"]["launchState"], "starting");
         assert_eq!(event["data"]["errorCode"], "HOST_UNREACHABLE");
         assert_eq!(event["data"]["errorClass"], "runtime_activation_failed");
+        assert_eq!(
+            event["data"]["failureReason"],
+            "PROVIDER_STATE_PREPARE_FAILED"
+        );
         assert!(event["data"].get("errorMessage").is_none());
         assert!(!contents.contains("prepare provider bootstrap failed"));
+    }
+
+    #[test]
+    fn codex_prepare_stage_diagnostics_reach_the_body_free_failure_reason() {
+        let prepared = PreparedLaunch {
+            soul_id: SoulId::new(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: LaunchNonce::new(),
+            state: LaunchState::Created,
+            intent_revision: 7,
+            existing_request: false,
+        };
+        let cases = [
+            (
+                freshell_runtime_protocol::RuntimeDiagnosticCode::CodexConfigPlanningFailed,
+                "CODEX_CONFIG_PLANNING_FAILED",
+            ),
+            (
+                freshell_runtime_protocol::RuntimeDiagnosticCode::CodexAppServerStartFailed,
+                "CODEX_APP_SERVER_START_FAILED",
+            ),
+            (
+                freshell_runtime_protocol::RuntimeDiagnosticCode::CodexProxyStartFailed,
+                "CODEX_PROXY_START_FAILED",
+            ),
+        ];
+
+        for (diagnostic_code, expected_reason) in cases {
+            let error = RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "private local preparation detail",
+            )
+            .with_diagnostic_code(diagnostic_code);
+            let data = activation_failure_data(
+                &prepared,
+                LaunchState::Starting,
+                "deliver_execution_grant",
+                &error,
+            );
+
+            assert_eq!(data["failureReason"], expected_reason);
+            assert!(data.get("errorMessage").is_none());
+            assert!(!data
+                .to_string()
+                .contains("private local preparation detail"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod activation_backend_diagnostic_tests {
+    use super::*;
+    use freshell_runtime_protocol::{LaunchRequest, RuntimeProfile};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_stopped_backend_diagnostic_preserves_real_preflight_refusal() {
+        for missing in ["host", "workspace"] {
+            let dir = tempfile::tempdir().unwrap();
+            let binary = dir.path().join("host");
+            std::fs::write(&binary, b"never executed test host").unwrap();
+            let socket = dir.path().join("docker.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let supervisor = Supervisor::new(
+                registry.clone(),
+                Arc::new(DockerEngineBackend::new(&socket)),
+                SupervisorConfig {
+                    runtime_root: dir.path().join("runtime"),
+                    control_socket_path: dir.path().join("control.sock"),
+                    host_binary_path: binary.clone(),
+                    image_ref: format!("sha256:{}", "a".repeat(64)),
+                    test_run_id: "activation-backend-diagnostic".into(),
+                    control_secret: "private-diagnostic-control-secret".into(),
+                    lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                    admission: AdmissionPolicy::default(),
+                },
+            )
+            .unwrap();
+            if missing == "host" {
+                std::fs::remove_file(&binary).unwrap();
+            }
+            let soul = SoulId::new();
+            let workspace = dir.path().join("missing-workspace");
+            let terminal = (missing == "workspace").then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "terminalId":"diagnostic-terminal","streamId":"diagnostic-stream",
+                    "mode":"shell","program":"sh","cwd":workspace,"workspacePath":workspace,
+                    "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"diagnostic-project"
+                }))
+                .unwrap()
+            });
+            let error = supervisor
+                .launch(
+                    RequestId::new(),
+                    LaunchRequest {
+                        soul_id: soul.clone(),
+                        provider: if terminal.is_some() {
+                            "shell"
+                        } else {
+                            "fixture"
+                        }
+                        .into(),
+                        provider_store_id: "diagnostic-store".into(),
+                        creation_seed_ref: "diagnostic-seed".into(),
+                        limits: RuntimeLimits {
+                            cpu_milli: 500,
+                            memory_bytes: 64 * 1024 * 1024,
+                            swap_bytes: 0,
+                            pids_max: 32,
+                        },
+                        profile: RuntimeProfile::Custom,
+                        project_key: "diagnostic-project".into(),
+                        native_session_id: None,
+                        fixture: terminal.is_none().then_some(FixtureKind::Heartbeat),
+                        terminal,
+                        fresh_agent: None,
+                        view_intent: None,
+                        expected_control_epoch: None,
+                    },
+                )
+                .await
+                .expect_err("real backend preflight must fail before Docker create");
+            assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+            assert!(error.message.contains(if missing == "host" {
+                "host binary:"
+            } else {
+                "workspace:"
+            }));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+            let views = registry.inventory().await.unwrap();
+            assert_eq!(views.len(), 1);
+            assert!(views[0].container_id.is_none());
+            let text = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let backend = events
+                .iter()
+                .find(|event| event["event"] == "supervisor.activation_backend_failed")
+                .expect("the exact preflight cause must survive in the existing lifecycle log");
+            assert_eq!(backend["data"]["severity"], "error");
+            assert_eq!(backend["data"]["soulId"], soul.as_str());
+            assert_eq!(
+                backend["data"]["incarnationId"],
+                views[0].incarnation_id.as_str()
+            );
+            assert_eq!(backend["data"]["intentRevision"], views[0].intent_revision);
+            assert_eq!(backend["data"]["launchState"], "prepared");
+            assert_eq!(backend["data"]["stage"], "create_stopped_runtime");
+            assert_eq!(backend["data"]["backendErrorKind"], "invalid_config");
+            assert_eq!(
+                error.message,
+                format!(
+                    "runtime backend configuration rejected: {}",
+                    backend["data"]["backendFailureReason"].as_str().unwrap()
+                )
+            );
+            assert!(!text.contains(&supervisor.config.control_secret));
+            assert!(events
+                .iter()
+                .any(|event| event["event"] == "supervisor.activation_failed"
+                    && event["data"]["stage"] == "create_stopped_runtime"
+                    && event["data"]["errorCode"] == "RECOVERY_BLOCKED"));
+        }
+    }
+
+    #[test]
+    fn create_stopped_backend_diagnostic_omits_arbitrary_payloads_and_redacts_control_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("diagnostic.jsonl");
+        let control_secret = "private-diagnostic-control-secret";
+        lifecycle_secrets()
+            .lock()
+            .unwrap()
+            .insert(log.clone(), control_secret.into());
+        let prepared = PreparedLaunch {
+            soul_id: SoulId::new(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: freshell_runtime_protocol::LaunchNonce::new(),
+            state: LaunchState::Prepared,
+            intent_revision: 7,
+            existing_request: false,
+        };
+        for error in [
+            BackendError::DockerHttp {
+                status: 403,
+                body: "arbitrary-private-provider-response".into(),
+            },
+            BackendError::Malformed("arbitrary-private-parser-payload".into()),
+            BackendError::Unavailable("arbitrary-private-transport-payload".into()),
+            BackendError::InvalidConfig(format!("host binary: {control_secret}")),
+        ] {
+            append_event(
+                &log,
+                "supervisor.activation_backend_failed",
+                activation_backend_failure_data(&prepared, LaunchState::Prepared, &error),
+            );
+        }
+        let text = std::fs::read_to_string(log).unwrap();
+        assert!(!text.contains("arbitrary-private"));
+        assert!(!text.contains(control_secret));
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["data"]["backendErrorKind"], "docker_http");
+        assert_eq!(events[0]["data"]["backendHttpStatus"], 403);
+        assert!(events[..3]
+            .iter()
+            .all(|event| event["data"].get("backendFailureReason").is_none()));
+        assert_eq!(
+            events[3]["data"]["backendFailureReason"],
+            "host binary: ***REDACTED***"
+        );
+        assert!(!text.contains(prepared.launch_nonce.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod codex_pre_worker_retry_tests {
+    use super::*;
+    use crate::backend::{BackendCreated, BackendInspection, BackendRuntimeState};
+    use freshell_runtime_protocol::{
+        DockerDaemonId, FreshAgentProviderStartDiagnostic, LaunchRequest,
+        NativeIdentityObservation, NativeIdentitySource, RuntimeDiagnosticCode, RuntimeProfile,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex as StdMutex,
+        },
+    };
+
+    #[derive(Clone, Copy)]
+    enum FirstGrantOutcome {
+        CodexAppServerStartFailed,
+        CodexProxyStartFailed,
+        FreshAgentProviderStartFailed,
+        WorkerMayHaveStarted,
+    }
+
+    #[derive(Clone, Copy)]
+    enum HostOutcome {
+        CodexAppServerStartFailed,
+        CodexProxyStartFailed,
+        FreshAgentProviderStartFailed,
+        WorkerMayHaveStarted,
+        Running,
+    }
+
+    struct RuntimeRecord {
+        incarnation_id: IncarnationId,
+        state: BackendRuntimeState,
+        attempt: usize,
+        host: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        creates: AtomicUsize,
+        grants: AtomicUsize,
+        workers: AtomicUsize,
+        possible_workers: AtomicUsize,
+        stop_requests: AtomicUsize,
+        force_stops: AtomicUsize,
+        empty_checks: AtomicUsize,
+    }
+
+    struct FakeBackend {
+        first_grant: FirstGrantOutcome,
+        counts: Arc<Counts>,
+        runtimes: StdMutex<HashMap<String, RuntimeRecord>>,
+        stop_targets: StdMutex<Vec<(IncarnationId, String)>>,
+        empty_targets: StdMutex<Vec<(IncarnationId, String)>>,
+        cleanup_steps: StdMutex<Vec<(String, IncarnationId, String)>>,
+    }
+
+    impl FakeBackend {
+        fn new(first_grant: FirstGrantOutcome) -> Self {
+            Self {
+                first_grant,
+                counts: Arc::new(Counts::default()),
+                runtimes: StdMutex::new(HashMap::new()),
+                stop_targets: StdMutex::new(Vec::new()),
+                empty_targets: StdMutex::new(Vec::new()),
+                cleanup_steps: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn outcome_for(&self, attempt: usize) -> HostOutcome {
+            if attempt != 1 {
+                return HostOutcome::Running;
+            }
+            match self.first_grant {
+                FirstGrantOutcome::CodexAppServerStartFailed => {
+                    HostOutcome::CodexAppServerStartFailed
+                }
+                FirstGrantOutcome::CodexProxyStartFailed => HostOutcome::CodexProxyStartFailed,
+                FirstGrantOutcome::FreshAgentProviderStartFailed => {
+                    HostOutcome::FreshAgentProviderStartFailed
+                }
+                FirstGrantOutcome::WorkerMayHaveStarted => HostOutcome::WorkerMayHaveStarted,
+            }
+        }
+
+        fn runtime_state(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<BackendRuntimeState, BackendError> {
+            let runtimes = self.runtimes.lock().unwrap();
+            let record = runtimes
+                .get(handle.container_id())
+                .ok_or_else(|| BackendError::OwnershipMismatch("unknown test container".into()))?;
+            if &record.incarnation_id != handle.incarnation_id() {
+                return Err(BackendError::OwnershipMismatch(
+                    "test container incarnation changed".into(),
+                ));
+            }
+            Ok(record.state)
+        }
+
+        async fn stop_exact(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            let host = {
+                let mut runtimes = self.runtimes.lock().unwrap();
+                let record = runtimes.get_mut(handle.container_id()).ok_or_else(|| {
+                    BackendError::OwnershipMismatch("unknown test container".into())
+                })?;
+                if &record.incarnation_id != handle.incarnation_id() {
+                    return Err(BackendError::OwnershipMismatch(
+                        "test container incarnation changed".into(),
+                    ));
+                }
+                record.host.take()
+            };
+            if let Some(host) = host {
+                host.abort();
+                let _ = host.await;
+            }
+            self.runtimes
+                .lock()
+                .unwrap()
+                .get_mut(handle.container_id())
+                .expect("checked test container")
+                .state = BackendRuntimeState::Exited;
+            Ok(())
+        }
+    }
+
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            for record in self.runtimes.get_mut().unwrap().values_mut() {
+                if let Some(host) = record.host.take() {
+                    host.abort();
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeBackend for FakeBackend {
+        async fn create_stopped(
+            &self,
+            spec: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            let attempt = self.counts.creates.fetch_add(1, Ordering::SeqCst) + 1;
+            let container_id = format!("{:064x}", attempt);
+            self.runtimes.lock().unwrap().insert(
+                container_id.clone(),
+                RuntimeRecord {
+                    incarnation_id: spec.incarnation_id.clone(),
+                    state: BackendRuntimeState::Created,
+                    attempt,
+                    host: None,
+                },
+            );
+            Ok(BackendCreated {
+                daemon_id: DockerDaemonId::new(),
+                container_id,
+                immutable_config_digest: format!("fake-runtime-config-{attempt}"),
+            })
+        }
+
+        async fn start_host(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            let (attempt, limits) = {
+                let mut runtimes = self.runtimes.lock().unwrap();
+                let record = runtimes.get_mut(handle.container_id()).ok_or_else(|| {
+                    BackendError::OwnershipMismatch("unknown test container".into())
+                })?;
+                if &record.incarnation_id != handle.incarnation_id() {
+                    return Err(BackendError::OwnershipMismatch(
+                        "test container incarnation changed".into(),
+                    ));
+                }
+                record.state = BackendRuntimeState::Running;
+                (record.attempt, handle.requested_limits())
+            };
+            let socket_path = handle.runtime_dir().join("host.sock");
+            let listener = UnixListener::bind(&socket_path)
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let secret = std::fs::read(handle.runtime_dir().join("secret"))
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let incarnation = handle.incarnation_id().clone();
+            let outcome = self.outcome_for(attempt);
+            let counts = Arc::clone(&self.counts);
+            let host = tokio::spawn(async move {
+                serve_fake_host(listener, secret, incarnation, limits, outcome, counts).await;
+            });
+            self.runtimes
+                .lock()
+                .unwrap()
+                .get_mut(handle.container_id())
+                .expect("checked test container")
+                .host = Some(host);
+            Ok(())
+        }
+
+        async fn inspect(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<BackendInspection, BackendError> {
+            Ok(BackendInspection {
+                state: self.runtime_state(handle)?,
+                configured_limits: handle.requested_limits(),
+            })
+        }
+
+        async fn request_stop(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+            grace_seconds: u64,
+        ) -> Result<(), BackendError> {
+            assert_eq!(grace_seconds, 2);
+            self.counts.stop_requests.fetch_add(1, Ordering::SeqCst);
+            self.stop_targets.lock().unwrap().push((
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
+            self.cleanup_steps.lock().unwrap().push((
+                "request_stop".into(),
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
+            self.stop_exact(handle).await
+        }
+
+        async fn force_stop(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            self.counts.force_stops.fetch_add(1, Ordering::SeqCst);
+            self.stop_exact(handle).await
+        }
+
+        async fn verify_empty(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<bool, BackendError> {
+            self.counts.empty_checks.fetch_add(1, Ordering::SeqCst);
+            self.empty_targets.lock().unwrap().push((
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
+            self.cleanup_steps.lock().unwrap().push((
+                "verify_empty".into(),
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
+            Ok(matches!(
+                self.runtime_state(handle)?,
+                BackendRuntimeState::Missing
+                    | BackendRuntimeState::Created
+                    | BackendRuntimeState::Exited
+                    | BackendRuntimeState::Dead
+            ))
+        }
+
+        async fn list_known(
+            &self,
+            handles: &[crate::registry::OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            let mut result = Vec::with_capacity(handles.len());
+            for handle in handles {
+                result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+            }
+            Ok(result)
+        }
+
+        async fn read_limits(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+
+        async fn enable_long_lived(
+            &self,
+            _handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    async fn serve_fake_host(
+        listener: UnixListener,
+        secret: Vec<u8>,
+        incarnation: IncarnationId,
+        limits: RuntimeLimits,
+        outcome: HostOutcome,
+        counts: Arc<Counts>,
+    ) {
+        let boot = HostBootId::new();
+        let mut grant_epoch = 0;
+        let mut execution_generation = 0;
+        let mut observation = None;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(request) = read_frame::<_, Envelope<HostCommand>>(&mut socket).await else {
+                return;
+            };
+            let result = match request.body {
+                HostCommand::Hello {
+                    incarnation_id: requested_incarnation,
+                    challenge,
+                } => {
+                    if requested_incarnation != incarnation {
+                        return;
+                    }
+                    Ok(HostResult::Hello {
+                        proof: host_proof(&secret, &challenge, &boot, &incarnation),
+                        host_boot_id: boot.clone(),
+                        capabilities: vec!["native-identity-observation-v1".into()],
+                        effective_limits: limits,
+                    })
+                }
+                HostCommand::GrantExecution {
+                    control_epoch,
+                    execution_generation: generation,
+                    native_identity_launch,
+                    ..
+                } => {
+                    counts.grants.fetch_add(1, Ordering::SeqCst);
+                    match outcome {
+                        HostOutcome::CodexAppServerStartFailed => Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "synthetic-private-codex-output-marker",
+                        )
+                        .with_diagnostic_code(RuntimeDiagnosticCode::CodexAppServerStartFailed)),
+                        HostOutcome::CodexProxyStartFailed => Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "synthetic-private-codex-proxy-output-marker",
+                        )
+                        .with_diagnostic_code(RuntimeDiagnosticCode::CodexProxyStartFailed)),
+                        HostOutcome::FreshAgentProviderStartFailed => Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "hosted fresh-agent provider failed to start",
+                        )
+                        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                        .with_fresh_agent_provider_start_diagnostic(
+                            FreshAgentProviderStartDiagnostic::Authentication,
+                        )),
+                        HostOutcome::WorkerMayHaveStarted => {
+                            counts.possible_workers.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        HostOutcome::Running => {
+                            let Some(launch) = native_identity_launch else {
+                                return;
+                            };
+                            if launch.incarnation_id != incarnation {
+                                return;
+                            }
+                            grant_epoch = control_epoch;
+                            execution_generation = generation;
+                            let current = NativeIdentityObservation {
+                                native_session_id: "synthetic-codex-session".into(),
+                                incarnation_id: incarnation.clone(),
+                                launch_nonce: launch.launch_nonce,
+                                evidence_revision: launch.evidence_revision,
+                                source: NativeIdentitySource::CodexAppServer,
+                                evidence_digest: "b".repeat(64),
+                            };
+                            observation = Some(current.clone());
+                            counts.workers.fetch_add(1, Ordering::SeqCst);
+                            Ok(HostResult::GrantAccepted {
+                                host_boot_id: boot.clone(),
+                                worker_pid: 42,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                native_session_id: Some(current.native_session_id.clone()),
+                                native_identity_observation: Some(current),
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            })
+                        }
+                    }
+                }
+                HostCommand::Status { .. } => Ok(HostResult::Status {
+                    host_boot_id: boot.clone(),
+                    worker_pid: Some(42),
+                    worker_launch_count: 1,
+                    max_control_epoch: grant_epoch,
+                    max_execution_generation: execution_generation,
+                    fixture_evidence: serde_json::json!({}),
+                    exited: false,
+                    native_session_id: observation
+                        .as_ref()
+                        .map(|value| value.native_session_id.clone()),
+                    native_identity_observation: observation.clone(),
+                    opencode_transfer_receipt: None,
+                    opencode_adoption: Default::default(),
+                }),
+                _ => return,
+            };
+            if write_frame(
+                &mut socket,
+                &HostReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    fn supervisor(dir: &Path, backend: Arc<FakeBackend>) -> Supervisor {
+        Supervisor::new(
+            Registry::open(dir.join("registry"), None).unwrap(),
+            backend,
+            SupervisorConfig {
+                runtime_root: dir.join("runtime"),
+                control_socket_path: dir.join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "codex-pre-worker-retry".into(),
+                control_secret: "synthetic-pre-worker-control-secret".into(),
+                lifecycle_log: dir.join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn launch_request(soul_id: SoulId) -> LaunchRequest {
+        serde_json::from_value(serde_json::json!({
+            "soulId": soul_id,
+            "provider": "codex",
+            "providerStoreId": "synthetic-codex-store",
+            "creationSeedRef": "synthetic-codex-create",
+            "nativeSessionId": "synthetic-codex-session",
+            "limits": {
+                "cpuMilli": 500,
+                "memoryBytes": 67108864,
+                "swapBytes": 0,
+                "pidsMax": 32
+            },
+            "profile": RuntimeProfile::Custom,
+            "projectKey": "codex-pre-worker-retry",
+            "terminal": {
+                "terminalId": "synthetic-codex-terminal",
+                "streamId": "synthetic-codex-stream",
+                "mode": "codex",
+                "program": "codex",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0,
+                "cols": 80,
+                "rows": 24,
+                "projectKey": "codex-pre-worker-retry"
+            }
+        }))
+        .unwrap()
+    }
+
+    fn fresh_agent_launch_request(soul_id: SoulId, provider: &str) -> LaunchRequest {
+        let session_type = match provider {
+            "codex" => "freshcodex",
+            "claude" => "freshclaude",
+            _ => panic!("unsupported fresh-agent fixture provider: {provider}"),
+        };
+        serde_json::from_value(serde_json::json!({
+            "soulId": soul_id,
+            "provider": provider,
+            "providerStoreId": format!("synthetic-{provider}-store"),
+            "creationSeedRef": format!("synthetic-{provider}-create"),
+            "limits": {
+                "cpuMilli": 500,
+                "memoryBytes": 67108864,
+                "swapBytes": 0,
+                "pidsMax": 32
+            },
+            "profile": RuntimeProfile::Custom,
+            "projectKey": "fresh-agent-pre-worker-retry",
+            "freshAgent": {
+                "sessionId": format!("synthetic-{provider}-session"),
+                "provider": provider,
+                "sessionType": session_type,
+                "runtimeVariant": "owned-test-variant",
+                "providerStoreId": format!("synthetic-{provider}-store"),
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verified_codex_pre_worker_failure_allows_one_ordinary_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(
+            FirstGrantOutcome::CodexAppServerStartFailed,
+        ));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .expect_err("the injected pre-worker Codex startup failure should surface");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::CodexAppServerStartFailed)
+        );
+        let failed_attempt = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(failed_attempt.len(), 1);
+        assert_eq!(failed_attempt[0].launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed_attempt[0].cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+        let conn = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (command_state, writer_claims, reservations): (String, u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT state FROM commands WHERE incarnation_id=?1), (SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=?1), (SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=?1)",
+                [failed_attempt[0].incarnation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(command_state, "failed");
+        assert_eq!(writer_claims, 0);
+        assert_eq!(reservations, 0);
+
+        let result = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a verified pre-worker failure should permit a new ordinary launch: {:?}",
+                    error.code
+                )
+            });
+        assert_eq!(result.view.launch_state, LaunchState::Running);
+        assert_eq!(result.worker_launch_count, 1);
+        assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.workers.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.possible_workers.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.stop_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.force_stops.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.empty_checks.load(Ordering::SeqCst), 2);
+
+        let views = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(views.len(), 2);
+        let failed = views
+            .iter()
+            .find(|view| view.incarnation_id != result.view.incarnation_id)
+            .unwrap();
+        assert_eq!(failed.launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed.cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+        assert_eq!(
+            backend.stop_targets.lock().unwrap().as_slice(),
+            &[(
+                failed.incarnation_id.clone(),
+                failed.container_id.clone().unwrap(),
+            )]
+        );
+
+        let lifecycle = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+        let events = lifecycle
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let failure = events
+            .iter()
+            .find(|event| event["event"] == "supervisor.activation_failed")
+            .expect("the failure retains its existing lifecycle event");
+        assert_eq!(failure["data"]["stage"], "deliver_execution_grant");
+        assert_eq!(failure["data"]["launchState"], "starting");
+        assert_eq!(
+            failure["data"]["failureReason"],
+            "CODEX_APP_SERVER_START_FAILED"
+        );
+        assert!(failure["data"].get("errorMessage").is_none());
+        assert!(!lifecycle.contains("synthetic-private-codex-output-marker"));
+    }
+
+    #[tokio::test]
+    async fn verified_codex_proxy_pre_worker_failure_allows_one_ordinary_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(FirstGrantOutcome::CodexProxyStartFailed));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .expect_err("the injected pre-worker Codex proxy failure should surface");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::CodexProxyStartFailed)
+        );
+        let failed_attempt = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(failed_attempt.len(), 1);
+        assert_eq!(failed_attempt[0].launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed_attempt[0].cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+
+        let replacement = supervisor
+            .launch(RequestId::new(), launch_request(soul))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a verified pre-worker proxy failure should permit a new ordinary launch: {:?}",
+                    error.code
+                )
+            });
+        assert_eq!(replacement.view.launch_state, LaunchState::Running);
+        assert_eq!(replacement.worker_launch_count, 1);
+        assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.workers.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_codex_provider_start_failure_settles_after_exact_empty_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(
+            FirstGrantOutcome::FreshAgentProviderStartFailed,
+        ));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), fresh_agent_launch_request(soul, "codex"))
+            .await
+            .expect_err("the injected fresh Codex provider start failure should surface");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        let views = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(views.len(), 1);
+        let failed = &views[0];
+        assert_eq!(failed.launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed.cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+        let exact_target = (
+            failed.incarnation_id.clone(),
+            failed.container_id.clone().unwrap(),
+        );
+        assert_eq!(
+            backend.stop_targets.lock().unwrap().as_slice(),
+            std::slice::from_ref(&exact_target)
+        );
+        assert_eq!(
+            backend.empty_targets.lock().unwrap().as_slice(),
+            &[exact_target.clone(), exact_target.clone()]
+        );
+        assert_eq!(
+            backend.cleanup_steps.lock().unwrap().as_slice(),
+            &[
+                (
+                    "verify_empty".into(),
+                    exact_target.0.clone(),
+                    exact_target.1.clone()
+                ),
+                (
+                    "request_stop".into(),
+                    exact_target.0.clone(),
+                    exact_target.1.clone()
+                ),
+                (
+                    "verify_empty".into(),
+                    exact_target.0.clone(),
+                    exact_target.1.clone()
+                ),
+            ]
+        );
+
+        let conn = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (writer_claims, reservations): (u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=?1), (SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=?1)",
+                [failed.incarnation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(writer_claims, 0);
+        assert_eq!(reservations, 0);
+        let lifecycle = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+        let settled = lifecycle
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "supervisor.codex_pre_worker_failure_settled")
+            .expect("the verified failure has a structured settlement event");
+        assert_eq!(
+            settled["data"]["failureReason"],
+            "FRESH_AGENT_PROVIDER_START_FAILED"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_non_codex_provider_start_failure_skips_codex_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(
+            FirstGrantOutcome::FreshAgentProviderStartFailed,
+        ));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+
+        let error = supervisor
+            .launch(
+                RequestId::new(),
+                fresh_agent_launch_request(SoulId::new(), "claude"),
+            )
+            .await
+            .expect_err("the injected fresh Claude provider start failure should surface");
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        assert_eq!(backend.counts.stop_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.empty_checks.load(Ordering::SeqCst), 0);
+        assert!(backend.stop_targets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_codex_grant_keeps_the_incarnation_non_replaceable() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(FirstGrantOutcome::WorkerMayHaveStarted));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .expect_err("the fake host drops an ambiguous grant response");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::HostCommandFrameFailed)
+        );
+        let retry = supervisor
+            .launch(RequestId::new(), launch_request(soul))
+            .await
+            .expect_err("uncertain worker existence must retain the active incarnation");
+        assert_ne!(retry.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.workers.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.possible_workers.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.stop_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.force_stops.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.empty_checks.load(Ordering::SeqCst), 0);
+        let views = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].launch_state, LaunchState::Starting);
+    }
+}
+
+#[cfg(test)]
+mod stop_intent_order_tests {
+    use super::*;
+    use crate::{
+        admission::AdmissionPolicy,
+        registry::{BackendCreatedRecord, LaunchPreparation},
+    };
+    use freshell_runtime_protocol::{
+        DockerDaemonId, HostBootId, RuntimeLimits, RuntimeProfile, SoulId,
+    };
+    use rusqlite::Connection;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn stop_commits_intent_while_waiting_for_the_soul_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let limits = RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        };
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: soul.clone(),
+                provider: "fixture".into(),
+                provider_store_id: "store-stop-order".into(),
+                native_session_id: None,
+                creation_seed_ref: "seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "stop-order-test".into(),
+                requested_limits: limits,
+                profile: RuntimeProfile::Custom,
+                project_key: "stop-order-test".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: None,
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "stop-order-container".into(),
+                    image_ref: "stop-order-image".into(),
+                    runtime_dir: dir.path().join("runtime"),
+                    host_binary_path: dir.path().join("runtime/session-host"),
+                    immutable_config_digest: "stop-order-config".into(),
+                    launch_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits)
+            .await
+            .unwrap();
+        registry
+            .mark_running(prepared.incarnation_id)
+            .await
+            .unwrap();
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            Arc::new(DockerEngineBackend::new(
+                dir.path().join("unused-docker.sock"),
+            )),
+            SupervisorConfig {
+                runtime_root: dir.path().join("runtime"),
+                control_socket_path: dir.path().join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "stop-order-test".into(),
+                control_secret: "synthetic-test-secret".into(),
+                lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+
+        let lifecycle_lock = supervisor.lifecycle_lock(&soul).await;
+        let held = lifecycle_lock.lock().await;
+        let stopping = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.stop(soul, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap()
+                    .desired_state
+                    == freshell_runtime_protocol::DesiredState::Stopped
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Stop intent should not wait behind provider/recovery work");
+        assert!(
+            !stopping.is_finished(),
+            "cleanup must still wait until the in-flight operation releases the coordinator"
+        );
+        stopping.abort();
+        drop(held);
+
+        let conn = Connection::open(registry.database_path()).unwrap();
+        let (desired, state): (String, String) = conn
+            .query_row(
+                "SELECT desired_state,recovery_state FROM souls WHERE soul_id=?1",
+                rusqlite::params![soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((desired.as_str(), state.as_str()), ("stopped", "stopped"));
     }
 }
 
 fn semantic_launch_digest(
     request: &freshell_runtime_protocol::LaunchRequest,
 ) -> Result<String, RuntimeError> {
+    let mut terminal = request.terminal.clone();
+    if let Some(terminal) = &mut terminal {
+        // A fresh staging attempt is transport ownership, not a different
+        // launch. Retries for the same stable request retain idempotency.
+        terminal.opencode_transfer_attempt_id = None;
+    }
     let value = serde_json::json!({
         "soulId": request.soul_id,
         "provider": request.provider,
@@ -3662,12 +6874,987 @@ fn semantic_launch_digest(
         "projectKey": request.project_key,
         "nativeSessionId": request.native_session_id,
         "fixture": request.fixture,
-        "terminal": request.terminal,
-        "freshAgent": request.fresh_agent,
+        "terminal": terminal,
     });
     let bytes = serde_json::to_vec(&value)
         .map_err(|e| RuntimeError::new(RuntimeErrorCode::InvalidRequest, e.to_string()))?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod opencode_launch_digest_tests {
+    use super::semantic_launch_digest;
+    use freshell_runtime_protocol::LaunchRequest;
+
+    fn request() -> LaunchRequest {
+        serde_json::from_value(serde_json::json!({
+            "soulId": "soul-transfer-retry",
+            "provider": "opencode",
+            "providerStoreId": "soul-transfer-retry",
+            "creationSeedRef": "stable-create-key",
+            "limits": {
+                "cpuMilli": 2000,
+                "memoryBytes": 4096,
+                "swapBytes": 0,
+                "pidsMax": 512
+            },
+            "nativeSessionId": "native-session",
+            "terminal": {
+                "terminalId": "terminal-one",
+                "streamId": "stream-one",
+                "mode": "opencode",
+                "program": "/usr/bin/opencode",
+                "cwd": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0,
+                "cols": 80,
+                "rows": 24,
+                "projectKey": "project-one",
+                "workspacePath": "/workspace",
+                "resumeSessionId": "native-session",
+                "opencodeTransfer": {
+                    "transferId": "transfer-one",
+                    "provider": "opencode",
+                    "sourceStoreId": "a".repeat(64),
+                    "rootSessionId": "native-session",
+                    "sourceGeneration": "b".repeat(64),
+                    "providerSchema": "opencode-1.18.21",
+                    "sourceSchemaFingerprint": "c".repeat(64),
+                    "migrationJournalFingerprint": "d".repeat(64),
+                    "destinationStoreId": "soul-transfer-retry",
+                    "destinationDatabasePath": ".local/share/opencode/opencode.db",
+                    "targetImageRef": format!("sha256:{}", "e".repeat(64)),
+                    "targetBuildReceipt": "f".repeat(64),
+                    "incarnationId": "incarnation-one",
+                    "manifestJson": "{}",
+                    "files": [{
+                        "index": 0,
+                        "relativePath": "payload.json",
+                        "sizeBytes": 0,
+                        "sha256": "0".repeat(64)
+                    }],
+                    "totalBytes": 0,
+                    "bundleSha256": "1".repeat(64)
+                },
+                "opencodeTransferAttemptId": "a".repeat(32)
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_new_staging_attempt_keeps_the_same_launch_idempotency_digest() {
+        let first = request();
+        let mut retry = first.clone();
+        retry
+            .terminal
+            .as_mut()
+            .unwrap()
+            .opencode_transfer_attempt_id = Some("b".repeat(32));
+
+        assert_eq!(
+            semantic_launch_digest(&first).unwrap(),
+            semantic_launch_digest(&retry).unwrap()
+        );
+        retry.terminal.as_mut().unwrap().resume_session_id = Some("other-session".into());
+        assert_ne!(
+            semantic_launch_digest(&first).unwrap(),
+            semantic_launch_digest(&retry).unwrap(),
+            "stable launch intent must remain part of the digest"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opencode_transfer_restart_tests {
+    use super::*;
+    use freshell_runtime_protocol::{
+        opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
+        OpenCodeTransferDescriptor, OpenCodeTransferFile,
+    };
+    use rusqlite::{params, Connection};
+
+    const ATTEMPT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ATTEMPT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn recovery_dispatch_validates_controls_before_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry);
+        for (case, expected) in [
+            ("protocol", RuntimeErrorCode::ProtocolVersionMismatch),
+            ("role", RuntimeErrorCode::UnauthorizedRole),
+            ("credential", RuntimeErrorCode::UnauthorizedRole),
+            ("epoch", RuntimeErrorCode::StaleControlEpoch),
+            ("intent", RuntimeErrorCode::StaleIntentRevision),
+        ] {
+            let mut envelope = Envelope::new(
+                RequestId::new(),
+                if case == "role" {
+                    ControlRole::Runtime
+                } else {
+                    ControlRole::Web
+                },
+                AdminCommand::Recover(freshell_runtime_protocol::RecoverRequest {
+                    soul_id: soul.clone(),
+                    trigger: freshell_runtime_protocol::RecoveryTrigger::ManualRetry,
+                    expected_intent_revision: Some(
+                        context.intent_revision + u64::from(case == "intent"),
+                    ),
+                    // Earlier invalid controls must reject before the stale epoch.
+                    expected_control_epoch: Some(
+                        supervisor.registry.control_epoch() + u64::from(case != "intent"),
+                    ),
+                }),
+            );
+            envelope.auth = Some(
+                if case == "credential" {
+                    "invalid"
+                } else {
+                    "synthetic-secret"
+                }
+                .into(),
+            );
+            if case == "protocol" {
+                envelope.protocol_version += 1;
+            }
+            let request_id = envelope.request_id.clone();
+            let reply = supervisor.dispatch(envelope).await;
+            assert_eq!(reply.request_id, request_id);
+            assert_eq!(reply.result.unwrap_err().code, expected, "{case}");
+            let current = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            assert_eq!(current.intent_revision, context.intent_revision, "{case}");
+            assert!(current.recovery_attempt_id.is_none(), "{case}");
+            assert!(
+                supervisor
+                    .registry
+                    .recovery_retry(soul.clone(), context.intent_revision)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_native_transition_must_commit_before_input_and_recovery_probe() {
+        use freshell_runtime_protocol::{
+            NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryProbe,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_fresh_runtime(&registry, soul.clone(), dir.path())
+                .await;
+        let runtime = dir.path().join("owned-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,execution_generation=1 WHERE incarnation_id=?2",
+            params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-parent".into(),
+            )
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let parent_launch = NativeIdentityLaunch {
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+            evidence_revision: 7,
+            execution_generation: 1,
+            requested_native_session_id: Some("native-parent".into()),
+        };
+        registry
+            .bind_native_identity_launch(parent_launch.clone())
+            .await
+            .unwrap();
+        let proof = |root: &str, revision: u64| NativeIdentityObservation {
+            native_session_id: root.into(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            launch_nonce: parent_launch.launch_nonce.clone(),
+            evidence_revision: revision,
+            source: NativeIdentitySource::FreshProviderHandshake,
+            evidence_digest: "a".repeat(64),
+        };
+        let parent_proof = proof("native-parent", 7);
+        let child_proof = proof("native-child", 8);
+        let current_proof = Arc::new(std::sync::Mutex::new(Some(child_proof.clone())));
+        let inputs = Arc::new(AtomicUsize::new(0));
+        let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let responder = {
+            let current_proof = current_proof.clone();
+            let inputs = inputs.clone();
+            tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: vec![
+                                "owned-provider-config-v1".into(),
+                                "provider-store-probe-v1".into(),
+                                "native-identity-observation-v1".into(),
+                            ],
+                            effective_limits: context.requested_limits,
+                        },
+                        HostCommand::Status { .. } => {
+                            let observation = current_proof.lock().unwrap().clone();
+                            HostResult::Status {
+                                native_session_id: observation
+                                    .as_ref()
+                                    .map(|proof| proof.native_session_id.clone()),
+                                native_identity_observation: observation,
+                                host_boot_id: boot.clone(),
+                                worker_pid: None,
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: false,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::FreshAgentSend { .. } => {
+                            inputs.fetch_add(1, Ordering::SeqCst);
+                            HostResult::FreshAgentCommand {
+                                state: CommandState::ProviderAcked,
+                                native_session_id: Some("native-child".into()),
+                                claude_fork: None,
+                            }
+                        }
+                        HostCommand::FreshAgentFork { .. } => HostResult::FreshAgentFork(
+                            freshell_runtime_protocol::FreshAgentForkResult {
+                                parent_session_id: "native-parent".into(),
+                                child_session_id: "native-child".into(),
+                                parent_retired_by_runtime: true,
+                            },
+                        ),
+                        HostCommand::ProbeRecovery {
+                            resume_spec: Some(spec),
+                            ..
+                        } => HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                            evidence_revision: spec.evidence_revision,
+                            resume_spec: spec,
+                        }),
+                        other => panic!("unexpected controlled host command {other:?}"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            })
+        };
+        let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+            &dir,
+            registry.clone(),
+            crate::backend::BackendRuntimeState::Running,
+        );
+        assert!(supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                soul.clone(),
+                "blocked child input".into(),
+                None,
+                None,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            inputs.load(Ordering::SeqCst),
+            0,
+            "uncommitted native child cannot receive a prompt"
+        );
+        assert_eq!(
+            supervisor
+                .fresh_agent_resolve(
+                    soul.clone(),
+                    "uncommitted-decision".into(),
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::RecoveryBlocked,
+            "tool permission input also waits for the registry commit"
+        );
+        assert_eq!(
+            supervisor
+                .fresh_agent_compact(RequestId::new(), soul.clone(), None, None)
+                .await
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::RecoveryBlocked,
+            "provider compaction also waits for the registry commit"
+        );
+        let transition = supervisor
+            .fresh_agent_fork(RequestId::new(), soul.clone(), "native-parent".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(transition.child_session_id, "native-child");
+        let probe = supervisor
+            .probe_recovery_locked(soul.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(probe, RecoveryProbe::ReattachReady { .. }),
+            "current child proof should reach actual probe policy: {probe:?}"
+        );
+        assert_eq!(
+            supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    soul.clone(),
+                    "current child input".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            CommandState::ProviderAcked
+        );
+        assert_eq!(inputs.load(Ordering::SeqCst), 1);
+        for stale in [Some(parent_proof), None] {
+            *current_proof.lock().unwrap() = stale;
+            assert!(supervisor
+                .fresh_agent_send(
+                    RequestId::new(),
+                    soul.clone(),
+                    "stale input".into(),
+                    None,
+                    None,
+                )
+                .await
+                .is_err());
+            assert_eq!(inputs.load(Ordering::SeqCst), 1);
+            assert!(!matches!(
+                supervisor
+                    .probe_recovery_locked(soul.clone())
+                    .await
+                    .unwrap(),
+                RecoveryProbe::ReattachReady { .. }
+            ));
+        }
+        responder.abort();
+        let _ = responder.await;
+    }
+
+    fn descriptor() -> OpenCodeTransferDescriptor {
+        let payload = b"12345678";
+        let source_store_id = "b".repeat(64);
+        let source_schema_fingerprint = "c".repeat(64);
+        let migration_journal_fingerprint = "d".repeat(64);
+        let source_generation = "e".repeat(64);
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": "ses_exact",
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "generation": source_generation,
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "rows": []
+        })
+        .to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256,
+        }];
+        OpenCodeTransferDescriptor {
+            transfer_id: "transfer-read-error-fence".into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: "ses_exact".into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "soul-exact".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_build_receipt: opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            target_image_ref,
+            incarnation_id: "incarnation-test".into(),
+            bundle_sha256: opencode_transfer_bundle_digest(&manifest_json, &files),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_opencode_readiness_waits_for_current_observation() {
+        use crate::recovery::NativeIdentityWait;
+        use freshell_runtime_protocol::{
+            NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource,
+            OpenCodeAdoptionBaseline, OpenCodeAdoptionStatus,
+        };
+        for case in [
+            "ordinary",
+            "ordinary-create",
+            "initial",
+            "saved",
+            "ordinary-exact",
+            "fresh-opencode",
+            "other-provider",
+            "wrong-mode",
+            "invalid",
+            "stop",
+            "stale-intent",
+            "provider-exit",
+            "host-failure",
+            "unobserved",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("owned-host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute("UPDATE incarnations SET runtime_dir=?1,execution_generation=1,fixture_kind=NULL WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()]).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+            if case == "other-provider" {
+                conn.execute(
+                    "UPDATE souls SET provider='codex' WHERE soul_id=?1",
+                    [soul.as_str()],
+                )
+                .unwrap();
+            }
+            if case != "ordinary-create" {
+                registry
+                    .record_native_session(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        "ses_exact".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let binding = registry
+                .bind_native_identity_launch(NativeIdentityLaunch {
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                    evidence_revision: context.evidence_revision,
+                    execution_generation: 1,
+                    requested_native_session_id: (case != "ordinary-create")
+                        .then(|| "ses_exact".into()),
+                })
+                .await
+                .unwrap();
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                "terminalId":"terminal-import", "streamId":"stream-import", "mode":"opencode", "program":"opencode",
+                "cwd":"/workspace", "workspacePath":"/workspace", "projectKey":"owned-import",
+                "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24,
+                "env":{"HOME":"/home/freshell/provider"}, "resumeSessionId":"ses_exact",
+                "opencodeTransfer":descriptor(), "opencodeTransferAttemptId":ATTEMPT_A,
+            })).unwrap();
+            terminal.validate().unwrap();
+            let mut saved = None;
+            if matches!(case, "saved" | "ordinary-exact") {
+                let mut spec = freshell_agent_runtime::build_resume_spec(
+                    freshell_agent_runtime::ResumeSpecInput {
+                        provider: "opencode",
+                        provider_store_id: &context.provider_store_id,
+                        native_session_id: "ses_exact",
+                        terminal: &terminal,
+                        provider_version: Some("1.18.21".into()),
+                        creation_seed_ref: context.creation_seed_ref.clone(),
+                        checkpoint_revision: 0,
+                        evidence_revision: context.evidence_revision,
+                        never_dispatched: false,
+                    },
+                )
+                .unwrap();
+                if case == "saved" {
+                    spec.opencode_adoption_baseline =
+                        Some(OpenCodeAdoptionBaseline::from_descriptor(descriptor()).unwrap());
+                }
+                saved = Some(spec);
+            }
+            if !matches!(case, "initial" | "wrong-mode" | "invalid") {
+                terminal.opencode_transfer = None;
+                terminal.opencode_transfer_attempt_id = None;
+            } else if case == "wrong-mode" {
+                terminal.mode = "claude".into();
+                assert!(terminal.validate().is_err());
+            } else if case == "invalid" {
+                terminal.opencode_transfer.as_mut().unwrap().bundle_sha256 = "invalid".into();
+                assert!(terminal.validate().is_err());
+            }
+            let fresh_agent = (case == "fresh-opencode").then(|| {
+                serde_json::from_value(serde_json::json!({
+                "sessionId":"fresh-readiness", "provider":"opencode", "sessionType":"freshopencode",
+                "runtimeVariant":"opencode-mcp", "providerStoreId":context.provider_store_id,
+                "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534, "runAsGid":0
+            })).unwrap()
+            });
+            let workload = LaunchWorkload {
+                soul_id: soul.clone(),
+                fixture: None,
+                terminal: (case != "fresh-opencode").then_some(terminal),
+                fresh_agent,
+                resume_spec: saved,
+            };
+            let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+            let observation = NativeIdentityObservation {
+                native_session_id: "ses_exact".into(),
+                incarnation_id: binding.incarnation_id.clone(),
+                launch_nonce: binding.launch_nonce.clone(),
+                evidence_revision: binding.evidence_revision,
+                source: if case == "fresh-opencode" {
+                    NativeIdentitySource::FreshProviderHandshake
+                } else if case == "other-provider" {
+                    NativeIdentitySource::CodexAppServer
+                } else {
+                    NativeIdentitySource::OpencodeTui
+                },
+                evidence_digest: "a".repeat(64),
+            };
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let limits = context.requested_limits;
+            let started = Instant::now();
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let elapsed = started.elapsed();
+                    let observed = if elapsed < Duration::from_millis(250) {
+                        None
+                    } else {
+                        let mut current = observation.clone();
+                        if case == "unobserved" || elapsed < Duration::from_secs(9) {
+                            match (elapsed.as_millis() / 250) % 3 {
+                                0 => current.launch_nonce = "previous-launch".into(),
+                                1 => current.evidence_revision += 1,
+                                _ if case != "ordinary-create" => {
+                                    current.native_session_id = "ses_wrong".into()
+                                }
+                                _ => current.incarnation_id = IncarnationId::new(),
+                            }
+                        }
+                        Some(current)
+                    };
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: vec!["native-identity-observation-v1".into()],
+                            effective_limits: limits,
+                        },
+                        HostCommand::Status { .. } if case == "host-failure" => {
+                            write_frame(
+                                &mut socket,
+                                &HostReply {
+                                    request_id: request.request_id,
+                                    result: Err(RuntimeError::new(
+                                        RuntimeErrorCode::HostUnreachable,
+                                        "owned host unavailable",
+                                    )),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            continue;
+                        }
+                        HostCommand::Status { .. } => HostResult::Status {
+                            native_identity_observation: observed,
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: 1,
+                            max_execution_generation: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: case == "provider-exit"
+                                && elapsed >= Duration::from_millis(250),
+                            native_session_id: Some("ses_exact".into()),
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: if matches!(case, "initial" | "saved") {
+                                OpenCodeAdoptionStatus::AwaitingObservation
+                            } else {
+                                OpenCodeAdoptionStatus::NotRequired
+                            },
+                        },
+                        _ => panic!("unexpected native wait command"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let cancellation = if matches!(case, "stop" | "stale-intent") {
+                let registry = registry.clone();
+                let soul = soul.clone();
+                let database = dir.path().join("registry/runtime.sqlite3");
+                Some(tokio::spawn(async move {
+                    sleep(Duration::from_millis(250)).await;
+                    if case == "stop" {
+                        registry.begin_stop(soul).await.unwrap();
+                    } else {
+                        Connection::open(database).unwrap().execute(
+                        "UPDATE souls SET intent_revision=intent_revision+1 WHERE soul_id=?1", [soul.as_str()]).unwrap();
+                    }
+                }))
+            } else {
+                None
+            };
+            let result = supervisor
+                .wait_for_native_startup(
+                    &workload,
+                    &prepared.incarnation_id,
+                    &context,
+                    prepared.intent_revision,
+                )
+                .await;
+            if let Some(cancellation) = cancellation {
+                cancellation.await.unwrap();
+            }
+            responder.abort();
+            assert!(responder.await.unwrap_err().is_cancelled());
+            if matches!(
+                case,
+                "initial" | "saved" | "ordinary" | "ordinary-create" | "ordinary-exact"
+            ) {
+                assert!(
+                    matches!(result, NativeIdentityWait::Observed { .. }),
+                    "{case}: {result:?}"
+                );
+                if let NativeIdentityWait::Observed { elapsed_ms, .. } = &result {
+                    assert!(*elapsed_ms >= 9_000);
+                }
+            } else if case == "stop" {
+                assert!(
+                    matches!(result, NativeIdentityWait::StopIntent { .. }),
+                    "{result:?}"
+                );
+            } else if case == "stale-intent" {
+                assert!(
+                    matches!(result, NativeIdentityWait::IntentChanged { .. }),
+                    "{result:?}"
+                );
+            } else if case == "provider-exit" {
+                assert!(
+                    matches!(result, NativeIdentityWait::ProviderExited { .. }),
+                    "{result:?}"
+                );
+            } else if case == "host-failure" {
+                assert!(
+                    matches!(result, NativeIdentityWait::HostUnavailable { .. }),
+                    "{result:?}"
+                );
+            } else if case == "unobserved" {
+                assert!(matches!(
+                    result,
+                    NativeIdentityWait::TimedOut {
+                        adoption_pending: false,
+                        ..
+                    }
+                ));
+                assert!(started.elapsed() >= Duration::from_secs(180));
+                assert!(started.elapsed() < Duration::from_secs(190));
+            } else {
+                assert!(
+                    matches!(result, NativeIdentityWait::TimedOut { .. }),
+                    "{case}: {result:?}"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(9),
+                    "ordinary wait must end before the delayed observation"
+                );
+            }
+            if matches!(
+                case,
+                "stop" | "stale-intent" | "provider-exit" | "host-failure"
+            ) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "prompt cancellation: {case}"
+                );
+            }
+            let persisted: Option<String> = conn
+                .query_row(
+                    "SELECT native_identity_observation FROM incarnations WHERE incarnation_id=?1",
+                    [prepared.incarnation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                persisted.is_none(),
+                "waiting cannot publish outside the activation transaction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_startup_failure_records_its_typed_subtype_without_host_error_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind=NULL,runtime_dir=?1 WHERE incarnation_id=?2",
+            params![
+                dir.path().join("private-native-detail").to_string_lossy(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let workload = LaunchWorkload {
+            soul_id: soul.clone(),
+            fixture: None,
+            terminal: None,
+            fresh_agent: None,
+            resume_spec: None,
+        };
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry);
+        let result = supervisor
+            .wait_for_native_startup(
+                &workload,
+                &prepared.incarnation_id,
+                &context,
+                prepared.intent_revision,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            crate::recovery::NativeIdentityWait::HostUnavailable { .. }
+        ));
+        let text = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+        let event = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "supervisor.native_startup_wait_finished")
+            .unwrap();
+        assert_eq!(event["data"]["outcome"], "host_unavailable");
+        assert_eq!(event["data"]["waitClass"], "ordinary");
+        assert_eq!(event["data"]["soulId"], soul.as_str());
+        assert_eq!(
+            event["data"]["incarnationId"],
+            prepared.incarnation_id.as_str()
+        );
+        assert_eq!(event["data"]["severity"], "warning");
+        assert!(!text.contains("private-native-detail"));
+        assert!(event["data"]["message"].is_null());
+    }
+
+    fn chunk(descriptor: &OpenCodeTransferDescriptor) -> OpenCodeTransferChunk {
+        let data = b"12345678".to_vec();
+        OpenCodeTransferChunk {
+            transfer_id: descriptor.transfer_id.clone(),
+            attempt_id: ATTEMPT_A.into(),
+            sequence: 0,
+            file_index: 0,
+            offset: 0,
+            sha256: format!("{:x}", Sha256::digest(&data)),
+            data,
+        }
+    }
+
+    fn supervisor(dir: &tempfile::TempDir, registry: Registry) -> Supervisor {
+        Supervisor::new(
+            registry,
+            Arc::new(DockerEngineBackend::new(
+                dir.path().join("unused-docker.sock"),
+            )),
+            SupervisorConfig {
+                runtime_root: dir.path().join("runtime"),
+                control_socket_path: dir.path().join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "restart-reconcile-test".into(),
+                control_secret: "synthetic-test-secret".into(),
+                lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    async fn begin_as_retry(
+        supervisor: &Supervisor,
+        descriptor: OpenCodeTransferDescriptor,
+    ) -> Result<AdminResult, RuntimeError> {
+        let mut envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin {
+                descriptor: Box::new(descriptor),
+                attempt_id: ATTEMPT_B.into(),
+            }),
+        );
+        envelope.auth = Some("synthetic-test-secret".into());
+        supervisor.dispatch(envelope).await.result
+    }
+
+    #[tokio::test]
+    async fn registry_reference_read_error_does_not_release_registering_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: SoulId::new(),
+                provider: "fixture".into(),
+                provider_store_id: "store".into(),
+                native_session_id: None,
+                creation_seed_ref: "seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "test-read-error".into(),
+                requested_limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 64 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 32,
+                },
+                profile: freshell_runtime_protocol::RuntimeProfile::Custom,
+                project_key: "test-project".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: None,
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let connection = Connection::open(registry.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::json!({
+                        "opencodeTransfer": {"transferId": "transfer-read-error-fence"}
+                    })
+                    .to_string(),
+                    prepared.incarnation_id.as_str()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let supervisor = supervisor(&dir, registry);
+        let descriptor = descriptor();
+        let staging = &supervisor.opencode_transfer_staging;
+        staging.begin(&descriptor, ATTEMPT_A, 8).unwrap();
+        staging.write_chunk(&chunk(&descriptor)).unwrap();
+        staging
+            .finalize(&descriptor.transfer_id, ATTEMPT_A)
+            .unwrap();
+        staging
+            .mark_launch_registering(&descriptor, ATTEMPT_A, false)
+            .unwrap();
+
+        let error = begin_as_retry(&supervisor, descriptor.clone())
+            .await
+            .expect_err("an unreadable reference snapshot must fail Begin closed");
+        assert_eq!(error.code, RuntimeErrorCode::RegistryFailure);
+        assert!(
+            staging.begin(&descriptor, ATTEMPT_B, 8).is_err(),
+            "without a complete registry snapshot the previous registering attempt stays fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_recovers_an_unreferenced_registering_stage_before_the_first_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let supervisor = supervisor(&dir, registry);
+        let descriptor = descriptor();
+        let staging = &supervisor.opencode_transfer_staging;
+        staging.begin(&descriptor, ATTEMPT_A, 8).unwrap();
+        staging.write_chunk(&chunk(&descriptor)).unwrap();
+        staging
+            .finalize(&descriptor.transfer_id, ATTEMPT_A)
+            .unwrap();
+        staging
+            .mark_launch_registering(&descriptor, ATTEMPT_A, false)
+            .unwrap();
+
+        let result = begin_as_retry(&supervisor, descriptor)
+            .await
+            .expect("an empty, readable registry snapshot permits a fresh attempt");
+        assert!(matches!(
+            result,
+            AdminResult::OpenCodeTransfer(OpenCodeTransferResult::Started {
+                next_sequence: 1,
+                ..
+            })
+        ));
+    }
 }
 
 async fn find_view(
@@ -3686,6 +7873,19 @@ async fn find_view(
                 incarnation_id.to_string(),
             )
         })
+}
+
+fn map_opencode_transfer(error: crate::opencode_transfer::StagingError) -> RuntimeError {
+    let code = match &error {
+        crate::opencode_transfer::StagingError::InvalidDescriptor(_) => {
+            RuntimeErrorCode::InvalidRequest
+        }
+        crate::opencode_transfer::StagingError::Capacity(_) => RuntimeErrorCode::BlockedResource,
+        crate::opencode_transfer::StagingError::InvalidState(_)
+        | crate::opencode_transfer::StagingError::Io(_)
+        | crate::opencode_transfer::StagingError::Metadata(_) => RuntimeErrorCode::RegistryFailure,
+    };
+    RuntimeError::new(code, error.to_string())
 }
 
 fn map_registry(error: RegistryError) -> RuntimeError {
@@ -3712,13 +7912,13 @@ fn map_registry(error: RegistryError) -> RuntimeError {
     RuntimeError::new(code, error.to_string())
 }
 
-fn map_backend(error: BackendError) -> RuntimeError {
+pub(crate) fn map_backend(error: BackendError) -> RuntimeError {
     let code = match &error {
         BackendError::OwnershipMismatch(_) => RuntimeErrorCode::OwnershipMismatch,
-        BackendError::Unavailable(_) | BackendError::DockerHttp { .. } => {
+        error if crate::recovery_retry::TransientRecoveryFailure::from_backend(error).is_some() => {
             RuntimeErrorCode::BackendUnavailable
         }
-        _ => RuntimeErrorCode::BackendUnavailable,
+        _ => RuntimeErrorCode::RecoveryBlocked,
     };
     RuntimeError::new(code, error.to_string())
 }
@@ -3756,9 +7956,57 @@ fn lifecycle_secrets() -> &'static StdMutex<HashMap<PathBuf, String>> {
 }
 
 pub(crate) fn append_event(path: &Path, event: &str, data: serde_json::Value) {
+    let _incident_coordinator = crate::loss_report::incident_file_coordinator();
     let _write_guard = LIFECYCLE_WRITE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    append_event_locked(path, event, data);
+}
+
+/// Append an incident-bearing lifecycle event only while the exact incident
+/// still exists. The registry read and append share the retraction coordinator,
+/// so a delayed finalizer cannot recreate a withdrawn event after file cleanup.
+pub(crate) async fn append_incident_event_if_current(
+    registry: &Registry,
+    path: &Path,
+    event: &str,
+    data: serde_json::Value,
+    incident_id: IncidentId,
+) -> Result<bool, RegistryError> {
+    let path = path.to_path_buf();
+    let event = event.to_string();
+    registry
+        .run_blocking(move |conn| {
+            use rusqlite::OptionalExtension;
+
+            let _incident_coordinator = crate::loss_report::incident_file_coordinator();
+            let _write_guard = LIFECYCLE_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let generation: Option<i64> = conn
+                .query_row(
+                    "SELECT updated_at FROM loss_incidents WHERE incident_id=?1",
+                    rusqlite::params![incident_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(generation) = generation else {
+                return Ok(false);
+            };
+            let mut data = data;
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "incidentGeneration".into(),
+                    serde_json::Value::from(generation),
+                );
+            }
+            append_event_locked(&path, &event, data);
+            Ok(true)
+        })
+        .await
+}
+
+fn append_event_locked(path: &Path, event: &str, data: serde_json::Value) {
     let sequence = LIFECYCLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let sampled_nanos = LIFECYCLE_STARTED
         .get_or_init(Instant::now)
@@ -3796,13 +8044,47 @@ pub(crate) fn append_event(path: &Path, event: &str, data: serde_json::Value) {
     }
 }
 
+fn activation_backend_failure_data(
+    prepared: &PreparedLaunch,
+    state: LaunchState,
+    error: &BackendError,
+) -> serde_json::Value {
+    let kind = match error {
+        BackendError::StoppedRepair(_) => "stopped_repair",
+        BackendError::Unavailable(_) => "unavailable",
+        BackendError::OwnershipMismatch(_) => "ownership_mismatch",
+        BackendError::PolicyMismatch(_) => "policy_mismatch",
+        BackendError::DockerHttp { .. } => "docker_http",
+        BackendError::Malformed(_) => "malformed",
+        BackendError::InvalidConfig(_) => "invalid_config",
+    };
+    let mut data = serde_json::json!({
+        "severity": "error",
+        "soulId": prepared.soul_id,
+        "incarnationId": prepared.incarnation_id,
+        "intentRevision": prepared.intent_revision,
+        "launchState": state,
+        "stage": "create_stopped_runtime",
+        "backendErrorKind": kind,
+    });
+    match error {
+        // Create preflight configuration failures contain validation labels and
+        // file references, never provider file contents or response payloads.
+        // The existing lifecycle writer also applies its credential redaction.
+        BackendError::InvalidConfig(reason) => data["backendFailureReason"] = reason.clone().into(),
+        BackendError::DockerHttp { status, .. } => data["backendHttpStatus"] = (*status).into(),
+        _ => {}
+    }
+    data
+}
+
 fn activation_failure_data(
     prepared: &PreparedLaunch,
     state: LaunchState,
     stage: &'static str,
     error: &RuntimeError,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut data = serde_json::json!({
         "soulId": prepared.soul_id,
         "incarnationId": prepared.incarnation_id,
         "intentRevision": prepared.intent_revision,
@@ -3810,7 +8092,11 @@ fn activation_failure_data(
         "stage": stage,
         "errorCode": error.code,
         "errorClass": "runtime_activation_failed",
-    })
+    });
+    if let Some(reason) = error.diagnostic_code {
+        data["failureReason"] = serde_json::json!(reason);
+    }
+    data
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
@@ -3844,3 +8130,3298 @@ pub(crate) fn crash_if(point: &'static str) {
 }
 #[cfg(not(feature = "runtime-test-faults"))]
 pub(crate) fn crash_if(_point: &'static str) {}
+
+fn stop_crash_boundary(point: &'static str) {
+    crash_if(point);
+    #[cfg(test)]
+    interrupted_transaction_tests::crash_boundary(point);
+}
+
+fn stop_backend_outcome(error: BackendError) -> StopOutcome {
+    match error {
+        BackendError::OwnershipMismatch(_) => StopOutcome::BlockedOwnership,
+        BackendError::Unavailable(_) => StopOutcome::BackendUnavailable,
+        _ => StopOutcome::TerminationUnconfirmed,
+    }
+}
+
+fn stop_verification_outcome(error: RuntimeError) -> StopOutcome {
+    match error.code {
+        RuntimeErrorCode::OwnershipMismatch => StopOutcome::BlockedOwnership,
+        RuntimeErrorCode::BackendUnavailable => StopOutcome::BackendUnavailable,
+        _ => StopOutcome::TerminationUnconfirmed,
+    }
+}
+
+#[cfg(test)]
+mod interrupted_transaction_tests {
+    use super::*;
+    use crate::{backend::*, registry::OwnedRuntimeHandle};
+    use freshell_runtime_protocol::{CleanupState, DesiredState, RuntimeLimits};
+    use rusqlite::{params, Connection};
+    use std::{io::Write, os::unix::process::ExitStatusExt};
+
+    fn sandbox_only() {
+        assert_eq!(
+            std::env::var("FRESHELL_SANDBOX_MODE").as_deref(),
+            Ok("runtime-suite")
+        );
+        assert!(Path::new("/.dockerenv").exists());
+    }
+
+    pub(super) fn crash_boundary(point: &str) {
+        if std::env::var("FRESHELL_STOP_TEST_CRASH").ok().as_deref() != Some(point) {
+            return;
+        }
+        sandbox_only();
+        let root = PathBuf::from(std::env::var_os("FRESHELL_STOP_TEST_ROOT").unwrap());
+        std::fs::write(root.join("crash-boundary"), point).unwrap();
+        eprintln!("reached actual Stop boundary: {point}");
+        std::process::abort();
+    }
+
+    fn record(root: &Path, action: &str, target: &str) {
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join(action))
+                .unwrap(),
+            "{target}"
+        )
+        .unwrap();
+    }
+
+    fn count(root: &Path, action: &str) -> usize {
+        std::fs::read_to_string(root.join(action))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn stop_failure_events(supervisor: &Supervisor) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&supervisor.config.lifecycle_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["event"] == "supervisor.stop_stage_failed")
+            .collect()
+    }
+
+    async fn assert_pending_stop_custody(supervisor: &Supervisor, root: &Path) {
+        let mut handles = supervisor.registry.pending_stop_handles().await.unwrap();
+        assert_eq!(handles.len(), 1);
+        let handle = handles.remove(0);
+        assert!(
+            !supervisor
+                .registry
+                .stop_progress(&handle)
+                .await
+                .unwrap()
+                .settled
+        );
+        assert_retained(supervisor, root, 2).await;
+    }
+
+    struct StopBackend {
+        root: PathBuf,
+    }
+
+    impl StopBackend {
+        fn mode(&self) -> String {
+            std::fs::read_to_string(self.root.join("mode")).unwrap_or_else(|_| "graceful".into())
+        }
+        fn check(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            if self.mode() == "unavailable" {
+                return Err(BackendError::Unavailable(
+                    "synthetic backend offline".into(),
+                ));
+            }
+            if self.mode() == "mismatch" {
+                return Err(BackendError::OwnershipMismatch(
+                    "synthetic labels differ".into(),
+                ));
+            }
+            assert_eq!(
+                std::fs::read_to_string(self.root.join("container")).unwrap(),
+                handle.container_id()
+            );
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeBackend for StopBackend {
+        async fn inspect(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<BackendInspection, BackendError> {
+            self.check(handle)?;
+            Ok(BackendInspection {
+                state: if self.mode() == "removed" {
+                    BackendRuntimeState::Missing
+                } else if self.root.join("empty").exists() {
+                    BackendRuntimeState::Exited
+                } else {
+                    BackendRuntimeState::Running
+                },
+                configured_limits: handle.requested_limits(),
+            })
+        }
+        async fn create_stopped(
+            &self,
+            _: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            record(&self.root, "creates", "unexpected");
+            panic!("Stop must never create a replacement")
+        }
+        async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            record(&self.root, "starts", "unexpected");
+            panic!("Stop must never start a provider")
+        }
+        async fn request_stop(
+            &self,
+            handle: &OwnedRuntimeHandle,
+            graceful: u64,
+        ) -> Result<(), BackendError> {
+            self.check(handle)?;
+            assert_eq!(graceful, 2);
+            record(&self.root, "graceful", handle.container_id());
+            pause(&self.root, "graceful_return").await;
+            if self.mode() == "graceful" {
+                std::fs::write(self.root.join("empty"), b"empty").unwrap();
+            }
+            if self.mode() == "removed" {
+                return Err(BackendError::DockerHttp {
+                    status: 404,
+                    body: "exact enclosure absent".into(),
+                });
+            }
+            Ok(())
+        }
+        async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            self.check(handle)?;
+            record(&self.root, "force", handle.container_id());
+            pause(&self.root, "force_return").await;
+            if self.mode() != "surviving" {
+                std::fs::write(self.root.join("empty"), b"empty").unwrap();
+            }
+            Ok(())
+        }
+        async fn verify_empty(&self, handle: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            self.check(handle)?;
+            let empty = self.root.join("empty").exists() || self.mode() == "removed";
+            if empty {
+                pause(&self.root, "empty_observed").await;
+            }
+            Ok(empty)
+        }
+        async fn read_limits(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            panic!("Stop cannot enable execution")
+        }
+        async fn list_known(
+            &self,
+            handles: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            let mut result = vec![];
+            for handle in handles {
+                result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+            }
+            Ok(result)
+        }
+    }
+
+    fn open(root: &Path) -> Supervisor {
+        Supervisor::new(
+            Registry::open(root.join("registry"), None).unwrap(),
+            Arc::new(StopBackend { root: root.into() }),
+            SupervisorConfig {
+                runtime_root: root.join("runtime"),
+                control_socket_path: root.join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "ordinary-stop".into(),
+                control_secret: "synthetic-secret".into(),
+                lifecycle_log: root.join("lifecycle.jsonl"),
+                admission: Default::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    async fn seed(supervisor: &Supervisor, root: &Path, capability: bool) -> SoulId {
+        let soul = SoulId::new();
+        let prepared = crate::registry::tests::materialize_fresh_runtime(
+            &supervisor.registry,
+            soul.clone(),
+            root,
+        )
+        .await;
+        let runtime = root.join("runtime").join(prepared.incarnation_id.as_str());
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let mut agent: freshell_runtime_protocol::FreshAgentLaunchSpec = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT fresh_agent_spec FROM incarnations WHERE incarnation_id=?1",
+                    [prepared.incarnation_id.as_str()],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        if capability {
+            agent.provider_launch_context =
+                Some(freshell_runtime_protocol::ProviderLaunchContext {
+                    prepared_inputs: None,
+                    preparation: freshell_runtime_protocol::ProviderPreparation::Claude {
+                        mcp_args: vec![],
+                    },
+                    mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                        grant_id: "stop-exact-grant".into(),
+                        endpoint: "http://host.docker.internal:3456".into(),
+                        provider_relative_path: ".freshell/capability.json".into(),
+                        host_gateway_address: None,
+                    }),
+                    config: vec![],
+                });
+        }
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,fresh_agent_spec=?2 WHERE incarnation_id=?3",
+            params![
+                runtime.to_string_lossy(),
+                serde_json::to_string(&agent).unwrap(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        supervisor
+            .registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "stop-retained-root".into(),
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(root.join("provider")).unwrap();
+        std::fs::write(
+            root.join("provider/history.jsonl"),
+            b"{\"root\":\"stop-retained-root\",\"turn\":\"synthetic retained history\"}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("soul"), soul.as_str()).unwrap();
+        std::fs::write(
+            root.join("container"),
+            format!("container-{}", prepared.incarnation_id),
+        )
+        .unwrap();
+        let fingerprint: (String,String,String,u64,u64,u64) = conn.query_row(
+            "SELECT provider_store_id,provider_volume_name,native_session_id,evidence_revision,native_import_revision,successful_recoveries_in_window FROM souls WHERE soul_id=?1", [soul.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+        std::fs::write(
+            root.join("identity.json"),
+            serde_json::to_vec(&fingerprint).unwrap(),
+        )
+        .unwrap();
+        // Observe actual writes after fixture setup; no injected success flags.
+        conn.execute_batch("CREATE TABLE stop_test_effects(kind TEXT NOT NULL);
+            CREATE TRIGGER stop_test_new_incarnation AFTER INSERT ON incarnations BEGIN INSERT INTO stop_test_effects VALUES('replacement'); END;
+            CREATE TRIGGER stop_test_new_writer AFTER INSERT ON writer_claims BEGIN INSERT INTO stop_test_effects VALUES('writer'); END;
+            CREATE TRIGGER stop_test_new_grant AFTER UPDATE OF execution_generation,grant_id ON incarnations WHEN NEW.execution_generation!=OLD.execution_generation OR NEW.grant_id IS NOT OLD.grant_id BEGIN INSERT INTO stop_test_effects VALUES('execution_grant'); END;
+            CREATE TRIGGER stop_test_new_recovery AFTER INSERT ON recovery_attempts BEGIN INSERT INTO stop_test_effects VALUES('recovery'); END;").unwrap();
+        soul
+    }
+
+    fn soul(root: &Path) -> SoulId {
+        SoulId::parse(std::fs::read_to_string(root.join("soul")).unwrap()).unwrap()
+    }
+
+    async fn docker_fixture(
+        supervisor: &mut Supervisor,
+        root: &Path,
+        created: bool,
+    ) -> crate::backend::tests::StopDockerFixture {
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        if created {
+            // The replacement owns its container and retained soul history,
+            // but has not received an execution grant or started its host.
+            conn.execute(
+                "UPDATE incarnations SET launch_state='created',execution_generation=0,grant_id=NULL WHERE incarnation_id=?1",
+                [view.incarnation_id.as_str()],
+            ).unwrap();
+        }
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id)
+            .await
+            .unwrap();
+        let fixture = crate::backend::tests::StopDockerFixture::new(root, &handle).await;
+        conn.execute(
+            "UPDATE incarnations SET immutable_config_digest=?1 WHERE incarnation_id=?2",
+            params![fixture.digest, handle.incarnation_id().as_str()],
+        )
+        .unwrap();
+        // Setup is finished. Keep all execution/write counters active during
+        // Stop, reopen and observer continuation.
+        conn.execute("DELETE FROM stop_test_effects", []).unwrap();
+        supervisor.backend = Arc::new(fixture.backend.clone());
+        if !created {
+            fixture.state.lock().unwrap().inspection["State"] = serde_json::json!({
+                "Status":"running","Running":true,"Paused":false,"Restarting":false
+            });
+        }
+        fixture
+    }
+
+    #[tokio::test]
+    async fn docker_created_is_qualified_empty_without_starting_or_weakening_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), true).await;
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.backend.inspect(&handle).await.unwrap().state,
+            BackendRuntimeState::Created
+        );
+        fixture.backend.request_stop(&handle, 2).await.unwrap();
+        fixture.backend.force_stop(&handle).await.unwrap();
+        assert_eq!(
+            fixture.backend.inspect(&handle).await.unwrap().state,
+            BackendRuntimeState::Created
+        );
+        let created_empty = fixture.backend.verify_empty(&handle).await.unwrap();
+        let owned = fixture.state.lock().unwrap().inspection.clone();
+        for (state, expected) in [
+            (
+                serde_json::json!({"Status":"running","Running":true}),
+                BackendRuntimeState::Running,
+            ),
+            (
+                serde_json::json!({"Status":"created","Running":true}),
+                BackendRuntimeState::Running,
+            ),
+            (
+                serde_json::json!({"Status":"paused","Running":true,"Paused":true}),
+                BackendRuntimeState::Paused,
+            ),
+            (
+                serde_json::json!({"Status":"restarting","Restarting":true}),
+                BackendRuntimeState::Restarting,
+            ),
+        ] {
+            fixture.state.lock().unwrap().inspection["State"] = state;
+            assert_eq!(
+                fixture.backend.inspect(&handle).await.unwrap().state,
+                expected
+            );
+            assert!(!fixture.backend.verify_empty(&handle).await.unwrap());
+        }
+        fixture.state.lock().unwrap().inspection = owned.clone();
+        for pointer in [
+            "/Id",
+            "/Image",
+            "/Config/Labels/com.freshell.soul-id",
+            "/Mounts/0/Source",
+        ] {
+            *fixture
+                .state
+                .lock()
+                .unwrap()
+                .inspection
+                .pointer_mut(pointer)
+                .unwrap() = serde_json::json!("foreign");
+            assert!(matches!(
+                fixture.backend.verify_empty(&handle).await,
+                Err(BackendError::OwnershipMismatch(_))
+            ));
+            fixture.state.lock().unwrap().inspection = owned.clone();
+        }
+        fixture.state.lock().unwrap().daemon_id = "foreign-daemon".into();
+        assert!(matches!(
+            fixture.backend.verify_empty(&handle).await,
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+        fixture.state.lock().unwrap().daemon_id = handle.daemon_id().to_string();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET immutable_config_digest='tampered' WHERE incarnation_id=?1",
+            [view.incarnation_id.as_str()],
+        )
+        .unwrap();
+        let tampered = supervisor
+            .registry
+            .owned_handle(view.incarnation_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.backend.verify_empty(&tampered).await,
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+        assert!(!fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r.contains("/start") || r.contains("/create")));
+        fixture.close().await;
+        assert!(created_empty, "an exactly owned, never-started Created enclosure has no workload even after no-op stop/kill");
+    }
+
+    #[tokio::test]
+    async fn exited_unless_stopped_container_is_suppressed_before_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id.clone())
+            .await
+            .unwrap();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.inspection["State"] = serde_json::json!({
+                "Status":"exited","Running":false,"Paused":false,"Restarting":false
+            });
+            state.inspection["HostConfig"]["RestartPolicy"] = serde_json::json!({
+                "Name":"unless-stopped","MaximumRetryCount":0
+            });
+        }
+        assert!(
+            !fixture.backend.verify_empty(&handle).await.unwrap(),
+            "an exited container with restart enabled is not yet safe to settle"
+        );
+
+        let (outcome, _) = supervisor.stop(id, Some(1)).await.unwrap();
+
+        assert_eq!(outcome, StopOutcome::VerifiedEmpty);
+        let (update_request, update_body) = fixture
+            .state
+            .lock()
+            .unwrap()
+            .restart_updates
+            .first()
+            .cloned()
+            .expect("cleanup must disable the container's restart policy");
+        assert_eq!(
+            update_request,
+            format!(
+                "POST /v1.47/containers/{}/update HTTP/1.1",
+                handle.container_id()
+            )
+        );
+        assert_eq!(
+            update_body,
+            serde_json::json!({
+                "RestartPolicy":{"Name":"no","MaximumRetryCount":0}
+            })
+        );
+        {
+            let state = fixture.state.lock().unwrap();
+            assert_eq!(
+                state.inspection["HostConfig"]["RestartPolicy"]["Name"],
+                "no"
+            );
+            let final_inspection = format!(
+                "GET /v1.47/containers/{}/json HTTP/1.1",
+                handle.container_id()
+            );
+            assert_eq!(
+                state.requests.last().map(String::as_str),
+                Some(final_inspection.as_str()),
+                "the exact owned container must be inspected after restart suppression"
+            );
+        }
+
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let claims: (u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=?1), \
+                        (SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=?1)",
+                [handle.incarnation_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claims, (0, 0));
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn exited_unless_stopped_container_stays_pending_without_policy_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.inspection["State"] = serde_json::json!({
+                "Status":"exited","Running":false,"Paused":false,"Restarting":false
+            });
+            state.inspection["HostConfig"]["RestartPolicy"] = serde_json::json!({
+                "Name":"unless-stopped","MaximumRetryCount":0
+            });
+            state.apply_restart_update = false;
+        }
+
+        let (outcome, _) = supervisor.stop(id, Some(1)).await.unwrap();
+
+        assert_ne!(outcome, StopOutcome::VerifiedEmpty);
+        assert_eq!(
+            fixture.state.lock().unwrap().inspection["HostConfig"]["RestartPolicy"]["Name"],
+            "unless-stopped"
+        );
+        assert_eq!(
+            fixture.state.lock().unwrap().restart_updates.len(),
+            1,
+            "a successful update response without a verified policy change must fail closed"
+        );
+        assert_eq!(
+            supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the Stop intent must remain pending while restart remains enabled"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn stop_stays_pending_when_exact_container_remains_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id)
+            .await
+            .unwrap();
+        fixture.state.lock().unwrap().inspection["HostConfig"]["RestartPolicy"] =
+            serde_json::json!({"Name":"unless-stopped","MaximumRetryCount":0});
+
+        let (outcome, _) = supervisor.stop(id, Some(1)).await.unwrap();
+
+        assert_eq!(outcome, StopOutcome::TerminationUnconfirmed);
+        {
+            let state = fixture.state.lock().unwrap();
+            assert_eq!(
+                state.inspection["HostConfig"]["RestartPolicy"]["Name"],
+                "no"
+            );
+            assert_eq!(
+                state
+                    .restart_updates
+                    .first()
+                    .map(|(request, _)| request.as_str()),
+                Some(
+                    format!(
+                        "POST /v1.47/containers/{}/update HTTP/1.1",
+                        handle.container_id()
+                    )
+                    .as_str()
+                )
+            );
+            assert_eq!(state.inspection["State"]["Running"], true);
+        }
+        assert_eq!(
+            supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an active exact container must keep the Stop pending"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_docker_created_reopen_preserves_history_and_settles_exact_revoke() {
+        // Capability configuration is process-wide. Keep this production
+        // ownership test independent of other tests' configured directories.
+        // The child runs this exact non-destructive test, with its own tempdir.
+        const CHILD: &str = "FRESHELL_DOCKER_CREATED_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "service::interrupted_transaction_tests::ordinary_stop_docker_created_reopen_preserves_history_and_settles_exact_revoke", "--nocapture"])
+                    .env(CHILD, "1")
+                    .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                    .output().unwrap()
+            }).await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::time::timeout(Duration::from_secs(30), complete_docker_created_stop())
+            .await
+            .unwrap();
+    }
+
+    async fn complete_docker_created_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), true).await;
+        let grants = dir.path().join("mcp-capabilities");
+        std::fs::create_dir(&grants).unwrap();
+        std::fs::create_dir_all(dir.path().join("provider-roots/grant-stop-docker")).unwrap();
+        let capability_file = grants.join("grant-stop-docker.json");
+        std::fs::write(&capability_file, b"synthetic exact capability").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&capability_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        crate::backend::docker::configure_capability_dir(&dir.path().join("control.sock")).unwrap();
+        Connection::open(supervisor.registry.database_path()).unwrap().execute(
+            "UPDATE incarnations SET fresh_agent_spec=replace(fresh_agent_spec,'stop-exact-grant','grant-stop-docker')",[]
+        ).unwrap();
+        let fixture = docker_fixture(&mut supervisor, dir.path(), true).await;
+        let stopped = supervisor.registry.begin_stop(id).await.unwrap();
+        let revision = stopped.stop_fence().unwrap().intent_revision;
+        drop(supervisor);
+        let mut supervisor = open(dir.path());
+        supervisor.backend = Arc::new(fixture.backend.clone());
+        let revoke = callback_with_grant(dir.path(), b"ok", "grant-stop-docker").await;
+        supervisor.reconcile_startup().await.unwrap();
+        let progress = supervisor.registry.stop_progress(&stopped).await.unwrap();
+        assert_eq!(progress.outcome, Some(StopOutcome::VerifiedEmpty));
+        assert!(progress.settled);
+        assert_eq!(count(dir.path(), "revokes"), 1);
+        assert_retained(&supervisor, dir.path(), revision).await;
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let (generation, writers): (u64,u64) = conn.query_row(
+            "SELECT execution_generation,(SELECT count(*) FROM writer_claims WHERE soul_id=?1) FROM incarnations WHERE incarnation_id=?2",
+            params![stopped.soul_id().as_str(),stopped.incarnation_id().as_str()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((generation, writers), (0, 0));
+        assert_eq!(
+            fixture.backend.inspect(&stopped).await.unwrap().state,
+            BackendRuntimeState::Created
+        );
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(count(dir.path(), "revokes"), 1);
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| r.starts_with("GET ")));
+        close(revoke).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_failure_diagnostics_preserve_outcome_and_pending_intent() {
+        for (mode, expected, code) in [
+            (
+                "unavailable",
+                StopOutcome::BackendUnavailable,
+                "BACKEND_UNAVAILABLE",
+            ),
+            (
+                "mismatch",
+                StopOutcome::BlockedOwnership,
+                "OWNERSHIP_MISMATCH",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            std::fs::write(dir.path().join("mode"), mode).unwrap();
+            let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(view.intent_revision, 2);
+            let handle = supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .remove(0);
+            assert!(
+                !supervisor
+                    .registry
+                    .stop_progress(&handle)
+                    .await
+                    .unwrap()
+                    .settled
+            );
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let text = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+            let events = stop_failure_events(&supervisor);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["data"]["stage"], "initial_empty_inspection");
+            assert_eq!(events[0]["data"]["errorCode"], code);
+            assert_eq!(events[0]["data"]["intentRevision"], 2);
+            assert_eq!(
+                events[0]["data"]["incarnationId"],
+                handle.incarnation_id().as_str()
+            );
+            assert_eq!(events[0]["data"]["severity"], "warning");
+            assert!(!text.contains("synthetic backend offline"));
+            assert!(!text.contains("synthetic labels differ"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_inspection_origin_diagnostics_preserve_pending_custody() {
+        for category in ["docker_http", "unavailable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+            fixture.close().await;
+            let mut peer = None;
+            if category == "docker_http" {
+                let path = dir.path().join("docker-stop.sock");
+                std::fs::remove_file(&path).unwrap();
+                let listener = UnixListener::bind(path).unwrap();
+                let view = supervisor.registry.inventory().await.unwrap().remove(0);
+                let handle = supervisor
+                    .registry
+                    .owned_handle(view.incarnation_id)
+                    .await
+                    .unwrap();
+                let daemon_id = handle.daemon_id().to_owned();
+                peer = Some(tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            header.push(stream.read_u8().await.unwrap());
+                        }
+                        let header = String::from_utf8(header).unwrap();
+                        let (status, body) = if header.starts_with("GET /v1.47/info ") {
+                            (200, serde_json::json!({"ID":daemon_id}).to_string())
+                        } else {
+                            assert!(header.contains("/json HTTP/1.1"));
+                            (500, "private inspection failure body".into())
+                        };
+                        stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    }
+                }));
+            }
+            let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+            if let Some(peer) = peer {
+                close(peer).await;
+            }
+            assert_eq!(outcome, StopOutcome::BackendUnavailable);
+            assert_eq!(view.intent_revision, 2);
+            assert_pending_stop_custody(&supervisor, dir.path()).await;
+            let events = stop_failure_events(&supervisor);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["data"]["stage"], "initial_empty_inspection");
+            assert_eq!(events[0]["data"]["errorCategory"], category);
+            assert_eq!(
+                events[0]["data"]["httpStatus"],
+                if category == "docker_http" {
+                    serde_json::json!(500)
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert!(!std::fs::read_to_string(&supervisor.config.lifecycle_log)
+                .unwrap()
+                .contains("private inspection failure body"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_host_origin_diagnostics_preserve_fallback_and_pending_custody() {
+        const CHILD: &str = "FRESHELL_STOP_HOST_ORIGIN_CHILD";
+        const NAME: &str = "service::interrupted_transaction_tests::ordinary_stop_host_origin_diagnostics_preserve_fallback_and_pending_custody";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env(CHILD, "1")
+                    .env(HOST_COMMAND_TIMEOUT_ENV, "100")
+                    .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for stage in ["host_authentication", "host_stop"] {
+            for category in ["timeout", "unavailable"] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut supervisor = open(dir.path());
+                let id = seed(&supervisor, dir.path(), false).await;
+                let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+                fixture.state.lock().unwrap().silence = Some("graceful_request");
+                let view = supervisor.registry.inventory().await.unwrap().remove(0);
+                let handle = supervisor
+                    .registry
+                    .owned_handle(view.incarnation_id)
+                    .await
+                    .unwrap();
+                let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+                let limits = handle.requested_limits();
+                let peer = tokio::spawn(async move {
+                    let boot = HostBootId::new();
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let request: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+                        let failing = if stage == "host_authentication" {
+                            matches!(request.body, HostCommand::Hello { .. })
+                        } else {
+                            matches!(request.body, HostCommand::Stop { .. })
+                        };
+                        if failing {
+                            if category == "timeout" {
+                                let mut bytes = vec![];
+                                stream.read_to_end(&mut bytes).await.unwrap();
+                            }
+                            continue;
+                        }
+                        let HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } = request.body
+                        else {
+                            panic!("unexpected command")
+                        };
+                        write_frame(
+                            &mut stream,
+                            &HostReply {
+                                request_id: request.request_id,
+                                result: Ok(HostResult::Hello {
+                                    host_boot_id: boot.clone(),
+                                    proof: host_proof(
+                                        b"synthetic-secret",
+                                        &challenge,
+                                        &boot,
+                                        &incarnation_id,
+                                    ),
+                                    effective_limits: limits,
+                                    capabilities: vec![],
+                                }),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+                let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+                close(peer).await;
+                fixture.close().await;
+                assert_eq!(outcome, StopOutcome::BackendUnavailable);
+                assert_eq!(view.intent_revision, 2);
+                assert_pending_stop_custody(&supervisor, dir.path()).await;
+                let failures = stop_failure_events(&supervisor);
+                let failure = failures
+                    .iter()
+                    .find(|event| event["data"]["stage"] == stage)
+                    .unwrap();
+                assert_eq!(
+                    failure["data"]["errorCategory"], category,
+                    "{stage}: {category}"
+                );
+                assert_eq!(
+                    failure["data"]["errorCode"],
+                    serde_json::json!(RuntimeErrorCode::HostUnreachable)
+                );
+                assert!(failure["data"]["httpStatus"].is_null());
+                assert!(failures
+                    .iter()
+                    .any(|event| event["data"]["stage"] == "graceful_stop"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_keeps_legacy_host_custody_and_requires_known_capabilities() {
+        for (caps, expected) in [
+            (
+                vec!["CHOWN", "SETGID", "SETUID"],
+                StopOutcome::VerifiedEmpty,
+            ),
+            (
+                vec!["CHOWN", "KILL", "SETGID", "SETUID"],
+                StopOutcome::VerifiedEmpty,
+            ),
+            (
+                vec!["CHOWN", "KILL", "SETGID", "SETUID", "SYS_ADMIN"],
+                StopOutcome::BlockedOwnership,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.inspection["HostConfig"]["CapAdd"] = serde_json::json!(caps);
+                state.stop_response_overhead = Some(Duration::ZERO);
+            }
+            let fixture_host = host(&supervisor, dir.path()).await;
+            let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(view.intent_revision, 2);
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let requests = fixture.state.lock().unwrap().requests.clone();
+            let writers: u64 = Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .query_row("SELECT count(*) FROM writer_claims", [], |r| r.get(0))
+                .unwrap();
+            if expected == StopOutcome::VerifiedEmpty {
+                assert_eq!(writers, 0);
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.contains("/stop?t=2 "))
+                        .count(),
+                    1
+                );
+                assert!(supervisor
+                    .registry
+                    .pending_stop_handles()
+                    .await
+                    .unwrap()
+                    .is_empty());
+            } else {
+                assert_eq!(writers, 1);
+                assert!(requests.iter().all(|request| request.starts_with("GET ")));
+                assert_pending_stop_custody(&supervisor, dir.path()).await;
+            }
+            close(fixture_host).await;
+            fixture.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_docker_grace_includes_http_overhead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        fixture.state.lock().unwrap().stop_response_overhead = Some(Duration::from_millis(250));
+        let fixture_host = host(&supervisor, dir.path()).await;
+        let lock = supervisor.lifecycle_lock(&id).await;
+        // The real HTTP peer remains Running until it consumes the requested
+        // Docker grace plus transport overhead; no observer retries this Stop.
+        let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let progress: (u64, String, bool) = conn
+            .query_row("SELECT intent_revision,outcome,settled FROM ordinary_stops WHERE incarnation_id=?1",
+                [view.incarnation_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let writers: u64 = conn
+            .query_row("SELECT count(*) FROM writer_claims", [], |r| r.get(0))
+            .unwrap();
+        let (requests, completed_stops) = {
+            let state = fixture.state.lock().unwrap();
+            (state.requests.clone(), state.completed_stops)
+        };
+        assert_retained(&supervisor, dir.path(), 2).await;
+        close(fixture_host).await;
+        fixture.close().await;
+
+        assert_eq!(outcome, StopOutcome::VerifiedEmpty);
+        assert_eq!(view.cleanup_state, CleanupState::VerifiedEmpty);
+        assert_eq!(progress, (2, "verified_empty".into(), true));
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(lock.try_lock().is_ok());
+        assert_eq!(completed_stops, 1);
+        assert_eq!(
+            requests.iter().filter(|r| r.contains("/stop?t=2 ")).count(),
+            1
+        );
+        assert!(!requests
+            .iter()
+            .any(|r| r.contains("/kill?") || r.contains("/start") || r.contains("/create")));
+        assert_eq!(writers, 0);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DueRecoverySilenceCase {
+        Reserved,
+        OpenCodePreflight,
+        ForegroundStop,
+    }
+
+    async fn run_due_recovery_docker_silence(case: DueRecoverySilenceCase) {
+        let test_name = match case {
+            DueRecoverySilenceCase::Reserved => "service::interrupted_transaction_tests::due_recovery_docker_silence_settles_retry_and_releases_stop",
+            DueRecoverySilenceCase::OpenCodePreflight => "service::interrupted_transaction_tests::due_recovery_docker_silence_settles_retry_after_opencode_preflight",
+            DueRecoverySilenceCase::ForegroundStop => "service::interrupted_transaction_tests::due_recovery_docker_silence_does_not_block_foreground_stop",
+        };
+        // Match the ordinary Stop fixture's existing process boundary: a
+        // foreign registry's synchronous logging cannot spend this case's
+        // real Docker deadlines. All actors for one case remain together.
+        if run_docker_stop_test_child("FRESHELL_RECOVERY_SILENCE_TEST_CHILD", test_name).await {
+            return;
+        }
+        match case {
+            DueRecoverySilenceCase::Reserved => due_recovery_silence_settlement(false).await,
+            DueRecoverySilenceCase::OpenCodePreflight => {
+                due_recovery_silence_settlement(true).await
+            }
+            DueRecoverySilenceCase::ForegroundStop => complete_due_recovery_foreground_stop().await,
+        }
+    }
+
+    #[tokio::test]
+    async fn due_recovery_docker_silence_settles_retry_and_releases_stop() {
+        run_due_recovery_docker_silence(DueRecoverySilenceCase::Reserved).await;
+    }
+
+    #[tokio::test]
+    async fn due_recovery_docker_silence_settles_retry_after_opencode_preflight() {
+        run_due_recovery_docker_silence(DueRecoverySilenceCase::OpenCodePreflight).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn due_recovery_docker_silence_is_independent_of_foreign_registry_logging() {
+        // Isolate the deliberate foreign lock holder from the broad test process.
+        if run_docker_stop_test_child(
+            "FRESHELL_RECOVERY_SILENCE_COORDINATOR_TEST_CHILD",
+            "service::interrupted_transaction_tests::due_recovery_docker_silence_is_independent_of_foreign_registry_logging",
+        ).await {
+            return;
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_registry = Registry::open(foreign.path().join("registry"), None).unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _registry = foreign_registry;
+            let _coordinator = crate::loss_report::incident_file_coordinator();
+            held_tx.send(()).unwrap();
+            matches!(
+                release_rx.recv_timeout(Duration::from_secs(180)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )
+        });
+        held_rx.await.unwrap();
+        let mut release = Some(release_tx);
+        for case in [
+            DueRecoverySilenceCase::Reserved,
+            DueRecoverySilenceCase::OpenCodePreflight,
+            DueRecoverySilenceCase::ForegroundStop,
+        ] {
+            let mut running = tokio::spawn(run_due_recovery_docker_silence(case));
+            // Each case retains its original 25/5/20-second behavior deadlines.
+            // This only bounds the regression's deliberate foreign-lock hold.
+            let result = tokio::time::timeout(Duration::from_secs(35), &mut running).await;
+            let (completed_while_held, joined) = match result {
+                Ok(joined) => (true, joined),
+                Err(_) => {
+                    drop(release.take());
+                    (false, running.await)
+                }
+            };
+            if !completed_while_held || joined.is_err() {
+                drop(release.take());
+                let held_until_release = holder.join().unwrap();
+                panic!("{case:?} foreign logging interference: completedWhileHeld={completed_while_held}, heldUntilRelease={held_until_release}, result={joined:?}");
+            }
+        }
+        drop(release);
+        assert!(
+            holder.join().unwrap(),
+            "foreign lock must remain held through all three cases"
+        );
+    }
+
+    async fn due_recovery_silence_settlement(preflight: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, fixture, soul) = silent_due_recovery(dir.path(), preflight).await;
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
+        let mut observing = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.observe_once().await })
+        };
+        if wait_for_silent_recovery_requests(&fixture, 1)
+            .await
+            .is_err()
+        {
+            observing.abort();
+            let _ = observing.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("recovery must reach the real Docker socket: {diagnostic}");
+        }
+        let observed = tokio::time::timeout(Duration::from_secs(25), &mut observing).await;
+        if observed.is_err() {
+            observing.abort();
+            let _ = observing.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("silent Docker must settle the observer: {diagnostic}");
+        }
+        observed
+            .expect("silent Docker must release the observer through typed settlement")
+            .unwrap()
+            .unwrap();
+        assert!(
+            lifecycle.try_lock().is_ok(),
+            "completed recovery must release the lifecycle lock"
+        );
+        let retry = supervisor
+            .registry
+            .recovery_retry(soul.clone(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.attempt_count, if preflight { 2 } else { 1 });
+        assert_eq!(
+            retry.next_due_at_ms,
+            Some(if preflight { 12_000 } else { 2_000 })
+        );
+        assert!(retry.reserved_attempt_id.is_none());
+        assert_eq!(retry.last_reason, "backend_unavailable");
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            context.recovery_state,
+            freshell_runtime_protocol::RecoveryState::Blocked
+        );
+        assert!(context.recovery_attempt_id.is_none());
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let unfinished: u64 = conn
+            .query_row(
+                "SELECT count(*) FROM recovery_attempts WHERE finished_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unfinished, 0,
+            "a timed-out dependency cannot strand its reservation"
+        );
+        let evidence: String = conn
+            .query_row(
+                "SELECT evidence_ref FROM recovery_attempts ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(evidence.contains("timed out"), "{evidence}");
+        assert_eq!(
+            fixture
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.contains("/json "))
+                .count(),
+            if preflight { 2 } else { 1 }
+        );
+        let requests = fixture.state.lock().unwrap().requests.len();
+        tokio::time::timeout(Duration::from_secs(2), supervisor.observe_once())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture.state.lock().unwrap().requests.len(),
+            requests,
+            "backoff must keep the next observer pass from repeating Docker work"
+        );
+        let inspection_count = if preflight { 2 } else { 1 };
+        let mut stopping = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.stop(soul, Some(1)).await })
+        };
+        // As in the ordinary Stop socket case, start the dependency budget
+        // when the peer accepts this Stop's inspection, after intent setup.
+        if wait_for_silent_recovery_requests(&fixture, inspection_count + 1)
+            .await
+            .is_err()
+        {
+            stopping.abort();
+            let _ = stopping.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("Stop must reach its own Docker inspection: {diagnostic}");
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(5), &mut stopping).await;
+        if stopped.is_err() {
+            stopping.abort();
+            let _ = stopping.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("Stop dependency must settle within its original budget: {diagnostic}");
+        }
+        let (outcome, view) = stopped.unwrap().unwrap().unwrap();
+        assert_eq!(outcome, StopOutcome::BackendUnavailable);
+        assert_ne!(view.cleanup_state, CleanupState::VerifiedEmpty);
+        assert!(lifecycle.try_lock().is_ok());
+        finish_silent_recovery_stop(
+            &supervisor,
+            fixture,
+            &soul,
+            &lifecycle,
+            inspection_count + 1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn due_recovery_docker_silence_does_not_block_foreground_stop() {
+        run_due_recovery_docker_silence(DueRecoverySilenceCase::ForegroundStop).await;
+    }
+
+    async fn complete_due_recovery_foreground_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, fixture, soul) = silent_due_recovery(dir.path(), false).await;
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
+        let mut observing = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.observe_once().await })
+        };
+        if wait_for_silent_recovery_requests(&fixture, 1)
+            .await
+            .is_err()
+        {
+            observing.abort();
+            let _ = observing.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("recovery must reach the real Docker socket: {diagnostic}");
+        }
+        let mut stopping = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.stop(soul, Some(1)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .desired_state
+                != DesiredState::Stopped
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            lifecycle.try_lock().is_err(),
+            "recovery owns the lock while Docker is silent"
+        );
+        assert!(!stopping.is_finished());
+        let completed = tokio::time::timeout(Duration::from_secs(20), async {
+            let observed = (&mut observing).await.unwrap();
+            let stopped = (&mut stopping).await.unwrap();
+            (observed, stopped)
+        })
+        .await;
+        if completed.is_err() {
+            observing.abort();
+            stopping.abort();
+            let _ = observing.await;
+            let _ = stopping.await;
+            let diagnostic = silent_recovery_diagnostic(&fixture, &lifecycle);
+            fixture.close().await;
+            panic!("Docker silence cannot retain recovery's lock: {diagnostic}");
+        }
+        let (observed, stopped) =
+            completed.expect("Docker silence cannot retain recovery's lock indefinitely");
+        observed.unwrap();
+        let (outcome, view) = stopped.unwrap();
+        assert_eq!(outcome, StopOutcome::BackendUnavailable);
+        assert_ne!(view.cleanup_state, CleanupState::VerifiedEmpty);
+        assert!(lifecycle.try_lock().is_ok());
+        assert!(supervisor
+            .registry
+            .recovery_retry(soul.clone(), 1)
+            .await
+            .unwrap()
+            .is_none());
+        let verdict: String = Connection::open(supervisor.registry.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT verdict FROM recovery_attempts ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict, "cancelled");
+        finish_silent_recovery_stop(&supervisor, fixture, &soul, &lifecycle, 2).await;
+    }
+
+    async fn silent_due_recovery(
+        root: &Path,
+        preflight: bool,
+    ) -> (Supervisor, crate::backend::tests::StopDockerFixture, SoulId) {
+        use crate::recovery_retry::TransientRecoveryFailure;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let mut supervisor = open(root);
+        let clock = Arc::new(AtomicI64::new(0));
+        supervisor.registry.retry_clock = Some(clock.clone());
+        let soul = seed(&supervisor, root, false).await;
+        if preflight {
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            let mut agent = context.fresh_agent.unwrap();
+            agent.provider = freshell_runtime_protocol::FreshProvider::Opencode;
+            agent.session_type = "freshopencode".into();
+            agent.runtime_variant = "opencode-http-v1".into();
+            let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                [soul.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE incarnations SET fresh_agent_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(&agent).unwrap(),
+                    context.prior_handle.incarnation_id().as_str()
+                ],
+            )
+            .unwrap();
+        }
+        let reserved = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), 1, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        if preflight {
+            let context = supervisor
+                .registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap();
+            supervisor
+                .registry
+                .mark_recovery_blocked_with_retry(
+                    soul.clone(),
+                    reserved.reserved_attempt_id,
+                    freshell_runtime_protocol::RecoveryBlockReason::ProviderUnavailable,
+                    vec!["synthetic prior dependency outage".into()],
+                    context.write_fence(),
+                    Some(TransientRecoveryFailure::Backend),
+                )
+                .await
+                .unwrap();
+            clock.store(2_000, Ordering::SeqCst);
+        }
+        let fixture = docker_fixture(&mut supervisor, root, false).await;
+        fixture.state.lock().unwrap().silence = Some("initial_inspect");
+        (supervisor, fixture, soul)
+    }
+
+    async fn wait_for_silent_recovery_requests(
+        fixture: &crate::backend::tests::StopDockerFixture,
+        count: usize,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.contains("/json "))
+                .count()
+                < count
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    async fn wait_for_silent_recovery_disconnects(
+        fixture: &crate::backend::tests::StopDockerFixture,
+        count: usize,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.state.lock().unwrap().disconnected < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    fn silent_recovery_diagnostic(
+        fixture: &crate::backend::tests::StopDockerFixture,
+        lifecycle: &Arc<Mutex<()>>,
+    ) -> serde_json::Value {
+        let state = fixture.state.lock().unwrap();
+        serde_json::json!({
+            "severity":"debug", "event":"test.due_recovery_silence.transport",
+            "acceptedInspections":state.requests.iter().filter(|request| request.contains("/json ")).count(),
+            "silentEofCount":state.disconnected,
+            "firstInspectionElapsedMs":state.first_inspection_at.map(|at| at.elapsed().as_millis()),
+            "firstSilentEofElapsedMs":state.first_silent_eof_at.zip(state.first_inspection_at).map(|(eof, accepted)| eof.duration_since(accepted).as_millis()),
+            "lifecycleLockHeld":lifecycle.try_lock().is_err(),
+        })
+    }
+
+    async fn finish_silent_recovery_stop(
+        supervisor: &Supervisor,
+        fixture: crate::backend::tests::StopDockerFixture,
+        soul: &SoulId,
+        lifecycle: &Arc<Mutex<()>>,
+        inspections: usize,
+    ) {
+        let disconnected = wait_for_silent_recovery_disconnects(&fixture, inspections).await;
+        let diagnostic = silent_recovery_diagnostic(&fixture, lifecycle);
+        assert_eq!(
+            supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "silence must retain pending cleanup, never claim verified empty"
+        );
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.silence = None;
+            state.inspection["State"] = serde_json::json!({"Status":"created","Running":false,"Paused":false,"Restarting":false});
+        }
+        tokio::time::timeout(Duration::from_secs(5), supervisor.observe_once())
+            .await
+            .expect("a later observer pass can finish the same Stop intent")
+            .unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(context.desired_state, DesiredState::Stopped);
+        assert_eq!(context.intent_revision, 2);
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            supervisor.registry.inventory().await.unwrap()[0].cleanup_state,
+            CleanupState::VerifiedEmpty
+        );
+        assert!(!fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| request.contains("/start ") || request.contains("/create")));
+        fixture.close().await;
+        assert!(
+            disconnected.is_ok(),
+            "all silent transports must close: {diagnostic}"
+        );
+        eprintln!("{diagnostic}");
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_docker_silence_releases_lock_and_retries_same_intent() {
+        run_ordinary_stop_docker_silence().await;
+    }
+
+    async fn run_ordinary_stop_docker_silence() {
+        // Each registry has its own Docker peer and files, but lifecycle writes
+        // share process-wide incident/rotation locks. A foreign test registry
+        // must not consume this fixture's actual backend-completion budgets.
+        if run_docker_stop_test_child(
+            "FRESHELL_DOCKER_SILENCE_TEST_CHILD",
+            "service::interrupted_transaction_tests::ordinary_stop_docker_silence_releases_lock_and_retries_same_intent",
+        ).await {
+            return;
+        }
+        complete_ordinary_stop_docker_silence().await;
+    }
+
+    async fn run_docker_stop_test_child(child_env: &'static str, test_name: &'static str) -> bool {
+        if std::env::var(child_env).as_deref() == Ok("1") {
+            return false;
+        }
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(child_env, "1")
+                .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "exact Docker case must execute one test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        true
+    }
+
+    async fn complete_ordinary_stop_docker_silence() {
+        let mut failures = Vec::new();
+        for point in [
+            "initial_inspect",
+            "graceful_request",
+            "graceful_observation",
+            "force_request",
+            "force_observation",
+            "error_observation",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+            fixture.state.lock().unwrap().silence = Some(point);
+            let fixture_host = host(&supervisor, dir.path()).await;
+            let lock = supervisor.lifecycle_lock(&id).await;
+            let mut stopping = {
+                let supervisor = supervisor.clone();
+                let id = id.clone();
+                tokio::spawn(async move { supervisor.stop(id, Some(1)).await })
+            };
+            // Measure the backend budget from an actual accepted inspection.
+            // Parallel suite setup can queue SQLite intent commits before any
+            // backend future exists; that is not time spent awaiting Docker.
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !fixture
+                    .state
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .any(|r| r.contains("/json "))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let limit = Duration::from_secs(if point.starts_with("force_") { 7 } else { 4 });
+            let result = tokio::time::timeout(limit, &mut stopping).await;
+            if result.is_err() {
+                // The timeout does not own/cancel the foreground Stop. Prove
+                // that it is still the old lock holder, then reap our task.
+                let lock_held = lock.try_lock().is_err();
+                assert!(lock_held);
+                let (accepted_at, transport) = {
+                    let state = fixture.state.lock().unwrap();
+                    let sampled_at = std::time::Instant::now();
+                    let accepted_at = state.first_inspection_at;
+                    (
+                        accepted_at,
+                        serde_json::json!({
+                            "acceptedInspectionElapsedMs": accepted_at.map(|at| sampled_at.duration_since(at).as_secs_f64() * 1000.0),
+                            "firstSilentEofElapsedMs": state.first_silent_eof_at.zip(accepted_at).map(|(eof, accepted)| eof.duration_since(accepted).as_secs_f64() * 1000.0),
+                            "disconnected": state.disconnected,
+                            "lifecycleLockHeld": lock_held,
+                        }),
+                    )
+                };
+                // This independent reader never uses the Registry's writable
+                // connection setup or extends the original Stop deadline.
+                // Its snapshot can be later than the transport/lock sample.
+                let database = supervisor.registry.database_path().to_path_buf();
+                let soul = id.as_str().to_owned();
+                let mut reader = tokio::task::spawn_blocking(move || {
+                    let started_at = std::time::Instant::now();
+                    let projection = (|| -> rusqlite::Result<serde_json::Value> {
+                        let connection = Connection::open_with_flags(
+                            database,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )?;
+                        connection.busy_timeout(Duration::from_millis(25))?;
+                        connection.pragma_update(None, "query_only", true)?;
+                        connection.query_row(
+                            "SELECT p.incarnation_id,p.outcome,p.settled,p.intent_revision,p.execution_generation,w.count \
+                             FROM (SELECT count(*) AS count FROM writer_claims WHERE soul_id=?1) w \
+                             LEFT JOIN ordinary_stops p ON p.soul_id=?1 AND p.intent_revision=2",
+                            [soul],
+                            |row| {
+                                let incarnation: Option<String> = row.get(0)?;
+                                Ok(serde_json::json!({
+                                    "status":"observed", "rowPresent":incarnation.is_some(),
+                                    "incarnationId":incarnation,
+                                    "outcome":row.get::<_, Option<String>>(1)?,
+                                    "settled":row.get::<_, Option<bool>>(2)?,
+                                    "intentRevision":row.get::<_, Option<u64>>(3)?,
+                                    "executionGeneration":row.get::<_, Option<u64>>(4)?,
+                                    "writerCount":row.get::<_, u64>(5)?,
+                                }))
+                            },
+                        )
+                    })();
+                    serde_json::json!({
+                        "readStartedElapsedMs":accepted_at.map(|at| started_at.duration_since(at).as_secs_f64() * 1000.0),
+                        "readFinishedElapsedMs":accepted_at.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                        "projection":projection.unwrap_or_else(|_| serde_json::json!({"status":"unknown","reason":"query_error"})),
+                    })
+                });
+                let read = tokio::time::timeout(Duration::from_millis(100), &mut reader).await;
+                let reader_pending = read.is_err();
+                let registry = match read {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(_)) => {
+                        serde_json::json!({"status":"unknown","reason":"reader_join_error"})
+                    }
+                    Err(_) => serde_json::json!({"status":"unknown","reason":"read_timeout"}),
+                };
+                stopping.abort();
+                let _ = stopping.await;
+                close(fixture_host).await;
+                fixture.close().await;
+                // A timed-out blocking read remains owned: join it before the
+                // fixture directory is dropped, but keep its snapshot UNKNOWN.
+                if reader_pending {
+                    let _ = reader.await;
+                }
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "severity":"error", "event":"test.ordinary_stop.failure_stage",
+                        "soulId":id, "phase":point, "resultDeadlineMs":limit.as_millis(),
+                        "registryReadDeadlineMs":100, "transport":transport, "registry":registry,
+                    })
+                );
+                failures.push(format!(
+                    "{point}: foreground Stop retained its lifecycle lock beyond {limit:?}"
+                ));
+                continue;
+            }
+            let (outcome, view) = result.unwrap().unwrap().unwrap();
+            let expected = if point == "error_observation" {
+                StopOutcome::TerminationUnconfirmed
+            } else {
+                StopOutcome::BackendUnavailable
+            };
+            assert_eq!(outcome, expected, "{point}");
+            let failures = stop_failure_events(&supervisor);
+            let stage = match point {
+                "initial_inspect" => "initial_empty_inspection",
+                "graceful_request" | "error_observation" => "graceful_stop",
+                "graceful_observation" => "graceful_empty_inspection",
+                "force_request" => "force_stop",
+                "force_observation" => "force_empty_inspection",
+                _ => unreachable!(),
+            };
+            assert!(
+                failures.iter().any(|event| event["data"]["stage"] == stage),
+                "{point}: missing failed stage"
+            );
+            if point == "error_observation" {
+                assert!(failures
+                    .iter()
+                    .any(|event| event["data"]["stage"] == "graceful_failure_empty_inspection"));
+                assert_eq!(failures[0]["data"]["errorCategory"], "docker_http");
+                assert_eq!(failures[0]["data"]["httpStatus"], 500);
+            } else {
+                let failure = failures
+                    .iter()
+                    .find(|event| event["data"]["stage"] == stage)
+                    .unwrap();
+                assert_eq!(failure["data"]["errorCategory"], "timeout", "{point}");
+                assert!(failure["data"]["httpStatus"].is_null());
+            }
+            assert_eq!(view.intent_revision, 2);
+            assert_eq!(view.cleanup_state, CleanupState::TerminationUnconfirmed);
+            assert!(
+                lock.try_lock().is_ok(),
+                "{point}: completed Stop must release the original lock"
+            );
+            let handle = supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .remove(0);
+            let progress = supervisor.registry.stop_progress(&handle).await.unwrap();
+            assert_eq!(progress.outcome, Some(expected));
+            assert!(!progress.settled);
+            assert_retained(&supervisor, dir.path(), 2).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while fixture.state.lock().unwrap().disconnected == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.silence = None;
+                state.inspection["State"] = serde_json::json!({"Status":"exited","Running":false});
+            }
+            tokio::time::timeout(Duration::from_secs(2), supervisor.observe_once())
+                .await
+                .unwrap()
+                .unwrap();
+            let progress = supervisor.registry.stop_progress(&handle).await.unwrap();
+            assert_eq!(progress.outcome, Some(StopOutcome::VerifiedEmpty));
+            assert!(progress.settled);
+            assert!(supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .is_empty());
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let writers: u64 = Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .query_row("SELECT count(*) FROM writer_claims", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(writers, 0);
+            assert!(!fixture
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|r| r.contains("/start") || r.contains("/create")));
+            eprintln!("bounded silent Docker {point}; same-intent observer completion verified");
+            close(fixture_host).await;
+            fixture.close().await;
+        }
+        assert!(
+            failures.is_empty(),
+            "unbounded Stop backend futures: {failures:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_stop_docker_silence_is_independent_of_foreign_registry_logging() {
+        // The regression's deliberate lock holder also needs its own process:
+        // it must not introduce the same contention into unrelated tests.
+        if run_docker_stop_test_child(
+            "FRESHELL_DOCKER_SILENCE_COORDINATOR_TEST_CHILD",
+            "service::interrupted_transaction_tests::ordinary_stop_docker_silence_is_independent_of_foreign_registry_logging",
+        ).await {
+            return;
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_registry = Registry::open(foreign.path().join("registry"), None).unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _registry = foreign_registry;
+            let _coordinator = crate::loss_report::incident_file_coordinator();
+            held_tx.send(()).unwrap();
+            // Always release this test's lock, including on a failed child.
+            // This is only the holder's deadlock escape; the original six
+            // backend deadlines still run unchanged inside the child.
+            matches!(
+                release_rx.recv_timeout(Duration::from_secs(180)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )
+        });
+        held_rx.await.unwrap();
+        let result = tokio::spawn(run_ordinary_stop_docker_silence()).await;
+        drop(release_tx);
+        assert!(
+            holder.join().unwrap(),
+            "foreign coordinator must remain held until every phase completes"
+        );
+        result.expect("foreign registry logging must not consume the Stop fixture's budgets");
+    }
+
+    async fn host(supervisor: &Supervisor, root: &Path) -> tokio::task::JoinHandle<()> {
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id)
+            .await
+            .unwrap();
+        let socket = handle.runtime_dir().join("host.sock");
+        if socket.exists() {
+            std::fs::remove_file(&socket).unwrap();
+        }
+        let listener = UnixListener::bind(socket).unwrap();
+        let root = root.to_path_buf();
+        tokio::spawn(async move {
+            let boot = HostBootId::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                let result = match request.body {
+                    HostCommand::Hello {
+                        incarnation_id,
+                        challenge,
+                    } => {
+                        assert_eq!(&incarnation_id, handle.incarnation_id());
+                        pause(&root, "host_authenticated").await;
+                        HostResult::Hello {
+                            host_boot_id: boot.clone(),
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            effective_limits: handle.requested_limits(),
+                            capabilities: vec![],
+                        }
+                    }
+                    HostCommand::Stop { .. } => {
+                        record(&root, "host_stops", handle.container_id());
+                        pause(&root, "host_stopped").await;
+                        HostResult::Stopped
+                    }
+                    _ => panic!("ordinary Stop cannot issue execution or recovery IPC"),
+                };
+                write_frame(
+                    &mut socket,
+                    &HostReply {
+                        request_id: request.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        })
+    }
+
+    async fn pause(root: &Path, point: &str) {
+        if std::fs::read_to_string(root.join("pause-at"))
+            .ok()
+            .as_deref()
+            == Some(point)
+        {
+            std::fs::write(root.join("pause-reached"), point).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !root.join("pause-release").exists() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn callback(root: &Path, response: &'static [u8]) -> tokio::task::JoinHandle<()> {
+        callback_with_grant(root, response, "stop-exact-grant").await
+    }
+
+    async fn callback_with_grant(
+        root: &Path,
+        response: &'static [u8],
+        grant: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        let path = root.join("mcp.sock");
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let root = root.to_path_buf();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut body = vec![];
+                socket.read_to_end(&mut body).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["action"], "revoke");
+                assert_eq!(request["grantId"], grant);
+                assert_eq!(request["soulId"], soul(&root).as_str());
+                let incarnation: String = Connection::open(root.join("registry/runtime.sqlite3"))
+                    .unwrap()
+                    .query_row(
+                        "SELECT incarnation_id FROM incarnations WHERE soul_id=?1",
+                        [soul(&root).as_str()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(request["incarnationId"], incarnation);
+                record(&root, "revokes", request["grantId"].as_str().unwrap());
+                pause(&root, "revoke_sent").await;
+                socket.write_all(response).await.unwrap();
+            }
+        })
+    }
+
+    async fn close(task: tokio::task::JoinHandle<()>) {
+        task.abort();
+        let _ = task.await;
+    }
+
+    async fn crash_child(root: &Path, point: &str, resume: bool) {
+        let marker = root.join("crash-boundary");
+        if marker.exists() {
+            std::fs::remove_file(&marker).unwrap();
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::interrupted_transaction_tests::interrupted_transaction_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FRESHELL_STOP_TEST_ROOT", root)
+            .env("FRESHELL_STOP_TEST_CRASH", point)
+            .env("FRESHELL_STOP_TEST_RESUME", if resume { "1" } else { "0" })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("owned Stop child timed out at {point}");
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "expected actual boundary abort: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), point);
+        eprintln!("verified interrupted Stop: {point}");
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess fixture; disposable runtime-suite only"]
+    async fn interrupted_transaction_child() {
+        let Some(root) = std::env::var_os("FRESHELL_STOP_TEST_ROOT") else {
+            return;
+        };
+        sandbox_only();
+        let root = PathBuf::from(root);
+        let supervisor = open(&root);
+        let fixture_host = host(&supervisor, &root).await;
+        if std::env::var("FRESHELL_STOP_TEST_RESUME").as_deref() == Ok("1") {
+            supervisor.reconcile_startup().await.unwrap();
+        } else {
+            supervisor.stop(soul(&root), None).await.unwrap();
+        }
+        close(fixture_host).await;
+        panic!("Stop boundary was not reached");
+    }
+
+    async fn assert_retained(supervisor: &Supervisor, root: &Path, revision: u64) {
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let fingerprint: (String,String,String,u64,u64,u64) = conn.query_row(
+            "SELECT provider_store_id,provider_volume_name,native_session_id,evidence_revision,native_import_revision,successful_recoveries_in_window FROM souls WHERE soul_id=?1", [soul(root).as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&fingerprint).unwrap(),
+            std::fs::read(root.join("identity.json")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(root.join("provider/history.jsonl")).unwrap(),
+            b"{\"root\":\"stop-retained-root\",\"turn\":\"synthetic retained history\"}\n"
+        );
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        assert_eq!(view.desired_state, DesiredState::Stopped);
+        assert_eq!(view.intent_revision, revision);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM incarnations", [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM recovery_attempts", [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(count(root, "creates"), 0);
+        assert_eq!(count(root, "starts"), 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM stop_test_effects", [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        for action in ["host_stops", "graceful", "force"] {
+            for target in std::fs::read_to_string(root.join(action))
+                .unwrap_or_default()
+                .lines()
+            {
+                assert_eq!(
+                    target,
+                    std::fs::read_to_string(root.join("container")).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "destructive crash matrix; disposable runtime-suite only"]
+    async fn ordinary_stop_crash_boundary_matrix() {
+        sandbox_only();
+        let mut failures = vec![];
+        let points = [
+            "ordinary_stop_after_intent",
+            "ordinary_stop_after_graceful",
+            "ordinary_stop_after_empty",
+            "ordinary_stop_after_outcome",
+        ];
+        for point in points {
+            let dir = tempfile::tempdir().unwrap();
+            let supervisor = open(dir.path());
+            seed(&supervisor, dir.path(), true).await;
+            if point == "ordinary_stop_after_empty" {
+                std::fs::write(dir.path().join("mode"), b"force").unwrap();
+            }
+            drop(supervisor);
+            crash_child(dir.path(), point, false).await;
+            let callback = callback(dir.path(), b"ok").await;
+            let supervisor = open(dir.path());
+            let fixture_host = host(&supervisor, dir.path()).await;
+            if point == "ordinary_stop_after_empty" {
+                assert_eq!(count(dir.path(), "force"), 1);
+            }
+            assert_retained(&supervisor, dir.path(), 2).await;
+            supervisor.reconcile_startup().await.unwrap();
+            supervisor.observe_once().await.unwrap();
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let view = supervisor.registry.inventory().await.unwrap().remove(0);
+            if view.cleanup_state != CleanupState::VerifiedEmpty
+                || count(dir.path(), "revokes") != 1
+            {
+                failures.push(format!(
+                    "{point}: {:?}, revokes={}",
+                    view.cleanup_state,
+                    count(dir.path(), "revokes")
+                ));
+            }
+            close(callback).await;
+            close(fixture_host).await;
+        }
+        assert_eq!(points.len(), 4);
+        assert!(
+            failures.is_empty(),
+            "interrupted Stop did not continue: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "destructive crash matrix; disposable runtime-suite only"]
+    async fn ordinary_stop_crash_unresolved_and_stale_matrix() {
+        sandbox_only();
+        let cases = [
+            ("unavailable", CleanupState::TerminationUnconfirmed),
+            ("surviving", CleanupState::TerminationUnconfirmed),
+            ("mismatch", CleanupState::BlockedOwnership),
+            ("removed", CleanupState::VerifiedEmpty),
+        ];
+        let mut failures = vec![];
+        for (mode, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let supervisor = open(dir.path());
+            seed(&supervisor, dir.path(), false).await;
+            drop(supervisor);
+            crash_child(dir.path(), "ordinary_stop_after_intent", false).await;
+            std::fs::write(dir.path().join("mode"), mode).unwrap();
+            let supervisor = open(dir.path());
+            let fixture_host = host(&supervisor, dir.path()).await;
+            supervisor.reconcile_startup().await.unwrap();
+            let view = supervisor.registry.inventory().await.unwrap().remove(0);
+            if view.cleanup_state != expected {
+                failures.push(format!("{mode}: {:?}", view.cleanup_state));
+            }
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let handle = supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .pop();
+            if mode == "removed" {
+                assert!(handle.is_none());
+                assert_eq!(count(dir.path(), "host_stops"), 0);
+                assert_eq!(count(dir.path(), "graceful"), 0);
+            } else {
+                let progress = supervisor
+                    .registry
+                    .stop_progress(&handle.unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    progress.outcome,
+                    Some(match mode {
+                        "unavailable" => StopOutcome::BackendUnavailable,
+                        "mismatch" => StopOutcome::BlockedOwnership,
+                        _ => StopOutcome::TerminationUnconfirmed,
+                    })
+                );
+                assert!(!progress.settled);
+            }
+            close(fixture_host).await;
+        }
+        // A later Stop is committed while the first caller waits for the lock.
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let lock = supervisor.lifecycle_lock(&id).await;
+        let guard = lock.lock().await;
+        let waiting = {
+            let supervisor = supervisor.clone();
+            let id = id.clone();
+            tokio::spawn(async move { supervisor.stop(id, Some(1)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while supervisor.registry.inventory().await.unwrap()[0].intent_revision != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        supervisor
+            .registry
+            .begin_stop_expected(id, Some(2))
+            .await
+            .unwrap();
+        drop(guard);
+        let result = waiting.await.unwrap();
+        if result.is_ok() || count(dir.path(), "graceful") != 0 {
+            failures.push("old same-incarnation Stop signaled after a newer intent".into());
+        }
+        assert_retained(&supervisor, dir.path(), 3).await;
+        assert!(
+            failures.is_empty(),
+            "Stop continuation or fence missing: {failures:?}"
+        );
+        for point in [
+            "host_authenticated",
+            "host_stopped",
+            "graceful_return",
+            "force_return",
+            "empty_observed",
+            "revoke_sent",
+        ] {
+            stale_during_effect(point).await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = open(dir.path());
+        let id = SoulId::new();
+        let old =
+            crate::registry::tests::materialize_test_runtime(&supervisor.registry, id.clone())
+                .await;
+        let stale = supervisor.registry.begin_stop(id.clone()).await.unwrap();
+        supervisor
+            .registry
+            .mark_stop_outcome(old.incarnation_id, StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        let new = crate::registry::tests::materialize_test_runtime(&supervisor.registry, id).await;
+        assert!(supervisor.finish_stop_handle(&stale).await.is_err());
+        assert_eq!(count(dir.path(), "graceful"), 0);
+        assert_eq!(
+            supervisor
+                .registry
+                .owned_handle(new.incarnation_id)
+                .await
+                .unwrap()
+                .container_id(),
+            supervisor
+                .registry
+                .inventory()
+                .await
+                .unwrap()
+                .iter()
+                .find(|v| v.launch_state == LaunchState::Running)
+                .unwrap()
+                .container_id
+                .as_deref()
+                .unwrap()
+        );
+    }
+
+    async fn stale_during_effect(point: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), true).await;
+        let fixture_host = host(&supervisor, dir.path()).await;
+        let callback = callback(dir.path(), b"ok").await;
+        std::fs::write(dir.path().join("pause-at"), point).unwrap();
+        if matches!(point, "graceful_return" | "force_return") {
+            std::fs::write(dir.path().join("mode"), b"force").unwrap();
+        }
+        let stale = supervisor.registry.begin_stop(id.clone()).await.unwrap();
+        let waiting = {
+            let supervisor = supervisor.clone();
+            let handle = stale.clone();
+            tokio::spawn(async move {
+                let lock = supervisor.lifecycle_lock(handle.soul_id()).await;
+                let _guard = lock.lock().await;
+                supervisor.finish_stop_handle(&handle).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while !dir.path().join("pause-reached").exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        supervisor
+            .registry
+            .begin_stop_expected(id, Some(2))
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("pause-release"), b"release").unwrap();
+        assert!(
+            waiting.await.unwrap().is_err(),
+            "stale {point} must not settle the new intent"
+        );
+        assert_eq!(
+            supervisor.registry.inventory().await.unwrap()[0].cleanup_state,
+            if point == "revoke_sent" {
+                CleanupState::VerifiedEmpty
+            } else {
+                CleanupState::Requested
+            }
+        );
+        if point == "host_authenticated" {
+            assert_eq!(count(dir.path(), "host_stops"), 0);
+        }
+        if matches!(point, "host_authenticated" | "host_stopped") {
+            assert_eq!(count(dir.path(), "graceful"), 0);
+        }
+        if point == "graceful_return" {
+            assert_eq!(count(dir.path(), "force"), 0);
+        }
+        assert_eq!(
+            count(dir.path(), "revokes"),
+            usize::from(point == "revoke_sent")
+        );
+        assert!(supervisor
+            .registry
+            .record_ordinary_stop_outcome(&stale, StopOutcome::VerifiedEmpty)
+            .await
+            .is_err());
+        assert!(supervisor
+            .registry
+            .acknowledge_stop_revoke(
+                &stale,
+                "http://host.docker.internal:3456",
+                "stop-exact-grant"
+            )
+            .await
+            .is_err());
+        assert_retained(&supervisor, dir.path(), 3).await;
+        close(callback).await;
+        close(fixture_host).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "destructive migration/revocation matrix; disposable runtime-suite only"]
+    async fn ordinary_stop_crash_migration_and_revoke() {
+        sandbox_only();
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = open(dir.path());
+        seed(&supervisor, dir.path(), true).await;
+        drop(supervisor);
+        crash_child(dir.path(), "ordinary_stop_after_intent", false).await;
+        // Same executable pre-Task-6 fixture technique as the schema14 retry
+        // fixture: retain real data/Stop intent, remove only the newer schema.
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS ordinary_stops; UPDATE installation SET schema_version=15;",
+        )
+        .unwrap();
+        drop(conn);
+        crash_child(dir.path(), "ordinary_stop_after_outcome", true).await;
+        let rejected = callback(dir.path(), b"not-acknowledged").await;
+        let supervisor = open(dir.path());
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(count(dir.path(), "revokes"), 1);
+        close(rejected).await;
+        drop(supervisor);
+        let acknowledged = callback(dir.path(), b"ok").await;
+        let supervisor = open(dir.path());
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(
+            count(dir.path(), "revokes"),
+            2,
+            "same grant retries until positive acknowledgement, then settles once"
+        );
+        assert_retained(&supervisor, dir.path(), 2).await;
+        assert_eq!(
+            supervisor.registry.inventory().await.unwrap()[0].cleanup_state,
+            CleanupState::VerifiedEmpty
+        );
+        close(acknowledged).await;
+        drop(supervisor);
+        let supervisor = open(dir.path());
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(count(dir.path(), "revokes"), 2);
+
+        for completed in [false, true] {
+            for capability in [false, true] {
+                legacy_stop_case(completed, capability).await;
+            }
+        }
+
+        // No committed container means no signal/empty authority, even though
+        // durable Stop still cancels intent before reporting the refusal.
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), true).await;
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute("UPDATE incarnations SET launch_state='prepared',container_id=NULL,docker_daemon_id=NULL WHERE soul_id=?1", [id.as_str()]).unwrap();
+        assert!(supervisor.registry.begin_stop(id).await.is_err());
+        supervisor.reconcile_startup().await.unwrap();
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        assert_eq!(view.intent_revision, 2);
+        assert_eq!(view.cleanup_state, CleanupState::BlockedOwnership);
+        assert_eq!(count(dir.path(), "revokes"), 0);
+        assert_eq!(count(dir.path(), "graceful"), 0);
+    }
+
+    async fn legacy_stop_case(completed: bool, capability: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), capability).await;
+        let handle = supervisor.registry.begin_stop(id).await.unwrap();
+        if completed {
+            supervisor
+                .registry
+                .mark_stop_outcome(handle.incarnation_id().clone(), StopOutcome::VerifiedEmpty)
+                .await
+                .unwrap();
+            std::fs::write(dir.path().join("empty"), b"empty").unwrap();
+        }
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        conn.execute_batch("DROP TABLE ordinary_stops; UPDATE installation SET schema_version=15;")
+            .unwrap();
+        drop(conn);
+        drop(supervisor);
+        let supervisor = open(dir.path());
+        let fixture_host = host(&supervisor, dir.path()).await;
+        let callback = callback(dir.path(), b"ok").await;
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
+        assert_retained(&supervisor, dir.path(), 2).await;
+        assert_eq!(
+            supervisor.registry.inventory().await.unwrap()[0].cleanup_state,
+            CleanupState::VerifiedEmpty
+        );
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(count(dir.path(), "revokes"), usize::from(capability));
+        assert_eq!(count(dir.path(), "graceful"), usize::from(!completed));
+        close(fixture_host).await;
+        close(callback).await;
+    }
+}
+
+#[cfg(test)]
+mod native_observation_ipc_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    async fn run_native_observation_test_child(test_name: &'static str) -> bool {
+        const CHILD_ENV: &str = "FRESHELL_NATIVE_OBSERVATION_IPC_TEST_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, test_name)
+                .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_probe_fixture_is_independent_of_foreign_registry_logging() {
+        // Keep the deliberately held process-wide lock out of other tests.
+        if run_native_observation_test_child(
+            "service::native_observation_ipc_tests::status_probe_fixture_is_independent_of_foreign_registry_logging",
+        )
+        .await
+        {
+            return;
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_registry = Registry::open(foreign.path().join("registry"), None).unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _registry = foreign_registry;
+            let _coordinator = crate::loss_report::incident_file_coordinator();
+            held_tx.send(()).unwrap();
+            matches!(
+                release_rx.recv_timeout(Duration::from_secs(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )
+        });
+        held_rx.await.unwrap();
+        let mut fixture = tokio::spawn(run_status_probe_fence_test());
+        let result = tokio::time::timeout(Duration::from_secs(15), &mut fixture).await;
+        drop(release_tx);
+        assert!(
+            holder.join().unwrap(),
+            "foreign coordinator must remain held until the fixture completes"
+        );
+        if result.is_err() {
+            // Release the owned lock and join the pending fixture before failing.
+            let _ = fixture.await;
+        }
+        result
+            .expect("foreign registry logging consumed the native IPC fixture's deadline")
+            .expect("native IPC fixture failed");
+    }
+
+    #[tokio::test]
+    async fn pending_terminal_output_io_does_not_block_replacement_and_refuses_late_output() {
+        for stall_hello in [false, true] {
+            for native_session_id in [None, Some("ses_old".to_string())] {
+                pending_terminal_output_case(stall_hello, native_session_id, "incarnation").await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_output_without_identity_still_revalidates_every_captured_fence() {
+        for change in [
+            "intent_revision",
+            "identity_revision",
+            "evidence_revision",
+            "native_import_revision",
+            "recovery_attempt_id",
+            "reply_incarnation",
+            "unchanged",
+        ] {
+            pending_terminal_output_case(false, None, change).await;
+        }
+    }
+
+    async fn pending_terminal_output_case(
+        stall_hello: bool,
+        native_session_id: Option<String>,
+        change: &'static str,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let old = crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let runtime = dir.path().join("host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        Connection::open(registry.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), old.incarnation_id.as_str()],
+            )
+            .unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        let limits = registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .requested_limits;
+        let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let boot = HostBootId::new();
+            let (mut hello, _) = listener.accept().await.unwrap();
+            let request: Envelope<HostCommand> = read_frame(&mut hello).await.unwrap();
+            let HostCommand::Hello {
+                incarnation_id,
+                challenge,
+            } = request.body
+            else {
+                panic!("expected handshake")
+            };
+            let mut pending_tx = Some(pending_tx);
+            let mut release_rx = Some(release_rx);
+            if stall_hello {
+                pending_tx.take().unwrap().send(()).unwrap();
+                release_rx.take().unwrap().await.unwrap();
+            }
+            write_frame(
+                &mut hello,
+                &HostReply {
+                    request_id: request.request_id,
+                    result: Ok(HostResult::Hello {
+                        proof: host_proof(b"synthetic-secret", &challenge, &boot, &incarnation_id),
+                        host_boot_id: boot.clone(),
+                        capabilities: vec![],
+                        effective_limits: limits,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            let (mut output, _) = listener.accept().await.unwrap();
+            let request: Envelope<HostCommand> = read_frame(&mut output).await.unwrap();
+            assert!(matches!(
+                request.body,
+                HostCommand::TerminalReadOutput { .. }
+            ));
+            assert_eq!(
+                request.auth,
+                Some(host_proof(
+                    b"synthetic-secret",
+                    "command-auth",
+                    &boot,
+                    &incarnation_id,
+                ))
+            );
+            if !stall_hello {
+                pending_tx.take().unwrap().send(()).unwrap();
+                release_rx.take().unwrap().await.unwrap();
+            }
+            write_frame(
+                &mut output,
+                &HostReply {
+                    request_id: request.request_id,
+                    result: Ok(HostResult::TerminalOutput(RuntimeOutputBatch {
+                        completion: None,
+                        incarnation_id: if change == "reply_incarnation" {
+                            IncarnationId::new()
+                        } else {
+                            incarnation_id
+                        },
+                        terminal_id: "terminal-old".into(),
+                        codex_activity: None,
+                        opencode_activity: None,
+                        stream_epoch: "epoch-old".into(),
+                        retained_from_seq: 0,
+                        head_seq: 0,
+                        reset_required: false,
+                        truncated: false,
+                        exited: false,
+                        exit_code: None,
+                        native_session_id,
+                        frames: vec![],
+                    })),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let read = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.terminal_read_output(soul, 0, 4096, None).await })
+        };
+        pending_rx.await.unwrap();
+        let lifecycle = supervisor.lifecycle_lock(&soul).await;
+        let replacement_guard =
+            tokio::time::timeout(Duration::from_millis(250), lifecycle.lock()).await;
+        let replacement_was_unblocked = replacement_guard.is_ok();
+        if let Ok(_guard) = replacement_guard {
+            if change == "incarnation" {
+                registry
+                    .mark_stop_outcome(old.incarnation_id.clone(), StopOutcome::VerifiedEmpty)
+                    .await
+                    .unwrap();
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            } else if change != "unchanged" && change != "reply_incarnation" {
+                let update = match change {
+                    "intent_revision" => "intent_revision=intent_revision+1",
+                    "identity_revision" => "identity_revision=identity_revision+1",
+                    "evidence_revision" => "evidence_revision=evidence_revision+1",
+                    "native_import_revision" => "native_import_revision=native_import_revision+1",
+                    "recovery_attempt_id" => "recovery_attempt_id='recovery-other'",
+                    _ => panic!("unknown fixture mutation"),
+                };
+                Connection::open(registry.database_path())
+                    .unwrap()
+                    .execute(
+                        &format!("UPDATE souls SET {update} WHERE soul_id=?1"),
+                        params![soul.as_str()],
+                    )
+                    .unwrap();
+            }
+        }
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap();
+        responder.await.unwrap();
+        assert!(
+            replacement_was_unblocked,
+            "read-only host IO must not retain lifecycle custody (hello={stall_hello})"
+        );
+        if change == "unchanged" {
+            let output = result.unwrap();
+            assert_eq!(output.incarnation_id, old.incarnation_id);
+            assert_eq!(output.stream_epoch, "epoch-old");
+        } else {
+            assert!(result.is_err(), "changed {change} output must be refused");
+        }
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id,
+            None,
+            "the late read must not publish its old root"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_terminal_ipc_cannot_reverse_identity_or_bind_an_old_incarnation() {
+        for replace_incarnation in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute(
+                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+            )
+            .unwrap();
+            if !replace_incarnation {
+                let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                    "terminalId":"terminal", "streamId":"stream", "mode":"opencode", "program":"opencode",
+                    "cwd":"/synthetic", "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24,
+                    "projectKey":"synthetic", "workspacePath":"/synthetic"
+                })).unwrap();
+                conn.execute(
+                    "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                    params![soul.as_str()],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                    params![
+                        serde_json::to_string(&terminal).unwrap(),
+                        prepared.incarnation_id.as_str()
+                    ],
+                )
+                .unwrap();
+                registry
+                    .record_native_session(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        "ses_A".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let source = registry.recovery_context(soul.clone()).await.unwrap();
+            let responder = {
+                let registry = registry.clone();
+                let soul = soul.clone();
+                tokio::spawn(async move {
+                    let (mut hello, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut hello).await.unwrap();
+                    let HostCommand::Hello {
+                        incarnation_id,
+                        challenge,
+                    } = request.body
+                    else {
+                        panic!("expected handshake")
+                    };
+                    let boot = HostBootId::new();
+                    write_frame(
+                        &mut hello,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(HostResult::Hello {
+                                proof: host_proof(
+                                    b"synthetic-secret",
+                                    &challenge,
+                                    &boot,
+                                    &incarnation_id,
+                                ),
+                                host_boot_id: boot,
+                                capabilities: vec![],
+                                effective_limits: source.requested_limits,
+                            }),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let (mut output, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut output).await.unwrap();
+                    assert!(matches!(
+                        request.body,
+                        HostCommand::TerminalReadOutput { .. }
+                    ));
+                    if replace_incarnation {
+                        registry
+                            .mark_stop_outcome(incarnation_id.clone(), StopOutcome::VerifiedEmpty)
+                            .await
+                            .unwrap();
+                        crate::registry::tests::materialize_test_runtime(&registry, soul.clone())
+                            .await;
+                    } else {
+                        registry
+                            .transition_native_session_fenced(
+                                soul,
+                                incarnation_id.clone(),
+                                "ses_A",
+                                "ses_B",
+                                source.write_fence(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    write_frame(
+                        &mut output,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(HostResult::TerminalOutput(RuntimeOutputBatch {
+                                completion: None,
+                                incarnation_id,
+                                terminal_id: "terminal".into(),
+                                codex_activity: None,
+                                opencode_activity: None,
+                                stream_epoch: "epoch".into(),
+                                retained_from_seq: 0,
+                                head_seq: 0,
+                                reset_required: false,
+                                truncated: false,
+                                exited: false,
+                                exit_code: None,
+                                native_session_id: Some("ses_A".into()),
+                                frames: vec![],
+                            })),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                })
+            };
+            let mut request = Envelope::new(
+                RequestId::new(),
+                ControlRole::Web,
+                AdminCommand::TerminalReadOutput(
+                    freshell_runtime_protocol::TerminalReadOutputRequest {
+                        soul_id: soul.clone(),
+                        after_seq: 0,
+                        max_bytes: 4096,
+                        expected_stream_epoch: None,
+                        expected_control_epoch: None,
+                    },
+                ),
+            );
+            request.auth = Some(supervisor.config.control_secret.clone());
+            let result = tokio::time::timeout(Duration::from_secs(5), supervisor.dispatch(request))
+                .await
+                .unwrap();
+            responder.await.unwrap();
+            assert!(
+                result.result.is_err(),
+                "a late response must retain its pre-IPC fence"
+            );
+            let current = registry.recovery_context(soul).await.unwrap();
+            if replace_incarnation {
+                assert_ne!(
+                    current.prior_handle.incarnation_id(),
+                    &prepared.incarnation_id
+                );
+                assert_eq!(current.native_session_id, None);
+            } else {
+                assert_eq!(current.native_session_id.as_deref(), Some("ses_B"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn unreachable_legacy_host_with_exact_recorded_root_requires_compatibility_without_saved_recipe(
+    ) {
+        use freshell_runtime_protocol::{RecoveryBlockReason, RecoveryProbe};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let launch =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let runtime = dir.path().join("unreachable-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute("UPDATE souls SET provider='opencode',native_session_id='ses_legacy_exact' WHERE soul_id=?1",params![soul.as_str()]).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,fixture_kind=NULL WHERE incarnation_id=?2",
+            params![runtime.to_string_lossy(), launch.incarnation_id.as_str()],
+        )
+        .unwrap();
+        let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+            &dir,
+            registry.clone(),
+            crate::backend::BackendRuntimeState::Running,
+        );
+        assert!(registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .resume_spec
+            .is_none());
+        let probe = supervisor.probe_recovery(soul.clone()).await.unwrap();
+        // Without any terminal adapter this remains blocked; host reachability
+        // must not bypass current-image compatibility or authorize a new root.
+        assert!(
+            matches!(
+                probe,
+                RecoveryProbe::Blocked {
+                    reason: RecoveryBlockReason::ImplementationUnavailable,
+                    ..
+                }
+            ),
+            "{probe:?}"
+        );
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("ses_legacy_exact")
+        );
+        assert!(std::fs::read_to_string(dir.path().join("lifecycle.jsonl"))
+            .unwrap()
+            .contains("retained_host_unreachable"));
+    }
+
+    #[tokio::test]
+    async fn capability_unknown_retained_host_cannot_publish_status_identity_or_reattach() {
+        use freshell_runtime_protocol::{RecoveryBlockReason, RecoveryProbe};
+        for capabilities in [
+            vec![],
+            vec!["owned-provider-config-v1".into()],
+            vec!["provider-store-probe-v1".into()],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let launch =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                params![soul.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE incarnations SET runtime_dir=?1,fixture_kind=NULL WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), launch.incarnation_id.as_str()],
+            )
+            .unwrap();
+            let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+                &dir,
+                registry.clone(),
+                crate::backend::BackendRuntimeState::Running,
+            );
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let requested_limits = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .requested_limits;
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let Ok(Ok((mut socket, _))) =
+                        tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+                    else {
+                        break;
+                    };
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: capabilities.clone(),
+                            effective_limits: requested_limits,
+                        },
+                        HostCommand::Status { .. } => HostResult::Status {
+                            native_identity_observation: None,
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: 1,
+                            max_execution_generation: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: false,
+                            native_session_id: Some("ses_unqualified_status".into()),
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        },
+                        HostCommand::ProbeRecovery { .. } => {
+                            HostResult::RecoveryProbe(crate::recovery::tests::absent_native_probe())
+                        }
+                        _ => panic!("unexpected host command"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let probe = supervisor.probe_recovery(soul.clone()).await.unwrap();
+            responder.await.unwrap();
+            let preserved = registry.recovery_context(soul).await.unwrap();
+            assert_eq!(
+                preserved.native_session_id, None,
+                "unknown feature semantics cannot certify status identity"
+            );
+            assert!(
+                matches!(
+                    probe,
+                    RecoveryProbe::Blocked {
+                        reason: RecoveryBlockReason::CapabilityPending,
+                        ..
+                    }
+                ),
+                "{probe:?}"
+            );
+            assert_eq!(
+                preserved.prior_handle.incarnation_id(),
+                &launch.incarnation_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_id_prevents_seed_and_late_probe_cannot_authorize_reattach() {
+        run_status_probe_fence_test().await;
+    }
+
+    async fn run_status_probe_fence_test() {
+        use freshell_runtime_protocol::{
+            RecoverRequest, RecoveryPath, RecoveryProbe, RecoveryTrigger,
+        };
+
+        // These IPC deadlines measure this registry's host exchange, not
+        // process-wide incident logging held by a different test registry.
+        if run_native_observation_test_child(
+            "service::native_observation_ipc_tests::status_id_prevents_seed_and_late_probe_cannot_authorize_reattach",
+        )
+        .await
+        {
+            return;
+        }
+        for delayed_reattach in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let launch =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let db_path = dir.path().join("registry/runtime.sqlite3");
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='native-session-fixture' WHERE soul_id=?1",
+                params![soul.as_str()],
+            )
+            .unwrap();
+            conn.execute("UPDATE incarnations SET runtime_dir=?1,fixture_kind='native_session' WHERE incarnation_id=?2", params![runtime.to_string_lossy(), launch.incarnation_id.as_str()]).unwrap();
+            drop(conn);
+            let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+                &dir,
+                registry.clone(),
+                crate::backend::BackendRuntimeState::Running,
+            );
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let captured = registry.recovery_context(soul.clone()).await.unwrap();
+            assert!(captured.never_dispatched);
+            let initial_import_revision = captured.native_import_revision;
+            let expected_incarnation = launch.incarnation_id.clone();
+            let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                let mut pending_tx = Some(pending_tx);
+                let mut release_rx = Some(release_rx);
+                for step in 0..3 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.role, ControlRole::Supervisor);
+                    assert_eq!(request.protocol_version, CONTROL_PROTOCOL_VERSION);
+                    if step > 0 {
+                        assert_eq!(
+                            request.auth,
+                            Some(host_proof(
+                                b"synthetic-secret",
+                                "command-auth",
+                                &boot,
+                                &expected_incarnation,
+                            ))
+                        );
+                    }
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } if step == 0 => {
+                            assert_eq!(incarnation_id, expected_incarnation);
+                            HostResult::Hello {
+                                proof: host_proof(
+                                    b"synthetic-secret",
+                                    &challenge,
+                                    &boot,
+                                    &incarnation_id,
+                                ),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: captured.requested_limits,
+                            }
+                        }
+                        HostCommand::Status { incarnation_id } if step == 1 => {
+                            assert_eq!(incarnation_id, expected_incarnation);
+                            HostResult::Status {
+                                native_identity_observation: None,
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(123),
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: !delayed_reattach,
+                                native_session_id: Some("ses_from_status".into()),
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::ProbeRecovery {
+                            incarnation_id,
+                            resume_spec,
+                            creation_seed_ref,
+                            never_dispatched,
+                            run_as_uid,
+                            run_as_gid,
+                        } if step == 2 => {
+                            assert_eq!(incarnation_id, expected_incarnation);
+                            assert_eq!(creation_seed_ref, captured.creation_seed_ref);
+                            assert_eq!(never_dispatched, captured.never_dispatched);
+                            assert_eq!((run_as_uid, run_as_gid), (0, 0));
+                            let native = resume_spec.expect("status identity must bind the probe");
+                            assert_eq!(native.provider_session.provider, captured.provider);
+                            assert_eq!(
+                                native.provider_session.provider_store_id,
+                                captured.provider_store_id
+                            );
+                            assert_eq!(
+                                native.provider_session.native_session_id,
+                                "ses_from_status"
+                            );
+                            pending_tx.take().unwrap().send(()).unwrap();
+                            release_rx.take().unwrap().await.unwrap();
+                            HostResult::RecoveryProbe(crate::recovery::tests::absent_native_probe())
+                        }
+                        _ => panic!("unexpected recovery protocol step"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let operation = {
+                let supervisor = supervisor.clone();
+                let soul = soul.clone();
+                tokio::spawn(async move {
+                    if delayed_reattach {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            supervisor.recover(RecoverRequest {
+                                soul_id: soul.clone(),
+                                trigger: RecoveryTrigger::ProviderExit,
+                                expected_intent_revision: None,
+                                expected_control_epoch: None,
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                        let error = result.expect_err(
+                            "late probe cannot reattach using newer registry revisions",
+                        );
+                        assert_eq!(error.code, RuntimeErrorCode::RegistryFailure);
+                        assert!(error.message.contains("stale recovery write fence"));
+                    } else {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            supervisor.probe_recovery(soul),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert!(
+                            matches!(
+                                result,
+                                RecoveryProbe::DefinitivelyUnavailable {
+                                    path: RecoveryPath::NativeResume,
+                                    ..
+                                }
+                            ),
+                            "status materialization must defeat stale seed readiness: {result:?}"
+                        );
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                .await
+                .expect("host must receive the native-store probe")
+                .unwrap();
+            let pending = registry.recovery_context(soul.clone()).await.unwrap();
+            assert_eq!(
+                pending.native_session_id.as_deref(),
+                Some("ses_from_status")
+            );
+            assert_eq!(pending.native_import_revision, initial_import_revision);
+            assert!(!pending.never_dispatched);
+            assert!(
+                !operation.is_finished(),
+                "the probe response is still withheld"
+            );
+            if delayed_reattach {
+                let soul = soul.clone();
+                registry
+                    .run_blocking(move |conn| {
+                        assert_eq!(
+                            conn.execute(
+                                "UPDATE souls SET native_import_revision=native_import_revision+1,recovery_state='blocked' WHERE soul_id=?1",
+                                params![soul.as_str()],
+                            )?,
+                            1
+                        );
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            release_tx.send(()).unwrap();
+            operation.await.unwrap();
+            responder.await.unwrap();
+            if delayed_reattach {
+                let current = registry.recovery_context(soul.clone()).await.unwrap();
+                assert_eq!(
+                    current.recovery_state,
+                    freshell_runtime_protocol::RecoveryState::Blocked
+                );
+                assert_eq!(current.native_import_revision, initial_import_revision + 1);
+                assert_eq!(
+                    current.prior_handle.incarnation_id(),
+                    &launch.incarnation_id
+                );
+            }
+            assert_eq!(
+                registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .native_session_id
+                    .as_deref(),
+                Some("ses_from_status")
+            );
+        }
+    }
+}

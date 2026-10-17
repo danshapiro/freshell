@@ -316,6 +316,10 @@ async fn recovery_host_status(
                     effective_limits: checkpoints::tests::limits(),
                 },
                 HostCommand::Status { .. } => HostResult::Status {
+                    native_identity_observation: None,
+                    opencode_adoption:
+                        freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                    opencode_transfer_receipt: None,
                     host_boot_id: boot.clone(),
                     worker_pid,
                     worker_launch_count: 1,

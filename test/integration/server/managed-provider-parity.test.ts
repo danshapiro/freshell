@@ -76,6 +76,7 @@ class TerminalWire {
   send(frame: unknown): void { this.socket.send(JSON.stringify(frame)) }
 
   recentFrames(): any[] { return this.frames.slice(-12) }
+  inputFailures(): any[] { return this.frames.filter(frame => frame.type === 'terminal.input.blocked' || frame.type === 'error') }
   terminalOutput(): string { return this.frames.filter(frame => frame.type === 'terminal.output').map(frame => frame.data).join('').slice(-4000) }
   recordRows(): RecordRow[] { return this.records }
 
@@ -138,10 +139,41 @@ class TerminalWire {
   }
 }
 
+const ordinaryClaudeSessionStart = [{ hooks: [{ type: 'command', command:
+  'sh -lc \'d="$HOME/.freshell/session-signals/claude"; n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";; esac; f="$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$"; mkdir -p "$d" && cat > "$f.tmp" && mv "$f.tmp" "$f.json"\' 2>/dev/null || true',
+}] }]
+const managedClaudeSessionStart = [{ hooks: [{ type: 'command', command:
+  'node /opt/freshell-claude-sidecar/native-session-channel.mjs',
+}] }]
+const managedClaudeStatusLine = { type: 'command', command:
+  'node /opt/freshell-claude-sidecar/native-session-channel.mjs --status-line' }
+
+function ordinaryClaudeSettings(raw: string): string {
+  let settings
+  try { settings = JSON.parse(raw) } catch { return raw }
+  const startup = JSON.stringify(settings?.hooks?.SessionStart)
+  const ordinary = startup === JSON.stringify(ordinaryClaudeSessionStart)
+  const managed = startup === JSON.stringify(managedClaudeSessionStart)
+    && JSON.stringify(settings.statusLine) === JSON.stringify(managedClaudeStatusLine)
+  if (ordinary || managed) {
+    settings.hooks.SessionStart = '<owned-session-start>'
+    if (managed) delete settings.statusLine
+  }
+  return JSON.stringify(settings)
+}
+
 function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
   const result: string[] = []
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
+    if (provider === 'claude' && arg === '--settings' && typeof argv[index + 1] === 'string') {
+      result.push(arg, ordinaryClaudeSettings(argv[++index]))
+      continue
+    }
+    if (provider === 'codex' && arg === '-c' && argv[index + 1] === 'check_for_update_on_startup=false') {
+      index++
+      continue
+    }
     if (arg === '--mcp-config' || arg === '--mcp-config-file') {
       result.push(arg, '<managed-mcp-config>')
       index++
@@ -272,6 +304,43 @@ function normalized(record: RecordRow) {
 }
 
 describe('managed provider parity argv comparison', () => {
+  it('compares only the exact owned Claude startup producer policy and preserves other settings', () => {
+    const settings = (SessionStart: unknown, statusLine?: unknown) => ({
+      hooks: { SessionStart, Stop: [{ hooks: [{ type: 'command', command: 'controlled-stop' }] }] },
+      ...(statusLine ? { statusLine } : {}), userSetting: 'keep',
+    })
+    const ordinary = settings(ordinaryClaudeSessionStart)
+    const managed = settings(managedClaudeSessionStart, managedClaudeStatusLine)
+    const record = (value: unknown, rest = ['--model', 'haiku', '--effort', 'low']): RecordRow => ({
+      provider: 'claude', kind: 'launch', env: {}, argv: ['--settings', JSON.stringify(value), ...rest],
+    })
+    expect(normalized(record(managed))).toEqual(normalized(record(ordinary)))
+    for (const mutated of [
+      settings([{ hooks: [{ type: 'command', command: 'unexpected-startup' }] }], managedClaudeStatusLine),
+      settings(managedClaudeSessionStart),
+      settings(managedClaudeSessionStart, { ...managedClaudeStatusLine, command: 'unexpected-status' }),
+      settings([...managedClaudeSessionStart, { hooks: [{ type: 'command', command: 'extra-hook' }] }], managedClaudeStatusLine),
+      { ...managed, userSetting: 'changed' },
+      { ...managed, hooks: { ...managed.hooks, Stop: [] } },
+      { ...managed, hooks: { ...managed.hooks, PreToolUse: [{ hooks: [] }] } },
+      { ...managed, statusLine: { ...managedClaudeStatusLine, refreshInterval: 99 } },
+    ]) expect(normalized(record(mutated))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed))).not.toEqual(normalized(record(settings([{ hooks: [] }]))))
+    expect(normalized(record(managed, ['--effort', 'low', '--model', 'haiku']))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed, ['--model', 'changed', '--effort', 'low']))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record(managed, ['--model', 'haiku', '--effort', 'high']))).not.toEqual(normalized(record(ordinary)))
+  })
+
+  it('compares Codex arguments around the managed image update suppression without hiding other settings', () => {
+    const record = (argv: string[]): RecordRow => ({ provider: 'codex', kind: 'launch', argv, env: {} })
+    const ordinary = ['--model', 'gpt-5.6-luna', '--sandbox', 'workspace-write']
+    const suppression = ['-c', 'check_for_update_on_startup=false']
+    expect(normalized(record([...suppression, ...ordinary]))).toEqual(normalized(record(ordinary)))
+    expect(normalized(record(['-c', 'check_for_update_on_startup=true', ...ordinary]))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record([...suppression, '-c', 'other_setting=false', ...ordinary]))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record([...suppression, '--sandbox', 'workspace-write', '--model', 'gpt-5.6-luna']))).not.toEqual(normalized(record(ordinary)))
+  })
+
   it.each([
     {
       provider: 'claude' as const,
@@ -294,6 +363,36 @@ describe('managed provider parity argv comparison', () => {
     expect(normalized(record(first))).not.toEqual(normalized(record(reordered)))
   })
 })
+
+function makeReadableTree(directory: string): void {
+  fs.chmodSync(directory, 0o755)
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const file = path.join(directory, entry.name)
+    if (entry.isDirectory()) {
+      fs.chmodSync(file, 0o755)
+      makeReadableTree(file)
+    } else {
+      fs.chmodSync(file, 0o644)
+    }
+  }
+}
+
+function writeAmplifierParityInputs(homeDir: string): void {
+  const directory = path.join(homeDir, '.amplifier')
+  for (const [relative, content] of [
+    ['config.yaml', 'parity_setting: true\n'],
+    ['bundles/parity-bundle.yaml', 'name: parity\n'],
+    // The selected-profile worker prepares settings.yaml from this local bundle.
+    ['bundles/default.yaml', JSON.stringify({
+      name: 'default',
+      providers: [{ module: 'provider-vllm', config: { default_model: 'glm-5.3' } }],
+    }) + '\n'],
+  ]) {
+    const target = path.join(directory, relative)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, content)
+  }
+}
 
 describe('ordinary and managed terminal provider parity', () => {
   let rig: ManagedRuntimeBrowserRig
@@ -325,7 +424,7 @@ describe('ordinary and managed terminal provider parity', () => {
     registeredVolumes.push({ ...authorization, requestId })
     rig.runtime.writeIncident('provider-parity-registered-requests', registeredVolumes)
   }
-  function providerOwnedMountEvidence(containerId: string): unknown {
+  async function providerOwnedMountEvidence(containerId: string): Promise<unknown> {
     const source = `const fs = require('node:fs')
 const path = require('node:path')
 const root = '/home/freshell/provider/.freshell/provider-roots'
@@ -342,7 +441,7 @@ try { aliasRealPath = fs.realpathSync(alias) } catch {}
 let directFile = null
 try { directFile = fs.readFileSync(owned, 'utf8') } catch {}
 process.stdout.write(JSON.stringify({ files, aliasExists: fs.existsSync(alias), aliasRealPath, directFile }))`
-    const guest = JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', source]))
+    const guest = JSON.parse(await rig.ownedProviderExec(containerId, ['node', '-e', source]))
     const inspect = rig.runtime.inspectContainer(containerId)
     const mounts = Array.isArray(inspect?.HostConfig?.Mounts) ? inspect.HostConfig.Mounts
       .map((mount: any) => ({
@@ -359,7 +458,7 @@ process.stdout.write(JSON.stringify({ files, aliasExists: fs.existsSync(alias), 
       : undefined
     const projectSubpath = projectMount?.VolumeOptions?.Subpath
     const projectState = typeof projectSubpath === 'string'
-      ? JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', `
+      ? JSON.parse(await rig.ownedProviderExec(containerId, ['node', '-e', `
 const fs=require('node:fs'),path=require('node:path');
 const root=path.join('/home/freshell/provider',${JSON.stringify(projectSubpath)});
 const file=path.join(root,'opencode.json');
@@ -414,8 +513,8 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     for (const provider of providers) {
       const wrapper = path.join(workspace, `parity-${provider}`)
       const script = provider === 'codex' || provider === 'opencode'
-        ? `#!/usr/bin/env node\nconst target = process.argv.includes(${JSON.stringify(provider === 'codex' ? 'app-server' : 'serve')}) ? ${JSON.stringify(provider === 'codex' ? './fake-app-server.mjs' : './fake-opencode.cjs')} : './parity-provider.mjs'\nvoid import(new URL(target, import.meta.url)).catch(error => { console.error(error); process.exitCode = 1 })\n`
-        : `#!/usr/bin/env node\nimport './parity-provider.mjs'\n`
+        ? `#!/usr/bin/env -S node --experimental-transform-types\nconst target = process.argv.includes(${JSON.stringify(provider === 'codex' ? 'app-server' : 'serve')}) ? ${JSON.stringify(provider === 'codex' ? './fake-app-server.mjs' : './fake-opencode.cjs')} : './parity-provider.mjs'\nvoid import(new URL(target, import.meta.url)).catch(error => { console.error(error); process.exitCode = 1 })\n`
+        : `#!/usr/bin/env -S node --experimental-transform-types\nimport './parity-provider.mjs'\n`
       fs.writeFileSync(wrapper, script, { mode: 0o755 })
       fs.chmodSync(wrapper, 0o755)
     }
@@ -507,7 +606,6 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
       ['.claude', 'plugins/parity-plugin.txt', 'claude parity plugin\n'],
       ['.codex', 'skills/parity/SKILL.md', 'codex parity skill\n'],
       ['custom-xdg/opencode', 'plugins/parity-plugin.js', 'export default { name: "parity" }\n'],
-      ['.amplifier', 'bundles/parity-bundle.yaml', 'name: parity\n'],
     ]) {
       const target = path.join(rig.info.homeDir, directory, relative)
       fs.mkdirSync(path.dirname(target), { recursive: true })
@@ -519,6 +617,7 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     ]) writeProviderParityEnvironment(path.join(rig.info.homeDir, directory), relative)
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/parity-policy.txt'), 'relative-config-reference-nonce')
     fs.writeFileSync(path.join(webHome, 'absolute-policy.txt'), 'absolute-config-reference-nonce')
+    writeAmplifierParityInputs(rig.info.homeDir)
   }, 900_000)
 
   beforeEach(() => {
@@ -553,9 +652,6 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
         })
       }
     } finally {
-      if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
-      if (webHome) fs.rmSync(webHome, { recursive: true, force: true })
-      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
       restoreOnecliEnvironment?.()
       for (const [key, value] of Object.entries(inheritedProviderEnvironment)) {
         if (value === undefined) delete process.env[key]
@@ -563,6 +659,9 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
       }
       if (inheritedFreshellUrl === undefined) delete process.env.FRESHELL_URL
       else process.env.FRESHELL_URL = inheritedFreshellUrl
+      if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
+      if (webHome) fs.rmSync(webHome, { recursive: true, force: true })
+      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
     }
   }, 180_000)
 
@@ -618,7 +717,7 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
           error: String(error),
         })
         if (managedRequest) {
-          const receipt = rig.runtime.broker.receipts().findLast(value => value.soulId === managedRequest!.soulId && value.workspacePath === workspace)
+          const receipt = [...rig.runtime.broker.receipts()].reverse().find(value => value.soulId === managedRequest!.soulId && value.workspacePath === workspace)
           if (receipt) {
             const diagnostic: Record<string, unknown> = { containerId: receipt.containerId, soulId: receipt.soulId }
             const logs = rig.runtime.containerLogs(receipt.containerId)
@@ -695,7 +794,35 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
         )))
       }
     }
-    expect(normalized(observed[1])).toEqual(normalized(observed[0]))
+    const launch = observed.map(row => normalized(row))
+    const launchArgv = observed.map(row => [...row.argv])
+    if (provider === 'claude') {
+      const settings = observed.map(row => JSON.parse(row.argv[row.argv.indexOf('--settings') + 1]))
+      expect(settings[0].hooks.SessionStart).toEqual(ordinaryClaudeSessionStart)
+      expect(settings[1].hooks.SessionStart).toEqual(managedClaudeSessionStart)
+      expect(settings[1].statusLine).toEqual(managedClaudeStatusLine)
+    }
+    if (provider === 'codex') {
+      // The managed image owns the pin and must not ask for updater input
+      // before the native create/resume acknowledgement. Verify that actual
+      // launch policy separately from the remaining provider-visible flags.
+      expect(observed[1].argv.slice(0, 2)).toEqual(['-c', 'check_for_update_on_startup=false'])
+      expect(observed[1].argv.filter((arg: string) => arg === 'check_for_update_on_startup=false')).toHaveLength(1)
+      expect(observed[0].argv).not.toContain('check_for_update_on_startup=false')
+      // Ordinary Codex routes the model through its app-server plan; the
+      // durable route also supplies it to the TUI. Check that exact difference
+      // before comparing their common inputs. Keep both actual argument
+      // lists in the fixture receipt; do not hide model flags in normalized().
+      expect(launch[0].argv).not.toContain('--model')
+      const effortAt = launch[0].argv.indexOf('model_reasoning_effort="low"') - 1
+      expect(effortAt).toBeGreaterThanOrEqual(0)
+      expect(launch[1].argv).toEqual([
+        ...launch[0].argv.slice(0, effortAt), '--model', 'gpt-5.6-luna',
+        ...launch[0].argv.slice(effortAt),
+      ])
+      launch[1].argv = launch[0].argv
+    }
+    expect(launch[1]).toEqual(launch[0])
     if (provider === 'opencode') {
       const selected = JSON.parse(observed[1].tuiConfig)
       expect(selected.plugin, `managed TUI: ${observed[1].tuiConfig}; direct TUI: ${observed[0].tuiConfig}`)
@@ -738,7 +865,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       }).catch(async error => {
         throw new Error(`${String(error)}; probe=${JSON.stringify(probe)}; inventory=${JSON.stringify(await rig.inventory())}`)
       })
-      rig.runtime.killOwnedRuntimeExact(before.containerId!)
+      await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
       const after = await waitFor(`${provider} replacement incarnation`, async () => {
         const view = await rig.runningViewForTerminal(managedTerminalId!)
         return view?.containerId && view.incarnationId !== before.incarnationId
@@ -787,9 +914,9 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
         }
       })
       expect(rejectedCreate).toBeDefined()
-      const launch = observed.map(row => normalized(row))
       fs.writeFileSync(path.join(evidenceDir, `terminal-${provider}.json`), JSON.stringify({
         provider,
+        launchArgv,
         direct: { launch: launch[0], mcp: mcpResults[0], nativeIdentity: identities[0] ?? observed[0].nativeSession },
         managed: { launch: launch[1], mcp: mcpResults[1], nativeIdentity: identities[1] ?? observed[1].nativeSession },
         recovery: { replacementObserved: true, sameNativeSession: after.nativeSessionId === before.nativeSessionId },
@@ -831,17 +958,16 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       return view?.containerId ? view : undefined
     })
     if (!before.containerId) throw new Error('initial OpenCode container missing')
-    rig.ownedProviderExec(before.containerId, ['sh', '-c',
+    await rig.ownedProviderExec(before.containerId, ['sh', '-c',
       'printf provider-owned-state > /home/freshell/provider/.config/opencode/plugins/provider-owned.txt'])
-    const beforeProviderOwnedMount = providerOwnedMountEvidence(before.containerId)
+    const beforeProviderOwnedMount = await providerOwnedMountEvidence(before.containerId)
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/new-provider.jsonc'), '{"replacement":true}\n')
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/opencode.jsonc'), '{"replacementOriginal":true}\n')
     fs.rmSync(path.join(xdgConfigHome, 'opencode/plugins/parity-plugin.js'))
     fs.rmSync(path.join(workspace, '.opencode'), { recursive: true, force: true })
     const editedTui = '{ // changed before replacement\n  "theme": "light"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
-    rig.runtime.killOwnedRuntimeExact(before.containerId)
-    await wire.requestAttachOnce(terminalId)
+    await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
     const after = await waitFor('replacement OpenCode incarnation', async () => {
       const rows = (await rig.inventory()).filter((row: any) => row.terminalId === terminalId)
       const blocked = rows.find((row: any) => row.recoveryState === 'blocked')
@@ -864,7 +990,8 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
     const resumed = await waitFor('resumed OpenCode child observation', () => wire.recordRows().find(row => (
       row.provider === 'opencode' && row.kind === 'launch' && row.launchId !== first.launchId
     )), 90_000)
-    const afterProviderOwnedMount = providerOwnedMountEvidence(after.containerId)
+    if (!after.containerId) throw new Error('resumed OpenCode runtime has no owned container')
+    const afterProviderOwnedMount = await providerOwnedMountEvidence(after.containerId)
     expect(resumed.providerConfig['new-provider.jsonc']).toEqual({ replacement: true })
     expect(resumed.providerConfig['opencode.jsonc']).toEqual({ replacementOriginal: true })
     expect(resumed.providerPlugin).toBeNull()
@@ -895,41 +1022,44 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
     )))
     const before = await waitFor('managed OpenCode container before switch', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
-      return view?.containerId ? view : undefined
+      return view?.containerId && view.durabilityState === 'resume_captured' ? view : undefined
     })
     if (!before.containerId) throw new Error('managed OpenCode container missing')
     const switchedId = `ses_ParitySwitch${Date.now()}`
-    const writeSignal = `
-      const fs = require('node:fs')
+    const createSelectedRoot = `
       const path = require('node:path')
       const { DatabaseSync } = require('node:sqlite')
-      const [previous, next, terminal] = process.argv.slice(1)
+      const [previous, next] = process.argv.slice(1)
       const home = '/home/freshell/provider'
       const db = new DatabaseSync(path.join(home, '.local/share/opencode/opencode.db'))
-      const changed = db.prepare('UPDATE session SET id = ? WHERE id = ?').run(next, previous)
+      const oldMessages = db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(previous).count
+      const created = db.prepare(\`INSERT INTO session
+        (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated)
+        SELECT ?, project_id, NULL, ?, directory, ?, version, model, ?, ? FROM session WHERE id = ?\`)
+        .run(next, next, next, Date.now(), Date.now(), previous)
+      if (created.changes !== 1) throw new Error('native session row was not available')
+      if (!db.prepare('SELECT id FROM session WHERE id = ?').get(previous)
+        || db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(previous).count !== oldMessages)
+        throw new Error('original native graph changed')
       db.close()
-      if (changed.changes !== 1) throw new Error('native session row was not available')
-      const signals = path.join(home, '.freshell/session-signals/opencode')
-      fs.mkdirSync(signals, { recursive: true })
-      fs.writeFileSync(path.join(signals, terminal + '__' + Date.now() + '.json'),
-        JSON.stringify({ session_id: next }))
     `
-    rig.ownedProviderExec(before.containerId, [
-      'node', '-e', writeSignal, initial.nativeSession.value, switchedId, terminalId,
+    await rig.ownedProviderExec(before.containerId, [
+      'node', '-e', createSelectedRoot, initial.nativeSession.value, switchedId,
     ])
+    wire.send({ type: 'terminal.input', terminalId, data: `SELECT_SESSION ${switchedId}\r` })
     await wire.wait(frame => frame.type === 'terminal.session.associated'
       && frame.terminalId === terminalId && frame.sessionRef?.sessionId === switchedId, 30_000).catch(async error => {
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${JSON.stringify(providerParityFailureDiagnostics(Object.values(rig.web.capturedOutput()).join('\n'))).slice(-3000)}`)
     })
     await wire.wait(frame => frame.type === 'terminal.meta.updated'
       && frame.upsert?.some((row: any) => row.terminalId === terminalId && row.sessionId === switchedId), 30_000)
-    await waitFor('switched OpenCode exact resume evidence', async () => {
+    const switched = await waitFor('switched OpenCode exact resume evidence', async () => {
       const view = (await rig.inventory()).find((row: any) => row.terminalId === terminalId)
       return view?.nativeSessionId === switchedId && view?.durabilityState === 'resume_captured' ? view : undefined
     }, 20_000).catch(async error => {
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}`)
     })
-    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    await rig.crashRuntimeHost(rig.exactRuntimeHandle(switched))
     const after = await waitFor('replacement OpenCode incarnation after native switch', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
@@ -970,7 +1100,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
     await rig.web.kill()
     const editedTui = '{ // changed while web is down\n  "theme": "solarized"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
-    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    await rig.crashRuntimeHost(rig.exactRuntimeHandle(before))
     await rig.restartWebGracefully()
     const recoveredWire = await TerminalWire.connect(rig.info, true)
     sockets.push(recoveredWire)

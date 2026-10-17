@@ -102,6 +102,8 @@ async fn directory_fixture_with_retry(
                 }
                 AdminCommand::TerminalReadOutput(read) => {
                     AdminResult::TerminalOutput(RuntimeOutputBatch {
+codex_activity: None,
+opencode_activity: None,
                         incarnation_id: incarnation.clone(),
                         terminal_id: "directory-retained".into(),
                         stream_epoch: "directory-epoch".into(),

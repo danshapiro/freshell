@@ -58,6 +58,25 @@ pub fn resolve_environment_profile(
     profile: EnvironmentProfile,
     raw: &str,
 ) -> Result<BTreeMap<String, String>, GrantError> {
+    resolve_environment_profile_with_native_auth(profile, raw, false)
+}
+
+/// Decode transport-only values only after the caller validates typed native auth.
+pub fn resolve_environment_profile_with_native_auth(
+    profile: EnvironmentProfile,
+    raw: &str,
+    native_auth: bool,
+) -> Result<BTreeMap<String, String>, GrantError> {
+    let parsed = parse_environment_values(profile, raw)?;
+    decode_profile(profile, &parsed, native_auth)
+        .map_err(|reason| error(profile, GrantOperation::Decode, reason))
+}
+
+/// Shared finite parser for typed native keys and ordinary environment grants.
+pub fn parse_environment_values(
+    profile: EnvironmentProfile,
+    raw: &str,
+) -> Result<BTreeMap<String, String>, GrantError> {
     if raw.len() > MAX_KEYS_BYTES as usize {
         return Err(error(
             profile,
@@ -65,7 +84,7 @@ pub fn resolve_environment_profile(
             "grant exceeds 128 KiB".into(),
         ));
     }
-    decode_profile(profile, raw).map_err(|reason| error(profile, GrantOperation::Decode, reason))
+    parse_keys_env(raw).map_err(|reason| error(profile, GrantOperation::Decode, reason))
 }
 
 /// Charge actual bytes, including source growth after metadata inspection.
@@ -138,6 +157,8 @@ const ALLOWED_NAMES: &[&str] = &[
     "GOOGLE_GENERATIVE_AI_API_KEY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "VLLM_API_KEY",
+    "VLLM_BASE_URL",
     "LUNAROUTE_API_KEY",
     "LUNAROUTE_BASE_URL",
     "NODE_EXTRA_CA_CERTS",
@@ -164,9 +185,9 @@ const CERTIFICATE_CHILD_NAMES: &[&str] = &[
 
 fn decode_profile(
     profile: EnvironmentProfile,
-    raw: &str,
+    parsed: &BTreeMap<String, String>,
+    native_auth: bool,
 ) -> Result<BTreeMap<String, String>, String> {
-    let parsed = parse_keys_env(raw)?;
     match profile {
         EnvironmentProfile::Claude => resolve_provider_environment(
             &parsed,
@@ -176,10 +197,14 @@ fn decode_profile(
                 "CLAUDE_CODE_OAUTH_TOKEN",
             ],
             false,
+            native_auth,
         ),
-        EnvironmentProfile::Codex => {
-            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"], false)
-        }
+        EnvironmentProfile::Codex => resolve_provider_environment(
+            &parsed,
+            &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+            false,
+            native_auth,
+        ),
         EnvironmentProfile::Opencode => resolve_provider_environment(
             &parsed,
             &[
@@ -194,6 +219,7 @@ fn decode_profile(
                 "OPENCODE_API_KEY",
             ],
             true,
+            native_auth,
         ),
         EnvironmentProfile::Amplifier => resolve_provider_environment(
             &parsed,
@@ -202,6 +228,8 @@ fn decode_profile(
                 "ANTHROPIC_BASE_URL",
                 "OPENAI_API_KEY",
                 "OPENAI_BASE_URL",
+                "VLLM_API_KEY",
+                "VLLM_BASE_URL",
                 "LUNAROUTE_API_KEY",
                 "LUNAROUTE_BASE_URL",
                 "GLM_RUNPOD_API_KEY",
@@ -211,6 +239,7 @@ fn decode_profile(
                 "OPENROUTER_API_KEY",
             ],
             false,
+            native_auth,
         ),
         EnvironmentProfile::AmplifierLunarouteGlm53 => {
             // The approved proxy may replace a provider placeholder key, so
@@ -261,6 +290,7 @@ fn resolve_provider_environment(
     parsed: &BTreeMap<String, String>,
     provider_names: &[&str],
     allow_opencode_proxy_settings: bool,
+    native_auth: bool,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut child = BTreeMap::new();
     for (name, value) in parsed {
@@ -295,9 +325,10 @@ fn resolve_provider_environment(
         }
     }
     if child.is_empty()
-        || !child
-            .keys()
-            .any(|name| provider_names.contains(&name.as_str()))
+        || (!native_auth
+            && !child
+                .keys()
+                .any(|name| provider_names.contains(&name.as_str())))
     {
         return Err("OneCLI environment profile has no provider values".into());
     }

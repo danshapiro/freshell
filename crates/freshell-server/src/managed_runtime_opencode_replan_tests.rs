@@ -103,6 +103,10 @@ mod uncertain_launch {
                         HostCommand::GrantExecution { .. } => {
                             state.lock().unwrap().dispatches += 1;
                             HostResult::GrantAccepted {
+                                native_identity_observation: None,
+                                opencode_adoption:
+                                    freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                                opencode_transfer_receipt: None,
                                 host_boot_id: boot.clone(),
                                 worker_pid: 1234,
                                 worker_launch_count: 1,
@@ -111,6 +115,10 @@ mod uncertain_launch {
                             }
                         }
                         HostCommand::Status { .. } => HostResult::Status {
+                            native_identity_observation: None,
+                            opencode_adoption:
+                                freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                            opencode_transfer_receipt: None,
                             host_boot_id: boot.clone(),
                             worker_pid: Some(1234),
                             worker_launch_count: 1,

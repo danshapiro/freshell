@@ -1906,6 +1906,10 @@
               "minimum": 0,
               "type": "integer"
             },
+            "paneId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "permissionMode": {
               "type": "string"
             },
@@ -3489,6 +3493,10 @@
               "minimum": 0,
               "type": "integer"
             },
+            "paneId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "permissionMode": {
               "type": "string"
             },
@@ -4531,6 +4539,10 @@
           "maximum": 9007199254740991,
           "minimum": 0,
           "type": "integer"
+        },
+        "paneId": {
+          "minLength": 1,
+          "type": "string"
         },
         "permissionMode": {
           "type": "string"
@@ -9288,6 +9300,13 @@
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991,
           "type": "integer"
+        },
+        "outcome": {
+          "enum": [
+            "completed",
+            "failed"
+          ],
+          "type": "string"
         },
         "provider": {
           "enum": [

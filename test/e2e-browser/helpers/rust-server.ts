@@ -12,6 +12,7 @@ import {
   type E2eServerInfo,
 } from './server-fixture-support.js'
 import type { E2eServerHandle } from './external-target.js'
+import { stripRuntimeWebEnvironment, type RuntimeWebConstructOptions } from '../../../scripts/testing/runtime-sandbox.js'
 
 /**
  * HARNESS-01 — an OWNED Rust-server Playwright fixture.
@@ -273,7 +274,7 @@ export const GEMINI_STRIP_ENV_PREFIXES: string[] = [
   'FRESHELL_GEMINI_BASE_URL',
 ]
 
-export interface RustServerOptions {
+export interface RustServerOptions extends Pick<RuntimeWebConstructOptions, 'providerFreeFixture' | 'fixtureOnecliReferences'> {
   /** Use this port instead of allocating an ephemeral port. */
   port?: number
   /** Reuse this isolated HOME instead of creating a fresh mkdtemp one. */
@@ -618,14 +619,7 @@ export class RustServer implements E2eServerHandle {
     )
     // Remove any inherited PORT-adjacent var that might interfere.
     delete (env as Record<string, string | undefined>).VITE_PORT
-    // Caller-requested credential scrubs (see RustServerOptions.stripEnvPrefixes).
-    for (const prefix of this.options.stripEnvPrefixes ?? []) {
-      for (const key of Object.keys(env)) {
-        if (key.startsWith(prefix)) {
-          delete (env as Record<string, string | undefined>)[key]
-        }
-      }
-    }
+    stripRuntimeWebEnvironment(env, this.options)
 
     this.stdoutBuffer = ''
     this.stderrBuffer = ''

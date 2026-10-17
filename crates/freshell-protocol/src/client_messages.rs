@@ -900,6 +900,10 @@ pub struct FreshAgentCreate {
     /// optional; conn-less (REST/MCP) creates omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// The creating pane's client-side id, used to bind managed view intent.
+    /// Additive optional; older clients omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
     /// Unified agent names (Task 1 wire / Task 2 Rust side): the pane's
     /// pre-durable naming handle — see `TerminalCreate::naming_handle`.
     /// Additive optional.

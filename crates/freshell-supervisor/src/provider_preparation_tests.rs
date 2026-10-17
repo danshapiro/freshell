@@ -192,6 +192,10 @@ impl RuntimeBackend for Backend {
                         }
                         state.lock().unwrap().grants += 1;
                         HostResult::GrantAccepted {
+                            native_identity_observation: None,
+                            opencode_adoption:
+                                freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                            opencode_transfer_receipt: None,
                             host_boot_id: boot.clone(),
                             worker_pid: 1234,
                             worker_launch_count: 1,
@@ -200,6 +204,10 @@ impl RuntimeBackend for Backend {
                         }
                     }
                     HostCommand::Status { .. } => HostResult::Status {
+                        native_identity_observation: None,
+                        opencode_adoption:
+                            freshell_runtime_protocol::OpenCodeAdoptionStatus::NotRequired,
+                        opencode_transfer_receipt: None,
                         host_boot_id: boot.clone(),
                         worker_pid: if rejected { None } else { Some(1234) },
                         worker_launch_count: u64::from(!rejected),
@@ -483,6 +491,7 @@ async fn live_opencode_probe_coalesces_failed_evidence_reads_then_recovers_befor
         .commit_created(
             incarnation_id.clone(),
             crate::registry::BackendCreatedRecord {
+                launch_policy: None,
                 daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
                 container_id: "d".repeat(64),
                 image_ref: format!("sha256:{}", "a".repeat(64)),

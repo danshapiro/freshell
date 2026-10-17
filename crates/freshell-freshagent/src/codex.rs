@@ -56,9 +56,7 @@ use axum::{
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 
-use freshell_codex::launch_lifecycle::{
-    allocate_loopback_port, drain_child_io, SIDECAR_START_BUDGET,
-};
+use freshell_codex::launch_lifecycle::{allocate_loopback_port, SIDECAR_START_BUDGET};
 use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
@@ -186,6 +184,142 @@ fn locate_thread_rollout(
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
+
+const CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES: usize = 4096;
+
+struct CodexStartupStderr {
+    sample: Arc<StdMutex<Vec<u8>>>,
+    drained: oneshot::Receiver<()>,
+}
+
+impl CodexStartupStderr {
+    async fn safe_category_after_exit(self) -> &'static str {
+        let mut drained = self.drained;
+        // Process exit closes the pipe. Keep the failure path bounded if a
+        // wrapper accidentally leaves another writer open.
+        let _ = tokio::time::timeout(Duration::from_millis(100), &mut drained).await;
+        let sample = self
+            .sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        classify_codex_startup_stderr(&sample)
+    }
+}
+
+/// Drain Codex startup output while retaining only a short stderr tail for
+/// classification. Provider output is never logged or persisted; callers get
+/// one fixed diagnostic category suitable for a structured failure event.
+fn drain_codex_child_io_with_startup_diagnostics(
+    child: &mut tokio::process::Child,
+) -> CodexStartupStderr {
+    use tokio::io::AsyncReadExt;
+
+    if let Some(mut stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
+        });
+    }
+
+    let sample = Arc::new(StdMutex::new(Vec::with_capacity(
+        CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES,
+    )));
+    let (drained_tx, drained_rx) = oneshot::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        let sample_for_task = Arc::clone(&sample);
+        tokio::spawn(async move {
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
+                let mut tail = sample_for_task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let overflow = tail
+                    .len()
+                    .saturating_add(count)
+                    .saturating_sub(CODEX_STARTUP_STDERR_SAMPLE_MAX_BYTES);
+                if overflow > 0 {
+                    let drain_len = overflow.min(tail.len());
+                    tail.drain(..drain_len);
+                }
+                tail.extend_from_slice(&chunk[..count]);
+            }
+            let _ = drained_tx.send(());
+        });
+    } else {
+        let _ = drained_tx.send(());
+    }
+    CodexStartupStderr {
+        sample,
+        drained: drained_rx,
+    }
+}
+
+fn classify_codex_startup_stderr(stderr: &[u8]) -> &'static str {
+    if stderr.is_empty() {
+        return "no-diagnostic";
+    }
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if [
+        "not logged in",
+        "login required",
+        "codex login",
+        "authentication",
+        "credentials",
+        "unauthorized",
+        "token expired",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "authentication"
+    } else if [
+        "unknown option",
+        "unrecognized option",
+        "unknown argument",
+        "unexpected argument",
+        "usage:",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "arguments"
+    } else if [
+        "address already in use",
+        "failed to bind",
+        "bind failed",
+        "permission denied",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "listener"
+    } else if [
+        "config.toml",
+        "invalid config",
+        "configuration error",
+        "failed to parse config",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "configuration"
+    } else if [
+        "connection refused",
+        "could not resolve",
+        "dns",
+        "network error",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "network"
+    } else {
+        "unclassified"
+    }
+}
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
 /// Codex history is sometimes behind the turn-completion notification. Keep
@@ -6038,6 +6172,15 @@ impl FreshCodexState {
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
     }
 
+    /// Read-only identity of this registered native process. A same-thread
+    /// crash recovery has a different token; this is not native session proof.
+    pub async fn live_session_incarnation(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        (!session.exited.load(Ordering::SeqCst) && !session.sidecar_ownership_id.is_empty())
+            .then(|| session.sidecar_ownership_id.clone())
+    }
+
     pub(crate) async fn local_snapshot_owner(
         &self,
         native_id: &str,
@@ -7449,8 +7592,10 @@ impl FreshCodexState {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
-        // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
-        drain_child_io(&mut child);
+        // Drain child output so verbose app-server logs cannot back-pressure it.
+        // Retain only a bounded stderr tail in memory, classify it to a fixed
+        // category on startup failure, and never expose the provider's text.
+        let startup_stderr = drain_codex_child_io_with_startup_diagnostics(&mut child);
 
         // wfah: durable tracking BEFORE the handshake — the record must exist
         // even while this sidecar's 45s startup budget is still running, or an
@@ -7474,15 +7619,24 @@ impl FreshCodexState {
                 Err(err) => {
                     if let Ok(Some(status)) = child.try_wait() {
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        return Err(format!(
-                            "codex app-server exited before listening: {status}"
-                        ));
+                        let diagnostic = startup_stderr.safe_category_after_exit().await;
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            exit_status = %status,
+                            startup_diagnostic = diagnostic,
+                            "freshagent.codex.app_server_start_failed_before_listening"
+                        );
+                        return Err(format!("codex app-server exited before listening: {status} (startup diagnostic: {diagnostic})"));
                     }
                     if Instant::now() >= deadline {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        return Err(format!("codex app-server WS never came up: {err}"));
+                        let diagnostic = startup_stderr.safe_category_after_exit().await;
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            startup_diagnostic = diagnostic,
+                            "freshagent.codex.app_server_listener_timeout"
+                        );
+                        return Err(format!("codex app-server WS never came up: {err} (startup diagnostic: {diagnostic})"));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -11131,10 +11285,15 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
             }
             Value::Object(map)
         }
-        CodexAdapterEvent::TurnComplete { session_id, at } => json!({
+        CodexAdapterEvent::TurnComplete {
+            session_id,
+            at,
+            outcome,
+        } => json!({
             "type": "freshAgent.turn.complete",
             "sessionId": session_id,
             "at": at,
+            "outcome": outcome.as_str(),
         }),
         CodexAdapterEvent::Status { session_id, status } => json!({
             "type": "freshAgent.status",
@@ -11179,6 +11338,7 @@ fn mint_synthesized_attention_edge(
     let event = CodexAdapterEvent::TurnComplete {
         session_id: thread_id.to_string(),
         at,
+        outcome: freshell_codex::CodexTurnOutcome::Unknown,
     };
     if let Some(frame) = adapter_event_to_frame(&event, thread_id) {
         let _ = broadcast_tx.send(frame);
@@ -11539,6 +11699,31 @@ pub(crate) mod tests {
     use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
+    #[test]
+    fn codex_startup_diagnostics_use_only_safe_categories() {
+        assert_eq!(
+            classify_codex_startup_stderr(b"Please run codex login to continue"),
+            "authentication"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"could not parse config.toml"),
+            "configuration"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"unknown option --listen"),
+            "arguments"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"address already in use"),
+            "listener"
+        );
+        assert_eq!(
+            classify_codex_startup_stderr(b"provider startup failed"),
+            "unclassified"
+        );
+        assert_eq!(classify_codex_startup_stderr(b""), "no-diagnostic");
+    }
+
     // ── DIAG-01 lifecycle tracing events (capturing test facility) ────────
     mod tracing_capture {
         use std::collections::BTreeMap;
@@ -11892,6 +12077,7 @@ pub(crate) mod tests {
             &CodexAdapterEvent::TurnComplete {
                 session_id: "t-1".into(),
                 at: 42,
+                outcome: freshell_codex::CodexTurnOutcome::Completed,
             },
             "t-1",
         )
@@ -11903,6 +12089,22 @@ pub(crate) mod tests {
         assert_eq!(wire["sessionId"], "t-1");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(wire["event"]["at"], 42);
+        assert_eq!(wire["event"]["outcome"], "completed");
+    }
+
+    #[test]
+    fn failed_turn_complete_frames_keep_the_unsuccessful_outcome() {
+        let frame = adapter_event_to_frame(
+            &CodexAdapterEvent::TurnComplete {
+                session_id: "t-1".into(),
+                at: 43,
+                outcome: freshell_codex::CodexTurnOutcome::Failed,
+            },
+            "t-1",
+        )
+        .unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["outcome"], "failed");
     }
 
     #[test]
@@ -12572,6 +12774,7 @@ pub(crate) mod tests {
         let sink = crate::naming::test_support::RecordingSink::new();
         st.set_session_naming(sink.clone());
         let create = FreshAgentCreate {
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             naming_handle: Some("handle-codex-early".to_string()),
@@ -14552,6 +14755,7 @@ pub(crate) mod tests {
         let create = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -14727,6 +14931,7 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -14887,6 +15092,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -22061,6 +22267,7 @@ pub(crate) mod tests {
             let (st, mut rx) = state_with_bus();
             st.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -22750,6 +22957,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -22803,6 +23011,7 @@ pub(crate) mod tests {
     /// `request_id`.
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            pane_id: None,
             naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
@@ -23148,6 +23357,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -23218,6 +23428,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -23299,6 +23510,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -23368,6 +23580,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -23996,6 +24209,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -24047,6 +24261,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 naming_handle: Some(naming_handle.to_string()),
@@ -24243,6 +24458,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -24312,6 +24528,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -24394,6 +24611,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -24918,6 +25136,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -28704,6 +28923,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
                         observed_generation: None,
@@ -28814,6 +29034,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
                         observed_generation: None,
@@ -28929,6 +29150,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -29342,6 +29564,7 @@ pub(crate) mod tests {
         // adopted without consulting the coordinator.
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -29432,6 +29655,7 @@ pub(crate) mod tests {
         // observed generation — the fence discipline refuses typed.
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: Some(registry.boot_epoch()),
                 observed_generation: Some(stale_generation),

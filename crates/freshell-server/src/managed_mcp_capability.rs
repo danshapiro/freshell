@@ -83,6 +83,16 @@ struct InputPreparation {
     prior_grant_ids: Vec<String>,
 }
 
+pub(crate) fn opencode_tui_reference(jsonc: bool) -> ProviderConfigReference {
+    let format = if jsonc { "jsonc" } else { "json" };
+    ProviderConfigReference {
+        root: ProviderConfigRoot::Ephemeral,
+        relative_path: format!("tui-config.{format}"),
+        provider_relative_path: format!(".freshell/opencode/user-tui.{format}"),
+        format: format.into(),
+    }
+}
+
 #[derive(Clone)]
 struct Grant {
     soul_id: SoulId,
@@ -112,6 +122,11 @@ struct CapabilitySettings {
 
 fn store() -> &'static CapabilityStore {
     STORE.get_or_init(CapabilityStore::default)
+}
+
+#[cfg(test)]
+pub(crate) fn grant_count_for_test() -> usize {
+    store().grants.lock().unwrap().len()
 }
 
 fn capability_dir() -> Result<PathBuf, String> {
@@ -1105,17 +1120,50 @@ fn apply_callback(
     match callback.action.as_str() {
         "issue" => {
             let provider = callback.provider.ok_or("missing managed MCP provider")?;
-            let references = provider_source_references(&provider, home)?;
+            let secret_references =
+                crate::managed_provider_bootstrap::named_provider_onecli_references(&provider)?;
+            let workspace = callback.workspace.as_deref().unwrap_or(home);
+            let cwd = callback.cwd.as_deref().unwrap_or(workspace);
+            let mut context =
+                crate::managed_provider_bootstrap::provider_launch_context_from_home_at(
+                    &provider, workspace, cwd, home, None,
+                )?
+                .ok_or("managed provider preparation is unavailable")?;
+            let references = context.config.clone();
             let reference = store.issue_replacement(
                 callback.soul_id,
                 directory,
                 endpoint.into(),
                 Some((&provider, home, &references)),
                 callback.tui_source.as_ref(),
-                callback.workspace.as_deref(),
+                Some(workspace),
             )?;
-            serde_json::to_vec(&reference).map_err(|error| error.to_string())
+            let stage = staged_provider_root_path(directory, &reference.grant_id)?;
+            if let freshell_runtime_protocol::ProviderPreparation::Opencode {
+                tui_config,
+                tui_source,
+                inline_config,
+                ..
+            } = &mut context.preparation
+            {
+                *tui_source = callback.tui_source;
+                *inline_config = stage.join("ephemeral/inline-config.json").is_file();
+                for name in ["tui-config.json", "tui-config.jsonc"] {
+                    if stage.join("ephemeral").join(name).is_file() {
+                        *tui_config = Some(opencode_tui_reference(name.ends_with("jsonc")));
+                        break;
+                    }
+                }
+            }
+            context =
+                crate::managed_provider_bootstrap::with_managed_mcp_reference(context, reference)?;
+            serde_json::to_vec(&freshell_runtime_protocol::ProviderReplacementPreparation {
+                context,
+                secret_references,
+            })
+            .map_err(|error| error.to_string())
         }
+
         "activate" => {
             let grant_id = callback.grant_id.ok_or("missing managed MCP grant id")?;
             let incarnation_id = callback
@@ -3518,6 +3566,48 @@ pub(crate) fn abort_prepared_claude_candidate(
     generation: &str,
 ) -> Result<(), String> {
     store().abort_preparation(generation, soul, &capability_dir()?)
+}
+
+/// Preparation owns an issued grant until the supervisor accepts its launch.
+/// This also covers early returns after provider resources have been staged.
+pub(crate) struct PendingMcpCapability {
+    reference: McpCapabilityReference,
+    armed: bool,
+}
+
+impl PendingMcpCapability {
+    pub(crate) fn new(reference: McpCapabilityReference) -> Self {
+        Self {
+            reference,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn reference(&self) -> McpCapabilityReference {
+        self.reference.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// A prepared-input journal owns this generation once launch is handed to
+    /// the supervisor. Keep its grant available while an uncertain reply is
+    /// reconciled against the recorded incarnation.
+    pub(crate) fn retain_for_reconciliation(mut self) {
+        self.disarm();
+    }
+}
+
+impl Drop for PendingMcpCapability {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = revoke_mcp_capability(&self.reference.grant_id) {
+                tracing::warn!(event = "managed_mcp.pending_cleanup_failed",
+                    grant_id = self.reference.grant_id.as_str(), error = %error);
+            }
+        }
+    }
 }
 
 /// A web-server restart restores only grants whose exact incarnation remains
@@ -6001,7 +6091,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         std::fs::create_dir_all(source.join("plugins")).unwrap();
         std::fs::write(source.join("settings.json"), "current setting").unwrap();
         std::fs::write(source.join("plugins/plugin.txt"), "current plugin").unwrap();
-        std::fs::write(source.join("plugins/auth.json"), "secret").unwrap();
+        std::fs::write(source.join("plugins/auth.json"), "package library nonce").unwrap();
         std::fs::write(source.join("auth.json"), "top-level secret").unwrap();
         let outside = home.path().join("outside.txt");
         std::fs::write(&outside, "outside").unwrap();
@@ -6040,7 +6130,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         );
         assert_eq!(
             std::fs::read_to_string(staged.join("plugins/auth.json")).unwrap(),
-            "secret"
+            "package library nonce"
         );
         assert!(!staged.join("plugins/alias-secret.json").exists());
         assert_eq!(
@@ -6282,8 +6372,20 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             home.path(),
         )
         .unwrap();
-        let pending: McpCapabilityReference = serde_json::from_slice(&lost).unwrap();
-        let retry: McpCapabilityReference = serde_json::from_slice(&repeated).unwrap();
+        let pending = serde_json::from_slice::<
+            freshell_runtime_protocol::ProviderReplacementPreparation,
+        >(&lost)
+        .unwrap()
+        .context
+        .mcp_capability
+        .unwrap();
+        let retry = serde_json::from_slice::<
+            freshell_runtime_protocol::ProviderReplacementPreparation,
+        >(&repeated)
+        .unwrap()
+        .context
+        .mcp_capability
+        .unwrap();
         assert_eq!(pending.grant_id, retry.grant_id);
         assert!(staged_provider_root_path(&directory, &first.grant_id)
             .unwrap()
@@ -12357,6 +12459,94 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         );
     }
 
+    fn check_replacement_callback_selected_tui_recipe(format: &str) {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let selected = home.path().join(format!("selected-tui.{format}"));
+        std::fs::write(&selected, r#"{"theme":"prior"}"#).unwrap();
+        let source = approved_tui_source(
+            selected.to_str().unwrap(),
+            home.path(),
+            home.path(),
+            home.path(),
+        )
+        .unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        store
+            .issue(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                OpencodeEphemeralInput {
+                    tui_source: Some(&source),
+                    workspace: Some(home.path()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let refreshed = if format == "jsonc" {
+            "{ // refreshed\n\"theme\":\"current\"}"
+        } else {
+            r#"{"theme":"current"}"#
+        };
+        std::fs::write(&selected, refreshed).unwrap();
+        let request = serde_json::to_vec(&serde_json::json!({
+            "action":"issue", "controlSecret":"test-control-secret", "soulId":soul,
+            "provider":"opencode", "workspace":home.path(), "cwd":home.path(), "tuiSource":source,
+        }))
+        .unwrap();
+        let response = apply_callback(
+            &request,
+            "test-control-secret",
+            &store,
+            &capabilities,
+            "http://host.docker.internal:4000",
+            home.path(),
+        )
+        .unwrap();
+        let replacement: freshell_runtime_protocol::ProviderReplacementPreparation =
+            serde_json::from_slice(&response).unwrap();
+        replacement
+            .context
+            .validate("opencode")
+            .expect("replacement callback must return a host-valid selected TUI recipe");
+        let freshell_runtime_protocol::ProviderPreparation::Opencode {
+            tui_config: Some(reference),
+            tui_source: Some(current_source),
+            ..
+        } = &replacement.context.preparation
+        else {
+            panic!("selected TUI omitted")
+        };
+        let grant = replacement.context.mcp_capability.as_ref().unwrap();
+        let stage = staged_provider_root_path(&capabilities, &grant.grant_id).unwrap();
+        // Resolve exactly as the host does; a doubled ephemeral prefix fails.
+        assert_eq!(
+            std::fs::read_to_string(stage.join("ephemeral").join(&reference.relative_path))
+                .unwrap(),
+            refreshed
+        );
+        assert_eq!(
+            reference.provider_relative_path,
+            current_source.provider_relative_path
+        );
+    }
+
+    #[test]
+    fn replacement_callback_selected_tui_recipe_json() {
+        check_replacement_callback_selected_tui_recipe("json");
+    }
+
+    #[test]
+    fn replacement_callback_selected_tui_recipe_jsonc() {
+        check_replacement_callback_selected_tui_recipe("jsonc");
+    }
+
     #[test]
     fn opencode_private_inputs_survive_restarting_after_container_exits() {
         let control = tempfile::tempdir().unwrap();
@@ -12907,18 +13097,20 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "action": "issue", "controlSecret": "right", "soulId": soul, "provider": "claude",
         }))
         .unwrap();
-        let replacement: McpCapabilityReference = serde_json::from_slice(
-            &apply_callback(
-                &issue,
-                "right",
-                &store,
-                dir.path(),
-                "http://host.docker.internal:4001",
-                dir.path(),
+        let replacement: freshell_runtime_protocol::ProviderReplacementPreparation =
+            serde_json::from_slice(
+                &apply_callback(
+                    &issue,
+                    "right",
+                    &store,
+                    dir.path(),
+                    "http://host.docker.internal:4001",
+                    dir.path(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
+            .unwrap();
+        let replacement = replacement.context.mcp_capability.unwrap();
         assert_ne!(replacement.grant_id, reference.grant_id);
         assert_eq!(replacement.endpoint, "http://host.docker.internal:4001");
         assert!(
@@ -12926,6 +13118,68 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             "lost issue response must not retire prior grant"
         );
         assert!(store.authenticates(active["scope"].as_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_controller_returns_exact_selected_context_and_resource_projection() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let package = root.path().join("package");
+        std::fs::create_dir_all(home.join(".codex/skills")).unwrap();
+        std::fs::create_dir_all(home.join(".agents/skills")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("run"),
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/resource\"\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("resource"), "selected-resource").unwrap();
+        std::fs::set_permissions(package.join("run"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        symlink(&package, home.join(".codex/skills/tool")).unwrap();
+        std::fs::write(home.join(".agents/skills/SKILL.md"), "discovered-selected").unwrap();
+        let capabilities = root.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&capabilities).unwrap();
+        let store = CapabilityStore::default();
+        let request=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"selected-control","soulId":SoulId::new(),"provider":"codex","workspace":workspace})).unwrap();
+        let response = apply_callback(
+            &request,
+            "selected-control",
+            &store,
+            &capabilities,
+            "http://host.docker.internal:4001",
+            &home,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert!(value.get("context").and_then(|context|context.get("preparation")).is_some(),"replacement needs the exact producer recipe, including previously absent legacy contexts");
+        let prepared: freshell_runtime_protocol::ProviderReplacementPreparation =
+            serde_json::from_value(value).unwrap();
+        let context = prepared.context;
+        assert!(context
+            .config
+            .iter()
+            .any(|reference| reference.provider_relative_path == ".freshell/resources"));
+        assert!(context
+            .config
+            .iter()
+            .any(|reference| reference.provider_relative_path
+                == ".codex/skills/freshell-discovered-agents"));
+        let grant = context.mcp_capability.unwrap();
+        let stage = staged_provider_root_path(&capabilities, &grant.grant_id).unwrap();
+        let output = std::process::Command::new(stage.join("skills/tool/run"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"selected-resource");
+        assert_eq!(
+            std::fs::read(stage.join("freshell-discovered-agents/SKILL.md")).unwrap(),
+            b"discovered-selected"
+        );
     }
 
     #[tokio::test]

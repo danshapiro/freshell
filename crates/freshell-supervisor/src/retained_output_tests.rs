@@ -113,6 +113,7 @@ async fn retained_output_replacement(
         .commit_created(
             replacement.prepared.incarnation_id.clone(),
             crate::registry::BackendCreatedRecord {
+                launch_policy: None,
                 daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
                 container_id: replacement
                     .prepared
@@ -233,6 +234,12 @@ async fn retained_output_failed_activation_without_spool_keeps_committed_prior()
             Some(replacement.attempt_id),
             RecoveryBlockReason::ProviderUnavailable,
             vec!["synthetic activation failure".into()],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -260,6 +267,12 @@ async fn retained_output_wrong_identity_spool_cannot_displace_committed_prior() 
             Some(replacement.attempt_id),
             RecoveryBlockReason::WrongNativeIdentity,
             vec!["synthetic wrong identity".into()],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -278,6 +291,12 @@ async fn retained_output_accepted_replacement_becomes_source_and_survives_later_
             context.soul_id.clone(),
             replacement.prepared.incarnation_id.clone(),
             replacement.attempt_id,
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -301,6 +320,12 @@ async fn retained_output_accepted_replacement_becomes_source_and_survives_later_
             Some(failed.attempt_id),
             RecoveryBlockReason::WrongNativeIdentity,
             vec![],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -324,6 +349,12 @@ async fn retained_output_legacy_success_with_overwritten_attempt_keeps_accepted_
             context.soul_id.clone(),
             replacement.prepared.incarnation_id.clone(),
             replacement.attempt_id.clone(),
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();
@@ -348,6 +379,12 @@ async fn retained_output_legacy_success_with_overwritten_attempt_keeps_accepted_
             Some(failed.attempt_id),
             RecoveryBlockReason::ProviderUnavailable,
             vec![],
+            supervisor
+                .registry
+                .recovery_context(context.soul_id.clone())
+                .await
+                .unwrap()
+                .write_fence(),
         )
         .await
         .unwrap();

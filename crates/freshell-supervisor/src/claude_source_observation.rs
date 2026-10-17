@@ -355,6 +355,7 @@ mod tests {
                 .commit_created(
                     prepared.incarnation_id,
                     BackendCreatedRecord {
+                        launch_policy: None,
                         daemon_id: DockerDaemonId::new(),
                         container_id: "owned-source-provider-never-stopped".into(),
                         image_ref: image.clone(),

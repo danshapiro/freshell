@@ -1,6 +1,6 @@
 import path from 'node:path'
 
-import { findExactSessionDirectories, readBoundedJsonlWithPositions, safeOpaqueId } from './safe-io.js'
+import { findExactSessionDirectories, readBoundedJsonlWithPositions, safeOpaqueId, type PositionedJsonlRecord } from './safe-io.js'
 import {
   MAX_NATIVE_TURNS,
   NATIVE_HISTORY_SCHEMA_VERSION,
@@ -21,7 +21,7 @@ type AmplifierProfile = {
   effort: string
 }
 
-function profileFromEvents(events: Record<string, any>[]): AmplifierProfile {
+function profileFromEvents(events: Record<string, any>[]): AmplifierProfile | null {
   const profiles: AmplifierProfile[] = []
   for (const event of events.filter((row) => row.event === 'session:config' || row.type === 'session:config')) {
     const raw = object(object(event.data, 'Amplifier session:config data').raw, 'Amplifier session:config raw data')
@@ -38,12 +38,106 @@ function profileFromEvents(events: Record<string, any>[]): AmplifierProfile {
       effort: optionalString(config.reasoning ?? config.reasoning_effort) ?? 'provider-default',
     })
   }
-  if (profiles.length === 0) throw new Error('Amplifier native events lack session:config profile evidence')
+  if (profiles.length === 0) return null
   const canonical = JSON.stringify(profiles[0])
   if (profiles.some((profile) => JSON.stringify(profile) !== canonical)) {
     throw new Error('Amplifier native session:config profile evidence is conflicting')
   }
   return profiles[0]
+}
+
+type Completion = {
+  completedAt: string
+  ordinal: number
+  eventSha256: string
+  profile: AmplifierProfile
+  observed?: { prompt: string; response: string; submittedAt: number; responseAt: number; requestId: string | null; responseEventSha256s: string[] }
+}
+
+/** The pinned CLI emits an orchestrator preview and a final CLI callback for
+ * one prompt. Only the subsequent durable cleanup closes that prompt. */
+function observedCompletions(records: PositionedJsonlRecord[]): Completion[] {
+  const completions: Completion[] = []
+  let lastEventAt = 0
+  let current: { prompt: string; submittedAt: number; lastAt: number; requestId: string | null; responses: PositionedJsonlRecord[]; callbacks: Record<string, any>[] } | undefined
+  for (const record of records) {
+    const event = record.value
+    if (!['prompt:submit', 'llm:response', 'prompt:complete', 'cleanup:store_end'].includes(event.event)) continue
+    const at = Date.parse(validTimestamp(event.ts, 'Amplifier native prompt event timestamp'))
+    if (at < lastEventAt) throw new Error('Amplifier native prompt timeline is reversed')
+    lastEventAt = at
+    const id = optionalString(event.request_id ?? event.span_id)
+    if (event.event === 'prompt:submit') {
+      if (current) throw new Error('Amplifier native events contain overlapping submitted prompts')
+      current = { prompt: requiredString(object(event.data, 'Amplifier submitted prompt data').prompt, 'Amplifier submitted prompt'), submittedAt: at, lastAt: at, requestId: id, responses: [], callbacks: [] }
+      continue
+    }
+    if (!current) throw new Error('Amplifier native completion/response lacks a preceding submitted prompt')
+    if (at < current.lastAt || (id && current.requestId && id !== current.requestId)) throw new Error('Amplifier native response/completion has conflicting prompt identity or event order')
+    current.lastAt = at; current.requestId ??= id
+    if (event.status !== undefined && event.status !== 'ok') throw new Error('Amplifier native prompt response or persistence was unsuccessful')
+    if (event.event === 'llm:response') {
+      if (current.callbacks.length) throw new Error('Amplifier native response follows prompt completion')
+      current.responses.push(record)
+      continue
+    }
+    if (event.event === 'prompt:complete') {
+      current.callbacks.push(object(event.data, 'Amplifier completion callback data'))
+      continue
+    }
+    if (!current.responses.length || current.callbacks.length !== 2) throw new Error('Amplifier stored prompt lacks its native response and preview/full completion callbacks')
+    const profiles = current.responses.map(response => {
+      const data = object(response.value.data, 'Amplifier llm:response data')
+      return { provider: requiredString(data.provider, 'Amplifier observed response provider'), model: requiredString(data.model, 'Amplifier observed response model'),
+        effort: data.reasoning_effort === undefined || data.reasoning_effort === null ? 'unknown' : requiredString(data.reasoning_effort, 'Amplifier observed response effort') }
+    })
+    if (profiles.some(profile => JSON.stringify(profile) !== JSON.stringify(profiles[0]))) throw new Error('Amplifier native responses have conflicting per-prompt profile evidence')
+    // The pinned producer establishes this pair; a preview alone cannot prove
+    // the complete response or its exact submitted prompt.
+    const [preview, full] = current.callbacks as [Record<string, any>, Record<string, any>]
+    if (typeof preview.response_preview !== 'string' || !Number.isSafeInteger(preview.length) || typeof full.prompt !== 'string' || typeof full.response !== 'string'
+      || full.response.length !== preview.length || !full.response.startsWith(preview.response_preview)) throw new Error('Amplifier native completion callbacks are duplicated or conflicting')
+    if (full.prompt !== current.prompt) throw new Error('Amplifier completion callback conflicts with the submitted native prompt')
+    const response = requiredString(full.response, 'Amplifier completed response')
+    completions.push({ completedAt: event.ts, ordinal: completions.length + 1, eventSha256: record.recordSha256, profile: profiles[0]!,
+      observed: { prompt: current.prompt, response, submittedAt: current.submittedAt, responseAt: Date.parse(current.responses.at(-1)!.value.ts), requestId: current.requestId, responseEventSha256s: current.responses.map(row => row.recordSha256) } })
+    current = undefined
+  }
+  if (current) throw new Error('Amplifier native events end with an unpersisted submitted prompt')
+  return completions
+}
+
+/** Preserve the older configuration-only shape without calling its defaults
+ * observed response telemetry. */
+function configuredCompletions(records: PositionedJsonlRecord[], profile: AmplifierProfile | null): Completion[] {
+  if (!profile) throw new Error('Amplifier native events lack response or configured profile evidence')
+  const completions: Completion[] = []
+  let pendingPromptId: string | null | undefined
+  let promptPending = false
+  for (const record of records) {
+    const event = record.value
+    if (event.event === 'prompt:complete') {
+      if (event.status !== undefined && event.status !== 'ok') continue
+      if (promptPending) throw new Error('Amplifier native events contain overlapping successful prompts; ordinal continuity is ambiguous')
+      pendingPromptId = optionalString(event.request_id ?? event.span_id)
+      promptPending = true
+      continue
+    }
+    if (event.event !== 'cleanup:store_end' || (event.status !== undefined && event.status !== 'ok')) continue
+    if (!promptPending) throw new Error('Amplifier stored completion lacks a preceding successful prompt')
+    const cleanupId = optionalString(event.request_id ?? event.span_id)
+    if (pendingPromptId && cleanupId && pendingPromptId !== cleanupId) {
+      throw new Error('Amplifier stored completion conflicts with the provider-supplied prompt identity')
+    }
+    // Missing IDs are legitimate in the pinned schema. Qualification supplies
+    // a serialized one-writer append boundary rather than inventing an ID.
+    completions.push({ completedAt: validTimestamp(event.ts, 'Amplifier stored completion timestamp'),
+      ordinal: completions.length + 1, eventSha256: record.recordSha256, profile })
+    promptPending = false
+    pendingPromptId = undefined
+  }
+  if (promptPending) throw new Error('Amplifier native events end with an unpersisted successful prompt')
+  return completions
 }
 
 function contentTextAndTools(message: Record<string, any>): { text: string; calls: NativeToolCall[] } {
@@ -98,36 +192,8 @@ export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId:
       return { type: 'tool:pre', ...(name ? { name } : {}) }
     }), 'Amplifier native tool events')
 
-  type Completion = { completedAt: string, ordinal: number, eventSha256: string }
-  const completions: Completion[] = []
-  let pendingPromptId: string | null | undefined
-  let promptPending = false
-  for (const record of positionedEvents) {
-    const event = record.value
-    if (event.event === 'prompt:complete') {
-      if (event.status !== undefined && event.status !== 'ok') continue
-      if (promptPending) throw new Error('Amplifier native events contain overlapping successful prompts; ordinal continuity is ambiguous')
-      pendingPromptId = optionalString(event.request_id ?? event.span_id)
-      promptPending = true
-      continue
-    }
-    if (event.event !== 'cleanup:store_end' || (event.status !== undefined && event.status !== 'ok')) continue
-    if (!promptPending) throw new Error('Amplifier stored completion lacks a preceding successful prompt')
-    const cleanupId = optionalString(event.request_id ?? event.span_id)
-    if (pendingPromptId && cleanupId && pendingPromptId !== cleanupId) {
-      throw new Error('Amplifier stored completion conflicts with the provider-supplied prompt identity')
-    }
-    // Missing IDs are legitimate in the pinned schema. Event order is native
-    // evidence because qualification serializes prompt dispatch in one writer.
-    completions.push({
-      completedAt: validTimestamp(event.ts, 'Amplifier stored completion timestamp'),
-      ordinal: completions.length + 1,
-      eventSha256: record.recordSha256,
-    })
-    promptPending = false
-    pendingPromptId = undefined
-  }
-  if (promptPending) throw new Error('Amplifier native events end with an unpersisted successful prompt')
+  const hasResponseTimeline = events.some(event => event.event === 'prompt:submit' || event.event === 'llm:response' || event.event === 'llm:request')
+  const completions = hasResponseTimeline ? observedCompletions(positionedEvents) : configuredCompletions(positionedEvents, profile)
   if (completions.length === 0) throw new Error('Amplifier exact native session has no stored completed prompt')
 
   const transcript = readBoundedJsonlWithPositions(path.join(sessionDir, 'transcript.jsonl'), 'Amplifier native transcript')
@@ -141,6 +207,18 @@ export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId:
     const message = record.value
     const materialized = contentTextAndTools(message)
     const completion = completions[index]
+    if (completion.observed) {
+      const observed = completion.observed, prior = transcript.find(prior => prior.recordIndex === record.recordIndex - 1)?.value
+      if (prior?.role !== 'user' || prior.content !== observed.prompt) throw new Error('Amplifier native response does not map to the exact preceding transcript prompt')
+      if (materialized.text !== observed.response) throw new Error('Amplifier native response does not match the stored assistant content')
+      const transcriptId = optionalString(message.metadata?.request_id ?? message.request_id)
+      if (transcriptId && observed.requestId && transcriptId !== observed.requestId) throw new Error('Amplifier transcript conflicts with the provider-supplied prompt identity')
+      const assistantAt = Date.parse(validTimestamp(message.metadata?.timestamp ?? message.timestamp, 'Amplifier stored assistant timestamp'))
+      if (assistantAt < observed.responseAt || assistantAt > Date.parse(completion.completedAt)) throw new Error('Amplifier stored assistant timestamp is outside its native response/persistence interval')
+      const userAt = Date.parse(validTimestamp(prior.metadata?.timestamp ?? prior.timestamp, 'Amplifier stored user timestamp'))
+      if (userAt < observed.submittedAt || userAt > observed.responseAt) throw new Error('Amplifier stored user timestamp is outside its native submission/response interval')
+    }
+    const nativeProfile = completion.profile
     return {
       nativeEvidence: {
         kind: 'append_only_record',
@@ -151,6 +229,7 @@ export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId:
         prefixSha256Before: record.prefixSha256Before,
         completionEventOrdinal: completion.ordinal,
         completionEventSha256: completion.eventSha256,
+        ...(completion.observed ? { responseEventSha256s: completion.observed.responseEventSha256s } : {}),
       },
       completedAt: completion.completedAt,
       text: materialized.text,
@@ -158,12 +237,12 @@ export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId:
       // Conservatively attach every exact-session invocation so no-tools
       // certification can never hide provider-native tool activity.
       toolCalls: boundedToolCalls([...materialized.calls, ...eventToolCalls], 'Amplifier native tool calls'),
-      resolvedProvider: profile.provider,
-      resolvedModel: profile.model,
-      resolvedReasoningEffort: profile.effort,
-      providerProvenance: 'amplifier-session:config.provider',
-      modelProvenance: 'amplifier-session:config.default_model',
-      reasoningEffortProvenance: 'amplifier-session:config.reasoning_effort',
+      resolvedProvider: nativeProfile.provider,
+      resolvedModel: nativeProfile.model,
+      resolvedReasoningEffort: nativeProfile.effort,
+      providerProvenance: completion.observed ? 'amplifier-llm:response.provider' : 'amplifier-session:config.provider',
+      modelProvenance: completion.observed ? 'amplifier-llm:response.model' : 'amplifier-session:config.default_model',
+      reasoningEffortProvenance: completion.observed ? nativeProfile.effort === 'unknown' ? 'unsupported-native-telemetry' : 'amplifier-llm:response.reasoning_effort' : 'amplifier-session:config.reasoning_effort',
     }
   })
   return { schemaVersion: NATIVE_HISTORY_SCHEMA_VERSION, provider: 'amplifier', nativeSessionId: sessionId, turns }

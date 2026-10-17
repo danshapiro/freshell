@@ -1,4 +1,27 @@
 use super::*;
+
+#[test]
+fn kilroy_actor_accepts_its_typed_claude_native_context() {
+    let mut profile = profile(FreshProvider::Kilroy, "owned-kilroy", None);
+    profile.provider_launch_context = Some(freshell_runtime_protocol::ProviderLaunchContext {
+        prepared_inputs: None,
+        preparation: freshell_runtime_protocol::ProviderPreparation::Claude {
+            mcp_args: Vec::new(),
+        },
+        config: Vec::new(),
+        mcp_capability: None,
+    });
+    assert!(profile.validate().is_ok());
+    profile
+        .provider_launch_context
+        .as_mut()
+        .unwrap()
+        .preparation = freshell_runtime_protocol::ProviderPreparation::Codex {
+        tui_args: Vec::new(),
+        sidecar_args: Vec::new(),
+    };
+    assert!(profile.validate().is_err());
+}
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct StartupAcknowledgementGap {
@@ -266,6 +289,194 @@ struct OperationTransport {
     operation_native_session_id: Option<String>,
 }
 
+struct ParentForkTransport {
+    state_dir: std::path::PathBuf,
+    current: std::sync::Mutex<Option<ClaudeForkState>>,
+    fork: ClaudeForkState,
+}
+
+#[async_trait]
+impl FreshAgentTransport for ParentForkTransport {
+    async fn restore_claude_fork_state(&self, state: ClaudeForkState) -> Result<(), String> {
+        *self.current.lock().unwrap() = Some(state);
+        Ok(())
+    }
+    async fn claude_fork_state(&self) -> Option<ClaudeForkState> {
+        self.current.lock().unwrap().clone()
+    }
+    async fn disable_claude_fork_recovery(
+        &self,
+        _destroys_redo: bool,
+    ) -> Result<Option<ClaudeForkState>, String> {
+        if let Some(state) = self.current.lock().unwrap().as_mut() {
+            if let Some(recipe) = state.recipe.as_mut() {
+                recipe.recovery_disabled = true;
+            }
+        }
+        Ok(self.current.lock().unwrap().clone())
+    }
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        if profile.native_session_id.as_deref() == Some(&self.fork.native_session_id)
+            && self
+                .current
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|state| state.recipe.as_ref())
+                .is_none_or(|recipe| recipe.recovery_disabled)
+        {
+            return Err("no child transcript and no current parent recipe".into());
+        }
+        Ok(TransportStart {
+            native_session_id: profile
+                .native_session_id
+                .clone()
+                .or_else(|| Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into())),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        let persisted: PersistedActorState = serde_json::from_slice(
+            &fs::read(self.state_dir.join("fresh-agent-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted
+                .claude_fork_state
+                .unwrap()
+                .recipe
+                .unwrap()
+                .recovery_disabled,
+            "old prefix disabled before ambiguous dispatch"
+        );
+        assert!(
+            self.current
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .recipe
+                .as_ref()
+                .unwrap()
+                .recovery_disabled
+        );
+        Err(DispatchFailure {
+            message: "accepted input reply lost".into(),
+            acceptance_ambiguous: true,
+        })
+    }
+    async fn supports_operation(&self, _: &FreshAgentOperation) -> Result<bool, String> {
+        Ok(true)
+    }
+    async fn dispatch_operation(
+        &self,
+        _: &RequestId,
+        _: &FreshAgentOperation,
+    ) -> Result<OperationAck, OperationFailure> {
+        *self.current.lock().unwrap() = Some(self.fork.clone());
+        Ok(OperationAck {
+            provider_ack_id: Some("native-undo".into()),
+            native_session_id: Some(self.fork.native_session_id.clone()),
+        })
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        unreachable!()
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn parent_backed_fork_survives_actor_reopen_but_never_an_ambiguous_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let fork = ClaudeForkState {
+        native_session_id: child.into(),
+        recipe: Some(crate::ClaudeForkRecipe {
+            recovery_disabled: false,
+            child_session_id: child.into(),
+            parent_session_id: parent.into(),
+            parent_transcript: format!(".claude/projects/work/{parent}.jsonl"),
+            child_transcript: format!(".claude/projects/work/{child}.jsonl"),
+            parent_sha256: "a".repeat(64),
+            target: crate::ClaudeForkTarget::Empty,
+        }),
+        rollback: Some(
+            serde_json::json!({"originalSessionId":parent,"originalTipUuid":"native-anchor","entries":[{"removedTurns":[{"id":"retained-native-id"}]}]}),
+        ),
+    };
+    let transport = || {
+        Arc::new(ParentForkTransport {
+            state_dir: dir.path().into(),
+            current: std::sync::Mutex::new(None),
+            fork: fork.clone(),
+        })
+    };
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "parent-backed", None),
+        transport(),
+    )
+    .await
+    .unwrap();
+    actor
+        .semantic_operation(
+            RequestId::parse("parent-backed-undo").unwrap(),
+            FreshAgentOperation::Rollback {
+                direction: FreshAgentRollbackDirection::Undo,
+                mode: FreshAgentRollbackMode::Step,
+                turn_id: None,
+                cwd: None,
+            },
+        )
+        .await
+        .unwrap();
+    let child_profile = actor.profile().await;
+    drop(actor);
+    let resumed_transport = transport();
+    let actor =
+        FreshAgentHostActor::open(dir.path(), child_profile.clone(), resumed_transport.clone())
+            .await
+            .expect("acknowledged child must survive a pre-input crash");
+    assert_eq!(
+        actor.observed_native_session_id().await.as_deref(),
+        Some(child)
+    );
+    assert_eq!(
+        resumed_transport.current.lock().unwrap().as_ref(),
+        Some(&fork)
+    );
+    assert!(matches!(
+        actor
+            .dispatch(
+                RequestId::parse("ambiguous-child-input").unwrap(),
+                "new input".into(),
+                None
+            )
+            .await,
+        Err(ActorError::AmbiguousDispatch)
+    ));
+    drop(actor);
+    assert!(
+        FreshAgentHostActor::open(dir.path(), child_profile, transport())
+            .await
+            .is_err(),
+        "an ambiguous input cannot restore an older prefix"
+    );
+}
+
 #[async_trait]
 impl FreshAgentTransport for OperationTransport {
     async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
@@ -331,15 +542,21 @@ impl FreshAgentTransport for OperationTransport {
 }
 
 struct FakeTransport {
+    recovery_releases: AtomicUsize,
+    recovery_result: std::sync::Mutex<Option<Result<(), DispatchFailure>>>,
+    recovery_started: tokio::sync::Notify,
     native: String,
     starts: AtomicUsize,
     start_profiles: std::sync::Mutex<Vec<FreshAgentProfile>>,
+    start_error: Option<String>,
     dispatches: AtomicUsize,
     checkpoint_attempts: std::sync::Mutex<Vec<Option<String>>>,
     decisions: AtomicUsize,
     stops: AtomicUsize,
     ambiguous_dispatch: bool,
     live: std::sync::atomic::AtomicBool,
+    native_evidence: std::sync::Mutex<Option<Value>>,
+    prepared_checkpoints: std::sync::Mutex<Vec<Value>>,
 }
 
 struct MaterializingTransport {
@@ -434,12 +651,18 @@ impl FakeTransport {
             native: native.into(),
             starts: AtomicUsize::new(0),
             start_profiles: std::sync::Mutex::new(Vec::new()),
+            start_error: None,
             dispatches: AtomicUsize::new(0),
             checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             ambiguous_dispatch: false,
             live: std::sync::atomic::AtomicBool::new(true),
+            native_evidence: std::sync::Mutex::new(None),
+            prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
+            recovery_releases: AtomicUsize::new(0),
+            recovery_result: std::sync::Mutex::new(Some(Ok(()))),
+            recovery_started: tokio::sync::Notify::new(),
         })
     }
     fn ambiguous(native: &str) -> Arc<Self> {
@@ -449,12 +672,18 @@ impl FakeTransport {
                 native: native.into(),
                 starts: AtomicUsize::new(0),
                 start_profiles: std::sync::Mutex::new(Vec::new()),
+                start_error: None,
                 dispatches: AtomicUsize::new(0),
                 checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
                 decisions: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
                 ambiguous_dispatch: false,
                 live: std::sync::atomic::AtomicBool::new(true),
+                native_evidence: std::sync::Mutex::new(None),
+                prepared_checkpoints: std::sync::Mutex::new(Vec::new()),
+                recovery_releases: AtomicUsize::new(0),
+                recovery_result: std::sync::Mutex::new(Some(Ok(()))),
+                recovery_started: tokio::sync::Notify::new(),
             }
         })
     }
@@ -462,9 +691,31 @@ impl FakeTransport {
 
 #[async_trait]
 impl FreshAgentTransport for FakeTransport {
+    async fn resume_native_permission_recovery(&self) -> Result<(), DispatchFailure> {
+        self.recovery_releases.fetch_add(1, Ordering::SeqCst);
+        self.recovery_started.notify_one();
+        let result = self.recovery_result.lock().unwrap().clone();
+        match result {
+            Some(result) => result,
+            None => std::future::pending().await,
+        }
+    }
+    async fn prepare_native_permission_recovery(
+        &self,
+        checkpoints: Vec<Value>,
+    ) -> Result<(), String> {
+        *self.prepared_checkpoints.lock().unwrap() = checkpoints;
+        Ok(())
+    }
+    async fn native_identity_evidence(&self) -> Option<Value> {
+        self.native_evidence.lock().unwrap().clone()
+    }
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         self.start_profiles.lock().unwrap().push(profile.clone());
+        if let Some(error) = &self.start_error {
+            return Err(error.clone());
+        }
         Ok(TransportStart {
             native_session_id: Some(self.native.clone()),
         })
@@ -540,6 +791,70 @@ fn profile(provider: FreshProvider, store: &str, native: Option<&str>) -> FreshA
         provider_launch_context: None,
         provider_secret_references: Vec::new(),
     }
+}
+
+#[test]
+fn provider_start_diagnostic_accepts_only_known_categories() {
+    for (error, expected) in [
+        (
+            "private detail (startup diagnostic: authentication)",
+            ProviderStartDiagnostic::Authentication,
+        ),
+        (
+            "private detail (startup diagnostic: arguments)",
+            ProviderStartDiagnostic::Arguments,
+        ),
+        (
+            "private detail (startup diagnostic: listener)",
+            ProviderStartDiagnostic::Listener,
+        ),
+        (
+            "private detail (startup diagnostic: configuration)",
+            ProviderStartDiagnostic::Configuration,
+        ),
+        (
+            "private detail (startup diagnostic: network)",
+            ProviderStartDiagnostic::Network,
+        ),
+        (
+            "private detail (startup diagnostic: unexpected)",
+            ProviderStartDiagnostic::Unclassified,
+        ),
+        (
+            "private detail with no category",
+            ProviderStartDiagnostic::NoDiagnostic,
+        ),
+    ] {
+        assert_eq!(
+            ProviderStartDiagnostic::from_provider_error(error),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_start_failure_keeps_only_the_fixed_diagnostic_category() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_detail = "private-provider-output-should-not-cross-the-actor-boundary";
+    let mut transport = FakeTransport::new("native-codex");
+    Arc::get_mut(&mut transport).unwrap().start_error = Some(format!(
+        "provider start rejected; private detail {secret_detail}; startup diagnostic: authentication"
+    ));
+
+    let error = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "codex-start-failure", None),
+        transport,
+    )
+    .await
+    .err()
+    .expect("provider start should fail");
+
+    assert_eq!(
+        error.to_string(),
+        "fresh-agent provider start failed (startup diagnostic: authentication)"
+    );
+    assert!(!format!("{error:?}").contains(secret_detail));
 }
 
 #[tokio::test]
@@ -776,6 +1091,11 @@ async fn semantic_operation_ack_rotates_and_persists_native_identity() {
         actor.profile().await.native_session_id.as_deref(),
         Some("native-after-rollback")
     );
+    assert_eq!(
+        actor.observed_native_session_id().await.as_deref(),
+        Some("native-after-rollback"),
+        "the native operation acknowledgement retires the parent observation"
+    );
     let persisted: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("fresh-agent-state.json")).unwrap())
             .unwrap();
@@ -871,6 +1191,445 @@ async fn pending_permission_persists_and_is_answered_exactly_once_after_gateway_
         .await
         .unwrap();
     assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn native_callback_cancellation_cannot_be_answered_as_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("current-native-root");
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "cancel-store", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    actor
+        .record_permission(
+            "current-card".into(),
+            serde_json::json!({"type":"freshAgent.permission.request","toolUseID":"toolu-current"}),
+        )
+        .await
+        .unwrap();
+    actor.record_event(AgentEvent::Provider {payload:serde_json::json!({"type":"freshAgent.event","event":{"type":"freshAgent.permission.cancelled","requestId":"current-card"}})}).await.unwrap();
+    let result = actor
+        .resolve_permission("current-card", serde_json::json!({"behavior":"allow"}))
+        .await;
+    assert!(
+        result.is_err(),
+        "a cancelled current native callback must remain interrupted"
+    );
+    assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+    assert!(!actor
+        .read_events(0, 100)
+        .await
+        .events
+        .iter()
+        .any(|entry| matches!(entry.event, AgentEvent::DecisionResolved { .. })));
+}
+
+#[tokio::test]
+async fn restart_does_not_resurrect_an_ordinary_claude_callback() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = "same-native-root";
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "restart-decision-store", None),
+        FakeTransport::new(native),
+    )
+    .await
+    .unwrap();
+    actor.record_permission("dead-process-card".into(),serde_json::json!({"type":"freshAgent.permission.request","toolUseID":"toolu-old","nativeRequestId":"dead-native-request"})).await.unwrap();
+    drop(actor);
+    let replacement = FakeTransport::new(native);
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "restart-decision-store", None),
+        replacement.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        actor
+            .resolve_permission("dead-process-card", serde_json::json!({"behavior":"allow"}))
+            .await,
+        Err(ActorError::UnknownDecision),
+        "an ordinary callback has no native no-effect checkpoint and cannot become a recoverable pending decision"
+    );
+    assert_eq!(replacement.decisions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fixture_shaped_callback_without_current_rebind_is_unknown_after_host_replacement() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        let dir = tempfile::tempdir().unwrap();
+        let native = "fixture-native-current-root";
+        let saved_profile = profile(provider, "fixture-decision-store", None);
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            saved_profile.clone(),
+            FakeTransport::new(native),
+        )
+        .await
+        .unwrap();
+        // This is the actual deterministic transport's current request shape.
+        // Its saved provider decision does not supply a native SDK checkpoint.
+        actor
+            .record_permission(
+                "current-fixture-decision".into(),
+                serde_json::json!({
+                    "type":"freshAgent.permission.request",
+                    "requestId":"current-fixture-decision",
+                    "subtype":"fixture",
+                    "tool":{"name":"Read","input":{"file_path":"fixture-only"}}
+                }),
+            )
+            .await
+            .unwrap();
+        drop(actor);
+        let replacement = FakeTransport::new(native);
+        let actor = FreshAgentHostActor::open(dir.path(), saved_profile, replacement.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.observed_native_session_id().await.as_deref(),
+            Some(native)
+        );
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "current-fixture-decision",
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await,
+            Err(ActorError::UnknownDecision)
+        );
+        assert_eq!(replacement.decisions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            actor.state.lock().await.decisions["current-fixture-decision"].state,
+            DecisionState::Interrupted
+        ));
+    }
+}
+
+#[tokio::test]
+async fn admitted_durable_fixture_decision_survives_replacement_without_native_callback_replay() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        let dir = tempfile::tempdir().unwrap();
+        let native = "fixture-native-current-root";
+        let saved_profile = profile(provider.clone(), "durable-fixture-store", None);
+        let actor = FreshAgentHostActor::open_deterministic_fixture(
+            dir.path(),
+            saved_profile.clone(),
+            FakeTransport::new(native),
+        )
+        .await
+        .unwrap();
+        actor
+            .record_permission(
+                "retained-fixture-decision".into(),
+                serde_json::json!({
+                    "type":"freshAgent.permission.request", "requestId":"retained-fixture-decision",
+                    "subtype":"fixture", "tool":{"name":"Read","input":{"file_path":"fixture-only"}}
+                }),
+            )
+            .await
+            .unwrap();
+        drop(actor);
+        let replacement = FakeTransport::new(native);
+        let actor = FreshAgentHostActor::open_deterministic_fixture(
+            dir.path(),
+            saved_profile,
+            replacement.clone(),
+        )
+        .await
+        .unwrap();
+        let allow = serde_json::json!({"behavior":"allow"});
+        assert_eq!(
+            actor
+                .resolve_permission("retained-fixture-decision", allow.clone())
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            actor
+                .resolve_permission("retained-fixture-decision", allow)
+                .await,
+            Ok(())
+        );
+        assert_eq!(replacement.decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "unknown-fixture-decision",
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await,
+            Err(ActorError::UnknownDecision)
+        );
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "retained-fixture-decision",
+                    serde_json::json!({"behavior":"deny"})
+                )
+                .await,
+            Err(ActorError::DecisionAlreadyResolved)
+        );
+        {
+            let mut state = actor.state.lock().await;
+            let decision = state
+                .decisions
+                .get_mut("retained-fixture-decision")
+                .unwrap();
+            decision.state = DecisionState::Dispatching;
+            write_state(dir.path(), &state).unwrap();
+        }
+        drop(actor);
+        let actor = FreshAgentHostActor::open_deterministic_fixture(
+            dir.path(),
+            profile(provider, "durable-fixture-store", None),
+            replacement.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actor
+                .resolve_permission(
+                    "retained-fixture-decision",
+                    serde_json::json!({"behavior":"allow"})
+                )
+                .await,
+            Err(ActorError::AmbiguousDispatch)
+        );
+        assert_eq!(replacement.decisions.load(Ordering::SeqCst), 1);
+    }
+}
+
+fn native_checkpoint_evidence(native: &str, nonce: &str) -> Value {
+    serde_json::json!({"launch":{"incarnationId":nonce,"launchNonce":nonce,
+        "evidenceRevision":0,"executionGeneration":1,"requestedNativeSessionId":native},
+        "queryGeneration":2})
+}
+
+fn native_checkpoint_permission(native: &str, nonce: &str) -> Value {
+    let input = serde_json::json!({"command":"harmless"});
+    let checkpoint = serde_json::json!({"nativeSessionId":native,"toolUseID":"toolu_original1",
+        "toolName":"Bash","inputDigest":digest(&serde_json::to_vec(&input).unwrap()),"profileDigest":"b".repeat(64),
+        "checkpointUuid":"original-checkpoint","assistantUuid":"original-assistant",
+        "checkpointDigest":"c".repeat(64),"nativeVersion":"2.1.237"});
+    let mut binding = native_checkpoint_evidence(native, nonce);
+    binding["nativeRequestId"] = serde_json::json!(nonce);
+    serde_json::json!({"type":"freshAgent.permission.request",
+        "requestId":"same-checkpoint-card","nativeRequestId":nonce,"toolUseID":"toolu_original1",
+        "tool":{"name":"Bash","input":input},"nativeCheckpoint":checkpoint,
+        "nativeBinding":binding})
+}
+
+#[tokio::test]
+async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let payload = |nonce: &str| native_checkpoint_permission(native, nonce);
+    let checkpoint = payload("old")["nativeCheckpoint"].clone();
+    let old = FakeTransport::new(native);
+    *old.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "old"));
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "checkpoint-store", None),
+        old.clone(),
+    )
+    .await
+    .unwrap();
+    actor
+        .record_permission("same-checkpoint-card".into(), payload("old"))
+        .await
+        .unwrap();
+    actor.resume_pending_native_permissions().await.unwrap();
+    assert_eq!(old.recovery_releases.load(Ordering::SeqCst), 0,
+        "retained current callback is not a prepared recovered checkpoint and must not receive recovery input");
+    drop(actor);
+    let current = FakeTransport::new(native);
+    *current.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "current"));
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "checkpoint-store", None),
+        current.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *current.prepared_checkpoints.lock().unwrap(),
+        vec![checkpoint.clone()],
+        "prepare only the persisted exact native checkpoint before current native start"
+    );
+    assert_eq!(
+        current.recovery_releases.load(Ordering::SeqCst),
+        0,
+        "preparing and starting cannot release the old operation"
+    );
+    actor.resume_pending_native_permissions().await.unwrap();
+    assert_eq!(
+        current.recovery_releases.load(Ordering::SeqCst),
+        1,
+        "explicit fenced release must reach the current transport once"
+    );
+    assert_eq!(actor.resume_pending_native_permissions().await, Ok(()));
+    assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
+    let evidence = current.native_evidence.lock().unwrap().take();
+    assert_eq!(
+        actor.resume_pending_native_permissions().await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    let mut wrong_root = evidence.clone().unwrap();
+    wrong_root["launch"]["requestedNativeSessionId"] =
+        serde_json::json!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    *current.native_evidence.lock().unwrap() = Some(wrong_root);
+    assert_eq!(
+        actor.resume_pending_native_permissions().await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    *current.native_evidence.lock().unwrap() = evidence;
+    assert_eq!(actor.resume_pending_native_permissions().await, Ok(()));
+    assert!(actor
+        .resolve_permission(
+            "same-checkpoint-card",
+            serde_json::json!({"behavior":"allow"})
+        )
+        .await
+        .is_err());
+    let mut changed = payload("current");
+    changed["nativeCheckpoint"]["inputDigest"] = serde_json::json!("d".repeat(64));
+    assert!(actor
+        .record_permission("same-checkpoint-card".into(), changed)
+        .await
+        .is_err());
+    assert!(actor
+        .record_permission("same-checkpoint-card".into(), payload("stale"))
+        .await
+        .is_err());
+    let mut old_query = payload("current");
+    old_query["nativeBinding"]["queryGeneration"] = serde_json::json!(1);
+    assert!(actor
+        .record_permission("same-checkpoint-card".into(), old_query)
+        .await
+        .is_err());
+    actor
+        .record_permission("same-checkpoint-card".into(), payload("current"))
+        .await
+        .expect("current native same-operation proof must rebind the interrupted card");
+    actor
+        .resolve_permission(
+            "same-checkpoint-card",
+            serde_json::json!({"behavior":"deny"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.decisions.load(Ordering::SeqCst), 1);
+    assert_eq!(actor.resume_pending_native_permissions().await, Ok(()));
+    assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
+    actor.clone().stop().await.unwrap();
+    assert_eq!(
+        actor.resume_pending_native_permissions().await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    assert_eq!(current.recovery_releases.load(Ordering::SeqCst), 1);
+}
+
+async fn actor_with_recovered_checkpoint(
+    provider: FreshProvider,
+) -> (
+    tempfile::TempDir,
+    Arc<FreshAgentHostActor>,
+    Arc<FakeTransport>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let prior = FakeTransport::new(native);
+    *prior.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "prior"));
+    let saved_profile = profile(provider, "checkpoint-store", None);
+    let actor = FreshAgentHostActor::open(dir.path(), saved_profile.clone(), prior)
+        .await
+        .unwrap();
+    actor
+        .record_permission(
+            "same-checkpoint-card".into(),
+            native_checkpoint_permission(native, "prior"),
+        )
+        .await
+        .unwrap();
+    actor.stop().await.unwrap();
+    let current = FakeTransport::new(native);
+    *current.native_evidence.lock().unwrap() = Some(native_checkpoint_evidence(native, "current"));
+    let actor = FreshAgentHostActor::open(dir.path(), saved_profile, current.clone())
+        .await
+        .unwrap();
+    (dir, actor, current)
+}
+
+#[tokio::test]
+async fn native_checkpoint_release_failures_remain_fenced_without_replay() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        for acceptance_ambiguous in [false, true] {
+            let (_dir, actor, transport) = actor_with_recovered_checkpoint(provider.clone()).await;
+            *transport.recovery_result.lock().unwrap() = Some(Err(DispatchFailure {
+                message: "native continuation failed".into(),
+                acceptance_ambiguous,
+            }));
+            let expected = if acceptance_ambiguous {
+                ActorError::AmbiguousDispatch
+            } else {
+                ActorError::Transport("native continuation failed".into())
+            };
+            assert_eq!(
+                actor.resume_pending_native_permissions().await,
+                Err(expected)
+            );
+            // A later healthy transport is not evidence that an earlier release settled.
+            *transport.recovery_result.lock().unwrap() = Some(Ok(()));
+            assert_eq!(
+                actor.resume_pending_native_permissions().await,
+                Err(ActorError::AmbiguousDispatch)
+            );
+            assert_eq!(transport.recovery_releases.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+            actor.stop().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_checkpoint_release_in_progress_and_cancelled_never_complete_or_replay() {
+    for provider in [FreshProvider::Claude, FreshProvider::Kilroy] {
+        let (_dir, actor, transport) = actor_with_recovered_checkpoint(provider).await;
+        *transport.recovery_result.lock().unwrap() = None;
+        let releasing_actor = actor.clone();
+        let release =
+            tokio::spawn(async move { releasing_actor.resume_pending_native_permissions().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            transport.recovery_started.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            actor.resume_pending_native_permissions()
+        )
+        .await
+        .is_err());
+        assert!(!release.is_finished());
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+        *transport.recovery_result.lock().unwrap() = Some(Ok(()));
+        assert_eq!(
+            actor.resume_pending_native_permissions().await,
+            Err(ActorError::AmbiguousDispatch)
+        );
+        assert_eq!(transport.recovery_releases.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 0);
+        actor.stop().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1450,6 +2209,11 @@ async fn provider_native_fork_transitions_the_same_actor_without_a_second_writer
         actor.profile().await.native_session_id.as_deref(),
         Some("native-child")
     );
+    assert_eq!(
+        actor.observed_native_session_id().await.as_deref(),
+        Some("native-child"),
+        "the native fork acknowledgement retires the parent observation"
+    );
     assert_eq!(transport.forks.load(Ordering::SeqCst), 1);
 
     // Lost reply/reconnect reuses durable completion and never calls provider fork twice.
@@ -1477,6 +2241,7 @@ async fn provider_native_fork_transitions_the_same_actor_without_a_second_writer
 struct HangingForkTransport {
     forks: AtomicUsize,
     entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -1502,7 +2267,12 @@ impl FreshAgentTransport for HangingForkTransport {
     ) -> Result<ForkTransition, DispatchFailure> {
         self.forks.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
-        std::future::pending::<Result<ForkTransition, DispatchFailure>>().await
+        self.release.notified().await;
+        Ok(ForkTransition {
+            parent_session_id: "native-parent".into(),
+            child_session_id: "native-child".into(),
+            parent_retired_by_runtime: true,
+        })
     }
     async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
         Ok(())
@@ -1524,6 +2294,7 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
     let first_transport = Arc::new(HangingForkTransport {
         forks: AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
     });
     let actor = FreshAgentHostActor::open(
         dir.path(),
@@ -1544,9 +2315,27 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
     )
     .await
     .expect("fork reached provider acceptance window");
+    assert_eq!(actor.observed_native_session_id().await, None);
+    assert_eq!(
+        actor.observe_native_identity("native-parent".into()).await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
+    assert_eq!(
+        actor.observe_native_identity("native-child".into()).await,
+        Err(ActorError::NativeIdentityMismatch)
+    );
     spawned.abort();
     let _ = spawned.await;
     assert_eq!(first_transport.forks.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            actor.fork(RequestId::new(), "native-parent".into(), None)
+        )
+        .await,
+        Ok(Err(ActorError::NativeIdentityMismatch)),
+        "an unsettled fork must reject another native mutation"
+    );
     drop(actor);
     drop(first_transport);
 
@@ -1573,4 +2362,38 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
         reopened.profile().await.native_session_id.as_deref(),
         Some("native-parent")
     );
+}
+
+#[tokio::test]
+async fn stop_fences_a_late_native_fork_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(HangingForkTransport {
+        forks: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "same-store", Some("native-parent")),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let task = {
+        let actor = actor.clone();
+        tokio::spawn(async move {
+            actor
+                .fork(RequestId::new(), "native-parent".into(), None)
+                .await
+        })
+    };
+    transport.entered.notified().await;
+    actor.clone().stop().await.unwrap();
+    transport.release.notify_one();
+    assert_eq!(task.await.unwrap(), Err(ActorError::AmbiguousDispatch));
+    assert_eq!(
+        actor.profile().await.native_session_id.as_deref(),
+        Some("native-parent")
+    );
+    assert_eq!(actor.observed_native_session_id().await, None);
 }

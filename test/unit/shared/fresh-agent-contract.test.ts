@@ -38,6 +38,19 @@ describe('fresh-agent shared contract schemas', () => {
     expect(FreshAgentSnapshotSchema.parse(codexContractSnapshot).turns[0].summaryKind).toBe('echo')
   })
 
+  it('accepts the managed-directory metadata returned with owned native history', () => {
+    const managedDirectory = {
+      incarnationId: 'incarnation-1', cwd: '/workspace', workspacePath: '/workspace',
+      gitCommonDir: null, sessionType: 'freshcodex',
+    }
+    const parsed = FreshAgentSnapshotSchema.safeParse({ ...codexContractSnapshot, managedDirectory })
+
+    expect(parsed.success).toBe(true)
+    if (parsed.success) expect(parsed.data.managedDirectory).toEqual(managedDirectory)
+    expect(() => FreshAgentSnapshotSchema.parse({ ...codexContractSnapshot,
+      managedDirectory: { ...managedDirectory, unexpected: true } })).toThrow()
+  })
+
   it('parses turn pages and turn bodies with the full session locator', () => {
     expect(FreshAgentTurnPageSchema.parse(claudeContractTurnPage).provider).toBe('claude')
     expect(FreshAgentTurnPageSchema.parse(codexContractTurnPage).provider).toBe('codex')
@@ -92,6 +105,7 @@ describe('fresh-agent shared contract schemas', () => {
 
   it('registers the session-command schema for contract traceability', () => {
     expect(FRESH_AGENT_CONTRACT_SCHEMA_NAMES).toContain('FreshAgentSessionCommandSchema')
+    expect(FRESH_AGENT_CONTRACT_SCHEMA_NAMES).toContain('FreshAgentManagedDirectorySchema')
   })
 
   it('parses action results and contract errors with locator context', () => {

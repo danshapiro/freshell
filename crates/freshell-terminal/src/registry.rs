@@ -897,6 +897,32 @@ impl From<&str> for ManagedTerminalLaunchError {
         message.to_owned().into()
     }
 }
+/// Preserve undispatched input refusals across the controller boundary without
+/// depending on provider or recovery message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedTerminalInputError {
+    RecoveryPending,
+    RecoveryBlocked,
+    Unavailable(String),
+}
+
+impl From<String> for ManagedTerminalInputError {
+    fn from(detail: String) -> Self {
+        Self::Unavailable(detail)
+    }
+}
+
+impl std::fmt::Display for ManagedTerminalInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecoveryPending => formatter.write_str("managed terminal recovery is pending"),
+            Self::RecoveryBlocked => formatter.write_str("managed terminal recovery is blocked"),
+            Self::Unavailable(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for ManagedTerminalInputError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedOutputChunk {
@@ -950,6 +976,8 @@ pub struct ManagedOutputRead {
     pub exit_code: Option<i64>,
     pub native_session_id: Option<String>,
     pub chunks: Vec<ManagedOutputChunk>,
+    pub opencode_activity: Option<freshell_activity::opencode::OpencodeActivityBatch>,
+    pub codex_activity: Option<freshell_activity::codex::CodexActivityBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1008,7 +1036,7 @@ pub trait ManagedTerminalController: Send + Sync {
         &'a self,
         terminal: ManagedTerminalDescriptor,
         data: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>>;
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>>;
     fn resize<'a>(
         &'a self,
         terminal: ManagedTerminalDescriptor,
@@ -4718,6 +4746,12 @@ impl TerminalRegistry {
     /// process handle it could accidentally reap.
     pub fn register_managed(&self, descriptor: ManagedTerminalDescriptor) {
         let created_at = now_ms();
+        let created = ActivityEvent::Created {
+            terminal_id: descriptor.terminal_id.clone(),
+            mode: descriptor.mode.clone(),
+            resume_session_id: descriptor.resume_session_id.clone(),
+            at: created_at,
+        };
         let shared = Arc::new(Mutex::new(TerminalShared {
             managed_identity: Some((
                 descriptor.soul_id.clone(),
@@ -4774,6 +4808,8 @@ impl TerminalRegistry {
             },
         );
         inner.revision += 1;
+        drop(inner);
+        self.notify_activity(created);
     }
 
     /// Merge one host-spooled output chunk into the ordinary replay/fan-out
@@ -4847,12 +4883,16 @@ impl TerminalRegistry {
         controller.launch(request).await
     }
 
-    pub async fn managed_input(&self, terminal_id: &str, data: String) -> Result<(), String> {
+    pub async fn managed_input(
+        &self,
+        terminal_id: &str,
+        data: String,
+    ) -> Result<(), ManagedTerminalInputError> {
         let terminal = self
             .managed_descriptor(terminal_id)
             .ok_or_else(|| "managed terminal not found".to_string())?;
         if !self.is_pty_running(terminal_id) {
-            return Err("recovery is blocked: retained managed terminal has ended".to_string());
+            return Err(ManagedTerminalInputError::RecoveryBlocked);
         }
         let controller = self
             .managed_controller
@@ -4923,6 +4963,8 @@ impl TerminalRegistry {
             return Ok(ManagedOutputRead {
                 lifecycle: None,
                 completion: None,
+                codex_activity: None,
+                opencode_activity: None,
                 stream_epoch: None,
                 incarnation_id: None,
                 reset_required: false,
