@@ -1410,7 +1410,21 @@ impl Supervisor {
             .map(|(result, _)| result)
     }
 
-    pub(crate) async fn activate_prepared_observed(
+    pub(crate) fn activate_prepared_observed(
+        &self,
+        prepared: PreparedLaunch,
+        workload: LaunchWorkload,
+        limits: RuntimeLimits,
+        fence: RecoveryWriteFence,
+    ) -> impl std::future::Future<Output = Result<(LaunchResult, RecoveryWriteFence), RuntimeError>>
+           + Send
+           + '_ {
+        // Construct the large activation state here so recovery callers only
+        // retain the boxed future while polling host replies and registry I/O.
+        Box::pin(self.activate_prepared_observed_inner(prepared, workload, limits, fence))
+    }
+
+    async fn activate_prepared_observed_inner(
         &self,
         prepared: PreparedLaunch,
         workload: LaunchWorkload,
@@ -1648,10 +1662,10 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
             })?;
-        let mut accepted = match self
-            .send_grant(&handle, &workload, &authenticated, &grant)
-            .await
-        {
+        // Grant delivery retains its own launch context while decoding replies.
+        let grant_result =
+            Box::pin(self.send_grant(&handle, &workload, &authenticated, &grant)).await;
+        let mut accepted = match grant_result {
             Ok(accepted) => accepted,
             Err(error)
                 if error.code == RuntimeErrorCode::ProviderInputsChanged
@@ -4922,11 +4936,6 @@ mod grant_identity_tests {
                 .owned_handle(prepared.incarnation_id.clone())
                 .await
                 .unwrap();
-            let was_never_dispatched = registry
-                .recovery_context(soul.clone())
-                .await
-                .unwrap()
-                .never_dispatched;
             let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
             let expected_handle = handle.clone();
             // Controlled proof shapes test admission, not native qualification.
@@ -5091,6 +5100,17 @@ mod grant_identity_tests {
                 )
                 .await
                 .unwrap();
+            // Issuing the initialization grant already makes provider execution
+            // uncertain. The grant consumer must preserve that post-grant state.
+            let was_never_dispatched = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .never_dispatched;
+            assert!(
+                !was_never_dispatched,
+                "{case}: an issued grant is not pristine"
+            );
             if case == "wrong-profile" {
                 agent.model = Some("changed-unregistered-profile".into());
             }
