@@ -162,6 +162,7 @@ Named Docker volumes persist across runs to avoid re-fetching dependencies every
 of each is slower — see below):
 
 - `freshell-sandbox-cargo-registry`, `freshell-sandbox-cargo-git` — cargo's package cache
+- `freshell-sandbox-pnpm-store` — pnpm's downloaded package store.
 - `freshell-sandbox-cargo-target` — **sandbox-owned**, not the host's `target/`. Sharing the host
   target directory would cause lock contention with concurrent host builds.
 - `freshell-sandbox-node-modules` — **sandbox-owned**, populated by the container's dependency
@@ -176,7 +177,7 @@ of each is slower — see below):
 - `freshell-sandbox-playwright-cache` — downloaded browser binaries.
 
 Set `FRESHELL_SANDBOX_CACHE_PREFIX` to a unique Docker volume name prefix to use an
-independent set of all seven caches, including when running `scripts/sandbox-selftest.sh`.
+independent set of all eight caches, including when running `scripts/sandbox-selftest.sh`.
 The default prefix is `freshell-sandbox`; paths are rejected to prevent accidentally mounting
 host directories. The cold-start regression creates and removes its own volumes automatically.
 
@@ -184,7 +185,7 @@ Reset everything (forces a clean re-warm on next run):
 
 ```bash
 docker volume rm freshell-sandbox-cargo-registry freshell-sandbox-cargo-git \
-  freshell-sandbox-cargo-target freshell-sandbox-node-modules \
+  freshell-sandbox-cargo-target freshell-sandbox-pnpm-store freshell-sandbox-node-modules \
   freshell-sandbox-sidecar-node-modules freshell-sandbox-mcp-node-modules \
   freshell-sandbox-playwright-cache
 ```
