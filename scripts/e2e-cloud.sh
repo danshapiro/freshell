@@ -573,7 +573,7 @@ cmd_run() {
   # JSON-quoted YAML values retain exact selections without exporting owner
   # paths, OneCLI files, Docker access or local receipt destinations.
   local managed_external_yaml managed_external=false
-  managed_external_yaml=$(cd "$ROOT" && pnpm exec tsx -e 'import { externalCloudMetadata } from "./scripts/testing/runtime-external-browser.ts"; for (const [key,value] of Object.entries(externalCloudMetadata(process.env))) process.stdout.write(key+": "+JSON.stringify(value)+"\n")')
+  managed_external_yaml=$(cd "$ROOT" && pnpm exec tsx scripts/testing/e2e-external-target.ts cloud-metadata "${pw_args[@]}")
   if [ -n "$managed_external_yaml" ]; then
     managed_external=true
     if $local_mode || [ "$shards" != "1" ]; then
