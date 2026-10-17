@@ -347,6 +347,8 @@ async function configuredClaudeStartup() {
   }
   const source = argv.includes('--resume') ? 'resume' : 'startup'
   const transcript = path.join(providerHome, 'projects/provider-parity', `${nativeId}.jsonl`)
+  let sessionStartCommands = 0
+  let statusLineExecuted = false
   const command = (selected, input) => new Promise((resolve, reject) => {
     const child = spawn('/bin/sh', ['-c', selected], { env: process.env, cwd, stdio: ['pipe', 'inherit', 'inherit'] })
     const timer = setTimeout(() => { child.kill(); reject(new Error('configured native command timeout')) }, 5000)
@@ -361,6 +363,7 @@ async function configuredClaudeStartup() {
       for (const hook of group.hooks ?? []) {
         if (hook.type === 'command' && typeof hook.command === 'string') {
           await command(hook.command, { hook_event_name: 'SessionStart', session_id: nativeId, source, cwd, transcript_path: transcript })
+          sessionStartCommands++
         }
       }
     }
@@ -370,10 +373,16 @@ async function configuredClaudeStartup() {
     await command(settings.statusLine.command, { session_id: nativeId, transcript_path: transcript,
       version: '2.1.263', model: { id: model >= 0 ? argv[model + 1] : settings.model ?? 'controlled-fixture-model' },
       workspace: { current_dir: cwd }, context_window: { context_window_size: 200000, current_usage: null } })
+    statusLineExecuted = true
   }
+  return { kind: 'startup', launchId, terminalId: process.env.FRESHELL_TERMINAL_ID,
+    nativeSessionId: nativeId, source, sessionStartCommands, statusLineExecuted }
 }
 if (provider === 'claude') {
-  try { await configuredClaudeStartup() }
+  try {
+    const startup = await configuredClaudeStartup()
+    if (startup) append(startup)
+  }
   catch (error) { append({ kind: 'native-startup', result: 'refused', errorKind: error?.name ?? 'Error' }); process.exitCode = 1 }
 }
 async function configuredAmplifierStartup() {
