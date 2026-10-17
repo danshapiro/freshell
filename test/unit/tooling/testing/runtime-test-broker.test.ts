@@ -2011,7 +2011,7 @@ describe('fixed indexed publisher broker',()=>{
   });
 });
 
-async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gatewaysOrOptions?:Set<string> | { allowTask2LegacyNegativeFixtures?: boolean; delayHelperWait?: boolean; gitWorkspace?: string }, physicalStage = false,
+async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gatewaysOrOptions?:Set<string> | { allowTask2LegacyNegativeFixtures?: boolean; delayHelperWait?: boolean; gitWorkspace?: string; initialProviderVolumeLookup?: (volume: string) => ReturnType<typeof sourceAuthorization> | undefined }, physicalStage = false,
   allowedProviderInputRoots = new Set<string>()) {
   const gateways = gatewaysOrOptions instanceof Set ? gatewaysOrOptions : undefined
   const options = gatewaysOrOptions instanceof Set ? {} : (gatewaysOrOptions ?? {})
@@ -2125,6 +2125,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     allowTerminalWorkloads: true,
     allowedWorkspaceRoots: new Set(['/workspace', ...(options.gitWorkspace ? [options.gitWorkspace] : [])]),
     allowedProviderInputRoots,
+    initialProviderVolumeLookup: options.initialProviderVolumeLookup,
     testRunId: 'run-one',
     logPath: path.join(dir, 'broker.jsonl'),
   })
@@ -2150,6 +2151,37 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     await fs.rm(dir, { recursive: true, force: true })
   }
 }
+
+it('admits only an exact owned published initial provider volume before its first workload receipt', async () => {
+  const owner = sourceAuthorization()
+  const lookup = vi.fn((volume: string) => volume === owner.providerVolumeName ? owner : undefined)
+  await withHttpBroker(async ({ request, forwarded, broker }) => {
+    expect(broker.receipts()).toEqual([])
+    expect((await request('GET', `/v1.47/volumes/${owner.providerVolumeName}`)).status).toBe(200)
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(owner.providerVolumeName)
+    expect(broker.initialProviderVolumeCreations()).toEqual([])
+    expect((await request('POST', '/v1.47/volumes/create', {
+      Name: owner.providerVolumeName, Driver: 'local', Labels: {
+        'com.freshell.installation-id': owner.installationId, 'com.freshell.soul-id': owner.soulId,
+        'freshell.input.reservation': '11111111-1111-4111-8111-111111111111',
+        'freshell.input.incarnation': 'incarnation-owned', 'freshell.input.intent': '1',
+        'freshell.input.daemon': owner.daemonId, 'freshell.input.image': owner.imageRef,
+        'freshell.input.binary-sha256': owner.binarySha256,
+      },
+    })).status).toBe(201)
+    expect(broker.initialProviderVolumeCreations()).toEqual([owner])
+    expect((await request('GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`)).status).toBe(403)
+    expect(forwarded.map(operation => operation.url)).toEqual([`/v1.47/volumes/${owner.providerVolumeName}`, '/v1.47/volumes/create'])
+  }, { initialProviderVolumeLookup: lookup })
+})
+
+it('refuses a changed owner returned by initial provider volume discovery', async () => {
+  const owner = sourceAuthorization()
+  await withHttpBroker(async ({ request, forwarded }) => {
+    expect((await request('GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`)).status).toBe(403)
+    expect(forwarded).toEqual([])
+  }, { initialProviderVolumeLookup: () => owner })
+})
 
 it('requires signal authority for new provider runtimes and retains exact Stop ownership', async () => {
   await withHttpBroker(async ({ request, forwarded, broker }) => {

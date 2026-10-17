@@ -27,6 +27,10 @@ import { hasSuccessfulNativeAnswer, type NativeHistory } from './provider-native
 
 import { configuredProviderOnecliGrantFiles } from './runtime-amplifier-onecli.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt, type BrokerSettlementFailure } from './runtime-test-broker.js'
+import {
+  captureInitialProviderVolumes, cleanupInitialProviderVolumes, findInitialProviderVolume,
+  type InitialProviderRegistrySource,
+} from './initial-provider-volume.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
@@ -2691,6 +2695,7 @@ export class RuntimeHarness {
   private readonly task007Fixtures = new Map<Task007StoppedFixtureKind, Task007PreparedStoppedFixture>()
   private readonly task007HostPaths = new Set<string>()
   private readonly task007WorkspaceRoots = new Set<string>()
+  private readonly initialProviderRegistries = new Map<string, InitialProviderRegistrySource>()
 
   constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1,
     providerFixtureHomeOrIsolation?: string | RuntimeOwnerIsolation,
@@ -2787,6 +2792,7 @@ export class RuntimeHarness {
       allowedProviderUserRoots: new Set(this.phase >= 2 ? this.phase2ProviderUserRoots() : []),
       allowedBootstrapFiles: new Set(this.phase >= 2 ? this.phase2BootstrapFiles() : []),
       allowedOperatorHomeRoots: new Set(options.operatorHome ? [options.operatorHome] : []),
+      initialProviderVolumeLookup: volume => findInitialProviderVolume(volume, [...this.initialProviderRegistries.values()]),
       testRunId: this.runId,
       logPath: path.join(this.evidenceDir, 'broker.jsonl'),
     })
@@ -3432,11 +3438,18 @@ export class RuntimeHarness {
       } catch (error) { brokerSettlementComplete = false; errors.push(`broker settlement: ${String(error)}`) }
     }
     const receipts = brokers.flatMap(broker => broker.receipts())
+    const initialProviders = brokers.flatMap(broker => broker.initialProviderVolumeCreations())
+    const initialProviderNames = new Set(initialProviders.map(owner => owner.providerVolumeName))
+    let initialProviderVolumes: ReturnType<typeof captureInitialProviderVolumes> = []
+    let initialProviderCleanupConfirmed = true
+    try { initialProviderVolumes = captureInitialProviderVolumes(initialProviders) }
+    catch (error) { initialProviderCleanupConfirmed = false; errors.push(`initial provider capture: ${String(error)}`) }
     const exactContainerIds = [...new Set([
       ...supervisorIds, ...this.trackedForeignContainers,
       ...this.trackedContainers, ...brokers.flatMap(broker => [...broker.receiptIds()]),
     ])]
-    const providerVolumes = new Set(receipts.map(receipt => receipt.providerVolumeName).filter((value): value is string => !!value))
+    const providerVolumes = new Set([...initialProviderNames,
+      ...receipts.map(receipt => receipt.providerVolumeName).filter((value): value is string => !!value)])
     const exactVolumes = [...new Set([...this.trackedVolumes, ...providerVolumes])]
     const historyHelperNames = [...new Set([...brokers.flatMap(broker => broker.historyHelperNames()), ...this.task007HelperNames])]
     for (const id of new Set(brokers.flatMap(broker => [...broker.receiptIds()]))) {
@@ -3474,7 +3487,11 @@ export class RuntimeHarness {
       }
     }
     exactVolumes.push(...[...indexedVolumes].filter(volume => !exactVolumes.includes(volume)))
-    for (const volume of exactVolumes.filter(volume => !indexedVolumes.has(volume))) {
+    if (initialProviderCleanupConfirmed) {
+      try { cleanupInitialProviderVolumes(initialProviderVolumes) }
+      catch (error) { initialProviderCleanupConfirmed = false; errors.push(`initial provider cleanup: ${String(error)}`) }
+    }
+    for (const volume of exactVolumes.filter(volume => !indexedVolumes.has(volume) && !initialProviderNames.has(volume))) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`volume ${volume}: ${String(error)}`) }
     }
     if (this.brokerStarted) {
@@ -3494,7 +3511,7 @@ export class RuntimeHarness {
       })
       knownResourcesAbsent = true
     } catch (error) { errors.push(`runtime absence: ${error instanceof Error ? error.message : String(error)}`) }
-    const resourcesAbsent = knownResourcesAbsent && brokerSettlementComplete
+    const resourcesAbsent = knownResourcesAbsent && brokerSettlementComplete && initialProviderCleanupConfirmed
       && !brokerSettlementFailures.some(failure => failure.allocationUnknown)
     if (resourcesAbsent && this.ownedImage) {
       try { removeRunOwnedRuntimeImage(this.ownedImage) }
@@ -3737,7 +3754,25 @@ export class RuntimeHarness {
     this.trackedContainers.add(containerId)
     const instance: SupervisorInstance = { scenarioId, containerId, controlSocket, controlSecret, controlSecretFile, runtimeRoot, volumeName, binaryKind }
     this.recordLifecycle('supervisor.started', { scenarioId, containerId, binaryKind, crashPoint: options.crashPoint, dbFailpoint: options.dbFailpoint, volumeName })
-    if (options.waitForHealth !== false) await this.waitForSupervisorHealth(instance)
+    if (options.waitForHealth !== false) {
+      const health = await this.waitForSupervisorHealth(instance)
+      if (this.phase >= 2 && dockerIsRootless()) {
+        const metadata = JSON.parse(docker(['volume', 'inspect', volumeName]))[0]
+        if (!this.trackedVolumes.has(volumeName) || metadata?.Name !== volumeName
+          || metadata.Driver !== 'local' || typeof metadata.Mountpoint !== 'string') {
+          throw new Error('owned supervisor registry mount is unavailable')
+        }
+        const source: InitialProviderRegistrySource = {
+          registryPath: path.join(fs.realpathSync(metadata.Mountpoint), 'runtime.sqlite3'),
+          installationId: z.string().min(1).parse(health.data.installation_id),
+          imageRef: this.imageRef, hostBinaryPath: hostBinary,
+          binarySha256: createHash('sha256').update(fs.readFileSync(hostBinary)).digest('hex'),
+          daemonId: docker(['info', '--format', '{{.ID}}']).trim(),
+        }
+        this.initialProviderRegistries.set(volumeName, source)
+        this.recordLifecycle('runtime.initial_provider_registry.registered', { severity: 'info', scenarioId })
+      }
+    }
     return instance
   }
 

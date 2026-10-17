@@ -162,6 +162,7 @@ export type RestrictedDockerBrokerPolicy = {
   allowedBootstrapFiles?: Set<string>
   allowedHostGatewayAddresses?: Set<string>
   allowedOperatorHomeRoots?: Set<string>
+  initialProviderVolumeLookup?: (volumeName: string) => InitialProviderVolumeAuthorization | undefined
   testRunId: string
   logPath: string
 }
@@ -324,6 +325,13 @@ export class RestrictedDockerBroker {
     const previous=this.initialProviderVolumes.get(stable)
     if (previous && !equalRecord(input,previous)) throw new Error('initial provider source ownership changed')
     this.initialProviderVolumes.set(stable,{...input})
+  }
+
+  initialProviderVolumeCreations(): InitialProviderVolumeAuthorization[] {
+    return [...this.initialReservations.keys()].flatMap(name => {
+      const owner = this.initialProviderVolumes.get(name)
+      return owner ? [{ ...owner }] : []
+    })
   }
 
   authorizePreparedInputs(input: PreparedInputAuthorization): void {
@@ -585,6 +593,19 @@ export class RestrictedDockerBroker {
     }
 
     const volume = url.match(/^\/v1\.47\/volumes\/(freshell-provider-[a-f0-9]{24})$/)?.[1]
+    if (method === 'GET' && volume && !this.initialProviderVolumes.has(volume)
+      && this.policy.initialProviderVolumeLookup) {
+      try {
+        const owner = this.policy.initialProviderVolumeLookup(volume)
+        if (owner) {
+          if (owner.providerVolumeName !== volume) throw new Error('published initial provider volume differs')
+          this.authorizeInitialProviderVolume(owner)
+        }
+      } catch {
+        this.block(response, method, url, 403, 'owned initial provider preparation lookup failed', false)
+        return
+      }
+    }
     if (method === 'GET' && volume && (this.initialProviderVolumes.has(volume)
       || this.receipts().some((receipt) => receipt.providerVolumeName === volume))) {
       await this.forwardAndReply(request, response, body, { destructive: false })
