@@ -220,7 +220,7 @@ fn decode_profile(
 ) -> Result<BTreeMap<String, String>, String> {
     match profile {
         EnvironmentProfile::Claude => resolve_provider_environment(
-            &parsed,
+            parsed,
             &[
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_BASE_URL",
@@ -230,13 +230,13 @@ fn decode_profile(
             native_auth,
         ),
         EnvironmentProfile::Codex => resolve_provider_environment(
-            &parsed,
+            parsed,
             &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
             false,
             native_auth,
         ),
         EnvironmentProfile::Opencode => resolve_provider_environment(
-            &parsed,
+            parsed,
             &[
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_BASE_URL",
@@ -252,7 +252,7 @@ fn decode_profile(
             native_auth,
         ),
         EnvironmentProfile::Amplifier => resolve_provider_environment(
-            &parsed,
+            parsed,
             &[
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_BASE_URL",
@@ -275,10 +275,10 @@ fn decode_profile(
             // The approved proxy may replace a provider placeholder key, so
             // only non-emptiness is required here. The credentialed gateway
             // URL itself must never retain its operator placeholder.
-            let api_key = required(&parsed, "LUNAROUTE_API_KEY")?;
-            let upstream = required(&parsed, "LUNAROUTE_BASE_URL")?;
+            let api_key = required(parsed, "LUNAROUTE_API_KEY")?;
+            let upstream = required(parsed, "LUNAROUTE_BASE_URL")?;
             validate_https_upstream(upstream)?;
-            let gateway = required(&parsed, "ONECLI_GATEWAY")?;
+            let gateway = required(parsed, "ONECLI_GATEWAY")?;
             if gateway != "1" && !gateway.eq_ignore_ascii_case("enabled") {
                 return Err(
                     "Amplifier OneCLI profile requires ONECLI_GATEWAY to be enabled".into(),
