@@ -3287,64 +3287,6 @@ impl Supervisor {
                     .probe_recovery_for_attempt(request.soul_id.clone())
                     .await?;
                 match rechecked.clone() {
-                    RecoveryProbe::ReattachReady { handle, .. } => {
-                        self.registry
-                            .mark_recovery_live(
-                                request.soul_id.clone(),
-                                handle.incarnation_id.clone(),
-                                rechecked_context.write_fence(),
-                            )
-                            .await
-                            .map_err(map_registry)?;
-                        let owned = self
-                            .registry
-                            .owned_handle(handle.incarnation_id.clone())
-                            .await
-                            .map_err(map_registry)?;
-                        self.complete_pending_provider_preparation(&owned).await?;
-                        self.release_pending_native_permissions_after_live(
-                            request.soul_id.clone(),
-                            handle.incarnation_id.clone(),
-                        )
-                        .await?;
-                        Ok(RecoveryResult {
-                            outcome: RecoveryOutcome::Reattached,
-                            view: self.view_for(&handle.incarnation_id).await?,
-                            probe: Some(rechecked),
-                            prior_incarnation_id: None,
-                            attempt_id: None,
-                            expected_native_session_id: None,
-                            observed_native_session_id: None,
-                            incident_id: None,
-                        })
-                    }
-                    RecoveryProbe::ResumeReady { resume_spec, .. } => {
-                        let path = if resume_spec.checkpoint_revision > 0 {
-                            RecoveryPath::CheckpointRestore
-                        } else {
-                            RecoveryPath::NativeResume
-                        };
-                        Box::pin(self.replace(
-                            request.soul_id,
-                            request.trigger,
-                            path,
-                            Some(*resume_spec),
-                            rechecked,
-                            rechecked_context.write_fence(),
-                        ))
-                        .await
-                    }
-                    RecoveryProbe::PristineSeedReady { .. } => {
-                        Box::pin(self.replace(
-                            request.soul_id,
-                            request.trigger,
-                            RecoveryPath::PristineSeed,
-                            None,
-                            rechecked,
-                            rechecked_context.write_fence(),
-                        ))
-                        .await
-                    }
                     RecoveryProbe::Blocked {
                         reason, evidence, ..
                     } => {
@@ -3380,8 +3322,24 @@ impl Supervisor {
                         })
                     }
                     RecoveryProbe::DefinitivelyUnavailable { .. } => {
-                        self.certify_and_cleanup_loss(request.soul_id, request.trigger, rechecked)
-                            .await
+                        Box::pin(self.certify_and_cleanup_loss(
+                            request.soul_id,
+                            request.trigger,
+                            rechecked,
+                        ))
+                        .await
+                    }
+                    _ => {
+                        // Reuse the positive completion branches instead of
+                        // embedding their large launch futures in this loss
+                        // revalidation poll frame.
+                        self.complete_recovery_probe(
+                            request,
+                            rechecked,
+                            rechecked_context,
+                            rechecked_transient,
+                        )
+                        .await
                     }
                 }
             }),
@@ -5626,6 +5584,11 @@ pub(crate) fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe
                 context.soul_id
             ),
         };
+    }
+    // Shell has no native store or checkpoint path. Its terminal-end probe
+    // is qualified again by the complete reattach/seed inventory before loss.
+    if context.provider == "shell" {
+        return probe;
     }
     let row = match checkpoints::inspected_negative(&probe, RecoveryPath::NativeResume) {
         Ok(row) => row,

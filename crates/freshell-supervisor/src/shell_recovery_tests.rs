@@ -51,6 +51,29 @@ impl crate::backend::RuntimeBackend for RecoveryBackend {
     async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
         Ok(())
     }
+    async fn qualify_retained_opencode(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+        _: &std::path::Path,
+    ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError> {
+        let terminal = handle.terminal().expect("retained launch metadata");
+        assert_eq!(terminal.mode, "opencode");
+        assert_eq!(request.provider_store_id, handle.provider_store_id());
+        assert_eq!(
+            Some(request.native_session_id.as_str()),
+            terminal.resume_session_id.as_deref()
+        );
+        assert_eq!(request.cwd, terminal.cwd);
+        assert_eq!(request.workspace_path, terminal.workspace_path);
+        assert_eq!(request.provider_uid, terminal.run_as_uid);
+        assert_eq!(request.provider_gid, terminal.run_as_gid);
+        // No provider store or native proof is installed in this backend.
+        // Exercise a failed qualification, without inventing a native census.
+        Err(BackendError::Malformed(
+            "fixture retained provider store has no verified native evidence".into(),
+        ))
+    }
 }
 
 async fn shell_supervisor(
@@ -108,10 +131,62 @@ async fn offline_coding_provider_without_verified_resume(native_session_id: Opti
     let (registry, ctx) = checkpoints::tests::context_with_native_identity(
         temp.path(),
         "opencode",
-        true,
+        false,
         native_session_id,
     )
     .await;
+    registry
+        .commit_execution_grant(
+            ctx.prior_handle.incarnation_id().clone(),
+            freshell_runtime_protocol::HostBootId::new(),
+            checkpoints::tests::limits(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        registry.mark_running(ctx.prior_handle.incarnation_id().clone()).await,
+        Err(RegistryError::RecoveryBlocked { reason, .. }) if reason == "NATIVE_IDENTITY_UNOBSERVED"
+    ));
+    // Reproduce a retained record admitted before native observation became
+    // mandatory. Modern admission must refuse it; recovery must still retain
+    // its real dispatch journal and output without certifying native loss.
+    let terminal: freshell_runtime_protocol::TerminalLaunchSpec =
+        serde_json::from_value(serde_json::json!({
+            "terminalId":"unverified-terminal", "streamId":"unverified-stream",
+            "mode":"opencode", "program":"opencode", "cwd":"/workspace",
+            "workspacePath":"/workspace", "projectKey":"fixture",
+            "env":{"HOME":"/home/freshell/provider"}, "cols":80,"rows":24,
+            "runAsUid":65534,"runAsGid":0,"resumeSessionId":native_session_id
+        }))
+        .unwrap();
+    let legacy = rusqlite::Connection::open(registry.database_path()).unwrap();
+    legacy
+        .execute(
+            "UPDATE incarnations SET launch_state='running',terminal_spec=?2,terminal_id=?3 WHERE incarnation_id=?1",
+            rusqlite::params![
+                ctx.prior_handle.incarnation_id().as_str(),
+                serde_json::to_string(&terminal).unwrap(),
+                terminal.terminal_id,
+            ],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "UPDATE souls SET recovery_state='live' WHERE soul_id=?1",
+            [ctx.soul_id.as_str()],
+        )
+        .unwrap();
+    drop(legacy);
+    let input = freshell_runtime_protocol::RequestId::new();
+    registry
+        .begin_input(ctx.soul_id.clone(), input.clone(), b"synthetic-input", None)
+        .await
+        .unwrap();
+    registry
+        .mark_input_dispatching(ctx.soul_id.clone(), input)
+        .await
+        .unwrap();
+    let ctx = registry.recovery_context(ctx.soul_id).await.unwrap();
     assert_eq!(ctx.native_session_id.as_deref(), native_session_id);
     assert!(ctx.resume_spec.is_none());
     assert_eq!(ctx.checkpoint_revision, 0);
@@ -165,11 +240,25 @@ async fn offline_coding_provider_without_verified_resume(native_session_id: Opti
         );
     };
     assert_eq!(path, RecoveryPath::NativeResume);
-    assert_eq!(reason, RecoveryBlockReason::AmbiguousIdentity);
+    assert_eq!(reason, RecoveryBlockReason::StoreUnreadable);
     assert!(retry_hint.manual_retry);
     assert!(retry_hint.automatic_after_ms.is_none());
     assert!(retry_hint.repair.is_some_and(|repair| !repair.is_empty()));
-    assert!(!evidence.is_empty());
+    if native_session_id.is_some() {
+        assert!(!evidence.is_empty());
+    } else {
+        assert!(
+            evidence.is_empty(),
+            "unknown native identity has no inspected proof"
+        );
+    }
+    let qualification_attempts = std::fs::read_to_string(&supervisor.config.lifecycle_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "supervisor.recovery.retained_qualification_started")
+        .count();
+    assert_eq!(qualification_attempts > 0, native_session_id.is_some());
     assert_eq!(result.view.soul_id, ctx.soul_id);
     assert_eq!(
         result.view.incarnation_id,
@@ -433,6 +522,12 @@ async fn shell_ended(online: bool) {
         true,
     )
     .await;
+    assert_eq!(
+        ctx.allocation_state,
+        freshell_runtime_protocol::AllocationState::Allocated
+    );
+    assert!(ctx.native_session_id.is_none());
+    assert_eq!(ctx.dispatched_command_count, 1);
     let output = ctx.prior_handle.runtime_dir().join("retained-output");
     std::fs::write(&output, b"last-shell-diagnostic").unwrap();
     let host = if online {
@@ -457,7 +552,13 @@ async fn shell_ended(online: bool) {
         );
     }
     let result = result.unwrap();
-    assert_eq!(result.outcome, RecoveryOutcome::Lost);
+    assert_eq!(result.outcome, RecoveryOutcome::Lost, "{result:?}");
+    assert_eq!(result.view.cleanup_state, CleanupState::VerifiedEmpty);
+    assert!(supervisor
+        .backend
+        .verify_empty(&ctx.prior_handle)
+        .await
+        .unwrap());
     let certificate = supervisor
         .registry
         .loss_certificate(result.incident_id.unwrap())
@@ -468,6 +569,10 @@ async fn shell_ended(online: bool) {
         freshell_runtime_protocol::LossDecisionState::NonResumableTerminalEnded
     );
     assert_eq!(certificate.recovery_paths.len(), 2);
+    assert_eq!(
+        certificate.cleanup_target.incarnation_id,
+        *ctx.prior_handle.incarnation_id()
+    );
     assert!(certificate
         .recovery_paths
         .iter()
@@ -484,6 +589,7 @@ async fn shell_dispatched_verified_end_online() {
 async fn shell_dispatched_verified_end_offline() {
     shell_ended(false).await;
 }
+
 #[tokio::test]
 async fn shell_uncertain_end_blocks() {
     let temp = tempfile::tempdir().unwrap();
@@ -506,11 +612,69 @@ async fn shell_uncertain_end_blocks() {
 }
 #[tokio::test]
 async fn shell_never_dispatched_preserves_pristine_seed() {
+    for execution_granted in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (s, ctx) = shell_supervisor(temp.path(), BackendRuntimeState::Exited, false).await;
+        if execution_granted {
+            s.registry
+                .commit_execution_grant(
+                    ctx.prior_handle.incarnation_id().clone(),
+                    freshell_runtime_protocol::HostBootId::new(),
+                    checkpoints::tests::limits(),
+                )
+                .await
+                .unwrap();
+            s.registry
+                .mark_running(ctx.prior_handle.incarnation_id().clone())
+                .await
+                .unwrap();
+            s.registry
+                .begin_input(
+                    ctx.soul_id.clone(),
+                    freshell_runtime_protocol::RequestId::new(),
+                    b"accepted but never dispatched",
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            matches!(s.probe_recovery(ctx.soul_id).await.unwrap(),RecoveryProbe::PristineSeedReady {seed,..} if seed=="original-seed")
+        );
+        assert!(s
+            .registry
+            .unresolved_loss_incident_ids()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn shell_stop_intent_prevents_terminal_end_loss() {
     let temp = tempfile::tempdir().unwrap();
-    let (s, ctx) = shell_supervisor(temp.path(), BackendRuntimeState::Exited, false).await;
-    assert!(
-        matches!(s.probe_recovery(ctx.soul_id).await.unwrap(),RecoveryProbe::PristineSeedReady {seed,..} if seed=="original-seed")
-    );
+    let (s, ctx) = shell_supervisor(temp.path(), BackendRuntimeState::Exited, true).await;
+    let stopped = s.registry.begin_stop(ctx.soul_id.clone()).await.unwrap();
+    let result = s
+        .recover(RecoverRequest {
+            soul_id: ctx.soul_id.clone(),
+            trigger: RecoveryTrigger::ProviderExit,
+            expected_intent_revision: None,
+            expected_control_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, RecoveryOutcome::Stopped);
+    assert_eq!(result.view.desired_state, DesiredState::Stopped);
+    assert_eq!(result.view.incarnation_id, *stopped.incarnation_id());
+    assert!(result.incident_id.is_none());
+    assert!(s
+        .registry
+        .unresolved_loss_incident_ids()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(s.registry.inventory().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
