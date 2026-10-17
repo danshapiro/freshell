@@ -597,6 +597,8 @@ mod tests {
             terminal_id: terminal_id.into(),
             stream_id: "launch-prefix".into(),
             read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         let mut spool = File::create(directory.path().join(SPOOL_CURRENT_FILE)).unwrap();
@@ -665,6 +667,8 @@ mod tests {
             terminal_id: terminal_id.into(),
             stream_id: "launch-prefix".into(),
             read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         let frame = freshell_runtime_protocol::RuntimeOutputFrame {
@@ -731,6 +735,8 @@ mod tests {
             terminal_id: terminal_id.into(),
             stream_id: "launch-prefix".into(),
             read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         std::fs::write(
@@ -789,6 +795,8 @@ mod tests {
             terminal_id: terminal_id.into(),
             stream_id: "launch-prefix".into(),
             read_fence: Default::default(),
+            stopped: false,
+            verified_empty: false,
             native_session_id: None,
         };
         let descriptor = TerminalSpoolDescriptor {
