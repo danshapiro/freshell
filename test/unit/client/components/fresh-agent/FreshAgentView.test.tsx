@@ -550,6 +550,8 @@ function freshopencodeSnapshot(text: string, revision: number) {
 beforeEach(() => {
   setFreshAgentReconcileActive(false)
   resetSnapshotSchedulerForTests()
+  // A previous hidden pane can leave pacing timestamps in an advanced fake clock.
+  resetRebindQueueForTests()
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
   wsMock.onReconnect.mockReset()
@@ -861,7 +863,7 @@ describe('picker profile staging', () => {
       ['freshcodex', 'codex', 'gpt-5.6-luna', 'low'],
       ['freshopencode', 'opencode', 'opencode/big-pickle', 'provider-default'],
     ] as const)('releases exactly one %s create from the mounted picker pane with its staged profile', async (mode, provider, model, effort) => {
-      vi.useFakeTimers()
+      vi.useFakeTimers({ now: 0 })
       const store = createStore()
       installTestHarness(store as unknown as AppStore, () => 'ready', async () => {}, () => {}, wsMock.send)
       const harness = window.__FRESHELL_TEST_HARNESS__!
@@ -3777,7 +3779,7 @@ describe('FreshAgentView', () => {
   // debounced scheduler deterministically (the sibling loop test's pattern —
   // the wall-clock debounce races under parallel suites).
   it('recovers a reveal-lane 409 with snapshotDirty armed through the reveal refresh and clears the overlay', async () => {
-    vi.useFakeTimers()
+    vi.useFakeTimers({ now: 0 })
     try {
       const store = createStore()
       store.dispatch(applyRuntimeOwner({
