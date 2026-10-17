@@ -3,9 +3,18 @@ import fs from 'node:fs'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { TASK007_BATCH_STORE_PROBE } from './runtime-sandbox.js'
 
 const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
+const CLEANUP_DRAIN_MS = 5_000
+
+export type BrokerSettlementFailure = {
+  method: string
+  url: string
+  reason: string
+  allocationUnknown: boolean
+}
 
 export type BrokerReceipt = {
   containerId: string
@@ -22,6 +31,7 @@ export type BrokerReceipt = {
 
 export type BrokerEvent = {
   at: string
+  severity: 'info' | 'warn'
   method: string
   url: string
   decision: 'forward' | 'block' | 'inject_failure'
@@ -31,6 +41,7 @@ export type BrokerEvent = {
   helperName?: string
   requestDigest?: string
   providerVolumeName?: string
+  allocationUnknown?: boolean
   destructive: boolean
   unsafeAttempt: boolean
 }
@@ -42,6 +53,7 @@ export type RestrictedDockerBrokerPolicy = {
   allowedHostBinaryPaths: Set<string>
   allowedImageRefs: Set<string>
   allowTerminalWorkloads?: boolean
+  allowTask2LegacyNegativeFixtures?: boolean
   allowedWorkspaceRoots?: Set<string>
   allowedProviderUserRoots?: Set<string>
   allowedBootstrapFiles?: Set<string>
@@ -56,12 +68,20 @@ type DockerResponse = {
 }
 
 export class RestrictedDockerBroker {
+  private readonly task2LegacyNegativeInspectionOwners = new Map<string, string>()
   private readonly knownContainerIds = new Set<string>()
   private readonly receiptsById = new Map<string, BrokerReceipt>()
   private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string }>()
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
+  private readonly pendingRequests = new Set<Promise<void>>()
+  private readonly incomingRequests = new Set<IncomingMessage>()
+  private readonly upstreamRequests = new Set<http.ClientRequest>()
+  private readonly settlementFailures: BrokerSettlementFailure[] = []
+  private draining = false
+  private drainExpired = false
   private stopFailuresRemaining = 0
+  private transportSequence = 0
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
@@ -77,6 +97,8 @@ export class RestrictedDockerBroker {
     return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
+  historyHelperNames(): string[] { return [...this.historyHelpers.keys()] }
+
   eventsSnapshot(): BrokerEvent[] {
     return [...this.events]
   }
@@ -89,6 +111,35 @@ export class RestrictedDockerBroker {
     return this.events.filter((event) => event.destructive && event.containerId === containerId)
   }
 
+  // Test-only inspector admission; these IDs confer no runtime mutation rights
+  // and deliberately never join receiptIds()/receipts()/knownContainerIds.
+  admitTask2LegacyNegativeInspection(inspected: Record<string, any>, original: Record<string, any>): void {
+    const ownerId = original.Id
+    const owner = this.receiptsById.get(ownerId), id = inspected.Id
+    const labels = inspected.Config?.Labels ?? {}
+    const originalLabels = original.Config?.Labels ?? {}
+    if (!this.policy.allowTask2LegacyNegativeFixtures || !owner || !/^[a-f0-9]{64}$/.test(id)
+      || this.knownContainerIds.has(id) || this.task2LegacyNegativeInspectionOwners.has(id)
+      || inspected.Image !== owner.imageRef || inspected.State?.Status !== 'created'
+      || inspected.State?.Running !== false || inspected.State?.Pid !== 0
+      || labels['com.freshell.runtime-test-run-id'] !== this.policy.testRunId
+      || labels['com.freshell.managed'] !== 'true' || labels.project !== 'freshell'
+      || labels['com.freshell.soul-id'] !== owner.soulId
+      || labels['com.freshell.incarnation-id'] !== owner.incarnationId
+      || original.Image !== owner.imageRef
+      || originalLabels['com.freshell.soul-id'] !== owner.soulId
+      || originalLabels['com.freshell.incarnation-id'] !== owner.incarnationId
+      || originalLabels['com.freshell.runtime-test-run-id'] !== this.policy.testRunId
+      || !originalLabels['com.freshell.installation-id']
+      || labels['com.freshell.installation-id'] !== originalLabels['com.freshell.installation-id']
+      || !['extra_mount', 'missing_tmpfs', 'missing_binary', 'foreign_binary'].includes(labels['com.freshell.task2-negative']))
+      throw new Error('exact never-started Task2 negative inspector fixture required')
+    this.task2LegacyNegativeInspectionOwners.set(id, ownerId)
+  }
+
+  forgetTask2LegacyNegativeInspection(containerId: string): void {
+    this.task2LegacyNegativeInspectionOwners.delete(containerId)
+  }
   failNextStop(count = 1): void {
     this.stopFailuresRemaining = Math.max(0, count)
   }
@@ -99,7 +150,33 @@ export class RestrictedDockerBroker {
     fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
-      void this.handle(request, response)
+      if (this.draining) {
+        response.writeHead(503, { connection: 'close' })
+        response.end('owner cleanup in progress')
+        request.resume()
+        return
+      }
+      this.incomingRequests.add(request)
+      const settlement = this.handle(request, response).catch(() => {
+        try {
+          this.record({
+            method: request.method ?? 'GET', url: request.url ?? '/',
+            decision: 'block', reason: 'owner_request_failed', destructive: false, unsafeAttempt: false,
+          })
+        } catch {
+          process.stderr.write(`${JSON.stringify({
+            severity: 'error', event: 'runtime.broker.request_failure_logging_failed', runId: this.policy.testRunId,
+          })}\n`)
+        } finally {
+          response.destroy()
+        }
+      })
+      this.pendingRequests.add(settlement)
+      const forget = () => {
+        this.pendingRequests.delete(settlement)
+        this.incomingRequests.delete(request)
+      }
+      settlement.then(forget, forget)
     })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
@@ -110,9 +187,31 @@ export class RestrictedDockerBroker {
 
   async close(): Promise<void> {
     if (!this.server) return
-    await new Promise<void>((resolve) => this.server!.close(() => resolve()))
+    const closed = new Promise<void>((resolve) => this.server!.close(() => resolve()))
+    this.server.closeAllConnections()
+    await closed
     this.server = undefined
     fs.rmSync(this.policy.proxySocketPath, { force: true })
+  }
+
+  /** The owner first stops its exact producers/enclosures, keeping this broker
+   * available until their already-forwarded operations publish their receipts. */
+  async awaitPendingRequests(): Promise<BrokerSettlementFailure[]> {
+    this.draining = true
+    // Only shutdown has a deadline. A healthy helper wait may legitimately run
+    // for the full scenario. Expiry destroys and joins our actual transports;
+    // it cannot establish whether an unacknowledged daemon create allocated.
+    const deadline = setTimeout(() => {
+      this.drainExpired = true
+      for (const request of this.upstreamRequests) request.destroy(new Error('cleanup_deadline'))
+      for (const request of this.incomingRequests) request.destroy()
+    }, CLEANUP_DRAIN_MS)
+    try {
+      while (this.pendingRequests.size) await Promise.all([...this.pendingRequests])
+      return [...this.settlementFailures]
+    } finally {
+      clearTimeout(deadline)
+    }
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -144,16 +243,23 @@ export class RestrictedDockerBroker {
       return
     }
 
-    const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs))?(?:\?.*)?$/)
+    const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs|json))?(?:\?.*)?$/)
     const helperEntry = helperTarget && [...this.historyHelpers].find(([name, helper]) => (
       helperTarget[1] === name || helperTarget[1] === helper.containerId
     ))
     if (helperEntry) {
       const [name, helper] = helperEntry
       const exactId = helperTarget![1] === helper.containerId
-      const allowed = (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/start`)
-        || (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/wait?condition=not-running`)
-        || (method === 'GET' && exactId && [0, 1].some((stderr) => url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/logs?stdout=1&stderr=${stderr}`))
+      const helperPath = `${DOCKER_API_PREFIX}/containers/${helper.containerId}`
+      // API1.47 omitted wait condition is not-running. Docker logs first
+      // inspects Tty, then serializes the same stdout/stderr flags stderr-first.
+      const allowed = (method === 'POST' && exactId && [
+        `${helperPath}/start`, `${helperPath}/wait`, `${helperPath}/wait?condition=not-running`,
+      ].includes(url))
+        || (method === 'GET' && exactId && [
+          `${helperPath}/json`, `${helperPath}/logs?stdout=1&stderr=0`,
+          `${helperPath}/logs?stdout=1&stderr=1`, `${helperPath}/logs?stderr=1&stdout=1`,
+        ].includes(url))
         || (method === 'DELETE' && url === `${DOCKER_API_PREFIX}/containers/${helperTarget![1]}?force=1`)
       if (allowed) {
         const forwarded = await this.forward(request, body)
@@ -166,10 +272,11 @@ export class RestrictedDockerBroker {
 
     if (method === 'POST' && url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`)) {
       const name = new URL(url, 'http://docker').searchParams.get('name') ?? ''
-      if (name.startsWith('freshell-history-')) {
-        const owner = this.validateHistoryHelper(name, body)
+      if (name.startsWith('freshell-history-') || name.startsWith('freshell-opencode-repair-')) {
+        const owner = name.startsWith('freshell-opencode-repair-')
+          ? this.validateStoppedRepairHelper(name, body) : this.validateHistoryHelper(name, body)
         if (!owner || this.historyHelpers.has(name)) {
-          this.block(response, method, url, 403, 'history helper does not match an owned read-only source', false)
+          this.block(response, method, url, 403, 'helper does not match its owned source and topology', false)
           return
         }
         // Reserve the exact validated name before forwarding: Docker may create it but lose its acknowledgement.
@@ -231,6 +338,12 @@ export class RestrictedDockerBroker {
     }
 
     if (target) {
+      const negativeOwner = this.task2LegacyNegativeInspectionOwners.get(target.containerId)
+      if (negativeOwner && method === 'GET' && target.action === 'json') {
+        await this.forwardAndReply(request, response, body, { destructive: false,
+          containerId: target.containerId, ownerContainerId: negativeOwner })
+        return
+      }
       const known = this.knownContainerIds.has(target.containerId)
       if (!known) {
         this.block(response, method, url, 403, 'container id is not in this broker run receipt set', destructive, target.containerId)
@@ -303,8 +416,12 @@ export class RestrictedDockerBroker {
     if (host.Privileged === true) return { ok: false, reason: 'privileged runtime forbidden' }
     if (!Array.isArray(host.CapDrop) || !host.CapDrop.includes('ALL')) return { ok: false, reason: 'all capabilities must be dropped before explicit host additions' }
     const capAdd = Array.isArray(host.CapAdd) ? [...host.CapAdd].sort() : []
-    const expectedCapAdd = terminalWorkload ? ['CHOWN', 'SETGID', 'SETUID'] : []
-    if (JSON.stringify(capAdd) !== JSON.stringify(expectedCapAdd)) return { ok: false, reason: `unexpected host capability additions: ${capAdd.join(',')}` }
+    const allowedCapAdd = terminalWorkload
+      ? [['CHOWN', 'KILL', 'SETGID', 'SETUID'], ['CHOWN', 'SETGID', 'SETUID']]
+      : [[]]
+    if (!allowedCapAdd.some((capabilities) => JSON.stringify(capAdd) === JSON.stringify(capabilities))) {
+      return { ok: false, reason: `unexpected host capability additions: ${capAdd.join(',')}` }
+    }
     if (!Array.isArray(host.SecurityOpt) || !host.SecurityOpt.includes('no-new-privileges:true')) return { ok: false, reason: 'no-new-privileges is required' }
     if (host.RestartPolicy?.Name !== 'no') return { ok: false, reason: 'staging container must start with restart=no' }
     if (!(Number(host.NanoCpus) > 0) || !(Number(host.Memory) > 0) || !(Number(host.PidsLimit) > 0)) {
@@ -334,6 +451,7 @@ export class RestrictedDockerBroker {
     let providerVolumeName = ''
     let workspacePath = ''
     let actorStateDir = ''
+    let opencodeTransferStagePath: string | undefined
     for (const bind of binds) {
       const parts = bind.split(':')
       const mode = parts.pop() ?? ''
@@ -349,6 +467,22 @@ export class RestrictedDockerBroker {
       }
       if (destination === '/home/freshell/provider' && mode === 'rw' && /^freshell-provider-[a-f0-9]{24}$/.test(source)) {
         providerVolumeName = source
+        continue
+      }
+      if (terminalWorkload && destination === '/run/freshell-opencode-transfer') {
+        const relative = path.relative(this.policy.runtimeRootPrefix, source)
+        const parts = relative.split(path.sep)
+        if (mode !== 'ro'
+          || !isStrictDescendant(source, this.policy.runtimeRootPrefix)
+          || parts.length !== 4
+          || !/^[a-zA-Z0-9-]+$/.test(parts[0])
+          || parts[1] !== 'x'
+          || parts[2] !== 'opencode-transfers'
+          || !/^opencode-transfer-[a-zA-Z0-9-]+\.ready$/.test(parts[3])
+          || opencodeTransferStagePath) {
+          return { ok: false, reason: `unapproved OpenCode transfer stage bind ${bind}` }
+        }
+        opencodeTransferStagePath = source
         continue
       }
       if (destination === '/run/freshell-host-actor' && mode === 'rw') {
@@ -379,6 +513,10 @@ export class RestrictedDockerBroker {
       return { ok: false, reason: `unapproved bind ${bind}` }
     }
     if (!hostBinaryPath || !runtimeDir || !providerVolumeName) return { ok: false, reason: 'required binary/runtime/provider-volume bind topology missing' }
+    if (opencodeTransferStagePath
+      && path.dirname(opencodeTransferStagePath) !== path.join(path.dirname(runtimeDir), 'opencode-transfers')) {
+      return { ok: false, reason: 'OpenCode transfer stage is not owned by the active runtime root' }
+    }
     if (terminalWorkload && !workspacePath) return { ok: false, reason: 'terminal workload missing approved workspace bind' }
     const actorKey = createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex')
     const expectedActorStateDir = path.join(path.dirname(runtimeDir), 'souls', actorKey, 'actor')
@@ -394,6 +532,53 @@ export class RestrictedDockerBroker {
     return { ok: true, incarnationId, soulId, imageRef, runtimeDir, hostBinaryPath, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
   }
 
+  private validateStoppedRepairHelper(name: string, body: Buffer): BrokerReceipt | undefined {
+    if (!/^freshell-opencode-repair-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(name)) return
+    let parsed: Record<string, any>
+    try { parsed = JSON.parse(body.toString('utf8')) } catch { return }
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    const host = parsed.HostConfig ?? {}
+    const workspace = parsed.Cmd?.[4]
+    const cwd = parsed.WorkingDir
+    if (parsed.User !== '0:0' || parsed.Tty !== false || Object.keys(parsed.Labels ?? {}).length !== 0
+      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])
+      || typeof workspace !== 'string' || path.normalize(workspace) !== workspace || !this.isAllowedWorkspacePath(workspace)
+      || typeof cwd !== 'string' || path.normalize(cwd) !== cwd
+      || !(cwd === workspace || isStrictDescendant(cwd, workspace))
+      || !same(parsed.Cmd, ['opencode-stopped-repair-worker', '--stage-dir', '/run/freshell-opencode-transfer',
+        '--workspace-root', workspace, '--expected-cwd', cwd, '--provider-uid', '65534', '--provider-gid', '0'])
+      || !this.validHistoryHelperHost(host, false, ['SETUID', 'SETGID'])
+      || (host.PortBindings && Object.keys(host.PortBindings).length > 0)
+      || (host.ExtraHosts?.length ?? 0) !== 0) return
+    const mounts: Record<string, any>[] = host.Mounts
+    if (!Array.isArray(mounts) || ![4, 5].includes(mounts.length)
+      || new Set(mounts.map(mount => mount.Target)).size !== mounts.length) return
+    const binary = mounts.find(mount => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    const volume = mounts.find(mount => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === false)
+    const stage = mounts.find(mount => mount.Type === 'bind' && mount.Target === '/run/freshell-opencode-transfer' && mount.ReadOnly === true)
+    const workspaceMount = mounts.find(mount => mount.Type === 'bind' && mount.Source === workspace && mount.Target === workspace && mount.ReadOnly === true)
+    if (!binary || !volume || !stage || !workspaceMount || typeof stage.Source !== 'string'
+      || path.normalize(stage.Source) !== stage.Source || !/^(?:opencode-transfer-[a-zA-Z0-9-]+|stopped-repair-[a-f0-9]{48})\.ready$/.test(path.basename(stage.Source))) return
+    if (mounts.length === 5) {
+      const git = mounts.find(mount => mount !== binary && mount !== volume && mount !== stage && mount !== workspaceMount)
+      if (!git || git.Type !== 'bind' || git.ReadOnly !== true || git.Source !== git.Target
+        || typeof git.Source !== 'string' || path.normalize(git.Source) !== git.Source
+        || !this.isAllowedWorkspacePath(git.Source) || git.Source === workspace || isStrictDescendant(git.Source, workspace)) return
+    }
+    const requiredEnv = new Map([
+      ['HOME', '/home/freshell/provider'], ['XDG_DATA_HOME', '/home/freshell/provider/.local/share'],
+      ['XDG_CONFIG_HOME', '/home/freshell/provider/.config'], ['OPENCODE_DB', '/home/freshell/provider/.local/share/opencode/opencode.db'],
+    ])
+    // Production clones terminal.env, then forces these four locations. The ordinary host's Env is a different projection.
+    if (!Array.isArray(parsed.Env) || parsed.Env.some((value: unknown) => typeof value !== 'string' || value.indexOf('=') < 1 || value.includes('\0'))) return
+    const env: string[] = parsed.Env
+    const keys = env.map(value => value.slice(0, value.indexOf('=')))
+    if (new Set(keys).size !== keys.length || [...requiredEnv].some(([key, value]) => !env.includes(`${key}=${value}`))) return
+    return this.receipts().find(receipt => receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source
+      && receipt.providerVolumeName === volume.Source && receipt.workspacePath === workspace
+      && path.dirname(stage.Source) === path.join(path.dirname(receipt.runtimeDir), 'opencode-transfers'))
+  }
+
   private validateHistoryHelper(name: string, body: Buffer): BrokerReceipt | undefined {
     if (!/^freshell-history-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(name)) return
     let parsed: Record<string, any>
@@ -401,27 +586,104 @@ export class RestrictedDockerBroker {
     const host = parsed.HostConfig ?? {}
     if (Object.keys(parsed.Labels ?? {}).length !== 0) return
     const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
-    if (parsed.User !== '65534:0' || parsed.Tty !== true
-      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])
-      || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
+    if (same(parsed.Entrypoint, ['node'])) return this.validateNodeHistoryHelper(parsed)
+    if (parsed.User !== '65534:0'
+      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])) return
     const cmd = parsed.Cmd
-    if (!Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== 'native-history-only'
+    const retained = Array.isArray(cmd) && cmd.length === 2 && cmd[0] === 'retained-opencode-store-worker'
+    if (parsed.Tty !== !retained) return
+    let selected: Record<string, any> | undefined
+    if (retained) {
+      if (typeof cmd[1] !== 'string' || Buffer.byteLength(cmd[1]) > 8192) return
+      try { selected = JSON.parse(cmd[1]) } catch { return }
+      if (!selected || Object.keys(selected).sort().join(',') !== 'cwd,imageRef,nativeSessionId,providerGid,providerHome,providerStoreId,providerUid,workspacePath'
+        || selected.imageRef !== parsed.Image || !/^sha256:[a-f0-9]{64}$/.test(selected.imageRef)
+        || selected.providerHome !== '/home/freshell/provider' || selected.providerUid !== 65534 || selected.providerGid !== 0
+        || typeof selected.providerStoreId !== 'string' || !selected.providerStoreId || selected.providerStoreId.length > 256
+        || typeof selected.nativeSessionId !== 'string' || !/^ses_[A-Za-z0-9_-]{1,252}$/.test(selected.nativeSessionId)
+        || typeof selected.workspacePath !== 'string' || path.normalize(selected.workspacePath) !== selected.workspacePath || !this.isAllowedWorkspacePath(selected.workspacePath)
+        || typeof selected.cwd !== 'string' || path.normalize(selected.cwd) !== selected.cwd
+        || !(selected.cwd === selected.workspacePath || isStrictDescendant(selected.cwd, selected.workspacePath))
+        || parsed.WorkingDir !== selected.cwd
+        // Docker CLI serializes its environment map in arbitrary order.
+        // Sorting keeps the exact four entries, including duplicate rejection.
+        || !Array.isArray(parsed.Env)
+        || !same([...parsed.Env].sort(), ['HOME=/home/freshell/provider', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', 'XDG_DATA_HOME=/home/freshell/provider/.local/share'])) return
+    } else if (!Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== 'native-history-only'
       || cmd[1] !== '--provider' || !['claude', 'kilroy', 'codex', 'opencode'].includes(cmd[2])
       || cmd[3] !== '--session-id' || typeof cmd[4] !== 'string' || !cmd[4]
-      || cmd[5] !== '--provider-home' || cmd[6] !== '/home/freshell/provider') return
-    if (host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true || host.Privileged === true
-      || (host.PidMode ?? '') !== '' || (host.Binds?.length ?? 0) !== 0 || (host.CapAdd?.length ?? 0) !== 0
-      || !same(host.CapDrop, ['ALL']) || !same(host.SecurityOpt, ['no-new-privileges'])
-      || host.Memory !== 256 * 1024 * 1024 || host.MemorySwap !== 256 * 1024 * 1024
-      || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32
-      || !same(host.Tmpfs, { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' })) return
+      || cmd[5] !== '--provider-home' || cmd[6] !== '/home/freshell/provider'
+      || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
+    if (!this.validHistoryHelperHost(host, retained)) return
     const mounts = host.Mounts
-    if (!Array.isArray(mounts) || mounts.length !== 2) return
+    if (!Array.isArray(mounts) || (retained ? ![3, 4].includes(mounts.length) : mounts.length !== 2)) return
     const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
     const volume = mounts.find((mount) => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
     if (!binary || !volume || !this.policy.allowedHostBinaryPaths.has(binary.Source) || !this.policy.allowedImageRefs.has(parsed.Image)) return
+    if (retained) {
+      const workspace = mounts.find((mount) => mount.Type === 'bind' && mount.Source === selected!.workspacePath && mount.Target === selected!.workspacePath && mount.ReadOnly === true)
+      if (!workspace || new Set(mounts.map((mount) => mount.Target)).size !== mounts.length) return
+      if (mounts.length === 4) {
+        const git = mounts.find((mount) => mount !== binary && mount !== volume && mount !== workspace)
+        if (!git || git.Type !== 'bind' || git.ReadOnly !== true || git.Source !== git.Target
+          || !this.isAllowedWorkspacePath(git.Source) || isStrictDescendant(git.Source, workspace.Source)) return
+      }
+      return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source && receipt.workspacePath === workspace.Source)
+    }
     return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source
       && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
+  }
+
+  private validHistoryHelperHost(host: Record<string, any>, retained: boolean, capAdd: string[] = []): boolean {
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    return host.NetworkMode === 'none' && host.ReadonlyRootfs === true && host.Privileged !== true
+      && (host.PidMode ?? '') === '' && (host.Binds?.length ?? 0) === 0 && same(host.CapAdd ?? [], capAdd)
+      && same(host.CapDrop, ['ALL']) && same(host.SecurityOpt, ['no-new-privileges'])
+      && host.Memory === 256 * 1024 * 1024 && host.MemorySwap === 256 * 1024 * 1024
+      && host.NanoCpus === 500_000_000 && host.PidsLimit === 32
+      && same(host.Tmpfs, { '/tmp': retained ? 'rw,noexec,nosuid,nodev,size=64m' : 'rw,noexec,nosuid,nodev,size=16m' })
+  }
+
+  private validateNodeHistoryHelper(parsed: Record<string, any>): BrokerReceipt | undefined {
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    const host = parsed.HostConfig ?? {}
+    const cmd = parsed.Cmd
+    const semantic = Array.isArray(cmd) && cmd.length === 7 && cmd[2] === TASK007_BATCH_STORE_PROBE
+    const workspace = semantic ? cmd[6] : parsed.WorkingDir
+    if (typeof workspace !== 'string' || path.normalize(workspace) !== workspace || !this.isAllowedWorkspacePath(workspace)) return
+    const sources: Record<string, string> = {
+      claude: '/home/freshell/provider/.claude/projects', codex: '/home/freshell/provider/.codex/sessions',
+      opencode: '/home/freshell/provider/.local/share/opencode/opencode.db', amplifier: '/home/freshell/provider/.amplifier/projects',
+    }
+    // Read the owner binding only when handling a request, after both ESM
+    // modules initialize; the helper admits no caller-selected script.
+    const batch = Array.isArray(cmd) && (cmd.length === 5 || semantic) && cmd[0] === '--no-warnings' && cmd[1] === '-e'
+      && cmd[2] === TASK007_BATCH_STORE_PROBE && cmd[3] === sources.opencode
+      && typeof cmd[4] === 'string' && /^ses_[A-Za-z0-9_-]{1,252}$/.test(cmd[4])
+      && (!semantic || cmd[5] === '/run/freshell-opencode-reader.frame')
+      && typeof parsed.Image === 'string' && /^sha256:[a-f0-9]{64}$/.test(parsed.Image)
+    const native = typeof workspace === 'string' && Array.isArray(cmd) && cmd.length === 5
+      && cmd[0] === '--no-warnings'
+      && cmd[1] === path.join(workspace, 'dist', `native-history-${this.policy.testRunId}`, 'probe-cli.mjs')
+      && typeof cmd[2] === 'string' && Object.hasOwn(sources, cmd[2]) && cmd[3] === sources[cmd[2]]
+      && typeof cmd[4] === 'string' && cmd[4].length > 0
+    if ((!batch && !native) || parsed.User !== '65534:0' || parsed.Tty !== !batch || !this.validHistoryHelperHost(host, false)
+      || !Array.isArray(parsed.Env) || !same([...parsed.Env].sort(), semantic ? ['HOME=/home/freshell/provider', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', 'XDG_DATA_HOME=/home/freshell/provider/.local/share'] : ['HOME=/home/freshell/provider'])
+      || (semantic && (typeof parsed.WorkingDir !== 'string' || path.normalize(parsed.WorkingDir) !== parsed.WorkingDir
+        || !(parsed.WorkingDir === workspace || isStrictDescendant(parsed.WorkingDir, workspace))))
+      || !this.policy.allowedImageRefs.has(parsed.Image)) return
+    const mounts = host.Mounts
+    if (!Array.isArray(mounts) || mounts.length !== (semantic ? 4 : 2) || new Set(mounts.map(mount => mount.Target)).size !== mounts.length) return
+    const volume = mounts.find(mount => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
+    const source = mounts.find(mount => mount.Type === 'bind' && mount.Source === workspace && mount.Target === workspace && mount.ReadOnly === true)
+    if (!volume || !source) return
+    const binary = semantic && mounts.find(mount => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    const descriptor = semantic && mounts.find(mount => mount.Type === 'bind' && mount.Target === '/run/freshell-opencode-reader.frame' && mount.ReadOnly === true)
+    if (semantic && (!binary || !descriptor || !this.policy.allowedHostBinaryPaths.has(binary.Source))) return
+    return this.receipts().find(receipt => receipt.providerVolumeName === volume.Source
+      && receipt.workspacePath === workspace && receipt.imageRef === parsed.Image
+      && (!semantic || (binary.Source === receipt.hostBinaryPath
+        && descriptor.Source === path.join(receipt.runtimeDir, 'task007-reader-descriptor.frame'))))
   }
 
   private isAllowedWorkspacePath(candidate: string): boolean {
@@ -432,14 +694,21 @@ export class RestrictedDockerBroker {
     return false
   }
 
-  private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string }): Promise<void> {
+  private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string; ownerContainerId?: string }): Promise<void> {
     const forwarded = await this.forward(request, body)
-    this.record({ method: request.method ?? 'GET', url: request.url ?? '/', decision: 'forward', destructive: event.destructive, unsafeAttempt: false, containerId: event.containerId })
+    this.record({ method: request.method ?? 'GET', url: request.url ?? '/', decision: 'forward', destructive: event.destructive, unsafeAttempt: false, containerId: event.containerId, ownerContainerId: event.ownerContainerId })
     replyDocker(response, forwarded)
   }
 
   private forward(request: IncomingMessage, body: Buffer): Promise<DockerResponse> {
+    if (this.drainExpired) return Promise.reject(new Error('broker cleanup deadline expired'))
+    const requestId = `${this.policy.testRunId}:${++this.transportSequence}`
+    const started = performance.now()
+    const address = { requestId, method: request.method ?? 'GET', ...transportAddress(request.url ?? '/') }
+    this.recordTransport('request_started', 'info', address)
     return new Promise((resolve, reject) => {
+      let result: DockerResponse | undefined
+      let failure: string | undefined
       const upstream = http.request({
         socketPath: this.policy.realSocketPath,
         path: request.url,
@@ -448,12 +717,49 @@ export class RestrictedDockerBroker {
       }, (upstreamResponse) => {
         const chunks: Buffer[] = []
         upstreamResponse.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
-        upstreamResponse.once('end', () => resolve({ statusCode: upstreamResponse.statusCode ?? 500, headers: upstreamResponse.headers, body: Buffer.concat(chunks) }))
+        upstreamResponse.once('end', () => { result = { statusCode: upstreamResponse.statusCode ?? 500, headers: upstreamResponse.headers, body: Buffer.concat(chunks) } })
+        const failResponse = () => { failure ??= 'upstream_response_incomplete'; upstream.destroy() }
+        upstreamResponse.once('aborted', failResponse)
+        upstreamResponse.once('error', failResponse)
+        upstreamResponse.once('close', () => { if (!upstreamResponse.complete) failResponse() })
       })
-      upstream.once('error', reject)
+      this.upstreamRequests.add(upstream)
+      upstream.once('error', () => { failure ??= this.drainExpired ? 'cleanup_deadline' : 'upstream_request_failed' })
+      upstream.once('close', () => {
+        this.upstreamRequests.delete(upstream)
+        this.recordTransport('request_completed', result && !failure ? 'info' : 'warn', {
+          ...address, durationMs: Math.max(0, performance.now() - started),
+          ...(result && !failure ? { statusCode: result.statusCode } : { errorCategory: failure ?? 'upstream_response_incomplete' }),
+        })
+        if (result && !failure) { resolve(result); return }
+        const details: BrokerSettlementFailure = { method: request.method ?? 'GET', url: request.url ?? '/',
+          reason: failure ?? 'upstream_response_incomplete',
+          allocationUnknown: request.method === 'POST' && !!request.url?.startsWith(`${DOCKER_API_PREFIX}/containers/create?`) }
+        this.settlementFailures.push(details)
+        try {
+          this.record({ ...details, decision: 'block', destructive: false, unsafeAttempt: false })
+          reject(new Error(details.reason))
+        } catch (error) {
+          reject(error)
+        }
+      })
       if (body.length > 0) upstream.write(body)
       upstream.end()
     })
+  }
+
+  /** Transport diagnostics do not enter the ownership/cleanup receipt stream. */
+  private recordTransport(phase: 'request_started' | 'request_completed', severity: 'info' | 'warn', fields: {
+    requestId: string; method: string; route: string; containerId?: string; stopGraceSeconds?: number; durationMs?: number; statusCode?: number; errorCategory?: string
+  }): void {
+    const entry = { at: new Date().toISOString(), severity, event: `runtime.broker.${phase}`, ...fields }
+    try {
+      fs.appendFileSync(this.policy.logPath, `${JSON.stringify(entry)}\n`, { mode: 0o600 })
+      fs.chmodSync(this.policy.logPath, 0o600)
+    } catch {
+      process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'runtime.broker.transport_logging_failed',
+        runId: this.policy.testRunId, requestId: fields.requestId, phase })}\n`)
+    }
   }
 
   private block(response: ServerResponse, method: string, url: string, status: number, reason: string, destructive: boolean, containerId?: string): void {
@@ -463,12 +769,28 @@ export class RestrictedDockerBroker {
     response.end(JSON.stringify({ message: reason }))
   }
 
-  private record(event: Omit<BrokerEvent, 'at'>): void {
-    const full: BrokerEvent = { at: new Date().toISOString(), ...event }
+  private record(event: Omit<BrokerEvent, 'at' | 'severity'>): void {
+    const full: BrokerEvent = { at: new Date().toISOString(), severity: event.decision === 'forward' ? 'info' : 'warn', ...event }
     this.events.push(full)
     fs.appendFileSync(this.policy.logPath, `${JSON.stringify(full)}\n`, { mode: 0o600 })
     fs.chmodSync(this.policy.logPath, 0o600)
   }
+}
+
+/** Only fixed actions, exact container IDs and numeric Stop grace belong in diagnostics. */
+function transportAddress(url: string): { route: string; containerId?: string; stopGraceSeconds?: number } {
+  const parsed = new URL(url, 'http://docker')
+  if (parsed.pathname === '/_ping') return { route: 'daemon_ping' }
+  if (parsed.pathname === `${DOCKER_API_PREFIX}/info`) return { route: 'daemon_info' }
+  if (parsed.pathname === `${DOCKER_API_PREFIX}/containers/create`) return { route: 'container_create' }
+  if (parsed.pathname.startsWith(`${DOCKER_API_PREFIX}/volumes/`)) return { route: 'volume_inspect' }
+  const target = parsed.pathname.match(/^\/v1\.47\/containers\/([^/]+)(?:\/(json|start|stop|kill|unpause|update|wait|logs))?$/)
+  const action = target?.[2] ?? 'remove'
+  const containerId = target && /^[a-f0-9]{64}$/.test(target[1]) ? target[1] : undefined
+  const grace = parsed.searchParams.get('t')
+  const stopGraceSeconds = action === 'stop' && grace !== null && /^\d+$/.test(grace) && Number.isSafeInteger(Number(grace)) ? Number(grace) : undefined
+  return { route: target ? `container_${action}` : 'unknown',
+    ...(containerId ? { containerId } : {}), ...(stopGraceSeconds !== undefined ? { stopGraceSeconds } : {}) }
 }
 
 function parseContainerTarget(url: string): { containerId: string; action: string } | undefined {

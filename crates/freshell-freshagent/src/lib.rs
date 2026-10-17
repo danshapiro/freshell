@@ -3158,11 +3158,68 @@ impl FreshAgentState {
             // re-lookup, never a spawn, never a kill.
             Err(_) => return self.opencode_disk_state_response(thread_id),
         };
-        let messages = match manager.list_messages_at(thread_id, &route, &base).await {
+        let (messages, message_status) = match manager
+            .list_messages_at_with_status(thread_id, &route, &base)
+            .await
+        {
             Ok(value) => value,
-            Err(ServeError::Http { status: 404, .. }) => json!([]),
+            Err(ServeError::Http { status: 404, .. }) => (json!([]), 404),
             Err(_) => return self.opencode_disk_state_response(thread_id),
         };
+
+        let message_rows = messages.as_array();
+        let user_message_count = message_rows
+            .into_iter()
+            .flatten()
+            .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+            .count();
+        let assistant_message_count = message_rows
+            .into_iter()
+            .flatten()
+            .filter(|message| {
+                message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+            })
+            .count();
+        let assistant_text_bytes = message_rows
+            .into_iter()
+            .flatten()
+            .filter(|message| {
+                message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+            })
+            .flat_map(|message| {
+                message
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(str::len)
+            .sum::<usize>();
+        if message_rows.is_none_or(Vec::is_empty) || message_status != 200 {
+            let info_id_matches = info.get("id").and_then(Value::as_str) == Some(thread_id);
+            let payload_kind = match &messages {
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                Value::String(_) => "string",
+                Value::Number(_) => "number",
+                Value::Bool(_) => "boolean",
+                Value::Null => "null",
+            };
+            tracing::info!(target: "freshell_freshagent::opencode",
+                session_id = %thread_id,
+                route_cwd_present = route.is_some(),
+                info_id_matches = info_id_matches,
+                message_http_status = message_status,
+                message_payload_kind = payload_kind,
+                message_rows = message_rows.map_or(0, Vec::len),
+                user_message_count,
+                assistant_message_count,
+                assistant_text_bytes,
+                "freshagent.opencode.native_transcript_read"
+            );
+        }
 
         // Kata 1wxv Task 5: the DURABLE rollback record (memory-fast sync read
         // over the ledger's write-through index) sources the marker bucket,

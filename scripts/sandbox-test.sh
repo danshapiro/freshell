@@ -12,8 +12,9 @@
 #   scripts/sandbox-test.sh --native-tools <manifest-path> --receipt-dir <absolute-directory>
 #   scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex ..."
 #
-# --runtime-suite is the stricter managed-runtime lifecycle mode: no network,
-# no real provider corpus, no Docker/admin socket, read-only container root.
+# --runtime-suite prepares dependencies first, then runs the caller in the
+# stricter managed-runtime lifecycle mode: no network, no real provider corpus,
+# no Docker/admin socket, read-only container root.
 #
 # --corpus mounts ~/.codex/sessions and ~/.claude/projects READ-ONLY at their
 # natural paths inside the container, for realistic-data perf tests. Without
@@ -31,6 +32,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
+CACHE_PREFIX="${FRESHELL_SANDBOX_CACHE_PREFIX:-freshell-sandbox}"
 
 if [ "${1:-}" = "--native-tools" ]; then
   NATIVE_MANIFEST="${2:-}"
@@ -91,52 +93,62 @@ if [ "$#" -lt 1 ]; then
 fi
 CMD="$1"
 
+# This one committed library selector needs the owned runtime broker and its
+# daemon-host paths. Every parent and its aborting child still runs enclosed.
+if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "$#" -eq 1 ] && \
+   [ "${CMD}" = "cargo test -p freshell-supervisor stopped_repair_crash_ -- --ignored" ]; then
+  cd "${REPO_ROOT}"
+  exec pnpm exec tsx "${REPO_ROOT}/scripts/testing/task007-destructive-sandbox.ts"
+fi
+
+# A prefix must name Docker volumes, never turn these mounts into host paths.
+if [[ ! "${CACHE_PREFIX}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+  echo "[sandbox] FRESHELL_SANDBOX_CACHE_PREFIX must be a Docker volume name prefix, not a path" >&2
+  exit 2
+fi
+
 if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
   echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
   "${REPO_ROOT}/scripts/sandbox-build.sh"
 fi
 
-# Ordinary destructive tests keep the established dedicated bridge network.
-# Managed-runtime lifecycle tests are stricter: no network at all. Neither mode
-# ever uses the host network.
-NETWORK_ARGS=()
-if [ "${RUNTIME_SUITE}" -eq 1 ]; then
-  NETWORK_ARGS=(--network none)
-else
-  NETWORK_NAME="freshell-sandbox"
-  if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
-    docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
-  fi
-  NETWORK_ARGS=(--network "${NETWORK_NAME}")
+# Preparation and ordinary tests use the dedicated bridge, never host
+# networking. The runtime-suite caller runs in a separate container without
+# networking after preparation succeeds.
+NETWORK_NAME="freshell-sandbox"
+if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
+  docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
 fi
 
 DOCKER_ARGS=(
   # Reap orphaned test children so zombies cannot exhaust the PID limit.
   run --rm --init
-  "${NETWORK_ARGS[@]}"
   --pids-limit 512
   --memory 8g
   -v "${REPO_ROOT}:/workspace"
-  -v freshell-sandbox-cargo-registry:/usr/local/cargo/registry
-  -v freshell-sandbox-cargo-git:/usr/local/cargo/git
-  -v freshell-sandbox-cargo-target:/workspace/target
-  -v freshell-sandbox-node-modules:/workspace/node_modules
+  -v "${CACHE_PREFIX}-cargo-registry:/usr/local/cargo/registry"
+  -v "${CACHE_PREFIX}-cargo-git:/usr/local/cargo/git"
+  -v "${CACHE_PREFIX}-cargo-target:/workspace/target"
+  -v "${CACHE_PREFIX}-node-modules:/workspace/node_modules"
   # pnpm workspace members with their own dependencies get their own
   # sandbox-owned node_modules (the entrypoint chowns and, on fingerprint
   # changes, purges these only as mounted volumes). On legacy npm-era
   # branches these stay mounted-but-unused and harmless.
-  -v freshell-sandbox-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules
-  -v freshell-sandbox-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules
-  -v freshell-sandbox-playwright-cache:/home/sandbox/.cache/ms-playwright
+  -v "${CACHE_PREFIX}-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules"
+  -v "${CACHE_PREFIX}-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules"
+  -v "${CACHE_PREFIX}-playwright-cache:/home/sandbox/.cache/ms-playwright"
 )
 
+EXECUTION_ARGS=(--network "${NETWORK_NAME}")
 if [ "${RUNTIME_SUITE}" -eq 1 ]; then
-  DOCKER_ARGS+=(
+  EXECUTION_ARGS=(
+    --network none
     --read-only
-    --tmpfs /tmp:rw,nosuid,nodev,size=512m
-    --tmpfs /home/sandbox/.cache:rw,nosuid,nodev,size=256m
+    --tmpfs "/tmp:rw,nosuid,nodev,size=512m"
+    --tmpfs "/home/sandbox/.cache:rw,nosuid,nodev,size=256m"
     --security-opt no-new-privileges
     -e FRESHELL_SANDBOX_MODE=runtime-suite
+    -e CARGO_NET_OFFLINE=true
   )
 fi
 
@@ -177,7 +189,18 @@ done
 # which on Debian unconditionally overwrites PATH and would clobber the
 # cargo/rustup PATH entry set via the image's Dockerfile ENV.
 DOCKER_STATUS=0
-docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?
+if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+  # The entrypoint prepares fingerprinted Node dependencies. Fetch Rust
+  # sources into the same named volumes too, so cold Cargo tests can compile
+  # offline. Only this fixed preparation runs with networking and a writable
+  # root; the caller's command is never sent to this container.
+  echo "[sandbox] preparing runtime-suite dependencies before restricted execution" >&2
+  docker "${DOCKER_ARGS[@]}" --network "${NETWORK_NAME}" "${IMAGE_TAG}" \
+    bash -c 'if [ -f Cargo.lock ]; then cargo fetch --locked; fi' || DOCKER_STATUS=$?
+fi
+if [ "${DOCKER_STATUS}" -eq 0 ]; then
+  docker "${DOCKER_ARGS[@]}" "${EXECUTION_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?
+fi
 
 # Guard-rail: verify the pre-create step above actually did its job, rather
 # than assuming it. If dockerd (or a future volume/mount this script doesn't

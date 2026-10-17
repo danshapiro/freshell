@@ -128,6 +128,11 @@ function rejectRawCodexResume(mode: unknown, resumeSessionId: unknown): boolean 
 
 type CliSessionRef = { provider: string; sessionId: string }
 
+// Kilroy is a logical Claude-backed agent, so its saved root uses provider "claude".
+function freshAgentProvider(agent: string | undefined): string | undefined {
+  return agent === 'kilroy' ? 'claude' : agent
+}
+
 function resolveSessionRefFlag(mode: unknown, raw: unknown): { rejected: boolean; sessionRef?: CliSessionRef } {
   if (raw === undefined) return { rejected: false }
   if (typeof raw !== 'string' || raw.trim().length === 0) {
@@ -458,8 +463,9 @@ async function main() {
       const editor = getFlag(flags, 'editor') as string | undefined
       const model = getFlag(flags, 'model') as string | undefined
       const effort = getFlag(flags, 'effort') as string | undefined
+      const permissionMode = getFlag(flags, 'permissionMode') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
-      const resumeProvider = mode ?? agent
+      const resumeProvider = mode ?? freshAgentProvider(agent)
       const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
       const prompt = getFlag(flags, 'prompt') as string | undefined
       if (rejectRawCodexResume(resumeProvider, resumeSessionId)) return
@@ -478,6 +484,7 @@ async function main() {
         agent,
         model,
         effort,
+        permissionMode,
         ...(isTruthy(getFlag(flags, 'hostStats')) ? { hostStats: true } : {}),
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
@@ -574,13 +581,18 @@ async function main() {
       const browser = getFlag(flags, 'browser') as string | undefined
       const editor = getFlag(flags, 'editor') as string | undefined
       const mode = getFlag(flags, 'mode') as string | undefined
+      const agent = getFlag(flags, 'agent') as string | undefined
+      const model = getFlag(flags, 'model') as string | undefined
+      const effort = getFlag(flags, 'effort') as string | undefined
+      const permissionMode = getFlag(flags, 'permissionMode') as string | undefined
       const shell = getFlag(flags, 'shell') as string | undefined
       const cwd = getFlag(flags, 'cwd') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
-      const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
-      if (rejectRawCodexResume(mode, resumeSessionId)) return
+      const resumeProvider = mode ?? freshAgentProvider(agent)
+      const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
+      if (rejectRawCodexResume(resumeProvider, resumeSessionId)) return
       if (sessionRefResult.rejected) return
-      const promoted = promoteResumeFlag(mode, resumeSessionId, sessionRefResult.sessionRef)
+      const promoted = promoteResumeFlag(resumeProvider, resumeSessionId, sessionRefResult.sessionRef)
       if (promoted.rejected) return
 
       const resolved = await resolvePaneTarget(client, target)
@@ -597,6 +609,10 @@ async function main() {
         mode,
         shell,
         cwd,
+        agent,
+        model,
+        effort,
+        permissionMode,
         ...(isTruthy(getFlag(flags, 'hostStats')) ? { hostStats: true } : {}),
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })

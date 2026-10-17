@@ -2,9 +2,871 @@ use super::*;
 use freshell_protocol::{FreshAgentFork, FreshAgentRecoveryStop};
 use freshell_runtime_protocol::{
     read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope,
-    FreshAgentForkResult, InstallationId, RuntimeErrorCode,
+    FreshAgentForkResult, FreshAgentProviderStartDiagnostic, InstallationId, RuntimeDiagnosticCode,
+    RuntimeErrorCode,
 };
 use tokio::net::UnixListener;
+
+#[cfg(feature = "managed-fresh-agent-fixtures")]
+#[path = "managed_launch_preparation_tests.rs"]
+mod launch_preparation;
+
+#[cfg(feature = "managed-fresh-agent-fixtures")]
+mod initial_grant_reference_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use freshell_runtime_protocol::*;
+    use freshell_supervisor::{
+        admission::AdmissionPolicy,
+        backend::{
+            BackendCreated, BackendError, BackendInspection, CreateRuntimeSpec, RuntimeBackend,
+        },
+        registry::{OwnedRuntimeHandle, Registry},
+        service::{serve_control, Supervisor, SupervisorConfig},
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex as StdMutex,
+    };
+
+    // This replaces only the enclosure and host reply. Registry activation,
+    // grant consumption, RuntimeClient, and the server's wire ACK remain real.
+    // Actual host/actor publication has separate session-host grant coverage.
+    #[derive(Default)]
+    struct GrantBackend {
+        allocations: AtomicUsize,
+        grants: Arc<AtomicUsize>,
+        statuses: Arc<AtomicUsize>,
+        host_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+        shutdown: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        native_root: Option<String>,
+    }
+
+    impl GrantBackend {
+        async fn close(&self) {
+            self.shutdown
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            let task = self.host_task.lock().unwrap().take().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeBackend for GrantBackend {
+        async fn create_stopped(
+            &self,
+            _: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            self.allocations.fetch_add(1, Ordering::SeqCst);
+            Ok(BackendCreated {
+                daemon_id: DockerDaemonId::new(),
+                container_id: "a".repeat(64),
+                immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+            })
+        }
+
+        async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            let handle = handle.clone();
+            let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+            let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
+            let native_root = self.native_root.clone();
+            let grants = self.grants.clone();
+            let statuses = self.statuses.clone();
+            let (shutdown, mut stopped) = tokio::sync::oneshot::channel();
+            *self.shutdown.lock().unwrap() = Some(shutdown);
+            *self.host_task.lock().unwrap() = Some(tokio::spawn(async move {
+                let boot = HostBootId::new();
+                let mut generation = 0;
+                let mut epoch = 0;
+                loop {
+                    let accepted = tokio::select! {
+                        _ = &mut stopped => break,
+                        accepted = listener.accept() => accepted.unwrap(),
+                    };
+                    let (mut socket, _) = accepted;
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.role, ControlRole::Supervisor);
+                    if !matches!(&request.body, HostCommand::Hello { .. }) {
+                        assert_eq!(
+                            request.auth.as_deref(),
+                            Some(
+                                host_proof(&secret, "command-auth", &boot, handle.incarnation_id())
+                                    .as_str()
+                            )
+                        );
+                    }
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            HostResult::Hello {
+                                proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: handle.requested_limits(),
+                            }
+                        }
+                        HostCommand::GrantExecution {
+                            incarnation_id,
+                            soul_id,
+                            host_boot_id,
+                            control_epoch,
+                            execution_generation,
+                            fresh_agent,
+                            native_identity_launch,
+                            ..
+                        } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            assert_eq!(&soul_id, handle.soul_id());
+                            assert_eq!(host_boot_id, boot);
+                            assert_eq!(fresh_agent.as_deref(), handle.fresh_agent());
+                            let binding = native_identity_launch.unwrap();
+                            assert_eq!(binding.incarnation_id, incarnation_id);
+                            assert_eq!(binding.launch_nonce, handle.launch_nonce().as_str());
+                            assert_eq!(binding.execution_generation, execution_generation);
+                            assert!(execution_generation > 0 && control_epoch > 0);
+                            generation = execution_generation;
+                            epoch = control_epoch;
+                            grants.fetch_add(1, Ordering::SeqCst);
+                            HostResult::GrantAccepted {
+                                host_boot_id: boot.clone(),
+                                worker_pid: 123,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                native_session_id: native_root.clone(),
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::FreshAgentReadEvents { incarnation_id, .. } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            // Started never enriches the registry before the first ACK.
+                            HostResult::FreshAgentEvents(AgentEventBatch {
+                                retained_from: 0,
+                                head: 0,
+                                reset_required: false,
+                                events: vec![],
+                            })
+                        }
+                        HostCommand::Status { incarnation_id } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            statuses.fetch_add(1, Ordering::SeqCst);
+                            HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(123),
+                                worker_launch_count: 1,
+                                max_control_epoch: epoch,
+                                max_execution_generation: generation,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: false,
+                                native_session_id: native_root.clone(),
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        _ => panic!(
+                            "creation must not dispatch input, completion or recovery probes"
+                        ),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }));
+            Ok(())
+        }
+        async fn inspect(&self, _: &OwnedRuntimeHandle) -> Result<BackendInspection, BackendError> {
+            unreachable!()
+        }
+        async fn request_stop(&self, _: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            unreachable!()
+        }
+        async fn list_known(
+            &self,
+            _: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            unreachable!()
+        }
+        async fn read_limits(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_fixture_grant_reaches_canonical_ack_all_four_modes() {
+        let test = "fresh_agent_proxy::tests::initial_grant_reference_tests::initial_fixture_grant_reaches_canonical_ack_all_four_modes";
+        let cases = [
+            "freshclaude",
+            "kilroy",
+            "freshcodex",
+            "freshopencode",
+            "absent",
+        ];
+        let child_case = std::env::var("FRESHELL_CREATE_FAILURE_TRACE_CHILD").ok();
+        let Some(case) = child_case.as_deref().filter(|case| cases.contains(case)) else {
+            for case in cases {
+                assert!(create_failure_trace_child(case, test));
+                eprintln!("initial-grant child {case}: passed");
+            }
+            return;
+        };
+        let mode = if case == "absent" {
+            "freshclaude"
+        } else {
+            case
+        };
+        let provider = match mode {
+            "kilroy" => "kilroy",
+            "freshcodex" => "codex",
+            "freshopencode" => "opencode",
+            _ => "claude",
+        };
+        let public_provider = if provider == "kilroy" {
+            "claude"
+        } else {
+            provider
+        };
+        let trace = crate::test_trace_capture::captured_trace_events();
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::open(root.path().join("registry"), None).unwrap();
+        let socket = root.path().join("control.sock");
+        let secret = root.path().join("control-secret");
+        std::fs::write(&secret, "0123456789abcdef").unwrap();
+        crate::managed_mcp_capability::configure("0.0.0.0", 39483, &socket, &secret).unwrap();
+        crate::managed_mcp_capability::spawn_callback_server()
+            .await
+            .unwrap();
+        let backend = Arc::new(GrantBackend {
+            native_root: (case != "absent").then(|| "owned-current-fixture-root".into()),
+            ..Default::default()
+        });
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            backend.clone(),
+            SupervisorConfig {
+                runtime_root: root.path().join("runtimes"),
+                control_socket_path: socket.clone(),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                test_run_id: "initial-grant-reference".into(),
+                control_secret: "0123456789abcdef".into(),
+                lifecycle_log: root.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        let control_socket = socket.clone();
+        let control =
+            tokio::spawn(async move { serve_control(supervisor, &control_socket).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = UnixListener::bind(root.path().join("unrelated.sock")).unwrap();
+        let mut proxy = snapshot_outage_proxy(&socket);
+        Arc::get_mut(&mut proxy)
+            .unwrap()
+            .fixture_modes
+            .insert(mode.into());
+        let mut frames = proxy.broadcast.subscribe();
+        let message = serde_json::json!({"requestId":"initial-grant-reference-owned", "provider":public_provider,
+            "sessionType":mode, "cwd":root.path(), "model":"owned-fixture-model", "effort":"low"});
+        let created = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.create(serde_json::from_value(message.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        if created.is_err() {
+            control.abort();
+            assert!(control.await.unwrap_err().is_cancelled());
+            let reasons = trace
+                .snapshot()
+                .into_iter()
+                .flat_map(|event| {
+                    [
+                        event.fields.get("reason").cloned(),
+                        event.fields.get("runtime_code").cloned(),
+                    ]
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            panic!("controlled launch setup failed with finite reasons: {reasons:?}");
+        }
+        let first: serde_json::Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        let initial = registry.inventory().await.unwrap().remove(0);
+        let context = registry
+            .recovery_context(initial.soul_id.clone())
+            .await
+            .unwrap();
+        let initial_statuses = backend.statuses.load(Ordering::SeqCst);
+        let replayed = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.create(serde_json::from_value(message).unwrap()),
+        )
+        .await
+        .unwrap();
+        let replay: serde_json::Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        let replay_view = registry.inventory().await.unwrap().remove(0);
+        // Join only our host/control tasks even on the causal assertion failure.
+        control.abort();
+        assert!(control.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !proxy.pollers.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        backend.close().await;
+        assert!(
+            tokio::net::UnixStream::connect(root.path().join("unrelated.sock"))
+                .await
+                .is_ok()
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::net::UnixStream::connect(context.prior_handle.runtime_dir().join("host.sock"))
+        )
+        .await
+        .unwrap()
+        .is_err());
+        drop(unrelated);
+        created.unwrap();
+        replayed.unwrap();
+        assert_eq!(
+            initial_statuses, 0,
+            "Status must not enrich the initial view"
+        );
+        assert_eq!(first["type"], "freshAgent.created");
+        assert_eq!(first["requestId"], "initial-grant-reference-owned");
+        assert_eq!(first["provider"], public_provider);
+        assert_eq!(first["runtimeProvider"], provider);
+        assert_eq!(first["sessionType"], mode);
+        assert_eq!(
+            first["sessionId"],
+            initial.fresh_agent_session_id.as_deref().unwrap()
+        );
+        let expected = backend
+            .native_root
+            .as_ref()
+            .map(|root| serde_json::json!({"provider":public_provider,"sessionId":root}));
+        assert_eq!(
+            first.get("sessionRef"),
+            expected.as_ref(),
+            "initial canonical ACK must carry the accepted fixture root"
+        );
+        assert_eq!(initial.native_session_id, backend.native_root);
+        assert_eq!(initial.native_identity_observation, None);
+        assert_eq!(initial.provider.as_deref(), Some(provider));
+        assert_eq!(initial.launch_state, LaunchState::Running);
+        assert_eq!(
+            context.fresh_agent.as_ref().unwrap().model.as_deref(),
+            Some("owned-fixture-model")
+        );
+        assert_eq!(
+            context.fresh_agent.as_ref().unwrap().effort.as_deref(),
+            Some("low")
+        );
+        assert_eq!(replay, first);
+        assert_eq!(replay_view.incarnation_id, initial.incarnation_id);
+        assert_eq!(replay_view.native_session_id, initial.native_session_id);
+        assert_eq!(backend.allocations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.grants.load(Ordering::SeqCst), 1);
+    }
+}
+
+// The MCP controller is process-global. Run these refusal paths in exact
+// isolated test children so their owned HOME/controller cannot affect peers.
+fn create_failure_trace_child(case: &str, test: &str) -> bool {
+    if std::env::var("FRESHELL_CREATE_FAILURE_TRACE_CHILD")
+        .ok()
+        .as_deref()
+        == Some(case)
+    {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env("FRESHELL_CREATE_FAILURE_TRACE_CHILD", case)
+        .env("HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+        .env("CLAUDE_HOME", home.path().join(".claude"))
+        .env("CODEX_HOME", home.path().join(".codex"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env(
+            "FRESHELL_RUNTIME_CAPABILITY_DIR",
+            home.path().join("owned-capabilities"),
+        );
+    for provider in ["CLAUDE", "CODEX", "OPENCODE", "AMPLIFIER"] {
+        for suffix in ["ENV_FILE", "AUTH_FILE", "CA_FILE"] {
+            child.env_remove(format!("FRESHELL_MANAGED_{provider}_ONECLI_{suffix}"));
+        }
+    }
+    child.env_remove("FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE");
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[tokio::test]
+async fn create_failure_trace_missing_cwd() {
+    if create_failure_trace_child(
+        "cwd",
+        "fresh_agent_proxy::tests::create_failure_trace_missing_cwd",
+    ) {
+        return;
+    }
+    let events = crate::test_trace_capture::captured_trace_events();
+    let root = tempfile::tempdir().unwrap();
+    let proxy = snapshot_outage_proxy(&root.path().join("never-contacted.sock"));
+    for (provider, mode) in [
+        ("claude", "freshclaude"),
+        ("codex", "freshcodex"),
+        ("opencode", "freshopencode"),
+    ] {
+        let request_id = format!("trace-cwd-owned-{provider}");
+        let message = serde_json::from_value(
+            serde_json::json!({"requestId":request_id, "provider":provider, "sessionType":mode,
+        "cwd":root.path().join("missing-private-workspace")}),
+        )
+        .unwrap();
+        assert!(proxy.create(message).await.is_err());
+        let captured = events.snapshot();
+        let event = captured
+            .iter()
+            .find(|event| {
+                event.fields.get("request_id").map(String::as_str) == Some(request_id.as_str())
+            })
+            .expect("executed cwd refusal must emit its finite create observation");
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(
+            event.fields.get("event").map(String::as_str),
+            Some("fresh_agent.create.preparation_failed")
+        );
+        assert_eq!(
+            event.fields.get("reason").map(String::as_str),
+            Some("cwd_unavailable")
+        );
+        assert_eq!(
+            event.fields.get("provider").map(String::as_str),
+            Some(provider)
+        );
+        assert_eq!(
+            event.fields.get("session_type").map(String::as_str),
+            Some(mode)
+        );
+        assert!(!format!("{event:?}").contains("missing-private-workspace"));
+        assert!(!event.fields.contains_key("error"));
+    }
+}
+
+#[tokio::test]
+async fn create_failure_trace_excluded_native_mode_before_bootstrap() {
+    if create_failure_trace_child(
+        "excluded-native",
+        "fresh_agent_proxy::tests::create_failure_trace_excluded_native_mode_before_bootstrap",
+    ) {
+        return;
+    }
+    let events = crate::test_trace_capture::captured_trace_events();
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("never-contacted.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let proxy = snapshot_outage_proxy(&socket);
+    let message = serde_json::from_value(serde_json::json!({"requestId":"excluded-native-kilroy", "provider":"claude", "sessionType":"kilroy", "cwd":root.path().join("missing-workspace")})).unwrap();
+    assert!(proxy.create(message).await.is_err());
+    let message = serde_json::from_value(serde_json::json!({"requestId":"excluded-native-kilroy-resume", "provider":"claude", "sessionType":"kilroy",
+        "sessionRef":{"provider":"claude", "sessionId":"owned-never-resumed"}, "cwd":root.path()})).unwrap();
+    assert!(proxy.create(message).await.is_err());
+    for (provider, mode) in [
+        ("codex", "freshclaude"),
+        ("opencode", "freshcodex"),
+        ("claude", "freshopencode"),
+    ] {
+        let message = serde_json::from_value(
+            serde_json::json!({"requestId":format!("invalid-pair-{provider}"),
+            "provider":provider, "sessionType":mode, "cwd":root.path()}),
+        )
+        .unwrap();
+        assert!(proxy.create(message).await.is_err());
+    }
+    let observed = events.snapshot();
+    assert!(
+        observed
+            .iter()
+            .any(|event| event.fields.get("reason").map(String::as_str)
+                == Some("mode_not_release_qualified")),
+        "{observed:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(proxy.aliases.lock().await.is_empty());
+    assert!(proxy.pollers.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn create_failure_trace_launch_rejection() {
+    if create_failure_trace_child(
+        "launch",
+        "fresh_agent_proxy::tests::create_failure_trace_launch_rejection",
+    ) {
+        return;
+    }
+    let events = crate::test_trace_capture::captured_trace_events();
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("typed-supervisor.sock");
+    let secret = root.path().join("control-secret");
+    std::fs::write(&secret, "0123456789abcdef").unwrap();
+    crate::managed_mcp_capability::configure("0.0.0.0", 39481, &socket, &secret).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let expected_soul = stable_soul_id("claude", "trace-launch-owned").unwrap();
+    let supervisor = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health if index == 0 => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::Launch(launch) if index == 1 => {
+                    assert_eq!(launch.soul_id, expected_soul);
+                    assert_eq!(launch.provider, "claude");
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::BackendUnavailable,
+                        "private-launch-failure-body",
+                    ))
+                }
+                other => panic!("unexpected create request {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let proxy = snapshot_outage_proxy(&socket);
+    let message = serde_json::from_value(serde_json::json!({"requestId":"trace-launch-owned", "provider":"claude", "sessionType":"freshclaude",
+        "cwd":root.path()})).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), proxy.create(message))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("typed supervisor must receive Launch")
+        .unwrap();
+    let captured = events.snapshot();
+    let event = captured
+        .iter()
+        .find(|event| {
+            event.fields.get("event").map(String::as_str)
+                == Some("fresh_agent.create.launch_failed")
+        })
+        .expect("executed typed Launch refusal must emit a finite observation");
+    assert_eq!(event.level, tracing::Level::WARN);
+    assert_eq!(
+        event.fields.get("request_id").map(String::as_str),
+        Some("trace-launch-owned")
+    );
+    assert_eq!(
+        event.fields.get("provider").map(String::as_str),
+        Some("claude")
+    );
+    assert_eq!(
+        event.fields.get("session_type").map(String::as_str),
+        Some("freshclaude")
+    );
+    assert_eq!(
+        event.fields.get("soul_id").map(String::as_str),
+        Some(
+            stable_soul_id("claude", "trace-launch-owned")
+                .unwrap()
+                .as_str()
+        )
+    );
+    assert_eq!(
+        event.fields.get("reason").map(String::as_str),
+        Some("runtime_rejection")
+    );
+    assert_eq!(
+        event.fields.get("runtime_code").map(String::as_str),
+        Some("BACKEND_UNAVAILABLE")
+    );
+    assert!(!format!("{event:?}").contains("private-launch-failure-body"));
+    assert!(!event.fields.contains_key("error"));
+}
+
+#[tokio::test]
+async fn create_provider_start_failure_keeps_only_the_safe_category_on_the_wire() {
+    if create_failure_trace_child(
+        "provider-start-frame",
+        "fresh_agent_proxy::tests::create_provider_start_failure_keeps_only_the_safe_category_on_the_wire",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("typed-supervisor.sock");
+    let secret = root.path().join("control-secret");
+    std::fs::write(&secret, "0123456789abcdef").unwrap();
+    crate::managed_mcp_capability::configure("0.0.0.0", 39483, &socket, &secret).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let supervisor = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health if index == 0 => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::Launch(_) if index == 1 => {
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "private-launch-failure-body",
+                    )
+                    .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                    .with_fresh_agent_provider_start_diagnostic(
+                        FreshAgentProviderStartDiagnostic::Authentication,
+                    ))
+                }
+                other => panic!("unexpected provider-start test request {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::from(["freshclaude".to_string()]),
+        naming: OnceLock::new(),
+    });
+    let create = serde_json::from_value(serde_json::json!({
+        "requestId": "provider-start-auth-owned",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "cwd": root.path(),
+    }))
+    .unwrap();
+    proxy.handle(HostedFreshAgentCommand::Create(create)).await;
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("supervisor should receive the failed launch")
+        .unwrap();
+
+    let frame: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(frame["type"], "freshAgent.create.failed");
+    assert_eq!(frame["code"], "FRESH_AGENT_PROVIDER_START_FAILED");
+    assert_eq!(
+        frame["message"],
+        "hosted fresh-agent provider failed to start (startup diagnostic: authentication)"
+    );
+    assert!(!frame.to_string().contains("private-launch-failure-body"));
+}
+
+#[cfg(feature = "managed-fresh-agent-fixtures")]
+#[tokio::test]
+async fn kilroy_create_uses_claude_native_dependencies_without_changing_runtime_identity() {
+    if create_failure_trace_child("kilroy-family", "fresh_agent_proxy::tests::kilroy_create_uses_claude_native_dependencies_without_changing_runtime_identity") { return; }
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("kilroy-supervisor.sock");
+    let secret = root.path().join("control-secret");
+    std::fs::write(&secret, "0123456789abcdef").unwrap();
+    crate::managed_mcp_capability::configure("0.0.0.0", 39482, &socket, &secret).unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"permissions":{"deny":["Bash"]}}"#,
+    )
+    .unwrap();
+    let selected_environment = root.path().join("owned-provider.env");
+    std::fs::write(
+        &selected_environment,
+        "CLAUDE_CODE_OAUTH_TOKEN=owned-test-reference\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &selected_environment,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    std::env::set_var(
+        "FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE",
+        &selected_environment,
+    );
+    let listener = UnixListener::bind(&socket).unwrap();
+    let supervisor = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health if index == 0 => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::Launch(launch) if index == 1 => {
+                    assert_eq!(launch.provider, "kilroy");
+                    assert_eq!(
+                        launch.soul_id,
+                        stable_soul_id("kilroy", "owned-kilroy-create").unwrap()
+                    );
+                    let fresh = launch.fresh_agent.unwrap();
+                    assert_eq!(fresh.provider, FreshProvider::Kilroy);
+                    assert_eq!(fresh.session_type, "kilroy");
+                    assert_eq!(fresh.runtime_variant, "kilroy-claude-agent-sdk");
+                    assert_eq!(
+                        fresh.fixture_transport,
+                        Some(FreshAgentFixtureTransport::Deterministic)
+                    );
+                    assert_eq!(fresh.provider_secret_references.len(), 1);
+                    assert_eq!(
+                        fresh.provider_secret_references[0].source_path,
+                        selected_environment.to_string_lossy()
+                    );
+                    assert_eq!(
+                        fresh.provider_secret_references[0].profile,
+                        freshell_runtime_protocol::ProviderSecretProfile::ClaudeOnecliEnvironment
+                    );
+                    let context = fresh.provider_launch_context.unwrap();
+                    assert!(matches!(
+                        context.preparation,
+                        freshell_runtime_protocol::ProviderPreparation::Claude { .. }
+                    ));
+                    assert!(context.config.iter().any(|file| file.root
+                        == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
+                        && file.relative_path == "settings.json"
+                        && file.provider_relative_path == ".claude/settings.json"));
+                    let capability = context.mcp_capability.unwrap();
+                    let directory =
+                        PathBuf::from(std::env::var_os("FRESHELL_RUNTIME_CAPABILITY_DIR").unwrap());
+                    let grant: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(directory.join(format!("{}.json", capability.grant_id)))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        grant["soulId"],
+                        stable_soul_id("kilroy", "owned-kilroy-create")
+                            .unwrap()
+                            .to_string()
+                    );
+                    let staged_settings: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(
+                            directory
+                                .parent()
+                                .unwrap()
+                                .join("provider-roots")
+                                .join(&capability.grant_id)
+                                .join("settings.json"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        staged_settings["permissions"]["deny"],
+                        serde_json::json!(["Bash"])
+                    );
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::BackendUnavailable,
+                        "owned no-provider launch rejection",
+                    ))
+                }
+                other => panic!("unexpected Kilroy create request {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let mut proxy = snapshot_outage_proxy(&socket);
+    Arc::get_mut(&mut proxy)
+        .unwrap()
+        .fixture_modes
+        .insert("kilroy".into());
+    let message = serde_json::from_value(serde_json::json!({"requestId":"owned-kilroy-create", "provider":"claude", "sessionType":"kilroy", "cwd":root.path()})).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), proxy.create(message))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("native-family Kilroy create must reach the typed Launch boundary")
+        .unwrap();
+}
 
 #[test]
 fn hosted_created_frame_uses_the_public_request_identity() {
@@ -13,7 +875,7 @@ fn hosted_created_frame_uses_the_public_request_identity() {
         client: RuntimeClient::new("/tmp/unopened-fresh-agent-proxy.sock", "fixture"),
         broadcast: Arc::new(broadcast),
         aliases: Mutex::new(HashMap::new()),
-        presentation_ids: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
@@ -35,6 +897,110 @@ fn hosted_created_frame_uses_the_public_request_identity() {
 }
 
 #[tokio::test]
+async fn managed_ordinary_stop_eof_broadcasts_one_failed_ack_to_both_receivers() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("owned-stop-soul").unwrap();
+    let expected_soul = soul.clone();
+    let supervisor = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let health: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+        assert!(matches!(health.body, AdminCommand::Health));
+        assert_eq!(health.role, ControlRole::Web);
+        assert_eq!(health.auth.as_deref(), Some("0123456789abcdef"));
+        write_frame(
+            &mut stream,
+            &AdminReply {
+                request_id: health.request_id.clone(),
+                result: Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+        assert_eq!(request.role, ControlRole::Web);
+        assert_eq!(request.auth.as_deref(), Some("0123456789abcdef"));
+        assert_ne!(request.request_id, health.request_id);
+        let AdminCommand::Stop(stop) = request.body else {
+            panic!("ordinary kill must issue exactly one Stop")
+        };
+        assert_eq!(stop.soul_id, expected_soul);
+        assert_eq!(stop.expected_control_epoch, Some(77));
+        assert_eq!(stop.expected_intent_revision, None);
+        // Model the crashed supervisor's real UDS EOF, not a typed refusal.
+        drop(stream);
+        listener
+    });
+    let (broadcast, mut first) = broadcast::channel(16);
+    let mut second = broadcast.subscribe();
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::from([
+            (
+                ("codex".into(), "presentation-stop-session".into()),
+                soul.clone(),
+            ),
+            (
+                ("codex".into(), "different-native-root".into()),
+                soul.clone(),
+            ),
+        ])),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul,
+            PresentationRoute::initial("presentation-stop-session"),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.dispatch(HostedFreshAgentCommand::Kill(
+            freshell_protocol::FreshAgentKill {
+                provider: AgentProvider::Codex,
+                session_id: "presentation-stop-session".into(),
+                session_type: SessionType::Freshcodex,
+                cwd: None,
+                observed_epoch: Some(77),
+                observed_generation: Some(9),
+            },
+        )),
+    )
+    .await
+    .expect("UDS EOF must settle the actual gateway dispatch");
+    let first_frame = first.try_recv().expect("first connected receiver gets ACK");
+    assert_eq!(second.try_recv().unwrap(), first_frame);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&first_frame).unwrap(),
+        serde_json::json!({
+            "type":"freshAgent.killed", "provider":"codex",
+            "sessionId":"presentation-stop-session", "sessionType":"freshcodex",
+            "success":false
+        })
+    );
+    assert!(first.try_recv().is_err());
+    assert!(second.try_recv().is_err());
+    let listener = tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "EOF must not cause another Stop, retry, or other control effect"
+    );
+}
+
+#[tokio::test]
 async fn managed_recovery_stop_refuses_without_contacting_the_host() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("supervisor.sock");
@@ -45,7 +1011,7 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
         client: RuntimeClient::new(&socket, "0123456789abcdef"),
         broadcast: Arc::new(broadcast),
         aliases: Mutex::new(HashMap::from([(("codex".into(), "thread-1".into()), soul)])),
-        presentation_ids: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
@@ -99,6 +1065,180 @@ fn presentation_rewrite_keeps_materialized_native_identity() {
     rewrite_presentation_id(&mut materialized, "public");
     assert_eq!(materialized["previousSessionId"], "public");
     assert_eq!(materialized["sessionId"], "native");
+}
+
+#[tokio::test]
+async fn materialization_keeps_following_transcript_invalidations_on_the_native_route() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let soul = SoulId::parse("soul-materialization-route").unwrap();
+    let proxy = HostedFreshAgentProxy {
+        client: RuntimeClient::new("/unused/supervisor.sock", "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::initial("managed-public"),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+    let events = [
+        serde_json::json!({
+            "type":"freshAgent.session.materialized",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "previousSessionId":"managed-public",
+            "sessionId":"ses_native"
+        }),
+        serde_json::json!({
+            "type":"freshAgent.send.accepted",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_native",
+            "requestId":"materialized-send"
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_native",
+            "event":{"type":"freshAgent.session.changed","sessionId":"ses_native"}
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_native",
+            "event":{"type":"freshAgent.turn.complete","sessionId":"ses_native","at":42}
+        }),
+    ];
+
+    for event in events {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload: event },
+                "opencode",
+                "managed-public",
+                "freshopencode",
+            )
+            .await;
+    }
+
+    let frames: Vec<serde_json::Value> = (0..4)
+        .map(|_| serde_json::from_str(&receiver.try_recv().unwrap()).unwrap())
+        .collect();
+    assert_eq!(frames[0]["previousSessionId"], "managed-public");
+    assert_eq!(frames[0]["sessionId"], "ses_native");
+    assert_eq!(frames[1]["type"], "freshAgent.send.accepted");
+    assert_eq!(frames[1]["sessionId"], "ses_native");
+    assert_eq!(frames[1]["requestId"], "materialized-send");
+    for (frame, event_type) in frames[2..]
+        .iter()
+        .zip(["freshAgent.session.changed", "freshAgent.turn.complete"])
+    {
+        assert_eq!(frame["event"]["type"], event_type);
+        assert_eq!(
+            frame["sessionId"], "ses_native",
+            "{event_type} must follow the pane's materialized native session key"
+        );
+    }
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .map(|route| route.session_id.as_str()),
+        Some("ses_native"),
+    );
+}
+
+#[tokio::test]
+async fn replayed_materialization_does_not_rekey_a_forked_pane_to_its_retired_parent() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let soul = SoulId::parse("soul-materialization-fork-route").unwrap();
+    // Model the fork route retained after a poller exits; its next poller
+    // starts at cursor zero and sees the parent's old materialization again.
+    let proxy = HostedFreshAgentProxy {
+        client: RuntimeClient::new("/unused/supervisor.sock", "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::materialized("ses_child"),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+    let events = [
+        serde_json::json!({
+            "type":"freshAgent.session.materialized",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "previousSessionId":"managed-public",
+            "sessionId":"ses_parent"
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_parent",
+            "event":{"type":"freshAgent.session.changed","sessionId":"ses_parent"}
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_parent",
+            "event":{"type":"freshAgent.turn.complete","sessionId":"ses_parent","at":42}
+        }),
+    ];
+
+    for event in events {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload: event },
+                "opencode",
+                "managed-public",
+                "freshopencode",
+            )
+            .await;
+    }
+
+    let frames: Vec<serde_json::Value> = std::iter::from_fn(|| {
+        receiver
+            .try_recv()
+            .ok()
+            .map(|frame| serde_json::from_str(&frame).unwrap())
+    })
+    .collect();
+    assert_eq!(frames.len(), 2, "the stale materialization must be dropped");
+    for (frame, event_type) in frames
+        .iter()
+        .zip(["freshAgent.session.changed", "freshAgent.turn.complete"])
+    {
+        assert_eq!(frame["event"]["type"], event_type);
+        assert_eq!(frame["sessionId"], "ses_child");
+    }
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .map(|route| route.session_id.as_str()),
+        Some("ses_child"),
+    );
+    assert!(proxy
+        .presentation_routes
+        .lock()
+        .await
+        .get(&soul)
+        .is_some_and(|route| route.materialized));
 }
 
 #[test]
@@ -319,7 +1459,10 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
             ("codex".into(), "public-parent".into()),
             soul.clone(),
         )])),
-        presentation_ids: Mutex::new(HashMap::from([(soul.clone(), "public-parent".into())])),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::initial("public-parent"),
+        )])),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: std::sync::OnceLock::new(),
@@ -361,13 +1504,19 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
     );
     assert_eq!(
         proxy
-            .presentation_ids
+            .presentation_routes
             .lock()
             .await
             .get(&soul)
-            .map(String::as_str),
+            .map(|route| route.session_id.as_str()),
         Some("native-child")
     );
+    assert!(proxy
+        .presentation_routes
+        .lock()
+        .await
+        .get(&soul)
+        .is_some_and(|route| route.materialized));
     let aliases = proxy.aliases.lock().await;
     assert_eq!(
         aliases.get(&("codex".into(), "native-child".into())),
@@ -387,24 +1536,30 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
 fn semantic_operation_failures_keep_typed_public_codes() {
     use freshell_runtime_client::ClientError;
     assert_eq!(
-        operation_error_code(&ClientError::Runtime(
-            RuntimeErrorCode::UnsupportedOperation,
-            "redacted".into(),
-        )),
+        operation_error_code(&ClientError::Runtime {
+            code: RuntimeErrorCode::UnsupportedOperation,
+            message: "redacted".into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
+        }),
         "UNSUPPORTED_CAPABILITY"
     );
     assert_eq!(
-        operation_error_code(&ClientError::Runtime(
-            RuntimeErrorCode::CommandAmbiguous,
-            "redacted".into(),
-        )),
+        operation_error_code(&ClientError::Runtime {
+            code: RuntimeErrorCode::CommandAmbiguous,
+            message: "redacted".into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
+        }),
         "COMMAND_AMBIGUOUS"
     );
     assert_eq!(
-        operation_error_code(&ClientError::Runtime(
-            RuntimeErrorCode::OperationImplementationUnavailable,
-            "redacted".into(),
-        )),
+        operation_error_code(&ClientError::Runtime {
+            code: RuntimeErrorCode::OperationImplementationUnavailable,
+            message: "redacted".into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
+        }),
         "IMPLEMENTATION_UNAVAILABLE"
     );
 }
@@ -642,7 +1797,7 @@ async fn rollback_commands_keep_direction_target_and_request_fences() {
                 ("codex".into(), "public-thread".into()),
                 soul,
             )])),
-            presentation_ids: Mutex::new(HashMap::new()),
+            presentation_routes: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
             fixture_modes: HashSet::new(),
             naming: OnceLock::new(),
@@ -707,7 +1862,7 @@ fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
         client: RuntimeClient::new(socket, "0123456789abcdef"),
         broadcast: Arc::new(broadcast::channel(16).0),
         aliases: Mutex::new(HashMap::new()),
-        presentation_ids: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
@@ -823,7 +1978,11 @@ async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_regi
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Global HOME lock spans set/use/restore.
 async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_wrong_local_store() {
+    // Acquire the shared HOME lock before the Claude lock, matching readers.
+    let _home_guard = crate::session_directory::HOME_ENV_TEST_LOCK.lock().unwrap();
+    let _claude_guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let _env = SnapshotTestEnv::isolate(dir.path());
@@ -1003,7 +2162,11 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Global HOME lock spans set/use/restore.
 async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_authority() {
+    // Acquire the shared HOME lock before the Claude lock, matching readers.
+    let _home_guard = crate::session_directory::HOME_ENV_TEST_LOCK.lock().unwrap();
+    let _claude_guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let _env = SnapshotTestEnv::isolate(dir.path());
@@ -1170,7 +2333,11 @@ async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_au
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Global HOME lock spans set/use/restore.
 async fn real_gateway_outage_keeps_a_registered_local_provider_snapshot_live() {
+    // Acquire the shared HOME lock before the Claude lock, matching readers.
+    let _home_guard = crate::session_directory::HOME_ENV_TEST_LOCK.lock().unwrap();
+    let _claude_guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let _env = SnapshotTestEnv::isolate(dir.path());

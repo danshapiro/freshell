@@ -27,9 +27,14 @@ notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
 # compiles the SQLite amalgamation so the parser is not coupled to the host's
 # libsqlite3 version (deterministic across dev/CI/Windows).
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled"] }
 # Canonical logical thread and physical rollout identifiers in Codex history.
 uuid = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+flate2 = "1"
+hex = "0.4"
+tempfile = "3"
 # SYNC-06 resume-resolve parity: the `shared/resume-input-parser.ts` port's
 # candidate-extraction regexes + hint tables (`resume_input.rs`). `(?-u:\b)`
 # keeps JS's ASCII \b word-boundary semantics. Same major already a direct
@@ -49,6 +54,19 @@ tracing = "0.1"
 # parent repository while preserving the checkout as `cwd`.
 freshell-platform = { path = "../freshell-platform" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Production OpenCode process-liveness checks use kill(2) on non-Linux Unix.
+libc = "0.2"
+
 [dev-dependencies]
 # The opencode SQLite parity test builds fixture databases with a writable connection
 # before the parser opens them read-only (same bundled engine, unified by cargo).
@@ -59,9 +77,3 @@ tracing-subscriber = "0.3"
 # SESSION-07: unique temp-file names for `search.rs`'s file-content search
 # tests (same version/feature set as every other crate's `uuid` dependency).
 uuid = { version = "1", features = ["v4"] }
-
-[target.'cfg(unix)'.dev-dependencies]
-# amplifier_stub's rollback-on-partial-write test needs a deterministic,
-# child-process-scoped permission-denied write failure using `umask()`.
-# Same version freshell-ws already pins directly for `pane_ledger`'s `flock(2)`.
-libc = "0.2"

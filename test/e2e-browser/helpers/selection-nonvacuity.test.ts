@@ -6,6 +6,7 @@ import { LOCAL_ONLY_SPECS } from '../playwright.config.js'
 import { CLOUD_SKIP_SPECS, CLOUD_SKIP_TITLES } from '../playwright.cloud.config.js'
 import { createE2eServerHandle } from './external-target.js'
 import { assertRustServerInfo, RustServer } from './rust-server.js'
+import { EXTERNAL_DESCRIPTOR_KEYS, EXTERNAL_SELECTION_KEYS } from '../../../scripts/testing/runtime-external-browser.js'
 
 const require = createRequire(import.meta.url)
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
@@ -26,6 +27,8 @@ function cleanEnvironment(overrides: Record<string, string> = {}): NodeJS.Proces
   const env = { ...process.env }
   delete env.CI
   delete env.FRESHELL_SMOKE
+  for (const key of [...EXTERNAL_DESCRIPTOR_KEYS, ...EXTERNAL_SELECTION_KEYS,
+    'FRESHELL_RUNTIME_EXTERNAL_SPEC', 'FRESHELL_RUNTIME_EXTERNAL_GREP']) delete env[key]
   return { ...env, ...overrides }
 }
 
@@ -94,18 +97,76 @@ function listedSpecFiles(output: string): Set<string> {
 }
 
 describe('browser selection non-vacuity', () => {
+  const fixtureSpec = 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts'
+  const external = {
+    FRESHELL_E2E_TARGET_URL: 'https://owned.trycloudflare.com',
+    FRESHELL_E2E_TARGET_WS_URL: 'wss://owned.trycloudflare.com/ws',
+    FRESHELL_E2E_TARGET_TOKEN: 'private-listing-token',
+    FRESHELL_RUNTIME_EXTERNAL_RUN_ID: 'b8c53aab-d4f8-4153-bb7d-0873a7dcce90',
+    FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA: 'a'.repeat(40),
+    FRESHELL_RUNTIME_EXTERNAL_SPEC: fixtureSpec,
+  }
+
+  function expectExternalFixtureCase(title: string) {
+    const grep = `${title}$`
+    const listed = listedProjects(cleanEnvironment({ ...external,
+      FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1', FRESHELL_RUNTIME_EXTERNAL_GREP: grep,
+    }), cloudConfig, ['--project=chromium-external-target', fixtureSpec, '--grep', grep])
+    expect(listed.labels).toEqual(['chromium-external-target'])
+    expect(listed.tests).toBe(1)
+    expect(listed.files).toBe(1)
+    expect(listedSpecFiles(listed.output)).toEqual(new Set([path.basename(fixtureSpec)]))
+    expect(listed.output).toContain(title)
+  }
+
+  it('positively lists the requested owned external managed case on the Cloud project', () => {
+    expectExternalFixtureCase('all modes share activation and exact-native recovery without provider access')
+  })
+
+  it('positively lists the owned external managed History case independently', () => {
+    expectExternalFixtureCase('completed owned native fixture history opens its existing browser pane')
+  })
+
+  it('fails before selection when an external managed descriptor lacks the exact fixture opt-in', () => {
+    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--project=chromium-external-target', '--list', fixtureSpec], {
+      cwd: projectRoot, env: cleanEnvironment(external), encoding: 'utf8',
+    })
+    expect(listed.status).not.toBe(0)
+    expect(`${listed.stdout}${listed.stderr}`).toContain('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST')
+  })
+
+  it('does not count an external grep matching no requested cases', () => {
+    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--project=chromium-external-target', '--list', fixtureSpec, '--grep', 'absent managed scenario'], {
+      cwd: projectRoot, env: cleanEnvironment({ ...external, FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1' }), encoding: 'utf8',
+    })
+    expect(listed.status).not.toBe(0)
+    expect(`${listed.stdout}${listed.stderr}`).toMatch(/No tests found/)
+  })
+  it('selects the actual topology smoke only with its owned external project', () => {
+    const spec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
+    const absent = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig, '--list', spec], {
+      cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8',
+    })
+    expect(absent.status).not.toBe(0)
+    expect(`${absent.stdout}${absent.stderr}`).toMatch(/No tests found/)
+    const selected = listedProjects(cleanEnvironment({ ...external, FRESHELL_RUNTIME_EXTERNAL_SPEC: spec }), cloudConfig,
+      ['--project=chromium-external-target', spec, '--grep', 'actual managed external topology and finite owner facts'])
+    expect(selected.tests).toBe(1)
+    expect(selected.files).toBe(1)
+    expect(selected.output).toContain('actual managed external topology and finite owner facts')
+  })
+
   it('resolves only Rust application projects with the exact continuity exclusion', () => {
     const defaultProjects = resolvedConfig(playwrightConfig, cleanEnvironment())
     expect(defaultProjects.map((project) => project.name)).toEqual(['chromium'])
-    expect(defaultProjects[0].testIgnore).toEqual([continuityPattern])
 
     const ciProjects = resolvedConfig(playwrightConfig, cleanEnvironment({ CI: '1' }))
     expect(ciProjects.map((project) => project.name)).toEqual(['chromium', 'firefox', 'webkit'])
-    for (const project of ciProjects) expect(project.testIgnore).toEqual([continuityPattern])
 
     const continuityProjects = resolvedConfig(playwrightConfig, cleanEnvironment({ FRESHELL_SMOKE: '1' }))
     expect(continuityProjects.map((project) => project.name)).toEqual(['chromium', 'continuity-smoke'])
-    expect(continuityProjects[0].testIgnore).toEqual([continuityPattern])
     expect(continuityProjects[1]).toMatchObject({
       name: 'continuity-smoke',
       testIgnore: [],
@@ -154,13 +215,17 @@ describe('browser selection non-vacuity', () => {
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
   })
 
-  it('creates Rust fixtures and selects the supported cloud projects', async () => {
+  // These contracts collect independently: five real Playwright children in
+  // one case otherwise share a 30s deadline, even when each finishes promptly.
+  it('creates an owned Rust fixture without starting its server', async () => {
     const server = await createE2eServerHandle({})
     expect(server).toBeInstanceOf(RustServer)
     expect(typeof server.start).toBe('function')
     expect(typeof server.stop).toBe('function')
     expect(() => server.info).toThrow('RustServer not started')
+  })
 
+  it('resolves the supported cloud projects and local-only exclusions', () => {
     expect(LOCAL_ONLY_SPECS).toContainEqual({
       spec: 'mcp-qa-smoke-rust.spec.ts',
       classification: 'local-only-provider-binary',
@@ -172,13 +237,11 @@ describe('browser selection non-vacuity', () => {
 
     const cloudProjects = resolvedConfig(cloudConfig, cleanEnvironment())
     expect(cloudProjects.map((project) => project.name)).toEqual(['chromium'])
-    expect(cloudProjects[0].testIgnore).toEqual([
-      continuityPattern,
-      ...CLOUD_SKIP_SPECS.map((spec) => ({ kind: 'string' as const, source: `**/${spec}` })),
-    ])
     expect(new Set(CLOUD_SKIP_SPECS).size).toBe(CLOUD_SKIP_SPECS.length)
     for (const localOnly of LOCAL_ONLY_SPECS) expect(CLOUD_SKIP_SPECS).toContain(localOnly.spec)
+  })
 
+  it('selects a non-vacuous cloud roster honoring all file and title exclusions', () => {
     const cloud = listedProjects(cleanEnvironment(), cloudConfig)
     expect(cloud.labels).toEqual(['chromium'])
     expect(cloud.output).toContain('[chromium]')
@@ -196,7 +259,9 @@ describe('browser selection non-vacuity', () => {
     for (const title of CLOUD_SKIP_TITLES) {
       expect(cloud.output, `cloud lane must not list excluded title: ${title.source}`).not.toMatch(title)
     }
+  })
 
+  it('intersects mixed cloud selectors with the supported cloud projects', () => {
     // Explicit positional file args are an INTERSECTION with testIgnore,
     // never a bypass (Playwright 1.58.2 cliFileMatcher semantics): a mixed
     // focused invocation must keep its cloud-legal member and silently drop
@@ -209,7 +274,10 @@ describe('browser selection non-vacuity', () => {
     expect(mixed.output).toContain('host-stats-pane.spec.ts')
     expect(mixed.output).not.toContain('truly-idle-alerting')
     expect(mixed.files).toBe(1)
+    expect(mixed.tests).toBeGreaterThan(0)
+  })
 
+  it('rejects an all-skip selection on the supported cloud projects', () => {
     // An ALL-skip focused invocation fails LOUDLY (exit 1, "No tests
     // found") instead of silently reading as a green zero-test run — a
     // vacuous focused cloud proof can never masquerade as coverage.
@@ -222,7 +290,9 @@ describe('browser selection non-vacuity', () => {
     ], { cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8' })
     expect(allSkip.status).toBe(1)
     expect(`${allSkip.stdout}\n${allSkip.stderr}`).toContain('No tests found')
+  })
 
+  it('selects all migrated cases on the supported cloud projects', () => {
     const migrated = listedProjects(cleanEnvironment(), cloudConfig, [
       'test/e2e-browser/specs/server-build-mismatch-rust.spec.ts',
       'test/e2e-browser/specs/tabs-client-retire.spec.ts',

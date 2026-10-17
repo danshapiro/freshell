@@ -68,7 +68,7 @@ use freshell_protocol::{
     TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
     TerminalResize, FRESH_AGENT_DISABLED_REFUSAL, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
-use freshell_terminal::registry::ManagedTerminalLaunch;
+use freshell_terminal::registry::{ManagedTerminalInputError, ManagedTerminalLaunch};
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
 use crate::WsState;
@@ -80,6 +80,10 @@ mod terminal_create_ordering_tests;
 #[cfg(test)]
 #[path = "terminal_launch_prep_tests.rs"]
 mod terminal_launch_prep_tests;
+
+#[cfg(test)]
+#[path = "terminal_managed_input_tests.rs"]
+mod terminal_managed_input_tests;
 
 #[path = "connection_writer.rs"]
 mod connection_writer;
@@ -3519,7 +3523,7 @@ mod managed_runtime_id_tests {
     };
     use freshell_terminal::registry::{
         ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
-        ManagedTerminalFuture, ManagedTerminalLaunch,
+        ManagedTerminalFuture, ManagedTerminalInputError, ManagedTerminalLaunch,
     };
     use std::sync::Arc;
 
@@ -3560,6 +3564,187 @@ mod managed_runtime_id_tests {
         descriptor: ManagedTerminalDescriptor,
     }
 
+    struct CaptureLaunchController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+
+    impl ManagedTerminalController for CaptureLaunchController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(request);
+                Err("captured managed launch without spawning".into())
+            })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            Box::pin(async { panic!("capture must not receive terminal input") })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { panic!("capture must not resize a terminal") })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { panic!("capture must not stop a terminal") })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async { panic!("capture must not read terminal output") })
+        }
+    }
+
+    struct PresentCodexSession;
+
+    impl crate::existence::SessionExistenceProbe for PresentCodexSession {
+        fn exists(&self, provider: &str, session_id: &str) -> crate::existence::SessionExistence {
+            assert_eq!(provider, "codex");
+            assert_eq!(session_id, "owned-native-root");
+            crate::existence::SessionExistence::Present
+        }
+
+        fn ever_observed(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    async fn assert_managed_codex_model(model: Option<&str>, resume: bool) {
+        let mut state = super::pane_reconcile_gate_tests::state();
+        let mut settings = crate::test_settings();
+        settings.coding_cli.providers.insert(
+            "codex".into(),
+            serde_json::from_value(serde_json::json!({ "model": model, "effort": "low" })).unwrap(),
+        );
+        state.settings = Arc::new(settings);
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "codex".into(),
+            label: "Codex CLI".into(),
+            default_cmd: "codex".into(),
+            model_args: Some(vec!["--model".into(), "{{model}}".into()]),
+            effort_args: Some(vec![
+                "-c".into(),
+                "model_reasoning_effort=\"{{effort}}\"".into(),
+            ]),
+            resume_args: Some(vec!["resume".into(), "{{sessionId}}".into()]),
+            ..Default::default()
+        }]);
+        let controller = Arc::new(CaptureLaunchController(std::sync::Mutex::new(None)));
+        state
+            .registry
+            .set_managed_controller(Some(controller.clone()));
+        state.registry.set_managed_runtime_connection(17, true);
+        state.session_existence = Arc::new(PresentCodexSession);
+        let sink: freshell_terminal::FrameSink = Arc::new(|_| {});
+        let mut output = crate::create_gate::CreateOutput::Channel(&sink);
+        let mut body = serde_json::json!({
+            "requestId": "managed-codex-model", "mode": "codex", "shell": "system",
+            "cwd": std::env::temp_dir(),
+        });
+        if resume {
+            body["sessionRef"] = serde_json::json!({
+                "provider": "codex", "sessionId": "owned-native-root"
+            });
+        }
+        let create = serde_json::from_value(body).unwrap();
+        let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+        assert!(
+            super::handle_create(
+                create,
+                None,
+                &mut output,
+                &state,
+                17,
+                true,
+                &mut limiter,
+                &super::ConnectionIdentity::default(),
+                super::now_ms(),
+            )
+            .await
+        );
+        let request = controller
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("actual managed launch request");
+        assert_eq!(request.provider_model.as_deref(), model);
+        assert_eq!(request.provider_reasoning_effort.as_deref(), Some("low"));
+        let args = &request.spec.args;
+        let models: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--model")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            models,
+            model.into_iter().collect::<Vec<_>>(),
+            "the native TUI must receive the configured model through the shipped template"
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"low\""]));
+        assert_eq!(
+            request.resume_session_id.as_deref(),
+            resume.then_some("owned-native-root")
+        );
+        assert_eq!(args.iter().any(|arg| arg == "resume"), resume);
+        if resume {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["resume", "owned-native-root"]));
+        }
+        assert!(
+            state.registry.directory().is_empty(),
+            "capture spawns no provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_reaches_native_launch() {
+        assert_managed_codex_model(Some("gpt-5.6-luna"), false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_honors_a_different_user_selection() {
+        assert_managed_codex_model(Some("gpt-5.2-codex"), false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_missing_does_not_fabricate_a_default() {
+        assert_managed_codex_model(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_exact_resume_keeps_model_effort_and_native_root() {
+        assert_managed_codex_model(Some("gpt-5.6-luna"), true).await;
+        assert_managed_codex_model(Some("gpt-5.2-codex"), true).await;
+    }
+
     impl ManagedTerminalController for LookupOnlyController {
         fn lookup_terminal<'a>(
             &'a self,
@@ -3582,7 +3767,7 @@ mod managed_runtime_id_tests {
             &'a self,
             _terminal: ManagedTerminalDescriptor,
             _data: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -6097,11 +6282,17 @@ pub(crate) async fn handle_create(
     } else {
         cli_provider_settings(state, &mode)
     };
-    // Codex model, sandbox, and approval belong to the app-server plan on
-    // both routes. The managed launch still carries them separately to the
-    // soul's sidecar; the TUI gets the ordinary CLI settings tuple.
+    // Preserve the legacy Codex CLI policy. A managed terminal's host adds
+    // --remote to this TUI; the configured model must also reach that TUI
+    // through the manifest, just as on the ordinary REST spawn path. The
+    // sidecar's typed launch plan alone does not apply a native model setting.
     let (cli_permission_mode, cli_model, cli_effort, cli_sandbox) =
         cli_provider_settings(state, &mode);
+    let cli_model = if use_managed_runtime && mode == "codex" {
+        model.as_deref()
+    } else {
+        cli_model.as_deref()
+    };
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -6263,7 +6454,7 @@ pub(crate) async fn handle_create(
         resume_session_id: resume_session_id.as_deref(),
         launch_intent,
         permission_mode: cli_permission_mode.as_deref(),
-        model: cli_model.as_deref(),
+        model: cli_model,
         effort: cli_effort.as_deref(),
         sandbox: cli_sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
@@ -8511,6 +8702,30 @@ async fn refresh_managed_output_and_associate(
         crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
             .await;
     }
+    if let (Some(hub), Some(epoch), Some(native)) = (
+        state.activity.as_ref(),
+        read.stream_epoch.as_deref(),
+        read.codex_activity,
+    ) {
+        hub.note_managed_codex_activity(
+            terminal_id,
+            epoch,
+            read.native_session_id.as_deref(),
+            native,
+        );
+    }
+    if let (Some(hub), Some(epoch), Some(native)) = (
+        state.activity.as_ref(),
+        read.stream_epoch.as_deref(),
+        read.opencode_activity,
+    ) {
+        hub.note_managed_opencode_activity(
+            terminal_id,
+            epoch,
+            read.native_session_id.as_deref(),
+            native,
+        );
+    }
     if let Some(exit_code) = read.exit_code {
         state.registry.finish_managed_exit(terminal_id, exit_code);
     }
@@ -8931,19 +9146,17 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
     })
 }
 
-fn managed_input_blocked_reason(detail: &str) -> Option<TerminalInputBlockedReason> {
-    let normalized = detail.to_ascii_lowercase();
-    if normalized.contains("recovery is in progress")
-        || normalized.contains("input was not dispatched")
-    {
-        Some(TerminalInputBlockedReason::ManagedRecoveryPending)
-    } else if normalized.contains("recovery ended in blocked")
-        || normalized.contains("recovery is blocked")
-        || normalized.contains("blocked_retry_budget")
-    {
-        Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
-    } else {
-        None
+fn managed_input_blocked_reason(
+    error: &ManagedTerminalInputError,
+) -> Option<TerminalInputBlockedReason> {
+    match error {
+        ManagedTerminalInputError::RecoveryPending => {
+            Some(TerminalInputBlockedReason::ManagedRecoveryPending)
+        }
+        ManagedTerminalInputError::RecoveryBlocked => {
+            Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
+        }
+        ManagedTerminalInputError::Unavailable(_) => None,
     }
 }
 
@@ -12063,14 +12276,12 @@ mod terminal_dims_range_tests {
 
     #[test]
     fn managed_recovery_input_is_visibly_fenced() {
-        let pending = managed_input_blocked_reason(
-            "managed soul recovery is in progress; input was not dispatched",
-        )
-        .expect("pending recovery reason");
-        let blocked = managed_input_blocked_reason(
-            "managed soul recovery ended in Blocked: BLOCKED_RETRY_BUDGET",
-        )
-        .expect("blocked recovery reason");
+        let pending =
+            managed_input_blocked_reason(&super::ManagedTerminalInputError::RecoveryPending)
+                .expect("pending recovery reason");
+        let blocked =
+            managed_input_blocked_reason(&super::ManagedTerminalInputError::RecoveryBlocked)
+                .expect("blocked recovery reason");
         assert_eq!(pending, TerminalInputBlockedReason::ManagedRecoveryPending);
         assert_eq!(blocked, TerminalInputBlockedReason::ManagedRecoveryBlocked);
 
@@ -12348,7 +12559,7 @@ mod pane_reconcile_gate_tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+    pub(super) async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
         let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
         let router = axum::Router::new().route(
@@ -12394,7 +12605,7 @@ mod pane_reconcile_gate_tests {
         (sink, client)
     }
 
-    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+    pub(super) async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
             .await
             .expect("frame within timeout")
@@ -12648,9 +12859,9 @@ mod managed_output_order_tests {
         ManagedTerminalDescriptor, ManagedTerminalFuture,
     };
 
-    struct ExitedOpenCodeRead;
+    struct ManagedOutputFixture(ManagedOutputRead);
 
-    impl ManagedTerminalController for ExitedOpenCodeRead {
+    impl ManagedTerminalController for ManagedOutputFixture {
         fn lookup_terminal<'a>(
             &'a self,
             _: &'a str,
@@ -12670,8 +12881,12 @@ mod managed_output_order_tests {
             &'a self,
             _: ManagedTerminalDescriptor,
             _: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unused input".into()) })
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            Box::pin(async {
+                Err(ManagedTerminalInputError::Unavailable(
+                    "unused input".into(),
+                ))
+            })
         }
 
         fn resize<'a>(
@@ -12696,23 +12911,7 @@ mod managed_output_order_tests {
             _: i64,
             _: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
-            Box::pin(async {
-                Ok(ManagedOutputRead {
-                    stream_epoch: Some("S-managed-short-lived".into()),
-                    incarnation_id: Some("incarnation-short-lived".into()),
-                    reset_required: false,
-                    truncated: false,
-                    retained_from_seq: 1,
-                    head_seq: 1,
-                    exit_code: Some(17),
-                    native_session_id: Some("ses-short-lived".into()),
-                    chunks: vec![ManagedOutputChunk {
-                        seq_start: 1,
-                        seq_end: 1,
-                        data: "last output\n".into(),
-                    }],
-                })
-            })
+            Box::pin(async { Ok(self.0.clone()) })
         }
     }
 
@@ -12732,7 +12931,23 @@ mod managed_output_order_tests {
         });
         state
             .registry
-            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead)));
+            .set_managed_controller(Some(Arc::new(ManagedOutputFixture(ManagedOutputRead {
+                codex_activity: None,
+                opencode_activity: None,
+                stream_epoch: Some("S-managed-short-lived".into()),
+                incarnation_id: Some("incarnation-short-lived".into()),
+                reset_required: false,
+                truncated: false,
+                retained_from_seq: 1,
+                head_seq: 1,
+                exit_code: Some(17),
+                native_session_id: Some("ses-short-lived".into()),
+                chunks: vec![ManagedOutputChunk {
+                    seq_start: 1,
+                    seq_end: 1,
+                    data: "last output\n".into(),
+                }],
+            }))));
 
         refresh_managed_output_and_associate(&state, terminal_id, 1024)
             .await
@@ -12755,6 +12970,105 @@ mod managed_output_order_tests {
         assert_eq!(row.status, freshell_protocol::TerminalRunStatus::Exited);
         assert_eq!(row.resume_session_id.as_deref(), Some("ses-short-lived"));
         assert_eq!(row.snapshot, "last output\n");
+    }
+
+    #[tokio::test]
+    async fn managed_codex_native_turns_reach_browser_activity_and_complete_once() {
+        use freshell_activity::codex::{CodexActivityBatch, CodexActivityEvent};
+        let mut state = super::pane_reconcile_gate_tests::state();
+        let hub = crate::activity::ActivityHub::new(state.broadcast_tx.clone(), None);
+        state
+            .registry
+            .set_activity_observer(hub.registry_observer());
+        state.activity = Some(hub);
+        let mut frames = state.broadcast_tx.subscribe();
+        let terminal_id = "T-managed-codex";
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-codex".into(),
+            incarnation_id: "incarnation-codex".into(),
+            terminal_id: terminal_id.into(),
+            stream_id: "codex-epoch".into(),
+            mode: "codex".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("thread-owned".into()),
+            create_request_id: Some("create-codex".into()),
+        });
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ManagedOutputFixture(ManagedOutputRead {
+                stream_epoch: Some("codex-epoch".into()),
+                incarnation_id: Some("incarnation-codex".into()),
+                reset_required: false,
+                truncated: false,
+                retained_from_seq: 1,
+                head_seq: 1,
+                exit_code: None,
+                native_session_id: Some("thread-owned".into()),
+                chunks: vec![ManagedOutputChunk {
+                    seq_start: 1,
+                    seq_end: 1,
+                    data: "assistant answer without a bell".into(),
+                }],
+                opencode_activity: None,
+                codex_activity: Some(CodexActivityBatch {
+                    retained_from_seq: 1,
+                    head_seq: 2,
+                    events: [false, true]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, completed)| CodexActivityEvent {
+                            seq: index as u64 + 1,
+                            at: now_ms() + index as i64,
+                            thread_id: "thread-owned".into(),
+                            turn_id: Some("turn-owned".into()),
+                            status: completed.then(|| "completed".into()),
+                            completed,
+                        })
+                        .collect(),
+                }),
+            }))));
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .unwrap();
+        let mut saw_busy = false;
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame: serde_json::Value =
+                    serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                if frame["type"] == "codex.activity.updated"
+                    && frame["upsert"]
+                        .as_array()
+                        .is_some_and(|rows| rows.iter().any(|row| row["phase"] == "busy"))
+                {
+                    saw_busy = true;
+                }
+                if frame["type"] == "terminal.turn.complete" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("native Codex turn completion must reach the browser without a PTY bell");
+        assert!(saw_busy);
+        assert_eq!(completion["outcome"], "completed");
+        assert_eq!(completion["sessionId"], "thread-owned");
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+                    if frame["type"] == "terminal.turn.complete" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "repeated host reads must not duplicate a completion"
+        );
     }
 }
 #[cfg(test)]

@@ -11,7 +11,12 @@ coverage/
 /server/
 /test/server/
 /test/unit/server/
-/test/integration/server/
+# Retain only the actual fake-grant implementation and teardown callbacks
+# executed by the default tooling unit suite; other retired tests stay excluded.
+/test/integration/server/*
+!/test/integration/server/provider-parity-onecli.ts
+!/test/integration/server/fresh-agent-parity.test.ts
+!/test/integration/server/managed-provider-parity.test.ts
 
 # Version control and CI
 .git/
@@ -89,6 +94,12 @@ examples/extensions/live-counter/*
 !examples/extensions/status-dashboard/
 examples/extensions/status-dashboard/*
 !examples/extensions/status-dashboard/server.js
+
+# The default wire test runs this actual Rust serializer after the cloud copy.
+# Keep this exception after the broader examples rules above.
+!/crates/freshell-runtime-protocol/examples/
+/crates/freshell-runtime-protocol/examples/*
+!/crates/freshell-runtime-protocol/examples/native-identity-wire.rs
 
 !installers/
 installers/*

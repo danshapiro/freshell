@@ -760,6 +760,7 @@ async fn unsupported_atomic_handoff_refuses_before_mutation_and_clear_bypasses_p
 
 fn create_msg(sid: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        pane_id: None,
         naming_handle: None,
         request_id: format!("handoff-create-{}", uuid::Uuid::new_v4()),
         session_type: SessionType::Freshclaude,
@@ -6951,6 +6952,7 @@ const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
     FreshAgentCreate {
+        pane_id: None,
         naming_handle: None,
         request_id: format!("handoff-create-fresh-{}", uuid::Uuid::new_v4()),
         session_type,

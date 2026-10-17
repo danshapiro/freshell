@@ -140,6 +140,18 @@ function spawnSidecar(env: Record<string, string> = {}) {
   return { child, frames, send, waitFor, waitExit: () => waitForExit(child, () => stderrOut), stderr: () => stderrOut }
 }
 
+it('never auto-allows a late native callback after the session closes', async () => {
+  const rig=spawnSidecar()
+  try {
+    rig.send({ type: 'create', requestId: 'closed-permission-query' })
+    const created=await rig.waitFor((frame)=>frame.type==='created','created')
+    rig.send({ type: 'send', sessionId: created.sessionId, text: '__end_and_late_permission__' })
+    await rig.waitFor((frame)=>frame.type==='sdk.status' && frame.status==='idle','closed query')
+    const late=await rig.waitFor((frame)=>frame.type==='probe.late-permission','late callback')
+    expect(late.decision.behavior).toBe('deny')
+  } finally { rig.send({ type:'shutdown' }); await rig.waitExit() }
+})
+
 // ── case 1 ───────────────────────────────────────────────────────────────────
 describe('case 1: raisePermissionRequest parks, emits request + 0->>=1 waiting edge', () => {
   it('emits sdk.permission.request (minted 21-char id + tool payload) then sdk.turn.waiting; a second park does NOT re-emit waiting', async () => {
@@ -381,6 +393,16 @@ describe('cases 6/7: canUseTool adapter preserves legacy ordering (sdk-bridge.ts
     expect(frames).toEqual([])
     expect(session.pendingPermissions?.size ?? 0).toBe(0)
     expect(session.pendingQuestions?.size ?? 0).toBe(0)
+  })
+
+  it('keeps a genuine managed native ask under bypass instead of overriding its policy', async () => {
+    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps({ permissionMode: 'bypassPermissions', nativeChannel: {} })
+    const pending = canUseTool({ session, emit, nanoid, nextMonotonic, sessionId: 'current',
+      toolName: 'Bash', input: { command: 'harmless' }, options: { toolUseID: 'toolu_current1', requestId: 'native-current' } })
+    const requested = frames.find((frame) => frame.type === 'sdk.permission.request')
+    expect(requested).toMatchObject({ nativeRequestId: 'native-current', toolUseID: 'toolu_current1' })
+    expect(respondPermission(session, requested!.requestId, { behavior: 'deny', message: 'User denied' })).toBe(true)
+    expect(await pending).toEqual({ behavior: 'deny', message: 'User denied' })
   })
 
   it('case 7: AskUserQuestion routes to the question path even under bypassPermissions', async () => {
