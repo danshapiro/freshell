@@ -164,6 +164,20 @@ struct ReadonlyNativeReader {
     tty: bool,
 }
 
+/// Existing-store helpers need the accepted workspace namespace, not a new
+/// provider input publication. Their callers resolve these mounts for adoption.
+fn readonly_workspace_mounts(mounts: &docker::TerminalMounts) -> Vec<Value> {
+    let mut selected = vec![
+        json!({"Type":"bind","Source":mounts.workspace,"Target":mounts.workspace,"ReadOnly":true}),
+    ];
+    if let Some(git) = &mounts.git_common_dir {
+        if !git.starts_with(&mounts.workspace) {
+            selected.push(json!({"Type":"bind","Source":git,"Target":git,"ReadOnly":true}));
+        }
+    }
+    selected
+}
+
 fn stopped_repair_provider_env(terminal: &TerminalLaunchSpec) -> Vec<String> {
     let mut env = terminal.env.clone();
     env.insert("HOME".into(), OPENCODE_PROVIDER_HOME.into());
@@ -293,8 +307,12 @@ impl DockerEngineBackend {
         if needs_workspace {
             let mounts = handle
                 .terminal()
-                .map(docker::terminal_mounts)
-                .or_else(|| handle.fresh_agent().map(docker::fresh_agent_mounts))
+                .map(docker::terminal_mounts_for_adoption)
+                .or_else(|| {
+                    handle
+                        .fresh_agent()
+                        .map(docker::fresh_agent_mounts_for_adoption)
+                })
                 .ok_or_else(|| {
                     BackendError::Unavailable(
                         "selected native store has no owned workspace mounts".into(),
@@ -316,13 +334,7 @@ impl DockerEngineBackend {
                     ));
                 }
             }
-            extra_mounts.push(json!({"Type":"bind","Source":mounts.workspace,"Target":mounts.workspace,"ReadOnly":true}));
-            if let Some(git) = mounts.git_common_dir {
-                if !git.starts_with(&mounts.workspace) {
-                    extra_mounts
-                        .push(json!({"Type":"bind","Source":git,"Target":git,"ReadOnly":true}));
-                }
-            }
+            extra_mounts = readonly_workspace_mounts(&mounts);
         }
         let output = self
             .readonly_native_helper(
@@ -377,7 +389,8 @@ impl DockerEngineBackend {
                 "stopped OpenCode repair stage is not canonical".into(),
             ));
         }
-        let mounts = docker::terminal_mounts(terminal).map_err(BackendError::InvalidConfig)?;
+        let mounts =
+            docker::terminal_mounts_for_adoption(terminal).map_err(BackendError::InvalidConfig)?;
         let binary = canonical_regular_file(handle.host_binary_path())?;
         let name = format!("freshell-opencode-repair-{}", uuid::Uuid::new_v4());
         let mut create_attempted = false;
@@ -413,14 +426,8 @@ impl DockerEngineBackend {
                 json!({"Type":"bind", "Source":binary, "Target":"/runtime/freshell-session-host", "ReadOnly":true}),
                 json!({"Type":"volume", "Source":handle.provider_volume_name(), "Target":"/home/freshell/provider", "ReadOnly":false}),
                 json!({"Type":"bind", "Source":stage, "Target":"/run/freshell-opencode-transfer", "ReadOnly":true}),
-                json!({"Type":"bind", "Source":mounts.workspace, "Target":mounts.workspace, "ReadOnly":true}),
             ];
-            if let Some(git) = &mounts.git_common_dir {
-                if !git.starts_with(&mounts.workspace) {
-                    docker_mounts
-                        .push(json!({"Type":"bind", "Source":git, "Target":git, "ReadOnly":true}));
-                }
-            }
+            docker_mounts.extend(readonly_workspace_mounts(&mounts));
             let env = stopped_repair_provider_env(terminal);
             let body = json!({
                 "Image": handle.image_ref(),
@@ -666,7 +673,7 @@ impl DockerEngineBackend {
                 terminal.run_as_gid,
                 terminal.workspace_path.as_str(),
                 terminal.cwd.as_str(),
-                docker::terminal_mounts(terminal),
+                docker::terminal_mounts_for_adoption(terminal),
             )
         } else if let Some(agent) = handle.fresh_agent() {
             if agent.provider.as_str() != "opencode" {
@@ -679,7 +686,7 @@ impl DockerEngineBackend {
                 agent.run_as_gid,
                 agent.workspace_path.as_str(),
                 agent.cwd.as_str(),
-                docker::fresh_agent_mounts(agent),
+                docker::fresh_agent_mounts_for_adoption(agent),
             )
         } else {
             return Err(BackendError::InvalidConfig(
@@ -695,14 +702,7 @@ impl DockerEngineBackend {
             ));
         }
         let mounts = mounts.map_err(BackendError::InvalidConfig)?;
-        let mut extra_mounts = vec![
-            json!({"Type":"bind","Source":mounts.workspace,"Target":mounts.workspace,"ReadOnly":true}),
-        ];
-        if let Some(git) = mounts.git_common_dir {
-            if !git.starts_with(&mounts.workspace) {
-                extra_mounts.push(json!({"Type":"bind","Source":git,"Target":git,"ReadOnly":true}));
-            }
-        }
+        let extra_mounts = readonly_workspace_mounts(&mounts);
         let output=self.readonly_native_helper(handle,reader_binary,ReadonlyNativeReader {
             image_ref:request.image_ref.clone(),uid,gid,
             args:vec!["retained-opencode-store-worker".into(),serde_json::to_string(request).map_err(|error|BackendError::Malformed(error.to_string()))?],
@@ -927,6 +927,88 @@ mod tests {
         framed
     }
 
+    fn isolated_deleted_input_case() -> bool {
+        const CHILD: &str = "FRESHELL_DELETED_INPUT_HELPER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let thread = std::thread::current();
+        let test_name = thread.name().expect("named test thread");
+        let status = std::process::Command::new("/usr/bin/timeout")
+            .args(["--kill-after=1s", "20s"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated deleted-input helper case failed"
+        );
+        true
+    }
+
+    fn selected_input_context(
+        root: &Path,
+        workspace: &Path,
+    ) -> freshell_runtime_protocol::ProviderLaunchContext {
+        use std::os::unix::fs::PermissionsExt;
+        let capabilities = root.join("mcp-capabilities");
+        let stage = root.join("provider-roots/grant-helper-input");
+        let selected = workspace.join(".opencode");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("plugin.json"), b"{}").unwrap();
+        std::fs::create_dir(&capabilities).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/resource-units/project")).unwrap();
+        let manifest = b"{\"sources\":[]}";
+        std::fs::write(stage.join(".freshell/input-manifest.json"), manifest).unwrap();
+        let grant = capabilities.join("grant-helper-input.json");
+        std::fs::write(&grant, b"{}").unwrap();
+        std::fs::set_permissions(grant, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", capabilities);
+        std::env::set_var("HOME", workspace);
+        std::env::remove_var("FRESHELL_SUPERVISOR_OPERATOR_HOME");
+        serde_json::from_value(json!({
+            "preparation":freshell_runtime_protocol::ProviderPreparation::Opencode {
+                project_config:vec![], tui_config:None, tui_source:None, inline_config:false,
+            },
+            "config":[],
+            "mcpCapability":{"grantId":"grant-helper-input","endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+            "preparedInputs":{
+                "generationId":"grant-helper-input",
+                "manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(manifest)),"sourceCount":0,"aliasCount":0,"recipeCount":0},
+                "configBinds":[],"indexedFiles":null,
+                "resourceMounts":[{"stageRelativePath":".freshell/resource-units/project","providerRelativePath":".freshell/provider-roots/project",
+                    "logicalDestination":selected,"effectiveDestination":selected,"kind":"directory","writable":false,"referenceAliases":[],"retiredReferenceAliases":[]}]
+            }
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retained_store_helper_reads_terminal_after_selected_input_deletion() {
+        check_history_helper("compatibility_deleted_terminal").await;
+    }
+
+    #[tokio::test]
+    async fn retained_store_helper_reads_fresh_after_selected_input_deletion() {
+        check_history_helper("compatibility_deleted_fresh").await;
+    }
+
+    #[tokio::test]
+    async fn census_helper_reads_terminal_after_selected_input_deletion() {
+        check_history_helper("census_workspace_deleted_terminal").await;
+    }
+
+    #[tokio::test]
+    async fn census_helper_reads_fresh_after_selected_input_deletion() {
+        check_history_helper("census_workspace_deleted_fresh").await;
+    }
+
+    #[tokio::test]
+    async fn history_helper_reads_fresh_after_selected_input_deletion() {
+        check_history_helper("history_deleted_fresh").await;
+    }
+
     #[test]
     fn stopped_repair_decodes_bounded_docker_stdout_frames() {
         let mut frames = docker_stdout_frame(b"{\"imported\":");
@@ -976,275 +1058,362 @@ mod tests {
             "timeout",
             "failed_cleanup",
         ] {
-            let temp = tempfile::tempdir().unwrap();
-            let socket = temp.path().join("docker.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
-            let daemon = DockerDaemonId::new();
-            let expected_daemon = daemon.clone();
-            let binary = temp.path().join("reader");
-            std::fs::write(&binary, "fixture binary").unwrap();
-            let workspace = temp.path().join("workspace");
-            std::fs::create_dir(&workspace).unwrap();
-            let agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
+            check_history_helper(mode).await;
+        }
+    }
+
+    async fn check_history_helper(mode: &'static str) {
+        let deleted_input = mode.contains("deleted");
+        if deleted_input && isolated_deleted_input_case() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("docker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let daemon = DockerDaemonId::new();
+        let expected_daemon = daemon.clone();
+        let binary = temp.path().join("reader");
+        std::fs::write(&binary, "fixture binary").unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
                 "sessionId":"presentation-alias","provider":"opencode","sessionType":"freshopencode",
                 "runtimeVariant":"opencode","providerStoreId":"store","cwd":workspace,"workspacePath":workspace,
                 "runAsUid":65534,"runAsGid":0,"nativeSessionId":"ses_saved"
             })).unwrap();
-            let handle = OwnedRuntimeHandle::from_registry(
-                InstallationId::new(),
-                SoulId::new(),
-                "store".into(),
-                IncarnationId::new(),
-                LaunchNonce::new(),
-                daemon,
-                "provider-container-must-not-touch".into(),
-                "sha256:fixture".into(),
-                temp.path().into(),
-                binary.clone(),
-                "config".into(),
-                RuntimeLimits {
-                    cpu_milli: 500,
-                    memory_bytes: 64 * 1024 * 1024,
-                    swap_bytes: 0,
-                    pids_max: 32,
-                },
-                (mode == "census_fixture")
-                    .then_some(freshell_runtime_protocol::FixtureKind::NativeSession),
-                None,
-                (mode != "census_fixture").then_some(agent),
-                "owned-native-volume".into(),
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(json!({"terminalId":"census","streamId":"census","mode":"opencode","program":"opencode",
+            "cwd":workspace,"workspacePath":workspace,"env":{"HOME":OPENCODE_PROVIDER_HOME,"API_KEY":"private-fixture-value"},
+            "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test"})).unwrap();
+        if deleted_input {
+            let context = selected_input_context(temp.path(), &workspace);
+            agent.provider_launch_context = Some(context.clone());
+            terminal.provider_launch_context = Some(context);
+            let git = temp.path().join("git-common");
+            std::fs::create_dir(&git).unwrap();
+            agent.git_common_dir = Some(git.to_string_lossy().into());
+            terminal.git_common_dir = agent.git_common_dir.clone();
+            docker::terminal_mounts(&terminal)
+                .expect("valid current terminal inputs before deletion");
+            docker::fresh_agent_mounts(&agent).expect("valid current fresh inputs before deletion");
+            std::fs::remove_dir_all(workspace.join(".opencode")).unwrap();
+            assert!(docker::terminal_mounts(&terminal).is_err());
+            assert!(docker::fresh_agent_mounts(&agent).is_err());
+        }
+        let handle = OwnedRuntimeHandle::from_registry(
+            InstallationId::new(),
+            SoulId::new(),
+            "store".into(),
+            IncarnationId::new(),
+            LaunchNonce::new(),
+            daemon,
+            "provider-container-must-not-touch".into(),
+            "sha256:fixture".into(),
+            temp.path().into(),
+            binary.clone(),
+            "config".into(),
+            RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 64 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 32,
+            },
+            (mode == "census_fixture")
+                .then_some(freshell_runtime_protocol::FixtureKind::NativeSession),
+            mode.ends_with("_terminal").then_some(terminal.clone()),
+            (mode != "census_fixture" && !mode.ends_with("_terminal")).then_some(agent),
+            "owned-native-volume".into(),
+        );
+        let mut spec =
+            freshell_agent_runtime::build_resume_spec(freshell_agent_runtime::ResumeSpecInput {
+                provider: "opencode",
+                provider_store_id: "store",
+                native_session_id: "ses_saved",
+                terminal: &terminal,
+                provider_version: None,
+                creation_seed_ref: "seed".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 1,
+                never_dispatched: false,
+            })
+            .unwrap();
+        if mode == "census_unreadable" {
+            let database = temp.path().join(".local/share/opencode/opencode.db");
+            std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+            std::fs::write(database, "incomplete native store").unwrap();
+        }
+        let provider_home = temp.path().join("provider");
+        std::fs::create_dir_all(&provider_home).unwrap();
+        if mode == "census_fixture" {
+            spec.provider_session.provider = "native-session-fixture".into();
+        }
+        if mode.starts_with("census_") && mode != "census_fixture" {
+            spec.environment
+                .insert("OPENCODE_DISABLE_CHANNEL_DB".into(), "1".into());
+            spec.provider_version = Some("1.18.21".into());
+        }
+        if mode.starts_with("census_workspace") || mode == "census_unmounted" {
+            let selected = if mode.starts_with("census_workspace") {
+                workspace.join("selected.db")
+            } else {
+                temp.path().join("unmounted/selected.db")
+            };
+            spec.environment
+                .insert("OPENCODE_DB".into(), selected.display().to_string());
+        }
+        if mode == "census_unmounted" {
+            let result = DockerEngineBackend::new(&socket)
+                .read_native_census(
+                    &handle,
+                    &spec,
+                    &binary,
+                    &format!("sha256:{}", "b".repeat(64)),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(BackendError::Unavailable(ref detail))
+                    if detail == "selected native store is outside the owned reader mounts"),
+                "{result:?}"
             );
-            let terminal = serde_json::from_value(json!({"terminalId":"census","streamId":"census","mode":"opencode","program":"opencode",
-                "cwd":workspace,"workspacePath":workspace,"env":{"HOME":OPENCODE_PROVIDER_HOME,"API_KEY":"private-fixture-value"},
-                "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test"})).unwrap();
-            let mut spec = freshell_agent_runtime::build_resume_spec(
-                freshell_agent_runtime::ResumeSpecInput {
-                    provider: "opencode",
-                    provider_store_id: "store",
-                    native_session_id: "ses_saved",
-                    terminal: &terminal,
-                    provider_version: None,
-                    creation_seed_ref: "seed".into(),
-                    checkpoint_revision: 0,
-                    evidence_revision: 1,
-                    never_dispatched: false,
-                },
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err(),
+                "an uncovered selected store must refuse before creating a helper"
+            );
+            return;
+        }
+        if matches!(mode, "census_success" | "census_workspace") || deleted_input {
+            let path = if mode.starts_with("census_workspace") {
+                workspace.join("selected.db")
+            } else {
+                temp.path().join(".local/share/opencode/opencode.db")
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = rusqlite::Connection::open(path).unwrap();
+            db.execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
+                .unwrap();
+            for migration in
+                freshell_sessions::opencode_transfer::pinned_destination_migration_ids()
+            {
+                db.execute("INSERT INTO migration VALUES (?1,0)", [migration])
+                    .unwrap();
+            }
+            if deleted_input {
+                db.execute("INSERT INTO project (id,worktree,time_created,time_updated,sandboxes) VALUES ('project',?1,1,1,'{}')",[workspace.to_string_lossy().as_ref()]).unwrap();
+                db.execute("INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES ('ses_saved','project','slug',?1,'saved session','1.18.21',1,1)",[workspace.to_string_lossy().as_ref()]).unwrap();
+                db.execute("INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES ('msg_saved','ses_saved',1,1,'{}')",[]).unwrap();
+            }
+        }
+        let actual_probe = freshell_agent_runtime::probe_provider_store(
+            if mode == "census_fixture" {
+                &provider_home
+            } else {
+                temp.path()
+            },
+            &spec,
+        );
+        let actual_receipt = serde_json::to_string(&actual_probe).unwrap();
+        let compatibility_evidence = if deleted_input && mode.starts_with("compatibility_") {
+            use freshell_sessions::opencode_transfer::{
+                export_exact_session, ExportOptions, HostOpenCodeInventory,
+            };
+            let source =
+                HostOpenCodeInventory::new(temp.path().join(".local/share/opencode/opencode.db"))
+                    .with_trusted_mount_for_selected_session(workspace.clone());
+            let snapshot = export_exact_session(
+                &source,
+                "ses_saved",
+                ExportOptions::new(temp.path().join("saved-export")),
             )
             .unwrap();
-            if mode == "census_unreadable" {
-                let database = temp.path().join(".local/share/opencode/opencode.db");
-                std::fs::create_dir_all(database.parent().unwrap()).unwrap();
-                std::fs::write(database, "incomplete native store").unwrap();
-            }
-            let provider_home = temp.path().join("provider");
-            std::fs::create_dir_all(&provider_home).unwrap();
-            if mode == "census_fixture" {
-                spec.provider_session.provider = "native-session-fixture".into();
-            }
-            if mode.starts_with("census_") && mode != "census_fixture" {
-                spec.environment
-                    .insert("OPENCODE_DISABLE_CHANNEL_DB".into(), "1".into());
-                spec.provider_version = Some("1.18.21".into());
-            }
-            if matches!(mode, "census_workspace" | "census_unmounted") {
-                let selected = if mode == "census_workspace" {
-                    workspace.join("selected.db")
-                } else {
-                    temp.path().join("unmounted/selected.db")
-                };
-                spec.environment
-                    .insert("OPENCODE_DB".into(), selected.display().to_string());
-            }
-            if mode == "census_unmounted" {
-                let result = DockerEngineBackend::new(&socket)
-                    .read_native_census(
-                        &handle,
-                        &spec,
-                        &binary,
-                        &format!("sha256:{}", "b".repeat(64)),
-                    )
-                    .await;
-                assert!(
-                    matches!(result, Err(BackendError::Unavailable(ref detail))
-                    if detail == "selected native store is outside the owned reader mounts"),
-                    "{result:?}"
-                );
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(20), listener.accept())
-                        .await
-                        .is_err(),
-                    "an uncovered selected store must refuse before creating a helper"
-                );
-                continue;
-            }
-            if matches!(mode, "census_success" | "census_workspace") {
-                let path = if mode == "census_workspace" {
-                    workspace.join("selected.db")
-                } else {
-                    temp.path().join(".local/share/opencode/opencode.db")
-                };
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                let db = rusqlite::Connection::open(path).unwrap();
-                db.execute_batch(
-                    freshell_sessions::opencode_transfer::pinned_destination_schema_sql(),
-                )
-                .unwrap();
-                for migration in
-                    freshell_sessions::opencode_transfer::pinned_destination_migration_ids()
-                {
-                    db.execute("INSERT INTO migration VALUES (?1,0)", [migration])
+            let manifest = snapshot.manifest();
+            json!({"sourceSchemaFingerprint":manifest.source_schema_fingerprint,"migrationJournalFingerprint":manifest.migration_journal_fingerprint,
+                "generation":manifest.generation,"rowCount":manifest.row_count})
+        } else {
+            json!({"sourceSchemaFingerprint":"c".repeat(64),"migrationJournalFingerprint":"d".repeat(64),"generation":"e".repeat(64),"rowCount":3})
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let seen = captured.clone();
+                let daemon = expected_daemon.clone();
+                let actual_receipt = actual_receipt.clone();
+                let compatibility_evidence = compatibility_evidence.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut byte = [0];
+                    while !raw.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).await.unwrap();
+                        raw.push(byte[0]);
+                    }
+                    let head = String::from_utf8(raw).unwrap();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .unwrap()
+                        .trim()
+                        .parse()
                         .unwrap();
-                }
-            }
-            let actual_probe = freshell_agent_runtime::probe_provider_store(
-                if mode == "census_fixture" {
-                    &provider_home
-                } else {
-                    temp.path()
-                },
-                &spec,
-            );
-            let actual_receipt = serde_json::to_string(&actual_probe).unwrap();
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let captured = seen.clone();
-            let server = tokio::spawn(async move {
-                loop {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    let seen = captured.clone();
-                    let daemon = expected_daemon.clone();
-                    let actual_receipt = actual_receipt.clone();
-                    tokio::spawn(async move {
-                        let mut raw = Vec::new();
-                        let mut byte = [0];
-                        while !raw.ends_with(b"\r\n\r\n") {
-                            stream.read_exact(&mut byte).await.unwrap();
-                            raw.push(byte[0]);
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let request = head.lines().next().unwrap().to_string();
+                    seen.lock().unwrap().push((request.clone(), body));
+                    let (status, body) = if request.contains("/info ") {
+                        (200, json!({"ID":daemon}).to_string())
+                    } else if request.contains("/volumes/") {
+                        (200, json!({"Name":"owned-native-volume"}).to_string())
+                    } else if request.contains("/create?") {
+                        (201, json!({"Id":"owned-history-helper"}).to_string())
+                    } else if request.contains("/start ") {
+                        (204, String::new())
+                    } else if request.contains("/wait?") {
+                        if mode == "timeout" {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
-                        let head = String::from_utf8(raw).unwrap();
-                        let length: usize = head
-                            .lines()
-                            .find_map(|line| line.strip_prefix("Content-Length: "))
-                            .unwrap()
-                            .trim()
-                            .parse()
-                            .unwrap();
-                        let mut body = vec![0; length];
-                        stream.read_exact(&mut body).await.unwrap();
-                        let request = head.lines().next().unwrap().to_string();
-                        seen.lock().unwrap().push((request.clone(), body));
-                        let (status, body) = if request.contains("/info ") {
-                            (200, json!({"ID":daemon}).to_string())
-                        } else if request.contains("/volumes/") {
-                            (200, json!({"Name":"owned-native-volume"}).to_string())
-                        } else if request.contains("/create?") {
-                            (201, json!({"Id":"owned-history-helper"}).to_string())
-                        } else if request.contains("/start ") {
-                            (204, String::new())
-                        } else if request.contains("/wait?") {
-                            if mode == "timeout" {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                            }
-                            (
+                        (
                                 200,
                                 json!({"StatusCode": if matches!(mode, "failed_exit" | "compatibility_failure") {1} else {0}})
                                     .to_string(),
                             )
-                        } else if request.contains("/logs?") {
-                            (
-                                200,
-                                if mode == "bad_output" {
-                                    "invalid".into()
-                                } else if matches!(mode, "failed_exit" | "compatibility_failure") {
-                                    json!({"event":"session_host.fatal","error":"saved native session not found"}).to_string()
+                    } else if request.contains("/logs?") {
+                        (
+                            200,
+                            if mode == "bad_output" {
+                                "invalid".into()
+                            } else if matches!(mode, "failed_exit" | "compatibility_failure") {
+                                json!({"event":"session_host.fatal","error":"saved native session not found"}).to_string()
+                            } else {
+                                if mode.starts_with("census_") {
+                                    actual_receipt
+                                } else if mode.starts_with("compatibility_") {
+                                    let seen = seen.lock().unwrap();
+                                    let create: Value = serde_json::from_slice(
+                                        &seen
+                                            .iter()
+                                            .find(|(request, _)| request.contains("/create?"))
+                                            .unwrap()
+                                            .1,
+                                    )
+                                    .unwrap();
+                                    let request: Value =
+                                        serde_json::from_str(create["Cmd"][1].as_str().unwrap())
+                                            .unwrap();
+                                    let mut receipt = compatibility_evidence;
+                                    receipt["request"] = request;
+                                    receipt["providerVersion"] = json!("1.18.21");
+                                    receipt.to_string()
                                 } else {
-                                    if mode.starts_with("census_") {
-                                        actual_receipt
-                                    } else if mode.starts_with("compatibility_") {
-                                        let seen = seen.lock().unwrap();
-                                        let create: Value = serde_json::from_slice(
-                                            &seen
-                                                .iter()
-                                                .find(|(request, _)| request.contains("/create?"))
-                                                .unwrap()
-                                                .1,
-                                        )
-                                        .unwrap();
-                                        let request: Value = serde_json::from_str(
-                                            create["Cmd"][1].as_str().unwrap(),
-                                        )
-                                        .unwrap();
-                                        json!({"request":request,"providerVersion":"1.18.21","sourceSchemaFingerprint":"c".repeat(64),"migrationJournalFingerprint":"d".repeat(64),"generation":"e".repeat(64),"rowCount":3}).to_string()
-                                    } else {
-                                        json!({"threadId":"ses_saved","provider":"opencode","turns":[]}).to_string()
-                                    }
-                                },
-                            )
-                        } else if request.starts_with("DELETE ") {
-                            (
-                                if mode == "failed_cleanup" { 500 } else { 204 },
-                                String::new(),
-                            )
-                        } else {
-                            panic!("unexpected request {request}")
-                        };
-                        let body = if (mode.starts_with("compatibility_")
-                            || mode.starts_with("census_"))
-                            && request.contains("/logs?")
-                        {
-                            let mut frame = docker_stdout_frame(body.as_bytes());
-                            if mode == "compatibility_failure" {
-                                frame[0] = 2;
-                            }
-                            frame
-                        } else {
-                            body.into_bytes()
-                        };
-                        let header=format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
-                        let _ = stream.write_all(header.as_bytes()).await;
-                        let _ = stream.write_all(&body).await;
-                    });
-                }
-            });
-            let backend = DockerEngineBackend::new(&socket);
-            let result = if mode.starts_with("census_") {
-                backend.read_native_census(&handle, &spec, &binary, &format!("sha256:{}", "b".repeat(64))).await.map(|probe| {
+                                    json!({"threadId":"ses_saved","provider":"opencode","turns":[]})
+                                        .to_string()
+                                }
+                            },
+                        )
+                    } else if request.starts_with("DELETE ") {
+                        (
+                            if mode == "failed_cleanup" { 500 } else { 204 },
+                            String::new(),
+                        )
+                    } else {
+                        panic!("unexpected request {request}")
+                    };
+                    let body = if (mode.starts_with("compatibility_")
+                        || mode.starts_with("census_"))
+                        && request.contains("/logs?")
+                    {
+                        let mut frame = docker_stdout_frame(body.as_bytes());
+                        if mode == "compatibility_failure" {
+                            frame[0] = 2;
+                        }
+                        frame
+                    } else {
+                        body.into_bytes()
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        let backend = DockerEngineBackend::new(&socket);
+        let result = if mode.starts_with("census_") {
+            backend.read_native_census(&handle, &spec, &binary, &format!("sha256:{}", "b".repeat(64))).await.map(|probe| {
                     assert_eq!(probe, actual_probe);
+                    if deleted_input {
+                        assert!(matches!(probe, freshell_agent_runtime::ProviderStoreProbe::Ready { .. }),
+                            "the selected saved native session must remain readable: {probe:?}");
+                    }
                     assert_eq!(matches!(probe, freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable { .. }), matches!(mode, "census_success" | "census_workspace" | "census_fixture"));
                     serde_json::to_value(probe).unwrap()
                 })
-            } else if mode.starts_with("compatibility_") {
-                let request = freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
-                    provider_store_id: handle.provider_store_id().into(),
-                    native_session_id: "ses_saved".into(),
-                    image_ref: format!("sha256:{}", "b".repeat(64)),
-                    provider_home: OPENCODE_PROVIDER_HOME.into(),
-                    workspace_path: workspace.to_string_lossy().into(),
-                    cwd: workspace.to_string_lossy().into(),
-                    provider_uid: 65534,
-                    provider_gid: 0,
-                };
-                backend
-                    .qualify_retained_opencode(&handle, &request, &binary)
-                    .await
-                    .map(|receipt| serde_json::to_value(receipt).unwrap())
-            } else {
-                backend
-                    .read_history_helper(
-                        &handle,
-                        "opencode",
-                        "ses_saved",
-                        &binary,
-                        if mode == "timeout" {
-                            Duration::from_millis(250)
-                        } else {
-                            Duration::from_secs(5)
-                        },
-                    )
-                    .await
+        } else if mode.starts_with("compatibility_") {
+            let request = freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
+                provider_store_id: handle.provider_store_id().into(),
+                native_session_id: "ses_saved".into(),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                provider_home: OPENCODE_PROVIDER_HOME.into(),
+                workspace_path: workspace.to_string_lossy().into(),
+                cwd: workspace.to_string_lossy().into(),
+                provider_uid: 65534,
+                provider_gid: 0,
             };
-            assert_eq!(
-                result.is_ok(),
-                matches!(
+            if deleted_input {
+                for mismatched in [
+                    freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
+                        provider_store_id: "foreign-store".into(),
+                        ..request.clone()
+                    },
+                    freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
+                        provider_uid: 1234,
+                        ..request.clone()
+                    },
+                    freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
+                        cwd: temp.path().display().to_string(),
+                        ..request.clone()
+                    },
+                ] {
+                    assert!(
+                        matches!(
+                            backend
+                                .qualify_retained_opencode(&handle, &mismatched, &binary)
+                                .await,
+                            Err(BackendError::OwnershipMismatch(_))
+                        ),
+                        "deleted input must not relax selected-store identity"
+                    );
+                }
+                assert!(
+                    seen.lock().unwrap().is_empty(),
+                    "mismatched authority must refuse before Docker access"
+                );
+            }
+            backend
+                .qualify_retained_opencode(&handle, &request, &binary)
+                .await
+                .map(|receipt| serde_json::to_value(receipt).unwrap())
+        } else {
+            backend
+                .read_history_helper(
+                    &handle,
+                    "opencode",
+                    "ses_saved",
+                    &binary,
+                    if mode == "timeout" {
+                        Duration::from_millis(250)
+                    } else {
+                        Duration::from_secs(5)
+                    },
+                )
+                .await
+        };
+        assert_eq!(
+            result.is_ok(),
+            deleted_input
+                || matches!(
                     mode,
                     "success"
                         | "compatibility_success"
@@ -1253,102 +1422,133 @@ mod tests {
                         | "census_unreadable"
                         | "census_fixture"
                 ),
-                "{mode}: {result:?}"
-            );
-            if matches!(mode, "failed_exit" | "compatibility_failure") {
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("saved native session not found"));
-            }
-            {
-                let seen = seen.lock().unwrap();
-                assert!(seen
-                    .iter()
-                    .all(|(request, _)| !request.contains(handle.container_id())));
-                let create: Value = serde_json::from_slice(
-                    &seen
-                        .iter()
-                        .find(|(request, _)| request.contains("/create?"))
-                        .unwrap()
-                        .1,
-                )
-                .unwrap();
-                assert_eq!(
-                    create["User"],
-                    if mode == "census_fixture" {
-                        "0:0"
-                    } else {
-                        "65534:0"
-                    }
-                );
-                assert_eq!(
-                    create["Tty"],
-                    !(mode.starts_with("compatibility_") || mode.starts_with("census_"))
-                );
-                if mode.starts_with("census_") {
-                    assert_eq!(create["Cmd"][0], "provider-census-only");
-                    assert!(!create.to_string().contains("private-fixture-value"));
-                    assert_eq!(create["HostConfig"]["CapDrop"], json!(["ALL"]));
-                    assert_eq!(create["HostConfig"]["Mounts"][1]["ReadOnly"], true);
-                    let reader: freshell_runtime_protocol::ResumeSpec =
-                        serde_json::from_str(create["Cmd"][1].as_str().unwrap()).unwrap();
-                    assert_eq!(reader.cwd, spec.cwd);
-                    if mode != "census_fixture" {
-                        assert_eq!(
-                            reader
-                                .environment
-                                .get("OPENCODE_DISABLE_CHANNEL_DB")
-                                .map(String::as_str),
-                            Some("1")
-                        );
-                    }
-                    if mode == "census_workspace" {
-                        let mount = &create["HostConfig"]["Mounts"][2];
-                        assert_eq!(mount["Source"], workspace.to_string_lossy().as_ref());
-                        assert_eq!(mount["Target"], workspace.to_string_lossy().as_ref());
-                        assert_eq!(mount["ReadOnly"], true);
-                        assert_eq!(
-                            reader.environment.get("OPENCODE_DB"),
-                            spec.environment.get("OPENCODE_DB")
-                        );
-                    }
-                }
-                assert_eq!(create["HostConfig"]["NetworkMode"], "none");
-                assert_eq!(
-                    create["HostConfig"]["Mounts"].as_array().unwrap().len(),
-                    if mode.starts_with("compatibility_") || mode == "census_workspace" {
-                        3
-                    } else {
-                        2
-                    }
-                );
-                if mode.starts_with("compatibility_") {
-                    assert_eq!(create["Image"], format!("sha256:{}", "b".repeat(64)));
-                    assert_eq!(create["Cmd"][0], "retained-opencode-store-worker");
-                    assert_ne!(create["Image"], handle.image_ref());
-                }
-                assert!(create["HostConfig"]["Mounts"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|mount| mount["ReadOnly"] == true));
-                assert!(create.get("Labels").is_none());
-                let deletes: Vec<_> = seen
-                    .iter()
-                    .filter(|(request, _)| request.starts_with("DELETE "))
-                    .collect();
-                assert_eq!(deletes.len(), 1);
-                assert!(deletes[0].0.contains("/containers/freshell-history-"));
-            }
-            server.abort();
-            let _ = server.await;
+            "{mode}: {result:?}"
+        );
+        if matches!(mode, "failed_exit" | "compatibility_failure") {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("saved native session not found"));
         }
+        {
+            let seen = seen.lock().unwrap();
+            assert!(seen
+                .iter()
+                .all(|(request, _)| !request.contains(handle.container_id())));
+            let create: Value = serde_json::from_slice(
+                &seen
+                    .iter()
+                    .find(|(request, _)| request.contains("/create?"))
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+            assert_eq!(
+                create["User"],
+                if mode == "census_fixture" {
+                    "0:0"
+                } else {
+                    "65534:0"
+                }
+            );
+            assert_eq!(
+                create["Tty"],
+                !(mode.starts_with("compatibility_") || mode.starts_with("census_"))
+            );
+            if mode.starts_with("census_") {
+                assert_eq!(create["Cmd"][0], "provider-census-only");
+                assert!(!create.to_string().contains("private-fixture-value"));
+                assert_eq!(create["HostConfig"]["CapDrop"], json!(["ALL"]));
+                assert_eq!(create["HostConfig"]["Mounts"][1]["ReadOnly"], true);
+                let reader: freshell_runtime_protocol::ResumeSpec =
+                    serde_json::from_str(create["Cmd"][1].as_str().unwrap()).unwrap();
+                assert_eq!(reader.cwd, spec.cwd);
+                if mode != "census_fixture" {
+                    assert_eq!(
+                        reader
+                            .environment
+                            .get("OPENCODE_DISABLE_CHANNEL_DB")
+                            .map(String::as_str),
+                        Some("1")
+                    );
+                }
+                if mode.starts_with("census_workspace") {
+                    let mount = &create["HostConfig"]["Mounts"][2];
+                    assert_eq!(mount["Source"], workspace.to_string_lossy().as_ref());
+                    assert_eq!(mount["Target"], workspace.to_string_lossy().as_ref());
+                    assert_eq!(mount["ReadOnly"], true);
+                    assert_eq!(
+                        reader.environment.get("OPENCODE_DB"),
+                        spec.environment.get("OPENCODE_DB")
+                    );
+                }
+            }
+            assert_eq!(create["HostConfig"]["NetworkMode"], "none");
+            assert_eq!(
+                create["HostConfig"]["Mounts"][1]["Source"],
+                handle.provider_volume_name()
+            );
+            assert_eq!(
+                create["HostConfig"]["Mounts"].as_array().unwrap().len(),
+                if mode.starts_with("compatibility_") || mode.starts_with("census_workspace") {
+                    if deleted_input {
+                        4
+                    } else {
+                        3
+                    }
+                } else {
+                    2
+                }
+            );
+            if mode.starts_with("compatibility_") {
+                assert_eq!(create["Image"], format!("sha256:{}", "b".repeat(64)));
+                assert_eq!(create["Cmd"][0], "retained-opencode-store-worker");
+                assert_ne!(create["Image"], handle.image_ref());
+            }
+            if deleted_input
+                && (mode.starts_with("compatibility_") || mode.starts_with("census_workspace"))
+            {
+                let mounts = create["HostConfig"]["Mounts"].as_array().unwrap();
+                for path in [&workspace, &temp.path().join("git-common")] {
+                    assert!(mounts.iter().any(|mount| mount["Source"] == json!(path)
+                        && mount["Target"] == json!(path)
+                        && mount["ReadOnly"] == true));
+                }
+                assert!(
+                    mounts
+                        .iter()
+                        .all(|mount| mount["Target"] != json!(workspace.join(".opencode"))),
+                    "store readers mount only their required owned namespaces"
+                );
+            }
+            assert!(create["HostConfig"]["Mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|mount| mount["ReadOnly"] == true));
+            assert!(create.get("Labels").is_none());
+            let deletes: Vec<_> = seen
+                .iter()
+                .filter(|(request, _)| request.starts_with("DELETE "))
+                .collect();
+            assert_eq!(deletes.len(), 1);
+            assert!(deletes[0].0.contains("/containers/freshell-history-"));
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
     async fn stopped_repair_uses_a_no_tty_identity_helper_with_only_uid_gid_capabilities() {
         check_stopped_repair_helper(None).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_repair_helper_reads_terminal_after_selected_input_deletion() {
+        if isolated_deleted_input_case() {
+            return;
+        }
+        check_stopped_repair_helper_with_inputs(None, true).await;
     }
 
     #[tokio::test]
@@ -1374,6 +1574,13 @@ mod tests {
     }
 
     async fn check_stopped_repair_helper(failure: Option<&'static str>) {
+        check_stopped_repair_helper_with_inputs(failure, false).await;
+    }
+
+    async fn check_stopped_repair_helper_with_inputs(
+        failure: Option<&'static str>,
+        deleted_input: bool,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -1385,7 +1592,7 @@ mod tests {
         let expected_daemon = daemon.clone();
         let binary = temp.path().join("freshell-session-host");
         std::fs::write(&binary, "fixture binary").unwrap();
-        let terminal: TerminalLaunchSpec = serde_json::from_value(json!({
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(json!({
             "terminalId":"terminal-repair",
             "streamId":"stream-repair",
             "mode":"opencode",
@@ -1404,6 +1611,19 @@ mod tests {
             }
         }))
         .unwrap();
+        if deleted_input {
+            terminal.provider_launch_context =
+                Some(selected_input_context(temp.path(), &workspace));
+            let git = temp.path().join("git-common");
+            std::fs::create_dir(&git).unwrap();
+            terminal.git_common_dir = Some(git.display().to_string());
+            docker::terminal_mounts(&terminal).expect("valid prepared inputs before deletion");
+            std::fs::remove_dir_all(workspace.join(".opencode")).unwrap();
+            assert!(
+                docker::terminal_mounts(&terminal).is_err(),
+                "new runtime still requires current inputs"
+            );
+        }
         let soul_id = SoulId::new();
         let handle = OwnedRuntimeHandle::from_registry(
             InstallationId::new(),
@@ -1699,12 +1919,20 @@ private-body-secret-sentinel
                 .find(|mount| mount["Target"] == "/home/freshell/provider")
                 .unwrap();
             assert_eq!(provider["Type"], "volume");
+            assert_eq!(provider["Source"], handle.provider_volume_name());
             assert_eq!(provider["ReadOnly"], false);
             let staged = mounts
                 .iter()
                 .find(|mount| mount["Target"] == "/run/freshell-opencode-transfer")
                 .unwrap();
             assert_eq!(staged["ReadOnly"], true);
+            if deleted_input {
+                for path in [&workspace, &temp.path().join("git-common")] {
+                    assert!(mounts.iter().any(|mount| mount["Source"] == json!(path)
+                        && mount["Target"] == json!(path)
+                        && mount["ReadOnly"] == true));
+                }
+            }
             let delete = seen
                 .iter()
                 .find(|(request, _)| request.starts_with("DELETE "))
