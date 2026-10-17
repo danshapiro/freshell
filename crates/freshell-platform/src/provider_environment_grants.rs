@@ -113,16 +113,46 @@ pub fn read_environment_grant(
     path: &Path,
     profile: EnvironmentProfile,
 ) -> Result<BTreeMap<String, String>, GrantError> {
+    read_environment_grant_with_native_auth(path, profile, false)
+}
+
+/// Transport-only grants require a separately validated typed native authority.
+pub fn read_environment_grant_with_native_auth(
+    path: &Path,
+    profile: EnvironmentProfile,
+    native_auth: bool,
+) -> Result<BTreeMap<String, String>, GrantError> {
     let raw = read_private_grant(path, profile)?;
-    resolve_environment_profile(profile, &raw)
+    resolve_environment_profile_with_native_auth(profile, &raw, native_auth)
 }
 
 pub fn read_opencode_auth_environment(
     path: &Path,
     needed: &[String],
 ) -> Result<BTreeMap<String, String>, GrantError> {
+    Ok(read_opencode_auth_grant(path, needed)?.environment)
+}
+
+pub struct OpencodeAuthGrant {
+    pub environment: BTreeMap<String, String>,
+    pub valid_native_auth: bool,
+}
+
+/// Read one private grant generation for both source overlays and native auth.
+/// Well-known source overlays remain valid independently of API/OAuth authority.
+pub fn read_opencode_auth_grant(
+    path: &Path,
+    needed: &[String],
+) -> Result<OpencodeAuthGrant, GrantError> {
     let raw = read_private_grant(path, EnvironmentProfile::Opencode)?;
-    resolve_opencode_auth_environment(&raw, needed)
+    Ok(OpencodeAuthGrant {
+        environment: resolve_opencode_auth_environment(&raw, needed)?,
+        valid_native_auth: crate::provider_native_auth::validate_native_auth(
+            "opencode",
+            raw.as_bytes(),
+        )
+        .is_ok(),
+    })
 }
 
 fn read_private_grant(path: &Path, profile: EnvironmentProfile) -> Result<String, GrantError> {
