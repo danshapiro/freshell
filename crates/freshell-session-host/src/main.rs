@@ -64,6 +64,7 @@ struct HostState {
     state_dir: PathBuf,
     secret: Vec<u8>,
     requested_limits: RuntimeLimits,
+    control_fence: std::sync::Mutex<HostControlFence>,
     persisted: Mutex<PersistedHostState>,
     child: Mutex<Option<Child>>,
     pty: Mutex<Option<HostedPty>>,
@@ -72,6 +73,64 @@ struct HostState {
     provider_config_paths: ProviderConfigPaths,
     opencode_transfer_mount: PathBuf,
     bootstrap_root: PathBuf,
+}
+
+// Preparation can hold the durable-state lock across blocking provider work.
+// Keep authenticated Stop admission independent of that lock. This fence is
+// boot-local; the supervisor owns durable stopped intent and enclosure teardown.
+#[derive(Default)]
+struct HostControlFence {
+    max_control_epoch: u64,
+    max_execution_generation: u64,
+    stopped: bool,
+}
+
+impl From<&PersistedHostState> for HostControlFence {
+    fn from(persisted: &PersistedHostState) -> Self {
+        Self {
+            max_control_epoch: persisted.max_control_epoch,
+            max_execution_generation: persisted.max_execution_generation,
+            stopped: false,
+        }
+    }
+}
+
+impl HostControlFence {
+    fn validate_generation(&self, epoch: u64, generation: u64) -> Result<(), RuntimeError> {
+        if epoch < self.max_control_epoch || generation < self.max_execution_generation {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::StaleExecutionGrant,
+                "stale host command generation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn admit_grant(&mut self, epoch: u64, generation: u64) -> Result<(), RuntimeError> {
+        self.ensure_running(epoch, generation)?;
+        self.max_control_epoch = epoch;
+        self.max_execution_generation = generation;
+        Ok(())
+    }
+
+    fn stop(&mut self, epoch: u64, generation: u64) -> Result<(), RuntimeError> {
+        self.validate_generation(epoch, generation)?;
+        self.max_control_epoch = epoch;
+        self.max_execution_generation = generation;
+        self.stopped = true;
+        Ok(())
+    }
+
+    fn ensure_running(&self, epoch: u64, generation: u64) -> Result<(), RuntimeError> {
+        self.validate_generation(epoch, generation)?;
+        if self.stopped {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::StaleExecutionGrant,
+                "host startup was stopped",
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct SpawnedTerminalPty {
@@ -83,6 +142,29 @@ struct SpawnedTerminalPty {
 
 #[async_trait::async_trait]
 trait GrantExecutionEffects: Sync {
+    async fn prepare_terminal(
+        &self,
+        terminal: TerminalLaunchSpec,
+        child_secret_env: &std::collections::BTreeMap<String, String>,
+        prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+        selected_claude_settings: Option<&str>,
+    ) -> Result<providers::PreparedTerminal, providers::ProviderLaunchPreparationError> {
+        providers::prepare_terminal(
+            terminal,
+            child_secret_env,
+            prepared_opencode_plan,
+            selected_claude_settings,
+        )
+        .await
+    }
+
+    async fn start_terminal_sidecar(
+        &self,
+        prepared: providers::PreparedTerminal,
+    ) -> Result<providers::PreparedTerminal, providers::ProviderLaunchPreparationError> {
+        providers::start_terminal_sidecar(prepared).await
+    }
+
     async fn prepare_fresh_agent_child_environment(
         &self,
         launch: &FreshAgentLaunchSpec,
@@ -593,6 +675,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
         state_dir,
         secret,
         requested_limits,
+        control_fence: std::sync::Mutex::new(HostControlFence::from(&persisted)),
         persisted: Mutex::new(persisted),
         child: Mutex::new(None),
         pty: Mutex::new(None),
@@ -755,24 +838,12 @@ async fn dispatch_with_effects(
                     execution_generation,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
-                    let persisted = state.persisted.lock().await.clone();
-                    if control_epoch < persisted.max_control_epoch
-                        || execution_generation < persisted.max_execution_generation
-                    {
-                        return Err(RuntimeError::new(
-                            RuntimeErrorCode::StaleExecutionGrant,
-                            "stale stop generation",
-                        ));
-                    }
-                    if let Some(child) = state.child.lock().await.as_mut() {
-                        let _ = child.start_kill();
-                    }
-                    if let Some(mut pty) = state.pty.lock().await.take() {
-                        pty.stop().await;
-                    }
-                    if let Some(agent) = state.fresh_agent.lock().await.take() {
-                        let _ = agent.stop().await;
-                    }
+                    state
+                        .control_fence
+                        .lock()
+                        .unwrap()
+                        .stop(control_epoch, execution_generation)?;
+                    stop_hosted_workloads(state).await;
                     append_event_with_secret(&state.state_dir, &state.secret, "host.stop_requested", serde_json::json!({"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
                     Ok(HostResult::Stopped)
                 }
@@ -1323,6 +1394,86 @@ struct GrantExecutionRequest {
     native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
 }
 
+async fn stop_hosted_workloads(state: &HostState) {
+    if let Some(child) = state.child.lock().await.as_mut() {
+        let _ = child.start_kill();
+    }
+    if let Some(mut pty) = state.pty.lock().await.take() {
+        pty.stop().await;
+    }
+    if let Some(agent) = state.fresh_agent.lock().await.take() {
+        let _ = agent.stop().await;
+    }
+}
+
+fn ensure_grant_running(
+    state: &HostState,
+    epoch: u64,
+    generation: u64,
+) -> Result<(), RuntimeError> {
+    state
+        .control_fence
+        .lock()
+        .unwrap()
+        .ensure_running(epoch, generation)
+}
+
+async fn cleanup_startup_sidecar(
+    state: &HostState,
+    sidecar: Option<&Arc<freshell_codex::launch_lifecycle::CodexLaunchSidecar>>,
+) {
+    if let Some(sidecar) = sidecar {
+        if let Err(error) = sidecar.shutdown().await {
+            append_event_with_secret(
+                &state.state_dir,
+                &state.secret,
+                "host.startup_cleanup_failed",
+                serde_json::json!({"severity":"error", "stage":"codex_sidecar", "error":error}),
+            )
+            .ok();
+        }
+    }
+}
+
+async fn grant_accepted_result(
+    state: &HostState,
+    persisted: &PersistedHostState,
+    opencode_adoption_required: bool,
+    control_epoch: u64,
+    execution_generation: u64,
+) -> Result<HostResult, RuntimeError> {
+    let worker_pid = persisted.worker_pid.ok_or_else(|| {
+        RuntimeError::new(
+            RuntimeErrorCode::StaleExecutionGrant,
+            "grant was durably consumed but worker launch did not complete",
+        )
+    })?;
+    let opencode_adoption = state
+        .pty
+        .lock()
+        .await
+        .as_ref()
+        .map(HostedPty::opencode_adoption_status)
+        .unwrap_or_else(|| adoption_status_for_required(opencode_adoption_required));
+    let native_identity_observation = current_native_observation(state, persisted).await;
+    let native_session_id =
+        published_grant_native_session_id(state, persisted, native_identity_observation.as_ref())
+            .await;
+    // Every path, including an idempotent reply, must pass the Stop fence
+    // after its final await and before accepting a worker PID.
+    ensure_grant_running(state, control_epoch, execution_generation)?;
+    Ok(HostResult::GrantAccepted {
+        native_session_id,
+        native_identity_observation,
+        host_boot_id: state.host_boot_id.clone(),
+        worker_pid,
+        worker_launch_count: persisted.worker_launch_count,
+        fixture_evidence: persisted.fixture_evidence.clone(),
+        opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
+        opencode_adoption,
+    })
+}
+
 async fn grant_execution(
     state: &Arc<HostState>,
     request: GrantExecutionRequest,
@@ -1359,6 +1510,11 @@ async fn grant_execution(
             })
         });
     let mut persisted = state.persisted.lock().await;
+    state
+        .control_fence
+        .lock()
+        .unwrap()
+        .admit_grant(control_epoch, execution_generation)?;
     let mut transfer_prepared_terminal = None;
     let mut transfer_phase_gate = None;
     let mut transfer_readiness_receipt = None;
@@ -1372,42 +1528,16 @@ async fn grant_execution(
     }
     if let Some(existing) = persisted.grant_id.as_ref() {
         if existing == &grant_id {
-            if let Some(pid) = persisted.worker_pid {
-                let native_identity_observation =
-                    current_native_observation(state, &persisted).await;
-                let native_session_id = published_grant_native_session_id(
-                    state,
-                    &persisted,
-                    native_identity_observation.as_ref(),
-                )
-                .await;
-                return Ok(HostResult::GrantAccepted {
-                    native_identity_observation,
-                    host_boot_id: state.host_boot_id.clone(),
-                    worker_pid: pid,
-                    worker_launch_count: persisted.worker_launch_count,
-                    fixture_evidence: persisted.fixture_evidence.clone(),
-                    native_session_id,
-                    opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
-                    opencode_adoption: state
-                        .pty
-                        .lock()
-                        .await
-                        .as_ref()
-                        .map(HostedPty::opencode_adoption_status)
-                        .unwrap_or_else(|| {
-                            adoption_status_for_required(
-                                terminal
-                                    .as_ref()
-                                    .is_some_and(|terminal| terminal.opencode_adoption.is_some()),
-                            )
-                        }),
-                });
-            }
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::StaleExecutionGrant,
-                "grant was durably consumed but worker launch did not complete",
-            ));
+            return grant_accepted_result(
+                state,
+                &persisted,
+                terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.opencode_adoption.is_some()),
+                control_epoch,
+                execution_generation,
+            )
+            .await;
         }
         return Err(RuntimeError::new(
             RuntimeErrorCode::StaleExecutionGrant,
@@ -1469,6 +1599,7 @@ async fn grant_execution(
         )?;
         transfer_prepared_terminal = Some(preflight_terminal.clone());
         persisted = state.persisted.lock().await;
+        ensure_grant_running(state, control_epoch, execution_generation)?;
         if control_epoch < persisted.max_control_epoch
             || execution_generation < persisted.max_execution_generation
         {
@@ -1479,41 +1610,16 @@ async fn grant_execution(
         }
         if let Some(existing) = persisted.grant_id.as_ref() {
             if existing == &grant_id {
-                if let Some(pid) = persisted.worker_pid {
-                    let native_identity_observation =
-                        current_native_observation(state, &persisted).await;
-                    return Ok(HostResult::GrantAccepted {
-                        native_session_id: published_grant_native_session_id(
-                            state,
-                            &persisted,
-                            native_identity_observation.as_ref(),
-                        )
-                        .await,
-                        native_identity_observation,
-                        host_boot_id: state.host_boot_id.clone(),
-                        worker_pid: pid,
-                        worker_launch_count: persisted.worker_launch_count,
-                        fixture_evidence: persisted.fixture_evidence.clone(),
-                        opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
-                        opencode_adoption: state
-                            .pty
-                            .lock()
-                            .await
-                            .as_ref()
-                            .map(HostedPty::opencode_adoption_status)
-                            .unwrap_or_else(|| {
-                                adoption_status_for_required(
-                                    terminal.as_ref().is_some_and(|terminal| {
-                                        terminal.opencode_adoption.is_some()
-                                    }),
-                                )
-                            }),
-                    });
-                }
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::StaleExecutionGrant,
-                    "grant was durably consumed but worker launch did not complete",
-                ));
+                return grant_accepted_result(
+                    state,
+                    &persisted,
+                    terminal
+                        .as_ref()
+                        .is_some_and(|terminal| terminal.opencode_adoption.is_some()),
+                    control_epoch,
+                    execution_generation,
+                )
+                .await;
             }
             return Err(RuntimeError::new(
                 RuntimeErrorCode::StaleExecutionGrant,
@@ -1602,6 +1708,10 @@ async fn grant_execution(
     // safely. Persist consumption only at the native dispatch boundary; once
     // spawning is attempted, uncertain delivery must never authorize a replay.
     let consume_grant = |persisted: &mut PersistedHostState| {
+        // Serialize Stop with the actual durable consumption boundary, without
+        // making Stop wait for the rest of preparation or native startup.
+        let fence = state.control_fence.lock().unwrap();
+        fence.ensure_running(control_epoch, execution_generation)?;
         persisted.max_control_epoch = control_epoch;
         persisted.native_identity_launch = native_identity_launch.clone();
         persisted.max_execution_generation = execution_generation;
@@ -1656,6 +1766,7 @@ async fn grant_execution(
                 }
             }
             consume_grant(&mut persisted)?;
+            ensure_grant_running(state, control_epoch, execution_generation)?;
             let child = command.spawn().map_err(|e| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
@@ -1677,6 +1788,7 @@ async fn grant_execution(
             (pid, evidence, None)
         }
         (None, Some(terminal), None) => {
+            ensure_grant_running(state, control_epoch, execution_generation)?;
             let exact_resume = resume_spec.is_some();
             let mut terminal = match transfer_prepared_terminal.take() {
                 Some(prepared) => prepared,
@@ -1746,22 +1858,24 @@ async fn grant_execution(
                     )
                 })?;
             }
-            let mut prepared = providers::prepare_terminal(
-                terminal,
-                &resolved_secrets.environment,
-                resolved_secrets.opencode_plan.as_ref(),
-                resolved_secrets.claude_settings_argument.as_deref(),
-            )
-            .await
-            .map_err(|error| {
-                let diagnostic =
-                    error.diagnostic_code_or(RuntimeDiagnosticCode::ProviderLaunchPrepareFailed);
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("prepare managed provider: {error}"),
+            ensure_grant_running(state, control_epoch, execution_generation)?;
+            let mut prepared = effects
+                .prepare_terminal(
+                    terminal,
+                    &resolved_secrets.environment,
+                    resolved_secrets.opencode_plan.as_ref(),
+                    resolved_secrets.claude_settings_argument.as_deref(),
                 )
-                .with_diagnostic_code(diagnostic)
-            })?;
+                .await
+                .map_err(|error| {
+                    let diagnostic = error
+                        .diagnostic_code_or(RuntimeDiagnosticCode::ProviderLaunchPrepareFailed);
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        format!("prepare managed provider: {error}"),
+                    )
+                    .with_diagnostic_code(diagnostic)
+                })?;
             claude_source_observation::verify_final(
                 prepared.terminal.provider_launch_context.as_ref(),
                 &state
@@ -1790,7 +1904,9 @@ async fn grant_execution(
                 gate.advance(OpenCodeTransferPhase::GrantConsumed)
                     .expect("OpenCode transfer grant phase was prevalidated");
             }
-            let prepared = providers::start_terminal_sidecar(prepared)
+            ensure_grant_running(state, control_epoch, execution_generation)?;
+            let prepared = effects
+                .start_terminal_sidecar(prepared)
                 .await
                 .map_err(|error| {
                     let diagnostic = error
@@ -1798,6 +1914,12 @@ async fn grant_execution(
                     RuntimeError::new(RuntimeErrorCode::HostUnreachable, error.to_string())
                         .with_diagnostic_code(diagnostic)
                 })?;
+            if let Err(error) = ensure_grant_running(state, control_epoch, execution_generation) {
+                cleanup_startup_sidecar(state, prepared.codex.as_ref().map(|codex| &codex.sidecar))
+                    .await;
+                return Err(error);
+            }
+            let sidecar = prepared.codex.as_ref().map(|codex| codex.sidecar.clone());
             let terminal = prepared.terminal;
             let spawn = || {
                 effects.spawn_terminal_pty(
@@ -1810,12 +1932,30 @@ async fn grant_execution(
                 )
             };
             let launched = match transfer_phase_gate.as_mut() {
-                Some(gate) => run_opencode_transfer_pty_spawn(gate, spawn).await?,
+                Some(gate) => run_opencode_transfer_pty_spawn(gate, spawn).await,
                 None => spawn().await.map_err(|error| {
                     error.with_diagnostic_code(
                         freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderProcessSpawnFailed,
                     )
-                })?,
+                }),
+            };
+            if let Err(error) = ensure_grant_running(state, control_epoch, execution_generation) {
+                if let Ok(SpawnedTerminalPty {
+                    hosted: Some(mut hosted),
+                    ..
+                }) = launched
+                {
+                    hosted.stop().await;
+                }
+                cleanup_startup_sidecar(state, sidecar.as_ref()).await;
+                return Err(error);
+            }
+            let launched = match launched {
+                Ok(launched) => launched,
+                Err(error) => {
+                    cleanup_startup_sidecar(state, sidecar.as_ref()).await;
+                    return Err(error);
+                }
             };
             let pid = launched.pid;
             if let Some(transfer) = terminal.opencode_transfer.as_ref() {
@@ -1842,6 +1982,7 @@ async fn grant_execution(
             (pid, evidence, None)
         }
         (None, None, Some(mut launch)) => {
+            ensure_grant_running(state, control_epoch, execution_generation)?;
             let exact_resume = resume_spec.is_some();
             if let Some(resume) = resume_spec.as_ref() {
                 if resume.provider_session.native_session_id.is_empty()
@@ -1944,6 +2085,7 @@ async fn grant_execution(
                             RuntimeDiagnosticCode::ProviderChildEnvironmentPrepareFailed,
                         )
                 })?;
+            ensure_grant_running(state, control_epoch, execution_generation)?;
             claude_source_observation::verify_final(
                 launch.provider_launch_context.as_ref(),
                 &state
@@ -1970,10 +2112,15 @@ async fn grant_execution(
                         freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderChildEnvironmentInstallFailed,
                     )
                 })?;
+            ensure_grant_running(state, control_epoch, execution_generation)?;
             let actor = effects
                 .open_fresh_agent(&state.state_dir, launch.clone())
                 .await
                 .map_err(map_fresh_agent_open_error)?;
+            if let Err(error) = ensure_grant_running(state, control_epoch, execution_generation) {
+                let _ = actor.stop().await;
+                return Err(error);
+            }
             let profile = actor.profile().await;
             let native_session_id = actor.observed_native_session_id().await;
             let evidence = serde_json::json!({
@@ -1995,35 +2142,30 @@ async fn grant_execution(
         }
     };
 
+    if let Err(error) = ensure_grant_running(state, control_epoch, execution_generation) {
+        stop_hosted_workloads(state).await;
+        return Err(error);
+    }
     persisted.worker_launch_count += 1;
     persisted.worker_pid = Some(pid);
     persisted.fixture_evidence = evidence;
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
     append_event_with_secret(&state.state_dir, &state.secret, "host.grant_consumed", serde_json::json!({"grantId":grant_id,"workerPid":pid,"workerLaunchCount":persisted.worker_launch_count,"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
 
-    let opencode_adoption = state
-        .pty
-        .lock()
-        .await
-        .as_ref()
-        .map(HostedPty::opencode_adoption_status)
-        .unwrap_or_else(|| adoption_status_for_required(opencode_adoption_required));
-    let native_identity_observation = current_native_observation(state, &persisted).await;
-    Ok(HostResult::GrantAccepted {
-        native_session_id: published_grant_native_session_id(
-            state,
-            &persisted,
-            native_identity_observation.as_ref(),
-        )
-        .await,
-        native_identity_observation,
-        host_boot_id: state.host_boot_id.clone(),
-        worker_pid: pid,
-        worker_launch_count: persisted.worker_launch_count,
-        fixture_evidence: persisted.fixture_evidence.clone(),
-        opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
-        opencode_adoption,
-    })
+    let accepted = grant_accepted_result(
+        state,
+        &persisted,
+        opencode_adoption_required,
+        control_epoch,
+        execution_generation,
+    )
+    .await;
+    if accepted.is_err() {
+        persisted.worker_pid = None;
+        write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
+        stop_hosted_workloads(state).await;
+    }
+    accepted
 }
 
 async fn published_grant_native_session_id(
@@ -10690,6 +10832,7 @@ mod tests {
             let mut persisted = state.persisted.lock().await;
             persisted.max_control_epoch = 7;
             persisted.max_execution_generation = 9;
+            *state.control_fence.lock().unwrap() = HostControlFence::from(&*persisted);
         }
         let envelope = authenticated_host_envelope(
             &state,
@@ -10729,6 +10872,576 @@ mod tests {
         assert_eq!(error.code, RuntimeErrorCode::StaleExecutionGrant);
         let persisted = state.persisted.lock().await.clone();
         assert!(persisted.grant_id.is_none());
+        assert_eq!(persisted.worker_launch_count, 0);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StartupStopBoundary {
+        Preparation,
+        PreparationFailure,
+        Sidecar,
+        SidecarFailure,
+        PtySpawn,
+        FreshOpen,
+    }
+
+    #[derive(Default)]
+    struct StartupStopGate {
+        entered: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        release: std::sync::Condvar,
+    }
+
+    impl StartupStopGate {
+        fn wait(&self) {
+            self.entered.notify_one();
+            let guard = self.released.lock().unwrap();
+            drop(
+                self.release
+                    .wait_while(guard, |released| !*released)
+                    .unwrap(),
+            );
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release.notify_all();
+        }
+    }
+
+    struct StartupStopRuntime {
+        gate: Arc<StartupStopGate>,
+        failure: bool,
+        stops: AtomicUsize,
+    }
+
+    impl freshell_codex::launch_lifecycle::CodexLaunchRuntime for StartupStopRuntime {
+        fn ensure_ready(
+            &self,
+            _: Option<String>,
+        ) -> freshell_codex::app_server::BoxFuture<
+            '_,
+            Result<freshell_codex::launch_lifecycle::CodexRuntimeReady, String>,
+        > {
+            Box::pin(async move {
+                self.gate.wait();
+                if self.failure {
+                    Err("owned test sidecar readiness failed".into())
+                } else {
+                    Ok(freshell_codex::launch_lifecycle::CodexRuntimeReady {
+                        ws_url: "ws://127.0.0.1:1".into(),
+                    })
+                }
+            })
+        }
+
+        fn update_ownership_metadata(
+            &self,
+            _: String,
+            _: u64,
+        ) -> freshell_codex::app_server::BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) -> freshell_codex::app_server::BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    struct StartupStopEffects {
+        boundary: StartupStopBoundary,
+        gate: Arc<StartupStopGate>,
+        runtime: Arc<StartupStopRuntime>,
+        spawns: AtomicUsize,
+        actor:
+            std::sync::Mutex<Option<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>>>,
+    }
+
+    #[async_trait]
+    impl GrantExecutionEffects for StartupStopEffects {
+        async fn open_fresh_agent(
+            &self,
+            state_dir: &Path,
+            launch: FreshAgentLaunchSpec,
+        ) -> Result<
+            Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+            freshell_agent_runtime::host_actor::ActorError,
+        > {
+            let actor = ConfigPublicationGrantEffects {
+                opens: AtomicUsize::new(0),
+                native_evidence: None,
+            }
+            .open_fresh_agent(state_dir, launch)
+            .await?;
+            *self.actor.lock().unwrap() = Some(actor.clone());
+            self.gate.wait();
+            Ok(actor)
+        }
+        async fn prepare_terminal(
+            &self,
+            terminal: TerminalLaunchSpec,
+            env: &std::collections::BTreeMap<String, String>,
+            plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+            settings: Option<&str>,
+        ) -> Result<providers::PreparedTerminal, providers::ProviderLaunchPreparationError>
+        {
+            let prepared = providers::prepare_terminal(terminal, env, plan, settings).await?;
+            if matches!(
+                self.boundary,
+                StartupStopBoundary::Preparation | StartupStopBoundary::PreparationFailure
+            ) {
+                // Deliberately do not yield, as with the provider-owned refresh.
+                self.gate.wait();
+            }
+            if self.boundary == StartupStopBoundary::PreparationFailure {
+                return Err("owned test preparation failed".into());
+            }
+            Ok(prepared)
+        }
+
+        async fn start_terminal_sidecar(
+            &self,
+            mut prepared: providers::PreparedTerminal,
+        ) -> Result<providers::PreparedTerminal, providers::ProviderLaunchPreparationError>
+        {
+            if matches!(
+                self.boundary,
+                StartupStopBoundary::Sidecar | StartupStopBoundary::SidecarFailure
+            ) {
+                use freshell_codex::launch_lifecycle::{
+                    CodexLaunchPlanner, CodexLaunchRuntime, CodexRuntimeFactory,
+                };
+                let runtime = self.runtime.clone();
+                let factory: CodexRuntimeFactory = Box::new(move |_| {
+                    let runtime = runtime.clone();
+                    Box::pin(async move { runtime as Arc<dyn CodexLaunchRuntime> })
+                });
+                let launched = CodexLaunchPlanner::new(factory)
+                    .plan_create(&freshell_codex::launch_plan::CodexLaunchPlanInput::default())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                prepared.codex = Some(providers::PreparedCodexLaunch {
+                    sidecar: launched.sidecar,
+                    events: launched.events,
+                    remote_args: freshell_codex::launch_plan::codex_remote_args(
+                        &launched.remote_ws_url,
+                    )
+                    .unwrap(),
+                });
+            }
+            Ok(prepared)
+        }
+
+        fn run_opencode_provider_helper(
+            &self,
+            _: &TerminalLaunchSpec,
+            _: &OpenCodeTransferDescriptor,
+            _: &Path,
+            _: &Path,
+            _: &str,
+            _: Option<&Path>,
+        ) -> Result<Vec<u8>, String> {
+            panic!("Codex startup must not use the OpenCode helper")
+        }
+
+        async fn spawn_terminal_pty(
+            &self,
+            _: &Path,
+            _: &IncarnationId,
+            terminal: &TerminalLaunchSpec,
+            _: std::collections::BTreeMap<String, String>,
+            codex: Option<providers::PreparedCodexLaunch>,
+            _: Option<String>,
+        ) -> Result<SpawnedTerminalPty, RuntimeError> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            if self.boundary == StartupStopBoundary::PtySpawn {
+                self.gate.wait();
+            }
+            if let Some(codex) = codex {
+                codex.sidecar.shutdown().await.unwrap();
+            }
+            Ok(SpawnedTerminalPty {
+                pid: 4242,
+                terminal_id: terminal.terminal_id.clone(),
+                stream_epoch: terminal.stream_id.clone(),
+                hosted: None,
+            })
+        }
+    }
+
+    fn startup_stop_effects(boundary: StartupStopBoundary) -> Arc<StartupStopEffects> {
+        let gate = Arc::new(StartupStopGate::default());
+        Arc::new(StartupStopEffects {
+            boundary,
+            gate: gate.clone(),
+            runtime: Arc::new(StartupStopRuntime {
+                gate,
+                failure: boundary == StartupStopBoundary::SidecarFailure,
+                stops: AtomicUsize::new(0),
+            }),
+            spawns: AtomicUsize::new(0),
+            actor: std::sync::Mutex::new(None),
+        })
+    }
+
+    async fn startup_stop_over_socket(
+        state: Arc<HostState>,
+        command: HostCommand,
+    ) -> Result<HostResult, RuntimeError> {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let envelope = authenticated_host_envelope(&state, command);
+        let serving = tokio::spawn(handle_connection(server, state));
+        write_frame(&mut client, &envelope).await.unwrap();
+        let reply: HostReply = read_frame(&mut client).await.unwrap();
+        serving.await.unwrap().unwrap();
+        reply.result
+    }
+
+    fn startup_stop_grant(state: &HostState, root: &Path) -> HostCommand {
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let terminal = serde_json::from_value(serde_json::json!({
+            "terminalId":"stop-startup", "streamId":"stop-startup", "mode":"codex",
+            "program":"/unused-owned-fixture", "args":[], "env":{}, "cwd":root,
+            "workspacePath":root, "runAsUid":uid, "runAsGid":gid,
+            "cols":80, "rows":24, "projectKey":"stop-startup"
+        }))
+        .unwrap();
+        let resume = serde_json::from_value(serde_json::json!({
+            "providerSession":{"provider":"codex","providerStoreId":"stop-startup","nativeSessionId":"ses_owned_stop_startup"},
+            "mode":"codex", "runtimeVariant":"managed_terminal_pty", "program":"/unused-owned-fixture", "resumeArgv":[],
+            "providerHome":"/home/freshell/provider", "cwd":root, "workspacePath":root,
+            "identityProvenance":"provider_observed", "durablePosition":{}, "creationSeedRef":"owned-startup",
+            "checkpointRevision":0, "allocationState":"verified_durable", "evidenceRevision":1,"neverDispatched":false
+        })).unwrap();
+        HostCommand::GrantExecution {
+            incarnation_id: state.incarnation_id.clone(),
+            soul_id: SoulId::new(),
+            host_boot_id: state.host_boot_id.clone(),
+            control_epoch: 7,
+            execution_generation: 9,
+            grant_id: GrantId::new(),
+            fixture: None,
+            terminal: Some(Box::new(terminal)),
+            fresh_agent: None,
+            resume_spec: Some(Box::new(resume)),
+            native_identity_launch: None,
+            provider_path_inputs: Default::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authenticated_stop_fences_blocked_startup_and_owned_sidecar_completion() {
+        for boundary in [
+            StartupStopBoundary::Preparation,
+            StartupStopBoundary::PreparationFailure,
+            StartupStopBoundary::Sidecar,
+            StartupStopBoundary::SidecarFailure,
+            StartupStopBoundary::PtySpawn,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_host_state();
+            let command = startup_stop_grant(&state, root.path());
+            let effects = startup_stop_effects(boundary);
+            let gate = &effects.gate;
+            let starting = {
+                let state = state.clone();
+                let command = command.clone();
+                let effects = effects.clone();
+                tokio::spawn(async move {
+                    dispatch_with_effects(
+                        authenticated_host_envelope(&state, command),
+                        &state,
+                        effects.as_ref(),
+                    )
+                    .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            assert!(
+                !starting.is_finished(),
+                "{boundary:?}: no PID accepted before preparation/spawn completes"
+            );
+            let stopping = startup_stop_over_socket(
+                state.clone(),
+                HostCommand::Stop {
+                    incarnation_id: state.incarnation_id.clone(),
+                    control_epoch: 7,
+                    execution_generation: 9,
+                },
+            );
+            tokio::pin!(stopping);
+            let stopped_promptly =
+                tokio::time::timeout(Duration::from_millis(500), &mut stopping).await;
+            let responsive = stopped_promptly.is_ok();
+            gate.release();
+            let started = tokio::time::timeout(Duration::from_secs(5), starting)
+                .await
+                .unwrap()
+                .unwrap();
+            let stopped = match stopped_promptly {
+                Ok(result) => result,
+                Err(_) => stopping.await,
+            };
+            assert!(matches!(stopped, Ok(HostResult::Stopped)));
+            assert!(
+                responsive,
+                "{boundary:?}: Stop must not wait for preparation's persisted lock"
+            );
+            assert!(
+                started.is_err(),
+                "{boundary:?}: stopped startup must not return GrantAccepted"
+            );
+            let persisted = state.persisted.lock().await.clone();
+            assert!(persisted.worker_pid.is_none(), "{boundary:?}");
+            assert_eq!(persisted.worker_launch_count, 0, "{boundary:?}");
+            let consumed = !matches!(
+                boundary,
+                StartupStopBoundary::Preparation | StartupStopBoundary::PreparationFailure
+            );
+            assert_eq!(persisted.grant_id.is_some(), consumed, "{boundary:?}");
+            assert_eq!(
+                effects.spawns.load(Ordering::SeqCst),
+                usize::from(boundary == StartupStopBoundary::PtySpawn),
+                "{boundary:?}"
+            );
+            assert_eq!(
+                effects.runtime.stops.load(Ordering::SeqCst),
+                usize::from(matches!(
+                    boundary,
+                    StartupStopBoundary::Sidecar | StartupStopBoundary::SidecarFailure
+                )),
+                "{boundary:?}: owned sidecar cleanup"
+            );
+            let error = dispatch_with_effects(
+                authenticated_host_envelope(&state, command),
+                &state,
+                effects.as_ref(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                RuntimeErrorCode::StaleExecutionGrant,
+                "{boundary:?}: Stop/consumption prevents replay"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_and_unauthenticated_stop_leave_current_startup_and_duplicate_grant_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_host_state();
+        let command = startup_stop_grant(&state, root.path());
+        let effects = startup_stop_effects(StartupStopBoundary::Preparation);
+        let starting = {
+            let state = state.clone();
+            let command = command.clone();
+            let effects = effects.clone();
+            tokio::spawn(async move {
+                dispatch_with_effects(
+                    authenticated_host_envelope(&state, command),
+                    &state,
+                    effects.as_ref(),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), effects.gate.entered.notified())
+            .await
+            .unwrap();
+        let mut results = Vec::new();
+        for (epoch, generation, incarnation, auth, expected) in [
+            (
+                6,
+                9,
+                state.incarnation_id.clone(),
+                true,
+                RuntimeErrorCode::StaleExecutionGrant,
+            ),
+            (
+                7,
+                8,
+                state.incarnation_id.clone(),
+                true,
+                RuntimeErrorCode::StaleExecutionGrant,
+            ),
+            (
+                7,
+                9,
+                IncarnationId::new(),
+                true,
+                RuntimeErrorCode::OwnershipMismatch,
+            ),
+            (
+                7,
+                9,
+                state.incarnation_id.clone(),
+                false,
+                RuntimeErrorCode::HostAuthenticationFailed,
+            ),
+        ] {
+            let mut envelope = authenticated_host_envelope(
+                &state,
+                HostCommand::Stop {
+                    incarnation_id: incarnation,
+                    control_epoch: epoch,
+                    execution_generation: generation,
+                },
+            );
+            if !auth {
+                envelope.auth = None;
+            }
+            results.push((
+                expected,
+                tokio::time::timeout(Duration::from_millis(500), dispatch(envelope, &state)).await,
+            ));
+        }
+        effects.gate.release();
+        let accepted = tokio::time::timeout(Duration::from_secs(5), starting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for (expected, result) in results {
+            assert_eq!(result.unwrap().unwrap_err().code, expected);
+        }
+        assert!(matches!(
+            accepted,
+            HostResult::GrantAccepted {
+                worker_pid: 4242,
+                worker_launch_count: 1,
+                ..
+            }
+        ));
+        let duplicate = dispatch_with_effects(
+            authenticated_host_envelope(&state, command),
+            &state,
+            effects.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            duplicate,
+            HostResult::GrantAccepted {
+                worker_pid: 4242,
+                worker_launch_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(effects.spawns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_stop_before_grant_prevents_dispatch_in_the_same_boot() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_host_state();
+        let effects = startup_stop_effects(StartupStopBoundary::Preparation);
+        let stopped = startup_stop_over_socket(
+            state.clone(),
+            HostCommand::Stop {
+                incarnation_id: state.incarnation_id.clone(),
+                control_epoch: 7,
+                execution_generation: 9,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(stopped, HostResult::Stopped));
+        let error = dispatch_with_effects(
+            authenticated_host_envelope(&state, startup_stop_grant(&state, root.path())),
+            &state,
+            effects.as_ref(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::StaleExecutionGrant);
+        let persisted = state.persisted.lock().await;
+        assert!(persisted.grant_id.is_none());
+        assert!(persisted.worker_pid.is_none());
+        assert_eq!(persisted.worker_launch_count, 0);
+        assert_eq!(effects.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authenticated_stop_cleans_fresh_actor_opened_after_stop_acknowledgement() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_host_state();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        Arc::get_mut(&mut state).unwrap().provider_config_paths = ProviderConfigPaths {
+            private_mount: root.path().join("private"),
+            provider_home: home,
+        };
+        let mut command = startup_stop_grant(&state, root.path());
+        if let HostCommand::GrantExecution {
+            terminal,
+            fresh_agent,
+            resume_spec,
+            ..
+        } = &mut command
+        {
+            *terminal = None;
+            *resume_spec = None;
+            *fresh_agent = Some(Box::new(serde_json::from_value(serde_json::json!({
+                "sessionId":"owned-stop-startup", "provider":"claude", "sessionType":"freshclaude",
+                "runtimeVariant":"freshclaude", "providerStoreId":"owned-stop-startup", "cwd":root.path(),
+                "workspacePath":root.path(), "runAsUid":unsafe { libc::geteuid() }, "runAsGid":unsafe { libc::getegid() },
+            })).unwrap()));
+        }
+        let effects = startup_stop_effects(StartupStopBoundary::FreshOpen);
+        let starting = {
+            let state = state.clone();
+            let command = command.clone();
+            let effects = effects.clone();
+            tokio::spawn(async move {
+                dispatch_with_effects(
+                    authenticated_host_envelope(&state, command),
+                    &state,
+                    effects.as_ref(),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), effects.gate.entered.notified())
+            .await
+            .unwrap();
+        let stop = tokio::time::timeout(
+            Duration::from_millis(500),
+            startup_stop_over_socket(
+                state.clone(),
+                HostCommand::Stop {
+                    incarnation_id: state.incarnation_id.clone(),
+                    control_epoch: 7,
+                    execution_generation: 9,
+                },
+            ),
+        )
+        .await;
+        effects.gate.release();
+        let started = tokio::time::timeout(Duration::from_secs(5), starting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(stop.unwrap().unwrap(), HostResult::Stopped));
+        assert_eq!(
+            started.unwrap_err().code,
+            RuntimeErrorCode::StaleExecutionGrant
+        );
+        let actor = effects.actor.lock().unwrap().clone().unwrap();
+        assert!(
+            !actor.is_live().await,
+            "locally owned late actor must receive stop"
+        );
+        assert!(state.fresh_agent.lock().await.is_none());
+        let persisted = state.persisted.lock().await;
+        assert!(persisted.grant_id.is_some());
+        assert!(persisted.worker_pid.is_none());
         assert_eq!(persisted.worker_launch_count, 0);
     }
 
@@ -12743,6 +13456,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 swap_bytes: 0,
                 pids_max: 64,
             },
+            control_fence: std::sync::Mutex::new(HostControlFence::default()),
             persisted: Mutex::new(PersistedHostState::default()),
             child: Mutex::new(None),
             pty: Mutex::new(None),
@@ -14035,6 +14749,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 swap_bytes: 0,
                 pids_max: 64,
             },
+            control_fence: std::sync::Mutex::new(HostControlFence::from(&persisted)),
             persisted: Mutex::new(persisted),
             child: Mutex::new(None),
             pty: Mutex::new(None),
@@ -14750,6 +15465,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                 swap_bytes: 0,
                 pids_max: 64,
             },
+            control_fence: std::sync::Mutex::new(HostControlFence::default()),
             persisted: Mutex::new(PersistedHostState::default()),
             child: Mutex::new(None),
             pty: Mutex::new(None),
@@ -14983,6 +15699,7 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                 swap_bytes: 0,
                 pids_max: 64,
             },
+            control_fence: std::sync::Mutex::new(HostControlFence::default()),
             persisted: Mutex::new(PersistedHostState {
                 host_boot_id: Some(host_boot_id.clone()),
                 opencode_transfer_receipt: preserved_receipt,
