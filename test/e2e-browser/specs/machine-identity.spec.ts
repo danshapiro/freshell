@@ -47,9 +47,13 @@ test.describe.serial('default E2E machine selection', () => {
     test.setTimeout(120_000)
     let endpointAvailable = false
     let failedRequests = 0
-    let documentNavigations = 0
-    page.on('framenavigated', frame => {
-      if (frame === page.mainFrame()) documentNavigations += 1
+    let documentRequests = 0
+    // Auth cleanup uses history.replaceState, which keeps the same document.
+    // Count navigation requests so a reload still fails this proof.
+    page.on('request', request => {
+      if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+        documentRequests += 1
+      }
     })
     // Keep the real app document mounted while its discovery request has the
     // same network failure as a cached desktop client starting offline.
@@ -75,7 +79,7 @@ test.describe.serial('default E2E machine selection', () => {
     await harness.waitForConnection()
     await expect(page.getByRole('heading', { name: 'Could not choose a machine' })).not.toBeVisible()
     expect(await page.evaluate(() => localStorage.getItem('freshell.machine-id.v1'))).toBe(e2eMachineId)
-    expect(documentNavigations).toBe(1)
+    expect(documentRequests).toBe(1)
     expect(await harness.getConnectionStatus()).toBe('ready')
   })
 
