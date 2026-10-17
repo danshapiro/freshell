@@ -138,7 +138,13 @@ test.describe.serial('freshopencode operator-home {file:} references', () => {
         cwd: workspace,
         model: 'openai/gpt-5.6-luna',
       }))
-      if (!created?.paneId || !created?.sessionId) throw new Error('MCP new-tab did not create a fresh-agent pane')
+      if (!created?.paneId || !created?.sessionId) {
+        throw new Error(`MCP new-tab did not create a fresh-agent pane: ${JSON.stringify({
+          status: created?.status,
+          error: created?.error,
+          message: created?.message,
+        })}`)
+      }
       const paneId = created.paneId as string
       const sessionId = created.sessionId as string
       const tabId = created.tabId as string
