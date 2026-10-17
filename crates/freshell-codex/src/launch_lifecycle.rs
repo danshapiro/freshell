@@ -71,7 +71,7 @@ pub const CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE: &str =
 
 /// How long a spawned app-server gets to bring its WS listener up — the shared
 /// sidecar-spawn budget (S5.d.1 unification; also `freshell-freshagent`'s spawn).
-pub const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
+pub use crate::launch_plan::{SIDECAR_START_BUDGET, SIDECAR_TEARDOWN_BUDGET};
 
 // ─── the runtime seam (CodexRuntimeLike, launch-planner.ts:34-52, scoped) ───────────────
 
@@ -597,7 +597,7 @@ struct AdoptedTerminalLaunch {
 /// Interactive waiter behind K queued restores waits ~ceil(K/2) x T
 /// (T = healthy plan time, seconds).
 pub const CODEX_SIDECAR_PLAN_CONCURRENCY: usize = 2;
-pub const CODEX_SIDECAR_PLAN_WAIT: Duration = Duration::from_secs(30);
+pub use crate::launch_plan::CODEX_SIDECAR_PLAN_WAIT;
 
 /// Env knob for the restore-class plan queue cap. Mirrors
 /// `FRESHELL_SPAWN_GATE_QUEUE_CAP` semantics (create_limit.rs): unset,
@@ -1354,7 +1354,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                     }
                     None => {
                         let _ = child.start_kill();
-                        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                        let _ = tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, child.wait()).await;
                         tracing::error!(
                             target: "freshell_codex::launch",
                             ownership_id = %ownership_id,
@@ -1463,7 +1463,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                     // Record-less: the ynfn gate — teardown exactly as today.
                     let _ = spawned.child.start_kill();
                     let _ =
-                        tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
+                        tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, spawned.child.wait()).await;
                     reap_owned_codex_sidecars(&spawned.ownership_id);
                     self.scrub_record(&spawned.ownership_id);
                     Ok(())
@@ -1477,7 +1477,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             let mut state = self.state.lock().await;
             if let Some(mut spawned) = state.take() {
                 let _ = spawned.child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
+                let _ = tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, spawned.child.wait()).await;
                 reap_owned_codex_sidecars(&spawned.ownership_id);
                 // Explicit teardown scrubs the record (Task 3): a cleanly
                 // shut-down sidecar must leave nothing for boot reconcile.
@@ -1500,7 +1500,7 @@ async fn persist_record_or_terminate_exact_child(
     if let Err(error) = store.write(row) {
         let pid = child.id();
         let kill_error = child.start_kill().err().map(|e| e.to_string());
-        let wait_result = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let wait_result = tokio::time::timeout(SIDECAR_TEARDOWN_BUDGET, child.wait()).await;
         let cleanup = match wait_result {
             Ok(Ok(status)) => format!("exact child {pid:?} exited with {status}"),
             Ok(Err(wait_error)) => format!("exact child {pid:?} wait failed: {wait_error}"),

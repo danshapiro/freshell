@@ -584,9 +584,12 @@ impl DockerEngineBackend {
             }
             Ok::<_, BackendError>(())
         };
-        tokio::time::timeout(Duration::from_secs(5), cleanup)
-            .await
-            .map_err(|_| fail("Claude candidate owned cleanup timed out"))??;
+        tokio::time::timeout(
+            freshell_platform::provider_startup::NATIVE_OBSERVATION_CLEANUP,
+            cleanup,
+        )
+        .await
+        .map_err(|_| fail("Claude candidate owned cleanup timed out"))??;
         tracing::debug!(event="provider.inputs.claude_candidate_helper.settled",soul_id=%request.soul_id,succeeded=result.is_ok(),"Claude candidate reader settled after owned cleanup");
         result
     }
@@ -1572,9 +1575,12 @@ impl DockerEngineBackend {
                 }
                 Ok(())
             };
-            tokio::time::timeout(Duration::from_secs(5), cleanup)
-                .await
-                .map_err(|_| fail("Claude source helper cleanup timed out"))??;
+            tokio::time::timeout(
+                freshell_platform::provider_startup::NATIVE_OBSERVATION_CLEANUP,
+                cleanup,
+            )
+            .await
+            .map_err(|_| fail("Claude source helper cleanup timed out"))??;
         }
         tracing::debug!(event="provider.inputs.native_source_helper.settled",soul_id=%request.soul_id,helper=%name,succeeded=result.is_ok(),
             "Claude source helper settled after owned cleanup");

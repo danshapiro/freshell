@@ -923,7 +923,7 @@ impl RuntimeBackend for DockerEngineBackend {
             owner,
             request,
             test_run_id,
-            std::time::Duration::from_secs(25),
+            freshell_platform::provider_startup::NATIVE_OBSERVATION_RUN,
         )
         .await
     }

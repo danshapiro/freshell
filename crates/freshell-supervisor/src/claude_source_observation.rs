@@ -114,7 +114,9 @@ impl Supervisor {
         // The backend owns a 25-second operation and five-second finite cleanup.
         // This outer deadline permits that cleanup to finish before returning.
         let reply = tokio::time::timeout(
-            Duration::from_secs(35),
+            freshell_platform::provider_startup::NATIVE_OBSERVATION_RUN
+                + freshell_platform::provider_startup::NATIVE_OBSERVATION_CLEANUP
+                + Duration::from_secs(5),
             self.backend
                 .observe_claude_sources(&owner, &request, &self.config.test_run_id),
         )
@@ -301,6 +303,8 @@ mod tests {
     async fn provider_claude_nested_source_reply_requires_live_scope_after_private_ipc() {
         for mode in [
             "live",
+            "within-callback",
+            "candidate-within-callback",
             "dropped",
             "expired",
             "candidate",
@@ -397,6 +401,18 @@ mod tests {
             let lock = supervisor.lifecycle_lock(&soul).await;
             let _held = lock.lock().await;
             let scope = supervisor.auth_lookup_scope(&start);
+            if mode.ends_with("within-callback") {
+                // Model 31 seconds elapsed within the still-active preparation.
+                // Execute the real nested authority validation on that deadline.
+                supervisor
+                    .auth_lookup_authorities
+                    .lock()
+                    .unwrap()
+                    .get_mut(&scope.key)
+                    .unwrap()
+                    .expires -= Duration::from_secs(31);
+            }
+
             if matches!(
                 mode,
                 "dropped" | "expired" | "candidate-dropped" | "candidate-expired"
@@ -475,7 +491,7 @@ mod tests {
             );
             assert_eq!(
                 result.is_ok(),
-                matches!(mode, "live" | "candidate"),
+                matches!(mode, "live" | "candidate" | "within-callback" | "candidate-within-callback"),
                 "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
             if let Err(error) = result {

@@ -464,7 +464,7 @@ async fn probe_managed_endpoint(endpoint: &str) -> Result<(), String> {
         .port_or_known_default()
         .ok_or_else(|| "managed MCP endpoint port is missing".to_string())?;
     tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        freshell_platform::provider_startup::PROVIDER_ENDPOINT_WAIT,
         tokio::net::TcpStream::connect(("host.docker.internal", port)),
     )
     .await

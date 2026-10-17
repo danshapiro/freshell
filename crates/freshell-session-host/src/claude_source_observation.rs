@@ -79,8 +79,8 @@ pub(crate) async fn verify_final(
         &request_sha256,
         &expected,
         (uid, gid),
-        std::time::Duration::from_secs(20),
-        std::time::Duration::from_secs(5),
+        freshell_platform::provider_startup::PROVIDER_METADATA_READ_RUN,
+        freshell_platform::provider_startup::PROVIDER_METADATA_READ_CLEANUP,
     )
     .await;
     match &result {

@@ -1040,7 +1040,10 @@ impl Supervisor {
             key.clone(),
             AuthLookupAuthority {
                 start: start.clone(),
-                expires: Instant::now() + Duration::from_secs(30),
+                expires: Instant::now()
+                    + freshell_platform::provider_startup::provider_preparation_budget(Some(
+                        &start.context.provider,
+                    )),
             },
         );
         AuthLookupScope {
@@ -3538,30 +3541,76 @@ impl Supervisor {
             }
             Ok::<_, std::io::Error>(response)
         };
-        let response = tokio::time::timeout(Duration::from_secs(35), exchange)
-            .await
-            .map_err(|_| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    "capability_pending: server callback timed out",
-                )
-            })?
-            .map_err(|error| {
-                RuntimeError::new(
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::Other
-                            | std::io::ErrorKind::InvalidInput
-                            | std::io::ErrorKind::InvalidData
-                    ) {
-                        RuntimeErrorCode::RecoveryBlocked
-                    } else {
-                        RuntimeErrorCode::HostUnreachable
-                    },
-                    format!("capability_pending: server callback unavailable: {error}"),
-                )
-            })?;
+        let budget =
+            freshell_platform::provider_startup::provider_preparation_budget(request.provider);
+        // Recovery composes several large native request futures. Keep this
+        // exchange and intent polling off its nested poll stack.
+        let bounded = Box::pin(tokio::time::timeout(budget, exchange));
+        let response = if request.action == "issue" {
+            Box::pin(self.await_running_startup(request.soul_id, "provider_preparation", bounded))
+                .await?
+        } else {
+            bounded.await
+        }
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "capability_pending: server callback timed out",
+            )
+        })?
+        .map_err(|error| {
+            RuntimeError::new(
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Other
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::InvalidData
+                ) {
+                    RuntimeErrorCode::RecoveryBlocked
+                } else {
+                    RuntimeErrorCode::HostUnreachable
+                },
+                format!("capability_pending: server callback unavailable: {error}"),
+            )
+        })?;
         Ok(response)
+    }
+
+    /// Stop commits its intent before acquiring lifecycle ownership. Observe
+    /// that transaction while awaiting preparation so Stop need not wait for a
+    /// startup budget before it can perform its normal owned teardown.
+    async fn await_running_startup<T>(
+        &self,
+        soul_id: &SoulId,
+        stage: &'static str,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T, RuntimeError> {
+        tokio::pin!(operation);
+        loop {
+            let context = self
+                .registry
+                .recovery_context(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if context.desired_state != freshell_runtime_protocol::DesiredState::Running {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.startup.interrupted",
+                    serde_json::json!({
+                        "severity":"info", "soulId":soul_id, "intentRevision":context.intent_revision,
+                        "stage":stage, "reason":"stopped_intent"
+                    }),
+                );
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleIntentRevision,
+                    "startup interrupted by stopped intent",
+                ));
+            }
+            tokio::select! {
+                result = &mut operation => return Ok(result),
+                _ = sleep(Duration::from_millis(100)) => {}
+            }
+        }
     }
 
     async fn stop(
@@ -4355,15 +4404,16 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, ClassifiedFailure> {
-        let is_slow_fresh_agent_command = matches!(
+        let startup_soul = match &command {
+            HostCommand::GrantExecution { soul_id, .. } => Some(soul_id.clone()),
+            _ => None,
+        };
+        let budget = command_reply_budget(
             &command,
-            HostCommand::FreshAgentSend { .. }
-                | HostCommand::FreshAgentCompact { .. }
-                | HostCommand::FreshAgentRollback { .. }
-                | HostCommand::GrantExecution {
-                    fresh_agent: Some(_),
-                    ..
-                }
+            std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref(),
+            std::env::var(FRESH_AGENT_COMMAND_TIMEOUT_ENV)
+                .ok()
+                .as_deref(),
         );
         let mut envelope = Envelope::new(RequestId::new(), ControlRole::Supervisor, command);
         envelope.auth = Some(host_proof(
@@ -4372,18 +4422,17 @@ impl Supervisor {
             &host.host_boot_id,
             &incarnation_id,
         ));
-        let budget = if is_slow_fresh_agent_command {
-            fresh_agent_command_budget(
-                std::env::var(FRESH_AGENT_COMMAND_TIMEOUT_ENV)
-                    .ok()
-                    .as_deref(),
-            )
+        let socket_path = runtime_dir.join("host.sock");
+        let exchange = Box::pin(request_host_reply_classified(
+            &socket_path,
+            &envelope,
+            budget,
+        ));
+        let reply = if let Some(soul) = startup_soul {
+            Box::pin(self.await_running_startup(&soul, "execution_grant", exchange)).await??
         } else {
-            host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref())
+            exchange.await?
         };
-        let reply =
-            request_host_reply_classified(&runtime_dir.join("host.sock"), &envelope, budget)
-                .await?;
         reply.result.map_err(Into::into)
     }
 
@@ -4671,6 +4720,82 @@ pub(crate) fn fresh_agent_command_budget(configured: Option<&str>) -> Duration {
         .unwrap_or(Duration::from_millis(
             DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS,
         ))
+}
+
+fn command_reply_budget(
+    command: &HostCommand,
+    host_override: Option<&str>,
+    fresh_override: Option<&str>,
+) -> Duration {
+    let configured = |value: Option<&str>| {
+        value
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    };
+    if let HostCommand::GrantExecution {
+        terminal,
+        fresh_agent,
+        ..
+    } = command
+    {
+        let provider = terminal
+            .as_ref()
+            .map(|spec| spec.mode.as_str())
+            .or_else(|| {
+                fresh_agent
+                    .as_ref()
+                    .map(|spec| spec.provider.native_provider())
+            });
+        if let Some(provider) = provider.filter(|provider| {
+            matches!(
+                *provider,
+                "codex" | "opencode" | "claude" | "amplifier" | "kilroy"
+            )
+        }) {
+            use freshell_platform::provider_startup as startup;
+            // Preparation, final selection/auth readers, then actual native
+            // dispatch complete before GrantAccepted may carry a worker PID.
+            let readers = if matches!(provider, "claude" | "kilroy" | "opencode") {
+                startup::PROVIDER_METADATA_READ_RUN + startup::PROVIDER_METADATA_READ_CLEANUP
+            } else {
+                Duration::ZERO
+            };
+            let native = if fresh_agent.is_some() {
+                let bootstrap = match provider {
+                    "codex" => freshell_codex::launch_plan::managed_fresh_startup_budget(),
+                    "claude" | "kilroy" => startup::CLAUDE_SIDECAR_CREATE,
+                    "opencode" => startup::HOSTED_CREATE_WAIT,
+                    _ => Duration::ZERO,
+                };
+                bootstrap + startup::HOSTED_CREATE_WAIT * 2
+            } else if provider == "codex" {
+                freshell_codex::launch_plan::managed_sidecar_startup_budget()
+            } else {
+                Duration::ZERO
+            };
+            let startup = Duration::from_millis(DEFAULT_HOST_COMMAND_TIMEOUT_MS)
+                + startup::provider_refresh_completion_budget()
+                + startup::PROVIDER_ENDPOINT_WAIT
+                + readers
+                + native;
+            return if fresh_agent.is_some() {
+                configured(fresh_override).unwrap_or(startup.max(fresh_agent_command_budget(None)))
+            } else {
+                configured(host_override).unwrap_or(startup)
+            };
+        }
+    }
+    if matches!(
+        command,
+        HostCommand::FreshAgentSend { .. }
+            | HostCommand::FreshAgentCompact { .. }
+            | HostCommand::FreshAgentRollback { .. }
+    ) {
+        fresh_agent_command_budget(fresh_override)
+    } else {
+        host_command_budget(host_override)
+    }
 }
 
 fn map_host_frame_error(error: freshell_runtime_protocol::FrameError) -> RuntimeError {
@@ -8202,7 +8327,9 @@ fn stop_verification_outcome(error: RuntimeError) -> StopOutcome {
 mod interrupted_transaction_tests {
     use super::*;
     use crate::{backend::*, registry::OwnedRuntimeHandle};
-    use freshell_runtime_protocol::{CleanupState, DesiredState, RuntimeLimits};
+    use freshell_runtime_protocol::{
+        CleanupState, DesiredState, OpenCodeAdoptionStatus, RuntimeDiagnosticCode, RuntimeLimits,
+    };
     use rusqlite::{params, Connection};
     use std::{io::Write, os::unix::process::ExitStatusExt};
 
@@ -8482,6 +8609,391 @@ mod interrupted_transaction_tests {
             CREATE TRIGGER stop_test_new_grant AFTER UPDATE OF execution_generation,grant_id ON incarnations WHEN NEW.execution_generation!=OLD.execution_generation OR NEW.grant_id IS NOT OLD.grant_id BEGIN INSERT INTO stop_test_effects VALUES('execution_grant'); END;
             CREATE TRIGGER stop_test_new_recovery AFTER INSERT ON recovery_attempts BEGIN INSERT INTO stop_test_effects VALUES('recovery'); END;").unwrap();
         soul
+    }
+
+    fn startup_terminal_command(
+        soul: SoulId,
+        incarnation: IncarnationId,
+        boot: HostBootId,
+    ) -> HostCommand {
+        let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"startup-terminal", "streamId":"startup-stream", "mode":"opencode",
+            "program":"opencode", "cwd":"/workspace", "workspacePath":"/workspace",
+            "projectKey":"startup", "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24
+        }))
+        .unwrap();
+        HostCommand::GrantExecution {
+            native_identity_launch: None,
+            incarnation_id: incarnation,
+            soul_id: soul,
+            host_boot_id: boot,
+            control_epoch: 1,
+            execution_generation: 1,
+            grant_id: freshell_runtime_protocol::GrantId::new(),
+            fixture: None,
+            provider_path_inputs: Default::default(),
+            terminal: Some(Box::new(terminal)),
+            fresh_agent: None,
+            resume_spec: None,
+        }
+    }
+
+    fn startup_issue_request(soul: &SoulId) -> McpCapabilityRequest<'_> {
+        McpCapabilityRequest {
+            action: "issue",
+            soul_id: soul,
+            incarnation_id: None,
+            grant_id: None,
+            provider: Some("claude"),
+            tui_source: None,
+            workspace: Some("/workspace"),
+            auth_lookup_authority: None,
+            claude_recovery_source: None,
+            cwd: Some("/workspace"),
+            prior_context: None,
+            provider_secret_references: None,
+            provider_path_inputs: None,
+        }
+    }
+
+    async fn startup_host_peer(
+        handle: &OwnedRuntimeHandle,
+        delay: Duration,
+        fail: bool,
+        began: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+        let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
+        let boot = HostBootId::new();
+        let limits = handle.requested_limits();
+        tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let secret = secret.clone();
+                let boot = boot.clone();
+                let began = began.clone();
+                requests.spawn(async move {
+                    let request: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+                    if !matches!(&request.body, HostCommand::Hello { .. }) {
+                        assert_eq!(
+                            request.auth.as_deref(),
+                            Some(
+                                host_proof(
+                                    &secret,
+                                    "command-auth",
+                                    &boot,
+                                    match &request.body {
+                                        HostCommand::GrantExecution { incarnation_id, .. }
+                                        | HostCommand::Stop { incarnation_id, .. } =>
+                                            incarnation_id,
+                                        _ => unreachable!(),
+                                    }
+                                )
+                                .as_str()
+                            )
+                        );
+                    }
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => Ok(HostResult::Hello {
+                            host_boot_id: boot.clone(),
+                            proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                            capabilities: vec![],
+                            effective_limits: limits,
+                        }),
+                        HostCommand::Stop { .. } => Ok(HostResult::Stopped),
+                        HostCommand::GrantExecution { .. } => {
+                            began.send(()).unwrap();
+                            sleep(delay).await;
+                            if fail {
+                                Err(RuntimeError::new(
+                                    RuntimeErrorCode::HostUnreachable,
+                                    "synthetic startup preparation failed",
+                                )
+                                .with_diagnostic_code(
+                                    RuntimeDiagnosticCode::ProviderLaunchPrepareFailed,
+                                ))
+                            } else {
+                                Ok(HostResult::GrantAccepted {
+                                    native_identity_observation: None,
+                                    host_boot_id: boot,
+                                    worker_pid: 123,
+                                    worker_launch_count: 1,
+                                    fixture_evidence: serde_json::json!({}),
+                                    native_session_id: None,
+                                    opencode_transfer_receipt: None,
+                                    opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
+                                })
+                            }
+                        }
+                        other => panic!("unexpected startup peer command: {other:?}"),
+                    };
+                    let _ = write_frame(
+                        &mut stream,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result,
+                        },
+                    )
+                    .await;
+                });
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn startup_reply_budget_composes_existing_operations_and_keeps_controls_short() {
+        let incarnation = IncarnationId::new();
+        let mut command =
+            startup_terminal_command(SoulId::new(), incarnation.clone(), HostBootId::new());
+        for (provider, seconds) in [
+            ("opencode", 109),
+            ("claude", 109),
+            ("amplifier", 84),
+            ("codex", 365),
+            ("shell", 10),
+        ] {
+            let HostCommand::GrantExecution {
+                terminal: Some(terminal),
+                ..
+            } = &mut command
+            else {
+                unreachable!()
+            };
+            terminal.mode = provider.into();
+            assert_eq!(
+                command_reply_budget(&command, None, None),
+                Duration::from_secs(seconds)
+            );
+            assert_eq!(
+                command_reply_budget(&command, Some("100"), None),
+                Duration::from_millis(100)
+            );
+            assert_eq!(
+                command_reply_budget(&command, Some("0"), None),
+                Duration::from_secs(seconds)
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = open(root.path());
+        let soul = seed(&supervisor, root.path(), false).await;
+        let owner = supervisor
+            .registry
+            .active_handle_for_soul(soul)
+            .await
+            .unwrap();
+        let mut launch = owner.fresh_agent().unwrap().clone();
+        for (provider, millis) in [
+            (freshell_runtime_protocol::FreshProvider::Claude, 254_000),
+            (freshell_runtime_protocol::FreshProvider::Opencode, 259_000),
+            (freshell_runtime_protocol::FreshProvider::Codex, 264_150),
+        ] {
+            launch.provider = provider;
+            let HostCommand::GrantExecution {
+                terminal,
+                fresh_agent,
+                ..
+            } = &mut command
+            else {
+                unreachable!()
+            };
+            *terminal = None;
+            *fresh_agent = Some(Box::new(launch.clone()));
+            assert_eq!(
+                command_reply_budget(&command, None, None),
+                Duration::from_millis(millis)
+            );
+            assert_eq!(
+                command_reply_budget(&command, None, Some("100")),
+                Duration::from_millis(100)
+            );
+        }
+        for control in [
+            HostCommand::Status {
+                incarnation_id: incarnation.clone(),
+            },
+            HostCommand::Stop {
+                incarnation_id: incarnation,
+                control_epoch: 1,
+                execution_generation: 1,
+            },
+        ] {
+            assert_eq!(
+                command_reply_budget(&control, None, None),
+                Duration::from_secs(10)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_terminal_grant_waits_beyond_control_budget_for_real_completion() {
+        for fail in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let supervisor = open(root.path());
+            let soul = seed(&supervisor, root.path(), false).await;
+            let handle = supervisor
+                .registry
+                .active_handle_for_soul(soul.clone())
+                .await
+                .unwrap();
+            let (tx, mut began) = tokio::sync::mpsc::unbounded_channel();
+            let peer = startup_host_peer(&handle, Duration::from_secs(11), fail, tx).await;
+            let host = supervisor
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                .await
+                .unwrap();
+            let result = supervisor
+                .send_authenticated_host_command(
+                    handle.incarnation_id().clone(),
+                    handle.runtime_dir(),
+                    &host,
+                    startup_terminal_command(
+                        soul,
+                        handle.incarnation_id().clone(),
+                        host.host_boot_id.clone(),
+                    ),
+                )
+                .await;
+            began.recv().await.unwrap();
+            peer.abort();
+            let _ = peer.await;
+            if fail {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+                assert_eq!(
+                    error.diagnostic_code,
+                    Some(RuntimeDiagnosticCode::ProviderLaunchPrepareFailed)
+                );
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Ok(HostResult::GrantAccepted {
+                            worker_pid: 123,
+                            ..
+                        })
+                    ),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_callback_waits_for_both_native_observation_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let supervisor = open(root.path());
+        let soul = seed(&supervisor, root.path(), false).await;
+        let listener = UnixListener::bind(root.path().join("mcp.sock")).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut body = Vec::new();
+            stream.read_to_end(&mut body).await.unwrap();
+            sleep(Duration::from_secs(36)).await;
+            let _ = stream.write_all(b"prepared-complete").await;
+        });
+        let result = supervisor
+            .mcp_capability_callback(startup_issue_request(&soul))
+            .await;
+        peer.abort();
+        let _ = peer.await;
+        assert_eq!(result.unwrap(), b"prepared-complete");
+    }
+
+    #[tokio::test]
+    async fn startup_stop_interrupts_preparation_and_grant_waits_before_teardown() {
+        for phase in ["callback", "grant"] {
+            let root = tempfile::tempdir().unwrap();
+            let supervisor = Arc::new(open(root.path()));
+            let soul = seed(&supervisor, root.path(), false).await;
+            let handle = supervisor
+                .registry
+                .active_handle_for_soul(soul.clone())
+                .await
+                .unwrap();
+            let (tx, mut began) = tokio::sync::mpsc::unbounded_channel();
+            let host_peer =
+                startup_host_peer(&handle, Duration::from_secs(3600), false, tx.clone()).await;
+            let callback = if phase == "callback" {
+                let listener = UnixListener::bind(root.path().join("mcp.sock")).unwrap();
+                Some(tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut body = Vec::new();
+                    stream.read_to_end(&mut body).await.unwrap();
+                    tx.send(()).unwrap();
+                    sleep(Duration::from_secs(3600)).await;
+                }))
+            } else {
+                None
+            };
+            let owner = supervisor.clone();
+            let owned_soul = soul.clone();
+            let startup = tokio::spawn(async move {
+                let lock = owner.lifecycle_lock(&owned_soul).await;
+                let _held = lock.lock().await;
+                if phase == "callback" {
+                    owner
+                        .mcp_capability_callback(startup_issue_request(&owned_soul))
+                        .await
+                        .map(|_| ())
+                } else {
+                    let host = owner
+                        .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                        .await
+                        .unwrap();
+                    owner
+                        .send_authenticated_host_command(
+                            handle.incarnation_id().clone(),
+                            handle.runtime_dir(),
+                            &host,
+                            startup_terminal_command(
+                                owned_soul,
+                                handle.incarnation_id().clone(),
+                                host.host_boot_id.clone(),
+                            ),
+                        )
+                        .await
+                        .map(|_| ())
+                }
+            });
+            began.recv().await.unwrap();
+            let stopped = tokio::time::timeout(
+                Duration::from_secs(2),
+                supervisor.stop(soul.clone(), Some(1)),
+            )
+            .await;
+            host_peer.abort();
+            let _ = host_peer.await;
+            if let Some(callback) = callback {
+                callback.abort();
+                let _ = callback.await;
+            }
+            if stopped.is_err() {
+                startup.abort();
+                let _ = startup.await;
+                panic!("Stop remained behind {phase} startup");
+            }
+            assert_eq!(stopped.unwrap().unwrap().0, StopOutcome::VerifiedEmpty);
+            assert_eq!(
+                startup.await.unwrap().unwrap_err().code,
+                RuntimeErrorCode::StaleIntentRevision
+            );
+            assert_eq!(
+                supervisor
+                    .registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .desired_state,
+                DesiredState::Stopped
+            );
+            assert_eq!(count(root.path(), "graceful"), 1);
+            assert_eq!(count(root.path(), "creates"), 0);
+            assert_eq!(count(root.path(), "starts"), 0);
+        }
     }
 
     fn soul(root: &Path) -> SoulId {
