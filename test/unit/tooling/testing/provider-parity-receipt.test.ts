@@ -1,7 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { runInNewContext } from 'node:vm'
-import ts from 'typescript'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -14,7 +12,7 @@ import {
 } from '../../../../scripts/testing/provider-parity-receipt.js'
 import { validateProviderQualificationReceipt } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { validateFreshAgentQualificationReceipt } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
-import { exposeGrantsToHarness, fakeOnecliGrants } from '../../../integration/server/provider-parity-onecli.js'
+import { exposeGrantsToHarness, fakeOnecliGrants } from '../../../helpers/provider-parity-onecli.js'
 
 describe('provider parity suite discovery', () => {
   it.each([
@@ -22,65 +20,43 @@ describe('provider parity suite discovery', () => {
     { context: 'local Cloud dispatcher', environment: { FRESHELL_VITEST_BACKEND: 'cloud', CI: 'true' }, runtimeSuites: true },
     { context: 'source-only Cloud Vitest worker', environment: { TEST_MODE: 'vitest' }, runtimeSuites: false },
     { context: 'other container mode', environment: { TEST_MODE: 'playwright' }, runtimeSuites: true },
-  ])('collects the intended runtime and callback suites in $context', ({ environment, runtimeSuites }) => {
+  ])('collects the intended runtime and unit suites in $context', ({ environment, runtimeSuites }) => {
     const repoRoot = path.resolve(import.meta.dirname, '../../../..')
-    const cache = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-parity-discovery-'))
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-parity-discovery-'))
+    const paritySuites = ['fresh-agent-parity.test.ts', 'managed-provider-parity.test.ts']
+      .map(file => `test/integration/server/${file}`)
+    const unitSuite = 'test/unit/tooling/testing/provider-parity-receipt.test.ts'
+    const realProviderSuite = 'test/integration/real/provider-contract.test.ts'
     const env: NodeJS.ProcessEnv = { ...process.env, ...environment }
     if (!('TEST_MODE' in environment)) delete env.TEST_MODE
+    delete env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
     try {
-      // Glob the real default config without importing test modules or running
-      // the runtime suites' beforeAll hooks. Close the collector in the child.
+      // Exercise the real config against a finite source tree. Cloud excludes
+      // the actual runtime suites; discovery must not require their sources.
+      for (const file of [...paritySuites, unitSuite, realProviderSuite]) {
+        const target = path.join(fixture, file)
+        fs.mkdirSync(path.dirname(target), { recursive: true })
+        fs.writeFileSync(target, 'throw new Error("discovery must never import a suite")\n')
+      }
       const files: string[] = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
         import { createVitest } from 'vitest/node'
         import path from 'node:path'
-        const collector = await createVitest({ config: 'config/vitest/vitest.config.ts', watch: false }, {
-          configLoader: 'runner', cacheDir: process.argv[1],
+        const collector = await createVitest({ config: path.resolve('config/vitest/vitest.config.ts'), root: process.argv[1], watch: false }, {
+          configLoader: 'runner', cacheDir: path.join(process.argv[1], '.cache'),
         })
         try {
           const specifications = await collector.globTestSpecifications()
-          process.stdout.write(JSON.stringify(specifications.map(specification => path.relative(process.cwd(), specification.moduleId))))
+          process.stdout.write(JSON.stringify(specifications.map(specification => path.relative(process.argv[1], specification.moduleId))))
         } finally { await collector.close() }
-      `, cache], { cwd: repoRoot, env, encoding: 'utf8', timeout: 30_000 }))
-      const paritySuites = ['fresh-agent-parity.test.ts', 'managed-provider-parity.test.ts']
-        .map(file => `test/integration/server/${file}`)
+      `, fixture], { cwd: repoRoot, env, encoding: 'utf8', timeout: 30_000 }))
       expect(files.filter(file => paritySuites.includes(file)).sort()).toEqual(runtimeSuites ? paritySuites : [])
-      expect(files).toContain('test/unit/tooling/testing/provider-parity-receipt.test.ts')
-    } finally { fs.rmSync(cache, { recursive: true, force: true }) }
+      expect(files).toContain(unitSuite)
+      expect(files).not.toContain(realProviderSuite)
+    } finally { fs.rmSync(fixture, { recursive: true, force: true }) }
   })
 })
 
 describe('fake provider parity grant isolation', () => {
-  it.each(['fresh-agent-parity.test.ts', 'managed-provider-parity.test.ts'].flatMap(file =>
-    ['stop', 'remove'].map(stage => ({ file, stage }))))(
-    'restores ambient references when actual $file cleanup fails during $stage', async ({ file, stage }) => {
-    const filename = `test/integration/server/${file}`
-    // Execute the actual teardown callback without starting provider fixtures.
-    const text = fs.readFileSync(path.resolve(import.meta.dirname, '../../../..', filename), 'utf8')
-    const source = ts.createSourceFile(filename, text, ts.ScriptTarget.Latest, true)
-    let callback: ts.Node | undefined
-    const find = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && node.expression.getText(source) === 'afterAll') callback = node.arguments[0]
-      ts.forEachChild(node, find)
-    }
-    find(source)
-    if (!callback) throw new Error('actual parity teardown callback is missing')
-    vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE', '/nonexistent/operator/auth.json')
-    const fake = fakeOnecliGrants(['opencode'])
-    const restore = exposeGrantsToHarness(fake.serverEnv)
-    const restoreOnecliEnvironment = vi.fn(restore)
-    const teardown = runInNewContext(`(${callback.getText(source)})`, {
-      rig: { stop: async () => { if (stage === 'stop') throw new Error('controlled cleanup failure'); return { ok: true, errors: [] } } },
-      wires: [], sockets: [], expect, process, inheritedFreshellUrl: process.env.FRESHELL_URL,
-      workspace: undefined, webHome: undefined, homeDir: undefined, opencodeProject: undefined, onecli: fake,
-      restoreOnecliEnvironment, fs: { rmSync: () => { if (stage === 'remove') throw new Error('controlled cleanup failure') } },
-    }) as () => Promise<void>
-    try {
-      await expect(teardown()).rejects.toThrow('controlled cleanup failure')
-      expect(restoreOnecliEnvironment).toHaveBeenCalledOnce()
-      expect(process.env.FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE).toBe('/nonexistent/operator/auth.json')
-    } finally { restore(); vi.unstubAllEnvs(); fs.rmSync(fake.directory, { recursive: true, force: true }) }
-  })
-
   it('exposes only owned fake references to actual child processes and restores ambient references', () => {
     const ambient = {
       FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '/nonexistent/operator/auth.json',

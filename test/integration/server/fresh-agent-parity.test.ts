@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
+import { cleanupProviderParity } from '../../helpers/provider-parity-cleanup.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [
@@ -116,20 +117,10 @@ describe('hosted fresh-agent provider inputs', () => {
     fs.writeFileSync(path.join(opencodePlugin, 'user-plugin.ts'), 'export const User = async () => ({})\n')
   }, 900_000)
 
-  afterAll(async () => {
-    try {
-      await Promise.allSettled(wires.map(wire => wire.close()))
-      if (rig) {
-        const cleanup = await rig.stop()
-        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
-      }
-    } finally {
-      restoreOnecliEnvironment?.()
-      if (opencodeProject) fs.rmSync(opencodeProject, { recursive: true, force: true })
-      if (homeDir) fs.rmSync(homeDir, { recursive: true, force: true })
-      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
-    }
-  }, 180_000)
+  afterAll(() => cleanupProviderParity({
+    connections: wires, rig, restoreOnecliEnvironment,
+    directories: [opencodeProject, homeDir, onecli?.directory],
+  }), 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {
     const wire = await FreshWire.connect(rig.info)
