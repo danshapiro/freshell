@@ -1065,6 +1065,8 @@ struct TerminalHandle {
     managed_read_in_flight: Arc<AtomicBool>,
     managed_geometry_in_flight: Arc<AtomicBool>,
     managed_geometry_applied: Option<ManagedGeometry>,
+    /// Explicit command completions invalidate overlapping projection replies.
+    managed_geometry_revision: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2654,6 +2656,7 @@ impl TerminalRegistry {
                 managed_read_in_flight: Arc::new(AtomicBool::new(false)),
                 managed_geometry_in_flight: Arc::new(AtomicBool::new(false)),
                 managed_geometry_applied: None,
+                managed_geometry_revision: 0,
             },
         );
         inner.revision += 1;
@@ -4827,6 +4830,7 @@ impl TerminalRegistry {
                 managed_read_in_flight: Arc::new(AtomicBool::new(false)),
                 managed_geometry_in_flight: Arc::new(AtomicBool::new(false)),
                 managed_geometry_applied: None,
+                managed_geometry_revision: 0,
             },
         );
         inner.revision += 1;
@@ -4939,7 +4943,7 @@ impl TerminalRegistry {
             .read()
             .expect("managed controller lock")
             .clone()?;
-        let (terminal, geometry, claim) = {
+        let (terminal, geometry, claim, revision) = {
             let inner = self.inner.lock().expect("registry lock");
             let handle = inner.terminals.get(terminal_id)?;
             let terminal = handle.managed.clone()?;
@@ -4970,6 +4974,7 @@ impl TerminalRegistry {
                 terminal,
                 geometry,
                 ManagedGeometryClaim(handle.managed_geometry_in_flight.clone()),
+                handle.managed_geometry_revision,
             )
         };
         let registry = self.clone();
@@ -4990,6 +4995,7 @@ impl TerminalRegistry {
                             && t.stream_id == geometry.stream_id
                     });
                     handle.managed_geometry_applied = (result.is_ok()
+                        && handle.managed_geometry_revision == revision
                         && current
                         && s.cols == geometry.cols
                         && s.rows == geometry.rows
@@ -5010,7 +5016,7 @@ impl TerminalRegistry {
         cols: u16,
         rows: u16,
     ) -> Result<(), String> {
-        let terminal = {
+        let (terminal, facade) = {
             let mut inner = self.inner.lock().expect("registry lock");
             let handle = inner
                 .terminals
@@ -5019,7 +5025,10 @@ impl TerminalRegistry {
             // Explicit requests retain their ordinary result. A pending older
             // projection cannot make these new canonical dimensions look done.
             handle.managed_geometry_applied = None;
-            handle.managed.clone().ok_or("managed terminal not found")?
+            (
+                handle.managed.clone().ok_or("managed terminal not found")?,
+                handle.managed_geometry_in_flight.clone(),
+            )
         };
         let controller = self
             .managed_controller
@@ -5027,7 +5036,19 @@ impl TerminalRegistry {
             .expect("managed controller lock")
             .clone()
             .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
-        controller.resize(terminal, cols, rows).await
+        let result = controller.resize(terminal, cols, rows).await;
+        let mut inner = self.inner.lock().expect("registry lock");
+        if let Some(handle) = inner.terminals.get_mut(terminal_id) {
+            if Arc::ptr_eq(&facade, &handle.managed_geometry_in_flight) {
+                // An older explicit command can reach the host after a newer
+                // projection. Dirty on completion too, and invalidate any
+                // overlapping projection acknowledgement regardless of reply
+                // arrival order. The ordinary ticker reapplies canonical size.
+                handle.managed_geometry_revision = handle.managed_geometry_revision.wrapping_add(1);
+                handle.managed_geometry_applied = None;
+            }
+        }
+        result
     }
 
     pub async fn managed_stop(&self, terminal_id: &str) -> Result<(), String> {
@@ -5460,6 +5481,7 @@ impl TerminalRegistry {
                     managed_read_in_flight: Arc::new(AtomicBool::new(false)),
                     managed_geometry_in_flight: Arc::new(AtomicBool::new(false)),
                     managed_geometry_applied: None,
+                    managed_geometry_revision: 0,
                 },
             );
             inner.revision += 1;

@@ -13524,6 +13524,7 @@ mod managed_output_order_tests {
         resizes: StdMutex<Vec<(String, u16, u16)>>,
         resize_completed: Arc<std::sync::atomic::AtomicUsize>,
         resize_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+        resize_reply_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
         host_geometry: Arc<StdMutex<(u16, u16)>>,
     }
 
@@ -13535,12 +13536,11 @@ mod managed_output_order_tests {
                 resizes: StdMutex::new(Vec::new()),
                 resize_completed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 resize_gate: StdMutex::new(None),
+                resize_reply_gate: StdMutex::new(None),
                 host_geometry: Arc::new(StdMutex::new((80, 24))),
             }
         }
-    }
 
-    impl ManagedOutputFixture {
         async fn wait_for_resizes(&self, count: usize) {
             tokio::time::timeout(std::time::Duration::from_millis(500), async {
                 while self
@@ -14009,6 +14009,129 @@ mod managed_output_order_tests {
         }
     }
 
+    #[tokio::test]
+    async fn managed_old_explicit_resize_cannot_leave_newer_geometry_cached() {
+        old_explicit_geometry_race(false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_old_explicit_resize_completion_invalidates_a_delayed_projection_reply() {
+        old_explicit_geometry_race(true).await;
+    }
+
+    async fn old_explicit_geometry_race(delayed_projection_reply: bool) {
+        let state = Arc::new(super::pane_reconcile_gate_tests::state());
+        let terminal = "T-explicit-geometry-race";
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-explicit-geometry-race".into(),
+            incarnation_id: "current".into(),
+            terminal_id: terminal.into(),
+            stream_id: "stream".into(),
+            mode: "shell".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: None,
+        });
+        let initial = Arc::new(ManagedOutputFixture::new(geometry_output(
+            "current",
+            "stream",
+            ManagedLifecycleState::Running,
+        )));
+        *initial.resize_result.lock().unwrap() = Ok(());
+        state.registry.set_managed_controller(Some(initial.clone()));
+        let sink: FrameSink = Arc::new(|_| {});
+        let attach = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 80, "rows": 24,
+            "sinceSeq": 0, "attachRequestId": "initial"
+        }))
+        .unwrap();
+        handle_attach(attach, &state, 7, &sink, false, false, None).await;
+        initial.wait_for_resizes(1).await;
+        let secondary = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 200, "rows": 60,
+            "sinceSeq": 0, "attachRequestId": "secondary"
+        }))
+        .unwrap();
+        handle_attach(secondary, &state, 8, &sink, false, false, None).await;
+        assert_eq!(state.registry.managed_attached_to(8), vec![terminal]);
+        let fixture = || {
+            let mut fixture = ManagedOutputFixture::new(geometry_output(
+                "current",
+                "stream",
+                ManagedLifecycleState::Running,
+            ));
+            fixture.host_geometry = initial.host_geometry.clone();
+            *fixture.resize_result.lock().unwrap() = Ok(());
+            Arc::new(fixture)
+        };
+        let old = fixture();
+        let old_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *old.resize_gate.lock().unwrap() = Some(old_gate.clone());
+        state.registry.set_managed_controller(Some(old.clone()));
+        let resize = |cols, rows| {
+            serde_json::from_value(serde_json::json!({
+                "terminalId": terminal, "cols": cols, "rows": rows
+            }))
+            .unwrap()
+        };
+        let old_state = state.clone();
+        let old_request = resize(120, 40);
+        let old_task = tokio::spawn(async move { handle_resize(old_request, &old_state).await });
+        tokio::task::yield_now().await;
+        assert_eq!(*old.resizes.lock().unwrap(), [("current".into(), 120, 40)]);
+        // Another viewer's newer canonical size reaches this same actual host.
+        let newer = fixture();
+        state.registry.set_managed_controller(Some(newer.clone()));
+        handle_resize(resize(150, 50), &state).await.unwrap();
+        let projection = fixture();
+        let reply_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        if delayed_projection_reply {
+            *projection.resize_reply_gate.lock().unwrap() = Some(reply_gate.clone());
+        }
+        state
+            .registry
+            .set_managed_controller(Some(projection.clone()));
+        project_managed_geometry(&state, terminal);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *projection.resizes.lock().unwrap(),
+            [("current".into(), 150, 50)]
+        );
+        assert_eq!(*initial.host_geometry.lock().unwrap(), (150, 50));
+        if !delayed_projection_reply {
+            projection.wait_for_resizes(1).await;
+        }
+        old_gate.add_permits(1);
+        old_task.await.unwrap().unwrap();
+        assert_eq!(*initial.host_geometry.lock().unwrap(), (120, 40));
+        if delayed_projection_reply {
+            reply_gate.add_permits(1);
+            projection.wait_for_resizes(1).await;
+            *projection.resize_reply_gate.lock().unwrap() = None;
+        }
+        // No further viewer action occurs. The existing output ticker must
+        // restore the current canonical size after either reply ordering.
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                for attached in state.registry.managed_attached_to(7) {
+                    refresh_managed_output_and_associate(&state, &attached, 65_536).await.unwrap();
+                    project_managed_geometry(&state, &attached);
+                }
+                if *initial.host_geometry.lock().unwrap() == (150, 50) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("an older explicit resize must not strand canonical geometry behind a falsely clean cache");
+        projection.wait_for_resizes(2).await;
+        assert_eq!(
+            state.registry.geometry(terminal).map(|(c, r, _)| (c, r)),
+            Some((150, 50))
+        );
+        assert_eq!(
+            *projection.resizes.lock().unwrap(),
+            [("current".into(), 150, 50), ("current".into(), 150, 50)]
+        );
+    }
+
     impl ManagedTerminalController for ManagedOutputFixture {
         fn lookup_terminal<'a>(
             &'a self,
@@ -14055,6 +14178,7 @@ mod managed_output_order_tests {
                 .push((terminal.incarnation_id, cols, rows));
             let result = self.resize_result.lock().unwrap().clone();
             let gate = self.resize_gate.lock().unwrap().clone();
+            let reply_gate = self.resize_reply_gate.lock().unwrap().clone();
             let completed = self.resize_completed.clone();
             let geometry = self.host_geometry.clone();
             Box::pin(async move {
@@ -14063,6 +14187,9 @@ mod managed_output_order_tests {
                 }
                 if result.is_ok() {
                     *geometry.lock().unwrap() = (cols, rows);
+                }
+                if let Some(gate) = reply_gate {
+                    gate.acquire_owned().await.unwrap().forget();
                 }
                 completed.fetch_add(1, std::sync::atomic::Ordering::Release);
                 result
