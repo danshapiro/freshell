@@ -4364,6 +4364,33 @@ mod tests {
         spec.mode = "freshclaude".into();
         assert!(
             matches!(
+                probe_provider_store(
+                    home.path(),
+                    &resume_spec_for_test("claude", parent, home.path())
+                ),
+                ProviderStoreProbe::Ready { .. }
+            ),
+            "the complete parent transcript has a readable native owner"
+        );
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::DefinitivelyUnavailable { .. }
+            ),
+            "a complete unrelated transcript permits an exact child absence census"
+        );
+        // A metadata-only artifact has no native message owner. Keep the
+        // ordinary census unresolved while the explicit fork remains usable.
+        fs::write(
+            home.path().join(".claude/projects/work/companion.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"mode","sessionId":parent})
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(
                 probe_provider_store(home.path(), &spec),
                 ProviderStoreProbe::Blocked { .. }
             ),
@@ -4382,9 +4409,8 @@ mod tests {
             },
         });
         let probe = probe_provider_store(home.path(), &spec);
-        assert_eq!(
-            serde_json::to_value(&probe).unwrap()["kind"],
-            "parent_backed_claude_fork",
+        assert!(
+            matches!(probe, ProviderStoreProbe::ParentBackedClaudeFork { .. }),
             "{probe:?}"
         );
         let child_path = home
