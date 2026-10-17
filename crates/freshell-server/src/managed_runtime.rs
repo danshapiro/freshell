@@ -268,29 +268,31 @@ impl ServerManagedRuntimeController {
     }
 
     async fn blocked_recovery(&self, soul_id: &str) -> Result<Option<String>, String> {
-        let cached = self
+        let needs_refresh = self
             .recovery
             .slots
             .lock()
             .await
             .get(soul_id)
-            .map(|slot| lifecycle(&slot.publication).state);
-        if !matches!(
-            cached,
-            Some(ManagedLifecycleState::Blocked | ManagedLifecycleState::Ended)
-        ) {
+            .is_some_and(|slot| {
+                !slot.task_in_flight
+                    && lifecycle(&slot.publication).state != ManagedLifecycleState::Running
+            });
+        if !needs_refresh {
             return Ok(None);
         }
+        let inventory_generation = self.recovery.next_generation();
         let views = self
             .client
             .inventory()
             .await
             .map_err(|error| error.to_string())?;
         let current = views
-            .iter()
+            .into_iter()
+            .rev()
             .find(|view| view.soul_id.as_str() == soul_id)
             .ok_or_else(|| "managed soul is no longer in supervisor inventory".to_string())?;
-        self.hydrate_at_generation(current.clone(), self.recovery.next_generation())
+        self.hydrate_at_generation(current.clone(), inventory_generation)
             .await;
         Ok(matches!(
             current.recovery_state,
@@ -1061,6 +1063,16 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 Err(error) => return Err(error.to_string()),
             };
             managed_output_validation::validate(&output, &terminal.terminal_id)?;
+            // The observer may have recovered independently of our last cached
+            // verdict. Failed inventory refresh must not discard readable output.
+            if let Err(error) = self.blocked_recovery(&soul_key).await {
+                tracing::warn!(
+                    event = "managed_runtime.lifecycle_refresh_failed",
+                    soul_id = %soul_key,
+                    error = %error,
+                    "managed lifecycle inventory refresh failed"
+                );
+            }
             let mut observation = self
                 .recovery
                 .slots
@@ -2052,7 +2064,7 @@ mod tests {
                                 max_control_epoch: 1,
                                 max_execution_generation: generation,
                                 fixture_evidence: serde_json::json!({}),
-                                exited: false,
+                                exited: original,
                                 native_session_id: Some(native),
                                 native_identity_observation: None,
                                 opencode_transfer_receipt: None,
@@ -2223,8 +2235,6 @@ mod tests {
             async fn new() -> Self {
                 let dir = tempfile::tempdir().unwrap();
                 let registry = Registry::open(dir.path().join("registry"), None).unwrap();
-                std::fs::create_dir(dir.path().join("original")).unwrap();
-                std::fs::write(dir.path().join("original/secret"), b"private-host-secret").unwrap();
                 let soul = SoulId::new();
                 let limits = RuntimeLimits {
                     cpu_milli: 1000,
@@ -2245,13 +2255,58 @@ mod tests {
                         profile: RuntimeProfile::Custom,
                         project_key: "web-retry".into(),
                         fixture: Some(FixtureKind::NativeSession),
-                        terminal: None,
+                        terminal: Some(serde_json::from_value(serde_json::json!({
+                            "terminalId":"web-retry-terminal", "streamId":"original-stream",
+                            "mode":"native-session-fixture", "program":"/usr/bin/true",
+                            "env":{"HOME":"/home/freshell/provider"},
+                            "cwd":dir.path(), "workspacePath":dir.path(), "projectKey":"web-retry",
+                            "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24
+                        })).unwrap()),
                         fresh_agent: None,
                         view_intent: None,
                         admission: Default::default(),
                     })
                     .await
                     .unwrap();
+                let runtime = dir
+                    .path()
+                    .join("runtime")
+                    .join(prepared.incarnation_id.as_str());
+                std::fs::create_dir_all(&runtime).unwrap();
+                std::fs::write(runtime.join("secret"), b"private-host-secret").unwrap();
+                std::fs::write(runtime.join("stopped"), b"stopped").unwrap();
+                // The original enclosure has ended. Retained polling observes
+                // its owned empty spool while backend recovery waits.
+                use freshell_runtime_protocol::terminal_spool::{
+                    TerminalExitObservation, TerminalSpoolCompletion, TerminalSpoolDescriptor,
+                    SPOOL_COMPLETION_FILE, SPOOL_CURRENT_FILE, SPOOL_DESCRIPTOR_FILE,
+                };
+                let descriptor = TerminalSpoolDescriptor {
+                    schema_version: 1,
+                    incarnation_id: prepared.incarnation_id.clone(),
+                    terminal_id: "web-retry-terminal".into(),
+                    stream_epoch: "original-stream-retained".into(),
+                    segment_limit_bytes: 1024,
+                };
+                let completion = TerminalSpoolCompletion {
+                    incarnation_id: descriptor.incarnation_id.clone(),
+                    terminal_id: descriptor.terminal_id.clone(),
+                    stream_epoch: descriptor.stream_epoch.clone(),
+                    retained_from_seq: 1,
+                    head_seq: 0,
+                    exit: TerminalExitObservation::Known { code: 0 },
+                };
+                std::fs::write(
+                    runtime.join(SPOOL_DESCRIPTOR_FILE),
+                    serde_json::to_vec(&descriptor).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    runtime.join(SPOOL_COMPLETION_FILE),
+                    serde_json::to_vec(&completion).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(runtime.join(SPOOL_CURRENT_FILE), b"").unwrap();
                 registry
                     .commit_created(
                         prepared.incarnation_id.clone(),
@@ -2259,7 +2314,7 @@ mod tests {
                             daemon_id: DockerDaemonId::new(),
                             container_id: "web-retry-original".into(),
                             image_ref: "private-test-image".into(),
-                            runtime_dir: dir.path().join("original"),
+                            runtime_dir: runtime,
                             host_binary_path: std::env::current_exe().unwrap(),
                             immutable_config_digest: "private-test".into(),
                             launch_policy: None,
@@ -2287,7 +2342,10 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let context = registry.recovery_context(soul.clone()).await.unwrap();
+                let mut context = registry.recovery_context(soul.clone()).await.unwrap();
+                // Use the deterministic native-session fixture adapter for
+                // resume evidence; the terminal spec separately owns output.
+                context.terminal = None;
                 let resume =
                     freshell_supervisor::resume_catalog::exact_resume_candidate(&context, None)
                         .unwrap()
@@ -2455,7 +2513,12 @@ mod tests {
                 .recovery_context(fixture.soul.clone())
                 .await
                 .unwrap();
-            assert_eq!(current.recovery_state, RecoveryState::Live);
+            assert_eq!(
+                current.recovery_state,
+                RecoveryState::Live,
+                "supervisor must independently recover first; lifecycle: {}",
+                std::fs::read_to_string(fixture.dir.path().join("lifecycle.jsonl")).unwrap()
+            );
             assert_eq!(current.successful_recoveries_in_window, 1);
             assert_eq!(current.native_session_id.as_deref(), Some("web-retry-root"));
             let output = fixture
@@ -2466,6 +2529,37 @@ mod tests {
                     "observer recovery must clear a stale web block without input or manual retry",
                 );
             assert_eq!(output.chunks[0].data, "recovered output");
+            assert_eq!(
+                output.lifecycle.as_ref().unwrap().state,
+                ManagedLifecycleState::Running,
+                "successful automatic recovery must restore a usable pane lifecycle"
+            );
+            assert_eq!(
+                output
+                    .lifecycle
+                    .as_ref()
+                    .unwrap()
+                    .recovery_summary
+                    .as_ref()
+                    .unwrap()
+                    .recovery_state,
+                "live"
+            );
+            assert_eq!(
+                fixture.controller.recovery.slots.lock().await[fixture.soul.as_str()]
+                    .incarnation_id
+                    .as_deref(),
+                Some(current.prior_handle.incarnation_id().as_str()),
+                "reconciliation must select the current incarnation from retained inventory"
+            );
+            assert!(
+                fixture
+                    .controller
+                    .begin_recovery(&fixture.soul, false)
+                    .await
+                    .is_some(),
+                "the next automatic recovery must not be rejected by the stale cached block"
+            );
             assert!(pending
                 .expect("pending recovery keeps the pane attached")
                 .chunks
@@ -2497,24 +2591,27 @@ mod tests {
             let mut fixture = Box::pin(RecoveryFixture::new()).await;
             fixture.backend.failure.store(2, Ordering::SeqCst);
             Box::pin(fixture.supervisor.observe_once()).await.unwrap();
+            // Hold the first automatically admitted request after its policy
+            // verdict. A cached block correctly refuses another automatic task.
+            fixture.gate.hold_next.store(true, Ordering::SeqCst);
             fixture
                 .controller
                 .read_output(fixture.terminal.clone(), 0, 4096)
                 .await
                 .unwrap();
-            fixture.wait_for_request().await;
-            assert!(fixture
-                .controller
-                .read_output(fixture.terminal.clone(), 0, 4096)
+            timeout(Duration::from_secs(1), fixture.gate.ready.notified())
                 .await
-                .is_err());
+                .unwrap();
             fixture.backend.failure.store(0, Ordering::SeqCst);
-            assert!(
-                fixture
-                    .controller
-                    .read_output(fixture.terminal.clone(), 0, 4096)
-                    .await
-                    .is_err(),
+            let blocked = fixture.controller.client.inventory().await.unwrap();
+            let current = blocked
+                .iter()
+                .rev()
+                .find(|view| view.soul_id == fixture.soul)
+                .unwrap();
+            assert_eq!(
+                current.recovery_state,
+                RecoveryState::Blocked,
                 "repairing a dependency alone cannot erase a current policy block"
             );
             assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
@@ -2525,14 +2622,6 @@ mod tests {
                 .await
                 .unwrap()
                 .intent_revision;
-            fixture.gate.hold_next.store(true, Ordering::SeqCst);
-            fixture
-                .controller
-                .schedule_recovery(fixture.soul.clone(), RecoveryTrigger::HostUnreachable, None)
-                .await;
-            timeout(Duration::from_secs(1), fixture.gate.ready.notified())
-                .await
-                .unwrap();
             let current = fixture
                 .controller
                 .client
@@ -2553,6 +2642,12 @@ mod tests {
                 .await
                 .expect("late old-intent reply cannot hide the current live output");
             assert_eq!(output.chunks[0].data, "recovered output");
+            assert_eq!(
+                output.lifecycle.unwrap().state,
+                ManagedLifecycleState::Running
+            );
+            assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 1);
+            assert!(fixture.backend.inputs.lock().unwrap().is_empty());
             fixture.close().await;
         }
 
@@ -2599,13 +2694,20 @@ mod tests {
             assert_eq!(fixture.attempts(), 2);
             assert_eq!(fixture.backend.creates.load(Ordering::SeqCst), 0);
             let newer_message = newer.view.recovery_reason.unwrap();
+            let blocked_output = fixture
+                .controller
+                .read_output(fixture.terminal.clone(), 0, 4096)
+                .await
+                .unwrap();
+            let blocked_lifecycle = blocked_output.lifecycle.unwrap();
+            assert_eq!(blocked_lifecycle.state, ManagedLifecycleState::Blocked);
             assert_eq!(
-                fixture
-                    .controller
-                    .read_output(fixture.terminal.clone(), 0, 4096)
-                    .await
-                    .unwrap_err(),
-                newer_message
+                blocked_lifecycle
+                    .recovery_summary
+                    .unwrap()
+                    .reason
+                    .as_deref(),
+                Some(newer_message.as_str())
             );
             let retained_block = fixture
                 .controller
