@@ -2387,6 +2387,57 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await expect(fsp.stat(info.homeDir!)).rejects.toThrow()
     } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
   })
+  it('preserves the actual native preparation error privately after owned HOME cleanup', async () => {
+    const { fixture: directory, entry } = await fixture()
+    const error = 'initial auth source observation failed; retry preparation PRIVATE_PREPARATION_SENTINEL'
+    const logging = `const fs=require('node:fs'),path=require('node:path');fs.writeFileSync(path.join(process.env.FRESHELL_LOG_DIR,'rust-server.jsonl'),JSON.stringify({level:'WARN',event:'fresh_agent.create.provider_inputs_failed',server_pid:process.pid,error:${JSON.stringify(error)}})+'\\n');\n`
+    await fsp.writeFile(entry, `${logging}${await fsp.readFile(entry, 'utf8')}`)
+    const diagnostics = vi.fn()
+    const owner = new ManagedRuntimeOwner(options => new runner.ManagedRuntimeWebServer({ ...options,
+      binary: process.execPath, candidateSha: 'a'.repeat(40), buildDirty: false, preserveHomeOnStop: false,
+      env: { ...options.env, NODE_OPTIONS: `--require=${entry}` } }, diagnostics), fixtureRepoRoot, 3, {}, {}, 'test', { enabledProviders: [] })
+    vi.spyOn(owner.runtime, 'prepare').mockResolvedValue(undefined)
+    vi.spyOn(owner as any, 'buildManagedServer').mockReturnValue(process.execPath)
+    vi.spyOn(owner as any, 'buildQualificationSupervisor').mockReturnValue(undefined)
+    vi.spyOn(owner.runtime, 'recordProviderQualificationBuild').mockReturnValue(undefined)
+    vi.spyOn(owner.runtime, 'startSupervisor').mockResolvedValue({ controlSocket: '/unused/socket', controlSecretFile: '/unused/secret' } as SupervisorInstance)
+    const cleanup = vi.spyOn(owner.runtime, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    try {
+      const info = await owner.start()
+      await expect(owner.stop()).resolves.toEqual({ ok: true, errors: [] })
+      expect(cleanup).toHaveBeenCalledOnce()
+      await expect(fsp.stat(info.homeDir)).rejects.toThrow()
+      await expect(fsp.stat(`/proc/${info.pid}`)).rejects.toThrow()
+      const record = diagnostics.mock.calls[0][0]
+      expect(record.privateLogArtifact, 'actual preparation error survives generated HOME removal').toEqual(expect.any(String))
+      const artifact = await fsp.readFile(record.privateLogArtifact, 'utf8')
+      expect(artifact).toContain(error)
+      expect((await fsp.stat(record.privateLogArtifact)).mode & 0o777).toBe(0o600)
+      expect(JSON.stringify(record)).not.toContain('PRIVATE_PREPARATION_SENTINEL')
+      expect(record.facts).toContainEqual({ severity: 'warn', event: 'fresh_agent.create.provider_inputs_failed', fields: {} })
+    } finally { await owner.stop(); vi.restoreAllMocks(); await fsp.rm(directory, { recursive: true }) }
+  })
+  it('reports private diagnostic write failure while completing owned process and HOME cleanup', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const logging = `const fs=require('node:fs'),path=require('node:path');fs.writeFileSync(path.join(process.env.FRESHELL_LOG_DIR,'rust-server.jsonl'),JSON.stringify({level:'WARN',event:'fresh_agent.create.provider_inputs_failed',server_pid:process.pid,error:'ordinary preparation failure'})+'\\n');\n`
+    await fsp.writeFile(entry, `${logging}${await fsp.readFile(entry, 'utf8')}`)
+    const diagnostics = vi.fn(), stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const options = { binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40),
+      buildDirty: false, setupHome: setup, preserveHomeOnStop: false, env: { NODE_OPTIONS: `--require=${entry}` },
+      writeDiagnosticArtifact: () => { throw Object.assign(new Error('PRIVATE_WRITE_FAILURE_SENTINEL'), { code: 'EACCES' }) } }
+    const server = new runner.ManagedRuntimeWebServer(options, diagnostics)
+    try {
+      const info = await server.start()
+      await expect(server.stop()).resolves.toBeUndefined()
+      await expect(fsp.stat(info.homeDir)).rejects.toThrow()
+      await expect(fsp.stat(`/proc/${info.pid}`)).rejects.toThrow()
+      expect(diagnostics.mock.calls[0][0].facts).toContainEqual({ severity: 'warn',
+        event: 'managed_runtime.web_diagnostics_retention_failed', fields: { code: 'EACCES' } })
+      expect(JSON.stringify(diagnostics.mock.calls)).not.toContain('PRIVATE_WRITE_FAILURE_SENTINEL')
+      expect(JSON.stringify(stderr.mock.calls)).toContain('managed_runtime.web_diagnostics_retention_failed')
+      expect(JSON.stringify(stderr.mock.calls)).not.toContain('PRIVATE_WRITE_FAILURE_SENTINEL')
+    } finally { await server.stop(); stderr.mockRestore(); await fsp.rm(directory, { recursive: true }) }
+  })
   it('surfaces an unreadable owned Rust log after stopping its PID and allows cleanup retry', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),

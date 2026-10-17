@@ -357,6 +357,7 @@ export function validateManagedWebProvenance(observed: unknown, candidateSha: st
 export type OwnedWebDiagnosticRecord = {
   pid: number; homeReference: string; bootAttemptCount: number; ignoredLineCount: number
   logReadState: 'missing' | 'read'; logFiles: { name: string; bytes: number; sha256: string }[]
+  privateLogArtifact?: string
   facts: { severity: string; event: string; fields: Record<string, string | number | boolean> }[]
 }
 
@@ -517,9 +518,24 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
       if (!this.homeDir) throw new Error('owned web HOME reference is unavailable')
       const outputFacts = ownedWebDiagnosticFacts(this.lastOutput, { text: log.text, pid: this.process.identity.pid })
       if (this.admissionFailure) outputFacts.facts.push(this.admissionFailure)
+      let privateLogArtifact: string | undefined
+      if (log.files.length && this.options.writeDiagnosticArtifact) {
+        try {
+          privateLogArtifact = this.options.writeDiagnosticArtifact(`owned-web-${this.process.identity.pid}-boot-${this.bootCount}.json`, {
+            pid: this.process.identity.pid, bootAttemptCount: this.bootCount, logFiles: log.files, content: log.text,
+          })
+        } catch (error) {
+          const errno = (error as NodeJS.ErrnoException)?.code
+          const fields = { code: typeof errno === 'string' && /^[A-Z0-9_]{1,64}$/.test(errno) ? errno : 'UNKNOWN' }
+          const failure = { severity: 'warn', event: 'managed_runtime.web_diagnostics_retention_failed', fields }
+          outputFacts.facts.push(failure)
+          process.stderr.write(`${JSON.stringify(failure)}\n`)
+        }
+      }
       await this.diagnostics?.({ pid: this.process.identity.pid, bootAttemptCount: this.bootCount,
         homeReference: this.homeDir,
         logReadState: log.files.length ? 'read' : 'missing', logFiles: log.files,
+        ...(privateLogArtifact ? { privateLogArtifact } : {}),
         ...outputFacts })
     }
     this.process = undefined
@@ -1514,7 +1530,8 @@ export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureCont
     this.session = new RetainedFixtureBrowserSession()
     this.facts = undefined
     const factory: RuntimeWebFactory = options => {
-      const configured = { ...options, token: this.owner.info.token }
+      const configured = { ...options, token: this.owner.info.token,
+        writeDiagnosticArtifact: (fileName: string, value: unknown) => h.writeArtifact(fileName, value) }
       const web = this.webFactory ? this.webFactory(configured) : new ManagedRuntimeWebServer(configured,
         record => h.recordLifecycle('external.web_diagnostics', { severity: 'info', ...record }))
       this.webs.add(web)

@@ -4818,6 +4818,7 @@ export type RuntimeWebConstructOptions = {
   binary: string; repoRoot: string; preserveHomeOnStop: boolean; homeDir?: string
   candidateSha: string; buildDirty: boolean
   env: Record<string, string>; setupHome: (homeDir: string) => Promise<void>
+  writeDiagnosticArtifact?: (fileName: string, value: unknown) => string
   stripEnvPrefixes?: string[]
   providerFreeFixture?: boolean
   fixtureOnecliReferences?: Partial<Record<FixtureOnecliReferenceKey, string>>
@@ -5772,6 +5773,7 @@ export class ManagedRuntimeOwner {
       binary: this.serverBin, repoRoot: this.repoRoot, candidateSha: this.runtime.candidateSha,
       buildDirty: git(this.repoRoot, ['status', '--porcelain']).trim().length > 0,
       preserveHomeOnStop: true,
+      writeDiagnosticArtifact: (fileName, value) => this.runtime.writeArtifact(fileName, value),
       providerFreeFixture: this.fixtureFreshAgentModes.length > 0 && this.enabledProviders.length === 0
         && this.freshAgentModes.every(mode => this.fixtureFreshAgentModes.includes(mode)),
       homeDir: this.webHomeDir ?? this.resolvedOperatorHome,
