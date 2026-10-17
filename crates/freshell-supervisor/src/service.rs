@@ -6875,6 +6875,7 @@ fn semantic_launch_digest(
         "nativeSessionId": request.native_session_id,
         "fixture": request.fixture,
         "terminal": terminal,
+        "freshAgent": request.fresh_agent,
     });
     let bytes = serde_json::to_vec(&value)
         .map_err(|e| RuntimeError::new(RuntimeErrorCode::InvalidRequest, e.to_string()))?;
