@@ -434,7 +434,7 @@ async fn retained_output_verified_end_survives_cleanup_and_cold_supervisor() {
         })
         .await
         .unwrap();
-    assert_eq!(result.outcome, RecoveryOutcome::Lost);
+    assert_eq!(result.outcome, RecoveryOutcome::Lost, "{result:?}");
     let config = (*supervisor.config).clone();
     let database_root = supervisor
         .registry
@@ -494,7 +494,9 @@ async fn concurrent_verified_empty_reads_share_one_completion_commit() {
             let source = crate::registry::RetainedOutputSource {
                 incarnation_id: incarnation_id.clone(),
                 runtime_dir: runtime_dir.clone(),
-                terminal: terminal.clone(),
+                terminal_id: terminal.terminal_id.clone(),
+                stream_id: terminal.stream_id.clone(),
+                read_fence: Default::default(),
                 native_session_id: None,
             };
             tokio::task::spawn_blocking(move || {
