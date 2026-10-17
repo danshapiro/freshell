@@ -342,3 +342,23 @@ describe('stopOwnedServerAndVerify', () => {
     expect(proveOwnership.mock.calls.length).toBeGreaterThanOrEqual(2)
   })
 })
+
+
+it.each(['fulfilled', 'stop-rejected', 'pid-probe-rejected', 'port-probe-rejected', 'not-gone'])(
+  'retains the actual owned stop operands/results for %s without changing teardown decisions', async mode => {
+    const stop = vi.fn(async () => { if (mode === 'stop-rejected') throw new Error('stop denied') })
+    const waitForPidGone = vi.fn(async () => { if (mode === 'pid-probe-rejected') throw new Error('PID denied'); return mode !== 'not-gone' })
+    const isPortFree = vi.fn(async () => { if (mode === 'port-probe-rejected') throw new Error('bind denied'); return mode !== 'not-gone' })
+    const observation = { pid: 4242, port: 4243, host: '127.0.0.1' as const }
+    const operation = stopOwnedServerAndVerify({ stop }, observation, { waitForPidGone, isPortFree }, observation)
+    if (mode === 'fulfilled') await expect(operation).resolves.toBeUndefined()
+    else await expect(operation).rejects.toBeInstanceOf(AggregateError)
+    expect(observation).toEqual({ pid: 4242, port: 4243, host: '127.0.0.1',
+      stop: mode === 'stop-rejected' ? 'rejected' : 'fulfilled',
+      pidGone: mode === 'pid-probe-rejected' ? 'probe-error' : mode !== 'not-gone',
+      portBindable: mode === 'port-probe-rejected' ? 'probe-error' : mode !== 'not-gone' })
+    expect(stop).toHaveBeenCalledOnce()
+    expect(waitForPidGone).toHaveBeenCalledExactlyOnceWith(4242)
+    expect(isPortFree).toHaveBeenCalledExactlyOnceWith(4243)
+  },
+)

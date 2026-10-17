@@ -15,10 +15,10 @@ import os from 'os'
 import { RustServer } from '../e2e-browser/helpers/rust-server.js'
 import type { E2eServerInfo } from '../e2e-browser/helpers/server-fixture-support.js'
 import type { LaunchServerCandidate } from '../../electron/types.js'
-import { stopOwnedServerAndVerify } from './owned-server-teardown.js'
+import { stopOwnedServerAndVerify, type OwnedServerStopObservation } from './owned-server-teardown.js'
 import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixture-cleanup.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
-import { navigateToUnavailableEndpoint } from './renderer-outage-navigation.js'
+import { observeOutageNavigation } from './renderer-outage-navigation.js'
 import { captureNativeWindowEvidence } from './native-process-evidence.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
@@ -346,6 +346,7 @@ test.describe('Renderer crash recovery', () => {
 
   test('recovers autonomously when an endpoint returns after the real cooldown', async () => {
     test.setTimeout(240_000)
+    const outageTestDeadline = Date.now() + test.info().timeout
     serverHome = fs.mkdtempSync(path.join(os.tmpdir(), 'electron-outage-server-'))
     server = new RustServer({ homeDir: serverHome, preserveHomeOnStop: true,
       expectedBuildCommit: requireElectronE2eBuildId(), expectedBuildDirty: false })
@@ -358,16 +359,25 @@ test.describe('Renderer crash recovery', () => {
     const savedUrl = `${serverInfo.baseUrl}/?token=${encodeURIComponent(serverInfo.token)}`
     const receipt = serverInfo
     const token = serverInfo.token, port = serverInfo.port
-    await stopOwnedServerAndVerify(server, receipt)
-    server = undefined
-    serverInfo = undefined
-    const logOffset = recoveryEvents().length
-    const outageStarted = Date.now()
     const native = await app.browserWindow(initial)
+    const stopObservation: OwnedServerStopObservation = { pid: receipt.pid, port: receipt.port, host: '127.0.0.1' }
+    let logOffset = 0, outageStarted = 0
     try {
-      const failure = await native.evaluate(navigateToUnavailableEndpoint, savedUrl)
-      await test.info().attach('renderer-outage-native-failure.json', {
-        body: JSON.stringify({ windowId: initialNative.id, ...failure }), contentType: 'application/json',
+      await observeOutageNavigation({ native, url: savedUrl,
+        deadline: outageTestDeadline,
+        stopObservation,
+        stop: async () => {
+          await stopOwnedServerAndVerify(server!, receipt, undefined, stopObservation)
+          server = undefined
+          serverInfo = undefined
+          logOffset = recoveryEvents().length
+          outageStarted = Date.now()
+        },
+        attach: async facts => {
+          await test.info().attach('renderer-outage-native-failure.json', {
+            body: JSON.stringify({ windowId: initialNative.id, ...facts }), contentType: 'application/json',
+          })
+        },
       })
     } finally { await native.dispose() }
     await expect.poll(() => recoveryEvents().slice(logOffset)

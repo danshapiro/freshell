@@ -7,6 +7,15 @@ export interface OwnedServerReceipt {
   identity?: string
 }
 
+export interface OwnedServerStopObservation {
+  pid: number
+  port: number
+  host: '127.0.0.1'
+  stop?: 'fulfilled' | 'rejected'
+  pidGone?: boolean | 'probe-error'
+  portBindable?: boolean | 'probe-error'
+}
+
 export interface OwnedServerHandle {
   stop(): Promise<void>
 }
@@ -83,22 +92,29 @@ function appendFailure(failures: Error[], message: string, error: unknown): void
 export async function verifyOwnedServerStopped(
   receipt: OwnedServerReceipt,
   probes: OwnedServerTeardownProbes = { waitForPidGone, isPortFree },
+  observation?: OwnedServerStopObservation,
 ): Promise<void> {
   const failures: Error[] = []
 
   try {
-    if (!(await probes.waitForPidGone(receipt.pid))) {
+    const gone = await probes.waitForPidGone(receipt.pid)
+    if (observation) observation.pidGone = gone
+    if (!gone) {
       failures.push(new Error(`owned server PID ${receipt.pid} is still alive after stop()`))
     }
   } catch (error) {
+    if (observation) observation.pidGone = 'probe-error'
     appendFailure(failures, `could not verify owned server PID ${receipt.pid} stopped`, error)
   }
 
   try {
-    if (!(await probes.isPortFree(receipt.port))) {
+    const bindable = await probes.isPortFree(receipt.port)
+    if (observation) observation.portBindable = bindable
+    if (!bindable) {
       failures.push(new Error(`owned server port ${receipt.port} is still bound after stop()`))
     }
   } catch (error) {
+    if (observation) observation.portBindable = 'probe-error'
     appendFailure(failures, `could not verify owned server port ${receipt.port} was released`, error)
   }
 
@@ -277,12 +293,15 @@ export async function stopOwnedServerAndVerify(
   server: OwnedServerHandle,
   receipt: OwnedServerReceipt,
   probes: OwnedServerTeardownProbes = { waitForPidGone, isPortFree },
+  observation?: OwnedServerStopObservation,
 ): Promise<void> {
   const failures: Error[] = []
 
   try {
     await server.stop()
+    if (observation) observation.stop = 'fulfilled'
   } catch (error) {
+    if (observation) observation.stop = 'rejected'
     failures.push(
       new Error(`owned server PID ${receipt.pid} stop failed`, {
         cause: error,
@@ -291,7 +310,7 @@ export async function stopOwnedServerAndVerify(
   }
 
   try {
-    await verifyOwnedServerStopped(receipt, probes)
+    await verifyOwnedServerStopped(receipt, probes, observation)
   } catch (error) {
     appendFailure(failures, `verifying owned server PID ${receipt.pid} stopped`, error)
   }
