@@ -5750,6 +5750,12 @@ export class ManagedRuntimeOwner {
         ...this.qualificationEnvironment(),
       },
       setupHome: async (homeDir) => {
+        if (this.enabledProviders.includes('codex') || this.freshAgentModes.includes('freshcodex')) {
+          // Web isolation explicitly selects this CODEX_HOME. Native input
+          // preparation requires that selected directory to exist already.
+          await fsp.mkdir(path.join(homeDir, '.codex'), { recursive: true, mode: 0o700 })
+          this.runtime.recordLifecycle('runtime.codex_home.prepared', { severity: 'info', owned: true })
+        }
         const freshell = path.join(homeDir, '.freshell')
         await fsp.mkdir(freshell, { recursive: true })
         await fsp.writeFile(path.join(freshell, 'config.json'), JSON.stringify({
