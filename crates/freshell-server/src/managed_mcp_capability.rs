@@ -124,7 +124,7 @@ fn store() -> &'static CapabilityStore {
     STORE.get_or_init(CapabilityStore::default)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "managed-fresh-agent-fixtures"))]
 pub(crate) fn grant_count_for_test() -> usize {
     store().grants.lock().unwrap().len()
 }
