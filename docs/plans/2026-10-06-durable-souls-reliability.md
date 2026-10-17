@@ -21,6 +21,8 @@ Fix all known durable-souls problems, complete ordinary use in the four selected
 - The user approved local execution for the selected live specs because they are excluded from Cloud; keep the configured backends for other checks.
 - Review the entire change, including recovery behavior and integration between components. Track actual file coverage and review subsequent repairs; do not count a failed reviewer launch as code-review evidence.
 
+- Rebase this repair branch onto the latest main at a suitable committed checkpoint before final review and verification.
+
 ### Accepted tradeoffs and residuals
 - Existing provider sessions may not survive a runtime transition; manual porting may be needed later.
 - Amplifier and Kilroy are outside this repair's live checks.
