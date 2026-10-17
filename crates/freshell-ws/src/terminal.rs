@@ -9411,16 +9411,24 @@ async fn handle_attach(
     {
         let cols = (attach.cols.clamp(0, u16::MAX as i64) as u16).max(2);
         let rows = (attach.rows.clamp(0, u16::MAX as i64) as u16).max(2);
-        if let Err(error) = state
+        if state
             .registry
             .managed_resize(&attach.terminal_id, cols, rows)
             .await
+            .is_err()
         {
-            state.registry.detach(&attach.terminal_id, conn_id);
-            return AttachReply::Error(Box::new(managed_runtime_error(
-                &attach.terminal_id,
-                &format!("attach resize failed: {error}"),
-            )));
+            // Ready/replay already established read-only output ownership.
+            // A recovering host may not yet permit geometry mutation; that
+            // cannot withdraw the subscription we just acknowledged. The
+            // client's replacement-epoch reattach can mirror geometry again.
+            tracing::warn!(
+                event = "managed_runtime.attach_resize_failed",
+                terminal_id = %attach.terminal_id,
+                cols,
+                rows,
+                cause = "host_resize_unavailable",
+                "Managed output remains attached while host geometry is unavailable"
+            );
         }
     }
     if outcome.found {
@@ -13514,7 +13522,132 @@ mod managed_output_order_tests {
         ManagedTerminalController, ManagedTerminalDescriptor, ManagedTerminalFuture,
     };
 
-    struct ManagedOutputFixture(ManagedOutputRead);
+    struct ManagedOutputFixture {
+        output: ManagedOutputRead,
+        resize_result: StdMutex<Result<(), String>>,
+        resizes: StdMutex<Vec<(String, u16, u16)>>,
+    }
+
+    impl ManagedOutputFixture {
+        fn new(output: ManagedOutputRead) -> Self {
+            Self {
+                output,
+                resize_result: StdMutex::new(Err("unused resize".into())),
+                resizes: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_attach_keeps_recovered_output_when_host_resize_is_unavailable() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal = "T-managed-attach-recovery";
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-attach-recovery".into(),
+            incarnation_id: "incarnation-old".into(),
+            terminal_id: terminal.into(),
+            stream_id: "epoch-old".into(),
+            mode: "shell".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: None,
+        });
+        let read = |epoch: &str, incarnation: &str, data: &str| ManagedOutputRead {
+            lifecycle: None,
+            completion: None,
+            stream_epoch: Some(epoch.into()),
+            incarnation_id: Some(incarnation.into()),
+            reset_required: false,
+            truncated: false,
+            retained_from_seq: 1,
+            head_seq: 1,
+            exit_code: None,
+            native_session_id: None,
+            chunks: vec![ManagedOutputChunk {
+                seq_start: 1,
+                seq_end: 1,
+                data: data.into(),
+            }],
+            opencode_activity: None,
+            codex_activity: None,
+        };
+        let before = Arc::new(ManagedOutputFixture::new(read(
+            "epoch-old",
+            "incarnation-old",
+            "old retained output\n",
+        )));
+        state.registry.set_managed_controller(Some(before.clone()));
+        let frames = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sink: FrameSink = Arc::new(move |frame| captured.lock().unwrap().push(frame));
+        let attach: TerminalAttach = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 80, "rows": 24,
+            "sinceSeq": 0, "attachRequestId": "attach-before-recovery"
+        }))
+        .unwrap();
+        // The real attach path publishes ready before its host resize. This
+        // controller refuses mutation, as a recovering enclosure can do.
+        let reply = handle_attach(attach, &state, 7, &sink, false, false, None).await;
+        assert_eq!(
+            *before.resizes.lock().unwrap(),
+            [("incarnation-old".into(), 80, 24)]
+        );
+        assert!(frames.lock().unwrap().iter().any(|frame| matches!(
+            frame, ServerMessage::TerminalAttachReady(ready) if ready.terminal_id == terminal
+        )));
+        let after = Arc::new(ManagedOutputFixture::new(read(
+            "epoch-replacement",
+            "incarnation-replacement",
+            "replacement launch\n",
+        )));
+        *after.resize_result.lock().unwrap() = Ok(());
+        state.registry.set_managed_controller(Some(after.clone()));
+        // Match the actual socket ticker: only retained subscribers get reads.
+        for attached in state.registry.managed_attached_to(7) {
+            refresh_managed_output_and_associate(&state, &attached, 65_536)
+                .await
+                .unwrap();
+        }
+        assert!(
+            frames.lock().unwrap().iter().any(|frame| matches!(
+                frame, ServerMessage::TerminalOutput(output)
+                    if output.terminal_id == terminal && output.data.contains("replacement launch")
+            )),
+            "an acknowledged attach must remain subscribed to accepted replacement output"
+        );
+        assert!(matches!(reply, AttachReply::Legacy));
+        assert_eq!(state.registry.managed_attached_to(7), vec![terminal]);
+        let secondary: TerminalAttach = serde_json::from_value(serde_json::json!({
+            "terminalId": terminal, "intent": "viewport_hydrate", "cols": 200, "rows": 60,
+            "sinceSeq": 0, "attachRequestId": "secondary-viewer"
+        }))
+        .unwrap();
+        assert!(matches!(
+            handle_attach(secondary, &state, 8, &sink, false, false, None).await,
+            AttachReply::Legacy
+        ));
+        assert!(
+            after.resizes.lock().unwrap().is_empty(),
+            "secondary viewers must not resize the host"
+        );
+        let resize = |cols, rows| {
+            serde_json::from_value(serde_json::json!({
+                "terminalId": terminal, "cols": cols, "rows": rows
+            }))
+            .unwrap()
+        };
+        handle_resize(resize(100, 40), &state).await.unwrap();
+        assert_eq!(
+            *after.resizes.lock().unwrap(),
+            [("incarnation-replacement".into(), 100, 40)]
+        );
+        *after.resize_result.lock().unwrap() = Err("host unavailable".into());
+        assert!(
+            handle_resize(resize(120, 50), &state).await.is_err(),
+            "explicit host resize failures remain visible to their caller"
+        );
+        assert_eq!(state.registry.managed_attached_to(7), vec![terminal]);
+    }
 
     impl ManagedTerminalController for ManagedOutputFixture {
         fn lookup_terminal<'a>(
@@ -13552,11 +13685,16 @@ mod managed_output_order_tests {
 
         fn resize<'a>(
             &'a self,
-            _: ManagedTerminalDescriptor,
-            _: u16,
-            _: u16,
+            terminal: ManagedTerminalDescriptor,
+            cols: u16,
+            rows: u16,
         ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unused resize".into()) })
+            self.resizes
+                .lock()
+                .unwrap()
+                .push((terminal.incarnation_id, cols, rows));
+            let result = self.resize_result.lock().unwrap().clone();
+            Box::pin(async move { result })
         }
 
         fn stop<'a>(
@@ -13572,7 +13710,7 @@ mod managed_output_order_tests {
             _: i64,
             _: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
-            Box::pin(async { Ok(self.0.clone()) })
+            Box::pin(async { Ok(self.output.clone()) })
         }
     }
 
@@ -14184,40 +14322,42 @@ mod managed_output_order_tests {
         });
         state
             .registry
-            .set_managed_controller(Some(Arc::new(ManagedOutputFixture(ManagedOutputRead {
-                lifecycle: None,
-                completion: None,
-                stream_epoch: Some("codex-epoch".into()),
-                incarnation_id: Some("incarnation-codex".into()),
-                reset_required: false,
-                truncated: false,
-                retained_from_seq: 1,
-                head_seq: 1,
-                exit_code: None,
-                native_session_id: Some("thread-owned".into()),
-                chunks: vec![ManagedOutputChunk {
-                    seq_start: 1,
-                    seq_end: 1,
-                    data: "assistant answer without a bell".into(),
-                }],
-                opencode_activity: None,
-                codex_activity: Some(CodexActivityBatch {
+            .set_managed_controller(Some(Arc::new(ManagedOutputFixture::new(
+                ManagedOutputRead {
+                    lifecycle: None,
+                    completion: None,
+                    stream_epoch: Some("codex-epoch".into()),
+                    incarnation_id: Some("incarnation-codex".into()),
+                    reset_required: false,
+                    truncated: false,
                     retained_from_seq: 1,
-                    head_seq: 2,
-                    events: [false, true]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, completed)| CodexActivityEvent {
-                            seq: index as u64 + 1,
-                            at: now_ms() + index as i64,
-                            thread_id: "thread-owned".into(),
-                            turn_id: Some("turn-owned".into()),
-                            status: completed.then(|| "completed".into()),
-                            completed,
-                        })
-                        .collect(),
-                }),
-            }))));
+                    head_seq: 1,
+                    exit_code: None,
+                    native_session_id: Some("thread-owned".into()),
+                    chunks: vec![ManagedOutputChunk {
+                        seq_start: 1,
+                        seq_end: 1,
+                        data: "assistant answer without a bell".into(),
+                    }],
+                    opencode_activity: None,
+                    codex_activity: Some(CodexActivityBatch {
+                        retained_from_seq: 1,
+                        head_seq: 2,
+                        events: [false, true]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, completed)| CodexActivityEvent {
+                                seq: index as u64 + 1,
+                                at: now_ms() + index as i64,
+                                thread_id: "thread-owned".into(),
+                                turn_id: Some("turn-owned".into()),
+                                status: completed.then(|| "completed".into()),
+                                completed,
+                            })
+                            .collect(),
+                    }),
+                },
+            ))));
         refresh_managed_output_and_associate(&state, terminal_id, 1024)
             .await
             .unwrap();
