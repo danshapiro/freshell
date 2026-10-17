@@ -86,6 +86,7 @@ async fn read_fixture_cached(
                         .map(
                             |(index, status)| freshell_activity::opencode::OpencodeActivityEvent {
                                 seq: index as u64 + 1,
+                                at: index as i64 + 100,
                                 cycle: 1,
                                 stream: 1,
                                 event: freshell_activity::opencode::OpencodeLaneEvent::Status {
@@ -238,6 +239,8 @@ async fn managed_control_rpc_preserves_native_activity_independently_of_terminal
         .opencode_activity
         .expect("native metadata must cross the authenticated output RPC");
     native.validate().unwrap();
+    assert_eq!(native.events[0].at, 100);
+    assert_eq!(native.events[1].at, 101);
     assert_eq!(native.events[0].seq, 1);
     assert!(matches!(
         native.events[0].event,

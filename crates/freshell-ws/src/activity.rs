@@ -1147,7 +1147,7 @@ impl ActivityHub {
                             .as_ref()
                             .is_some_and(|(epoch, _)| *epoch == stream_epoch);
                         let mut cursor = if same_epoch {
-                            current.expect("same epoch has cursor").1
+                            current.as_ref().expect("same epoch has cursor").1
                         } else {
                             0
                         };
@@ -1171,6 +1171,38 @@ impl ActivityHub {
                             frames.extend(opencode_frames(&mut inner.idle, effects).0);
                             cursor = batch.retained_from_seq - 1;
                         }
+                        if current.is_none() {
+                            let historical = batch
+                                .events
+                                .iter()
+                                .take_while(|record| record.at < self.started_at)
+                                .count();
+                            if historical > 0 {
+                                let mut snapshot = OpencodeActivityTracker::new();
+                                snapshot.track_terminal(
+                                    &terminal_id,
+                                    native_session_id.as_deref(),
+                                    at,
+                                );
+                                for record in batch.events.iter().take(historical) {
+                                    apply_opencode_native_event(
+                                        &mut snapshot,
+                                        &terminal_id,
+                                        record.cycle,
+                                        record.stream,
+                                        record.event.clone(),
+                                        record.at,
+                                    );
+                                }
+                                let effects = inner.opencode.seed_terminal_from_history(
+                                    &terminal_id,
+                                    snapshot,
+                                    at,
+                                );
+                                frames.extend(opencode_frames(&mut inner.idle, effects).0);
+                                cursor = cursor.max(batch.events[historical - 1].seq);
+                            }
+                        }
                         for record in batch.events {
                             if record.seq <= cursor {
                                 continue;
@@ -1181,7 +1213,7 @@ impl ActivityHub {
                                 record.cycle,
                                 record.stream,
                                 record.event,
-                                at,
+                                record.at,
                             );
                             frames.extend(opencode_frames(&mut inner.idle, effects).0);
                             cursor = record.seq;

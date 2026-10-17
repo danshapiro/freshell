@@ -211,6 +211,34 @@ impl OpencodeActivityTracker {
         self.ledger.list_latest_completions()
     }
 
+    /// Restore a historical observation snapshot without importing its old
+    /// completion ledger or emitting attention for already-finished turns.
+    pub fn seed_terminal_from_history(
+        &mut self,
+        terminal_id: &str,
+        mut history: Self,
+        at: i64,
+    ) -> Vec<OpencodeEffect> {
+        let Some(mut state) = history.states.remove(terminal_id) else {
+            return Vec::new();
+        };
+        if let Ownership::AwaitingAssociation { previous_known, .. } = &state.ownership {
+            // A later identity bind must not release a historical completion.
+            state.ownership = Ownership::Quiet {
+                known_session_id: previous_known.clone(),
+            };
+        }
+        state.last_observed_at = at;
+        let upsert: Vec<_> = state.record.clone().into_iter().collect();
+        let remove = if upsert.is_empty() {
+            vec![terminal_id.to_owned()]
+        } else {
+            Vec::new()
+        };
+        self.states.insert(terminal_id.to_owned(), state);
+        vec![TrackerEffect::Changed { upsert, remove }]
+    }
+
     /// Create-or-reset the terminal's state (tracking starts at create).
     pub fn track_terminal(
         &mut self,
@@ -2142,6 +2170,9 @@ pub struct OpencodeActivityBatch {
 #[serde(rename_all = "camelCase")]
 pub struct OpencodeActivityEvent {
     pub seq: u64,
+    /// Host observation time, retained unchanged across output reads.
+    #[serde(default)]
+    pub at: i64,
     pub cycle: u64,
     pub stream: u64,
     pub event: OpencodeLaneEvent,

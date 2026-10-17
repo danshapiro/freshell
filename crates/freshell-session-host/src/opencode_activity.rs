@@ -134,8 +134,13 @@ impl NativeJournal {
             _ => {}
         }
         self.head_seq += 1;
+        let observed_at = crate::now_millis();
         let mut record = OpencodeActivityEvent {
             seq: self.head_seq,
+            at: self
+                .events
+                .back()
+                .map_or(observed_at, |(last, _)| observed_at.max(last.at)),
             cycle,
             stream,
             event,
@@ -407,6 +412,26 @@ mod tests {
             );
             assert!(readiness.ensure_ready().is_err());
         }
+    }
+
+    #[test]
+    fn journal_reads_preserve_the_original_observation_time() {
+        let mut journal = NativeJournal::default();
+        let before = crate::now_millis();
+        journal.append(
+            "owned",
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses_native".into(),
+            },
+        );
+        let recorded = journal.batch().events[0].at;
+        assert!(recorded >= before && recorded <= crate::now_millis());
+        assert_eq!(journal.batch().events[0].at, recorded);
+        let wire = serde_json::to_vec(&journal.batch()).unwrap();
+        let replay: OpencodeActivityBatch = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(replay.events[0].at, recorded);
     }
 
     #[test]

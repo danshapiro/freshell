@@ -10,6 +10,7 @@ fn batch(events: Vec<OpencodeLaneEvent>) -> OpencodeActivityBatch {
             .enumerate()
             .map(|(index, event)| OpencodeActivityEvent {
                 seq: index as u64 + 1,
+                at: now_ms(),
                 cycle: 1,
                 stream: 1,
                 event,
@@ -149,6 +150,7 @@ async fn lost_native_event_prefix_cannot_turn_a_missing_error_into_success() {
             head_seq: 3,
             events: vec![OpencodeActivityEvent {
                 seq: 3,
+                at: now_ms(),
                 cycle: 1,
                 stream: 1,
                 event: status(OpencodeStatus::Idle),
@@ -319,4 +321,145 @@ async fn invalid_native_sequences_and_post_exit_events_are_inert() {
     assert!(!inner
         .managed_opencode_cursors
         .contains_key("managed-native"));
+}
+
+fn historical(mut native: OpencodeActivityBatch) -> OpencodeActivityBatch {
+    for event in &mut native.events {
+        event.at = now_ms() - 60_000;
+    }
+    native
+}
+
+#[tokio::test]
+async fn historical_native_completion_is_silent_but_later_live_turn_still_completes() {
+    let hub = managed();
+    let mut frames = hub.broadcast_tx.subscribe();
+    let old = historical(batch(vec![
+        status(OpencodeStatus::Busy),
+        status(OpencodeStatus::Idle),
+    ]));
+    send(&hub, "surviving-host", old.clone());
+    flush(&hub).await;
+    hub.expire_due();
+    flush(&hub).await;
+    assert!(
+        hub.inner
+            .lock()
+            .unwrap()
+            .opencode
+            .list_latest_completions()
+            .is_empty(),
+        "retained completion before this hub started must not become new attention"
+    );
+    while let Ok(frame) = frames.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_ne!(frame["type"], "terminal.turn.complete");
+        assert_ne!(frame["type"], "terminal.idle");
+    }
+    let mut live = batch(vec![
+        status(OpencodeStatus::Busy),
+        status(OpencodeStatus::Idle),
+        status(OpencodeStatus::Busy),
+        status(OpencodeStatus::Idle),
+    ]);
+    live.events[..2].clone_from_slice(&old.events);
+    send(&hub, "surviving-host", live.clone());
+    flush(&hub).await;
+    assert_eq!(
+        hub.inner
+            .lock()
+            .unwrap()
+            .opencode
+            .list_latest_completions()
+            .len(),
+        1
+    );
+    send(&hub, "surviving-host", live);
+    flush(&hub).await;
+    let completions = std::iter::from_fn(|| frames.try_recv().ok())
+        .map(|frame| serde_json::from_str::<serde_json::Value>(&frame).unwrap())
+        .filter(|frame| frame["type"] == "terminal.turn.complete")
+        .count();
+    assert_eq!(
+        completions, 1,
+        "live turn completes once after historical prefix consumption"
+    );
+}
+
+#[tokio::test]
+async fn historical_busy_and_permission_state_survives_until_live_resume_and_completion() {
+    let hub = managed();
+    send(
+        &hub,
+        "surviving-host",
+        historical(batch(vec![
+            status(OpencodeStatus::Busy),
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses_native".into(),
+                permission_id: "pending".into(),
+            },
+        ])),
+    );
+    flush(&hub).await;
+    assert!(hub
+        .inner
+        .lock()
+        .unwrap()
+        .opencode
+        .has_pending_permissions("managed-native"));
+    assert!(hub
+        .inner
+        .lock()
+        .unwrap()
+        .opencode
+        .list_latest_completions()
+        .is_empty());
+    let next = batch(vec![
+        status(OpencodeStatus::Busy),
+        OpencodeLaneEvent::PermissionAsked {
+            session_id: "ses_native".into(),
+            permission_id: "pending".into(),
+        },
+        OpencodeLaneEvent::PermissionReplied {
+            permission_id: "pending".into(),
+        },
+        status(OpencodeStatus::Idle),
+    ]);
+    send(&hub, "surviving-host", next);
+    flush(&hub).await;
+    assert_eq!(
+        hub.inner
+            .lock()
+            .unwrap()
+            .opencode
+            .list_latest_completions()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn first_native_read_preserves_a_new_turn_after_a_historical_prefix() {
+    let hub = managed();
+    let mut frames = hub.broadcast_tx.subscribe();
+    let old = historical(batch(vec![
+        status(OpencodeStatus::Busy),
+        status(OpencodeStatus::Idle),
+    ]));
+    let mut mixed = batch(vec![
+        status(OpencodeStatus::Busy),
+        status(OpencodeStatus::Idle),
+        status(OpencodeStatus::Busy),
+        status(OpencodeStatus::Idle),
+    ]);
+    mixed.events[..2].clone_from_slice(&old.events);
+    send(&hub, "surviving-host", mixed);
+    flush(&hub).await;
+    let completed: Vec<_> = std::iter::from_fn(|| frames.try_recv().ok())
+        .map(|frame| serde_json::from_str::<serde_json::Value>(&frame).unwrap())
+        .filter(|frame| frame["type"] == "terminal.turn.complete")
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["completionSeq"], 1);
+    assert_eq!(completed[0]["outcome"], "completed");
 }
