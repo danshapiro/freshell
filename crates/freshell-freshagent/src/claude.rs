@@ -103,7 +103,7 @@ const PENDING_CLAUDE_CREATE_PREFIX: &str = "pending-create-";
 /// is `FRESHELL_CODEX_SIDECAR_ID`); the `/proc` reaper keys on it.
 const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = "FRESHELL_CLAUDE_SIDECAR_ID";
 /// Cold-boot budget for the sidecar to answer the `create` request (`created`).
-const SIDECAR_CREATE_BUDGET: Duration = Duration::from_secs(45);
+const SIDECAR_CREATE_BUDGET: Duration = freshell_platform::provider_startup::CLAUDE_SIDECAR_CREATE;
 /// kata 1wxv task 4 review (C1): `handle_send`'s re-resolve cadence while a
 /// rollback holds the session's teardown→respawn window open. The loop is
 /// bounded by the rollback's own lifetime (`rollback_in_flight` membership

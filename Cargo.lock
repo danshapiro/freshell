@@ -1562,6 +1562,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "freshell-agent-runtime",
+ "freshell-codex",
  "freshell-platform",
  "freshell-runtime-observability",
  "freshell-runtime-protocol",

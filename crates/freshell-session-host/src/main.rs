@@ -6731,7 +6731,7 @@ fn refresh_provider_config_as_provider(
         provider,
         uid,
         gid,
-        std::time::Duration::from_secs(25),
+        freshell_platform::provider_startup::PROVIDER_REFRESH_RUN,
         &stage,
     );
     match status {
@@ -6762,7 +6762,17 @@ fn recover_provider_projection_as_provider(
         .map_err(|_| "provider projection recovery executable unavailable")?;
     let status = std::process::Command::new("/usr/bin/setpriv")
         .args(provider_identity_args(uid, gid))
-        .args(["/usr/bin/timeout", "--kill-after=2s", "30s"])
+        .args([
+            "/usr/bin/timeout".to_owned(),
+            format!(
+                "--kill-after={}s",
+                freshell_platform::provider_startup::PROVIDER_REFRESH_RECOVERY_KILL.as_secs()
+            ),
+            format!(
+                "{}s",
+                freshell_platform::provider_startup::PROVIDER_REFRESH_RECOVERY_RUN.as_secs()
+            ),
+        ])
         .arg(executable)
         .args(["refresh-provider-config", "--recover"])
         .arg(provider_home)
@@ -6815,8 +6825,8 @@ fn wait_for_provider_config_refresh(
                 let pid = child.id().to_string();
                 let termination =
                     run_provider_refresh_cleanup(uid, gid, "/usr/bin/kill", &["-KILL", "--", &pid]);
-                let cleanup_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let cleanup_deadline = std::time::Instant::now()
+                    + freshell_platform::provider_startup::PROVIDER_REFRESH_JOIN;
                 loop {
                     match child.try_wait() {
                         Ok(Some(_)) => {
@@ -6859,7 +6869,18 @@ fn run_provider_refresh_cleanup(
 ) -> Result<(), String> {
     let status = std::process::Command::new("/usr/bin/setpriv")
         .args(provider_identity_args(uid, gid))
-        .args(["/usr/bin/timeout", "--kill-after=1s", "4s", program])
+        .args([
+            "/usr/bin/timeout".to_owned(),
+            format!(
+                "--kill-after={}s",
+                freshell_platform::provider_startup::PROVIDER_REFRESH_CLEANUP_KILL.as_secs()
+            ),
+            format!(
+                "{}s",
+                freshell_platform::provider_startup::PROVIDER_REFRESH_CLEANUP_RUN.as_secs()
+            ),
+            program.to_owned(),
+        ])
         .args(args)
         .env_clear()
         .stdin(std::process::Stdio::null())

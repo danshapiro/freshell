@@ -7659,7 +7659,8 @@ impl FreshCodexState {
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server initialize failed: {err}"));
                     }
-                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    tokio::time::sleep(freshell_codex::launch_plan::SIDECAR_INITIALIZE_RETRY_DELAY)
+                        .await;
                 }
             }
         }

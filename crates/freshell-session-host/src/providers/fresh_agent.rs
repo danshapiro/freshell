@@ -32,7 +32,7 @@ use std::{
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
-const CREATE_TIMEOUT: Duration = Duration::from_secs(50);
+const CREATE_TIMEOUT: Duration = freshell_platform::provider_startup::HOSTED_CREATE_WAIT;
 // OpenCode's bounded cold start can consume 20s of health probing plus a 30s
 // request budget before the correlated acceptance edge exists. Stay below the
 // supervisor's 60s hosted-agent command envelope while covering that bound.
