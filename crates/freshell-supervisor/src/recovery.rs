@@ -2094,13 +2094,13 @@ impl Supervisor {
                                 .map_err(map_registry)?;
                         }
                         if context.provider != "shell" && context.resume_spec.is_none() {
-                            self.capture_live_resume_evidence(&context, &host, &status)
+                            self.capture_live_resume_evidence(context, &host, &status)
                                 .await;
                         }
-                        return Ok(live_reattach_probe(&context, &status));
+                        return Ok(live_reattach_probe(context, &status));
                     }
                     if context.provider == "shell" {
-                        return Ok(shell_terminal_end_probe(&context));
+                        return Ok(shell_terminal_end_probe(context));
                     }
                     let candidate = match resume_catalog::exact_resume_candidate(
                         &*context,
