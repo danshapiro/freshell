@@ -13999,10 +13999,18 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         let soul_id = SoulId::parse("synthetic-soul").map_err(|error| error.to_string())?;
         let host_boot_id = HostBootId::new();
         let home = PathBuf::from(&terminal.env["HOME"]);
+        let state_dir = root.join("host-state");
+        let mut persisted = match std::fs::read(state_dir.join("host-state.json")) {
+            Ok(bytes) => serde_json::from_slice::<PersistedHostState>(&bytes)
+                .map_err(|error| format!("read durable host state: {error}"))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => PersistedHostState::default(),
+            Err(error) => return Err(format!("read durable host state: {error}")),
+        };
+        persisted.host_boot_id = Some(host_boot_id.clone());
         let state = Arc::new(HostState {
             incarnation_id: incarnation_id.clone(),
             host_boot_id: host_boot_id.clone(),
-            state_dir: root.join("host-state"),
+            state_dir,
             secret: b"synthetic-host-secret-0123456789abcdef".to_vec(),
             requested_limits: RuntimeLimits {
                 cpu_milli: 500,
@@ -14010,10 +14018,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 swap_bytes: 0,
                 pids_max: 64,
             },
-            persisted: Mutex::new(PersistedHostState {
-                host_boot_id: Some(host_boot_id.clone()),
-                ..PersistedHostState::default()
-            }),
+            persisted: Mutex::new(persisted),
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
@@ -15198,22 +15203,33 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                 dispatch_synthetic_fixture_from_root(&root, 2, marker.clone())
                     .await
                     .unwrap();
-            assert!(matches!(
-                result,
-                Ok(HostResult::GrantAccepted {
-                    worker_launch_count: 1,
-                    ..
-                })
-            ));
-            assert_eq!(
-                *events.lock().unwrap(),
-                ["import", "reader", "reader", "current", "pty"]
-            );
-            assert!(pty_called.load(std::sync::atomic::Ordering::SeqCst));
-            assert!(
-                marker.is_file(),
-                "retry reaches PTY only after revalidation"
-            );
+            if state_should_be_published {
+                let error = result.expect_err("a durably consumed grant must fence another launch");
+                assert_eq!(error.code, RuntimeErrorCode::StaleExecutionGrant);
+                assert!(events.lock().unwrap().is_empty());
+                assert!(!pty_called.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(
+                    !marker.exists(),
+                    "restart must not reach PTY after grant consumption"
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Ok(HostResult::GrantAccepted {
+                        worker_launch_count: 1,
+                        ..
+                    })
+                ));
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    ["import", "reader", "reader", "current", "pty"]
+                );
+                assert!(pty_called.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(
+                    marker.is_file(),
+                    "retry reaches PTY only after revalidation"
+                );
+            }
         }
 
         for (crash_point, receipt_name, field, stale_value, expected_events) in [
