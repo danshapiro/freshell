@@ -6924,6 +6924,12 @@ fn apply_staged_provider_config_locked(
             paths.push(path.to_path_buf());
         }
     }
+    // The manifest names a physical graph, including targets discovered through
+    // selected links. Select its shared resource root as a unit so those targets
+    // retain their recorded paths rather than being relocated as new externals.
+    if current.contains(".freshell/resources") {
+        paths.push(".freshell/resources".into());
+    }
     paths.sort();
     paths.dedup();
     paths.sort_by_key(|path| path.components().count());
@@ -16530,6 +16536,215 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         )
         .unwrap();
         assert!(!destination.join(".claude/settings.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_codex_prepared_workspace_skill_keeps_complete_projection_on_refresh() {
+        use freshell_platform::provider_environment::{
+            copy_environment_excluding_subtree, CopySelection,
+        };
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let root = executable_fixture();
+        let workspace = root.path().join("repository/.worktrees/workspace");
+        let skills = workspace.join(".codex/skills");
+        let skill = workspace.join(".claude/skills/probe");
+        let controller = root.path().join("controller");
+        let home = root.path().join("provider");
+        for directory in [
+            &skills,
+            &skill,
+            &workspace.join("node_modules/probe-dependency"),
+            &controller.join(".freshell/resources"),
+            &home.join(".freshell/provider-roots/root-0"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(workspace.join("package.json"), r#"{"type":"commonjs"}"#).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "selected workspace skill").unwrap();
+        std::fs::write(skill.join("retired-resource"), "initial-resource-nonce").unwrap();
+        std::fs::write(
+            skill.join("run.cjs"),
+            "process.stdout.write(require('probe-dependency'));",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("node_modules/probe-dependency/index.js"),
+            "module.exports='workspace-dependency-nonce';",
+        )
+        .unwrap();
+        symlink("../../.claude/skills/probe", skills.join("probe")).unwrap();
+        copy_environment_excluding_subtree(
+            &[
+                CopySelection {
+                    source: controller.join(".freshell/resources"),
+                    destination_relative: ".freshell/resources".into(),
+                },
+                CopySelection {
+                    source: skills,
+                    destination_relative: ".freshell/resource-units/root-0".into(),
+                },
+            ],
+            &controller,
+            &[],
+            &workspace,
+            Default::default(),
+        )
+        .unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/root-0".into(),
+                    provider_relative_path: ".freshell/provider-roots/root-0".into(),
+                    logical_destination: workspace.join(".codex/skills").to_str().unwrap().into(),
+                    effective_destination: workspace.join(".codex/skills").to_str().unwrap().into(),
+                    kind: ProviderResourceKind::Directory,
+                    writable: false,
+                    reference_aliases: vec![],
+                    retired_reference_aliases: vec![],
+                }],
+                indexed_files: None,
+            }),
+            mcp_capability: Some(capability),
+            // Ordinary preparation describes its resource units; additional
+            // linked targets are discovered by the shared copier.
+            config: vec![],
+            preparation: ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+        };
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let refresh = || {
+            refresh_provider_config_references(
+                &context,
+                "codex",
+                &workspace,
+                &controller,
+                &home,
+                uid,
+                gid,
+            )
+            .unwrap();
+        };
+        refresh();
+        let sibling = home.join(".freshell/provider-roots/root-0/provider-created");
+        std::fs::write(&sibling, "durable-sibling-nonce").unwrap();
+        let inode = std::fs::metadata(&sibling).unwrap().ino();
+        let initial_manifest = read_projection_manifest(&home).unwrap();
+        for refreshed in [false, true] {
+            if refreshed {
+                let selected = controller.join(".freshell/resource-units/root-0/probe");
+                std::fs::write(
+                    selected.join("run.cjs"),
+                    "process.stdout.write(require('probe-dependency')+':refreshed');",
+                )
+                .unwrap();
+                std::fs::remove_file(selected.join("retired-resource")).unwrap();
+                std::fs::write(selected.join("new-resource"), "refreshed-resource-nonce").unwrap();
+            }
+            refresh();
+            let output = std::process::Command::new("node")
+                .arg(home.join(".freshell/provider-roots/root-0/probe/run.cjs"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let selected = home.join(".freshell/provider-roots/root-0/probe");
+            if refreshed {
+                assert_eq!(output.stdout, b"workspace-dependency-nonce:refreshed");
+                assert!(!selected.join("retired-resource").exists());
+                assert_eq!(
+                    std::fs::read(selected.join("new-resource")).unwrap(),
+                    b"refreshed-resource-nonce"
+                );
+            } else {
+                assert_eq!(output.stdout, b"workspace-dependency-nonce");
+                assert_eq!(read_projection_manifest(&home).unwrap(), initial_manifest);
+            }
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"durable-sibling-nonce");
+            assert_eq!(std::fs::metadata(&sibling).unwrap().ino(), inode);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_linked_resource_projection_still_refuses_incomplete_manifest() {
+        use freshell_platform::provider_environment::{copy_environment, CopySelection};
+        use std::collections::BTreeSet;
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let skill = root.path().join("external/skill");
+        let stage = root.path().join("stage");
+        let projection = stage.join("projection");
+        let home = root.path().join("home");
+        for directory in [&original, &skill, &stage, &home] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(skill.join("SKILL.md"), "selected skill").unwrap();
+        std::fs::write(skill.join("resource"), "selected-resource-nonce").unwrap();
+        std::os::unix::fs::symlink(&skill, original.join("skill")).unwrap();
+        let report = copy_environment(
+            &[CopySelection {
+                source: original,
+                destination_relative: "skills".into(),
+            }],
+            &projection,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let complete = report
+            .projected_paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        std::fs::write(stage.join("manifest.json"), r#"["skills"]"#).unwrap();
+        write_projection_manifest(&projection, &complete).unwrap();
+        apply_staged_provider_config(&stage, &home).unwrap();
+        let prior_manifest = std::fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap();
+        let selected = complete
+            .iter()
+            .find(|path| path.ends_with("/resource"))
+            .unwrap();
+        for omit_actual in [true, false] {
+            let mut incomplete = complete.clone();
+            if omit_actual {
+                incomplete.remove(selected);
+            } else {
+                incomplete.insert(".freshell/resources/unavailable-selected-file".into());
+            }
+            write_projection_manifest(&projection, &incomplete).unwrap();
+            let error = apply_staged_provider_config(&stage, &home).unwrap_err();
+            assert_eq!(
+                error,
+                "provider projection manifest does not describe the complete selected environment"
+            );
+            assert_eq!(
+                std::fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+                prior_manifest
+            );
+            assert_eq!(
+                std::fs::read(home.join("skills/skill/resource")).unwrap(),
+                b"selected-resource-nonce"
+            );
+        }
     }
 
     #[cfg(unix)]
