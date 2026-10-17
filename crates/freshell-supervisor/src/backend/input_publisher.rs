@@ -1524,6 +1524,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_input_publisher_failed_stopped_runtime_republishes_for_next_incarnation() {
+        publication_fixture(PublicationCase::WarmReplacementRetry).await;
+    }
+
+    #[tokio::test]
     async fn provider_input_publisher_cold_backend_repopulates_confirmed_undispatched_generation() {
         publication_fixture(PublicationCase::ColdRetry).await;
     }
@@ -1539,6 +1544,7 @@ mod tests {
     enum PublicationCase {
         WarmCommit,
         WarmAbort,
+        WarmReplacementRetry,
         ColdRetry,
         ColdAbort,
         ColdUncertain,
@@ -1567,7 +1573,9 @@ mod tests {
         );
         let cold = !matches!(
             case,
-            PublicationCase::WarmCommit | PublicationCase::WarmAbort
+            PublicationCase::WarmCommit
+                | PublicationCase::WarmAbort
+                | PublicationCase::WarmReplacementRetry
         );
         let uncertain = matches!(case, PublicationCase::ColdUncertain);
         let accepted = matches!(case, PublicationCase::ColdAcceptedRelease);
@@ -1793,6 +1801,81 @@ mod tests {
             !helper.lock().unwrap().as_ref().unwrap().is_finished(),
             "publisher must pin completed tmpfs before workload creation"
         );
+        if matches!(case, PublicationCase::WarmReplacementRetry) {
+            let handle = |candidate: &CreateRuntimeSpec| {
+                OwnedRuntimeHandle::from_registry(
+                    candidate.installation_id.clone(),
+                    candidate.soul_id.clone(),
+                    "store".into(),
+                    candidate.incarnation_id.clone(),
+                    freshell_runtime_protocol::LaunchNonce::new(),
+                    DockerDaemonId::parse("input-publisher-daemon").unwrap(),
+                    "c".repeat(64),
+                    candidate.image_ref.clone(),
+                    candidate.runtime_dir.clone(),
+                    binary.clone(),
+                    digest_expected(&ExpectedConfig::new(
+                        candidate,
+                        &binary,
+                        &candidate.runtime_dir,
+                    ))
+                    .unwrap(),
+                    candidate.limits,
+                    None,
+                    candidate.terminal.clone(),
+                    None,
+                    candidate.provider_volume_name.clone(),
+                )
+            };
+            let prior = handle(&spec);
+            backend
+                .discard_stopped_provider_inputs(&prior)
+                .await
+                .unwrap();
+            assert!(helper
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .join()
+                .unwrap()
+                .is_ok());
+            let mut next = spec.clone();
+            next.incarnation_id = IncarnationId::new();
+            backend
+                .begin_indexed_publication(&next, &mounts, &binary)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(volume_root.join("files/source-0")).unwrap(),
+                b"PRIVATE_PUBLISHER_SENTINEL"
+            );
+            assert_eq!(
+                created.lock().unwrap().as_ref().unwrap()["Labels"]["com.freshell.incarnation-id"],
+                next.incarnation_id.as_str()
+            );
+            backend
+                .commit_prepared_inputs(&handle(&next))
+                .await
+                .unwrap();
+            assert!(helper
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .join()
+                .unwrap()
+                .is_ok());
+            backend
+                .cleanup_input_volume(&volume_name, &labels(&next, generation), &volume_options())
+                .await
+                .unwrap();
+            assert!(backend.input_publishers.lock().unwrap().is_empty());
+            drop(backend);
+            server.abort();
+            let _ = server.await;
+            return;
+        }
         if cold {
             let expected_helper = created.lock().unwrap().clone().unwrap();
             drop(backend);

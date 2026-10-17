@@ -1978,7 +1978,7 @@ impl Supervisor {
             return Err(unavailable());
         };
         self.backend
-            .discard_rejected_provider_inputs(handle)
+            .discard_stopped_provider_inputs(handle)
             .await
             .map_err(|_| unavailable())?;
         self.registry
@@ -3287,16 +3287,40 @@ impl Supervisor {
             // The pending flag is armed atomically with initial acceptance or
             // exact verified recovery success. Healthy retries preserve those
             // gates while finishing interrupted release/retirement.
-            if let Some(prior) = self
+            let generation = |owner: &crate::registry::OwnedRuntimeHandle| {
+                owner
+                    .terminal()
+                    .and_then(|spec| spec.provider_launch_context.as_ref())
+                    .or_else(|| {
+                        owner
+                            .fresh_agent()
+                            .and_then(|spec| spec.provider_launch_context.as_ref())
+                    })
+                    .and_then(|context| context.prepared_inputs.as_ref())
+                    .map(|inputs| inputs.generation_id.clone())
+            };
+            let current_generation = generation(handle);
+            let mut prior = self
                 .registry
                 .prior_provider_owner(handle.incarnation_id().clone())
                 .await
-                .map_err(map_registry)?
-            {
+                .map_err(map_registry)?;
+            while let Some(owner) = prior {
+                // A failed start may have replayed the current preparation.
+                // Retirement must reach its distinct earlier generation.
+                if current_generation.is_some() && generation(&owner) == current_generation {
+                    prior = self
+                        .registry
+                        .prior_provider_owner(owner.incarnation_id().clone())
+                        .await
+                        .map_err(map_registry)?;
+                    continue;
+                }
                 self.backend
-                    .retire_prior_prepared_inputs(handle, &prior)
+                    .retire_prior_prepared_inputs(handle, &owner)
                     .await
                     .map_err(map_backend)?;
+                break;
             }
         }
         if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
