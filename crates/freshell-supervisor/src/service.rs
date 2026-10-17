@@ -3027,31 +3027,18 @@ impl Supervisor {
         max_bytes: u64,
         expected_stream_epoch: Option<String>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
-        let (source, observation_context) = {
-            // Recovery temporarily reserves a write fence even when it only
-            // reattaches the same worker. Capture after that lifecycle work
-            // settles, so its temporary attempt cannot become the read's
-            // baseline. Host IO remains outside lifecycle custody.
-            let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
-            let _guard = lifecycle_lock.lock().await;
-            let source = self
-                .registry
-                .retained_output_source(soul_id.clone())
-                .await
-                .map_err(map_registry)?;
-            let context = self.registry.recovery_context(soul_id.clone()).await;
-            (source, context)
-        };
-        crate::retained_output::validate_source(&source, &self.config.runtime_root)
-            .map_err(|error| RuntimeError::new(RuntimeErrorCode::OwnershipMismatch, error))?;
-        let source_incarnation = source.incarnation_id.clone();
-        // This independent capability is used only for exact read-only backend
-        // emptiness verification, never input, kill, or replacement dispatch.
-        let handle = self
+        let mut timing = TerminalOutputReadTiming::new(&self.config.lifecycle_log, &soul_id);
+        let source = self
             .registry
-            .owned_handle(source.incarnation_id.clone())
+            .retained_output_source(soul_id.clone())
             .await
             .map_err(map_registry)?;
+        crate::retained_output::validate_source(&source, &self.config.runtime_root)
+            .map_err(|error| RuntimeError::new(RuntimeErrorCode::OwnershipMismatch, error))?;
+        // Recovery authority is needed only if this batch introduces a native
+        // identity. Its bookkeeping is not ownership of already accepted output.
+        let observation_fence = self.registry.recovery_write_fence(soul_id.clone()).await;
+        timing.phase("host_read");
         let live = async {
             let host = self
                 .authenticate_host(&source.incarnation_id, &source.runtime_dir)
@@ -3070,13 +3057,28 @@ impl Supervisor {
             .await
         }
         .await;
-        let reply = match live {
-            Ok(reply) => reply,
+        let output = match live {
+            Ok(HostResult::TerminalOutput(output)) => output,
+            Ok(_) => {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "unexpected terminal output reply",
+                ));
+            }
             Err(_) => {
+                timing.phase("retained_fallback");
+                // This capability is used only for read-only emptiness
+                // verification, never input, kill or replacement dispatch.
+                let handle = self
+                    .registry
+                    .owned_handle(source.incarnation_id.clone())
+                    .await
+                    .map_err(map_registry)?;
                 let verified_empty = self.backend.verify_empty(&handle).await.unwrap_or(false);
-                let output = tokio::task::spawn_blocking(move || {
+                let retained_source = source.clone();
+                tokio::task::spawn_blocking(move || {
                     crate::retained_output::read(
-                        source,
+                        retained_source,
                         after_seq,
                         max_bytes,
                         expected_stream_epoch,
@@ -3090,52 +3092,80 @@ impl Supervisor {
                         "retained output reader failed",
                     )
                 })?
-                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
-                return Ok(output);
+                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?
             }
         };
-        match reply {
-            HostResult::TerminalOutput(output) => {
-                // A web read may be abandoned while its host is unreachable.
-                // Keep read-only IPC outside lifecycle custody so those reads
-                // cannot queue ahead of recovery or Stop. Revalidate every
-                // captured fence before publishing output or recording identity.
-                let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
-                let _guard = lifecycle_lock.lock().await;
-                let current = self.registry.recovery_context(soul_id.clone()).await;
-                let changed = match (observation_context.as_ref(), current.as_ref()) {
-                    (Ok(before), Ok(current)) => before.write_fence() != current.write_fence(),
-                    (Ok(_), Err(_)) => true,
-                    _ => false,
-                };
-                if changed || &output.incarnation_id != handle.incarnation_id() {
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::OwnershipMismatch,
-                        "terminal output owner changed during host read",
-                    ));
-                }
-                if let Some(native_session_id) = output.native_session_id.as_ref() {
-                    if let Ok(context) = observation_context.as_ref() {
-                        if context.prior_handle.incarnation_id() == &source_incarnation {
-                            record_terminal_identity_observation(
-                                &self.registry,
-                                context,
-                                native_session_id,
-                            )
-                            .await?;
-                        }
-                    }
-                    // Materialize durable resume evidence while the soul-local
-                    // store is still reachable. Repeated probes are idempotent.
-                    let _ = self.probe_recovery_locked(soul_id.clone()).await;
-                }
-                Ok(output)
-            }
-            _ => Err(RuntimeError::new(
-                RuntimeErrorCode::HostAuthenticationFailed,
-                "unexpected terminal output reply",
-            )),
+        timing.phase("owner_validation");
+        let current = self.registry.retained_output_source(soul_id.clone()).await;
+        if current.as_ref().ok().is_none_or(|current| {
+            !source.accepts_output(current, output.native_session_id.as_deref())
+        }) || output.incarnation_id != source.incarnation_id
+            || output.terminal_id != source.terminal_id
+        {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.terminal_output.owner_changed",
+                serde_json::json!({
+                    "severity":"warn", "soulId":soul_id,
+                    "sourceIncarnationId":source.incarnation_id,
+                    "currentIncarnationId":current.as_ref().ok().map(|source| &source.incarnation_id),
+                    "replyIncarnationId":output.incarnation_id,
+                    "sourceFence":source.read_fence,
+                    "currentFence":current.as_ref().ok().map(|source| &source.read_fence),
+                    "terminalMatches":output.terminal_id == source.terminal_id,
+                }),
+            );
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "terminal output owner changed during host read",
+            ));
         }
+        let current = current.map_err(map_registry)?;
+        if let Some(native_session_id) = output
+            .native_session_id
+            .as_ref()
+            .filter(|observed| current.native_session_id.as_ref() != Some(*observed))
+        {
+            timing.phase("identity_write_custody");
+            let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+            let _guard = lifecycle_lock.lock().await;
+            timing.phase("identity_observation");
+            let current = self
+                .registry
+                .retained_output_source(soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if !source.accepts_output(&current, Some(native_session_id)) {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::OwnershipMismatch,
+                    "terminal native identity owner changed before observation",
+                ));
+            }
+            if current.native_session_id.as_ref() != Some(native_session_id) {
+                let context = self.registry.recovery_context(soul_id.clone()).await;
+                let context = match (observation_fence.as_ref(), context) {
+                    (Ok(before), Ok(current))
+                        if before == &current.write_fence()
+                            && current.prior_handle.incarnation_id() == &source.incarnation_id =>
+                    {
+                        current
+                    }
+                    _ => {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::OwnershipMismatch,
+                            "terminal native identity authority changed during host read",
+                        ))
+                    }
+                };
+                // Generation/boot ownership is rechecked under lifecycle
+                // custody; the transaction validates the complete write fence.
+                // No provider probe or helper belongs to this observation.
+                record_terminal_identity_observation(&self.registry, &context, native_session_id)
+                    .await?;
+            }
+        }
+        timing.phase("complete");
+        Ok(output)
     }
 
     async fn runtime_metrics(&self, soul_id: SoulId) -> Result<RuntimeMetrics, RuntimeError> {
@@ -4489,6 +4519,62 @@ impl Supervisor {
             },
             fence,
         ))
+    }
+}
+
+/// Slow reads need their owning stage in the normal lifecycle diagnostics.
+/// Healthy reads do not emit an event, and no provider payload is retained.
+struct TerminalOutputReadTiming<'a> {
+    log: &'a Path,
+    soul: &'a SoulId,
+    started: Instant,
+    phase_started: Instant,
+    phase: &'static str,
+    phases: Vec<(&'static str, u64)>,
+}
+
+impl<'a> TerminalOutputReadTiming<'a> {
+    fn new(log: &'a Path, soul: &'a SoulId) -> Self {
+        let started = Instant::now();
+        Self {
+            log,
+            soul,
+            started,
+            phase_started: started,
+            phase: "source_snapshot",
+            phases: Vec::new(),
+        }
+    }
+
+    fn phase(&mut self, phase: &'static str) {
+        self.phases.push((
+            self.phase,
+            self.phase_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        ));
+        self.phase = phase;
+        self.phase_started = Instant::now();
+    }
+}
+
+impl Drop for TerminalOutputReadTiming<'_> {
+    fn drop(&mut self) {
+        if self.started.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+        append_event(
+            self.log,
+            "supervisor.terminal_output.slow_read",
+            serde_json::json!({
+                "severity":"warn", "soulId":self.soul,
+                "elapsedMs":self.started.elapsed().as_millis() as u64,
+                "phase":self.phase,
+                "phaseElapsedMs":self.phase_started.elapsed().as_millis() as u64,
+                "phasesMs":self.phases.iter().copied().collect::<std::collections::BTreeMap<_,_>>(),
+            }),
+        );
     }
 }
 
@@ -11221,44 +11307,100 @@ mod native_observation_ipc_tests {
     async fn pending_terminal_output_io_does_not_block_replacement_and_refuses_late_output() {
         for stall_hello in [false, true] {
             for native_session_id in [None, Some("ses_old".to_string())] {
-                pending_terminal_output_case(stall_hello, native_session_id, "incarnation").await;
+                pending_terminal_output_case(stall_hello, native_session_id, "incarnation", false)
+                    .await;
             }
         }
     }
 
     #[tokio::test]
-    async fn terminal_output_waits_for_healthy_reattach_before_capturing_its_owner() {
+    async fn terminal_output_remains_readable_across_healthy_reattach() {
         tokio::time::timeout(
             Duration::from_secs(5),
-            pending_terminal_output_case(false, None, "settled_recovery"),
+            pending_terminal_output_case(false, None, "settled_recovery", false),
         )
         .await
         .expect("same-owner reattach must leave output readable");
     }
 
     #[tokio::test]
-    async fn terminal_output_read_before_healthy_reattach_revalidates_after_settlement() {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            pending_terminal_output_case(false, None, "settled_recovery_after_read"),
-        )
-        .await
-        .expect("a healthy reattach during host IO must leave output readable");
+    async fn terminal_output_does_not_wait_for_same_owner_recovery_custody() {
+        for native in [None, Some("ses_known".into())] {
+            let known = native.is_some();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                pending_terminal_output_case(false, native, "long_recovery", known),
+            )
+            .await
+            .expect("accepted output must remain readable while recovery owns lifecycle custody");
+        }
     }
 
     #[tokio::test]
-    async fn terminal_output_without_identity_still_revalidates_every_captured_fence() {
+    async fn terminal_output_read_before_healthy_reattach_finishes_during_recovery() {
+        for native in [None, Some("ses_known".into())] {
+            let known = native.is_some();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                pending_terminal_output_case(false, native, "settled_recovery_after_read", known),
+            )
+            .await
+            .expect("a healthy reattach during host IO must leave output readable");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_output_preserves_read_ownership_and_fences_new_identity_writes() {
+        for native_session_id in [None, Some("ses_observed".to_string())] {
+            for change in [
+                "control_epoch",
+                "intent_revision",
+                "identity_revision",
+                "evidence_revision",
+                "native_import_revision",
+                "recovery_attempt_id",
+                "execution_generation",
+                "host_boot_id",
+                "stop_intent",
+                "reply_incarnation",
+                "reply_terminal",
+                "unchanged",
+            ] {
+                pending_terminal_output_case(false, native_session_id.clone(), change, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_output_with_known_identity_ignores_only_recovery_bookkeeping() {
         for change in [
-            "intent_revision",
-            "identity_revision",
+            "control_epoch",
             "evidence_revision",
             "native_import_revision",
             "recovery_attempt_id",
+            "intent_revision",
+            "identity_revision",
             "stop_intent",
-            "reply_incarnation",
-            "unchanged",
         ] {
-            pending_terminal_output_case(false, None, change).await;
+            pending_terminal_output_case(false, Some("ses_known".into()), change, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_output_accepts_only_an_independently_resolved_matching_native_root() {
+        for change in ["resolved_matching_root", "resolved_other_root"] {
+            pending_terminal_output_case(false, Some("ses_observed".into()), change, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_native_identity_write_revalidates_generation_after_lifecycle_custody() {
+        for change in [
+            "pending_identity_generation",
+            "pending_identity_boot",
+            "pending_identity_stop",
+        ] {
+            pending_terminal_output_case(false, Some("ses_observed".into()), change, false).await;
         }
     }
 
@@ -11266,6 +11408,7 @@ mod native_observation_ipc_tests {
         stall_hello: bool,
         native_session_id: Option<String>,
         change: &'static str,
+        already_known: bool,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path().join("registry"), None).unwrap();
@@ -11285,6 +11428,17 @@ mod native_observation_ipc_tests {
                 }).to_string(), old.incarnation_id.as_str()],
             )
             .unwrap();
+        let observed_native = native_session_id.clone();
+        if already_known {
+            registry
+                .record_native_session(
+                    soul.clone(),
+                    old.incarnation_id.clone(),
+                    native_session_id.clone().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
         let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
         let limits = registry
             .recovery_context(soul.clone())
@@ -11356,7 +11510,11 @@ mod native_observation_ipc_tests {
                         } else {
                             incarnation_id
                         },
-                        terminal_id: "terminal-old".into(),
+                        terminal_id: if change == "reply_terminal" {
+                            "terminal-other".into()
+                        } else {
+                            "terminal-old".into()
+                        },
                         codex_activity: None,
                         opencode_activity: None,
                         stream_epoch: "epoch-old".into(),
@@ -11382,24 +11540,62 @@ mod native_observation_ipc_tests {
         });
         let mut responder = Some(responder);
         let settling_lifecycle = supervisor.lifecycle_lock(&soul).await;
-        let settling_guard = if change == "settled_recovery" {
-            let guard = settling_lifecycle.lock().await;
-            reserve_output_reattach(&registry, &soul).await;
-            Some(guard)
-        } else {
-            None
-        };
+        let pending_identity_write = change.starts_with("pending_identity_");
+        let settling_guard =
+            if matches!(change, "settled_recovery" | "long_recovery") || pending_identity_write {
+                let guard = settling_lifecycle.lock().await;
+                if !pending_identity_write {
+                    reserve_output_reattach(&registry, &soul).await;
+                }
+                Some(guard)
+            } else {
+                None
+            };
         let mut read = {
             let supervisor = supervisor.clone();
             let soul = soul.clone();
             tokio::spawn(async move { supervisor.terminal_read_output(soul, 0, 4096, None).await })
         };
+        let mut early_read = None;
+        let mut read_was_responsive = false;
+        let mut resolved_revisions = None;
+        let mut identity_write_was_fenced = false;
         if let Some(guard) = settling_guard {
-            // Old code can reach the host with the temporary reservation in
-            // its captured fence. Correct capture waits for this lifecycle
-            // operation; either path must finish with the same valid output.
-            let _ = tokio::time::timeout(Duration::from_millis(50), &mut pending_rx).await;
-            settle_output_reattach(&registry, &soul, &old.incarnation_id).await;
+            // A temporary recovery reservation does not change ownership of
+            // the last accepted terminal's read-only output.
+            if change == "long_recovery" || pending_identity_write {
+                release_tx.take().unwrap().send(()).unwrap();
+                if let Ok(read) = tokio::time::timeout(Duration::from_millis(450), &mut read).await
+                {
+                    read_was_responsive = true;
+                    early_read = Some(read.unwrap());
+                } else if pending_identity_write {
+                    identity_write_was_fenced = true;
+                }
+            } else {
+                let _ = tokio::time::timeout(Duration::from_millis(50), &mut pending_rx).await;
+            }
+            if pending_identity_write {
+                let conn = Connection::open(registry.database_path()).unwrap();
+                match change {
+                    "pending_identity_generation" => {
+                        conn.execute("UPDATE incarnations SET execution_generation=execution_generation+1 WHERE incarnation_id=?1", [old.incarnation_id.as_str()]).unwrap();
+                    }
+                    "pending_identity_boot" => {
+                        conn.execute(
+                            "UPDATE incarnations SET host_boot_id=?2 WHERE incarnation_id=?1",
+                            params![old.incarnation_id.as_str(), HostBootId::new().as_str()],
+                        )
+                        .unwrap();
+                    }
+                    "pending_identity_stop" => {
+                        registry.begin_stop(soul.clone()).await.unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                settle_output_reattach(&registry, &soul, &old.incarnation_id).await;
+            }
             drop(guard);
         } else {
             pending_rx.await.unwrap();
@@ -11413,24 +11609,65 @@ mod native_observation_ipc_tests {
                 reserve_output_reattach(&registry, &soul).await;
                 release_tx.take().unwrap().send(()).unwrap();
                 responder.take().unwrap().await.unwrap();
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(50), &mut read)
-                        .await
-                        .is_err(),
-                    "a completed host reply must await lifecycle settlement before validation"
-                );
+                if let Ok(read) = tokio::time::timeout(Duration::from_millis(450), &mut read).await
+                {
+                    read_was_responsive = true;
+                    early_read = Some(read.unwrap());
+                }
                 settle_output_reattach(&registry, &soul, &old.incarnation_id).await;
             } else if change == "stop_intent" {
                 registry.begin_stop(soul.clone()).await.unwrap();
+            } else if matches!(change, "resolved_matching_root" | "resolved_other_root") {
+                registry
+                    .record_native_session(
+                        soul.clone(),
+                        old.incarnation_id.clone(),
+                        if change == "resolved_matching_root" {
+                            observed_native.clone().unwrap()
+                        } else {
+                            "ses_other".into()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let resolved = registry.recovery_context(soul.clone()).await.unwrap();
+                resolved_revisions = Some((resolved.identity_revision, resolved.evidence_revision));
             } else if change == "incarnation" {
                 registry
                     .mark_stop_outcome(old.incarnation_id.clone(), StopOutcome::VerifiedEmpty)
                     .await
                     .unwrap();
                 crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            } else if change == "control_epoch" {
+                Connection::open(registry.database_path())
+                    .unwrap()
+                    .execute("UPDATE installation SET control_epoch=control_epoch+1", [])
+                    .unwrap();
+            } else if matches!(change, "execution_generation" | "host_boot_id") {
+                let (update, value) = if change == "execution_generation" {
+                    ("execution_generation=execution_generation+1", String::new())
+                } else {
+                    ("host_boot_id=?2", HostBootId::new().as_str().to_string())
+                };
+                let conn = Connection::open(registry.database_path()).unwrap();
+                let sql = format!("UPDATE incarnations SET {update} WHERE incarnation_id=?1");
+                if change == "execution_generation" {
+                    conn.execute(&sql, params![old.incarnation_id.as_str()])
+                        .unwrap();
+                } else {
+                    conn.execute(&sql, params![old.incarnation_id.as_str(), value])
+                        .unwrap();
+                }
             } else if !matches!(
                 change,
-                "unchanged" | "reply_incarnation" | "settled_recovery"
+                "unchanged"
+                    | "reply_incarnation"
+                    | "reply_terminal"
+                    | "settled_recovery"
+                    | "long_recovery"
+                    | "pending_identity_generation"
+                    | "pending_identity_boot"
+                    | "pending_identity_stop"
             ) {
                 let update = match change {
                     "intent_revision" => "intent_revision=intent_revision+1",
@@ -11452,10 +11689,13 @@ mod native_observation_ipc_tests {
         if let Some(release) = release_tx {
             release.send(()).unwrap();
         }
-        let result = tokio::time::timeout(Duration::from_secs(5), read)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = match early_read {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
         if let Some(responder) = responder {
             responder.await.unwrap();
         }
@@ -11463,10 +11703,28 @@ mod native_observation_ipc_tests {
             replacement_was_unblocked,
             "read-only host IO must not retain lifecycle custody (hello={stall_hello})"
         );
-        if matches!(
+        if pending_identity_write {
+            assert!(
+                identity_write_was_fenced,
+                "a new native identity must wait for lifecycle write authority"
+            );
+        }
+        let read_accepted = matches!(
             change,
-            "unchanged" | "settled_recovery" | "settled_recovery_after_read"
-        ) {
+            "unchanged"
+                | "settled_recovery"
+                | "settled_recovery_after_read"
+                | "long_recovery"
+                | "resolved_matching_root"
+        ) || ((observed_native.is_none() || already_known)
+            && matches!(
+                change,
+                "control_epoch"
+                    | "evidence_revision"
+                    | "native_import_revision"
+                    | "recovery_attempt_id"
+            ));
+        if read_accepted {
             let output = result.unwrap();
             assert_eq!(output.incarnation_id, old.incarnation_id);
             assert_eq!(output.stream_epoch, "epoch-old");
@@ -11481,15 +11739,31 @@ mod native_observation_ipc_tests {
                 "changed {change} output must be refused after actual host IPC"
             );
         }
+        let current = registry.recovery_context(soul).await.unwrap();
         assert_eq!(
-            registry
-                .recovery_context(soul)
-                .await
-                .unwrap()
-                .native_session_id,
-            None,
-            "the late read must not publish its old root"
+            current.native_session_id,
+            if change == "resolved_other_root" {
+                Some("ses_other".into())
+            } else if already_known || read_accepted {
+                observed_native
+            } else {
+                None
+            },
+            "only a current, fully fenced observation may publish a new native root"
         );
+        if let Some(revisions) = resolved_revisions {
+            assert_eq!(
+                (current.identity_revision, current.evidence_revision),
+                revisions,
+                "reading an independently resolved root must not rewrite its evidence"
+            );
+        }
+        if matches!(change, "long_recovery" | "settled_recovery_after_read") {
+            assert!(
+                read_was_responsive,
+                "ready accepted output must not wait behind recovery past the replay budget"
+            );
+        }
     }
 
     async fn reserve_output_reattach(registry: &Registry, soul: &SoulId) {
@@ -11910,6 +12184,8 @@ mod native_observation_ipc_tests {
             assert!(captured.never_dispatched);
             let initial_import_revision = captured.native_import_revision;
             let expected_incarnation = launch.incarnation_id.clone();
+            let provider_home = dir.path().join("inspected-provider-home");
+            std::fs::create_dir(&provider_home).unwrap();
             let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let responder = tokio::spawn(async move {
@@ -11990,7 +12266,22 @@ mod native_observation_ipc_tests {
                             );
                             pending_tx.take().unwrap().send(()).unwrap();
                             release_rx.take().unwrap().await.unwrap();
-                            HostResult::RecoveryProbe(crate::recovery::tests::absent_native_probe())
+                            let freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+                                reason,
+                                evidence,
+                                store_state,
+                                negative_paths,
+                            } = freshell_agent_runtime::probe_provider_store(&provider_home, &native)
+                            else {
+                                panic!("the owned empty fixture store must be definitively inspected")
+                            };
+                            HostResult::RecoveryProbe(RecoveryProbe::DefinitivelyUnavailable {
+                                path: RecoveryPath::NativeResume,
+                                reason,
+                                evidence,
+                                store_state,
+                                negative_paths,
+                            })
                         }
                         _ => panic!("unexpected recovery protocol step"),
                     };

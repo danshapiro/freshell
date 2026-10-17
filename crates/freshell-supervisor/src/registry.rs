@@ -337,11 +337,46 @@ pub(crate) struct StopProgress {
 
 /// Read-only association to the last committed terminal incarnation. This is
 /// deliberately not an OwnedRuntimeHandle and cannot authorize input or stop.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalOutputReadFence {
+    intent_revision: u64,
+    identity_revision: u64,
+    execution_generation: u64,
+    host_boot_id: Option<HostBootId>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RetainedOutputSource {
     pub incarnation_id: IncarnationId,
     pub runtime_dir: PathBuf,
-    pub terminal: TerminalLaunchSpec,
+    pub terminal_id: String,
+    pub stream_id: String,
     pub native_session_id: Option<String>,
+    pub read_fence: TerminalOutputReadFence,
+}
+
+impl RetainedOutputSource {
+    pub(crate) fn accepts_output(&self, current: &Self, observed_native: Option<&str>) -> bool {
+        if self == current {
+            return true;
+        }
+        // Independent status observation may resolve the first native root
+        // during this read. Accept that same authenticated root without
+        // rewriting it; later transitions still invalidate the captured read.
+        if self.native_session_id.is_some()
+            || observed_native.is_none()
+            || current.native_session_id.as_deref() != observed_native
+            || self.read_fence.identity_revision.checked_add(1)
+                != Some(current.read_fence.identity_revision)
+        {
+            return false;
+        }
+        let mut resolved = self.clone();
+        resolved.native_session_id = current.native_session_id.clone();
+        resolved.read_fence.identity_revision = current.read_fence.identity_revision;
+        &resolved == current
+    }
 }
 
 impl OwnedRuntimeHandle {
@@ -1477,29 +1512,41 @@ impl Registry {
         &self,
         soul_id: SoulId,
     ) -> Result<RetainedOutputSource, RegistryError> {
-        let installation = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
             // Read one registry snapshot. Recovery's current control handle
             // can be an unaccepted replacement; retained reads instead follow
             // the last successful acceptance, independently of launch state.
             let tx = conn.transaction()?;
-            let native_session_id: Option<String> = tx
+            let (native_session_id, intent_revision, identity_revision): (Option<String>, u64, u64) = tx
                 .query_row(
-                    "SELECT native_session_id FROM souls WHERE soul_id=?1",
+                    "SELECT native_session_id,intent_revision,identity_revision FROM souls WHERE soul_id=?1",
                     [soul_id.as_str()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?
                 .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
             let incarnation_id = load_retained_incarnation(&tx, &soul_id)?;
-            let handle = load_owned_handle(&tx, installation, &incarnation_id)?;
+            // Reading output needs the committed association, not the provider
+            // launch payload or mutation authority carried by an owned handle.
+            let (runtime_dir, terminal_id, stream_id, execution_generation, host_boot_id):
+                (String, Option<String>, Option<String>, u64, Option<String>) = tx.query_row(
+                "SELECT runtime_dir,json_extract(terminal_spec,'$.terminalId'),json_extract(terminal_spec,'$.streamId'),execution_generation,host_boot_id FROM incarnations WHERE incarnation_id=?1 AND docker_daemon_id IS NOT NULL AND container_id IS NOT NULL AND image_ref IS NOT NULL AND runtime_dir IS NOT NULL AND host_binary_path IS NOT NULL AND immutable_config_digest IS NOT NULL",
+                [incarnation_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            )?;
+            let missing_terminal = || RegistryError::InvalidState("soul has no retained terminal".into());
             let source = RetainedOutputSource {
                 incarnation_id,
-                runtime_dir: handle.runtime_dir().to_path_buf(),
-                terminal: handle.terminal().cloned().ok_or_else(|| {
-                    RegistryError::InvalidState("soul has no retained terminal".into())
-                })?,
+                runtime_dir: runtime_dir.into(),
+                terminal_id: terminal_id.ok_or_else(missing_terminal)?,
+                stream_id: stream_id.ok_or_else(missing_terminal)?,
                 native_session_id,
+                read_fence: TerminalOutputReadFence {
+                    intent_revision,
+                    identity_revision,
+                    execution_generation,
+                    host_boot_id: host_boot_id.map(HostBootId::parse).transpose().map_err(|_| RegistryError::Integrity("invalid retained host boot id".into()))?,
+                },
             };
             tx.commit()?;
             Ok(source)
