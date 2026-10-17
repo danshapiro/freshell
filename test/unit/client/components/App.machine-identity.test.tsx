@@ -26,6 +26,7 @@ import {
   resolveLocalSettings,
 } from '@shared/settings'
 import { getWindowLayoutKey } from '@/store/window-layout-keys'
+import { ApiError, NetworkError } from '@/lib/api'
 
 vi.mock('@/components/TabContent', () => ({ default: () => <div /> }))
 vi.mock('@/components/Sidebar', () => ({ default: () => <aside />, AppView: {} as any }))
@@ -75,25 +76,25 @@ const mocks = vi.hoisted(() => ({
   realLayoutHealth: {} as typeof import('@/lib/recovery/layout-health'),
 }))
 
-vi.mock('@/lib/api', () => ({
-  ApiError: class ApiError extends Error {
-    constructor(public status: number, message: string) {
-      super(message)
-    }
-  },
-  api: {
-    get: (path: string) => mocks.apiGet(path),
-    patch: vi.fn(),
-    post: vi.fn(),
-  },
-  getMachines: () => mocks.getMachines(),
-  createMachine: (label: string) => mocks.createMachine(label),
-  fetchSidebarSessionsSnapshot: (...args: unknown[]) => mocks.fetchSidebarSessionsSnapshot(...args),
-  isApiUnauthorizedError: (error: unknown) => (
-    typeof error === 'object' && error !== null && (error as { status?: unknown }).status === 401
-  ),
-  isTransientRequestFailure: () => false,
-}))
+vi.mock('@/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/api')>()
+  return {
+    ApiError: actual.ApiError,
+    NetworkError: actual.NetworkError,
+    api: {
+      get: (path: string) => mocks.apiGet(path),
+      patch: vi.fn(),
+      post: vi.fn(),
+    },
+    getMachines: () => mocks.getMachines(),
+    createMachine: (label: string) => mocks.createMachine(label),
+    fetchSidebarSessionsSnapshot: (...args: unknown[]) => mocks.fetchSidebarSessionsSnapshot(...args),
+    isApiUnauthorizedError: (error: unknown) => (
+      typeof error === 'object' && error !== null && (error as { status?: unknown }).status === 401
+    ),
+    isTransientRequestFailure: actual.isTransientRequestFailure,
+  }
+})
 
 vi.mock('@/lib/machine-workspace', () => ({
   restoreMachineWorkspace: (...args: unknown[]) => mocks.restoreMachineWorkspace(...args),
@@ -254,8 +255,88 @@ describe('App machine identity bootstrap', () => {
 
   afterEach(() => {
     cleanup()
+    vi.useRealTimers()
     localStorage.clear()
     sessionStorage.clear()
+  })
+
+  it('autonomously leaves the mounted bootstrap error after a long outage without a native renderer event', async () => {
+    vi.useFakeTimers()
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockRejectedValue(new NetworkError())
+    const store = createStore()
+    await act(async () => { render(<Provider store={store}><App /></Provider>) })
+    expect(screen.getByRole('heading', { name: 'Could not choose a machine' })).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(65_001) })
+    expect(mocks.getMachines.mock.calls.length).toBeGreaterThan(4)
+    expect(mocks.connect).not.toHaveBeenCalled()
+    expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
+
+    // Only the endpoint's availability changes. No click, reload, online,
+    // visibility, websocket-ready or native recovery event is supplied.
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+    expect(store.getState().machineIdentity.status).toBe('ready')
+    expect(screen.queryByRole('heading', { name: 'Could not choose a machine' })).not.toBeInTheDocument()
+    expect(mocks.connect).toHaveBeenCalledOnce()
+    expect(mocks.startTabRegistrySync).toHaveBeenCalledOnce()
+    expect(mocks.restoreMachineWorkspace).not.toHaveBeenCalled()
+    const hello = mocks.setHelloExtensionProvider.mock.calls[0]?.[0] as () => Record<string, unknown>
+    expect(hello()).toMatchObject({ deviceId: MACHINE.id })
+  })
+
+  it('cancels the pending machine discovery retry when its mounted client is disposed', async () => {
+    vi.useFakeTimers()
+    mocks.getMachines.mockRejectedValue(new NetworkError())
+    const store = createStore()
+    let rendered!: ReturnType<typeof render>
+    await act(async () => { rendered = render(<Provider store={store}><App /></Provider>) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+    expect(mocks.getMachines.mock.calls.length).toBeGreaterThan(1)
+    rendered.unmount()
+    const attempts = mocks.getMachines.mock.calls.length
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+    expect(mocks.getMachines).toHaveBeenCalledTimes(attempts)
+    expect(mocks.connect).not.toHaveBeenCalled()
+    expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
+  })
+
+  it.each([400, 401, 403])('does not retry machine discovery after HTTP %s', async status => {
+    vi.useFakeTimers()
+    mocks.getMachines.mockRejectedValue(new ApiError(status, 'Request refused'))
+    const store = createStore()
+    await act(async () => { render(<Provider store={store}><App /></Provider>) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(65_000) })
+    expect(mocks.getMachines).toHaveBeenCalledOnce()
+    expect(mocks.connect).not.toHaveBeenCalled()
+    if (status === 401) expect(screen.getByTestId('auth-required-modal')).toBeInTheDocument()
+    else expect(store.getState().machineIdentity.status).toBe('error')
+  })
+
+  it('retries a transient gateway failure and stops when the endpoint requires authentication', async () => {
+    vi.useFakeTimers()
+    mocks.getMachines.mockRejectedValueOnce(new ApiError(503, 'Server restarting'))
+      .mockRejectedValue(new ApiError(401, 'Authentication required'))
+    const store = createStore()
+    await act(async () => { render(<Provider store={store}><App /></Provider>) })
+    expect(store.getState().machineIdentity.status).toBe('error')
+    await act(async () => { await vi.advanceTimersByTimeAsync(65_000) })
+    expect(mocks.getMachines).toHaveBeenCalledTimes(2)
+    expect(screen.getByTestId('auth-required-modal')).toBeInTheDocument()
+    expect(mocks.connect).not.toHaveBeenCalled()
+  })
+
+  it('stops network retries at explicit machine choice when the returning endpoint has existing machines', async () => {
+    vi.useFakeTimers()
+    mocks.getMachines.mockRejectedValueOnce(new NetworkError()).mockResolvedValue([MACHINE])
+    const store = createStore()
+    await act(async () => { render(<Provider store={store}><App /></Provider>) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(65_000) })
+    expect(screen.getByRole('dialog', { name: 'Choose a machine' })).toBeInTheDocument()
+    expect(mocks.getMachines).toHaveBeenCalledTimes(2)
+    expect(mocks.createMachine).not.toHaveBeenCalled()
+    expect(mocks.connect).not.toHaveBeenCalled()
   })
 
   it('shows the authentication prompt when bootstrap auth fails before machine selection', async () => {

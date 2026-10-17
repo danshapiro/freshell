@@ -166,6 +166,7 @@ const SIDEBAR_MAX_WIDTH = 500
 const CHROME_REVEAL_TOP_EDGE_PX = 48
 const CHROME_REVEAL_SWIPE_PX = 60
 const RECENT_HTTP_SESSIONS_BASELINE_MS = 30_000
+const MACHINE_DISCOVERY_RETRY_MS = 3_000
 
 
 function isVersionInfo(value: unknown): value is VersionInfo {
@@ -595,6 +596,7 @@ export default function App() {
       appStore.getState() as unknown as { machineIdentity?: MachineIdentityState }
     ).machineIdentity
     let machineTransportReady = !machineIdentityEnabled
+    let cancelMachineDiscoveryRetry: (() => void) | undefined
 
     // Bounded wait for the current boot's pane.reconcile.result: the result
     // is unicast to THIS socket, so a result lost with a dying socket would
@@ -817,7 +819,35 @@ export default function App() {
       const resolveMachineBeforeTransport = async (): Promise<boolean> => {
         if (!machineIdentityEnabled) return true
         try {
-          const machines = await getMachines()
+          // A mounted cached client can start while the server is offline.
+          // Machine discovery gates the websocket, so its transport retry
+          // cannot repair this earlier request. Retry only this read, leaving
+          // machine choice, authentication and workspace restore unchanged.
+          let machines: Awaited<ReturnType<typeof getMachines>>
+          for (;;) {
+            if (cancelled) return false
+            try {
+              machines = await getMachines()
+              break
+            } catch (error) {
+              if (cancelled || !isTransientRequestFailure(error)) throw error
+              dispatch(setMachineResolutionError(error instanceof Error ? error.message : 'Could not resolve a machine'))
+              log.warn('Machine discovery unavailable; retrying', {
+                event: 'machine_discovery_retry_scheduled', retryInMs: MACHINE_DISCOVERY_RETRY_MS, error,
+              })
+              await new Promise<void>((resolve) => {
+                const timer = setTimeout(() => {
+                  cancelMachineDiscoveryRetry = undefined
+                  resolve()
+                }, MACHINE_DISCOVERY_RETRY_MS)
+                cancelMachineDiscoveryRetry = () => {
+                  clearTimeout(timer)
+                  cancelMachineDiscoveryRetry = undefined
+                  resolve()
+                }
+              })
+            }
+          }
           if (cancelled) return false
           const suggestedLabel = await getSuggestedMachineLabel()
           if (cancelled) return false
@@ -2025,6 +2055,7 @@ export default function App() {
       window.removeEventListener('pageshow', pokeWs)
       document.removeEventListener('visibilitychange', pokeWsWhenVisible)
       cancelled = true
+      cancelMachineDiscoveryRetry?.()
       cleanedUp = true
       machineTransportReady = false
       clearReconcileResultWait()

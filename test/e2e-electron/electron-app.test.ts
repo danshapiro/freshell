@@ -7,7 +7,7 @@
  */
 
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test'
-import type { BrowserWindow } from 'electron'
+import type { BrowserWindow, WebPreferences } from 'electron'
 import type { ChildProcess } from 'node:child_process'
 import path from 'path'
 import fs from 'fs'
@@ -18,6 +18,7 @@ import type { LaunchServerCandidate } from '../../electron/types.js'
 import { stopOwnedServerAndVerify } from './owned-server-teardown.js'
 import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixture-cleanup.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
+import { navigateToUnavailableEndpoint } from './renderer-outage-navigation.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const electronProcesses = new WeakMap<ElectronApplication, ChildProcess>()
@@ -208,14 +209,25 @@ test.describe('Renderer crash recovery', () => {
   async function nativeWindowState(application: ElectronApplication, page: Page) {
     const native = await application.browserWindow(page)
     try {
-      return await native.evaluate((window: BrowserWindow) => ({
-        id: window.id,
-        visible: window.isVisible(),
-        focused: window.isFocused(),
-        minimized: window.isMinimized(),
-        maximized: window.isMaximized(),
-        bounds: window.getBounds(),
-      }))
+      return await native.evaluate((window: BrowserWindow) => {
+        const preferences = (window.webContents as typeof window.webContents & {
+          getLastWebPreferences(): WebPreferences
+        }).getLastWebPreferences()
+        return {
+          id: window.id,
+          mainPid: process.pid,
+          webContentsId: window.webContents.id,
+          rendererPid: window.webContents.getOSProcessId(),
+          sandbox: preferences.sandbox,
+          contextIsolation: preferences.contextIsolation,
+          nodeIntegration: preferences.nodeIntegration,
+          visible: window.isVisible(),
+          focused: window.isFocused(),
+          minimized: window.isMinimized(),
+          maximized: window.isMaximized(),
+          bounds: window.getBounds(),
+        }
+      })
     } finally { await native.dispose() }
   }
 
@@ -236,6 +248,7 @@ test.describe('Renderer crash recovery', () => {
     // Xvfb need not have a window manager that implements maximize. Establish
     // a normal, focused native window and preserve that actual state instead.
     await expect.poll(() => nativeWindowState(application, page), { timeout: 15_000 }).toMatchObject({
+      sandbox: true, contextIsolation: true, nodeIntegration: false,
       visible: true, focused: true, minimized: false, maximized: false, bounds,
     })
     expect(bounds.width).toBeGreaterThan(0)
@@ -246,12 +259,16 @@ test.describe('Renderer crash recovery', () => {
   }
 
   async function expectNativeRecovery(application: ElectronApplication, page: Page, before: Awaited<ReturnType<typeof nativeWindowState>>) {
-    const { id, ...presentation } = before
+    const { id, mainPid, webContentsId, rendererPid, ...presentation } = before
     // This is a read-only native check: a hidden DOM-ready candidate cannot
     // satisfy it, and the assertion never shows/focuses the recovered window.
     await expect.poll(() => nativeWindowState(application, page), { timeout: 15_000 }).toMatchObject(presentation)
     const after = await nativeWindowState(application, page)
+    expect(after.mainPid).toBe(mainPid)
     expect(after.id).not.toBe(id)
+    expect(after.webContentsId).not.toBe(webContentsId)
+    expect(after.rendererPid).not.toBe(rendererPid)
+    expect(after.rendererPid).toBeGreaterThan(0)
     await test.info().attach('renderer-recovery-native-window.json', {
       body: JSON.stringify({ before, after }), contentType: 'application/json',
     })
@@ -326,9 +343,13 @@ test.describe('Renderer crash recovery', () => {
     serverInfo = undefined
     const logOffset = recoveryEvents().length
     const outageStarted = Date.now()
-    await app.evaluate(async ({ BrowserWindow }, target) => {
-      await BrowserWindow.getAllWindows()[0].loadURL(target).catch(() => {})
-    }, savedUrl)
+    const native = await app.browserWindow(initial)
+    try {
+      const failure = await native.evaluate(navigateToUnavailableEndpoint, savedUrl)
+      await test.info().attach('renderer-outage-native-failure.json', {
+        body: JSON.stringify({ windowId: initialNative.id, ...failure }), contentType: 'application/json',
+      })
+    } finally { await native.dispose() }
     await expect.poll(() => recoveryEvents().slice(logOffset)
       .some(e => e.event === 'main_window_recovery_circuit_open'), { timeout: 60_000 }).toBe(true)
     await expect.poll(() => recoveryEvents().slice(logOffset)
@@ -347,6 +368,7 @@ test.describe('Renderer crash recovery', () => {
       new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`), 15_000)
     await expectNativeRecovery(app, recovered, initialNative)
     await expect(recovered.locator('text=New Tab').first()).toBeVisible({ timeout: 15_000 })
+    expect(await recovered.evaluate(() => window.freshellDesktop?.getHostname?.())).toBe(os.hostname())
     await recovered.locator('button[title^="Settings"]').click()
     await expect(recovered.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible()
     await test.info().attach('renderer-outage-timing.json', {
