@@ -189,6 +189,11 @@ async fn child(capabilities: &[String], evidence: &Path) {
             swap_bytes: 0,
             pids_max: 64,
         },
+        control_fence: std::sync::Mutex::new(HostControlFence {
+            max_control_epoch: 1,
+            max_execution_generation: 1,
+            stopped: false,
+        }),
         persisted: Mutex::new(PersistedHostState {
             max_control_epoch: 1,
             max_execution_generation: 1,
