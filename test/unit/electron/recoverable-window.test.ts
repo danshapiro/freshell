@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createRecoverableWindow } from '../../../electron/recoverable-window.js'
 import { registerRendererRecovery } from '../../../electron/renderer-recovery.js'
+import { initMainProcess } from '../../../electron/main.js'
 
 const url = 'http://localhost:4455/?token=secret'
 function deferred<T = void>() {
@@ -50,9 +51,124 @@ function fixture(configure?: (win: ReturnType<typeof native>, index: number) => 
   return { window, windows, identity, logger, construct }
 }
 
+type ActiveFailure = 'initial-load-failure' | 'initial-load-timeout' | 'active-verification-timeout'
+async function retiredActiveFixture(failure: ActiveFailure, candidatePhase: 'load' | 'readiness', minimizeToTray: boolean) {
+  const stale = deferred<any>()
+  const candidate = deferred<any>()
+  const state = fixture((win, index) => {
+    if (!index && failure === 'initial-load-failure') win.loadURL.mockRejectedValueOnce(new Error('offline'))
+    if (!index && failure === 'initial-load-timeout') win.loadURL.mockImplementationOnce(() => stale.promise)
+    if (index === 1) {
+      if (candidatePhase === 'load') {
+        const load = win.loadURL.getMockImplementation()!
+        win.loadURL.mockImplementationOnce(async next => { await candidate.promise; await load(next) })
+      } else win.webContents.executeJavaScript.mockImplementationOnce(() => candidate.promise)
+    }
+  })
+  const { window, windows, logger } = state
+  const disposeController = registerRendererRecovery({ window, loadUrl: url, serverUrl: 'http://localhost:4455', logger,
+    setTimeout, clearTimeout, verifyRecovered: () => window.verifyRendererReady!(url) })
+  const dispose = () => { disposeController(); window.cancelRecovery!() }
+  const closed = vi.fn(dispose)
+  window.on('closed', closed)
+  const app = Object.assign(new EventEmitter(), {
+    whenReady: async () => {}, quit: vi.fn(), requestSingleInstanceLock: () => true,
+  })
+  await initMainProcess({ app, createMainWindow: async () => window, stopServer: async () => {},
+    disposeRendererRecovery: dispose, minimizeToTray, platform: 'linux' })
+  if (failure === 'active-verification-timeout') {
+    await window.loadURL(url)
+    windows[0].webContents.executeJavaScript.mockImplementationOnce(() => stale.promise)
+  }
+  const work = failure === 'active-verification-timeout' ? window.verifyRendererReady!(url) : window.loadURL(url)
+  const failed = expect(work).rejects.toThrow(failure === 'initial-load-failure' ? 'offline' : 'renderer readiness timed out')
+  if (failure !== 'initial-load-failure') await vi.advanceTimersByTimeAsync(10_000)
+  await failed
+  await vi.advanceTimersByTimeAsync(0)
+  expect(windows).toHaveLength(2)
+  const settle = () => {
+    const mounted = { href: url, documentUri: url, ready: true, mounted: true }
+    stale.resolve(mounted)
+    candidate.resolve(mounted)
+  }
+  return { ...state, closed, settle, dispose }
+}
+
 describe('logical native window', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
+
+  it.each(['initial-load-failure', 'initial-load-timeout', 'active-verification-timeout'] as const)(
+    'keeps close-to-tray working on the surviving active native after %s', async failure => {
+      const state = await retiredActiveFixture(failure, 'load', true)
+      const { window, windows, identity, closed, settle, dispose } = state
+      try {
+        const close = { preventDefault: vi.fn() }
+        windows[0].emit('close', close)
+        expect(close.preventDefault).toHaveBeenCalledOnce()
+        expect(windows[0].hide).toHaveBeenCalledOnce()
+        expect(window.isVisible!()).toBe(false)
+        expect(closed).not.toHaveBeenCalled()
+        windows[0].webContents.emit('did-fail-load', {}, -102, 'retired navigation', url, true)
+        settle()
+        await vi.advanceTimersByTimeAsync(120_000)
+        expect(identity.mock.calls.map(([id]) => id)).toEqual([1, 2])
+        expect(windows[1].destroy).not.toHaveBeenCalled()
+      } finally { dispose(); settle() }
+    },
+  )
+
+  it.each([
+    ['initial-load-failure', 'load'], ['initial-load-failure', 'readiness'],
+    ['initial-load-timeout', 'load'], ['initial-load-timeout', 'readiness'],
+    ['active-verification-timeout', 'load'], ['active-verification-timeout', 'readiness'],
+  ] as const)('permanently cancels pending candidate %s/%s when the surviving active native actually closes', async (failure, phase) => {
+    const { window, windows, identity, logger, closed, settle, dispose } = await retiredActiveFixture(failure, phase, false)
+    try {
+      const close = { preventDefault: vi.fn() }
+      windows[0].emit('close', close)
+      expect(close.preventDefault).not.toHaveBeenCalled()
+      windows[0].destroy()
+      expect(closed).toHaveBeenCalledOnce()
+      expect(windows[1].destroy).toHaveBeenCalledOnce()
+      settle()
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(identity.mock.calls.map(([id]) => id)).toEqual([1])
+      expect(windows[1].show).not.toHaveBeenCalled()
+      expect(windows[1].focus).not.toHaveBeenCalled()
+      expect(logger.log.mock.calls.filter(([entry]) => entry.event === 'main_window_recovery_succeeded')).toEqual([])
+      await expect(window.webContents!.reload!()).rejects.toThrow('renderer recovery cancelled')
+      expect(windows).toHaveLength(2)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { dispose(); settle() }
+  })
+
+  it('keeps a genuine native abort event and rejected load promise inert through the recovery controller', async () => {
+    const { window, windows, logger, identity } = fixture((win, index) => {
+      if (!index) win.loadURL.mockImplementationOnce(async () => {
+        win.webContents.emit('did-fail-load', {}, -3, 'ERR_ABORTED', url, true)
+        throw Object.assign(new Error('ERR_ABORTED (-3)'), { code: 'ERR_ABORTED', errno: -3 })
+      })
+    })
+    const dispose = registerRendererRecovery({ window, loadUrl: url, serverUrl: 'http://localhost:4455', logger,
+      setTimeout, clearTimeout, verifyRecovered: () => window.verifyRendererReady!(url) })
+    try {
+      await expect(window.loadURL(url)).rejects.toThrow('ERR_ABORTED')
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(windows).toHaveLength(1)
+      expect(identity.mock.calls.map(([id]) => id)).toEqual([1])
+      expect(logger.log.mock.calls.filter(([entry]) => entry.event === 'main_window_navigation_failed').map(([entry]) =>
+        ({ code: entry.errorCode, willRecover: entry.willRecover }))).toEqual([{ code: -3, willRecover: false }])
+      expect(logger.log.mock.calls.filter(([entry]) => entry.event === 'main_window_recovery_started')).toEqual([])
+      expect(logger.log.mock.calls.filter(([entry]) => entry.event === 'main_window_recovery_succeeded')).toEqual([])
+      expect(vi.getTimerCount()).toBe(0)
+      // An external abort leaves the logical owner available for a later real crash.
+      windows[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(identity.mock.calls.map(([id]) => id)).toEqual([1, 2])
+      expect(logger.log.mock.calls.filter(([entry]) => entry.event === 'main_window_recovery_succeeded')).toHaveLength(1)
+    } finally { dispose(); window.cancelRecovery!() }
+  })
 
   it('verifies the hidden candidate before IPC identity, preserving geometry and retired-close isolation', async () => {
     const { window, windows, identity, construct } = fixture()

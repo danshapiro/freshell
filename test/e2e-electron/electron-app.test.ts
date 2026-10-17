@@ -7,6 +7,7 @@
  */
 
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test'
+import type { BrowserWindow } from 'electron'
 import type { ChildProcess } from 'node:child_process'
 import path from 'path'
 import fs from 'fs'
@@ -204,6 +205,58 @@ test.describe('Renderer crash recovery', () => {
       .filter(Boolean).map(line => JSON.parse(line))
   }
 
+  async function nativeWindowState(application: ElectronApplication, page: Page) {
+    const native = await application.browserWindow(page)
+    try {
+      return await native.evaluate((window: BrowserWindow) => ({
+        id: window.id,
+        visible: window.isVisible(),
+        focused: window.isFocused(),
+        minimized: window.isMinimized(),
+        maximized: window.isMaximized(),
+        bounds: window.getBounds(),
+      }))
+    } finally { await native.dispose() }
+  }
+
+  async function prepareNativeWindow(application: ElectronApplication, page: Page) {
+    const workArea = await application.evaluate(({ screen }) => screen.getPrimaryDisplay().workArea)
+    const bounds = { x: workArea.x + 20, y: workArea.y + 20,
+      width: Math.min(1000, workArea.width - 40), height: Math.min(700, workArea.height - 40) }
+    const native = await application.browserWindow(page)
+    try {
+      await native.evaluate((window: BrowserWindow, target) => {
+        if (window.isMinimized()) window.restore()
+        window.unmaximize()
+        window.setBounds(target)
+        window.show()
+        window.focus()
+      }, bounds)
+    } finally { await native.dispose() }
+    // Xvfb need not have a window manager that implements maximize. Establish
+    // a normal, focused native window and preserve that actual state instead.
+    await expect.poll(() => nativeWindowState(application, page), { timeout: 15_000 }).toMatchObject({
+      visible: true, focused: true, minimized: false, maximized: false, bounds,
+    })
+    expect(bounds.width).toBeGreaterThan(0)
+    expect(bounds.height).toBeGreaterThan(0)
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(workArea.x + workArea.width)
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(workArea.y + workArea.height)
+    return nativeWindowState(application, page)
+  }
+
+  async function expectNativeRecovery(application: ElectronApplication, page: Page, before: Awaited<ReturnType<typeof nativeWindowState>>) {
+    const { id, ...presentation } = before
+    // This is a read-only native check: a hidden DOM-ready candidate cannot
+    // satisfy it, and the assertion never shows/focuses the recovered window.
+    await expect.poll(() => nativeWindowState(application, page), { timeout: 15_000 }).toMatchObject(presentation)
+    const after = await nativeWindowState(application, page)
+    expect(after.id).not.toBe(id)
+    await test.info().attach('renderer-recovery-native-window.json', {
+      body: JSON.stringify({ before, after }), contentType: 'application/json',
+    })
+  }
+
   test.afterEach(async () => {
     const appToClose = app
     const serverToStop = server
@@ -264,6 +317,7 @@ test.describe('Renderer crash recovery', () => {
     app = await launchApp(tmpHome, true)
     const initial = await app.firstWindow()
     await expect(initial.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
+    const initialNative = await prepareNativeWindow(app, initial)
     const savedUrl = `${serverInfo.baseUrl}/?token=${encodeURIComponent(serverInfo.token)}`
     const receipt = serverInfo
     const token = serverInfo.token, port = serverInfo.port
@@ -291,6 +345,7 @@ test.describe('Renderer crash recovery', () => {
       .some(e => e.event === 'main_window_recovery_succeeded'), { timeout: 75_000 }).toBe(true)
     const recovered = await waitForWindowUrl(app,
       new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`), 15_000)
+    await expectNativeRecovery(app, recovered, initialNative)
     await expect(recovered.locator('text=New Tab').first()).toBeVisible({ timeout: 15_000 })
     await recovered.locator('button[title^="Settings"]').click()
     await expect(recovered.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible()
@@ -325,6 +380,7 @@ test.describe('Renderer crash recovery', () => {
     const firstWindow = await app.firstWindow()
     await firstWindow.waitForLoadState('domcontentloaded')
     await expect(firstWindow.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
+    const initialNative = await prepareNativeWindow(app, firstWindow)
 
     const crashed = firstWindow.waitForEvent('crash', { timeout: 10_000 }).catch(() => undefined)
     await app.evaluate(({ BrowserWindow }) => {
@@ -337,6 +393,7 @@ test.describe('Renderer crash recovery', () => {
       new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`),
       60_000,
     )
+    await expectNativeRecovery(app, recoveredWindow, initialNative)
     await recoveredWindow.waitForLoadState('domcontentloaded')
     await expect(recoveredWindow.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
     // The client may apply its one-time stale-build reload after the first

@@ -53,6 +53,12 @@ const INITIAL_ATTEMPT_MS = 10_000
 // Node/Electron timers coerce larger delays to 1 ms. Growth must remain finite and representable.
 const MAX_ATTEMPT_MS = 2_147_483_647
 
+function isNativeNavigationAbort(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const nativeError = error as { code?: unknown; errno?: unknown }
+  return nativeError.code === 'ERR_ABORTED' || nativeError.errno === -3
+}
+
 function waitForNative<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     const cancelled = () => {
@@ -87,7 +93,8 @@ export function createRecoverableWindow({ createNativeWindow, options, onWebCont
   const bind = (win: NativeWindow, target: 'window' | 'webContents', listener: Listener) => {
     const state = bindings.get(win)!
     const callback = (...args: any[]) => {
-      if (!disposed && win === activeWindow && bindings.has(win)) listener.callback(...args)
+      if (!disposed && win === activeWindow && bindings.has(win)
+        && (target === 'window' || !currentAttempt || currentAttempt.native === win)) listener.callback(...args)
     }
     state[target].push({ event: listener.event, callback, logical: listener })
     ;(target === 'window' ? win : win.webContents).on(listener.event, callback)
@@ -106,8 +113,9 @@ export function createRecoverableWindow({ createNativeWindow, options, onWebCont
     currentAttempt = undefined
     clearTimeout(attempt.timer)
     attempt.controller.abort(error)
-    // Detach before stopping/destroying: their native abort/close events belong to the retired attempt.
-    detach(attempt.native)
+    // A surviving active native still owns lifetime handlers and later recovery events.
+    // Only discarded candidates lose their bindings before destroy() emits closed.
+    if (attempt.native !== activeWindow) detach(attempt.native)
     if (!attempt.native.isDestroyed()) {
       if (attempt.native !== activeWindow) attempt.native.destroy()
       else attempt.native.webContents.stop()
@@ -174,10 +182,18 @@ export function createRecoverableWindow({ createNativeWindow, options, onWebCont
     }
     currentAttempt = attempt
     const isCurrent = () => !disposed && currentAttempt === attempt
+    let nativeNavigationAborted = false
     try {
       if (replacement) attempt.native = createNative({ ...options, ...bounds, show: false })
       const native = attempt.native
-      if (navigate) await waitForNative(native.loadURL(url), controller.signal)
+      if (navigate) {
+        try {
+          await waitForNative(native.loadURL(url), controller.signal)
+        } catch (error) {
+          nativeNavigationAborted = isNativeNavigationAbort(error)
+          throw error
+        }
+      }
       if (!isCurrent()) throw controller.signal.reason ?? new Error('renderer navigation changed')
       const generation = bindings.get(native)?.generation
       await verifyRendererReady(native, url, {
@@ -203,11 +219,12 @@ export function createRecoverableWindow({ createNativeWindow, options, onWebCont
           expire(attempt, budgetMs, url)
         } else {
           retire(attempt, error instanceof Error ? error : new Error(String(error)))
-          if (!disposed) logger.log({ severity: 'error', event: 'main_window_replacement_failed',
-            cause: 'native-document-unavailable', action: 'retire-attempt', outcome: 'retryable', loadUrl: url, error })
+          if (!disposed) logger.log({ severity: nativeNavigationAborted ? 'info' : 'error', event: 'main_window_replacement_failed',
+            cause: nativeNavigationAborted ? 'native-navigation-aborted' : 'native-document-unavailable',
+            action: 'retire-attempt', outcome: nativeNavigationAborted ? 'cancelled' : 'retryable', loadUrl: url, error })
           // Initial readiness can fail without a recoverable native event (for example
           // a cross-document abort). Keep that failure in the existing controller.
-          notifyNavigationFailure(url, -2, 'ERR_FAILED')
+          if (!nativeNavigationAborted) notifyNavigationFailure(url, -2, 'ERR_FAILED')
         }
       }
       throw error
