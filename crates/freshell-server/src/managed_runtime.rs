@@ -23,6 +23,10 @@ use tokio::sync::Mutex;
 #[path = "managed_output_validation.rs"]
 mod managed_output_validation;
 
+#[path = "managed_provider_env.rs"]
+mod managed_provider_env;
+use self::managed_provider_env::managed_provider_env;
+
 #[derive(Default)]
 struct ManagedRecoveryState {
     in_flight: Mutex<HashSet<String>>,
@@ -711,91 +715,6 @@ fn reused_running_descriptor(
         .transpose()
 }
 
-fn managed_env_allowlist(
-    source: &std::collections::BTreeMap<String, String>,
-) -> std::collections::BTreeMap<String, String> {
-    const ALLOWED: &[&str] = &[
-        "PATH",
-        "SHELL",
-        "TERM",
-        "COLORTERM",
-        "LANG",
-        "LC_ALL",
-        "TMPDIR",
-        "FRESHELL",
-        "FRESHELL_TERMINAL_ID",
-        "FRESHELL_TAB_ID",
-        "FRESHELL_PANE_ID",
-        "PROMPT_TOOLKIT_NO_CPR",
-    ];
-    source
-        .iter()
-        .filter(|(key, _)| ALLOWED.contains(&key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-fn managed_provider_env(
-    mode: &str,
-    source: &std::collections::BTreeMap<String, String>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut env = managed_env_allowlist(source);
-    // Never persist the web host's PATH into a pinned workload image. It may
-    // contain host-only homes, version-manager shims, or credential helpers.
-    env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
-    // Provider state belongs to this soul's Docker volume, not the web
-    // server's inherited HOME. These paths are inside the workload.
-    env.insert("HOME".into(), "/home/freshell/provider".into());
-    env.insert(
-        "CLAUDE_HOME".into(),
-        "/home/freshell/provider/.claude".into(),
-    );
-    env.insert(
-        "CLAUDE_CONFIG_DIR".into(),
-        "/home/freshell/provider/.claude".into(),
-    );
-    env.insert("CODEX_HOME".into(), "/home/freshell/provider/.codex".into());
-    env.insert(
-        "XDG_DATA_HOME".into(),
-        "/home/freshell/provider/.local/share".into(),
-    );
-    env.insert(
-        "XDG_CONFIG_HOME".into(),
-        "/home/freshell/provider/.config".into(),
-    );
-    env.insert(
-        "AMPLIFIER_HOME".into(),
-        "/home/freshell/provider/.amplifier".into(),
-    );
-    env.insert(
-        "FRESHELL_AMPLIFIER_HOME".into(),
-        "/home/freshell/provider/.amplifier".into(),
-    );
-    if mode == "opencode" {
-        env.insert("TMPDIR".into(), "/run/opencode-tmp".into());
-        if let Some(value) = source
-            .get("FRESHELL_OPENCODE_REBIND")
-            .filter(|value| matches!(value.as_str(), "0" | "false"))
-        {
-            env.insert("FRESHELL_OPENCODE_REBIND".into(), value.clone());
-        }
-        // Arbitrary inline JSON can carry credentials in values such as MCP
-        // command arguments. It is staged beside the private incarnation grant,
-        // never serialized into the supervisor's durable launch environment.
-        if let Some(permission) = source
-            .get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
-            .map(String::as_str)
-            .filter(|value| matches!(*value, "ask" | "allow" | "deny"))
-        {
-            env.insert(
-                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".into(),
-                permission.into(),
-            );
-        }
-    }
-    env
-}
-
 fn managed_provider_args(mode: &str, args: Vec<String>) -> Result<Vec<String>, String> {
     let settings = (mode == "claude").then(|| {
         freshell_platform::cli_launch::claude_settings_json(
@@ -884,41 +803,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_env_drops_server_and_provider_secrets() {
-        let source = [
-            ("PATH", "/usr/local/bin:/usr/bin"),
-            ("TERM", "xterm-256color"),
-            ("FRESHELL_TERMINAL_ID", "t1"),
-            ("FRESHELL_TOKEN", "web-secret"),
-            ("AUTH_TOKEN", "web-secret-2"),
-            ("ANTHROPIC_API_KEY", "provider-secret"),
-            ("CLAUDE_CODE_OAUTH_TOKEN", "provider-oauth"),
-            ("AWS_SECRET_ACCESS_KEY", "cloud-secret"),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-        let filtered = managed_env_allowlist(&source);
-        assert_eq!(
-            filtered.get("PATH").map(String::as_str),
-            Some("/usr/local/bin:/usr/bin")
-        );
-        assert_eq!(
-            filtered.get("FRESHELL_TERMINAL_ID").map(String::as_str),
-            Some("t1")
-        );
-        for key in [
-            "FRESHELL_TOKEN",
-            "AUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "AWS_SECRET_ACCESS_KEY",
-        ] {
-            assert!(!filtered.contains_key(key), "secret key leaked: {key}");
-        }
-    }
-
-    #[test]
     fn running_soul_is_reused_before_launch_payload_rehash_and_mismatches_fail_closed() {
         let soul = SoulId::parse("soul-terminal-test").unwrap();
         let running = freshell_runtime_protocol::RuntimeView {
@@ -1000,129 +884,6 @@ mod tests {
         let mut stopped = running;
         stopped.launch_state = freshell_runtime_protocol::LaunchState::Stopped;
         assert!(reusable_running_view(&[stopped], &soul, "terminal-stable").is_err());
-    }
-
-    #[test]
-    fn managed_opencode_env_uses_soul_state_and_drops_host_config_paths() {
-        let source = [
-            ("PATH", "/usr/local/bin:/usr/bin"),
-            ("OPENCODE_CONFIG_CONTENT", r#"{"secret":"do-not-persist"}"#),
-            (
-                "OPENCODE_TUI_CONFIG",
-                "/home/user/.freshell/opencode/tui.json",
-            ),
-            ("OPENCODE_API_KEY", "provider-secret"),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-        let env = managed_provider_env("opencode", &source);
-        assert_eq!(
-            env.get("HOME").map(String::as_str),
-            Some("/home/freshell/provider")
-        );
-        assert_eq!(
-            env.get("XDG_DATA_HOME").map(String::as_str),
-            Some("/home/freshell/provider/.local/share")
-        );
-        assert_eq!(
-            env.get("XDG_CONFIG_HOME").map(String::as_str),
-            Some("/home/freshell/provider/.config")
-        );
-        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
-        assert_eq!(
-            env.get("TMPDIR").map(String::as_str),
-            Some("/run/opencode-tmp")
-        );
-        assert!(!env.contains_key("OPENCODE_TUI_CONFIG"));
-        assert!(!env.contains_key("OPENCODE_API_KEY"));
-        assert!(!env.values().any(|value| value.contains("do-not-persist")));
-    }
-
-    #[test]
-    fn managed_opencode_inline_plugin_configuration_is_child_only() {
-        let source = std::collections::BTreeMap::from([
-            (
-                "OPENCODE_CONFIG_CONTENT".into(),
-                r#"{"plugin":["file:///workspace/plugin.ts"],"snapshot":true,"maxTokens":8192}"#
-                    .into(),
-            ),
-            ("FRESHELL_OPENCODE_REBIND".into(), "0".into()),
-        ]);
-        let env = managed_provider_env("opencode", &source);
-        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
-        assert_eq!(
-            env.get("FRESHELL_OPENCODE_REBIND").map(String::as_str),
-            Some("0")
-        );
-    }
-
-    #[test]
-    fn managed_opencode_does_not_filter_inline_json_by_field_name() {
-        let source = std::collections::BTreeMap::from([(
-            "OPENCODE_CONFIG_CONTENT".into(),
-            r#"{"plugin":["file:///workspace/plugin.ts"],"provider":{"apiKey":"raw-secret","model":"ordinary-model"}}"#.into(),
-        )]);
-        let env = managed_provider_env("opencode", &source);
-        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
-        assert!(!env.values().any(|value| value.contains("raw-secret")));
-    }
-
-    #[test]
-    fn managed_opencode_never_persists_nested_inline_secret_values() {
-        let source = std::collections::BTreeMap::from([(
-            "OPENCODE_CONFIG_CONTENT".into(),
-            r#"{"mcp":{"vendor":{"type":"local","command":["tool","--token","nested-secret-byte"]}},"provider":{"endpoint":"https://nested-secret-byte.example"}}"#.into(),
-        )]);
-        let env = managed_provider_env("opencode", &source);
-        let serialized = serde_json::to_string(&env).unwrap();
-        assert!(!serialized.contains("nested-secret-byte"));
-        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
-    }
-
-    #[test]
-    fn managed_opencode_permission_policy_is_sanitized_and_persistable() {
-        for allowed in ["ask", "allow", "deny"] {
-            let source = std::collections::BTreeMap::from([(
-                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".to_string(),
-                allowed.to_string(),
-            )]);
-            let env = managed_provider_env("opencode", &source);
-            assert_eq!(
-                env.get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
-                    .map(String::as_str),
-                Some(allowed)
-            );
-        }
-
-        let source = std::collections::BTreeMap::from([(
-            "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".to_string(),
-            "ask-with-secret-text".to_string(),
-        )]);
-        let env = managed_provider_env("opencode", &source);
-        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
-        assert!(!env.values().any(|value| value.contains("secret-text")));
-    }
-
-    #[test]
-    fn managed_opencode_bash_policy_preserves_other_ordinary_permissions() {
-        let source = std::collections::BTreeMap::from([
-            (
-                "OPENCODE_CONFIG_CONTENT".into(),
-                r#"{"permission":{"read":"allow"}}"#.into(),
-            ),
-            (
-                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".into(),
-                "ask".into(),
-            ),
-        ]);
-        let env = managed_provider_env("opencode", &source);
-        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
-        assert_eq!(
-            env.get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
-                .map(String::as_str),
-            Some("ask")
-        );
     }
 
     #[test]
