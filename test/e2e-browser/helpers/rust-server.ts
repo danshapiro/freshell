@@ -13,6 +13,7 @@ import {
 } from './server-fixture-support.js'
 import type { E2eServerHandle } from './external-target.js'
 import { stripRuntimeWebEnvironment, type RuntimeWebConstructOptions } from '../../../scripts/testing/runtime-sandbox.js'
+import { runtimeCargoBuildAndCopy, runtimeCargoTargetDirectory } from '../../../scripts/testing/runtime-cargo-artifacts.js'
 
 /**
  * HARNESS-01 — an OWNED Rust-server Playwright fixture.
@@ -69,10 +70,20 @@ const PROJECT_ROOT = findProjectRoot(__dirname)
  * Source of truth: `port/oracle/harness/external-server.ts`'s `rustServerBinPath`.
  */
 export function rustServerBinPath(root: string = PROJECT_ROOT, platform: NodeJS.Platform = process.platform): string {
-  return path.join(root, 'target', 'release', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
+  return path.join(runtimeCargoTargetDirectory(root), 'release', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
 }
 
-const verifiedRustBuilds = new Set<string>()
+const verifiedRustBuilds = new Map<string, string>()
+const fixtureBuildDirectories = new Set<string>()
+process.once('exit', () => {
+  for (const directory of fixtureBuildDirectories) {
+    try {
+      fs.rmSync(directory, { recursive: true, force: true })
+    } catch (error) {
+      console.error(JSON.stringify({ severity: 'warn', event: 'rust.fixture.build_cleanup_failed', directory, error: String(error) }))
+    }
+  }
+})
 
 /**
  * Ensure the Rust `freshell-server` release binary exists, building it once
@@ -97,24 +108,29 @@ export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
     }).bin
   }
   const bin = rustServerBinPath(root)
-  if (verifiedRustBuilds.has(bin) && fs.existsSync(bin)) return bin
+  const verified = verifiedRustBuilds.get(bin)
+  if (verified && fs.existsSync(verified)) return verified
 
-  const result = spawnSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
-    cwd: root,
-    stdio: 'inherit',
-    env: process.env,
-  })
-  if (result.status !== 0) {
+  // A managed feature build may replace Cargo's canonical executable after
+  // this function returns. Cache only our process-owned immutable selection.
+  const buildRoot = path.join(root, '.runtime-build')
+  fs.mkdirSync(buildRoot, { recursive: true })
+  const directory = fs.mkdtempSync(path.join(buildRoot, 'browser-server-'))
+  const selected = path.join(directory, path.basename(bin))
+  try {
+    runtimeCargoBuildAndCopy(root, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], [
+      { source: bin, target: selected },
+    ])
+  } catch (error) {
+    fs.rmSync(directory, { recursive: true, force: true })
     throw new Error(
-      '`cargo build --release -p freshell-server` failed ' +
-      `(exit ${result.status ?? 'signal ' + result.signal}); cannot boot the Rust server fixture.`,
+      '`cargo build --release -p freshell-server` failed; cannot boot the Rust server fixture.',
+      { cause: error },
     )
   }
-  if (!fs.existsSync(bin)) {
-    throw new Error(`cargo build completed but ${bin} is still missing.`)
-  }
-  verifiedRustBuilds.add(bin)
-  return bin
+  fixtureBuildDirectories.add(directory)
+  verifiedRustBuilds.set(bin, selected)
+  return selected
 }
 
 /** Resolve the freshell-server binary the harness will spawn. FAIL CLOSED
