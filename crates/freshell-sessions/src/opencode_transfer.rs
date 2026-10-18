@@ -11316,8 +11316,30 @@ mod native_source_inventory_tests {
 
     #[cfg(unix)]
     fn named_user_fixture_include(include: &Path) -> String {
-        let user = std::env::var("USER").unwrap();
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        use std::os::unix::ffi::OsStrExt;
+
+        // Git expands ~name from the account record, independently of USER/HOME.
+        let uid = unsafe { libc::geteuid() };
+        let mut account: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buffer = vec![0u8; 16 * 1024];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut account,
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        assert_eq!(status, 0, "getpwuid_r must succeed for the effective uid");
+        assert!(!result.is_null(), "effective uid must have a passwd entry");
+        let user = unsafe { std::ffi::CStr::from_ptr(account.pw_name) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let home = unsafe { std::ffi::CStr::from_ptr(account.pw_dir) };
+        let home = PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes()));
         assert!(home.is_absolute());
         let depth = home
             .components()
