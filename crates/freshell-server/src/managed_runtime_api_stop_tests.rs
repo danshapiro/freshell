@@ -240,9 +240,26 @@ pub(super) async fn fixture_fresh_soul_with_cleanup(
         .join("qualified-empty-provider-store")
         .join(soul_id.as_str());
     std::fs::create_dir_all(&provider_home).unwrap();
-    let spec = freshell_supervisor::resume_catalog::exact_resume_candidate(&context, None)
+    let mut spec = freshell_supervisor::resume_catalog::exact_resume_candidate(&context, None)
         .unwrap()
         .unwrap();
+    // This injected reader owns one exact synthetic database. Recording its
+    // selector makes a missing DB authoritative; an unrecorded default could
+    // belong to a different native channel and must remain inconclusive.
+    if provider == "opencode" {
+        spec.environment.insert(
+            "OPENCODE_DB".into(),
+            provider_home
+                .join(".local/share/opencode/opencode.db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        spec = registry
+            .store_verified_resume_spec(soul_id.clone(), spec)
+            .await
+            .unwrap();
+    }
+    let context = registry.recovery_context(soul_id.clone()).await.unwrap();
     let freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
         reason: native_reason,
         evidence: native_evidence,
