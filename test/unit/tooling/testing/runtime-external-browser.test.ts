@@ -85,6 +85,30 @@ afterEach(async () => {
   if (fixtureRepoRoot) await fsp.rm(fixtureRepoRoot, { recursive: true, force: true })
 })
 
+describe('owned tunnel executable selection', () => {
+  it('finds the executable on PATH without depending on another checkout', async () => {
+    const binaryDirectory = path.join(fixtureRepoRoot, 'bin')
+    const missingDirectory = path.join(fixtureRepoRoot, 'missing')
+    await fsp.mkdir(binaryDirectory)
+    const binary = path.join(binaryDirectory, 'cloudflared')
+    await fsp.writeFile(binary, '#!/bin/sh\nprintf selected-tunnel-executable\n', { mode: 0o700 })
+    const selected = runner.resolveOwnedTunnelBinary(undefined, [missingDirectory, binaryDirectory].join(path.delimiter))
+    expect(execFileSync(selected, [], { encoding: 'utf8' })).toBe('selected-tunnel-executable')
+  })
+
+  it('uses the explicitly selected executable before PATH', async () => {
+    const selected = path.join(fixtureRepoRoot, 'selected-cloudflared')
+    await fsp.writeFile(selected, '#!/bin/sh\nprintf explicitly-selected-tunnel\n', { mode: 0o700 })
+    const resolved = runner.resolveOwnedTunnelBinary(selected, path.join(fixtureRepoRoot, 'missing'))
+    expect(execFileSync(resolved, [], { encoding: 'utf8' })).toBe('explicitly-selected-tunnel')
+  })
+
+  it('reports the required setting when no executable is available', () => {
+    expect(() => runner.resolveOwnedTunnelBinary(undefined, path.join(fixtureRepoRoot, 'missing')))
+      .toThrow('FRESHELL_RUNTIME_CLOUDFLARED_BINARY')
+  })
+})
+
 describe('ordinary smoke failure cleanup', () => {
   it('awaits owned cleanup before returning the operation result', async () => {
     const resource = { released: false }

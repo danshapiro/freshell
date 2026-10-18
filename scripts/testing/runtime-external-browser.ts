@@ -567,7 +567,20 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
 }
 
 const PINNED_CLOUDFLARED_SHA256 = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
-const PINNED_CLOUDFLARED_PATH = '/home/dan/code/freshell/.worktrees/.the-usual-logs/managed-provider-environment/reports/transport-preflight/cloudflared'
+
+export function resolveOwnedTunnelBinary(configured: string | undefined, searchPath = process.env.PATH ?? ''): string {
+  if (configured !== undefined) return fs.realpathSync(configured)
+  for (const directory of searchPath.split(path.delimiter)) {
+    const candidate = path.resolve(directory || '.', 'cloudflared')
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+      if (fs.statSync(candidate).isFile()) return fs.realpathSync(candidate)
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR', 'EACCES'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
+    }
+  }
+  throw new Error('owned tunnel requires the pinned cloudflared executable on PATH or FRESHELL_RUNTIME_CLOUDFLARED_BINARY')
+}
 
 // A diagnostic write must not replace an operation result or interrupt cleanup.
 function emitExternalDiagnostic(site: 'relay' | 'client' | 'retained' | 'tunnel', emit: () => void): void {
@@ -614,7 +627,7 @@ export class OwnedManagedRuntimeTunnel {
   private home?: string
   private origin?: string
 
-  constructor(private readonly repoRoot: string, private readonly binary = process.env.FRESHELL_RUNTIME_CLOUDFLARED_BINARY ?? PINNED_CLOUDFLARED_PATH,
+  constructor(private readonly repoRoot: string, private readonly binary = process.env.FRESHELL_RUNTIME_CLOUDFLARED_BINARY,
     private readonly diagnostics?: (record: Record<string, string | number>) => void) {}
 
   get baseUrl(): string {
@@ -637,7 +650,7 @@ export class OwnedManagedRuntimeTunnel {
     if (relay.protocol !== 'http:' || relay.hostname !== '127.0.0.1' || !relay.port || relay.pathname !== '/' || relay.search || relay.hash) {
       throw new Error('owned tunnel requires the exact loopback relay address')
     }
-    const binary = fs.realpathSync(this.binary)
+    const binary = resolveOwnedTunnelBinary(this.binary)
     const digest = createHash('sha256').update(await fsp.readFile(binary)).digest('hex')
     if (digest !== PINNED_CLOUDFLARED_SHA256) throw new Error('owned tunnel executable differs from the pinned artifact')
     const version = execFileSync(binary, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim()
