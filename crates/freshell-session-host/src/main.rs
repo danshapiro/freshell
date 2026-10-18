@@ -11391,6 +11391,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn authenticated_stop_cleans_fresh_actor_opened_after_stop_acknowledgement() {
+        if run_in_fresh_host_test_process(
+            "tests::authenticated_stop_cleans_fresh_actor_opened_after_stop_acknowledgement",
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let mut state = test_host_state();
         let home = root.path().join("home");
@@ -12034,6 +12039,11 @@ mod tests {
 
     #[tokio::test]
     async fn provider_config_fresh_exact_resume_grant_blocks_before_transport_and_repairs() {
+        if run_in_fresh_host_test_process(
+            "tests::provider_config_fresh_exact_resume_grant_blocks_before_transport_and_repairs",
+        ) {
+            return;
+        }
         use freshell_runtime_protocol::{
             ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
         };
@@ -13463,6 +13473,30 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         );
         assert!(state.pty.lock().await.is_none());
         assert!(state.fresh_agent.lock().await.is_none());
+    }
+
+    fn run_in_fresh_host_test_process(test_name: &str) -> bool {
+        // Real fresh hosts install one immutable child environment per process.
+        // Keep independent test allocations in their own processes as well.
+        const CHILD_ENV: &str = "FRESHELL_FRESH_HOST_TEST_CHILD";
+        if let Some(selected) = std::env::var_os(CHILD_ENV) {
+            assert_eq!(
+                selected.to_str(),
+                Some(test_name),
+                "isolated fresh host must run only its selected test"
+            );
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ENV, test_name)
+            .status()
+            .expect("start isolated fresh host test");
+        assert!(
+            status.success(),
+            "isolated fresh host test failed: {test_name}"
+        );
+        true
     }
 
     fn test_host_state() -> Arc<HostState> {
