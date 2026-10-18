@@ -412,6 +412,51 @@ describe('createObservationEmitter', () => {
     expect(writes[0].body).not.toContain('private user content')
   })
 
+  it.each(['route-change', 'readiness-loss', 'dispose'] as const)(
+    'withdraws an already adopted root on %s and republishes only current hydration', async edge => {
+      const abort = new AbortController()
+      const api = makeApi()
+      const emit = createObservationEmitter({ ...deps(), signal: abort.signal })
+      await emit(api)
+      expect(writes).toHaveLength(1)
+      if (edge === 'route-change') api.route.current.params.sessionID = 'ses_otherroot1'
+      if (edge === 'readiness-loss') api.state.ready = false
+      if (edge === 'dispose') abort.abort()
+      await emit(api)
+      expect(writes).toHaveLength(2)
+      expect(JSON.parse(writes[1].body).adoption_observation).toMatchObject({
+        root_session_id: rootSessionId, incarnation_id: incarnationId, launch_nonce: launchNonce,
+        evidence_generation: evidenceGeneration, hydrated: false, messages_read: 'failed',
+      })
+      await emit(api)
+      expect(writes).toHaveLength(2)
+      if (edge === 'dispose') return
+      api.route.current.params.sessionID = rootSessionId
+      api.state.ready = true
+      await emit(api)
+      expect(writes).toHaveLength(3)
+      expect(JSON.parse(writes[2].body).adoption_observation.hydrated).toBe(true)
+      abort.abort()
+    },
+  )
+
+  it('withdraws an adopted root while a same-root read is pending without publishing its late result', async () => {
+    const api = makeApi()
+    const emit = createObservationEmitter(deps())
+    await emit(api)
+    let finish!: (value: unknown) => void
+    api.client.session.messages = () => new Promise(resolve => { finish = resolve })
+    const pending = emit(api)
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    api.route.current.params.sessionID = 'ses_otherroot1'
+    await emit(api)
+    expect(writes).toHaveLength(2)
+    expect(JSON.parse(writes[1].body).adoption_observation.hydrated).toBe(false)
+    finish({ data: [{ info: { id: tailMessageId, sessionID: rootSessionId }, parts: [] }] })
+    await pending
+    expect(writes).toHaveLength(2)
+  })
+
   it('refuses V2 empty projections when the V1 root has active history', async () => {
     const emit = createObservationEmitter(deps({
       FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID: undefined,

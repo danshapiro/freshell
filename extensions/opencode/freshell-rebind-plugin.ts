@@ -511,8 +511,9 @@ export function createObservationEmitter(
   let inFlight = false
   let observingTrigger: NativeObservationWake['trigger'] | undefined
   let lastCurrent = expected
+  let observed: AdoptionExpectation | null = null
   type ProgressStage = 'in_flight' | 'expectation_unavailable' | 'expectation_read'
-    | 'native_read_pending' | 'native_read_settled' | 'duplicate' | 'publication_succeeded'
+    | 'native_read_pending' | 'native_read_settled' | 'duplicate' | 'publication_succeeded' | 'withdrawn'
   // Fixed stage filenames retain the last actual transition even if a later
   // poll is blocked by an in-flight native read. No history or error bodies
   // enter these bounded diagnostics, and a reporting failure is inert.
@@ -546,8 +547,49 @@ export function createObservationEmitter(
       lastRefusal = signature
     } catch { /* A diagnostic failure cannot change the native gate or break the renderer. */ }
   }
+  const publish = (current: AdoptionExpectation, hydrated: boolean,
+    messagesRead: 'success' | 'empty_confirmed' | 'failed'): boolean => {
+    const observation = {
+      terminal_id: current.terminalId, root_session_id: current.rootSessionId,
+      tail_message_id: current.tailMessageId, evidence_generation: current.evidenceGeneration,
+      incarnation_id: current.incarnationId, launch_nonce: current.launchNonce,
+      hydrated, messages_read: messagesRead,
+    }
+    const signature = JSON.stringify(observation)
+    if (signature === lastEmitted) {
+      progress('duplicate')
+      return false
+    }
+    seq += 1
+    const nonce = `${String(now()).padStart(14, '0')}-${String(seq).padStart(6, '0')}-${process.pid}`
+    write(current.dir, `${current.terminalId}__${nonce}`, JSON.stringify({
+      session_id: expected.rootSessionId, source: 'opencode-tui-plugin', adoption_observation: observation,
+    }))
+    lastEmitted = signature
+    if (!hydrated) observed = null
+    else if (messagesRead !== 'failed') observed = current
+    progress(hydrated ? 'publication_succeeded' : 'withdrawn')
+    return true
+  }
+  const withdraw = (): void => {
+    if (!observed) return
+    try { publish(observed, false, 'failed') }
+    catch { /* Retain the positive state locally so the next wake retries withdrawal. */ }
+  }
+  const contextStillSelected = (apiValue: unknown, current: AdoptionExpectation): boolean => {
+    try {
+      const api = asRecord(apiValue) as unknown as AdoptionTuiApi | null
+      const session = api?.state?.session
+      return api?.state?.ready === true && currentRouteSessionId(api.route?.current) === current.rootSessionId
+        && typeof session?.get === 'function' && sessionIsExactRoot(session.get(current.rootSessionId), current.rootSessionId)
+    } catch { return false }
+  }
+  deps.signal?.addEventListener('abort', withdraw, { once: true })
   return async (apiValue: unknown): Promise<void> => {
-    if (deps.signal?.aborted) return
+    if (deps.signal?.aborted) return withdraw()
+    // Recheck the displayed root even during a pending native read. The
+    // initial adoption receipt must never outlive a later TUI route switch.
+    if (observed && !contextStillSelected(apiValue, observed)) withdraw()
     if (inFlight) {
       progress('in_flight')
       return
@@ -585,7 +627,10 @@ export function createObservationEmitter(
       if (deps.signal?.aborted) return
       progress('native_read_settled')
       const native = 'failure' in read ? null : read
-      if (currentRouteSessionId(api.route?.current) !== current.rootSessionId || state.ready !== true) return refuse(current, 'tui_context_changed')
+      if (!contextStillSelected(api, current)) {
+        withdraw()
+        return refuse(current, 'tui_context_changed')
+      }
       const selected = asRecord(sessionState.get(current.rootSessionId))
       if (!sessionIsExactRoot(selected, current.rootSessionId)) return refuse(current, 'tui_root_not_loaded')
       const hydratedMessages = activeMessages(sessionState.messages(current.rootSessionId), current.rootSessionId, selected?.revert)
@@ -624,36 +669,9 @@ export function createObservationEmitter(
         }
       }
 
-      const observation = {
-        terminal_id: current.terminalId,
-        root_session_id: current.rootSessionId,
-        tail_message_id: current.tailMessageId,
-        evidence_generation: current.evidenceGeneration,
-        incarnation_id: current.incarnationId,
-        launch_nonce: current.launchNonce,
-        hydrated: true,
-        messages_read: messagesRead,
-      }
-      const signature = JSON.stringify(observation)
-      if (signature === lastEmitted) {
-        progress('duplicate')
-        return
-      }
-      seq += 1
-      const nonce = `${String(now()).padStart(14, '0')}-${String(seq).padStart(6, '0')}-${process.pid}`
       if (deps.signal?.aborted) return
-      write(
-        current.dir,
-        `${current.terminalId}__${nonce}`,
-        JSON.stringify({
-          session_id: expected.rootSessionId,
-          source: 'opencode-tui-plugin',
-          adoption_observation: observation,
-        }),
-      )
       // A failed publication must remain eligible for the next observation.
-      lastEmitted = signature
-      progress('publication_succeeded')
+      publish(current, true, messagesRead)
       if (messagesRead !== 'failed') lastRefusal = null
     } catch {
       refuse(active, 'producer_or_publication_failed')

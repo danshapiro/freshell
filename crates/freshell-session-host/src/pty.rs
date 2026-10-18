@@ -811,6 +811,17 @@ impl OpenCodeAdoptionGate {
     }
 
     fn observe(&mut self, observation: OpenCodeAdoptionObservation) -> bool {
+        if !self.matches_binding(&observation) {
+            return false;
+        }
+        // A current producer can withdraw its selected route even after the
+        // first input. Retain the saved root, but require hydration again before
+        // exposing current identity or dispatching another command.
+        if !observation.hydrated {
+            let changed = self.observation.take().is_some() || self.released;
+            self.released = false;
+            return changed;
+        }
         if self.released || !self.matches(&observation) {
             return false;
         }
@@ -836,15 +847,17 @@ impl OpenCodeAdoptionGate {
         true
     }
 
+    fn matches_binding(&self, observation: &OpenCodeAdoptionObservation) -> bool {
+        observation.terminal_id == self.terminal_id
+            && observation.incarnation_id == self.incarnation_id
+            && observation.incarnation_id == self.expectation.incarnation_id
+            && observation.launch_nonce == self.expectation.launch_nonce
+            && observation.root_session_id == self.expectation.root_session_id
+            && observation.evidence_generation == self.expectation.evidence_generation
+    }
+
     fn matches(&self, observation: &OpenCodeAdoptionObservation) -> bool {
-        if observation.terminal_id != self.terminal_id
-            || observation.incarnation_id != self.incarnation_id
-            || observation.incarnation_id != self.expectation.incarnation_id
-            || observation.launch_nonce != self.expectation.launch_nonce
-            || observation.root_session_id != self.expectation.root_session_id
-            || observation.evidence_generation != self.expectation.evidence_generation
-            || !observation.hydrated
-        {
+        if !self.matches_binding(observation) || !observation.hydrated {
             return false;
         }
         match (&self.expectation.root_tail, observation.messages_read) {
@@ -1173,9 +1186,15 @@ fn process_opencode_adoption_signals(
             if let Ok(mut slot) = native_session_id.lock() {
                 *slot = Some(observation.root_session_id.clone());
             }
-            tracing::info!(terminal_id = %terminal_id,
-                root_session_id = %observation.root_session_id,
-                "managed_opencode.provider_observed");
+            if observation.hydrated {
+                tracing::info!(terminal_id = %terminal_id,
+                    root_session_id = %observation.root_session_id,
+                    "managed_opencode.provider_observed");
+            } else {
+                tracing::info!(terminal_id = %terminal_id,
+                    root_session_id = %observation.root_session_id,
+                    "managed_opencode.provider_observation_withdrawn");
+            }
         } else {
             tracing::debug!(terminal_id = %terminal_id,
                 "managed_opencode.adoption_observation_rejected");
@@ -2263,6 +2282,109 @@ mod managed_opencode_adoption_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(gate.release_input());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn adopted_route_withdrawal_revokes_identity_and_input_after_first_dispatch() {
+        let expected = expectation(OpenCodeVerifiedRootTail::QualifiedEmpty);
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (gate, _, _, signal_root) = gate_with_evidence(expected.clone(), initial);
+        let gate = Arc::new(Mutex::new(gate));
+        let owned = tempfile::tempdir().unwrap();
+        let history = owned.path().join("saved-native-history");
+        std::fs::write(&history, "original imported history").unwrap();
+        let launch = serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal-opencode-adoption", "streamId":"adoption-withdrawal", "mode":"shell",
+            "program":"/usr/bin/python3", "args":["-c", "import sys\nf=open('received-input', 'ab', buffering=0)\nfor line in sys.stdin.buffer: f.write(line)"],
+            "cwd":owned.path(), "workspacePath":owned.path(), "projectKey":"adoption-withdrawal",
+            "cols":80,"rows":24,"runAsUid":unsafe {libc::geteuid()},"runAsGid":unsafe {libc::getegid()},
+            "env":{"HOME":owned.path(),"PATH":"/usr/bin:/bin"}
+        })).unwrap();
+        let mut hosted = super::HostedPty::spawn(
+            &owned.path().join("state"),
+            expected.incarnation_id.clone(),
+            &launch,
+            Default::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        hosted.provider_mode = "opencode".into();
+        hosted.native_identity_launch = Some(freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: expected.incarnation_id.clone(),
+            launch_nonce: "identity-launch".into(),
+            evidence_revision: 0,
+            execution_generation: 1,
+            requested_native_session_id: Some(expected.root_session_id.clone()),
+        });
+        hosted.opencode_adoption = Some(gate.clone());
+        let native_session_id = hosted.native_session_id.clone();
+        let publish = |name: &str, value: OpenCodeAdoptionObservation| {
+            std::fs::write(signal_root.path().join(format!("terminal-opencode-adoption__{name}.json")),
+                serde_json::to_vec(&serde_json::json!({"session_id":value.root_session_id,"adoption_observation":value})).unwrap()).unwrap();
+            process_opencode_adoption_signals(
+                signal_root.path(),
+                "terminal-opencode-adoption",
+                &gate,
+                &native_session_id,
+            )
+        };
+        assert!(hosted.native_identity_observation().is_none());
+        assert_eq!(publish("initial", observation(&expected)), 1);
+        hosted.write_input(&RequestId::new(), "first\n").unwrap();
+        hosted.write_input(&RequestId::new(), "second\n").unwrap();
+        assert!(hosted.native_identity_observation().is_some());
+        let mut withdrawal = observation(&expected);
+        withdrawal.hydrated = false;
+        withdrawal.messages_read = OpenCodeMessagesRead::Failed;
+        let mut stale = withdrawal.clone();
+        stale.launch_nonce = "older-launch".into();
+        assert_eq!(publish("stale", stale), 0);
+        assert!(hosted.native_identity_observation().is_some());
+        assert_eq!(publish("withdrawn", withdrawal), 1);
+        let withdrawn_identity = hosted.native_identity_observation();
+        let withdrawn_output = hosted
+            .read_output(expected.incarnation_id.clone(), 0, 65536, None)
+            .unwrap();
+        let retry = RequestId::new();
+        let refused = hosted.write_input(&retry, "restored\n");
+        let claimed = hosted
+            .commands
+            .existing_disposition(&retry, b"restored\n")
+            .unwrap();
+        assert_eq!(publish("restored", observation(&expected)), 1);
+        hosted.write_input(&retry, "restored\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while std::fs::read(owned.path().join("received-input")).unwrap_or_default()
+                != b"first\nsecond\nrestored\n"
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        hosted.stop().await;
+        assert!(withdrawn_identity.is_none());
+        assert!(withdrawn_output.native_session_id.is_none());
+        assert_eq!(refused.unwrap_err().code, RuntimeErrorCode::RecoveryBlocked);
+        assert!(
+            claimed.is_none(),
+            "withdrawn input stays undispatched and retryable"
+        );
+        assert_eq!(
+            hosted.native_session_id().as_deref(),
+            Some(expected.root_session_id.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(history).unwrap(),
+            "original imported history"
+        );
     }
 
     #[test]
