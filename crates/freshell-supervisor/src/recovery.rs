@@ -5481,6 +5481,26 @@ impl Supervisor {
         incarnation_id: &freshell_runtime_protocol::IncarnationId,
     ) {
         if let Ok(handle) = self.registry.owned_handle(incarnation_id.clone()).await {
+            if self
+                .registry
+                .recovery_context(handle.soul_id().clone())
+                .await
+                .is_ok_and(|current| {
+                    current.desired_state == DesiredState::Stopped
+                        && current.prior_handle.incarnation_id() == incarnation_id
+                })
+            {
+                // The captured Stop owns this exact enclosure. An interrupted
+                // auxiliary completion must not reenter its slow input cleanup
+                // while still holding the lifecycle lock needed by Stop.
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.recovery.cleanup_deferred_to_stop",
+                    serde_json::json!({"severity":"info", "soulId":handle.soul_id(),
+                        "incarnationId":handle.incarnation_id()}),
+                );
+                return;
+            }
             if self.terminate_owned_for_recovery(&handle).await == Ok(StopOutcome::VerifiedEmpty) {
                 let _ = self.discard_failed_replacement_inputs(&handle).await;
             }
@@ -5491,14 +5511,20 @@ impl Supervisor {
         &self,
         handle: &OwnedRuntimeHandle,
     ) -> Result<(), RuntimeError> {
-        self.backend.discard_stopped_provider_inputs(handle).await.map_err(|error| {
+        Box::pin(self.await_running_startup(
+            handle.soul_id(),
+            "failed_provider_inputs_cleanup",
+            self.backend.discard_stopped_provider_inputs(handle),
+        ))
+        .await?
+        .map_err(|error| {
             crate::service::append_event(
                 &self.config.lifecycle_log,
                 "supervisor.recovery.failed_inputs_cleanup_deferred",
                 serde_json::json!({"severity":"warn", "soulId":handle.soul_id(),
-                    "incarnationId":handle.incarnation_id(), "backendErrorKind":match &error {
-                        BackendError::OwnershipMismatch(_) => "ownership_mismatch", _ => "unavailable",
-                    }}),
+                "incarnationId":handle.incarnation_id(), "backendErrorKind":match &error {
+                    BackendError::OwnershipMismatch(_) => "ownership_mismatch", _ => "unavailable",
+                }}),
             );
             map_backend(error)
         })

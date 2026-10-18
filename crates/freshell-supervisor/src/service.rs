@@ -1980,10 +1980,13 @@ impl Supervisor {
         {
             return Err(unavailable());
         };
-        self.backend
-            .discard_stopped_provider_inputs(handle)
-            .await
-            .map_err(|_| unavailable())?;
+        Box::pin(self.await_running_startup(
+            handle.soul_id(),
+            "rejected_provider_inputs_cleanup",
+            self.backend.discard_stopped_provider_inputs(handle),
+        ))
+        .await?
+        .map_err(|_| unavailable())?;
         self.registry
             .settle_rejected_initial_inputs(handle.incarnation_id().clone())
             .await
@@ -3303,7 +3306,13 @@ impl Supervisor {
             {
                 return Ok(());
             }
-            if let Err(error) = self.commit_provider_preparation(handle).await {
+            if let Err(error) = Box::pin(self.await_running_startup(
+                handle.soul_id(),
+                "provider_preparation_cleanup",
+                Box::pin(self.commit_provider_preparation(handle)),
+            ))
+            .await?
+            {
                 append_event(
                     &self.config.lifecycle_log,
                     "supervisor.provider_preparation.pending",
@@ -3655,7 +3664,7 @@ impl Supervisor {
     /// Stop commits its intent before acquiring lifecycle ownership. Observe
     /// that transaction while awaiting preparation so Stop need not wait for a
     /// startup budget before it can perform its normal owned teardown.
-    async fn await_running_startup<T>(
+    pub(crate) async fn await_running_startup<T>(
         &self,
         soul_id: &SoulId,
         stage: &'static str,

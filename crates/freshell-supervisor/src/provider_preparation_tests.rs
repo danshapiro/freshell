@@ -31,6 +31,18 @@ struct Daemon {
     cleanup_failures: usize,
     cleanup_owners: Vec<IncarnationId>,
     termination_unavailable: bool,
+    real_workloads: bool,
+    workers: std::collections::BTreeMap<IncarnationId, OwnedProviderWorker>,
+    completion_gate: Option<Arc<RecoveryProbeGate>>,
+    retirement_gate: Option<Arc<RecoveryProbeGate>>,
+}
+
+struct OwnedProviderWorker(std::process::Child);
+impl Drop for OwnedProviderWorker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 #[derive(Default)]
 struct RecoveryProbeGate {
@@ -191,7 +203,22 @@ impl RuntimeBackend for Backend {
         let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
         let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
         let id = handle.incarnation_id().clone();
-        self.0.lock().unwrap().running.insert(id.clone());
+        {
+            let mut state = self.0.lock().unwrap();
+            state.running.insert(id.clone());
+            if state.real_workloads {
+                let worker = std::process::Command::new("/bin/sleep")
+                    .arg("3600")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                state
+                    .workers
+                    .insert(id.clone(), OwnedProviderWorker(worker));
+            }
+        }
         let state = self.0.clone();
         let seed = self.0.lock().unwrap().seeded_host.clone();
         let task = tokio::spawn(async move {
@@ -333,7 +360,9 @@ impl RuntimeBackend for Backend {
                         }
                     }
                     HostCommand::Stop { .. } => {
-                        state.lock().unwrap().running.remove(&id);
+                        let mut state = state.lock().unwrap();
+                        state.running.remove(&id);
+                        state.workers.remove(&id);
                         HostResult::Stopped
                     }
                     command => panic!("unexpected synthetic host command {command:?}"),
@@ -389,6 +418,12 @@ impl RuntimeBackend for Backend {
             live, "live",
             "resumed B cannot complete before verified durable recovery success"
         );
+        drop(conn);
+        let gate = self.0.lock().unwrap().completion_gate.take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         let mut state = self.0.lock().unwrap();
         let generation = generation(handle);
         state.events.push(format!("release:{generation}"));
@@ -408,6 +443,11 @@ impl RuntimeBackend for Backend {
     ) -> Result<(), BackendError> {
         if generation(current) == generation(prior) {
             return Ok(());
+        }
+        let gate = self.0.lock().unwrap().retirement_gate.take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
         }
         let mut state = self.0.lock().unwrap();
         assert!(
@@ -478,6 +518,7 @@ impl RuntimeBackend for Backend {
             "healthy or consumed retry must not stop a workload"
         );
         state.running.remove(handle.incarnation_id());
+        state.workers.remove(handle.incarnation_id());
         state
             .events
             .push(format!("stop-rejected:{}", generation(handle)));
@@ -809,6 +850,257 @@ async fn provider_accepted_completion_retries_after_registry_success_on_fresh_he
     for failure in ["controller", "publisher", "retire"] {
         Box::pin(provider_completion_fixture(failure)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_auxiliary_cleanup_stop_interrupts_initial_commit() {
+    Box::pin(provider_auxiliary_cleanup_stop_fixture("initial")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_auxiliary_cleanup_stop_interrupts_resumed_commit() {
+    Box::pin(provider_auxiliary_cleanup_stop_fixture("resumed")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_auxiliary_cleanup_stop_interrupts_prior_retirement() {
+    Box::pin(provider_auxiliary_cleanup_stop_fixture("retirement")).await;
+}
+
+async fn provider_auxiliary_cleanup_stop_fixture(stage: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let registry_root = temp.path().join("registry");
+    let registry = Registry::open(&registry_root, None).unwrap();
+    let soul = SoulId::new();
+    let daemon = Arc::new(Mutex::new(Daemon {
+        real_workloads: true,
+        recovery_probe_available: true,
+        ..Default::default()
+    }));
+    let callback = UnixListener::bind(temp.path().join("mcp.sock")).unwrap();
+    let callback_soul = soul.clone();
+    let callback_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = callback.accept().await.unwrap();
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let response = if request["action"] == "issue" {
+                serde_json::to_vec(&PreparedProviderContext {
+                    provider_launch_context: context(&callback_soul, 2),
+                    provider_secret_references: references(),
+                })
+                .unwrap()
+            } else {
+                b"ok".to_vec()
+            };
+            let _ = stream.write_all(&response).await;
+        }
+    });
+    let binary = temp.path().join("synthetic-host");
+    std::fs::write(&binary, "synthetic-host-artifact").unwrap();
+    let supervisor = Supervisor::new(
+        registry.clone(),
+        Arc::new(Backend(daemon.clone(), registry_root)),
+        SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: binary,
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "provider-cleanup-stop".into(),
+            control_secret: "synthetic-control-secret".into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+        "terminalId":"terminal-cleanup-stop", "streamId":"stream-cleanup-stop",
+        "mode":"opencode", "program":"opencode", "args":[], "env":{"HOME":"/home/freshell/provider"},
+        "cwd":temp.path(), "workspacePath":temp.path(), "runAsUid":65534, "runAsGid":0,
+        "cols":80, "rows":24, "projectKey":"project-cleanup-stop",
+        "providerLaunchContext":context(&soul,1), "providerSecretReferences":references()
+    }))
+    .unwrap();
+    let prepared = registry
+        .prepare_launch(LaunchPreparation {
+            soul_id: soul.clone(),
+            provider: "opencode".into(),
+            provider_store_id: "store-exact".into(),
+            native_session_id: None,
+            creation_seed_ref: "cleanup-stop".into(),
+            request_id: RequestId::new(),
+            payload_digest: "cleanup-stop".into(),
+            requested_limits: limits(),
+            profile: RuntimeProfile::Custom,
+            project_key: "project-cleanup-stop".into(),
+            fixture: None,
+            terminal: Some(terminal.clone()),
+            fresh_agent: None,
+            view_intent: None,
+            admission: crate::admission::AdmissionPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let workload = LaunchWorkload {
+        soul_id: soul.clone(),
+        fixture: None,
+        terminal: Some(terminal.clone()),
+        fresh_agent: None,
+        resume_spec: None,
+    };
+    let gate = Arc::new(RecoveryProbeGate::default());
+    let owner = supervisor.clone();
+    let mut operation = if stage == "initial" {
+        daemon.lock().unwrap().completion_gate = Some(gate.clone());
+        tokio::spawn(async move {
+            // The ordinary launch owner holds this same lifecycle guard across
+            // activation, including acceptance-confirmed auxiliary completion.
+            let lock = owner.lifecycle_lock(&workload.soul_id).await;
+            let _held = lock.lock().await;
+            owner
+                .activate_prepared(prepared, workload, limits())
+                .await
+                .map(|_| ())
+        })
+    } else {
+        let first = supervisor
+            .activate_prepared(prepared, workload, limits())
+            .await
+            .unwrap();
+        let resume =
+            freshell_agent_runtime::build_resume_spec(freshell_agent_runtime::ResumeSpecInput {
+                provider: "opencode",
+                provider_store_id: "store-exact",
+                native_session_id: "ses_exact",
+                terminal: &terminal,
+                provider_version: Some("1.18.21".into()),
+                creation_seed_ref: "cleanup-stop".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 0,
+                never_dispatched: false,
+            })
+            .unwrap();
+        registry
+            .store_verified_resume_spec(soul.clone(), resume)
+            .await
+            .unwrap();
+        {
+            let mut state = daemon.lock().unwrap();
+            state.running.remove(&first.view.incarnation_id);
+            state.workers.remove(&first.view.incarnation_id);
+            if stage == "retirement" {
+                state.retirement_gate = Some(gate.clone());
+            } else {
+                state.completion_gate = Some(gate.clone());
+            }
+        }
+        let recovery_soul = soul.clone();
+        tokio::spawn(async move {
+            owner
+                .recover(RecoverRequest {
+                    soul_id: recovery_soul,
+                    trigger: RecoveryTrigger::HostUnreachable,
+                    expected_intent_revision: None,
+                    expected_control_epoch: None,
+                })
+                .await
+                .map(|_| ())
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    let current = registry.recovery_context(soul.clone()).await.unwrap();
+    assert_eq!(current.recovery_state, RecoveryState::Live);
+    let incarnation = current.prior_handle.incarnation_id().clone();
+    let pid = daemon
+        .lock()
+        .unwrap()
+        .workers
+        .get(&incarnation)
+        .unwrap()
+        .0
+        .id();
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+    let grants = daemon.lock().unwrap().grants;
+    let stopper = supervisor.clone();
+    let stop_soul = soul.clone();
+    let mut stopping = tokio::spawn(async move { stopper.stop(stop_soul, None).await });
+    let completed = tokio::time::timeout(Duration::from_secs(2), &mut stopping).await;
+    let stopped_before_release = completed.is_ok();
+    let worker_reaped_before_release = unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    // Eligibility deliberately excludes a stopped soul; inspect the durable
+    // pending bit itself so cancellation cannot masquerade as completion.
+    let pending_before_release: bool = rusqlite::Connection::open(registry.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT provider_preparation_pending FROM incarnations WHERE incarnation_id=?1",
+            [incarnation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let generations_before_release = daemon.lock().unwrap().generations.clone();
+    // Settle even the pre-fix failure before asserting, so the actual owned
+    // child and authenticated host tasks cannot escape a red regression.
+    gate.release.notify_one();
+    let stopped = match completed {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut stopping)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    };
+    let operation_result = tokio::time::timeout(Duration::from_secs(5), &mut operation)
+        .await
+        .unwrap()
+        .unwrap();
+    let grants_after = daemon.lock().unwrap().grants;
+    let publishers_after = daemon.lock().unwrap().publishers.clone();
+    callback_task.abort();
+    let _ = callback_task.await;
+    let tasks = std::mem::take(&mut daemon.lock().unwrap().host_tasks);
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    assert!(
+        stopped_before_release,
+        "{stage}: Stop must reach the workload while auxiliary helper removal remains blocked"
+    );
+    assert!(
+        worker_reaped_before_release,
+        "{stage}: desired STOPPED alone is insufficient; the real child must be reaped"
+    );
+    assert_eq!(stopped.0, StopOutcome::VerifiedEmpty);
+    assert!(
+        pending_before_release,
+        "interrupted cleanup must remain durably pending"
+    );
+    assert_eq!(
+        grants_after, grants,
+        "Stop cannot dispatch another provider"
+    );
+    assert!(generations_before_release.contains("grant-1"));
+    if stage != "initial" {
+        assert!(generations_before_release.contains("grant-2"));
+    }
+    if stage != "retirement" {
+        assert_eq!(
+            publishers_after.get(if stage == "initial" {
+                "grant-1"
+            } else {
+                "grant-2"
+            }),
+            Some(&incarnation)
+        );
+    }
+    assert_eq!(
+        operation_result.unwrap_err().code,
+        RuntimeErrorCode::StaleIntentRevision
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
