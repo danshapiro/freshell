@@ -808,6 +808,12 @@ enum PublicationJournalEntry {
         backup_id: usize,
         had_original: bool,
     },
+    MountedLeaf {
+        relative: PathBuf,
+        backup_id: usize,
+        mode: u32,
+        readonly: bool,
+    },
     CreatedDirectory(PathBuf),
     ObsoleteDirectory(PathBuf),
     Obsolete {
@@ -823,6 +829,20 @@ impl PartialEq for PublicationJournalEntry {
             comparisons.set(comparisons.get() + 1);
         });
         match (self, other) {
+            (
+                Self::MountedLeaf {
+                    relative: a,
+                    backup_id: b,
+                    mode: c,
+                    readonly: d,
+                },
+                Self::MountedLeaf {
+                    relative: e,
+                    backup_id: f,
+                    mode: g,
+                    readonly: h,
+                },
+            ) => (a, b, c, d) == (e, f, g, h),
             (
                 Self::Leaf {
                     relative: left_relative,
@@ -873,6 +893,22 @@ impl Ord for PublicationJournalEntry {
             comparisons.set(comparisons.get() + 1);
         });
         match (self, other) {
+            (
+                Self::MountedLeaf {
+                    relative: a,
+                    backup_id: b,
+                    mode: c,
+                    readonly: d,
+                },
+                Self::MountedLeaf {
+                    relative: e,
+                    backup_id: f,
+                    mode: g,
+                    readonly: h,
+                },
+            ) => (a, b, c, d).cmp(&(e, f, g, h)),
+            (Self::MountedLeaf { .. }, _) => Ordering::Greater,
+            (_, Self::MountedLeaf { .. }) => Ordering::Less,
             (
                 Self::Leaf {
                     relative: left_relative,
@@ -1003,6 +1039,18 @@ fn decode_relative_path(encoded: &str) -> Option<PathBuf> {
 
 fn journal_entry_value(entry: &PublicationJournalEntry) -> Result<serde_json::Value, CopyError> {
     match entry {
+        PublicationJournalEntry::MountedLeaf {
+            relative,
+            backup_id,
+            mode,
+            readonly,
+        } => Ok(serde_json::json!({
+            "kind": "mounted_leaf",
+            "pathHex": encode_relative_path(relative)?,
+            "backupId": backup_id,
+            "mode": mode,
+            "readonly": readonly,
+        })),
         PublicationJournalEntry::Leaf {
             relative,
             backup_id,
@@ -1086,9 +1134,7 @@ fn sync_directory_chain(root: &Path, directory: &Path) -> Result<(), CopyError> 
                 std::io::Error::other("injected directory sync failure"),
             ));
         }
-        File::open(current)
-            .and_then(|handle| handle.sync_all())
-            .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
+        sync_publication_directory(current)?;
         if current == root {
             return Ok(());
         }
@@ -1107,6 +1153,29 @@ fn sync_directory_chain(root: &Path, directory: &Path) -> Result<(), CopyError> 
             ));
         }
     }
+}
+
+fn sync_publication_directory(directory: &Path) -> Result<(), CopyError> {
+    #[cfg(unix)]
+    File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
+    // Windows does not support the Unix directory-fsync operation. File data
+    // is flushed through its writable handle before publication on that
+    // platform; do not turn a successful native rename into a failed copy by
+    // opening a directory with ordinary File::open/FlushFileBuffers.
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(directory)
+        .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?
+        .is_dir()
+    {
+        return Err(error(
+            Path::new(""),
+            "sync_publication",
+            "publication path must remain a directory",
+        ));
+    }
+    Ok(())
 }
 
 fn read_publication_journal(path: &Path) -> Result<Vec<PublicationJournalEntry>, CopyError> {
@@ -1176,6 +1245,41 @@ fn read_publication_journal(path: &Path) -> Result<Vec<PublicationJournalEntry>,
                 )
             })?;
         result.push(match kind {
+            "mounted_leaf" => PublicationJournalEntry::MountedLeaf {
+                relative: path,
+                backup_id: entry
+                    .get("backupId")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        error(
+                            Path::new(""),
+                            "read_journal",
+                            "mounted backup reference is invalid",
+                        )
+                    })?,
+                mode: entry
+                    .get("mode")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        error(
+                            Path::new(""),
+                            "read_journal",
+                            "mounted prior mode is invalid",
+                        )
+                    })?,
+                readonly: entry
+                    .get("readonly")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| {
+                        error(
+                            Path::new(""),
+                            "read_journal",
+                            "mounted prior readonly flag is invalid",
+                        )
+                    })?,
+            },
             "leaf" => PublicationJournalEntry::Leaf {
                 relative: path,
                 backup_id: entry
@@ -1607,6 +1711,72 @@ fn recover_interrupted_publications(
         let mut created_directories = Vec::new();
         for entry in &entries {
             match entry {
+                PublicationJournalEntry::MountedLeaf {
+                    relative,
+                    backup_id,
+                    mode,
+                    readonly,
+                } => {
+                    validate_recovery_parent_directories(destination_root, relative)?.ok_or_else(
+                        || {
+                            error(
+                                relative,
+                                "recover_publication",
+                                "mounted destination parent is missing",
+                            )
+                        },
+                    )?;
+                    let destination = destination_root.join(relative);
+                    let backup = backup_path(&backup_root, *backup_id);
+                    match fs::symlink_metadata(&backup) {
+                        Ok(metadata)
+                            if metadata.is_file() && !metadata.file_type().is_symlink() =>
+                        {
+                            #[cfg(unix)]
+                            let permissions = {
+                                use std::os::unix::fs::PermissionsExt;
+                                fs::Permissions::from_mode(*mode)
+                            };
+                            #[cfg(not(unix))]
+                            let permissions = {
+                                let mut permissions = fs::metadata(&destination)
+                                    .map_err(|cause| {
+                                        io_error(relative, "inspect_mounted_destination", cause)
+                                    })?
+                                    .permissions();
+                                permissions.set_readonly(*readonly);
+                                permissions
+                            };
+                            let _ = (mode, readonly);
+                            restore_mounted_file(&destination, &backup, relative, permissions)?;
+                            report.restored_paths += 1;
+                        }
+                        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+                            // The complete backup is published before any mounted
+                            // write; without it this inode has not been changed.
+                            let metadata = fs::symlink_metadata(&destination).map_err(|cause| {
+                                io_error(relative, "inspect_mounted_destination", cause)
+                            })?;
+                            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                                return Err(error(
+                                    relative,
+                                    "recover_publication",
+                                    "mounted destination is not a physical regular file",
+                                ));
+                            }
+                        }
+                        Ok(_) => {
+                            return Err(error(
+                                relative,
+                                "recover_publication",
+                                "mounted backup is not a physical regular file",
+                            ))
+                        }
+                        Err(cause) => {
+                            return Err(io_error(relative, "inspect_mounted_backup", cause))
+                        }
+                    }
+                }
                 PublicationJournalEntry::CreatedDirectory(relative) => {
                     created_directories.push(relative.clone());
                 }
@@ -1624,7 +1794,8 @@ fn recover_interrupted_publications(
                         PublicationJournalEntry::Leaf { had_original, .. } => *had_original,
                         PublicationJournalEntry::Obsolete { .. } => true,
                         PublicationJournalEntry::CreatedDirectory(_)
-                        | PublicationJournalEntry::ObsoleteDirectory(_) => unreachable!(),
+                        | PublicationJournalEntry::ObsoleteDirectory(_)
+                        | PublicationJournalEntry::MountedLeaf { .. } => unreachable!(),
                     };
                     let destination = destination_root.join(relative);
                     let backup = backup_path(&backup_root, *backup_id);
@@ -1961,6 +2132,7 @@ struct Publication {
     backup: TemporaryProjection,
     created: Vec<PathBuf>,
     replaced: Vec<(PathBuf, PathBuf)>,
+    mounted: Vec<(PathBuf, PathBuf, fs::Permissions)>,
     journal_entries: Vec<PublicationJournalEntry>,
     next_backup_id: usize,
     obsolete_directories: Vec<PathBuf>,
@@ -2035,6 +2207,7 @@ impl Drop for Publication {
             self.backup.0 = PathBuf::new();
             return;
         }
+        let mut failed = false;
         for path in self.created.iter().rev() {
             if let Ok(stat) = fs::symlink_metadata(path) {
                 let result = if stat.is_dir() {
@@ -2043,6 +2216,7 @@ impl Drop for Publication {
                     fs::remove_file(path)
                 };
                 if let Err(cause) = result {
+                    failed = true;
                     eprintln!(
                         "{}",
                         serde_json::json!({"severity":"error","event":"provider.environment.rollback.failed","operation":"remove_created","error_kind":format!("{:?}",cause.kind()),"os_error":cause.raw_os_error()})
@@ -2050,7 +2224,20 @@ impl Drop for Publication {
                 }
             }
         }
-        let mut failed = false;
+        for (destination, backup, permissions) in self.mounted.iter().rev() {
+            if let Err(cause) = restore_mounted_file(
+                destination,
+                backup,
+                Path::new("mounted-resource"),
+                permissions.clone(),
+            ) {
+                failed = true;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"severity":"error","event":"provider.environment.rollback.failed","operation":cause.operation,"corrective_message":cause.corrective_message})
+                );
+            }
+        }
         for (destination, backup) in self.replaced.iter().rev() {
             #[cfg(test)]
             let result = if take_publication_rollback_restore_failure(destination) {
@@ -2328,9 +2515,7 @@ impl EnvironmentPublication {
         &self.report.created_paths
     }
     pub fn commit(mut self) -> Result<CopyReport, CopyError> {
-        File::open(&self.root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
+        sync_publication_directory(&self.root)?;
         if let Some(publication) = self.rollback.as_mut() {
             publication.write_committed_marker(&self.root)?;
             publication.committed = true;
@@ -3020,7 +3205,29 @@ fn stage_environment_projection(
                     journal_entries
                         .push(PublicationJournalEntry::CreatedDirectory(relative.clone()));
                 }
-            } else if !(mounted_roots.contains(relative) && matches!(node, Node::File(..))) {
+            } else if mounted_roots.contains(relative) && matches!(node, Node::File(..)) {
+                let metadata = existing.as_ref().ok_or_else(|| {
+                    error(
+                        relative,
+                        "inspect_mounted_file",
+                        "mounted resource is missing",
+                    )
+                })?;
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode()
+                };
+                #[cfg(not(unix))]
+                let mode = 0;
+                journal_entries.push(PublicationJournalEntry::MountedLeaf {
+                    relative: relative.clone(),
+                    backup_id: next_backup_id,
+                    mode,
+                    readonly: metadata.permissions().readonly(),
+                });
+                next_backup_id += 1;
+            } else {
                 journal_entries.push(PublicationJournalEntry::Leaf {
                     relative: relative.clone(),
                     backup_id: next_backup_id,
@@ -3039,6 +3246,7 @@ fn stage_environment_projection(
             })?,
             created: Vec::new(),
             replaced: Vec::new(),
+            mounted: Vec::new(),
             journal_entries,
             next_backup_id,
             obsolete_directories: Vec::new(),
@@ -3088,6 +3296,7 @@ fn stage_environment_projection(
                 if preserve_existing_mounted_files.contains(relative)
                     && preserve_existing_mounted_file(&destination, relative, limits)?
                 {
+                    backup_id += 1;
                     continue;
                 }
                 let Node::File(_, source_mode, _) = node else {
@@ -3096,14 +3305,20 @@ fn stage_environment_projection(
                 publish_mounted_file(
                     &temporary.0.join(relative),
                     &destination,
-                    &temporary.0.join(format!(
-                        ".freshell-mounted-backup-{}",
-                        NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
-                    )),
+                    &backup_path(&publication.backup.0, backup_id),
                     relative,
                     *source_mode,
                     limits,
+                    |backup, permissions| {
+                        publication.mounted.push((
+                            destination.clone(),
+                            backup.to_owned(),
+                            permissions,
+                        ));
+                        sync_directory_chain(destination_root, &old_files)
+                    },
                 )?;
+                backup_id += 1;
             } else {
                 publication.set_leaf_had_original(
                     destination_root,
@@ -3229,6 +3444,7 @@ fn publish_mounted_file(
     relative: &Path,
     source_mode: u32,
     limits: CopyLimits,
+    before_write: impl FnOnce(&Path, fs::Permissions) -> Result<(), CopyError>,
 ) -> Result<(), CopyError> {
     use std::io::{Seek, SeekFrom};
     #[cfg(unix)]
@@ -3270,13 +3486,14 @@ fn publish_mounted_file(
     }
     // Preserve the previous selected bytes before modifying an inode that is
     // already bound into the worker. Both copies are streamed on its own HOME.
+    let temporary_backup = backup.with_extension("tmp");
     let mut saved = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(backup)
+        .open(&temporary_backup)
         .map_err(|cause| io_error(relative, "backup_mounted_file", cause))?;
-    mode(backup, 0o600, relative)?;
+    mode(&temporary_backup, 0o600, relative)?;
     let observed = std::io::copy(
         &mut (&mut target).take(metadata.len().checked_add(1).ok_or_else(|| {
             error(
@@ -3295,6 +3512,12 @@ fn publish_mounted_file(
             "mounted resource changed before publication; retry with a quiescent owner",
         ));
     }
+    saved
+        .sync_all()
+        .map_err(|cause| io_error(relative, "sync_mounted_backup", cause))?;
+    fs::rename(&temporary_backup, backup)
+        .map_err(|cause| io_error(relative, "publish_mounted_backup", cause))?;
+    before_write(backup, metadata.permissions())?;
     let result = (|| -> std::io::Result<()> {
         let incoming = File::open(source)?;
         let expected = incoming.metadata()?.len();
@@ -3316,13 +3539,13 @@ fn publish_mounted_file(
             ));
         }
         target.set_len(copied)?;
-        target.sync_all()?;
         mode(destination, private_file_mode(source_mode), relative).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "mounted file mode publication failed",
             )
         })?;
+        target.sync_all()?;
         Ok(())
     })();
     if let Err(cause) = result {
@@ -3331,8 +3554,8 @@ fn publish_mounted_file(
             target.seek(SeekFrom::Start(0))?;
             let restored = std::io::copy(&mut saved, &mut target)?;
             target.set_len(restored)?;
-            target.sync_all()?;
             fs::set_permissions(destination, metadata.permissions())?;
+            target.sync_all()?;
             Ok(())
         })();
         if let Err(restore) = restore {
@@ -3343,6 +3566,62 @@ fn publish_mounted_file(
     Ok(())
 }
 
+fn restore_mounted_file(
+    destination: &Path,
+    backup: &Path,
+    relative: &Path,
+    permissions: fs::Permissions,
+) -> Result<(), CopyError> {
+    use std::io::{Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = fs::symlink_metadata(destination)
+        .map_err(|cause| io_error(relative, "inspect_mounted_restore", cause))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(error(
+            relative,
+            "restore_mounted_file",
+            "mounted destination is not a physical regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut target = options
+        .open(destination)
+        .map_err(|cause| io_error(relative, "open_mounted_restore", cause))?;
+    #[cfg(unix)]
+    {
+        let opened = target
+            .metadata()
+            .map_err(|cause| io_error(relative, "inspect_mounted_restore", cause))?;
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+            return Err(error(
+                relative,
+                "restore_mounted_file",
+                "mounted inode changed before restoration",
+            ));
+        }
+    }
+    let mut saved =
+        File::open(backup).map_err(|cause| io_error(relative, "open_mounted_backup", cause))?;
+    target
+        .seek(SeekFrom::Start(0))
+        .map_err(|cause| io_error(relative, "restore_mounted_file", cause))?;
+    let restored = std::io::copy(&mut saved, &mut target)
+        .map_err(|cause| io_error(relative, "restore_mounted_file", cause))?;
+    target
+        .set_len(restored)
+        .map_err(|cause| io_error(relative, "restore_mounted_file", cause))?;
+    target
+        .set_permissions(permissions)
+        .map_err(|cause| io_error(relative, "restore_mounted_mode", cause))?;
+    target
+        .sync_all()
+        .map_err(|cause| io_error(relative, "sync_mounted_restore", cause))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3351,6 +3630,188 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
     use std::{fs, path::Path};
+
+    #[test]
+    fn regular_file_publication_creates_and_refreshes_home() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("selected-settings.json");
+        let home = root.path().join("home");
+        let selection = CopySelection {
+            source: source.clone(),
+            destination_relative: "provider/settings.json".into(),
+        };
+        fs::write(&source, "first settings").unwrap();
+        copy_environment(&[selection.clone()], &home, &[], Default::default()).unwrap();
+        assert_eq!(
+            fs::read(home.join("provider/settings.json")).unwrap(),
+            b"first settings"
+        );
+        fs::write(home.join("provider/native-history"), "retained history").unwrap();
+
+        fs::write(&source, "refreshed settings").unwrap();
+        copy_environment(&[selection], &home, &[], Default::default()).unwrap();
+        assert_eq!(
+            fs::read(home.join("provider/settings.json")).unwrap(),
+            b"refreshed settings"
+        );
+        assert_eq!(
+            fs::read(home.join("provider/native-history")).unwrap(),
+            b"retained history"
+        );
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unfinished_regular_file_publication_restores_prior_home() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("selected-settings.json");
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("settings.json"), "prior settings").unwrap();
+        fs::write(home.join("native-history"), "retained history").unwrap();
+        fs::write(&source, "next settings").unwrap();
+        let publication = stage_environment(
+            &[CopySelection {
+                source,
+                destination_relative: "settings.json".into(),
+            }],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(home.join("settings.json")).unwrap(),
+            b"next settings"
+        );
+        drop(publication);
+        assert_eq!(
+            fs::read(home.join("settings.json")).unwrap(),
+            b"prior settings"
+        );
+        assert_eq!(
+            fs::read(home.join("native-history")).unwrap(),
+            b"retained history"
+        );
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_file_failure_restores_prior_bytes_mode_and_inode() {
+        use std::io::{Read, Seek};
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let home = fixture.path().join("home");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&home).unwrap();
+        for name in ["a-mounted", "b-ordinary"] {
+            fs::write(source.join(name), format!("next-{name}")).unwrap();
+            fs::write(home.join(name), format!("prior-{name}")).unwrap();
+        }
+        fs::set_permissions(source.join("a-mounted"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(home.join("a-mounted"), fs::Permissions::from_mode(0o640)).unwrap();
+        let inode = fs::metadata(home.join("a-mounted")).unwrap().ino();
+        let mut alias = File::open(home.join("a-mounted")).unwrap();
+        let result = stage_environment_projection(
+            &[
+                selection(&source.join("a-mounted"), "a-mounted"),
+                selection(&source.join("b-ordinary"), "b-ordinary"),
+            ],
+            &home,
+            &[],
+            Default::default(),
+            CopyProjectionOptions {
+                mounted_roots: &["a-mounted".into()],
+                ..Default::default()
+            },
+            |_, _| {
+                Err(std::io::Error::other(
+                    "ordinary publication failed after mounted write",
+                ))
+            },
+        );
+        assert!(result.is_err());
+        alias.rewind().unwrap();
+        let mut bytes = String::new();
+        alias.read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "prior-a-mounted");
+        let restored = fs::metadata(home.join("a-mounted")).unwrap();
+        assert_eq!(restored.ino(), inode);
+        assert_eq!(restored.mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::read(home.join("b-ordinary")).unwrap(),
+            b"prior-b-ordinary"
+        );
+        assert_eq!(fs::read_dir(home).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_recovery_preserves_original_during_incomplete_backup() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let backup_root = home.join(format!("{BACKUP_PREFIX}interrupted-mounted-backup"));
+        fs::create_dir_all(backup_root.join(OLD_FILES_DIR)).unwrap();
+        fs::write(home.join("mounted"), b"complete prior settings").unwrap();
+        fs::set_permissions(home.join("mounted"), fs::Permissions::from_mode(0o640)).unwrap();
+        let inode = fs::metadata(home.join("mounted")).unwrap().ino();
+        write_publication_owner_marker(&home, &backup_root).unwrap();
+        write_publication_journal(
+            &home,
+            &backup_root,
+            &[PublicationJournalEntry::MountedLeaf {
+                relative: "mounted".into(),
+                backup_id: 0,
+                mode: 0o640,
+                readonly: false,
+            }],
+        )
+        .unwrap();
+        fs::write(
+            backup_path(&backup_root, 0).with_extension("tmp"),
+            b"partial",
+        )
+        .unwrap();
+
+        recover_environment(&home).unwrap();
+        assert_eq!(
+            fs::read(home.join("mounted")).unwrap(),
+            b"complete prior settings"
+        );
+        let original = fs::metadata(home.join("mounted")).unwrap();
+        assert_eq!(original.ino(), inode);
+        assert_eq!(original.mode() & 0o777, 0o640);
+        assert!(!backup_root.exists());
+    }
+
+    #[test]
+    fn mounted_recovery_keeps_complete_backup_when_destination_is_missing() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let backup_root = home.join(format!("{BACKUP_PREFIX}missing-mounted-destination"));
+        fs::create_dir_all(backup_root.join(OLD_FILES_DIR)).unwrap();
+        write_publication_owner_marker(&home, &backup_root).unwrap();
+        write_publication_journal(
+            &home,
+            &backup_root,
+            &[PublicationJournalEntry::MountedLeaf {
+                relative: "mounted".into(),
+                backup_id: 0,
+                mode: 0o600,
+                readonly: false,
+            }],
+        )
+        .unwrap();
+        let backup = backup_path(&backup_root, 0);
+        fs::write(&backup, b"complete prior settings").unwrap();
+
+        assert!(recover_environment(&home).is_err());
+        assert_eq!(fs::read(backup).unwrap(), b"complete prior settings");
+        assert!(backup_root.join(JOURNAL_FILE).is_file());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3674,8 +4135,9 @@ mod tests {
             let home = root.join("home");
             let reached = root.join(PARTIAL_PUBLISH_REACHED);
             let mut published = 0;
-            let _ = copy_environment_with_publisher(
+            let _ = stage_environment_projection(
                 &[
+                    selection(&source.join("0-mounted"), "0-mounted"),
                     selection(&source.join("a-first"), "a-first"),
                     selection(&source.join("m-new"), "m-new"),
                     selection(&source.join("z-last"), "z-last"),
@@ -3683,7 +4145,10 @@ mod tests {
                 &home,
                 &[],
                 Default::default(),
-                None,
+                CopyProjectionOptions {
+                    mounted_roots: &["0-mounted".into()],
+                    ..Default::default()
+                },
                 |from, to| {
                     fs::rename(from, to)?;
                     published += 1;
@@ -3704,10 +4169,14 @@ mod tests {
         let home = root.path().join("home");
         fs::create_dir(&source).unwrap();
         fs::create_dir(&home).unwrap();
-        for name in ["a-first", "z-last"] {
+        for name in ["0-mounted", "a-first", "z-last"] {
             fs::write(source.join(name), format!("new-{name}")).unwrap();
             fs::write(home.join(name), format!("prior-{name}")).unwrap();
         }
+        fs::set_permissions(home.join("0-mounted"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(source.join("0-mounted"), fs::Permissions::from_mode(0o700)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let mounted_inode = fs::metadata(home.join("0-mounted")).unwrap().ino();
         fs::write(source.join("m-new"), b"new-m-new").unwrap();
 
         let mut child = ChildGuard(
@@ -3736,6 +4205,7 @@ mod tests {
         }
         child.0.kill().unwrap();
         assert!(!child.0.wait().unwrap().success());
+        assert_eq!(fs::read(home.join("0-mounted")).unwrap(), b"new-0-mounted");
 
         let unrelated = source.join("unrelated");
         fs::write(&unrelated, b"unrelated").unwrap();
@@ -3748,6 +4218,13 @@ mod tests {
         .unwrap()
         .commit()
         .unwrap();
+        assert_eq!(
+            fs::read(home.join("0-mounted")).unwrap(),
+            b"prior-0-mounted"
+        );
+        let restored = fs::metadata(home.join("0-mounted")).unwrap();
+        assert_eq!(restored.ino(), mounted_inode);
+        assert_eq!(restored.mode() & 0o777, 0o640);
         assert_eq!(fs::read(home.join("a-first")).unwrap(), b"prior-a-first");
         assert_eq!(fs::read(home.join("z-last")).unwrap(), b"prior-z-last");
         assert!(!home.join("m-new").exists());
@@ -4310,6 +4787,7 @@ mod tests {
             backup: TemporaryProjection(backup.clone()),
             created: Vec::new(),
             replaced: Vec::new(),
+            mounted: Vec::new(),
             journal_entries: Vec::new(),
             next_backup_id: 0,
             obsolete_directories: Vec::new(),
