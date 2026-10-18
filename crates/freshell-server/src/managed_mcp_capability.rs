@@ -3828,6 +3828,133 @@ fn execute_copied_script(path: &Path) -> std::io::Result<std::process::Output> {
 mod tests {
     use super::*;
 
+    // Linux IN_ACCESS observes actual reads even on noatime-mounted fixture
+    // volumes. Each witness first detects a real one-byte read and drains it,
+    // so a broken observer cannot silently credit the subsequent refusal.
+    struct PayloadReadWitness {
+        #[cfg(target_os = "linux")]
+        events: std::fs::File,
+        #[cfg(not(target_os = "linux"))]
+        path: PathBuf,
+        #[cfg(not(target_os = "linux"))]
+        old_access: std::time::SystemTime,
+    }
+
+    impl PayloadReadWitness {
+        fn new(path: &Path) -> Self {
+            use std::io::Read;
+            #[cfg(target_os = "linux")]
+            let mut witness = {
+                use std::os::{
+                    fd::{AsRawFd, FromRawFd},
+                    unix::ffi::OsStrExt,
+                };
+                let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+                assert!(
+                    fd >= 0,
+                    "create payload read observer: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: inotify_init1 returned a new owned file descriptor.
+                let events = unsafe { std::fs::File::from_raw_fd(fd) };
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                let watch = unsafe {
+                    libc::inotify_add_watch(events.as_raw_fd(), path.as_ptr(), libc::IN_ACCESS)
+                };
+                assert!(
+                    watch >= 0,
+                    "watch payload reads: {}",
+                    std::io::Error::last_os_error()
+                );
+                Self { events }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let mut witness = {
+                let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_accessed(old_access))
+                    .unwrap();
+                Self {
+                    path: path.to_owned(),
+                    old_access,
+                }
+            };
+            std::fs::File::open(path)
+                .unwrap()
+                .read_exact(&mut [0])
+                .unwrap();
+            assert!(
+                witness.take_observed_read(),
+                "fixture must observe actual payload reads"
+            );
+            #[cfg(not(target_os = "linux"))]
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(witness.old_access))
+                .unwrap();
+            witness
+        }
+
+        #[cfg(target_os = "linux")]
+        fn take_observed_read(&mut self) -> bool {
+            use std::io::Read;
+            let mut buffer = [0u8; 4096];
+            let mut observed = false;
+            loop {
+                let count = match self.events.read(&mut buffer) {
+                    Ok(count) => count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        return observed
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read payload observer: {error}"),
+                };
+                assert!(count > 0, "payload read observer closed unexpectedly");
+                let mut offset = 0;
+                while offset < count {
+                    let header = std::mem::size_of::<libc::inotify_event>();
+                    assert!(count - offset >= header, "incomplete payload read event");
+                    // SAFETY: the complete event header is in the initialized
+                    // buffer; read_unaligned handles its byte-buffer alignment.
+                    let event = unsafe {
+                        std::ptr::read_unaligned(
+                            buffer.as_ptr().add(offset).cast::<libc::inotify_event>(),
+                        )
+                    };
+                    assert_eq!(
+                        event.mask & libc::IN_Q_OVERFLOW,
+                        0,
+                        "payload read event overflow"
+                    );
+                    assert_eq!(
+                        event.mask & (libc::IN_IGNORED | libc::IN_UNMOUNT),
+                        0,
+                        "payload read observer lost its file"
+                    );
+                    observed |= event.mask & libc::IN_ACCESS != 0;
+                    offset += header + event.len as usize;
+                    assert!(offset <= count, "incomplete payload read event name");
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn take_observed_read(&mut self) -> bool {
+            std::fs::metadata(&self.path).unwrap().accessed().unwrap() != self.old_access
+        }
+
+        fn assert_not_read(&mut self, message: &str) {
+            assert!(!self.take_observed_read(), "{message}");
+        }
+    }
+
     fn opencode_source_view(
         logical_path: PathBuf,
         lane: freshell_platform::opencode_recipe::SourceLane,
@@ -4128,34 +4255,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn managed_mcp_preparation_inventory_rejects_oversize_before_payload_read() {
-        use std::io::Read;
         let owned = tempfile::tempdir().unwrap();
         let path = grant_path(owned.path(), "grant-pending").unwrap();
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
         file.set_len(128 * 1024 + 1).unwrap();
-        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-        file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
-        file.read_exact(&mut [0]).unwrap();
-        assert_ne!(
-            file.metadata().unwrap().accessed().unwrap(),
-            old_access,
-            "fixture filesystem must observe payload reads"
-        );
-        file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
         drop(file);
+        let mut witness = PayloadReadWitness::new(&path);
         assert!(protected_preparation_ids(owned.path()).is_err());
-        assert_eq!(
-            std::fs::metadata(path).unwrap().accessed().unwrap(),
-            old_access,
-            "oversized preparation inventory payload was read"
-        );
+        witness.assert_not_read("oversized preparation inventory payload was read");
     }
 
     #[cfg(target_os = "linux")]
@@ -4363,8 +4475,9 @@ mod tests {
             assert!(
                 String::from_utf8_lossy(&output.stdout)
                     .contains("recovery_sparse_manifest_reader_ready"),
-                "allocation fixture must execute its child reader: {}",
-                String::from_utf8_lossy(&output.stdout)
+                "allocation fixture must execute its child reader: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
             eprintln!(
                 "recovery_sparse_manifest_child_result status={} oversized_payload_read={}",
@@ -4423,26 +4536,14 @@ mod tests {
                 .manifest
                 .relative_path,
         );
-        let mut sparse = std::fs::OpenOptions::new()
+        let sparse = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
         sparse.set_len(64 * 1024 * 1024 + 1).unwrap();
-        let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-        sparse
-            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
-        std::io::Read::read_exact(&mut sparse, &mut [0u8; 1]).unwrap();
-        assert_ne!(
-            std::fs::metadata(&path).unwrap().accessed().unwrap(),
-            old_access,
-            "fixture filesystem must report actual payload reads"
-        );
-        sparse
-            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
-            .unwrap();
         drop(sparse);
+        let mut witness = PayloadReadWitness::new(&path);
         let pages: u64 = std::fs::read_to_string("/proc/self/statm")
             .unwrap()
             .split_whitespace()
@@ -4458,10 +4559,8 @@ mod tests {
         println!("recovery_sparse_manifest_reader_ready");
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
         assert!(read_prior_manifest_bytes("codex", &store, &directory, &soul, &accepted).is_err());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().accessed().unwrap(),
-            old_access,
-            "oversized manifest payload was read before its physical bound was rejected"
+        witness.assert_not_read(
+            "oversized manifest payload was read before its physical bound was rejected",
         );
         assert!(store.grants.lock().unwrap().contains_key(&grant.grant_id));
         assert_eq!(
@@ -6699,7 +6798,6 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
 
     #[test]
     fn managed_mcp_generation_abort_cold_pending_requires_complete_matching_ownership() {
-        use std::io::Read;
         let mut failed = Vec::new();
         for case in [
             "pending",
@@ -6756,27 +6854,19 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             std::fs::write(stage.join("usable-resource"), b"pending-input-nonce").unwrap();
             let path = grant_path(&directory, &pending.grant_id).unwrap();
             let before = std::fs::read(&path).unwrap();
-            let old_access = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+            let mut read_witness = None;
             match case {
                 "missing" => std::fs::remove_file(&path).unwrap(),
                 "malformed" => std::fs::write(&path, b"{\"preparation\":").unwrap(),
                 "oversize" => {
-                    let mut file = std::fs::OpenOptions::new()
+                    let file = std::fs::OpenOptions::new()
                         .read(true)
                         .write(true)
                         .open(&path)
                         .unwrap();
                     file.set_len(128 * 1024 + 1).unwrap();
-                    file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                        .unwrap();
-                    file.read_exact(&mut [0]).unwrap();
-                    assert_ne!(
-                        file.metadata().unwrap().accessed().unwrap(),
-                        old_access,
-                        "fixture filesystem must observe ownership payload reads"
-                    );
-                    file.set_times(std::fs::FileTimes::new().set_accessed(old_access))
-                        .unwrap();
+                    drop(file);
+                    read_witness = Some(PayloadReadWitness::new(&path));
                 }
                 "assigned_pending" | "unrecorded" => {
                     let mut stored: serde_json::Value = serde_json::from_slice(&before).unwrap();
@@ -6818,9 +6908,13 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 "malformed" => {
                     std::fs::read(&path).is_ok_and(|bytes| bytes == b"{\"preparation\":")
                 }
-                "oversize" => std::fs::metadata(&path).is_ok_and(|metadata| {
-                    metadata.len() == 128 * 1024 + 1 && metadata.accessed().unwrap() == old_access
-                }),
+                "oversize" => {
+                    read_witness
+                        .as_mut()
+                        .unwrap()
+                        .assert_not_read("oversized ownership payload was read");
+                    std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == 128 * 1024 + 1)
+                }
                 "assigned_pending" | "unrecorded" => {
                     std::fs::read(&path).is_ok_and(|bytes| Some(bytes) == modified)
                 }
