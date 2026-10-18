@@ -5,6 +5,7 @@ import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
+import { RuntimePreparation } from '../../../../scripts/testing/runtime-preparation.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 
@@ -87,7 +88,131 @@ async function assertReaped(log: string): Promise<void> {
   }
 }
 
+async function waitForBuildDescendant(log: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const recorded = rows(log)
+    const command = recorded.find(row => row.name === 'mise')
+    if (command && recorded.some(row => row.parentPid === command.pid)) return
+    await delay(10)
+  }
+  assert.fail('teardown must reach a live preparation command and its actual descendant')
+}
+
+async function pendingCopy(cancel: boolean): Promise<void> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'prep-copy-'))
+  const source = path.join(root, 'source')
+  const target = path.join(root, 'target')
+  // Real, finite I/O: this is large enough to observe a writer in flight on
+  // the bounded two-CPU fixture, without fake fs promises or background work.
+  const bytes = 128 * 1024 * 1024
+  fs.writeFileSync(source, Buffer.alloc(bytes, 0x61))
+  const abort = new AbortController()
+  const preparation = new RuntimePreparation({ timeoutMs: cancel ? 5000 : 1, signal: abort.signal })
+  let settled = false
+  let observer: number | undefined
+  const outcome = preparation.copy(source, target).then(() => undefined, error => error).finally(() => { settled = true })
+  try {
+    assert.equal(settled, false, 'the actual filesystem copy is asynchronous and pending')
+    if (cancel) {
+      const deadline = Date.now() + 2000
+      while (!fs.existsSync(target) && !settled && Date.now() < deadline) await delay(1)
+      assert(fs.existsSync(target), 'cancellation reaches an actual run-owned writer')
+      const size = fs.statSync(target).size
+      assert(size < bytes && !settled, 'cancellation reaches the writer before its copy completes')
+      observer = fs.openSync(target, 'r')
+      abort.abort(new Error('copy fixture cancelled preparation'))
+    }
+    const error = await outcome
+    assert.match(String(error), /cancelled preparation|preparation.*deadline|preparation.*exceeded/i)
+    assert(!fs.existsSync(target) || fs.statSync(target).size < bytes, 'cancellation stops the actual copy before it writes all source bytes')
+    if (observer === undefined && fs.existsSync(target)) observer = fs.openSync(target, 'r')
+    const settledSize = observer === undefined ? undefined : fs.fstatSync(observer).size
+    fs.rmSync(target, { force: true })
+    await delay(100)
+    if (observer !== undefined) assert.equal(fs.fstatSync(observer).size, settledSize, 'the writer must settle, even after its path is unlinked')
+    assert.equal(fs.existsSync(target), false, 'a settled writer cannot recreate the run-owned path after cleanup')
+  } finally {
+    await outcome
+    preparation.close()
+    if (observer !== undefined) fs.closeSync(observer)
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
 export const preparationCases: Record<string, () => Promise<void>> = {
+  'healthy copies preserve source bytes, executable mode and filesystem errors': async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'prep-copy-healthy-'))
+    const source = path.join(root, 'source')
+    const target = path.join(root, 'target')
+    const preparation = new RuntimePreparation({ timeoutMs: 3000 })
+    try {
+      const bytes = Buffer.from([0, 255, 1, 128, 13, 10])
+      fs.writeFileSync(source, bytes, { mode: 0o600 })
+      await preparation.copy(source, target)
+      assert.deepEqual(fs.readFileSync(target), bytes)
+      assert.equal(fs.statSync(target).mode & 0o777, 0o755)
+      await assert.rejects(preparation.copy(path.join(root, 'missing'), target), { code: 'ENOENT' })
+      assert.deepEqual(fs.readFileSync(source), bytes)
+    } finally {
+      preparation.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  },
+  'harness cleanup cancels and joins pending preparation before removing copies': async () => {
+    await fixture({ commandMs: 2200, descendant: true }, async (harness, _root, log) => {
+      let settled = false
+      const pending = harness.prepare({ timeoutMs: 6000 }).finally(() => { settled = true })
+      const outcome = pending.then(() => undefined, error => error)
+      try {
+        await waitForBuildDescendant(log, 5000)
+        assert.deepEqual(await harness.cleanup(), { ok: true, errors: [] })
+        assert(settled, 'cleanup must join preparation before returning')
+        assert.match(String(await outcome), /preparation.*cancel/i)
+        await assertReaped(log)
+        await delay(80)
+        assert.equal(fs.existsSync(harness.buildDir), false)
+        assert.equal(fs.existsSync(path.join(harness.testRoot, 'broker/docker.sock')), false)
+        assert.deepEqual(await harness.cleanup(), { ok: true, errors: [] })
+        await assert.rejects(harness.prepare(), /stopped|closed|cancel/i)
+      } finally {
+        await outcome
+      }
+    })
+  },
+  'rig stop settles pending start and its preparation child without late runtime': async () => {
+    await fixture({ commandMs: 2200, descendant: true }, async (_harness, root, log) => {
+      const rig = new ManagedRuntimeBrowserRig(root, 2, {}, {}, 'test', { enabledProviders: [] })
+      let settled = false
+      const preparing = rig.prepare({ timeoutMs: 6000 })
+      const outcome = rig.start().finally(() => { settled = true }).then(() => undefined, error => error)
+      void preparing.catch(() => undefined)
+      try {
+        await waitForBuildDescendant(log, 5000)
+        assert.deepEqual(await rig.stop(), { ok: true, errors: [] })
+        assert(settled, 'stop must join pending start before returning')
+        assert.match(String(await outcome), /preparation.*cancel|stopped/i)
+        await assertReaped(log)
+        await delay(80)
+        assert.equal(fs.existsSync(rig.runtime.buildDir), false)
+        assert.equal(fs.existsSync(path.join(rig.runtime.testRoot, 'broker/docker.sock')), false)
+        assert.equal(rows(log).some(row => row.args?.[0] === 'run'), false)
+        assert.equal(rig.web, undefined)
+        assert.deepEqual(await rig.stop(), { ok: true, errors: [] })
+        await assert.rejects(rig.start(), /stopped|cancel/i)
+      } finally {
+        await outcome
+        await rig.stop()
+        fs.rmSync(rig.runtime.testRoot, { recursive: true, force: true })
+      }
+    })
+  },
+  'pending copy observes the shared deadline and settles its writer': async () => {
+    await pendingCopy(false)
+  },
+  'pending copy observes external cancellation and settles its writer': async () => {
+    await pendingCopy(true)
+  },
   'sequential source commands share one preparation deadline': async () => {
     await fixture({ commandMs: 180 }, async (harness, _root, log) => {
       const options = { operatorHome: undefined, timeoutMs: 420 }
@@ -111,16 +236,7 @@ export const preparationCases: Record<string, () => Promise<void>> = {
     await fixture({ commandMs: 1000, descendant: true }, async (harness, _root, log) => {
       const abort = new AbortController()
       const pending = harness.prepare({ operatorHome: undefined, timeoutMs: 5000, signal: abort.signal })
-      const deadline = Date.now() + 2000
-      while (Date.now() < deadline) {
-        const recorded = rows(log)
-        const command = recorded.find(row => row.name === 'mise')
-        if (command && recorded.some(row => row.parentPid === command.pid)) break
-        await delay(10)
-      }
-      const recorded = rows(log)
-      const command = recorded.find(row => row.name === 'mise')
-      assert(command && recorded.some(row => row.parentPid === command.pid), 'cancellation must reach a live command and its actual descendant')
+      await waitForBuildDescendant(log)
       abort.abort(new Error('fixture cancelled preparation'))
       await assert.rejects(pending, /cancelled preparation/)
       assert.equal(fs.existsSync(harness.buildDir), false)

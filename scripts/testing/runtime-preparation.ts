@@ -1,9 +1,18 @@
 import { spawn } from 'node:child_process'
-import fs from 'node:fs/promises'
 import { performance } from 'node:perf_hooks'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const RUNTIME_PREPARATION_TIMEOUT_MS = 45 * 60_000
+
+const COPY_EXECUTABLE_SCRIPT = `
+  import fs from 'node:fs/promises'
+  try {
+    await fs.copyFile(process.argv[1], process.argv[2])
+    await fs.chmod(process.argv[2], 0o755)
+  } catch (error) {
+    console.log(JSON.stringify({ message: error.message, code: error.code }))
+  }
+`
 
 export type RuntimePreparationPolicy = {
   /** One total budget for this rig's source builds and run-owned copies. */
@@ -31,6 +40,10 @@ export class RuntimePreparation {
   check(): void {
     this.controller.signal.throwIfAborted()
     if (performance.now() >= this.deadline) throw new Error('runtime preparation exceeded its deadline')
+  }
+
+  cancel(): void {
+    this.controller.abort(new Error('runtime preparation cancelled by teardown'))
   }
 
   async run(command: string, args: string[], options: { cwd?: string; inherit?: boolean } = {}): Promise<string> {
@@ -93,10 +106,14 @@ export class RuntimePreparation {
   }
 
   async copy(source: string, target: string): Promise<void> {
-    this.check()
-    await fs.copyFile(source, target)
-    await fs.chmod(target, 0o755)
-    this.check()
+    // fs.copyFile/chmod cannot abort pending I/O in this process. Keep their
+    // writer in the same owned command boundary as builds, so cancellation
+    // joins its exit before the harness removes any run-owned paths.
+    const output = await this.run(process.execPath, ['--input-type=module', '-e', COPY_EXECUTABLE_SCRIPT, source, target])
+    if (output) {
+      const { message, code } = JSON.parse(output)
+      throw Object.assign(new Error(message), { code })
+    }
   }
 
   close(): void {

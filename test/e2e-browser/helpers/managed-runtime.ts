@@ -76,6 +76,9 @@ export class ManagedRuntimeBrowserRig {
   info!: TestServerInfo
   private serverBin = ''
   private preparation: Promise<void> | undefined
+  private starting: Promise<TestServerInfo> | undefined
+  private stopping: Promise<{ ok: boolean; errors: string[] }> | undefined
+  private stopped = false
   private readonly serverEnv: Record<string, string>
   private readonly webHomeDir: string | undefined
   private readonly resolvedOperatorHome: string | undefined
@@ -140,6 +143,7 @@ export class ManagedRuntimeBrowserRig {
   }
 
   prepare(policy: RuntimePreparationPolicy = {}): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error('managed runtime rig is stopped'))
     this.preparation ??= this.runtime.prepare(
       { ...policy, operatorHome: this.resolvedOperatorHome },
       preparation => this.prepareManagedSources(preparation),
@@ -184,8 +188,15 @@ export class ManagedRuntimeBrowserRig {
     }
   }
 
-  async start(): Promise<TestServerInfo> {
+  start(): Promise<TestServerInfo> {
+    if (this.stopped) return Promise.reject(new Error('managed runtime rig is stopped'))
+    this.starting ??= this.startPrepared()
+    return this.starting
+  }
+
+  private async startPrepared(): Promise<TestServerInfo> {
     await this.prepare()
+    if (this.stopped) throw new Error('managed runtime rig is stopped')
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: 'browser-managed-runtime',
       binaryKind: this.supervisorBinaryKind,
@@ -193,6 +204,7 @@ export class ManagedRuntimeBrowserRig {
       binaryPath: this.qualificationSupervisorBin,
       operatorHome: this.resolvedOperatorHome,
     })
+    if (this.stopped) throw new Error('managed runtime rig is stopped')
     this.web = new RustServer({
       preserveHomeOnStop: true,
       homeDir: this.webHomeDir ?? this.resolvedOperatorHome,
@@ -298,7 +310,16 @@ export class ManagedRuntimeBrowserRig {
     return this.dataOf(result, 'stop')
   }
 
-  async stop(): Promise<{ ok: boolean; errors: string[] }> {
+  stop(): Promise<{ ok: boolean; errors: string[] }> {
+    this.stopped = true
+    this.runtime.cancelPreparation()
+    this.stopping ??= this.stopOwned()
+    return this.stopping
+  }
+
+  private async stopOwned(): Promise<{ ok: boolean; errors: string[] }> {
+    await this.starting?.catch(() => undefined)
+    await this.preparation?.catch(() => undefined)
     await this.web?.stop().catch(() => undefined)
     return this.runtime.cleanup()
   }

@@ -142,6 +142,10 @@ export class RuntimeHarness {
   private readonly trackedVolumes = new Set<string>()
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
+  private preparationWork: RuntimePreparation | undefined
+  private preparation: Promise<void> | undefined
+  private cleaningUp: Promise<{ ok: boolean; errors: string[] }> | undefined
+  private stopped = false
 
   constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1) {
     this.repoRoot = fs.realpathSync(repoRoot)
@@ -160,11 +164,26 @@ export class RuntimeHarness {
     this.browserDir = path.join(this.evidenceDir, 'browser')
   }
 
-  async prepare(
+  prepare(
     options: RuntimePreparationPolicy & { operatorHome?: string } = {},
     prepareManagedSources?: (preparation: RuntimePreparation) => Promise<void>,
   ): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error('runtime harness is stopped'))
+    this.preparation ??= this.prepareOwnedSources(options, prepareManagedSources)
+    return this.preparation
+  }
+
+  cancelPreparation(): void {
+    this.stopped = true
+    this.preparationWork?.cancel()
+  }
+
+  private async prepareOwnedSources(
+    options: RuntimePreparationPolicy & { operatorHome?: string },
+    prepareManagedSources?: (preparation: RuntimePreparation) => Promise<void>,
+  ): Promise<void> {
     const preparation = new RuntimePreparation(options)
+    this.preparationWork = preparation
     try {
       preparation.check()
       await this.prepareSources(options, preparation)
@@ -172,7 +191,9 @@ export class RuntimeHarness {
       preparation.check()
       this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: this.broker.proxySocketPath })
     } catch (error) {
-      const cleanup = await this.cleanup()
+      // This path already owns the preparation promise: join from public
+      // cleanup only, otherwise failure cleanup would await itself.
+      const cleanup = await this.cleanupResources()
       if (!cleanup.ok) throw new AggregateError([error, ...cleanup.errors], 'runtime preparation failed and cleanup was incomplete')
       throw error
     } finally {
@@ -254,7 +275,16 @@ export class RuntimeHarness {
     writePrivateJson(path.join(this.evidenceDir, 'build.json'), await this.collectBuildInfo(preparation))
   }
 
-  async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
+  cleanup(): Promise<{ ok: boolean; errors: string[] }> {
+    this.cancelPreparation()
+    this.cleaningUp ??= (async () => {
+      await this.preparation?.catch(() => undefined)
+      return this.cleanupResources()
+    })()
+    return this.cleaningUp
+  }
+
+  private async cleanupResources(): Promise<{ ok: boolean; errors: string[] }> {
     const errors: string[] = []
     for (const id of [...this.trackedSupervisorContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
