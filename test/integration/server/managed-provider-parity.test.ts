@@ -24,6 +24,19 @@ const fixture = path.join(root, 'test/fixtures/providers/parity-provider.mjs')
 const providers: Provider[] = ['claude', 'codex', 'opencode', 'amplifier']
 const nestedSecretMarker = 'nested-secret-byte'
 
+// Match the owned startup phases in freshell-platform/provider_startup.rs.
+// A replacement stages inputs before its existing stop/create/native wait;
+// the 4,201-file selection must be allowed to finish both ordinary projections.
+function providerPreparationWaitMs(provider: Provider): number {
+  const controller = 35_000
+  if (provider !== 'claude') return controller
+  const nativeObservation = 25_000
+  const ordinaryProjection = 25_000
+  const readerCleanup = 5_000
+  return controller + nativeObservation + readerCleanup
+    + nativeObservation + ordinaryProjection * 2 + readerCleanup
+}
+
 async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 45_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -606,6 +619,7 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
 
   afterEach(context => {
     if (context.task.result?.state !== 'fail' || !rig?.web) return
+    rig.runtime.recordLifecycle('provider_parity.case.failed', { test: context.task.name })
     const web = rig.web.capturedOutput()
     rig.runtime.writeIncident(`provider-parity-${context.task.name}-web-failure`, {
       test: context.task.name,
@@ -616,11 +630,14 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     })
   })
 
-  afterAll(() => cleanupProviderParity({
-    connections: sockets, rig, registeredVolumes, restoreOnecliEnvironment,
-    inheritedEnvironment: { ...inheritedProviderEnvironment, FRESHELL_URL: inheritedFreshellUrl },
-    directories: [workspace, webHome, onecli?.directory],
-  }), 180_000)
+  afterAll(async () => {
+    rig?.runtime.recordLifecycle('provider_parity.cleanup.started', {})
+    await cleanupProviderParity({
+      connections: sockets, rig, registeredVolumes, restoreOnecliEnvironment,
+      inheritedEnvironment: { ...inheritedProviderEnvironment, FRESHELL_URL: inheritedFreshellUrl },
+      directories: [workspace, webHome, onecli?.directory],
+    })
+  }, 180_000)
 
   it.each(providers)('%s preserves provider-visible launch and MCP behavior', async provider => {
     const observed: RecordRow[] = []
@@ -825,7 +842,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
         const view = await rig.runningViewForTerminal(managedTerminalId!)
         return view?.containerId && view.incarnationId !== before.incarnationId
           && view.recoveryState === 'live' ? view : undefined
-      }, 90_000).catch(async error => {
+      }, 90_000 + providerPreparationWaitMs(provider)).catch(async error => {
         throw new Error(`${String(error)}; inventory=${JSON.stringify(await rig.inventory())}`)
       })
       expect(after.soulId).toBe(before.soulId)
@@ -892,7 +909,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       }))
     }
     if (managedSoulId) await rig.stopSoul(managedSoulId)
-  }, 180_000)
+  }, 180_000 + providerPreparationWaitMs('claude'))
 
   it('resumed OpenCode child sees refreshed config and keeps provider-owned state', async () => {
     const wire = await TerminalWire.connect(rig.info, true)
