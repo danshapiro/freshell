@@ -26,12 +26,26 @@ pub fn provider_refresh_completion_budget() -> Duration {
         + PROVIDER_REFRESH_RECOVERY_KILL
 }
 
+/// Candidate observation projects the current ordinary inputs before reading
+/// their native selection. Retained candidates first reconstruct the frozen
+/// prior selection, so each supported refresh needs its own operation budget.
+pub fn claude_source_observation_budget(candidate: bool, retained: bool) -> Duration {
+    let refreshes = match (candidate, retained) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    };
+    NATIVE_OBSERVATION_RUN + PROVIDER_REFRESH_RUN * refreshes
+}
+
 /// Claude preparation reads the quiescent source and then the staged candidate.
 /// Keep time for both complete reader operations in addition to controller work.
 pub fn provider_preparation_budget(provider: Option<&str>) -> Duration {
     PREPARATION_CONTROL_ALLOWANCE
         + if matches!(provider, Some("claude" | "kilroy")) {
-            (NATIVE_OBSERVATION_RUN + NATIVE_OBSERVATION_CLEANUP) * 2
+            claude_source_observation_budget(false, true)
+                + claude_source_observation_budget(true, true)
+                + NATIVE_OBSERVATION_CLEANUP * 2
         } else {
             Duration::ZERO
         }

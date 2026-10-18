@@ -923,7 +923,10 @@ impl RuntimeBackend for DockerEngineBackend {
             owner,
             request,
             test_run_id,
-            freshell_platform::provider_startup::NATIVE_OBSERVATION_RUN,
+            freshell_platform::provider_startup::claude_source_observation_budget(
+                request.candidate.is_some(),
+                matches!(owner, ClaudeSourceOwner::Retained { .. }),
+            ),
         )
         .await
     }

@@ -111,11 +111,13 @@ impl Supervisor {
         )
         .map_err(|_| denied())?;
         let digest = format!("{:x}", Sha256::digest(&raw));
-        // The backend owns a 25-second operation and five-second finite cleanup.
-        // This outer deadline permits that cleanup to finish before returning.
+        // Candidate readers also perform ordinary projections. Match the
+        // backend's full operation and permit its finite cleanup to finish.
         let reply = tokio::time::timeout(
-            freshell_platform::provider_startup::NATIVE_OBSERVATION_RUN
-                + freshell_platform::provider_startup::NATIVE_OBSERVATION_CLEANUP
+            freshell_platform::provider_startup::claude_source_observation_budget(
+                request.candidate.is_some(),
+                matches!(&owner, ClaudeSourceOwner::Retained { .. }),
+            ) + freshell_platform::provider_startup::NATIVE_OBSERVATION_CLEANUP
                 + Duration::from_secs(5),
             self.backend
                 .observe_claude_sources(&owner, &request, &self.config.test_run_id),
@@ -197,6 +199,7 @@ mod tests {
         StdMutex<Option<Box<dyn FnOnce() + Send>>>,
         StdMutex<Option<ClaudeRecoverySourceBinding>>,
         std::sync::atomic::AtomicUsize,
+        Duration,
     );
     #[async_trait]
     impl RuntimeBackend for ReplyBackend {
@@ -234,6 +237,19 @@ mod tests {
             let action = self.0.lock().unwrap().take();
             if let Some(action) = action {
                 action();
+            }
+            if !self.3.is_zero() {
+                // Pause only the controlled reader wait. Registry IPC and
+                // authority revalidation keep using the ordinary live clock.
+                struct ReaderClock;
+                impl Drop for ReaderClock {
+                    fn drop(&mut self) {
+                        tokio::time::resume();
+                    }
+                }
+                tokio::time::pause();
+                let _clock = ReaderClock;
+                tokio::time::sleep(self.3).await;
             }
             // This is a synthetic transport reply, never native UID evidence.
             let selected = &request.observation_request;
@@ -311,6 +327,8 @@ mod tests {
             "candidate-dropped",
             "candidate-expired",
             "candidate-unrecorded-prior",
+            "candidate-complete-projection",
+            "candidate-projection-overrun",
         ] {
             let owned = tempfile::tempdir().unwrap();
             let binary = owned.path().join("host");
@@ -382,6 +400,13 @@ mod tests {
                 StdMutex::new(None),
                 StdMutex::new(None),
                 std::sync::atomic::AtomicUsize::new(0),
+                match mode {
+                    // Two supported ordinary refreshes can outlast the old
+                    // metadata-only deadline without losing their authority.
+                    "candidate-complete-projection" => Duration::from_secs(36),
+                    "candidate-projection-overrun" => Duration::from_secs(120),
+                    _ => Duration::ZERO,
+                },
             ));
             let supervisor = Supervisor::new(
                 registry,
@@ -478,7 +503,14 @@ mod tests {
             );
             envelope.auth = Some("synthetic-control-secret".into());
             let result = tokio::time::timeout(
-                Duration::from_millis(250),
+                if matches!(
+                    mode,
+                    "candidate-complete-projection" | "candidate-projection-overrun"
+                ) {
+                    Duration::from_secs(150)
+                } else {
+                    Duration::from_millis(250)
+                },
                 supervisor.dispatch(envelope),
             )
             .await
@@ -491,11 +523,18 @@ mod tests {
             );
             assert_eq!(
                 result.is_ok(),
-                matches!(mode, "live" | "candidate" | "within-callback" | "candidate-within-callback"),
+                matches!(mode, "live" | "candidate" | "within-callback" | "candidate-within-callback" | "candidate-complete-projection"),
                 "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
             if let Err(error) = result {
-                assert_eq!(error.code, RuntimeErrorCode::InvalidRequest);
+                assert_eq!(
+                    error.code,
+                    if mode == "candidate-projection-overrun" {
+                        RuntimeErrorCode::HostUnreachable
+                    } else {
+                        RuntimeErrorCode::InvalidRequest
+                    }
+                );
             }
             assert!(std::fs::read(&prior).unwrap() == b"immutable accepted prior generation");
         }
