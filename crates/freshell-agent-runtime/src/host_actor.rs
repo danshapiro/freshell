@@ -1788,11 +1788,58 @@ fn current_native_checkpoint(
         || !["checkpointUuid", "assistantUuid"]
             .iter()
             .all(|key| checkpoint[key].as_str().is_some_and(|id| !id.is_empty()))
-        || checkpoint["inputDigest"] != digest(&serde_json::to_vec(&payload["tool"]["input"]).ok()?)
+        || checkpoint["inputDigest"] != native_input_digest(&payload["tool"]["input"])?
     {
         return None;
     }
     Some(checkpoint.clone())
+}
+
+fn native_input_digest(input: &Value) -> Option<String> {
+    // Match nativeInputDigest in native-session-channel.mjs exactly: recursive
+    // UTF-16 key ordering and ECMAScript Number formatting both affect bytes.
+    let mut canonical = String::new();
+    write_native_input_json(input, &mut canonical)?;
+    Some(digest(canonical.as_bytes()))
+}
+
+fn write_native_input_json(input: &Value, output: &mut String) -> Option<()> {
+    match input {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::String(value) => output.push_str(&serde_json::to_string(value).ok()?),
+        Value::Number(value) => {
+            let value = value.as_f64().filter(|value| value.is_finite())?;
+            output.push_str(ryu_js::Buffer::new().format_finite(value));
+        }
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_native_input_json(value, output)?;
+            }
+            output.push(']');
+        }
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| {
+                left.encode_utf16().cmp(right.encode_utf16())
+            });
+            output.push('{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).ok()?);
+                output.push(':');
+                write_native_input_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+    Some(())
 }
 
 fn event_is_pending_decision(entry: &JournalEvent, pending_ids: &BTreeSet<String>) -> bool {

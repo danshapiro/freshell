@@ -1427,6 +1427,111 @@ fn native_checkpoint_permission(native: &str, nonce: &str) -> Value {
 }
 
 #[tokio::test]
+async fn native_checkpoint_permission_uses_sidecar_canonical_input_digest() {
+    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    // Produced by the real sidecar's nativeInputDigest, independent of Rust's
+    // preserve_order object serialization. Both inputs describe the same tool.
+    let expected_digest = "bafc50edb15bf77d90042e6d09f6bf6e07c15dcbfc6f7074e3f47953feea9e98";
+    for raw in [
+        r#"{"description":"owned checkpoint","command":"printf safe","timeout":1000,"metadata":{"z":2,"a":[{"y":true,"x":"nested"}]}}"#,
+        r#"{"metadata":{"a":[{"x":"nested","y":true}],"z":2},"timeout":1000,"command":"printf safe","description":"owned checkpoint"}"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new(native);
+        *transport.native_evidence.lock().unwrap() =
+            Some(native_checkpoint_evidence(native, "current"));
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Claude, "canonical-input", None),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let mut payload = native_checkpoint_permission(native, "current");
+        payload["tool"]["input"] = serde_json::from_str(raw).unwrap();
+        payload["nativeCheckpoint"]["inputDigest"] = expected_digest.into();
+        let mut changed = payload.clone();
+        changed["tool"]["input"]["metadata"]["a"][0]["x"] = "changed".into();
+        assert_eq!(
+            actor
+                .record_permission("changed-input".into(), changed)
+                .await,
+            Err(ActorError::NativeIdentityMismatch),
+        );
+        actor
+            .record_permission("canonical-input".into(), payload)
+            .await
+            .expect("native checkpoint admits semantically identical reordered JSON input");
+        actor
+            .resolve_permission("canonical-input", serde_json::json!({"behavior":"allow"}))
+            .await
+            .unwrap();
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn native_checkpoint_permission_matches_javascript_numbers_and_utf16_key_order() {
+    let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    // Digests produced by nativeInputDigest in native-session-channel.mjs, so
+    // these exercise the sidecar's actual Number/string and key-order rules.
+    for (raw, expected_digest) in [
+        (
+            r#"{"command":"printf safe","timeout":0.000001}"#,
+            "beb19489d62b669da8f5f19c7b9df4b038cf808f64948586429527bf358ce05a",
+        ),
+        (
+            r#"{"command":"printf safe","timeout":100000000000000000000}"#,
+            "f5a7140b33af813ce35a4cf2969f689d35a50999576bca10c95a720427b9c49d",
+        ),
+        (
+            r#"{"command":"printf safe","metadata":{"\ue000":"bmp","\ud800\udc00":"supplementary"}}"#,
+            "748cb31e273a2671e731314e81b897d3f3c07250d3d9e447f76830cf234687fb",
+        ),
+        (
+            r#"{"command":"printf safe","metadata":{"2":"two","10":"ten"},"values":[-0,1.0,1e-7,1e21,0.000001,1e20,1.2345678901234567,9007199254740992],"text":"tab\tline\nquote\"slash\\\u2028"}"#,
+            "8b6596a036efe1ee1337cd595df6e6f82fd6c0f2d1a73b15a941f355b5377a29",
+        ),
+        (
+            r#"{"command":"printf safe","values":[51.248178375505404,-93.31137037688033,-36.573994842753436,52.314008204106244,97.45365320034685,2.0030397744267762e-253,7.101215824554616e+260,1.769268377902049e+74,-1.6727517818542075e+58,3.9287532173373315e+299]}"#,
+            "8d24c738124dc514c08beb6027d56d55805f6d585e2da5c7a0dd5095f8c08acf",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FakeTransport::new(native);
+        *transport.native_evidence.lock().unwrap() =
+            Some(native_checkpoint_evidence(native, "current"));
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Claude, "javascript-input", None),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let mut payload = native_checkpoint_permission(native, "current");
+        payload["tool"]["input"] = serde_json::from_str(raw).unwrap();
+        payload["nativeCheckpoint"]["inputDigest"] = expected_digest.into();
+        let mut changed = payload.clone();
+        changed["tool"]["input"]["command"] = "changed".into();
+        assert_eq!(
+            actor
+                .record_permission("changed-input".into(), changed)
+                .await,
+            Err(ActorError::NativeIdentityMismatch),
+        );
+        actor
+            .record_permission("javascript-input".into(), payload)
+            .await
+            .unwrap_or_else(|error| panic!("sidecar checkpoint rejected for {raw}: {error:?}"));
+        actor
+            .resolve_permission("javascript-input", serde_json::json!({"behavior":"allow"}))
+            .await
+            .unwrap();
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn genuine_current_native_checkpoint_rebinds_only_the_same_interrupted_operation() {
     let dir = tempfile::tempdir().unwrap();
     let native = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
