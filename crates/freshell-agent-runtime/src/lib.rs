@@ -2139,7 +2139,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
         );
     }
     let mut matches = Vec::new();
-    let mut incomplete_bodies = false;
+    let mut unresolved_absence = false;
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
     let mut visited = 0_usize;
     while let Some((path, depth)) = queue.pop_front() {
@@ -2222,6 +2222,21 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
                 None,
             );
         }
+        if matches!(provider, "claude" | "kilroy")
+            && (path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+                || path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|directory| directory == "subagents"))
+        {
+            // Native tool output and subagents accompany the primary transcript;
+            // subagent records can carry the parent's sessionId. They cannot
+            // count as another primary owner or prove the primary is absent.
+            unresolved_absence = true;
+            continue;
+        }
         let Ok((owner, complete)) = read_native_rollout_owner(&path, provider) else {
             return blocked(
                 RecoveryBlockReason::StoreUnreadable,
@@ -2230,16 +2245,16 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
                 None,
             );
         };
-        incomplete_bodies |= !complete;
+        unresolved_absence |= !complete;
         if owner == expected {
             matches.push(path.display().to_string());
         }
     }
     matches.sort();
     match matches.len() {
-        0 if incomplete_bodies => blocked(
+        0 if unresolved_absence => blocked(
             RecoveryBlockReason::StoreUnreadable,
-            "provider native history exceeds the bounded complete absence inspection",
+            "provider native history contains companion or incompletely inspected artifacts; exact-root absence is unresolved",
             vec![root.display().to_string()],
             None,
         ),
@@ -2891,6 +2906,72 @@ mod tests {
     #[test]
     fn recovery_store_large_exact_claude_transcript_remains_ready() {
         assert_large_exact_transcript_ready("claude");
+    }
+
+    #[test]
+    fn claude_exact_resume_survives_native_tool_and_subagent_companions() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/-workspace");
+        let artifacts = project.join("exact");
+        fs::create_dir_all(artifacts.join("tool-results")).unwrap();
+        fs::create_dir_all(artifacts.join("subagents")).unwrap();
+        fs::write(
+            project.join("exact.jsonl"),
+            native_rollout_for_test("claude", "exact", false),
+        )
+        .unwrap();
+        fs::write(
+            artifacts.join("tool-results/toolu_original.txt"),
+            "native tool output\n",
+        )
+        .unwrap();
+        fs::write(
+            artifacts.join("subagents/agent-child.meta.json"),
+            "{\"agentType\":\"Explore\"}",
+        )
+        .unwrap();
+        fs::write(
+            artifacts.join("subagents/agent-child.jsonl"),
+            native_rollout_for_test("claude", "exact", false),
+        )
+        .unwrap();
+        let spec = resume_spec_for_test("claude", "exact", home.path());
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::Ready { .. }
+        ));
+
+        // Companion evidence must not become proof that a missing native root
+        // is safe to replace, even if a subagent carries its parent's ID.
+        fs::remove_file(project.join("exact.jsonl")).unwrap();
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn claude_companion_filter_keeps_malformed_native_transcripts_blocked() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/-workspace");
+        fs::create_dir_all(project.join("exact/tool-results")).unwrap();
+        fs::write(
+            project.join("exact/tool-results/toolu_original.txt"),
+            "native output",
+        )
+        .unwrap();
+        fs::write(
+            project.join("exact.jsonl"),
+            "{ incomplete native transcript\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            probe_provider_store(
+                home.path(),
+                &resume_spec_for_test("claude", "exact", home.path())
+            ),
+            ProviderStoreProbe::Blocked { .. }
+        ));
     }
 
     #[test]
