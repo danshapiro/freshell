@@ -24,7 +24,8 @@ describe.runIf(process.platform === 'linux')('runtime Cargo artifact ownership',
 use std::{env,fs,path::PathBuf,thread,time::{Duration,Instant}};
 fn main() {
     let root=PathBuf::from(env::var_os("LOCK_FIXTURE_ROOT").unwrap());
-    fs::write(root.join("child-ready"),std::process::id().to_string()).unwrap();
+    fs::write(root.join("child-ready.tmp"),std::process::id().to_string()).unwrap();
+    fs::rename(root.join("child-ready.tmp"),root.join("child-ready")).unwrap();
     let deadline=Instant::now()+Duration::from_secs(45);
     while !root.join("child-release").exists() && Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
 }
@@ -45,7 +46,8 @@ import ctypes,json,os,pathlib,subprocess,sys,time
 assert ctypes.CDLL(None,use_errno=True).prctl(36,1,0,0,0)==0
 root=pathlib.Path(os.environ['LOCK_FIXTURE_ROOT'])
 result=subprocess.run(json.loads(sys.argv[1]),timeout=30)
-(root/'cargo-finished').write_text(str(result.returncode))
+(root/'cargo-finished.tmp').write_text(str(result.returncode))
+(root/'cargo-finished.tmp').rename(root/'cargo-finished')
 if result.returncode==0:
     deadline=time.monotonic()+5
     while not (root/'child-ready').exists():
