@@ -5619,6 +5619,16 @@ describe('finite retained fresh native collection', () => {
       expect(rig.fixtureRegistrationFacts().enabledProviders).toEqual([])
     } finally { await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
+  it('rejects a native approval retention gap before accepting a later checkpoint', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const permission = { kind: 'permission_requested', data: { payload: { nativeCheckpoint: { toolUseID: 'toolu_after_gap' } } } }
+    vi.spyOn(rig.runtime, 'adminOk').mockResolvedValue({ data: { head: 20, retainedFrom: 20, resetRequired: true,
+      events: [{ sequence: 20, event: permission }] } } as any)
+    const challenge = { soulId: 'owned-soul', cursor: 1, batches: [], events: [] }
+    await expect((rig as any).freshApprovalEvents(challenge, (event: any) => event.kind === 'permission_requested'))
+      .rejects.toThrow('native approval event retention gap')
+    expect(challenge).toEqual({ soulId: 'owned-soul', cursor: 1, batches: [], events: [] })
+  })
   it('drains native event pages without skipping the checkpoint beyond the first page', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
     let calls = 0
@@ -5626,7 +5636,7 @@ describe('finite retained fresh native collection', () => {
     vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, body) => {
       calls++
       expect(body.params.afterSequence).toBe(calls === 1 ? 0 : 2)
-      return { data: { head: 3, reset_required: false, events: calls === 1
+      return { data: { head: 3, resetRequired: false, events: calls === 1
         ? [1, 2].map(sequence => ({ sequence, event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.status' } } } } }))
         : [{ sequence: 3, event: permission }] } } as any
     })
@@ -5667,7 +5677,7 @@ describe('finite retained fresh native collection', () => {
     vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, request) => {
       expect(request.method).toBe('fresh_agent_read_events')
       const events = pending; pending = []; head += events.length
-      return { data: { head, reset_required: false, events: events.map((event, index) => ({ sequence: head - events.length + index + 1, event })) } } as any
+      return { data: { head, resetRequired: false, events: events.map((event, index) => ({ sequence: head - events.length + index + 1, event })) } } as any
     })
     const effect = path.join(directory, 'effect.jsonl')
     vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => {

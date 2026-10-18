@@ -6430,7 +6430,7 @@ export class ManagedRuntimeOwner {
   private async readFreshApprovalEvents(challenge: any): Promise<{ head: number; events: any[] }> {
     const batch = await this.runtime.adminOk(this.supervisor, { method: 'fresh_agent_read_events',
       params: { soulId: challenge.soulId, afterSequence: challenge.cursor, maxEvents: 128 } })
-    if (batch.data.reset_required) throw new Error('native approval event retention gap')
+    if (batch.data.resetRequired) throw new Error('native approval event retention gap')
     challenge.batches.push(batch)
     challenge.cursor = batch.data.events.at(-1)?.sequence ?? batch.data.head
     const events = batch.data.events.map((row: any) => row.event)
