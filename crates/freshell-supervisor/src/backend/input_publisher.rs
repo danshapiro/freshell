@@ -1033,9 +1033,20 @@ impl DockerEngineBackend {
             }
             Ok(())
         };
-        tokio::time::timeout(Duration::from_secs(5), cleanup)
+        // Exact helper removal belongs to the ordinary Docker request budget;
+        // a slower teardown must not reject an already accepted provider start.
+        tokio::time::timeout(DOCKER_REQUEST_TIMEOUT, cleanup)
             .await
-            .map_err(|_| fail("input publisher cleanup timed out"))?
+            .map_err(|_| {
+                tracing::warn!(
+                    event = "supervisor.docker.request_timeout",
+                    operation = "input_publisher_cleanup",
+                    helper_name = name,
+                    timeout_ms = DOCKER_REQUEST_TIMEOUT.as_millis() as u64,
+                    "Input publisher cleanup timed out"
+                );
+                fail("input publisher cleanup timed out")
+            })?
     }
 
     async fn cleanup_input_volume(
@@ -1529,6 +1540,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_input_publisher_commit_accepts_owned_removal_within_docker_request_budget() {
+        publication_fixture(PublicationCase::WarmSlowCommit).await;
+    }
+
+    #[tokio::test]
+    async fn provider_input_publisher_commit_retains_ownership_after_unresponsive_removal() {
+        publication_fixture(PublicationCase::WarmUnresponsiveCommit).await;
+    }
+
+    #[tokio::test]
     async fn provider_input_publisher_cold_backend_repopulates_confirmed_undispatched_generation() {
         publication_fixture(PublicationCase::ColdRetry).await;
     }
@@ -1543,6 +1564,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PublicationCase {
         WarmCommit,
+        WarmSlowCommit,
+        WarmUnresponsiveCommit,
         WarmAbort,
         WarmReplacementRetry,
         ColdRetry,
@@ -1574,6 +1597,8 @@ mod tests {
         let cold = !matches!(
             case,
             PublicationCase::WarmCommit
+                | PublicationCase::WarmSlowCommit
+                | PublicationCase::WarmUnresponsiveCommit
                 | PublicationCase::WarmAbort
                 | PublicationCase::WarmReplacementRetry
         );
@@ -1778,6 +1803,23 @@ mod tests {
                             None => (404, String::new()),
                         }
                     } else if request.starts_with("DELETE ") {
+                        if matches!(case, PublicationCase::WarmSlowCommit) {
+                            // Docker can acknowledge an exact helper removal
+                            // after five seconds while ordinary requests still
+                            // remain inside their shared elapsed-time budget.
+                            tokio::time::sleep(Duration::from_secs(6)).await;
+                        }
+                        if matches!(case, PublicationCase::WarmUnresponsiveCommit)
+                            && seen
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|(request, _)| request.starts_with("DELETE "))
+                                .count()
+                                == 1
+                        {
+                            std::future::pending::<()>().await;
+                        }
                         *created.lock().unwrap() = None;
                         (204, String::new())
                     } else {
@@ -1801,32 +1843,32 @@ mod tests {
             !helper.lock().unwrap().as_ref().unwrap().is_finished(),
             "publisher must pin completed tmpfs before workload creation"
         );
+        let handle = |candidate: &CreateRuntimeSpec| {
+            OwnedRuntimeHandle::from_registry(
+                candidate.installation_id.clone(),
+                candidate.soul_id.clone(),
+                "store".into(),
+                candidate.incarnation_id.clone(),
+                freshell_runtime_protocol::LaunchNonce::new(),
+                DockerDaemonId::parse("input-publisher-daemon").unwrap(),
+                "c".repeat(64),
+                candidate.image_ref.clone(),
+                candidate.runtime_dir.clone(),
+                binary.clone(),
+                digest_expected(&ExpectedConfig::new(
+                    candidate,
+                    &binary,
+                    &candidate.runtime_dir,
+                ))
+                .unwrap(),
+                candidate.limits,
+                None,
+                candidate.terminal.clone(),
+                None,
+                candidate.provider_volume_name.clone(),
+            )
+        };
         if matches!(case, PublicationCase::WarmReplacementRetry) {
-            let handle = |candidate: &CreateRuntimeSpec| {
-                OwnedRuntimeHandle::from_registry(
-                    candidate.installation_id.clone(),
-                    candidate.soul_id.clone(),
-                    "store".into(),
-                    candidate.incarnation_id.clone(),
-                    freshell_runtime_protocol::LaunchNonce::new(),
-                    DockerDaemonId::parse("input-publisher-daemon").unwrap(),
-                    "c".repeat(64),
-                    candidate.image_ref.clone(),
-                    candidate.runtime_dir.clone(),
-                    binary.clone(),
-                    digest_expected(&ExpectedConfig::new(
-                        candidate,
-                        &binary,
-                        &candidate.runtime_dir,
-                    ))
-                    .unwrap(),
-                    candidate.limits,
-                    None,
-                    candidate.terminal.clone(),
-                    None,
-                    candidate.provider_volume_name.clone(),
-                )
-            };
             let prior = handle(&spec);
             backend
                 .discard_stopped_provider_inputs(&prior)
@@ -1894,32 +1936,7 @@ mod tests {
             *over_capacity.lock().unwrap() = capacity;
             std::fs::write(&source, b"FRESH_APPROVED_PUBLISHER_BYTES").unwrap();
             let result = if retirement {
-                let make_handle = |candidate: &CreateRuntimeSpec| {
-                    crate::registry::OwnedRuntimeHandle::from_registry(
-                        candidate.installation_id.clone(),
-                        candidate.soul_id.clone(),
-                        "store".into(),
-                        candidate.incarnation_id.clone(),
-                        freshell_runtime_protocol::LaunchNonce::new(),
-                        DockerDaemonId::parse("input-publisher-daemon").unwrap(),
-                        "c".repeat(64),
-                        candidate.image_ref.clone(),
-                        candidate.runtime_dir.clone(),
-                        binary.clone(),
-                        digest_expected(&ExpectedConfig::new(
-                            candidate,
-                            &binary,
-                            &candidate.runtime_dir,
-                        ))
-                        .unwrap(),
-                        candidate.limits,
-                        None,
-                        candidate.terminal.clone(),
-                        None,
-                        candidate.provider_volume_name.clone(),
-                    )
-                };
-                let prior = make_handle(&spec);
+                let prior = handle(&spec);
                 let mut next = spec.clone();
                 next.incarnation_id = IncarnationId::parse("incarnation-current").unwrap();
                 let context = next
@@ -1942,7 +1959,7 @@ mod tests {
                     "grant-current",
                 );
                 fresh
-                    .retire_prior_prepared_inputs(&make_handle(&next), &prior)
+                    .retire_prior_prepared_inputs(&handle(&next), &prior)
                     .await
             } else if accepted {
                 fresh
@@ -2043,6 +2060,39 @@ mod tests {
             .contains(&json!("INHERITED_TOKEN=")));
         if abort {
             backend.abort_indexed_publication(&spec).await.unwrap();
+        } else if matches!(
+            case,
+            PublicationCase::WarmSlowCommit | PublicationCase::WarmUnresponsiveCommit
+        ) {
+            if matches!(case, PublicationCase::WarmUnresponsiveCommit) {
+                let failed = tokio::time::timeout(
+                    DOCKER_REQUEST_TIMEOUT + Duration::from_secs(2),
+                    backend.commit_prepared_inputs(&handle(&spec)),
+                )
+                .await
+                .expect("unresponsive Docker removal must remain bounded");
+                assert!(matches!(failed, Err(BackendError::Unavailable(_))));
+                assert!(backend
+                    .input_publishers
+                    .lock()
+                    .unwrap()
+                    .contains_key(&volume_name));
+                assert!(created.lock().unwrap().is_some());
+                assert_eq!(
+                    std::fs::read(volume_root.join("files/source-0")).unwrap(),
+                    b"PRIVATE_PUBLISHER_SENTINEL"
+                );
+            }
+            backend
+                .commit_prepared_inputs(&handle(&spec))
+                .await
+                .expect("accepted provider startup must survive bounded owned-helper removal");
+            assert!(backend.input_publishers.lock().unwrap().is_empty());
+            assert!(created.lock().unwrap().is_none());
+            assert_eq!(
+                std::fs::read(volume_root.join("files/source-0")).unwrap(),
+                b"PRIVATE_PUBLISHER_SENTINEL"
+            );
         } else {
             backend
                 .release_indexed_publication(
