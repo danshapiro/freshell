@@ -91,12 +91,23 @@ owned_tmp="$(mktemp -d /freshell-test-artifacts/.freshell-rust-tests-XXXXXXXX)"
 owned_runtime_tmp="$owned_tmp"
 runner_pid=
 remove_owned_temps() {
+  # Transfer fixtures deliberately seal ready directories. Restore only owner
+  # directory writes within our two roots; never follow links to other data.
+  for directory in "$owned_tmp" "$owned_runtime_tmp"; do
+    # Signal cleanup can run before EXIT cleanup; an absent root is settled.
+    if [ -d "$directory" ]; then
+      find -P "$directory" -type d -uid "$(id -u)" -exec chmod u+w -- {} + || return 1
+    fi
+  done
   rm -rf -- "$owned_tmp" "$owned_runtime_tmp"
 }
 cleanup() {
   status=$?
   trap - EXIT
-  remove_owned_temps || { [ "$status" -ne 0 ] || status=1; }
+  remove_owned_temps || {
+    printf '{"severity":"error","event":"rust_test_temp_cleanup_failed"}\\n' >&2
+    [ "$status" -ne 0 ] || status=1
+  }
   exit "$status"
 }
 interrupt() {
