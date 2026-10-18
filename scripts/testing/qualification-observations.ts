@@ -6,7 +6,7 @@ import { readOpenCodeNativeObservation } from '../../test/e2e-browser/helpers/pr
 import { readClaudeNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/claude.js'
 import { readAmplifierNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/amplifier.js'
 import { readBoundedJsonl, readBoundedJsonlWithPositions } from '../../test/e2e-browser/helpers/provider-native-history/safe-io.js'
-import type { NativeAssistantTurn, NativeHistory } from './provider-native-history.js'
+import { hasSuccessfulNativeAnswer, type NativeAssistantTurn, type NativeHistory } from './provider-native-history.js'
 
 export const NATIVE_RECOVERY_ORIGINALS_FILE = 'native-recovery-originals.json'
 export type NativeOriginalReference = { path: string; sha256: string }
@@ -311,6 +311,7 @@ export function deriveNativeRecoveryOriginals(input: {
       equal(newInputs[0]!.text, prompt, 'native request/input text')
       const turn = turns[0]!, completedAt = timestamp(turn.completedAt, 'native completion')
       if (completedAt < sentAt || turn.toolCalls.length) throw new Error('native completion precedes dispatch or includes tools')
+      if (!hasSuccessfulNativeAnswer(turn, provider)) throw new Error('native completion failed or contains no assistant answer')
       if (provider === 'codex') equal(turn.turnId, newInputs[0]!.id, 'native input/completed turn')
       if (provider === 'opencode' || provider === 'claude') equal(turn.parentMessageId, newInputs[0]!.id, 'native assistant/user parent')
       if (provider === 'amplifier') {

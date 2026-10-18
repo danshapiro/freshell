@@ -305,7 +305,15 @@ function opencodeFixture() {
     finally { db.close() }
     refreshStage(index); write('native-recovery-originals.json', original)
   }
-  return { derive, replaceResponse }
+  const failResponse = (index: number) => {
+    const db = new DatabaseSync(path.join(input.evidenceDir, stages[index]!.nativeFile.path))
+    try {
+      db.prepare("UPDATE message SET data=json_set(data, '$.error', json(?)) WHERE id=?")
+        .run(JSON.stringify({ name: 'APIError', data: { message: 'provider turn failed' } }), `assistant-${index}`)
+    } finally { db.close() }
+    refreshStage(index); write('native-recovery-originals.json', original)
+  }
+  return { derive, replaceResponse, failResponse }
 }
 
 function amplifierFixture(observed = false, atomicSaves = false) {
@@ -363,6 +371,13 @@ function amplifierFixture(observed = false, atomicSaves = false) {
 }
 
 describe('qualification from private native originals', () => {
+  it('rejects a failed native OpenCode recovery turn even when its partial answer recalls the marker', () => {
+    const { derive, failResponse } = opencodeFixture()
+    expect(derive()).toHaveLength(1)
+    failResponse(2)
+    expect(derive).toThrow(/native completion failed/)
+  })
+
   it.each([2, 3])('derives %i Amplifier atomic-save recovery stages with complete prior history', count => {
     const { input, stages, original, conversation, write, derive } = amplifierFixture(true, true)
     const snapshots = stages.map(stage => JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8')).snapshot)
