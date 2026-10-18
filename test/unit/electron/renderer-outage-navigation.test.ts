@@ -9,18 +9,22 @@ const refused = () => Object.assign(new Error('ERR_CONNECTION_REFUSED'), { code:
 
 function cachedOfflineWindow() {
   let cachedDocument = true
+  let workerShell = true
   const window = {
-    webContents: { session: { clearCache: vi.fn(async () => { cachedDocument = false }) } },
+    webContents: { session: {
+      clearCache: vi.fn(async () => { cachedDocument = false }),
+      clearStorageData: vi.fn(async () => { workerShell = false }),
+    } },
     loadURL: vi.fn(async (_url: string) => {
       // Chromium can mount cached Freshell bytes while its API bootstrap fails.
-      if (!cachedDocument) throw refused()
+      if (!cachedDocument && !workerShell) throw refused()
     }),
   }
   return window
 }
 
 describe('renderer outage navigation fault', () => {
-  it('establishes a real network failure even when the app document is cached', async () => {
+  it('isolates HTTP and worker cached documents before native navigation', async () => {
     const window = cachedOfflineWindow()
     await expect(navigateToUnavailableEndpoint(window, url)).resolves.toEqual({ code: 'ERR_CONNECTION_REFUSED', errno: -102 })
     expect(window.loadURL).toHaveBeenCalledExactlyOnceWith(url)
@@ -47,6 +51,30 @@ describe('renderer outage navigation fault', () => {
     window.webContents.session.clearCache.mockRejectedValueOnce(failure)
     await expect(navigateToUnavailableEndpoint(window, url)).rejects.toBe(failure)
     expect(window.loadURL).not.toHaveBeenCalled()
+  })
+
+  it('does not navigate before worker storage isolation completes', async () => {
+    const window = cachedOfflineWindow()
+    let isolate!: () => void
+    const clear = window.webContents.session.clearStorageData.getMockImplementation()!
+    window.webContents.session.clearStorageData.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { isolate = resolve })
+      await clear()
+    })
+    const navigation = navigateToUnavailableEndpoint(window, url)
+    await vi.waitFor(() => expect(isolate).toBeTypeOf('function'))
+    expect(window.loadURL).not.toHaveBeenCalled()
+    isolate()
+    await expect(navigation).resolves.toEqual({ code: 'ERR_CONNECTION_REFUSED', errno: -102 })
+  })
+
+  it('preserves a worker-storage failure and its diagnostics without navigating', async () => {
+    const window = observedWindow(), failure = new Error('worker isolation failed')
+    window.webContents.session.clearStorageData.mockRejectedValueOnce(failure)
+    await expect(navigateToUnavailableEndpoint(window, { url, deadline: Date.now() + 1000 })).rejects.toBe(failure)
+    expect(window.loadURL).not.toHaveBeenCalled()
+    expect(window.__freshellOutageObservation).toMatchObject({ cache: 'fulfilled', storage: 'rejected', promise: { state: 'not-started' } })
+    expect(window.webContents.eventNames()).toEqual([])
   })
 
   it('refuses to count a successful app document as a native network failure', async () => {
@@ -95,7 +123,7 @@ describe('outage navigation retained failure observations', () => {
 function observedWindow() {
   const document = { documentURI: url, readyState: 'complete', getElementById: () => ({ childElementCount: 1 }) }
   const webContents = Object.assign(new EventEmitter(), {
-    id: 19, session: { clearCache: vi.fn(async () => {}) },
+    id: 19, session: { clearCache: vi.fn(async () => {}), clearStorageData: vi.fn(async () => {}) },
     getURL: vi.fn(() => url), getOSProcessId: () => 22,
     isLoading: () => true, isLoadingMainFrame: () => true,
     executeJavaScript: vi.fn(async (script: string) => runInNewContext(script, { document })),
@@ -109,7 +137,7 @@ afterEach(() => { vi.useRealTimers() })
 describe('bounded native outage observations', () => {
   it('runs both native callback serialized shapes in a fresh realm without transpiler helpers', async () => {
     const window = observedWindow()
-    const navigate = runInNewContext(`(${navigateToUnavailableEndpoint.toString()})`, { setTimeout, clearTimeout, process: { pid: 11 } })
+    const navigate = runInNewContext(`(${navigateToUnavailableEndpoint.toString()})`, { setTimeout, clearTimeout, URL, process: { pid: 11 } })
     const read = runInNewContext(`(${readOutageNavigationObservation.toString()})`)
     await expect(navigate(window, { url, deadline: Date.now() + 1000 })).resolves.toEqual({ code: 'ERR_CONNECTION_REFUSED', errno: -102 })
     expect(read(window).observation.promise.state).toBe('rejected')

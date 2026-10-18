@@ -5,7 +5,10 @@ interface OutageWindow {
   id?: number
   webContents: {
     id?: number
-    session: { clearCache(): Promise<void> }
+    session: {
+      clearCache(): Promise<void>
+      clearStorageData(options: { origin: string; storages: Array<'serviceworkers' | 'cachestorage'> }): Promise<void>
+    }
     getURL?(): string
     getOSProcessId?(): number
     isLoading?(): boolean
@@ -38,7 +41,7 @@ export async function navigateToUnavailableEndpoint(window: OutageWindow, input:
   const deadline = typeof input === 'string' ? 0 : input.deadline
   const observation: Record<string, any> | undefined = typeof input === 'string' ? undefined : {
     startedAt: Date.now(), windowId: window.id, webContentsId: window.webContents.id,
-    cache: 'pending', promise: { state: 'not-started' }, events: [], diagnosticErrors: [],
+    cache: 'pending', storage: 'not-started', promise: { state: 'not-started' }, events: [], diagnosticErrors: [],
     document: { unavailable: 'not-observed' },
   }
   const listeners: Array<[string, (...args: any[]) => void]> = []
@@ -95,9 +98,13 @@ export async function navigateToUnavailableEndpoint(window: OutageWindow, input:
     } catch (error) { observation.diagnosticErrors.push(diagnostics.text(error)) }
   }
   try {
-    // Preserve the original cache eviction and native promise decision exactly.
+    // HTTP cache eviction alone leaves Freshell's offline worker shell usable.
+    // Isolate that fixture fallback before the same native navigation.
     await window.webContents.session.clearCache()
-    if (observation) { observation.cache = 'fulfilled'; observation.promise = { state: 'pending', at: Date.now() } }
+    if (observation) { observation.cache = 'fulfilled'; observation.storage = 'pending' }
+    await window.webContents.session.clearStorageData({ origin: new URL(url).origin,
+      storages: ['serviceworkers', 'cachestorage'] })
+    if (observation) { observation.storage = 'fulfilled'; observation.promise = { state: 'pending', at: Date.now() } }
     try {
       await window.loadURL(url)
       if (observation) observation.promise = { state: 'fulfilled', at: Date.now() }
@@ -114,6 +121,7 @@ export async function navigateToUnavailableEndpoint(window: OutageWindow, input:
   } finally {
     if (observation) {
       if (observation.cache === 'pending') observation.cache = 'rejected'
+      if (observation.storage === 'pending') observation.storage = 'rejected'
       try {
         // Retain late native callbacks without reclassifying a fulfilled await.
         const remaining = Math.min(250, deadline - Date.now())
