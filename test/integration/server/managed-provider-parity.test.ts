@@ -6,6 +6,7 @@ import WebSocket from 'ws'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
+import { RUNTIME_PREPARATION_TIMEOUT_MS } from '../../../scripts/testing/runtime-preparation.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from './provider-parity-onecli.js'
 
@@ -288,6 +289,7 @@ describe('ordinary and managed terminal provider parity', () => {
         amplifier: { model: 'glm-5.3', effort: 'provider-default' },
       },
     }, webHome)
+    await rig.prepare()
     await rig.start()
     for (const [directory, filename, content] of [
       ['.claude', 'settings.json', JSON.stringify({ paritySetting: true })],
@@ -309,7 +311,7 @@ describe('ordinary and managed terminal provider parity', () => {
       fs.mkdirSync(path.dirname(target), { recursive: true })
       fs.writeFileSync(target, content)
     }
-  }, 900_000)
+  }, RUNTIME_PREPARATION_TIMEOUT_MS + 900_000)
 
   beforeEach(() => {
     // Vitest shuffles cases. Each case sees the same user-owned inputs even

@@ -6,6 +6,7 @@ import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
+import { RUNTIME_PREPARATION_TIMEOUT_MS } from '../../../scripts/testing/runtime-preparation.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from './provider-parity-onecli.js'
 
@@ -87,6 +88,7 @@ describe('hosted fresh-agent provider inputs', () => {
       freshAgentModes: providers.map(row => row.sessionType),
       fixtureFreshAgentModes: providers.map(row => row.sessionType),
     }, homeDir)
+    await rig.prepare()
     await rig.start()
     opencodeProject = fs.mkdtempSync(path.join(root, '.opencode-parity-'))
     fs.mkdirSync(path.join(opencodeProject, '.opencode'), { recursive: true })
@@ -114,7 +116,7 @@ describe('hosted fresh-agent provider inputs', () => {
     const opencodePlugin = path.join(rig.info.homeDir, 'custom-xdg/opencode/plugin')
     fs.mkdirSync(opencodePlugin, { recursive: true, mode: 0o755 })
     fs.writeFileSync(path.join(opencodePlugin, 'user-plugin.ts'), 'export const User = async () => ({})\n')
-  }, 900_000)
+  }, RUNTIME_PREPARATION_TIMEOUT_MS + 900_000)
 
   afterAll(async () => {
     await Promise.allSettled(wires.map(wire => wire.close()))

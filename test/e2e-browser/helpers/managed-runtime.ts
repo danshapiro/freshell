@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+import type { RuntimePreparation, RuntimePreparationPolicy } from '../../../scripts/testing/runtime-preparation.js'
 import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
 import {
   buildProviderQualificationReceipt,
@@ -75,6 +75,7 @@ export class ManagedRuntimeBrowserRig {
   web!: RustServer
   info!: TestServerInfo
   private serverBin = ''
+  private preparation: Promise<void> | undefined
   private readonly serverEnv: Record<string, string>
   private readonly webHomeDir: string | undefined
   private readonly resolvedOperatorHome: string | undefined
@@ -138,12 +139,17 @@ export class ManagedRuntimeBrowserRig {
     return this.resolvedOperatorHome
   }
 
-  async start(): Promise<TestServerInfo> {
-    await this.runtime.prepare(this.resolvedOperatorHome === undefined
-      ? {}
-      : { operatorHome: this.resolvedOperatorHome })
-    this.qualificationSupervisorBin = this.buildQualificationSupervisor()
-    this.serverBin = this.buildManagedServer()
+  prepare(policy: RuntimePreparationPolicy = {}): Promise<void> {
+    this.preparation ??= this.runtime.prepare(
+      { ...policy, operatorHome: this.resolvedOperatorHome },
+      preparation => this.prepareManagedSources(preparation),
+    )
+    return this.preparation
+  }
+
+  private async prepareManagedSources(preparation: RuntimePreparation): Promise<void> {
+    this.qualificationSupervisorBin = await this.buildQualificationSupervisor(preparation)
+    this.serverBin = await this.buildManagedServer(preparation)
     const selected = this.pendingQualificationProviders()
     this.runtime.recordProviderQualificationBuild({
       kind: selected.length ? 'qualification_fixture' : 'production',
@@ -176,6 +182,10 @@ export class ManagedRuntimeBrowserRig {
           : this.runtime.releaseHostBinary,
       })
     }
+  }
+
+  async start(): Promise<TestServerInfo> {
+    await this.prepare()
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: 'browser-managed-runtime',
       binaryKind: this.supervisorBinaryKind,
@@ -507,32 +517,30 @@ export class ManagedRuntimeBrowserRig {
     return canonical
   }
 
-  private buildManagedServer(): string {
+  private async buildManagedServer(preparation: RuntimePreparation): Promise<string> {
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
     const qualification = this.pendingQualificationProviders()
-    execFileSync(mise, [
+    await preparation.run(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
       '--features', this.fixtureFreshAgentModes.length > 0
         ? 'managed-fresh-agent-fixtures'
         : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
+    ], { cwd: this.repoRoot, inherit: true })
     const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
-    fs.copyFileSync(source, target)
-    fs.chmodSync(target, 0o755)
+    await preparation.copy(source, target)
     return target
   }
 
-  private buildQualificationSupervisor(): string | undefined {
+  private async buildQualificationSupervisor(preparation: RuntimePreparation): Promise<string | undefined> {
     if (this.pendingQualificationProviders().length === 0) return undefined
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, [
+    await preparation.run(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
       '--features', 'provider-qualification',
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
+    ], { cwd: this.repoRoot, inherit: true })
     const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
-    fs.copyFileSync(path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
-    fs.chmodSync(target, 0o755)
+    await preparation.copy(path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
     return target
   }
 

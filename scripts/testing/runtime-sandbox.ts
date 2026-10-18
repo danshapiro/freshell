@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
+import { RuntimePreparation, type RuntimePreparationPolicy } from './runtime-preparation.js'
 import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
@@ -159,7 +160,27 @@ export class RuntimeHarness {
     this.browserDir = path.join(this.evidenceDir, 'browser')
   }
 
-  async prepare(options: { operatorHome?: string } = {}): Promise<void> {
+  async prepare(
+    options: RuntimePreparationPolicy & { operatorHome?: string } = {},
+    prepareManagedSources?: (preparation: RuntimePreparation) => Promise<void>,
+  ): Promise<void> {
+    const preparation = new RuntimePreparation(options)
+    try {
+      preparation.check()
+      await this.prepareSources(options, preparation)
+      await prepareManagedSources?.(preparation)
+      preparation.check()
+      this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: this.broker.proxySocketPath })
+    } catch (error) {
+      const cleanup = await this.cleanup()
+      if (!cleanup.ok) throw new AggregateError([error, ...cleanup.errors], 'runtime preparation failed and cleanup was incomplete')
+      throw error
+    } finally {
+      preparation.close()
+    }
+  }
+
+  private async prepareSources(options: { operatorHome?: string }, preparation: RuntimePreparation): Promise<void> {
     fs.rmSync(this.testRoot, { recursive: true, force: true })
     fs.mkdirSync(this.testRoot, { recursive: true, mode: 0o700 })
     ensurePrivateDirectory(this.evidenceDir)
@@ -205,8 +226,8 @@ export class RuntimeHarness {
     writePrivateJson(path.join(this.evidenceDir, 'provider-results.json'), providerResults)
 
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
-    this.ensureRuntimeImage()
-    this.buildBinaries()
+    await this.ensureRuntimeImage(preparation)
+    await this.buildBinaries(preparation)
 
     const realSocketPath = dockerSocketPath()
     const proxySocketPath = path.join(this.testRoot, 'broker', 'docker.sock')
@@ -224,13 +245,13 @@ export class RuntimeHarness {
       testRunId: this.runId,
       logPath: path.join(this.evidenceDir, 'broker.jsonl'),
     })
-    await this.broker.start()
     this.brokerStarted = true
+    await this.broker.start()
+    preparation.check()
 
     writePrivateJson(path.join(this.evidenceDir, 'ownership-before.json'), { brokerReceipts: [], trackedContainers: [] })
-    writePrivateJson(path.join(this.evidenceDir, 'capabilities.json'), this.collectCapabilities())
-    writePrivateJson(path.join(this.evidenceDir, 'build.json'), this.collectBuildInfo())
-    this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: proxySocketPath })
+    writePrivateJson(path.join(this.evidenceDir, 'capabilities.json'), await this.collectCapabilities(preparation))
+    writePrivateJson(path.join(this.evidenceDir, 'build.json'), await this.collectBuildInfo(preparation))
   }
 
   async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
@@ -1016,35 +1037,27 @@ export class RuntimeHarness {
     return execFileSync(command, args, { cwd: options.cwd ?? this.repoRoot, env: { ...process.env, ...options.env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 })
   }
 
-  private ensureRuntimeImage(): void {
+  private async ensureRuntimeImage(preparation: RuntimePreparation): Promise<void> {
     const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : PHASE2_RUNTIME_IMAGE_TAG
-    let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+    let imageRef: string | undefined
     if (this.phase === 1) {
-      if (inspect.status !== 0) {
-        docker(['pull', tag])
-        inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+      try {
+        imageRef = (await preparation.run('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'])).trim()
+      } catch {
+        preparation.check()
+        await preparation.run('docker', ['pull', tag], { inherit: true })
       }
     } else {
-      // Always invoke the Phase 2 build so Docker validates the current
-      // Dockerfile/provider pins. Layer caching keeps unchanged rebuilds cheap.
-      // BuildKit provenance captures the whole context digest, including files
-      // the image never copies, and therefore changes the manifest-list ID for
-      // an otherwise identical workload image. Disable attestations here so
-      // the exact image identity is a reproducible digest of the image itself.
-      execFileSync('docker', [
-        'build',
-        '--pull=false',
-        '--provenance=false',
-        '--sbom=false',
-        '-f',
-        'docker/runtime/Dockerfile',
-        '-t',
-        tag,
-        '.',
-      ], { cwd: this.repoRoot, stdio: 'inherit' })
-      inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+      // Always validate the current Dockerfile/provider pins. Ordinary Docker
+      // layers remain an optimization of the required current-source build.
+      // Disable provenance/SBOM attestations so files the image never copies
+      // do not change its identity through BuildKit's whole-context digest.
+      await preparation.run('docker', [
+        'build', '--pull=false', '--provenance=false', '--sbom=false',
+        '-f', 'docker/runtime/Dockerfile', '-t', tag, '.',
+      ], { cwd: this.repoRoot, inherit: true })
     }
-    this.imageRef = inspect.stdout.trim()
+    this.imageRef = imageRef ?? (await preparation.run('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'])).trim()
     if (!/^sha256:[0-9a-f]{64}$/.test(this.imageRef)) throw new Error(`runtime image is not pinned: ${this.imageRef}`)
   }
 
@@ -1072,28 +1085,24 @@ export class RuntimeHarness {
     return roots
   }
 
-  private buildBinaries(): void {
+  private async buildBinaries(preparation: RuntimePreparation): Promise<void> {
     fs.mkdirSync(this.buildDir, { recursive: true })
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
+    await preparation.run(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, inherit: true })
     this.testSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-test')
     this.testHostBinary = path.join(this.buildDir, 'freshell-session-host-test')
-    fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-supervisor'), this.testSupervisorBinary)
-    fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-session-host'), this.testHostBinary)
-    fs.chmodSync(this.testSupervisorBinary, 0o755)
-    fs.chmodSync(this.testHostBinary, 0o755)
+    await preparation.copy(path.join(this.repoRoot, 'target/debug/freshell-supervisor'), this.testSupervisorBinary)
+    await preparation.copy(path.join(this.repoRoot, 'target/debug/freshell-session-host'), this.testHostBinary)
 
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, stdio: 'inherit' })
+    await preparation.run(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, inherit: true })
     this.releaseSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-release')
     this.releaseHostBinary = path.join(this.buildDir, 'freshell-session-host-release')
-    fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-supervisor'), this.releaseSupervisorBinary)
-    fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-session-host'), this.releaseHostBinary)
-    fs.chmodSync(this.releaseSupervisorBinary, 0o755)
-    fs.chmodSync(this.releaseHostBinary, 0o755)
+    await preparation.copy(path.join(this.repoRoot, 'target/release/freshell-supervisor'), this.releaseSupervisorBinary)
+    await preparation.copy(path.join(this.repoRoot, 'target/release/freshell-session-host'), this.releaseHostBinary)
   }
 
-  private collectCapabilities(): unknown {
-    const info = JSON.parse(docker(['info', '--format', '{{json .}}']))
+  private async collectCapabilities(preparation: RuntimePreparation): Promise<unknown> {
+    const info = JSON.parse(await preparation.run('docker', ['info', '--format', '{{json .}}']))
     return {
       docker: {
         serverVersion: info.ServerVersion,
@@ -1111,15 +1120,15 @@ export class RuntimeHarness {
     }
   }
 
-  private collectBuildInfo(): unknown {
+  private async collectBuildInfo(preparation: RuntimePreparation): Promise<unknown> {
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    const rustc = execFileSync(mise, ['exec', 'rust@1.96', '--', 'rustc', '--version'], { encoding: 'utf8' }).trim()
+    const rustc = (await preparation.run(mise, ['exec', 'rust@1.96', '--', 'rustc', '--version'])).trim()
     return {
       candidateSha: this.candidateSha,
       runtimeImage: this.imageRef,
       rustc,
       node: process.version,
-      docker: docker(['version', '--format', 'client={{.Client.Version}} server={{.Server.Version}}']).trim(),
+      docker: (await preparation.run('docker', ['version', '--format', 'client={{.Client.Version}} server={{.Server.Version}}'])).trim(),
       binaries: {
         testSupervisor: fileBuild(this.testSupervisorBinary),
         testHost: fileBuild(this.testHostBinary),

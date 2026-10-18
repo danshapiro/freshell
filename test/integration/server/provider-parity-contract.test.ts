@@ -5,6 +5,7 @@ import {
   PROVIDER_PARITY_CASE_IDS,
   type ProviderParityReceipt,
 } from '../../../scripts/testing/provider-parity-receipt.js'
+import { RUNTIME_PREPARATION_TIMEOUT_MS } from '../../../scripts/testing/runtime-preparation.js'
 import { runProviderParityFixture } from './provider-parity-fixture.js'
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..')
@@ -14,7 +15,7 @@ describe('direct and managed provider parity contract', () => {
 
   beforeAll(async () => {
     receipt = await runProviderParityFixture(repoRoot)
-  }, 1_800_000)
+  }, 2 * RUNTIME_PREPARATION_TIMEOUT_MS + 1_800_000)
 
   it.each(PROVIDER_PARITY_CASE_IDS)('%s has a provider-visible direct and managed trace', caseId => {
     const row = receipt.rows.find(candidate => candidate.caseId === caseId)
