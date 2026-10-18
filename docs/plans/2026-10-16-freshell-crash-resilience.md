@@ -567,7 +567,7 @@ git commit -m "fix: resume Electron recovery after bounded cooldowns"
 - Produces: `createRecoverableWindow({createNativeWindow, options, onWebContentsChanged, logger}): BrowserWindowLike` with `verifyRendererReady(loadUrl)` and `cancelRecovery()` methods.
 - Produces: main `StartupResult.disposeRendererRecovery(): void`; permanent disposal clears controller timers and aborts current native/load/verification work. Attempt deadline retirement allows future retries. Main startup installs listeners before `loadURL` and passes an actual native verifier. Logical close, new launch generation and quit dispose; retiring old native windows and hide-to-tray do not.
 
-- [ ] **Step 1: Add failing readiness, adapter and startup behavior tests**
+- [x] **Step 1: Add failing readiness, adapter and startup behavior tests**
 
 Create `test/unit/electron/renderer-readiness.test.ts`:
 
@@ -802,7 +802,7 @@ Add behavioral cases alongside these drafts for an active native load and a cand
 
 Add a fake-clock regression in which each valid navigation/mount takes longer than the initial 10,000 ms budget: after the first timeout, an automatically retried attempt must receive the increased budget and succeed without another event. Cover repeated deadline expirations and cooldowns retaining the increased budget, verified success resetting it, and logical disposal cancelling promptly at any budget. Do not replace this with a fast mock or a timing override. The first-attempt timeout drafts above still exercise the initial budget.
 
-- [ ] **Step 2: Run red**
+- [x] **Step 2: Run red**
 
 ```bash
 pnpm run test:vitest run test/unit/electron/renderer-readiness.test.ts test/unit/electron/recoverable-window.test.ts test/unit/electron/startup.test.ts test/unit/electron/main.test.ts --config config/vitest/vitest.electron.config.ts
@@ -810,7 +810,7 @@ pnpm run test:vitest run test/unit/electron/renderer-readiness.test.ts test/unit
 
 Expected: new modules are absent initially; then the meaningful startup case fails because listeners are installed after the first navigation. Confirm these intended missing behaviors, rather than counting a syntax/fixture failure as red evidence.
 
-- [ ] **Step 3: Implement actual native readiness, complete-attempt ownership and startup wiring**
+- [x] **Step 3: Implement actual native readiness, complete-attempt ownership and startup wiring**
 
 Extract only the existing native adapter and tiny listener types from `entry.ts` into `recoverable-window.ts`, keeping the native constructor injectable for meaningful adapter tests. Give that existing logical owner one finite cancellable attempt spanning native load/replacement and readiness. Apply Stage 2 decision 8's adaptive budget before awaiting any native navigation; readiness polling consumes the remaining budget rather than resetting it after navigation. Timeout growth must persist across retries/cooldowns and must not impose the same deadline forever on a slow valid load. A hung `loadURL` or evaluation must reject on deadline/cancellation and retire its prior native authority before a successor proceeds. Do not implement a timeout race that leaves a candidate able to activate later. Preserve future retries after attempt timeout; permanent logical disposal separately prevents all later work. The invalidated controller/adapter/readiness production-code drafts were removed; no replacement production code is presumed executed or correct.
 
@@ -822,7 +822,7 @@ Update `BrowserWindowLike` and the production startup context to expose the need
 
 Keep the current result's disposer at entry ownership. Dispose old-target recovery at each new `main()` generation and wire the current disposer to logical close and the first quit transition before asynchronous server stopping. Hiding to tray and retiring an old native do not dispose. Constructor injection remains the real Electron `BrowserWindow` with its existing preload; update trusted `mainWebContentsId` only for the verified current candidate. Test repeated before-quit delivery, destination changes and stale completion through these real seams. Reconcile exact source interfaces during implementation rather than introducing unused lifecycle methods.
 
-- [ ] **Step 4: Add and run the real long-outage acceptance test**
+- [x] **Step 4: Add and run the real long-outage acceptance test**
 
 Add `serverHome: string | undefined` alongside the existing renderer-recovery fixture variables. In its existing `afterEach`, capture `const serverHomeToRemove = serverHome`, clear the variable with the other fixture handles, define this closure and pass `removeHome: removeOwnedHomes` to the existing cleanup call:
 
@@ -907,11 +907,11 @@ Use the clean standalone committed source checkout already staged under the priv
 
 Expected: actual selected tests include both healthy crash/IPC recovery and the long-outage scenario; both PASS in the bounded disposable container. No success logs occur during the outage. No client event is supplied after endpoint restoration. Keep the exact clone path as a test-owned cleanup receipt; remove it only after logs/results have been copied to the external evidence directory. Do not fall back to raw Playwright, stale dist, skipped tests or host-side process-kill execution.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep document verification separate from retry scheduling and native replacement. Remove duplicated inline adapter types/imports and unused lifecycle methods. Prune retired native windows from listener binding maps after removal so repeated recoveries do not retain destroyed windows. Keep all current windows' removal semantics and close filtering intact. Review cancellation races at every awaited action and candidate activation; no polling-tick logging is needed. Re-run the focused command after cleanup.
 
-- [ ] **Step 6: Run impacted verification**
+- [x] **Step 6: Run impacted verification**
 
 ```bash
 pnpm run test:vitest run test/unit/electron --config config/vitest/vitest.electron.config.ts
@@ -920,7 +920,7 @@ pnpm run typecheck
 
 Expected: all Electron unit/integration tests PASS. Repeat canonical sandbox `Renderer crash recovery` only if refactoring or fixes changed the code exercised by its prior successful run; that run's commit must match the final reviewed source. The parent full supported gate covers startup, entry and shared test infrastructure across the repository. Electron sandbox coverage proves actual platform-independent reconnect/native-window behavior; a Windows installed-artifact smoke remains a separately approved deployment/user verification, not authorization to touch the running DANDESKTOP app.
 
-- [ ] **Step 7: Commit remaining task refinements**
+- [x] **Step 7: Commit remaining task refinements**
 
 ```bash
 git add electron/renderer-readiness.ts electron/recoverable-window.ts electron/startup.ts electron/entry.ts electron/main.ts test/unit/electron/renderer-readiness.test.ts test/unit/electron/recoverable-window.test.ts test/unit/electron/startup.test.ts test/unit/electron/main.test.ts test/e2e-electron/electron-app.test.ts
@@ -943,7 +943,7 @@ Only create this second commit if E2E/refactor changed source after the checkpoi
 - Produces: valid JSONL with existing uppercase `level`, lowercase `severity`, UID/unit, observed state, action, result and command failure code. A failed dump is diagnosed and still allows state-sensitive recovery; an empty/failed state query never authorizes mutation.
 - Preserves: 15-minute timer, root-owned watchdog independence, no host oomd policy/unit/timer edits and no live deployment.
 
-- [ ] **Step 1: Validate real-systemd feasibility safely and add failing policy tests**
+- [x] **Step 1: Validate real-systemd feasibility safely and add failing policy tests**
 
 First create only the guest Dockerfile, guest-smoke script and outer driver described in Step 3 below, copying the watchdog source unchanged. Build/run that owned fixture only as far as `--probe`, before implementing the watchdog policy. The parent has already proved the underlying bounded private remount/systemd/D-Bus capability; this rechecks it with the actual fixture image and source. It must establish actual rootful placement, a private cgroup namespace, enforced resource limits and a guest systemd-created child cgroup. It must not kill a manager at this stage. If this probe regresses, report the explicit system-level coverage gap to the parent before continuing the task; never replace this proof with shared-host operations.
 
@@ -1083,7 +1083,7 @@ assert_eq "both user managers follow the watchdog state policy" 0 "$watchdog_cas
 
 The Python matrix replaces the old one-UID semantics with stronger actual argv/outcome checks, including misleading registration text. There are no script-content assertions.
 
-- [ ] **Step 2: Run red**
+- [x] **Step 2: Run red**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 tests/test-oomd-watchdog.py
@@ -1091,7 +1091,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 tests/test-oomd-watchdog.py
 
 Expected: UID 1000 failed/inactive cases FAIL because the old watchdog restarts oomd unconditionally; the real executable runs and its argv receipt proves the wrong action. JSONL severity/UID assertions also fail until observability is implemented.
 
-- [ ] **Step 3: Implement the common per-UID recovery policy**
+- [x] **Step 3: Implement the common per-UID recovery policy**
 
 Keep the existing three command seams and replace the registration/decision body with:
 
@@ -1376,7 +1376,7 @@ The initial barrier runs before remounting the existing private cgroup hierarchy
 
 On outer timeout, the EXIT trap removes only the recorded guest ID and image. Capture the actual readiness/probe failure as a non-converged prerequisite, never a skipped green smoke. Do not automatically add this rootful/systemd requirement to `tests/validate.sh`; keep explicit real-smoke acceptance in this task so the default lightweight repository suite remains usable on other machines.
 
-- [ ] **Step 4: Run focused green and real guest acceptance**
+- [x] **Step 4: Run focused green and real guest acceptance**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 tests/test-oomd-watchdog.py
@@ -1392,7 +1392,7 @@ timeout 900 bash tests/smoke-oomd-watchdog.sh
 
 Expected: exact-argv policy tests PASS. Real probe PASS precedes any guest manager failure. Full guest smoke proves UID 1000 and UID 1001 manager PIDs and enabled-service generations change after controlled failure, cleanly stopped managers stay inactive, and an active/unregistered manager requests oomd restart without restarting that manager. Capture JSONL, journal, placement and exit receipts. If a guest prerequisite fails, required recovery coverage remains visibly unresolved; no production manager/service action is a substitute.
 
-- [ ] **Step 5: Refactor while green and write the deployment runbook**
+- [x] **Step 5: Refactor while green and write the deployment runbook**
 
 Keep one registration predicate, one state reader and one per-UID recovery function. Retain independent handling after one start failure and single aggregate oomd restart. Keep logs on controlled values so every line parses as JSON. Run focused Python/Bash tests after cleanup.
 
@@ -1425,7 +1425,7 @@ journalctl -u sentinelx-oomd-watchdog.service --since "$watchdog_install_started
 
 Runbook observation commands are read-only: `systemctl show sentinelx-oomd-watchdog.service sentinelx-oomd-watchdog.timer user@1000.service user@1001.service`, the timestamped journal command above, `oomctl dump`, and Freshell's documented health endpoint. Retain the source SHA, installation timestamp, backup/staging paths and before/after PID observations in the approved operator receipt.
 
-- [ ] **Step 6: Run impacted verification**
+- [x] **Step 6: Run impacted verification**
 
 ```bash
 umask 022
@@ -1446,7 +1446,7 @@ PYTHONDONTWRITEBYTECODE=1 timeout 600 bash tests/test-sentinelx-agent-cutover.sh
 
 Do not count an unavailable existing root-only ACL suite as coverage of that unrelated functionality. The final explorer report was reread for this draft: broad baseline exit 124 after 28 completed zero-failure suites; fresh seven-suite SentinelX baseline exit 0; clean unchanged machines base. Preserve this distinction in review/handoff.
 
-- [ ] **Step 7: Commit the complete machines task**
+- [x] **Step 7: Commit the complete machines task**
 
 ```bash
 git add garageserver/sentinelx/bin/sentinelx-oomd-watchdog tests/test-sentinelx-janitor.sh tests/test-oomd-watchdog.py tests/smoke-oomd-watchdog.sh tests/systemd-watchdog/Dockerfile tests/systemd-watchdog/guest-smoke.sh garageserver/docs/sentinelx-sandbox.md garageserver/sentinelx/AGENTS.md
