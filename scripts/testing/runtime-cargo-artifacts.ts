@@ -38,5 +38,14 @@ export function runtimeCargoBuildAndCopy(
 ): void {
   const worker = path.join(import.meta.dirname, 'runtime-cargo-artifacts-worker.mjs')
   const locked = runtimeCargoCommand(repoRoot, process.execPath, [worker, JSON.stringify({ command, args, copies })], env)
-  execFileSync(locked.command, locked.args, { cwd: repoRoot, env, stdio: 'inherit' })
+  try {
+    execFileSync(locked.command, locked.args, { cwd: repoRoot, env, stdio: ['inherit', 'inherit', 'inherit', 'pipe'] })
+  } catch (error) {
+    const report = (error as { output?: (Buffer | null)[] }).output?.[3]
+    if (!report) throw error
+    let failure: NodeJS.ErrnoException & { dest?: string }
+    try { failure = JSON.parse(report.toString()) } catch { throw error }
+    if (!failure || typeof failure.message !== 'string') throw error
+    throw Object.assign(new Error(failure.message, { cause: error }), failure)
+  }
 }

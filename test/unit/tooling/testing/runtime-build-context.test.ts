@@ -84,19 +84,32 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
         ${JSON.stringify(repo)}, 2, {}, {}, 'test', { enabledProviders: ['claude'] });
       fs.mkdirSync(rig.runtime.buildDir, { recursive: true });
       const errors = [];
+      const filesystemFailures = [];
       for (const [receiver, method] of [[rig.runtime, 'buildBinaries'], [rig, 'buildManagedServer'], [rig, 'buildQualificationSupervisor']]) {
-        try { receiver[method](); } catch (error) { errors.push({ method, code: error.code }); }
+        try { receiver[method](); } catch (error) {
+          errors.push({ method, code: error.code });
+          filesystemFailures.push({ method, path: error.path, dest: error.dest, syscall: error.syscall });
+        }
       }
-      process.stdout.write(JSON.stringify({ errors, buildDir: rig.runtime.buildDir,
+      process.stdout.write(JSON.stringify({ errors, filesystemFailures, buildDir: rig.runtime.buildDir,
         testSupervisor: rig.runtime.testSupervisorBinary, testHost: rig.runtime.testHostBinary,
         releaseSupervisor: rig.runtime.releaseSupervisorBinary, releaseHost: rig.runtime.releaseHostBinary }));
     `], { cwd: root, env, encoding: 'utf8', timeout: 15_000 })) as {
       errors: { method: string; code: string }[]; buildDir: string
+      filesystemFailures: { method: string; path: string; dest: string; syscall: string }[]
       testSupervisor: string; testHost: string; releaseSupervisor: string; releaseHost: string
     }
     if (kind === 'missing') {
       expect(outcome.errors).toEqual(['buildBinaries', 'buildManagedServer', 'buildQualificationSupervisor']
         .map(method => ({ method, code: 'ENOENT' })))
+      expect(outcome.filesystemFailures).toEqual([
+        ['buildBinaries', 'debug', 'freshell-supervisor', 'freshell-supervisor-test'],
+        ['buildManagedServer', 'release', 'freshell-server', 'freshell-server-managed'],
+        ['buildQualificationSupervisor', 'release', 'freshell-supervisor', 'freshell-supervisor-qualification'],
+      ].map(([method, profile, source, target]) => ({
+        method, syscall: 'copyfile', path: path.join(configured!, profile, source),
+        dest: path.join(outcome.buildDir, target),
+      })))
       expect(fs.readdirSync(outcome.buildDir)).toEqual([])
     } else {
       expect(outcome.errors).toEqual([])
