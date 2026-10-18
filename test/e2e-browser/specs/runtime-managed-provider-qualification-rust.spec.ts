@@ -785,7 +785,7 @@ async function exerciseTask2Browser(browser: Browser, legacy: boolean): Promise<
   let ownedPage: Awaited<ReturnType<typeof createFreshE2ePage>> | undefined
   let localInfo: E2eServerInfo | undefined
   const observed: Task2RetainedBrowserPhase[] = []
-  try {
+  await withOwnedCleanup(async () => {
     const observe = async (context: Task2RetainedPublicContext, phase: Task2RetainedBrowserPhase): Promise<void> => {
       if (!ownedPage) {
         const info = descriptor ? await new ExternalServer(process.env).start() : localInfo
@@ -894,20 +894,21 @@ async function exerciseTask2Browser(browser: Browser, legacy: boolean): Promise<
     }
     expect(observed).toEqual(legacy ? ['store_blocked', 'replaced'] : ['store_blocked', 'config_blocked', 'replaced'])
     if (h) expect(h.broker.unsafeAttempts()).toHaveLength(0)
-  } finally {
-    await ownedPage?.context.close()
-    if (external) {
-      const cleanup = await external.finishRetainedFixture()
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
-    }
-    if (h) {
-      const receipts = h.broker.receipts(), ids = h.transferOwnedIds()
-      const cleanup = await h.cleanup()
-      h.verifyTransferCleanup({ containers: [...new Set([...ids.containers, ...receipts.map(row => row.containerId)])],
-        volumes: [...new Set([...ids.volumes, ...receipts.flatMap(row => row.providerVolumeName ? [row.providerVolumeName] : [])])] })
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
-    }
-  }
+  }, async () => {
+    await withOwnedCleanup(async () => { await ownedPage?.context.close() }, async () => {
+      if (external) {
+        const cleanup = await external.finishRetainedFixture()
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+      }
+      if (h) {
+        const receipts = h.broker.receipts(), ids = h.transferOwnedIds()
+        const cleanup = await h.cleanup()
+        h.verifyTransferCleanup({ containers: [...new Set([...ids.containers, ...receipts.map(row => row.containerId)])],
+          volumes: [...new Set([...ids.volumes, ...receipts.flatMap(row => row.providerVolumeName ? [row.providerVolumeName] : [])])] })
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+      }
+    })
+  })
   // These labels describe the fixture type; physical/DOM/API assertions above
   // carry the evidence. This artifact cannot qualify native identity/readiness.
   h?.writeArtifact(legacy ? 'task002-legacy-browser.json' : 'task002-config-browser.json', {
