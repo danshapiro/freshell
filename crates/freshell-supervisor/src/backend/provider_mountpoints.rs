@@ -4,6 +4,133 @@ use freshell_platform::provider_mountpoints::Mountpoint;
 use std::time::Duration;
 use tokio::net::UnixListener;
 
+// Container creation and removal can take tens of seconds on rootless Docker.
+// Keep their lifecycle allowance separate from the fixed helper's work budget.
+const HELPER_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
+const HELPER_WORK_TIMEOUT: Duration = Duration::from_secs(30);
+const HELPER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(super) type HelperOwners = std::sync::Mutex<BTreeMap<String, Option<HeldProviderPreparation>>>;
+
+pub(super) type CreateReply = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<DockerResponse, BackendError>> + Send>,
+>;
+
+/// One exact owner spans scratch allocation, mountpoint setup, and the reader.
+/// An occupied map entry without this value is an active move/Drop claim.
+#[derive(Default)]
+pub(super) struct HeldProviderPreparation {
+    pub(super) mountpoint: Option<OwnedContainerCreate>,
+    pub(super) candidate_scratch: Option<claude_source_observation::CandidateScratch>,
+    pub(super) scratch_create: Option<CreateReply>,
+    pub(super) reader: Option<claude_source_observation::HeldCandidateReader>,
+}
+
+pub(super) struct OwnedContainerCreate {
+    name: String,
+    body: Value,
+    creation: HelperCreation,
+    reconciling: bool,
+    _directory: native_auth::ExchangeDirectory,
+}
+
+enum HelperCreation {
+    Absent,
+    Pending(CreateReply),
+    Accepted,
+    Rejected,
+    Ambiguous,
+}
+
+enum HelperCleanup {
+    Confirmed,
+    CreationUnconfirmed,
+}
+
+impl OwnedContainerCreate {
+    pub(super) fn new(
+        socket: PathBuf,
+        name: String,
+        body: Value,
+        directory: native_auth::ExchangeDirectory,
+    ) -> Self {
+        let creation = HelperCreation::Pending(creation_request(
+            socket,
+            format!("{DOCKER_API}/containers/create?name={name}"),
+            body.clone(),
+        ));
+        Self {
+            name,
+            body,
+            creation,
+            reconciling: false,
+            _directory: directory,
+        }
+    }
+
+    pub(super) async fn creation_reply(&mut self) -> Result<DockerResponse, BackendError> {
+        // Await in place: cancellation must not drop the response while Docker
+        // is still creating this exact owned helper. Retrying only settles it.
+        let HelperCreation::Pending(create) = &mut self.creation else {
+            unreachable!("pending helper creation")
+        };
+        let reply = create.await;
+        self.creation = match &reply {
+            Ok(response) if response.status == 201 => HelperCreation::Accepted,
+            Ok(response)
+                if !self.reconciling
+                    && matches!(response.status, 400 | 401 | 403 | 404 | 409 | 422) =>
+            {
+                HelperCreation::Rejected
+            }
+            _ => HelperCreation::Ambiguous,
+        };
+        reply
+    }
+}
+
+pub(super) fn creation_request(socket: PathBuf, path: String, body: Value) -> CreateReply {
+    // An independent transport avoids a reference cycle through the retained
+    // preparation owners. This future dispatches CREATE only, never START.
+    Box::pin(async move {
+        DockerEngineBackend::new(socket)
+            .request_bounded("POST", &path, Some(&body), 64 * 1024)
+            .await
+    })
+}
+
+pub(super) struct HelperClaim<'a> {
+    owners: &'a HelperOwners,
+    volume: String,
+    pub(super) held: Option<HeldProviderPreparation>,
+}
+
+impl Drop for HelperClaim<'_> {
+    fn drop(&mut self) {
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = self.held.take() {
+            tracing::debug!(
+                event = "runtime.provider_preparation.retained",
+                volume = %self.volume,
+                scratch_create_pending = held.scratch_create.is_some(),
+                mountpoint_retained = held.mountpoint.is_some(),
+                reader_retained = held.reader.is_some(),
+                "Retaining exact provider preparation ownership until cleanup"
+            );
+            owners.insert(self.volume.clone(), Some(held));
+        } else {
+            owners.remove(&self.volume);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "provider_mountpoints_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
 fn fail(cause: &'static str) -> BackendError {
     BackendError::Unavailable(cause.into())
 }
@@ -16,6 +143,7 @@ pub(super) struct MountpointHelperTarget<'a> {
     pub binary: &'a Path,
     pub daemon: &'a DockerDaemonId,
     pub labels: Value,
+    pub candidate_scratch: Option<&'a claude_source_observation::CandidateScratch>,
 }
 
 fn owned_mountpoint_helper(actual: &Value, expected: &Value) -> bool {
@@ -101,11 +229,167 @@ pub(super) fn selections(mounts: &docker::TerminalMounts) -> Result<Vec<Mountpoi
 }
 
 impl DockerEngineBackend {
-    pub(super) async fn cleanup_provider_mountpoint_helper(
+    pub(super) fn claim_mountpoint_helper(
+        &self,
+        volume: &str,
+    ) -> Result<HelperClaim<'_>, BackendError> {
+        use std::collections::btree_map::Entry;
+        let held = match self
+            .mountpoint_helpers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(volume.to_owned())
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(None);
+                None
+            }
+            Entry::Occupied(mut entry) => Some(entry.get_mut().take().ok_or_else(|| {
+                fail("provider mountpoint helper operation is already in progress")
+            })?),
+        };
+        Ok(HelperClaim {
+            owners: &self.mountpoint_helpers,
+            volume: volume.to_owned(),
+            held,
+        })
+    }
+
+    pub(super) async fn cleanup_retained_mountpoint_helper(
+        &self,
+        volume: &str,
+    ) -> Result<(), BackendError> {
+        self.cleanup_mountpoint_claim(&mut self.claim_mountpoint_helper(volume)?, true)
+            .await
+    }
+
+    pub(super) async fn cleanup_previous_candidate_mountpoints(
+        &self,
+        soul: &SoulId,
+    ) -> Result<(), BackendError> {
+        let volumes = self
+            .mountpoint_helpers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, held)| {
+                held.as_ref()
+                    .and_then(|held| held.candidate_scratch.as_ref())
+                    .is_some_and(|scratch| scratch.belongs_to(soul))
+            })
+            .map(|(volume, _)| volume.clone())
+            .collect::<Vec<_>>();
+        for volume in volumes {
+            self.cleanup_retained_mountpoint_helper(&volume).await?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_mountpoint_claim(
+        &self,
+        claim: &mut HelperClaim<'_>,
+        retire_scratch: bool,
+    ) -> Result<(), BackendError> {
+        let Some(held) = claim.held.as_mut() else {
+            return Ok(());
+        };
+        if let Some(create) = held.scratch_create.as_mut() {
+            // Docker volume GET shares CREATE's per-volume lock. Keep the
+            // original response alive across both observation and cleanup.
+            let reply = create.await;
+            held.scratch_create = None;
+            if matches!(reply, Ok(response) if response.status == 409) {
+                if let Some(scratch) = held.candidate_scratch.as_mut() {
+                    scratch.creation_rejected();
+                }
+            }
+        }
+        if retire_scratch {
+            if let Some(reader) = held.reader.as_mut() {
+                self.cleanup_owned_container(
+                    &mut reader.container,
+                    claude_source_observation::owned_candidate_helper,
+                )
+                .await?;
+                reader.cleanup_views()?;
+                held.reader.take();
+            }
+        }
+        if let Some(helper) = held.mountpoint.as_mut() {
+            self.cleanup_owned_container(helper, owned_mountpoint_helper)
+                .await?;
+            held.mountpoint.take();
+        }
+        if retire_scratch {
+            if let Some(scratch) = held.candidate_scratch.as_mut() {
+                self.cleanup_claude_candidate_scratch(scratch).await?;
+            }
+            claim.held.take();
+        } else if held.candidate_scratch.is_none() {
+            claim.held.take();
+        }
+        // A candidate continues from successful mountpoint setup to its reader.
+        // Keep the same exact scratch owner available between those phases.
+        Ok(())
+    }
+
+    async fn cleanup_owned_container(
+        &self,
+        helper: &mut OwnedContainerCreate,
+        qualifies: fn(&Value, &Value) -> bool,
+    ) -> Result<(), BackendError> {
+        if matches!(helper.creation, HelperCreation::Pending(_)) {
+            let _ = helper.creation_reply().await;
+        }
+        if !matches!(
+            helper.creation,
+            HelperCreation::Absent | HelperCreation::Rejected
+        ) {
+            let outcome = self
+                .cleanup_helper_container_body(
+                    &helper.name,
+                    &helper.body,
+                    matches!(helper.creation, HelperCreation::Accepted),
+                    qualifies,
+                )
+                .await?;
+            if matches!(outcome, HelperCleanup::CreationUnconfirmed) {
+                // Reconcile a lost transport using only its exact name/body.
+                // A live original CREATE was settled above; a retry conflict
+                // does not reject the original owner.
+                helper.reconciling = true;
+                helper.creation = HelperCreation::Pending(creation_request(
+                    self.socket_path.clone(),
+                    format!("{DOCKER_API}/containers/create?name={}", helper.name),
+                    helper.body.clone(),
+                ));
+                let _ = helper.creation_reply().await;
+                let outcome = self
+                    .cleanup_helper_container_body(
+                        &helper.name,
+                        &helper.body,
+                        matches!(helper.creation, HelperCreation::Accepted),
+                        qualifies,
+                    )
+                    .await?;
+                if matches!(outcome, HelperCleanup::CreationUnconfirmed) {
+                    return Err(fail("provider helper creation remains unconfirmed"));
+                }
+            }
+        }
+        // Record confirmed absence before another cancellable cleanup request.
+        // A later retry must not recreate an already retired helper or HOME.
+        helper.creation = HelperCreation::Absent;
+        Ok(())
+    }
+
+    async fn cleanup_helper_container_body(
         &self,
         name: &str,
         body: &Value,
-    ) -> Result<(), BackendError> {
+        creation_acknowledged: bool,
+        qualifies: fn(&Value, &Value) -> bool,
+    ) -> Result<HelperCleanup, BackendError> {
         let inspected = self
             .request_bounded(
                 "GET",
@@ -115,16 +399,20 @@ impl DockerEngineBackend {
             )
             .await?;
         if inspected.status == 404 {
-            return Ok(());
+            return if creation_acknowledged {
+                Ok(HelperCleanup::Confirmed)
+            } else {
+                Ok(HelperCleanup::CreationUnconfirmed)
+            };
         }
         let actual: Value = serde_json::from_slice(&inspected.body)
-            .map_err(|_| fail("provider mountpoint cleanup metadata invalid"))?;
+            .map_err(|_| fail("provider helper cleanup metadata invalid"))?;
         let id = actual["Id"]
             .as_str()
             .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or_else(|| fail("provider mountpoint cleanup identity invalid"))?;
-        if inspected.status != 200 || !owned_mountpoint_helper(&actual, body) {
-            return Err(fail("provider mountpoint cleanup ownership changed"));
+            .ok_or_else(|| fail("provider helper cleanup identity invalid"))?;
+        if inspected.status != 200 || !qualifies(&actual, body) {
+            return Err(fail("provider helper cleanup ownership changed"));
         }
         let removed = self
             .request_bounded(
@@ -135,7 +423,7 @@ impl DockerEngineBackend {
             )
             .await?;
         if !matches!(removed.status, 204 | 404) {
-            return Err(fail("provider mountpoint helper cleanup failed"));
+            return Err(fail("provider helper cleanup failed"));
         }
         // An acknowledged delete does not release a candidate's mounts until
         // the exact inspected helper is confirmed absent.
@@ -148,9 +436,9 @@ impl DockerEngineBackend {
             )
             .await?;
         if absent.status != 404 {
-            return Err(fail("provider mountpoint helper cleanup not confirmed"));
+            return Err(fail("provider helper cleanup not confirmed"));
         }
-        Ok(())
+        Ok(HelperCleanup::Confirmed)
     }
 
     pub(super) async fn prepare_provider_mountpoints(
@@ -162,7 +450,12 @@ impl DockerEngineBackend {
     ) -> Result<(), BackendError> {
         let selected = selections(mounts)?;
         if selected.is_empty() && spec.prior_provider_owner.is_none() {
-            return Ok(());
+            return tokio::time::timeout(
+                HELPER_CLEANUP_TIMEOUT,
+                self.cleanup_retained_mountpoint_helper(&spec.provider_volume_name),
+            )
+            .await
+            .map_err(|_| fail("provider mountpoint previous creation or cleanup timed out"))?;
         }
         if spec.initial_input_reservation.is_none() {
             let prior = spec.prior_provider_owner.as_ref().ok_or_else(|| fail("provider mountpoints require a bound initial reservation or retained registry owner"))?;
@@ -206,19 +499,21 @@ impl DockerEngineBackend {
         if self.daemon_id().await? != *daemon {
             return Err(fail("provider mountpoint daemon changed"));
         }
-        let mut owned = None;
         let target = MountpointHelperTarget {
             image: &spec.image_ref,
             volume: &spec.provider_volume_name,
             binary,
             daemon,
             labels: json!({"com.freshell.installation-id":spec.installation_id,"com.freshell.soul-id":spec.soul_id,"com.freshell.incarnation-id":spec.incarnation_id}),
+            candidate_scratch: None,
         };
         self.run_provider_mountpoint_helper(
             target,
             selected,
-            (Duration::from_secs(30), Duration::from_secs(5)),
-            &mut owned,
+            (
+                HELPER_CREATE_TIMEOUT + HELPER_WORK_TIMEOUT,
+                HELPER_CLEANUP_TIMEOUT,
+            ),
         )
         .await
     }
@@ -228,13 +523,33 @@ impl DockerEngineBackend {
         target: MountpointHelperTarget<'_>,
         selected: Vec<Mountpoint>,
         budgets: (Duration, Duration),
-        owned: &mut Option<(String, Value)>,
     ) -> Result<(), BackendError> {
-        if owned.is_some() {
-            return Err(fail(
-                "provider mountpoint previous helper cleanup remains unconfirmed",
-            ));
+        let mut claim = self.claim_mountpoint_helper(target.volume)?;
+        let continuing_candidate = claim.held.as_ref().is_some_and(|held| {
+            held.mountpoint.is_none()
+                && held.reader.is_none()
+                && held.scratch_create.is_none()
+                && held
+                    .candidate_scratch
+                    .as_ref()
+                    .zip(target.candidate_scratch)
+                    .is_some_and(|(retained, current)| retained.same_owner(current))
+        });
+        if claim.held.is_some() && !continuing_candidate {
+            tokio::time::timeout(budgets.1, self.cleanup_mountpoint_claim(&mut claim, true))
+                .await
+                .map_err(|_| {
+                    fail("provider mountpoint previous creation or cleanup timed out")
+                })??;
         }
+        if claim.held.is_none() && target.candidate_scratch.is_some() {
+            // Preserve the scratch owner even before image lookup can await.
+            claim.held = Some(HeldProviderPreparation {
+                candidate_scratch: target.candidate_scratch.cloned(),
+                ..Default::default()
+            });
+        }
+        let name = format!("freshell-mountpoints-{}", uuid::Uuid::new_v4());
         let deadline = tokio::time::Instant::now() + budgets.0;
         let request = freshell_runtime_protocol::bounded_json_bytes(&selected, 1024 * 1024)
             .map_err(|_| fail("provider mountpoint metadata profile exceeded"))?;
@@ -243,7 +558,6 @@ impl DockerEngineBackend {
         let listener = UnixListener::bind(&socket)
             .map_err(|_| fail("provider mountpoint exchange bind failed"))?;
         directory.mode(&socket, 0o660)?;
-        let name = format!("freshell-mountpoints-{}", uuid::Uuid::new_v4());
         let environment =
             tokio::time::timeout_at(deadline, self.private_helper_environment(target.image, &[]))
                 .await
@@ -265,22 +579,31 @@ impl DockerEngineBackend {
                     {"Type":"volume","Source":target.volume,"Target":"/home/freshell/provider","ReadOnly":false,"VolumeOptions":{"NoCopy":true}},
                     {"Type":"bind","Source":directory.0,"Target":"/run/freshell-input-exchange","ReadOnly":true}]}
         });
-        let mut attempted = false;
+        let held = claim
+            .held
+            .get_or_insert_with(HeldProviderPreparation::default);
+        held.mountpoint = Some(OwnedContainerCreate::new(
+            self.socket_path.clone(),
+            name.clone(),
+            body.clone(),
+            directory,
+        ));
+        let mut phase = "create";
         let operation = async {
-            attempted = true;
-            *owned = Some((name.clone(), body.clone()));
-            let created = self
-                .request_bounded(
-                    "POST",
-                    &format!("{DOCKER_API}/containers/create?name={name}"),
-                    Some(&body),
-                    64 * 1024,
-                )
-                .await?;
-            if created.status == 409 {
-                attempted = false;
-                *owned = None;
-            }
+            let create_deadline = deadline.min(tokio::time::Instant::now() + HELPER_CREATE_TIMEOUT);
+            let created = tokio::time::timeout_at(
+                create_deadline,
+                claim
+                    .held
+                    .as_mut()
+                    .unwrap()
+                    .mountpoint
+                    .as_mut()
+                    .unwrap()
+                    .creation_reply(),
+            )
+            .await
+            .map_err(|_| fail("provider mountpoint helper creation timed out"))??;
             if created.status != 201 {
                 return Err(fail("provider mountpoint helper creation failed"));
             }
@@ -290,113 +613,126 @@ impl DockerEngineBackend {
                 .as_str()
                 .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
                 .ok_or_else(|| fail("provider mountpoint helper identity invalid"))?;
-            let inspected = self
-                .request_bounded(
-                    "GET",
-                    &format!("{DOCKER_API}/containers/{id}/json"),
-                    None,
-                    1024 * 1024,
-                )
-                .await?;
-            let actual: Value = serde_json::from_slice(&inspected.body)
-                .map_err(|_| fail("provider mountpoint helper inspection invalid"))?;
-            if inspected.status != 200
-                || actual["Id"] != id
-                || actual["State"]["Running"] != false
-                || !owned_mountpoint_helper(&actual, &body)
-            {
-                return Err(fail(
-                    "provider mountpoint helper namespace changed before start",
-                ));
-            }
-            let started = self
-                .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
-                .await?;
-            if started.status != 204 {
-                return Err(fail("provider mountpoint helper start failed"));
-            }
-            let exchange = async {
-                let (mut stream, _) = listener
-                    .accept()
-                    .await
-                    .map_err(|_| fail("provider mountpoint exchange failed"))?;
-                stream
-                    .write_all(&(request.len() as u32).to_be_bytes())
-                    .await
-                    .map_err(|_| fail("provider mountpoint request failed"))?;
-                stream
-                    .write_all(&request)
-                    .await
-                    .map_err(|_| fail("provider mountpoint request incomplete"))?;
-                let mut acknowledgement = [0; 2];
-                stream
-                    .read_exact(&mut acknowledgement)
-                    .await
-                    .map_err(|_| fail("provider mountpoint acknowledgement unavailable"))?;
-                match &acknowledgement {
-                    b"ok" => Ok(()),
-                    b"er" => {
-                        let mut length = [0; 4];
-                        stream
-                            .read_exact(&mut length)
-                            .await
-                            .map_err(|_| fail("provider mountpoint failure reason unavailable"))?;
-                        let length = u32::from_be_bytes(length) as usize;
-                        if length == 0 || length > 4096 {
-                            return Err(fail("provider mountpoint failure reason exceeds limit"));
-                        }
-                        let mut reason = vec![0; length];
-                        stream
-                            .read_exact(&mut reason)
-                            .await
-                            .map_err(|_| fail("provider mountpoint failure reason incomplete"))?;
-                        let reason = std::str::from_utf8(&reason)
-                            .map_err(|_| fail("provider mountpoint failure reason invalid"))?;
-                        Err(BackendError::Unavailable(format!(
-                            "provider mountpoint preparation failed: {reason}"
-                        )))
-                    }
-                    _ => Err(fail("provider mountpoint acknowledgement invalid")),
-                }
-            };
-            let wait = async {
-                let response = self
+            let work_deadline = deadline.min(tokio::time::Instant::now() + HELPER_WORK_TIMEOUT);
+            let work = async {
+                phase = "inspect";
+                let inspected = self
                     .request_bounded(
-                        "POST",
-                        &format!("{DOCKER_API}/containers/{id}/wait?condition=not-running"),
+                        "GET",
+                        &format!("{DOCKER_API}/containers/{id}/json"),
                         None,
-                        64 * 1024,
+                        1024 * 1024,
                     )
                     .await?;
-                let value: Value = serde_json::from_slice(&response.body)
-                    .map_err(|_| fail("provider mountpoint exit metadata invalid"))?;
-                if response.status != 200 || value["StatusCode"] != 0 {
-                    return Err(fail("provider mountpoint helper failed"));
+                let actual: Value = serde_json::from_slice(&inspected.body)
+                    .map_err(|_| fail("provider mountpoint helper inspection invalid"))?;
+                if inspected.status != 200
+                    || actual["Id"] != id
+                    || actual["State"]["Running"] != false
+                    || !owned_mountpoint_helper(&actual, &body)
+                {
+                    return Err(fail(
+                        "provider mountpoint helper namespace changed before start",
+                    ));
+                }
+                phase = "start";
+                let started = self
+                    .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
+                    .await?;
+                if started.status != 204 {
+                    return Err(fail("provider mountpoint helper start failed"));
+                }
+                phase = "exchange";
+                let exchange = async {
+                    let (mut stream, _) = listener
+                        .accept()
+                        .await
+                        .map_err(|_| fail("provider mountpoint exchange failed"))?;
+                    stream
+                        .write_all(&(request.len() as u32).to_be_bytes())
+                        .await
+                        .map_err(|_| fail("provider mountpoint request failed"))?;
+                    stream
+                        .write_all(&request)
+                        .await
+                        .map_err(|_| fail("provider mountpoint request incomplete"))?;
+                    let mut acknowledgement = [0; 2];
+                    stream
+                        .read_exact(&mut acknowledgement)
+                        .await
+                        .map_err(|_| fail("provider mountpoint acknowledgement unavailable"))?;
+                    match &acknowledgement {
+                        b"ok" => Ok(()),
+                        b"er" => {
+                            let mut length = [0; 4];
+                            stream.read_exact(&mut length).await.map_err(|_| {
+                                fail("provider mountpoint failure reason unavailable")
+                            })?;
+                            let length = u32::from_be_bytes(length) as usize;
+                            if length == 0 || length > 4096 {
+                                return Err(fail(
+                                    "provider mountpoint failure reason exceeds limit",
+                                ));
+                            }
+                            let mut reason = vec![0; length];
+                            stream.read_exact(&mut reason).await.map_err(|_| {
+                                fail("provider mountpoint failure reason incomplete")
+                            })?;
+                            let reason = std::str::from_utf8(&reason)
+                                .map_err(|_| fail("provider mountpoint failure reason invalid"))?;
+                            Err(BackendError::Unavailable(format!(
+                                "provider mountpoint preparation failed: {reason}"
+                            )))
+                        }
+                        _ => Err(fail("provider mountpoint acknowledgement invalid")),
+                    }
+                };
+                let wait = async {
+                    let response = self
+                        .request_bounded(
+                            "POST",
+                            &format!("{DOCKER_API}/containers/{id}/wait?condition=not-running"),
+                            None,
+                            64 * 1024,
+                        )
+                        .await?;
+                    let value: Value = serde_json::from_slice(&response.body)
+                        .map_err(|_| fail("provider mountpoint exit metadata invalid"))?;
+                    if response.status != 200 || value["StatusCode"] != 0 {
+                        return Err(fail("provider mountpoint helper failed"));
+                    }
+                    Ok(())
+                };
+                let (exchange_result, wait_result) = tokio::join!(exchange, wait);
+                exchange_result?;
+                wait_result?;
+                if self.daemon_id().await? != *target.daemon {
+                    return Err(fail(
+                        "provider mountpoint daemon changed before main create",
+                    ));
                 }
                 Ok(())
             };
-            let (exchange_result, wait_result) = tokio::join!(exchange, wait);
-            exchange_result?;
-            wait_result?;
-            if self.daemon_id().await? != *target.daemon {
-                return Err(fail(
-                    "provider mountpoint daemon changed before main create",
-                ));
-            }
-            Ok(())
+            tokio::time::timeout_at(work_deadline, work)
+                .await
+                .unwrap_or_else(|_| Err(fail("provider mountpoint helper work timed out")))
         };
         let result = tokio::time::timeout_at(deadline, operation)
             .await
             .unwrap_or_else(|_| Err(fail("provider mountpoint preparation timed out")));
-        if attempted {
-            tokio::time::timeout(
-                budgets.1,
-                self.cleanup_provider_mountpoint_helper(&name, &body),
-            )
-            .await
-            .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
-            *owned = None;
+        if let Err(error) = &result {
+            tracing::warn!(
+                event = "runtime.provider_mountpoints.failed",
+                phase,
+                helper = %name,
+                operation_timeout_ms = budgets.0.as_millis() as u64,
+                error = %error,
+                "Provider mountpoint helper failed; reconciling owned creation and cleanup"
+            );
         }
+        tokio::time::timeout(budgets.1, self.cleanup_mountpoint_claim(&mut claim, false))
+            .await
+            .map_err(|_| fail("provider mountpoint creation or cleanup timed out"))??;
         tracing::debug!(
             event = "runtime.provider_mountpoints.settled",
             entries = selected.len(),
@@ -527,23 +863,26 @@ mod tests {
                 }
             });
             let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
-            let mut helper = None;
             let outcome=tokio::time::timeout(if mode=="cancel-private-exchange" {Duration::from_millis(50)} else {Duration::from_secs(3)},backend.run_provider_mountpoint_helper(
-                MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
+                MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"}),candidate_scratch:None},selected,(Duration::from_millis(250),Duration::from_millis(250))
             )).await;
             if mode == "cancel-private-exchange" {
                 assert!(outcome.is_err());
-                let (name, body) = helper
-                    .as_ref()
-                    .expect("canceled private exchange must retain exact helper ownership");
+                assert!(
+                    backend
+                        .mountpoint_helpers
+                        .lock()
+                        .unwrap()
+                        .contains_key("owned-candidate-volume"),
+                    "canceled private exchange must retain exact helper ownership"
+                );
                 tokio::time::timeout(
                     Duration::from_millis(250),
-                    backend.cleanup_provider_mountpoint_helper(name, body),
+                    backend.cleanup_retained_mountpoint_helper("owned-candidate-volume"),
                 )
                 .await
                 .unwrap()
                 .unwrap();
-                helper = None;
             }
             let _ = stop.send(());
             tokio::time::timeout(Duration::from_secs(2), server)
@@ -551,7 +890,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if mode == "cancel-private-exchange" {
-                assert!(helper.is_none());
+                assert!(backend.mountpoint_helpers.lock().unwrap().is_empty());
                 assert!(removed.load(std::sync::atomic::Ordering::SeqCst));
                 continue;
             }
@@ -572,17 +911,21 @@ mod tests {
                 mode,
                 "prepared" | "empty" | "preparation-error" | "lost-create-ack" | "timeout"
             ) {
-                assert!(helper.is_none());
+                assert!(backend.mountpoint_helpers.lock().unwrap().is_empty());
                 assert!(removed.load(std::sync::atomic::Ordering::SeqCst));
             }
             if matches!(mode, "wrong-caps" | "cleanup-still-present") {
                 assert!(
-                    helper.is_some(),
+                    backend
+                        .mountpoint_helpers
+                        .lock()
+                        .unwrap()
+                        .contains_key("owned-candidate-volume"),
                     "unconfirmed ownership or absence cannot clear cleanup tracking"
                 );
             }
             if mode == "slow-image" {
-                assert!(helper.is_none());
+                assert!(backend.mountpoint_helpers.lock().unwrap().is_empty());
                 assert!(!requests
                     .lock()
                     .unwrap()
@@ -679,7 +1022,12 @@ mod tests {
             let backend = DockerEngineBackend::new(temp.path().join("docker.sock"));
             let result = tokio::time::timeout(
                 Duration::from_secs(2),
-                backend.cleanup_provider_mountpoint_helper("freshell-mountpoints-synthetic", &body),
+                backend.cleanup_helper_container_body(
+                    "freshell-mountpoints-synthetic",
+                    &body,
+                    true,
+                    owned_mountpoint_helper,
+                ),
             )
             .await
             .unwrap();

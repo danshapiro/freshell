@@ -377,6 +377,7 @@ pub trait RuntimeBackend: Send + Sync {
 #[derive(Clone)]
 pub struct DockerEngineBackend {
     socket_path: PathBuf,
+    mountpoint_helpers: std::sync::Arc<provider_mountpoints::HelperOwners>,
     input_publishers:
         std::sync::Arc<std::sync::Mutex<BTreeMap<String, input_publisher::HeldPublisher>>>,
     input_publication_claims: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
@@ -386,6 +387,7 @@ impl DockerEngineBackend {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            mountpoint_helpers: Default::default(),
             input_publishers: Default::default(),
             input_publication_claims: Default::default(),
         }

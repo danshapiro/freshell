@@ -3,8 +3,11 @@ use freshell_platform::claude_inputs::observation::{LocalDecision, NativeObserva
 use freshell_runtime_protocol::{
     ClaudeSourceAuthority, InitialAuthVolumeObservation, ReserveProviderInputsRequest,
 };
-use std::sync::{Arc, Mutex};
-use tokio::{net::UnixListener, task::JoinSet};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use tokio::{net::UnixListener, sync::Notify, task::JoinSet};
 
 #[tokio::test]
 async fn provider_claude_candidate_scratch_owns_disk_backing_and_confirmed_cleanup() {
@@ -162,6 +165,98 @@ fn provider_claude_private_candidate_metadata_enforces_inclusive_limits() {
 
 #[tokio::test]
 async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() {
+    physical_candidate_publication_fixture(None).await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_cleanup_retries_after_new_request_and_interruption() {
+    physical_candidate_publication_fixture(Some(CandidateCleanupInterruption::HelperRemoval)).await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_retry_does_not_recreate_removed_helper_or_home() {
+    physical_candidate_publication_fixture(Some(CandidateCleanupInterruption::ScratchRemoval))
+        .await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_retry_settles_late_scratch_creation() {
+    physical_candidate_publication_fixture(Some(CandidateCleanupInterruption::ScratchCreation))
+        .await;
+}
+
+#[tokio::test]
+async fn provider_claude_candidate_retry_settles_late_reader_creation() {
+    physical_candidate_publication_fixture(Some(CandidateCleanupInterruption::ReaderCreation))
+        .await;
+}
+
+#[derive(Clone, Copy)]
+enum CandidateCleanupInterruption {
+    HelperRemoval,
+    ScratchRemoval,
+    ScratchCreation,
+    ReaderCreation,
+}
+
+#[derive(Default)]
+struct DelayedCandidateCreation {
+    started: AtomicBool,
+    finished: AtomicBool,
+    release: Notify,
+    settled: Notify,
+}
+
+// Advance only this synthetic observation and its five-second cleanup reserve.
+// The busy clock guard keeps real Unix IO from causing Tokio auto-advance.
+async fn expire_candidate_creation<F: std::future::Future>(
+    operation: F,
+    started: &AtomicBool,
+    budget: Duration,
+) -> Option<F::Output> {
+    tokio::time::pause();
+    let clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut operation = Box::pin(operation);
+    let mut settled = None;
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+        tokio::select! {
+            biased;
+            result = &mut operation => { settled = Some(result); break; }
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+    tokio::time::advance(budget + Duration::from_millis(1)).await;
+    if settled.is_none() {
+        tokio::select! {
+            biased;
+            result = &mut operation => settled = Some(result),
+            _ = std::future::ready(()) => {}
+        }
+    }
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while settled.is_none() && std::time::Instant::now() < until {
+        tokio::select! {
+            biased;
+            result = &mut operation => settled = Some(result),
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+    drop(operation);
+    clock.abort();
+    let _ = clock.await;
+    tokio::time::resume();
+    settled
+}
+
+async fn physical_candidate_publication_fixture(
+    retry_cleanup: Option<CandidateCleanupInterruption>,
+) {
     use freshell_platform::claude_inputs::{
         AcceptedNativeSourcePlan, ClaudeInputManifest, ClaudeSettingSource, NativeSourceRuntime,
     };
@@ -169,12 +264,19 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
         bounded_json_bytes, ClaudeCandidatePublication, PreparedProviderContext,
         ProviderLaunchContext, MAX_CONTROL_FRAME_BYTES,
     };
-    for (flavor, runtime) in [
-        ("claude", NativeSourceRuntime::Terminal),
-        ("claude", NativeSourceRuntime::Sdk),
-        ("kilroy", NativeSourceRuntime::Sdk),
-    ] {
-        for mode in [
+    let providers = if retry_cleanup.is_some() {
+        vec![("claude", NativeSourceRuntime::Terminal)]
+    } else {
+        vec![
+            ("claude", NativeSourceRuntime::Terminal),
+            ("claude", NativeSourceRuntime::Sdk),
+            ("kilroy", NativeSourceRuntime::Sdk),
+        ]
+    };
+    let modes = if retry_cleanup.is_some() {
+        vec!["valid"]
+    } else {
+        vec![
             "valid",
             "retained-current-workspace",
             "missing-resource",
@@ -192,7 +294,10 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             "changed-manifest",
             "symlink-publication",
             "oversized-publication",
-        ] {
+        ]
+    };
+    for (flavor, runtime) in providers {
+        for mode in modes.iter().copied() {
             let owned = tempfile::tempdir().unwrap();
             let workspace = owned.path().join("workspace");
             let original = owned.path().join("original-home");
@@ -494,7 +599,7 @@ async fn provider_claude_physical_candidate_publication_gates_frozen_consumer() 
             let qualified = qualify_candidate_stage(&stage, &owner, &request);
             assert_eq!(qualified.is_ok(),mode=="valid" || retained,"{flavor}/{runtime:?}/{mode}: physical issuer and current owner must qualify before consumer selection: {:?}",qualified.as_ref().err());
             if let Ok(projection) = qualified {
-                qualify_candidate_helper_transport(&owner, &request, &stage).await;
+                qualify_candidate_helper_transport(&owner, &request, &stage, retry_cleanup).await;
                 let selected = &projection
                     .provider_launch_context
                     .prepared_inputs
@@ -996,18 +1101,28 @@ async fn qualify_candidate_helper_transport(
     owner: &ClaudeSourceOwner,
     request: &ObserveClaudeSourcesRequest,
     stage: &Path,
+    retry_cleanup: Option<CandidateCleanupInterruption>,
 ) {
-    let mut modes = vec![
-        "success",
-        "docker-empty-tmpfs",
-        "unexpected-tmpfs",
-        "wrong-caps",
-        "lost-projection-ack",
-        "projection-timeout",
-        "volume-still-present",
-        "wrong-mount-report",
-        "wrong-resource-subpath",
-    ];
+    const REJECT_REMOVAL: usize = 0;
+    const BLOCK_REMOVAL: usize = 1;
+    const CONFIRM_REMOVAL: usize = 2;
+    let mut modes = match retry_cleanup {
+        Some(CandidateCleanupInterruption::HelperRemoval) => vec!["cleanup-retry"],
+        Some(CandidateCleanupInterruption::ScratchRemoval) => vec!["cleanup-retry-removed"],
+        Some(CandidateCleanupInterruption::ScratchCreation) => vec!["cleanup-retry-scratch-create"],
+        Some(CandidateCleanupInterruption::ReaderCreation) => vec!["cleanup-retry-reader-create"],
+        None => vec![
+            "success",
+            "docker-empty-tmpfs",
+            "unexpected-tmpfs",
+            "wrong-caps",
+            "lost-projection-ack",
+            "projection-timeout",
+            "volume-still-present",
+            "wrong-mount-report",
+            "wrong-resource-subpath",
+        ],
+    };
     if matches!(owner, ClaudeSourceOwner::Retained { .. }) {
         modes.extend([
             "writable-retained-home",
@@ -1062,14 +1177,38 @@ async fn qualify_candidate_helper_transport(
         }
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let containers = Arc::new(Mutex::new(BTreeMap::<String, Value>::new()));
-        let volume = Arc::new(Mutex::new(None::<Value>));
+        let volumes = Arc::new(Mutex::new(BTreeMap::<String, Value>::new()));
+        let cleanup_phase = Arc::new(AtomicUsize::new(REJECT_REMOVAL));
+        let cleanup_waiting = Arc::new(AtomicBool::new(false));
+        let premature_candidates = Arc::new(AtomicUsize::new(0));
+        let resurrected_volumes = Arc::new(AtomicUsize::new(0));
+        let delayed_creation = Arc::new(DelayedCandidateCreation::default());
         let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
-        let (seen, bodies, backing) = (calls.clone(), containers.clone(), volume.clone());
+        let (seen, bodies, backing) = (calls.clone(), containers.clone(), volumes.clone());
         let expected_scratch = format!(
             "freshell-claude-candidate-{}",
             request.observation_request.request_id
         );
+        let mut retry_requests = [request.clone(), request.clone()];
+        for retry in &mut retry_requests {
+            retry.observation_request.request_id = uuid::Uuid::new_v4().to_string();
+        }
+        let allowed_scratch = std::iter::once(expected_scratch.clone())
+            .chain(retry_requests.iter().map(|retry| {
+                format!(
+                    "freshell-claude-candidate-{}",
+                    retry.observation_request.request_id
+                )
+            }))
+            .collect::<std::collections::BTreeSet<_>>();
+        let (phase, waiting, premature, resurrected) = (
+            cleanup_phase.clone(),
+            cleanup_waiting.clone(),
+            premature_candidates.clone(),
+            resurrected_volumes.clone(),
+        );
+        let delayed = delayed_creation.clone();
         let retained_name_for_server = retained_name.clone();
         let server = tokio::spawn(async move {
             let retained_name = retained_name_for_server;
@@ -1080,7 +1219,7 @@ async fn qualify_candidate_helper_transport(
                     _=&mut stopped=>break,
                     accepted=listener.accept()=>{
                         let (mut stream,_)=accepted.unwrap();
-                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone());
+                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name,allowed_scratch,phase,waiting,premature,resurrected,delayed)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone(),allowed_scratch.clone(),phase.clone(),waiting.clone(),premature.clone(),resurrected.clone(),delayed.clone());
                         jobs.spawn(async move {
                             let mut header=Vec::new();let mut byte=[0];
                             while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
@@ -1092,15 +1231,68 @@ async fn qualify_candidate_helper_transport(
                             let (status,value)=if line.contains("/info "){(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
                             else if line.contains("/images/"){(200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_IMAGE_CREDENTIAL_SENTINEL"]}}))}
                             else if line.starts_with("POST") && line.contains("/volumes/create "){
-                                assert_eq!(body["Name"],expected_scratch,"private candidate request must identify its exact scratch backing before creation");
+                                if retry_cleanup.is_some() {
+                                    assert!(allowed_scratch.contains(body["Name"].as_str().unwrap()));
+                                } else {
+                                    assert_eq!(body["Name"],expected_scratch,"private candidate request must identify its exact scratch backing before creation");
+                                }
+                                let delayed_scratch=mode=="cleanup-retry-scratch-create" && body["Name"]==expected_scratch && !delayed.finished.load(Ordering::SeqCst);
+                                if delayed_scratch {
+                                    delayed.started.store(true, Ordering::SeqCst);
+                                    delayed.release.notified().await;
+                                }
                                 if serde_json::from_value::<BTreeMap<String,String>>(body["Labels"].clone()).is_err() { (400,json!({"message":"volume labels require string metadata"})) }
-                                else { let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual) }
+                                else if retry_cleanup.is_some() && !backing.lock().unwrap().is_empty() {
+                                    premature.fetch_add(1, Ordering::SeqCst);
+                                    (503, json!({"message":"previous owned candidate cleanup must finish first"}))
+                                }
+                                else {
+                                    let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});
+                                    backing.lock().unwrap().insert(body["Name"].as_str().unwrap().to_owned(),actual.clone());
+                                    if delayed_scratch {delayed.finished.store(true, Ordering::SeqCst);delayed.settled.notify_waiters();}
+                                    (201,actual)
+                                }
                             }
-                            else if line.starts_with("GET") && line.contains("/volumes/"){if retained_name.as_ref().is_some_and(|name|line.contains(name)) {(200,json!({"Name":retained_name,"Driver":"local","Options":{},"Mountpoint":"/synthetic/retained-home"}))} else {match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}}
-                            else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
+                            else if line.starts_with("GET") && line.contains("/volumes/"){
+                                let name=line.split("/volumes/").nth(1).unwrap().split_whitespace().next().unwrap();
+                                if mode=="cleanup-retry-scratch-create" && name==expected_scratch && delayed.started.load(Ordering::SeqCst) && !delayed.finished.load(Ordering::SeqCst) {
+                                    // Docker volume CREATE and GET share this volume's lock.
+                                    // Cleanup cannot observe absence until CREATE settles.
+                                    delayed.settled.notified().await;
+                                }
+                                if retained_name.as_ref().is_some_and(|name|line.contains(name)) {(200,json!({"Name":retained_name,"Driver":"local","Options":{},"Mountpoint":"/synthetic/retained-home"}))}
+                                else {match backing.lock().unwrap().get(name).cloned(){Some(v)=>(200,v),None=>(404,json!({}))}}
+                            }
+                            else if line.starts_with("DELETE") && line.contains("/volumes/"){
+                                assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");
+                                if mode!="volume-still-present" {let name=line.split("/volumes/").nth(1).unwrap().split_whitespace().next().unwrap();backing.lock().unwrap().remove(name);}
+                                if matches!(mode, "cleanup-retry-removed" | "cleanup-retry-scratch-create") && phase.load(Ordering::SeqCst) == BLOCK_REMOVAL {
+                                    waiting.store(true, Ordering::SeqCst);
+                                    std::future::pending::<()>().await;
+                                }
+                                (204,json!({}))
+                            }
                             else if line.contains("/containers/create?"){
                                 if body["Cmd"]==json!(["project-claude-candidate-private"]) {let root=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|m|m["Target"]=="/run/freshell-candidate-inputs").unwrap()["Source"].as_str().unwrap();assert!(!Path::new(root).join(".freshell/mcp-capability.json").exists(),"ordinary candidate input root must not expose capability credentials");}
-                                let name=line.split("name=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();let id=if body["Cmd"]==json!(["prepare-provider-mountpoints"]) {"a".repeat(64)} else {"b".repeat(64)};bodies.lock().unwrap().insert(name,json!({"Id":id,"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}}));(if mode=="lost-projection-ack" && body["Cmd"]==json!(["project-claude-candidate-private"]) {503}else{201},json!({"Id":id}))}
+                                let delayed_reader=mode=="cleanup-retry-reader-create" && body["Cmd"]==json!(["project-claude-candidate-private"]) && body["Labels"]["com.freshell.source-request-id"]==expected_scratch.trim_start_matches("freshell-claude-candidate-") && !delayed.finished.load(Ordering::SeqCst);
+                                if delayed_reader {
+                                    delayed.started.store(true, Ordering::SeqCst);
+                                    delayed.release.notified().await;
+                                }
+                                let mut lost_mountpoint_ack=false;
+                                if (mode=="cleanup-retry-removed" && body["Cmd"]==json!(["prepare-provider-mountpoints"])) || delayed_reader {
+                                    let volume=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|m|m["Target"]=="/home/freshell/provider").unwrap()["Source"].as_str().unwrap();
+                                    lost_mountpoint_ack=mode=="cleanup-retry-removed" && volume==expected_scratch;
+                                    if !backing.lock().unwrap().contains_key(volume) {
+                                        // Docker CREATE acquires a missing named volume even
+                                        // when this is only a stopped cleanup helper.
+                                        resurrected.fetch_add(1, Ordering::SeqCst);
+                                        backing.lock().unwrap().insert(volume.to_owned(),json!({"Name":volume,"Driver":"local","Options":{},"Labels":{},"Mountpoint":"/synthetic/resurrected-home"}));
+                                    }
+                                }
+                                let name=line.split("name=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();let id=if body["Cmd"]==json!(["prepare-provider-mountpoints"]) {"a".repeat(64)} else {"b".repeat(64)};bodies.lock().unwrap().insert(name,json!({"Id":id,"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}}));
+                                if delayed_reader {delayed.finished.store(true, Ordering::SeqCst);delayed.settled.notify_waiters();}
+                                (if lost_mountpoint_ack || (mode=="lost-projection-ack" && body["Cmd"]==json!(["project-claude-candidate-private"])) {503}else{201},json!({"Id":id}))}
                             else if line.starts_with("GET") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let found=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(_,v)|v.clone());match found {Some(mut v)=>{
                                 let reports=v["HostConfig"]["Mounts"].as_array().unwrap().iter().map(|m|json!({"Type":m["Type"],"Destination":m["Target"],"RW":!m["ReadOnly"].as_bool().unwrap(),"Source":if m["Type"]=="volume" {json!(if m["Target"]=="/run/freshell-retained-home" {"/synthetic/retained-home"} else {"/synthetic/ordinary-volume"})} else {m["Source"].clone()},"Name":if m["Type"]=="volume" {m["Source"].clone()} else {Value::Null}})).collect::<Vec<_>>();
                                 v["Mounts"]=json!(reports);
@@ -1113,7 +1305,18 @@ async fn qualify_candidate_helper_transport(
                                     if mode=="writable-retained-home" {v["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["Destination"]=="/run/freshell-retained-home").unwrap()["RW"]=json!(true);}
                                     if mode=="wrong-retained-volume" {v["Mounts"].as_array_mut().unwrap().iter_mut().find(|m|m["Destination"]=="/run/freshell-retained-home").unwrap()["Name"]=json!("foreign-provider-home");}
                                 } (200,v)},None=>(404,json!({}))}}
-                            else if line.starts_with("DELETE") && line.contains("/containers/"){let key=line.split("/containers/").nth(1).unwrap().split('?').next().unwrap();let name=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(name,_)|name.clone());if let Some(name)=name{bodies.lock().unwrap().remove(&name);}(204,json!({}))}
+                            else if line.starts_with("DELETE") && line.contains("/containers/"){
+                                if matches!(mode, "cleanup-retry" | "cleanup-retry-removed") && phase.load(Ordering::SeqCst) == REJECT_REMOVAL {
+                                    (503, json!({"message":"controlled owned helper removal failure"}))
+                                }
+                                else {
+                                    if matches!(mode, "cleanup-retry" | "cleanup-retry-reader-create") && phase.load(Ordering::SeqCst) == BLOCK_REMOVAL {
+                                        waiting.store(true, Ordering::SeqCst);
+                                        std::future::pending::<()>().await;
+                                    }
+                                    let key=line.split("/containers/").nth(1).unwrap().split('?').next().unwrap();let name=bodies.lock().unwrap().iter().find(|(name,v)|*name==key || v["Id"]==key).map(|(name,_)|name.clone());if let Some(name)=name{bodies.lock().unwrap().remove(&name);}(204,json!({}))
+                                }
+                            }
                             else if line.contains("/start "){let id=line.split("/containers/").nth(1).unwrap().split('/').next().unwrap();let v=bodies.lock().unwrap().values().find(|v|v["Id"]==id).unwrap().clone();private_jobs.lock().unwrap().push(tokio::spawn(async move {
                                 let is_mountpoint=v["Config"]["Cmd"]==json!(["prepare-provider-mountpoints"]);
                                 let target=if is_mountpoint {"/run/freshell-input-exchange"} else {"/run/freshell-source-exchange"};
@@ -1171,21 +1374,209 @@ async fn qualify_candidate_helper_transport(
             }
         });
         let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
-        let budget = if mode == "projection-timeout" {
+        let delayed_case = matches!(
+            mode,
+            "cleanup-retry-scratch-create" | "cleanup-retry-reader-create"
+        );
+        let budget = if delayed_case {
+            Duration::from_millis(100)
+        } else if mode == "projection-timeout" {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(3)
         };
-        let result = backend
-            .read_claude_candidate_helper(
-                owner,
-                request,
-                stage,
-                "synthetic-source-run",
-                budget,
-                retained_name.as_ref().map(|_| prior_stage.as_path()),
+        let first = backend.read_claude_candidate_helper(
+            owner,
+            request,
+            stage,
+            "synthetic-source-run",
+            budget,
+            retained_name.as_ref().map(|_| prior_stage.as_path()),
+        );
+        let mut creation_evidence = None;
+        let mut result = if delayed_case {
+            let result = expire_candidate_creation(first, &delayed_creation.started, budget).await;
+            let old_volume = format!(
+                "freshell-claude-candidate-{}",
+                request.observation_request.request_id
+            );
+            let owner_retained = backend
+                .mountpoint_helpers
+                .lock()
+                .unwrap()
+                .get(&old_volume)
+                .is_some_and(Option::is_some);
+            let interim = if mode == "cleanup-retry-scratch-create" {
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    backend.request_bounded(
+                        "GET",
+                        &format!("{DOCKER_API}/volumes/{old_volume}"),
+                        None,
+                        64 * 1024,
+                    ),
+                )
+                .await
+                .is_err()
+            } else {
+                let name = {
+                    let calls = calls.lock().unwrap();
+                    let (line, _) = calls
+                        .iter()
+                        .find(|(_, body)| {
+                            body["Cmd"] == json!(["project-claude-candidate-private"])
+                        })
+                        .expect("candidate must reach its controlled reader CREATE");
+                    line.split("name=")
+                        .nth(1)
+                        .unwrap()
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .to_string()
+                };
+                backend
+                    .request_bounded(
+                        "GET",
+                        &format!("{DOCKER_API}/containers/{name}/json"),
+                        None,
+                        64 * 1024,
+                    )
+                    .await
+                    .unwrap()
+                    .status
+                    == 404
+            };
+            delayed_creation.release.notify_one();
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while !delayed_creation.finished.load(Ordering::SeqCst)
+                && std::time::Instant::now() < until
+            {
+                tokio::task::yield_now().await;
+            }
+            creation_evidence = Some(
+                result.is_some()
+                    && owner_retained
+                    && interim
+                    && delayed_creation.started.load(Ordering::SeqCst)
+                    && delayed_creation.finished.load(Ordering::SeqCst),
+            );
+            result.unwrap_or_else(|| {
+                Err(fail(
+                    "synthetic observation did not settle within its cleanup reserve",
+                ))
+            })
+        } else {
+            first.await
+        };
+        let mut retry_evidence = None;
+        if retry_cleanup.is_some() {
+            let retry_budget = Duration::from_secs(3);
+            // Failure must leave the first request's exact resources reachable.
+            let first_failed = result.is_err();
+            let old_volume = format!(
+                "freshell-claude-candidate-{}",
+                request.observation_request.request_id
+            );
+            let old_paths = if mode == "cleanup-retry-scratch-create" {
+                vec![]
+            } else {
+                let calls = calls.lock().unwrap();
+                let reader = mode == "cleanup-retry-reader-create";
+                let (_, body) = calls
+                    .iter()
+                    .find(|(_, body)| {
+                        body["Cmd"]
+                            == json!([if reader {
+                                "project-claude-candidate-private"
+                            } else {
+                                "prepare-provider-mountpoints"
+                            }])
+                    })
+                    .expect("valid candidate must reach its controlled owned helper");
+                body["HostConfig"]["Mounts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|mount| {
+                        if reader {
+                            mount["Target"] == "/run/freshell-source-exchange"
+                                || mount["Target"] == "/run/freshell-candidate-inputs"
+                        } else {
+                            mount["Target"] == "/run/freshell-input-exchange"
+                        }
+                    })
+                    .flat_map(|mount| {
+                        let path = PathBuf::from(mount["Source"].as_str().unwrap());
+                        if mount["Target"] == "/run/freshell-candidate-inputs" {
+                            vec![path]
+                        } else {
+                            vec![path.clone(), path.join("reply.sock")]
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let resources_retained = |home_present| {
+                volumes.lock().unwrap().contains_key(&old_volume) == home_present
+                    && backend
+                        .mountpoint_helpers
+                        .lock()
+                        .unwrap()
+                        .get(&old_volume)
+                        .is_some_and(Option::is_some)
+                    && old_paths.iter().all(|path| path.exists())
+            };
+            let first_retained = resources_retained(true);
+            // Cancelling a different request must retain the same cleanup owner.
+            cleanup_phase.store(BLOCK_REMOVAL, Ordering::SeqCst);
+            let interrupted = tokio::time::timeout(
+                Duration::from_millis(250),
+                Box::pin(backend.read_claude_candidate_helper(
+                    owner,
+                    &retry_requests[0],
+                    stage,
+                    "synthetic-source-run",
+                    retry_budget,
+                    None,
+                )),
             )
-            .await;
+            .await
+            .is_err();
+            let interrupted_retained = if mode == "cleanup-retry-removed" {
+                // Confirmed helper absence releases its exchange immediately.
+                // The interrupted scratch transaction must still be retained.
+                !volumes.lock().unwrap().contains_key(&old_volume)
+                    && containers.lock().unwrap().is_empty()
+                    && backend
+                        .mountpoint_helpers
+                        .lock()
+                        .unwrap()
+                        .get(&old_volume)
+                        .is_some_and(Option::is_some)
+                    && old_paths.iter().all(|path| !path.exists())
+            } else {
+                resources_retained(mode != "cleanup-retry-scratch-create")
+            };
+            // Once Docker recovers, another new request must settle the old
+            // helper and HOME before the peer accepts any new scratch creation.
+            cleanup_phase.store(CONFIRM_REMOVAL, Ordering::SeqCst);
+            result = backend
+                .read_claude_candidate_helper(
+                    owner,
+                    &retry_requests[1],
+                    stage,
+                    "synthetic-source-run",
+                    retry_budget,
+                    None,
+                )
+                .await;
+            retry_evidence = Some((
+                first_failed && first_retained,
+                interrupted && cleanup_waiting.load(Ordering::SeqCst),
+                interrupted_retained,
+                old_paths,
+            ));
+        }
         let _ = stop.send(());
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
@@ -1193,7 +1584,7 @@ async fn qualify_candidate_helper_transport(
             .unwrap();
         assert_eq!(
             result.is_ok(),
-            matches!(mode, "success" | "docker-empty-tmpfs"),
+            retry_cleanup.is_some() || matches!(mode, "success" | "docker-empty-tmpfs"),
             "{mode}: candidate projection and confirmed owned cleanup gate evidence: {result:?}"
         );
         assert!(
@@ -1201,10 +1592,54 @@ async fn qualify_candidate_helper_transport(
             "{mode}: both helpers must be removed"
         );
         assert_eq!(
-            volume.lock().unwrap().is_some(),
+            !volumes.lock().unwrap().is_empty(),
             mode == "volume-still-present"
         );
+        if let Some((first_retained, interrupted, interrupted_retained, old_paths)) = retry_evidence
+        {
+            assert!(
+                first_retained,
+                "failed cleanup must retain the exact helper, exchange, and scratch HOME"
+            );
+            assert!(
+                interrupted,
+                "the next request must reconcile the old helper before starting new candidate work"
+            );
+            assert!(
+                interrupted_retained,
+                "a second cancellation must retain the same owned cleanup for retry"
+            );
+            assert!(
+                old_paths.iter().all(|path| !path.exists()),
+                "successful retry must remove the old exact exchange and ordinary input view"
+            );
+            assert!(backend.mountpoint_helpers.lock().unwrap().is_empty());
+            assert_eq!(
+                resurrected_volumes.load(Ordering::SeqCst),
+                0,
+                "retry after confirmed helper removal must not recreate its deleted scratch HOME"
+            );
+            assert_eq!(premature_candidates.load(Ordering::SeqCst), 0,
+                "new candidate scratch must not be created before the previous owned candidate is settled");
+        }
+        if let Some(retained) = creation_evidence {
+            assert!(retained, "observation timeout and cleanup must retain its pending CREATE through the real interim Docker result");
+        }
         let seen = calls.lock().unwrap();
+        if retry_cleanup.is_some() {
+            let old_volume = format!(
+                "freshell-claude-candidate-{}",
+                request.observation_request.request_id
+            );
+            assert_eq!(seen.iter().filter(|(_, body)| body["Cmd"] == json!(["prepare-provider-mountpoints"])
+                && body["HostConfig"]["Mounts"].as_array().unwrap().iter().any(|mount| mount["Source"] == old_volume)).count(), usize::from(mode != "cleanup-retry-scratch-create"),
+                "confirmed old helper removal must remain settled across interrupted scratch cleanup");
+            if mode == "cleanup-retry-reader-create" {
+                assert_eq!(seen.iter().filter(|(_, body)| body["Cmd"] == json!(["project-claude-candidate-private"])
+                    && body["Labels"]["com.freshell.source-request-id"] == request.observation_request.request_id).count(), 1,
+                    "a pending original reader CREATE must be settled before any retry dispatches another helper");
+            }
+        }
         if matches!(
             mode,
             "unexpected-tmpfs"

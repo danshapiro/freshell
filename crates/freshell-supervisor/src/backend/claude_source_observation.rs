@@ -47,7 +47,8 @@ fn retained_claude_context(
 
 /// Ordinary candidate files use disk backing, separately from indexed secrets.
 /// The owning reader retains this identity through helper and volume cleanup.
-struct CandidateScratch {
+#[derive(Clone)]
+pub(super) struct CandidateScratch {
     name: String,
     labels: Value,
     daemon: DockerDaemonId,
@@ -55,6 +56,18 @@ struct CandidateScratch {
 }
 
 impl CandidateScratch {
+    pub(super) fn belongs_to(&self, soul: &SoulId) -> bool {
+        self.labels["com.freshell.soul-id"] == soul.as_str()
+    }
+
+    pub(super) fn same_owner(&self, other: &Self) -> bool {
+        self.name == other.name && self.labels == other.labels && self.daemon == other.daemon
+    }
+
+    pub(super) fn creation_rejected(&mut self) {
+        self.attempted = false;
+    }
+
     fn owns(&self, actual: &Value) -> bool {
         actual["Name"] == self.name
             && actual["Driver"] == "local"
@@ -70,6 +83,26 @@ impl CandidateScratch {
 /// Resource payloads remain on their existing disk backing; they are not copied
 /// into the controller's private exchange or indexed-secret volume.
 struct CandidateInputView(PathBuf, bool);
+
+pub(super) struct HeldCandidateReader {
+    pub(super) container: provider_mountpoints::OwnedContainerCreate,
+    input_view: Option<CandidateInputView>,
+    retained_view: Option<CandidateInputView>,
+}
+
+impl HeldCandidateReader {
+    pub(super) fn cleanup_views(&mut self) -> Result<(), BackendError> {
+        for view in [&mut self.input_view, &mut self.retained_view]
+            .into_iter()
+            .flatten()
+        {
+            if !view.1 {
+                view.cleanup()?;
+            }
+        }
+        Ok(())
+    }
+}
 
 impl CandidateInputView {
     fn create(
@@ -249,9 +282,7 @@ impl DockerEngineBackend {
         let deadline = tokio::time::Instant::now() + budget;
         let name = format!("freshell-claude-candidate-reader-{}", uuid::Uuid::new_v4());
         let mut scratch = None::<CandidateScratch>;
-        let mut mountpoint_helper = None::<(String, Value)>;
-        let mut expected = None::<Value>;
-        let mut attempted = false;
+        let mut mountpoint_helper = None::<String>;
         let mut directory = None::<native_auth::ExchangeDirectory>;
         let mut input_view = None::<CandidateInputView>;
         let mut retained_view = None::<CandidateInputView>;
@@ -335,6 +366,10 @@ impl DockerEngineBackend {
             } else if let Some(attempt) = &projection.publication.registry_attempt_id {
                 labels["com.freshell.source-recovery-attempt-id"] = json!(attempt);
             }
+            // Observation request IDs change on retry. Retire the previous
+            // exact candidate owner before allocating this request's HOME.
+            self.cleanup_previous_candidate_mountpoints(&request.soul_id)
+                .await?;
             scratch = Some(CandidateScratch {
                 name: format!(
                     "freshell-claude-candidate-{}",
@@ -345,6 +380,7 @@ impl DockerEngineBackend {
                 attempted: false,
             });
             let backing = scratch.as_mut().unwrap();
+            mountpoint_helper = Some(backing.name.clone());
             self.create_claude_candidate_scratch(backing).await?;
             self.run_provider_mountpoint_helper(
                 provider_mountpoints::MountpointHelperTarget {
@@ -353,13 +389,13 @@ impl DockerEngineBackend {
                     binary: &binary,
                     daemon: &daemon,
                     labels: labels.clone(),
+                    candidate_scratch: Some(backing),
                 },
                 provider_mountpoints::selections(&mounts)?,
                 (
                     deadline.saturating_duration_since(tokio::time::Instant::now()),
                     Duration::from_secs(5),
                 ),
-                &mut mountpoint_helper,
             )
             .await?;
             directory = Some(native_auth::ExchangeDirectory::create_input()?);
@@ -407,19 +443,28 @@ impl DockerEngineBackend {
                 "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"CapAdd":["CHOWN","SETGID","SETUID"],
                     "SecurityOpt":["no-new-privileges"],"Memory":256*1024*1024,"MemorySwap":256*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
                     "LogConfig":{"Type":"none","Config":{}},"Tmpfs":{},"Mounts":descriptors}});
-            expected = Some(body.clone());
-            attempted = true;
-            let created = self
-                .request_bounded(
-                    "POST",
-                    &format!("{DOCKER_API}/containers/create?name={name}"),
-                    Some(&body),
-                    64 * 1024,
-                )
+            let mut reader_claim = self.claim_mountpoint_helper(&backing.name)?;
+            let retained = reader_claim
+                .held
+                .as_mut()
+                .ok_or_else(|| fail("Claude candidate preparation owner unavailable"))?;
+            retained.reader = Some(HeldCandidateReader {
+                container: provider_mountpoints::OwnedContainerCreate::new(
+                    self.socket_path.clone(),
+                    name.clone(),
+                    body.clone(),
+                    directory.take().unwrap(),
+                ),
+                input_view: input_view.take(),
+                retained_view: retained_view.take(),
+            });
+            let created = retained
+                .reader
+                .as_mut()
+                .unwrap()
+                .container
+                .creation_reply()
                 .await?;
-            if created.status == 409 {
-                attempted = false;
-            }
             if created.status != 201 {
                 return Err(fail(
                     "Claude candidate reader creation acknowledgement unavailable",
@@ -563,18 +608,9 @@ impl DockerEngineBackend {
         // One cleanup reserve covers both helpers and the ordinary backing.
         // Any uncertain helper removal prevents deleting its still-mounted HOME.
         let cleanup = async {
-            if let Some((helper, body)) = mountpoint_helper.as_ref() {
-                self.cleanup_provider_mountpoint_helper(helper, body)
-                    .await?;
+            if let Some(volume) = mountpoint_helper.as_ref() {
+                self.cleanup_retained_mountpoint_helper(volume).await?;
                 mountpoint_helper = None;
-            }
-            if attempted {
-                self.cleanup_claude_candidate_reader(&name, expected.as_ref().unwrap())
-                    .await?;
-                attempted = false;
-            }
-            if let Some(backing) = scratch.as_mut() {
-                self.cleanup_claude_candidate_scratch(backing).await?;
             }
             if let Some(view) = input_view.as_mut() {
                 view.cleanup()?;
@@ -594,60 +630,20 @@ impl DockerEngineBackend {
         result
     }
 
-    async fn cleanup_claude_candidate_reader(
-        &self,
-        name: &str,
-        expected: &Value,
-    ) -> Result<(), BackendError> {
-        let inspected = self
-            .request_bounded(
-                "GET",
-                &format!("{DOCKER_API}/containers/{name}/json"),
-                None,
-                1024 * 1024,
-            )
-            .await?;
-        if inspected.status == 404 {
-            return Ok(());
-        }
-        let actual: Value = serde_json::from_slice(&inspected.body)
-            .map_err(|_| fail("Claude candidate cleanup metadata invalid"))?;
-        let id = actual["Id"]
-            .as_str()
-            .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or_else(|| fail("Claude candidate cleanup identity invalid"))?;
-        if inspected.status != 200 || !owned_candidate_helper(&actual, expected) {
-            return Err(fail("Claude candidate cleanup ownership changed"));
-        }
-        let removed = self
-            .request_bounded(
-                "DELETE",
-                &format!("{DOCKER_API}/containers/{id}?force=1"),
-                None,
-                64 * 1024,
-            )
-            .await?;
-        if !matches!(removed.status, 204 | 404) {
-            return Err(fail("Claude candidate helper cleanup failed"));
-        }
-        let absent = self
-            .request_bounded(
-                "GET",
-                &format!("{DOCKER_API}/containers/{id}/json"),
-                None,
-                64 * 1024,
-            )
-            .await?;
-        if absent.status != 404 {
-            return Err(fail("Claude candidate helper cleanup not confirmed"));
-        }
-        Ok(())
-    }
-
     async fn create_claude_candidate_scratch(
         &self,
         scratch: &mut CandidateScratch,
     ) -> Result<(), BackendError> {
+        let mut claim = self.claim_mountpoint_helper(&scratch.name)?;
+        if claim.held.is_some() {
+            return Err(fail(
+                "Claude candidate prior preparation cleanup remains unconfirmed",
+            ));
+        }
+        claim.held = Some(provider_mountpoints::HeldProviderPreparation {
+            candidate_scratch: Some(scratch.clone()),
+            ..Default::default()
+        });
         if scratch.attempted || self.daemon_id().await? != scratch.daemon {
             return Err(fail("Claude candidate scratch namespace changed"));
         }
@@ -664,9 +660,19 @@ impl DockerEngineBackend {
         }
         // Retain ownership on a lost acknowledgement. A conflict is foreign.
         scratch.attempted = true;
-        let created = self.request_bounded("POST", &format!("{DOCKER_API}/volumes/create"), Some(&json!({"Name":scratch.name,"Driver":"local","Labels":scratch.labels,"DriverOpts":{}})), 64 * 1024).await?;
+        let retained = claim.held.as_mut().unwrap();
+        retained.candidate_scratch = Some(scratch.clone());
+        retained.scratch_create = Some(provider_mountpoints::creation_request(
+            self.socket_path.clone(),
+            format!("{DOCKER_API}/volumes/create"),
+            json!({"Name":scratch.name,"Driver":"local","Labels":scratch.labels,"DriverOpts":{}}),
+        ));
+        let created = retained.scratch_create.as_mut().unwrap().await;
+        retained.scratch_create = None;
+        let created = created?;
         if created.status == 409 {
             scratch.attempted = false;
+            retained.candidate_scratch = Some(scratch.clone());
         }
         if !matches!(created.status, 200 | 201) {
             return Err(fail(
@@ -692,7 +698,7 @@ impl DockerEngineBackend {
         Ok(())
     }
 
-    async fn cleanup_claude_candidate_scratch(
+    pub(super) async fn cleanup_claude_candidate_scratch(
         &self,
         scratch: &mut CandidateScratch,
     ) -> Result<(), BackendError> {
@@ -1009,7 +1015,7 @@ fn owned_helper(actual: &Value, expected: &Value) -> bool {
             .is_none_or(|caps| caps.is_empty())
 }
 
-fn owned_candidate_helper(actual: &Value, expected: &Value) -> bool {
+pub(super) fn owned_candidate_helper(actual: &Value, expected: &Value) -> bool {
     expected["User"] == "0:0"
         && expected["Cmd"] == json!(["project-claude-candidate-private"])
         && expected["HostConfig"]["CapAdd"] == json!(["CHOWN", "SETGID", "SETUID"])

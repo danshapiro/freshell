@@ -37,6 +37,21 @@ function providerPreparationWaitMs(provider: Provider): number {
     + nativeObservation + ordinaryProjection * 2 + readerCleanup
 }
 
+function managedLifecycleWaitMs(provider: Provider): number {
+  const runtimeStopCreateAndNativeReady = 90_000
+  const retainedMountpointCleanup = 60_000
+  const mountpointCreate = 60_000
+  const mountpointWork = 30_000
+  const mountpointCleanup = 60_000
+  const publisherOperationAndCleanup = 20_000 + 60_000
+  // Slow rootless Docker creation/removal is valid within these separate
+  // backend bounds. Add their preparation allowance to the existing runtime
+  // wait, including reconciliation of a retained helper from an earlier try.
+  return runtimeStopCreateAndNativeReady + providerPreparationWaitMs(provider)
+    + retainedMountpointCleanup + mountpointCreate + mountpointWork
+    + mountpointCleanup + publisherOperationAndCleanup
+}
+
 async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 45_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -53,7 +68,7 @@ class TerminalWire {
   private readonly records: RecordRow[] = []
   private outputBuffer = ''
 
-  private constructor(socket: WebSocket) {
+  private constructor(socket: WebSocket, private readonly managed: boolean) {
     this.socket = socket
     socket.on('message', data => {
       try {
@@ -74,7 +89,7 @@ class TerminalWire {
 
   static async connect(info: { wsUrl: string; token: string }, managed: boolean): Promise<TerminalWire> {
     const socket = new WebSocket(info.wsUrl)
-    const wire = new TerminalWire(socket)
+    const wire = new TerminalWire(socket, managed)
     await new Promise<void>((resolve, reject) => {
       socket.once('open', resolve)
       socket.once('error', reject)
@@ -107,7 +122,7 @@ class TerminalWire {
     this.send({ type: 'terminal.create', requestId, mode: provider, shell: 'system', cwd, tabId: `tab-${provider}`, paneId: `pane-${provider}` })
     const frame = await this.wait(message => (
       message.requestId === requestId && (message.type === 'terminal.created' || message.type === 'error')
-    ), 90_000)
+    ), this.managed ? managedLifecycleWaitMs(provider) : 90_000)
     if (frame.type === 'error') throw new Error(`${provider} terminal.create failed: ${JSON.stringify(frame)}`)
     await this.attach(frame.terminalId)
     return { requestId, terminalId: frame.terminalId }
@@ -842,7 +857,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
         const view = await rig.runningViewForTerminal(managedTerminalId!)
         return view?.containerId && view.incarnationId !== before.incarnationId
           && view.recoveryState === 'live' ? view : undefined
-      }, 90_000 + providerPreparationWaitMs(provider)).catch(async error => {
+      }, managedLifecycleWaitMs(provider)).catch(async error => {
         throw new Error(`${String(error)}; inventory=${JSON.stringify(await rig.inventory())}`)
       })
       expect(after.soulId).toBe(before.soulId)
@@ -909,7 +924,8 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       }))
     }
     if (managedSoulId) await rig.stopSoul(managedSoulId)
-  }, 180_000 + providerPreparationWaitMs('claude'))
+  }, 180_000 + managedLifecycleWaitMs('claude')
+    * (process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR ? 2 : 1))
 
   it('resumed OpenCode child sees refreshed config and keeps provider-owned state', async () => {
     const wire = await TerminalWire.connect(rig.info, true)
@@ -953,7 +969,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       }
       return rows.find((row: any) => row.launchState === 'running'
         && row.containerId && row.incarnationId !== before.incarnationId)
-    }, 300_000).catch(async error => {
+    }, managedLifecycleWaitMs('opencode')).catch(async error => {
       const inventory = await rig.inventory()
       const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(inventory)}; supervisor logs: ${supervisorLogs}`)
@@ -987,7 +1003,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       throw new Error(`${String(error)}; records: ${JSON.stringify(wire.recordRows())}; output: ${wire.terminalOutput()}`)
     })
     expect(resumedMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
-  }, 360_000)
+  }, 180_000 + managedLifecycleWaitMs('opencode') * 2)
 
   it('relays a managed OpenCode session switch and restores that native session', async () => {
     const wire = await TerminalWire.connect(rig.info, true)
@@ -1040,7 +1056,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
     const after = await waitFor('replacement OpenCode incarnation after native switch', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
-    }, 120_000).catch(async error => {
+    }, managedLifecycleWaitMs('opencode')).catch(async error => {
       throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}; web: ${JSON.stringify(providerParityFailureDiagnostics(Object.values(rig.web.capturedOutput()).join('\n'))).slice(-4000)}`)
     })
     expect(after.soulId).toBe(before.soulId)
@@ -1052,7 +1068,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       row.provider === 'opencode' && row.kind === 'launch' && row.argv.includes(switchedId)
     )), 90_000)
     expect(resumed.argv).toContain(switchedId)
-  }, 360_000)
+  }, 180_000 + managedLifecycleWaitMs('opencode') * 2)
 
   it('recovers OpenCode inline and home JSONC TUI inputs after web restart with its container down', async () => {
     const wire = await TerminalWire.connect(rig.info, true)
@@ -1099,7 +1115,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       }
       return rows.find((row: any) => row.launchState === 'running'
         && row.containerId && row.incarnationId !== before.incarnationId)
-    }, 300_000)
+    }, managedLifecycleWaitMs('opencode'))
     expect(after.soulId).toBe(before.soulId)
     await recoveredWire.attach(terminalId)
     const resumed = await waitFor('resumed OpenCode child after web restart', () => recoveredWire.recordRows().find(row => (
@@ -1117,5 +1133,5 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
       row.provider === 'opencode' && row.kind === 'mcp'
     )), 90_000)
     expect(resumedMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
-  }, 360_000)
+  }, 180_000 + managedLifecycleWaitMs('opencode') * 2)
 })
