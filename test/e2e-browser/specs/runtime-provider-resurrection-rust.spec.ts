@@ -694,7 +694,6 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       const currentForReceipt = await waitForRunningView(rig, terminalId,
         view => view.incarnationId === after.incarnationId && view.nativeSessionId === providerSessionIdAfter, 120_000)
       const { artifactRef } = await rig.publishPhase3BrowserReceipt(rig.exactRuntimeHandle(currentForReceipt), browserObservation)
-      // eslint-disable-next-line no-console
       console.log(`[P3-G10] provider resurrection receipt: ${artifactRef}`)
     } finally {
       const cleanup = await rig.stop()

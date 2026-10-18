@@ -486,7 +486,6 @@ test.describe.serial('Phase 5 runtime chaos', () => {
     expect(receiptReady).toBe(true)
     const receipt = await rig.finalizeChaosReceipt()
     expect(receipt.artifactRef).toMatch(/^phase5-chaos:[a-f0-9]{64}$/)
-    // eslint-disable-next-line no-console
     console.log(`[P5-G09] evidence-derived chaos receipt: ${receipt.artifactRef}`)
   })
 })

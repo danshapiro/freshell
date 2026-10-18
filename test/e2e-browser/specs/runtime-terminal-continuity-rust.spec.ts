@@ -252,7 +252,6 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         terminalId: initialPane.terminalId,
       }
       const { artifactRef } = await rig.publishTerminalContinuityReceipt(childEnclosure, receipt)
-      // eslint-disable-next-line no-console
       console.log(`[P2-G01] browser continuity receipt: ${artifactRef}`)
     } finally {
       const cleanup = await rig.stop()
@@ -398,7 +397,6 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         providerLaunchCount: hostFacts.workerLaunchCount,
       }
       const { artifactRef } = await rig.publishTerminalContinuityReceipt(continuityEnclosure, receipt)
-      // eslint-disable-next-line no-console
       console.log(`[P2-G04] real OpenCode continuity receipt: ${artifactRef}`)
     } finally {
       const cleanup = await rig.stop()

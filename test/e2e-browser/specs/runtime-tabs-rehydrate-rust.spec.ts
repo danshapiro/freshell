@@ -894,7 +894,6 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(receipt.browser.focusObservations).toHaveLength(4)
       expect(receipt.browser.focusStable).toBe(true)
       const published = await rig.publishPhase4BrowserReceipt(receipt.browser)
-      // eslint-disable-next-line no-console
       console.log(`[P4-G08] runtime tab rehydration receipt: ${published.artifactRef}`)
     } finally {
       oldClient?.close()

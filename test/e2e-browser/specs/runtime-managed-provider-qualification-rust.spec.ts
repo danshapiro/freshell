@@ -576,7 +576,6 @@ test.describe.serial('selectable managed-provider qualification', () => {
     const finalized = await rig.publishProviderQualification(providers)
     expect(finalized.schemaVersion).toBe(2)
     expect(finalized.rowCount).toBe(definitions.length)
-    // eslint-disable-next-line no-console
     console.log(`[provider-qualification] selected-provider receipts: ${finalized.artifactRefs.join(', ')}`)
   })
 })

@@ -345,7 +345,6 @@ test.describe.serial('Phase 5 certified provider loss', () => {
     expect(receiptReady).toBe(true)
     const receipt = await rig.finalizeLossReceipt()
     expect(receipt.artifactRef).toMatch(/^phase5-loss:[0-9a-f]{64}$/)
-    // eslint-disable-next-line no-console
     console.log(`[P5-G02] real OpenCode loss receipt: ${receipt.artifactRef}`)
   })
 })

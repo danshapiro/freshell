@@ -697,7 +697,6 @@ test.describe.serial('OpenCode provider qualification', () => {
     const finalized = await rig.publishProviderQualification([providerRow])
     expect(finalized.schemaVersion).toBe(2)
     expect(finalized.rowCount).toBe(1)
-    // eslint-disable-next-line no-console
     console.log(`[provider-qualification] OpenCode receipts: ${finalized.artifactRefs.join(', ')}`)
   })
 })
