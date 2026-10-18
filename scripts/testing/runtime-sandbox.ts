@@ -138,6 +138,7 @@ export class RuntimeHarness {
 
   private readonly trackedContainers = new Set<string>()
   private readonly trackedSupervisorContainers = new Set<string>()
+  private readonly supervisorRuntimeRoots = new Map<string, string>()
   private readonly trackedForeignContainers = new Set<string>()
   private readonly trackedVolumes = new Set<string>()
   private readonly assertions: AssertionRecord[] = []
@@ -286,6 +287,9 @@ export class RuntimeHarness {
 
   private async cleanupResources(): Promise<{ ok: boolean; errors: string[] }> {
     const errors: string[] = []
+    // Failed hosts may already be stopped. Retain their private bind-mounted
+    // journals while the owning trusted supervisor is still available.
+    try { this.collectHostLifecycleLogs(errors) } catch { errors.push('host journal evidence could not be retained') }
     for (const id of [...this.trackedSupervisorContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
     }
@@ -518,6 +522,7 @@ export class RuntimeHarness {
     if (!/^[0-9a-f]{64}$/.test(containerId)) throw new Error(`supervisor docker run returned invalid id: ${containerId}`)
     this.trackedSupervisorContainers.add(containerId)
     this.trackedContainers.add(containerId)
+    this.supervisorRuntimeRoots.set(runtimeRoot, containerId)
     const instance: SupervisorInstance = { scenarioId, containerId, controlSocket, controlSecret, controlSecretFile, runtimeRoot, volumeName, binaryKind }
     this.recordLifecycle('supervisor.started', { scenarioId, containerId, binaryKind, crashPoint: options.crashPoint, dbFailpoint: options.dbFailpoint, volumeName })
     if (options.waitForHealth !== false) await this.waitForSupervisorHealth(instance)
@@ -1165,6 +1170,58 @@ export class RuntimeHarness {
         releaseSupervisor: fileBuild(this.releaseSupervisorBinary),
         releaseHost: fileBuild(this.releaseHostBinary),
       },
+    }
+  }
+
+  private collectHostLifecycleLogs(errors: string[]): void {
+    for (const receipt of this.broker?.receipts?.() ?? []) {
+      const identity = { containerId: receipt.containerId, soulId: receipt.soulId, incarnationId: receipt.incarnationId }
+      for (const journal of ['host-lifecycle.jsonl.2', 'host-lifecycle.jsonl.1', 'host-lifecycle.jsonl']) {
+        const failed = (code: string, line?: number) => {
+          errors.push(`host journal ${receipt.containerId} ${journal}: ${code}${line === undefined ? '' : ` at line ${line}`}`)
+          this.recordLifecycle('host.lifecycle.collection_failed', { ...identity, journal, code, ...(line === undefined ? {} : { line }) })
+        }
+        let contents: string
+        try {
+          contents = this.readHostLifecycleJournal(receipt, journal)
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code ?? 'READ_FAILED'
+          if (code !== 'ENOENT') failed(code)
+          continue
+        }
+        for (const [index, line] of contents.split('\n').entries()) {
+          if (!line.trim()) continue
+          let raw: unknown
+          try { raw = JSON.parse(line) } catch { failed('INVALID_JSON', index + 1); continue }
+          // The host writer already redacts these rows. Never include a parse
+          // exception or rejected source line in collection diagnostics.
+          this.recordLifecycle('host.lifecycle', { ...identity, journal, raw })
+        }
+      }
+    }
+  }
+
+  private readHostLifecycleJournal(receipt: BrokerReceipt, journal: string): string {
+    const file = path.join(receipt.runtimeDir, journal)
+    try {
+      if (!fs.lstatSync(file).isFile()) throw Object.assign(new Error('journal is not a regular file'), { code: 'NOT_REGULAR' })
+      return fs.readFileSync(file, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EACCES') throw error
+      // Rootful private journals can belong to container root. Use only the
+      // existing trusted supervisor that owns this exact runtime root.
+      const supervisor = this.supervisorRuntimeRoots.get(path.dirname(receipt.runtimeDir))
+      if (!supervisor || !this.trackedSupervisorContainers.has(supervisor)) throw error
+      try {
+        return this.execOwnedContainerExact(supervisor, [
+          'sh', '-c',
+          'if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then exit 65; fi; if [ ! -e "$1" ]; then exit 66; fi; cat -- "$1"',
+          'host-journal', file,
+        ])
+      } catch (readError) {
+        const status = (readError as { status?: number }).status
+        throw Object.assign(new Error('owned supervisor journal read failed'), { code: status === 66 ? 'ENOENT' : status === 65 ? 'NOT_REGULAR' : 'READ_FAILED' })
+      }
     }
   }
 
