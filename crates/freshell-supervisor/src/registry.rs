@@ -1858,14 +1858,31 @@ impl Registry {
         data: &[u8],
         correlation: Option<&[u8]>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
-        let mut digest = Sha256::new();
-        digest.update((data.len() as u64).to_be_bytes());
-        digest.update(data);
-        if let Some(correlation) = correlation {
-            digest.update((correlation.len() as u64).to_be_bytes());
-            digest.update(correlation);
-        }
-        let payload_digest = format!("sha256:{:x}", digest.finalize());
+        self.begin_input_with_settings(soul_id, request_id, data, correlation, None)
+            .await
+    }
+
+    pub(crate) async fn begin_fresh_input(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        data: &[u8],
+        correlation: &[u8],
+        settings: Option<FreshAgentTurnSettings>,
+    ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
+        self.begin_input_with_settings(soul_id, request_id, data, Some(correlation), settings)
+            .await
+    }
+
+    async fn begin_input_with_settings(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        data: &[u8],
+        correlation: Option<&[u8]>,
+        settings: Option<FreshAgentTurnSettings>,
+    ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
+        let payload_digest = input_payload_digest(data, correlation);
         let protected_payload = data.to_vec();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1918,6 +1935,12 @@ impl Registry {
             let incarnation_id = IncarnationId::parse(incarnation_raw)
                 .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
 
+            // A settings refusal must roll back admission of the prompt too.
+            // Recovery consumes every queued row, so publishing it separately
+            // could later dispatch text from an already rejected request.
+            if let Some(settings) = settings {
+                update_fresh_agent_settings_in_tx(&tx, &soul_id, &incarnation_id, settings)?;
+            }
             let now = now_millis();
             let changed = tx.execute(
                 "UPDATE input_commands SET incarnation_id=?1,updated_at=?2 WHERE soul_id=?3 AND request_id=?4 AND state='queued'",
@@ -1935,6 +1958,41 @@ impl Registry {
         .await
     }
 
+    /// Read a terminal result without depending on current provider liveness.
+    /// Queued requests still require the normal admission path before dispatch.
+    pub(crate) async fn recorded_input_outcome(
+        &self,
+        soul_id: SoulId,
+        request_id: RequestId,
+        data: &[u8],
+        correlation: Option<&[u8]>,
+    ) -> Result<Option<InputJournalDisposition>, RegistryError> {
+        let digest = input_payload_digest(data, correlation);
+        let payload = data.to_vec();
+        self.run_blocking(move |conn| {
+            let row: Option<(String, Vec<u8>, String)> = conn
+                .query_row(
+                    "SELECT payload_digest,protected_payload,state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                    params![soul_id.as_str(), request_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((stored_digest, stored_payload, state)) = row else {
+                return Ok(None);
+            };
+            if stored_digest != digest || stored_payload != payload {
+                return Err(RegistryError::InputConflict);
+            }
+            match state.as_str() {
+                "completed" => Ok(Some(InputJournalDisposition::Completed)),
+                "dispatching" | "ambiguous" => Ok(Some(InputJournalDisposition::Ambiguous)),
+                "queued" => Ok(None),
+                _ => Err(RegistryError::Integrity(format!("unknown input command state {state}"))),
+            }
+        })
+        .await
+    }
+
     pub async fn update_fresh_agent_settings(
         &self,
         soul_id: SoulId,
@@ -1943,54 +2001,7 @@ impl Registry {
     ) -> Result<(), RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let encoded: String = tx
-                .query_row(
-                    "SELECT fresh_agent_spec FROM incarnations WHERE soul_id=?1 AND incarnation_id=?2 AND launch_state='running'",
-                    params![soul_id.as_str(), incarnation_id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
-            let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
-                .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
-            if let Some(value) = settings.cwd {
-                let cwd = std::fs::canonicalize(&value).map_err(|_| {
-                    RegistryError::InvalidState("fresh-agent cwd is unavailable".into())
-                })?;
-                let workspace = std::fs::canonicalize(&spec.workspace_path).map_err(|_| {
-                    RegistryError::InvalidState("fresh-agent workspace is unavailable".into())
-                })?;
-                if !cwd.is_dir() || !cwd.starts_with(&workspace) {
-                    return Err(RegistryError::InvalidState(
-                        "fresh-agent cwd is outside its workspace".into(),
-                    ));
-                }
-                spec.cwd = cwd.to_string_lossy().into_owned();
-            }
-            if let Some(value) = settings.model {
-                spec.model = Some(value);
-            }
-            if let Some(value) = settings.effort {
-                spec.effort = Some(value);
-            }
-            if let Some(value) = settings.permission_mode {
-                spec.permission_mode = Some(value);
-            }
-            if let Some(value) = settings.sandbox {
-                spec.sandbox = Some(value);
-            }
-            spec.validate().map_err(|error| {
-                RegistryError::InvalidState(error.message)
-            })?;
-            let encoded = serde_json::to_string(&spec)
-                .map_err(|_| RegistryError::Integrity("encode fresh-agent launch spec".into()))?;
-            let changed = tx.execute(
-                "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE soul_id=?3 AND incarnation_id=?4 AND launch_state='running'",
-                params![encoded, now_millis(), soul_id.as_str(), incarnation_id.as_str()],
-            )?;
-            if changed != 1 {
-                return Err(RegistryError::UnknownIncarnation(incarnation_id));
-            }
+            update_fresh_agent_settings_in_tx(&tx, &soul_id, &incarnation_id, settings)?;
             tx.commit()?;
             Ok(())
         })
@@ -4096,6 +4107,72 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, R
         }
     }
     Ok(false)
+}
+
+fn update_fresh_agent_settings_in_tx(
+    conn: &Connection,
+    soul_id: &SoulId,
+    incarnation_id: &IncarnationId,
+    settings: FreshAgentTurnSettings,
+) -> Result<(), RegistryError> {
+    let encoded: String = conn
+        .query_row(
+            "SELECT fresh_agent_spec FROM incarnations WHERE soul_id=?1 AND incarnation_id=?2 AND launch_state='running'",
+            params![soul_id.as_str(), incarnation_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
+    let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
+        .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+    if let Some(value) = settings.cwd {
+        let cwd = std::fs::canonicalize(&value)
+            .map_err(|_| RegistryError::InvalidState("fresh-agent cwd is unavailable".into()))?;
+        let workspace = std::fs::canonicalize(&spec.workspace_path).map_err(|_| {
+            RegistryError::InvalidState("fresh-agent workspace is unavailable".into())
+        })?;
+        if !cwd.is_dir() || !cwd.starts_with(&workspace) {
+            return Err(RegistryError::InvalidState(
+                "fresh-agent cwd is outside its workspace".into(),
+            ));
+        }
+        spec.cwd = cwd.to_string_lossy().into_owned();
+    }
+    if let Some(value) = settings.model {
+        spec.model = Some(value);
+    }
+    if let Some(value) = settings.effort {
+        spec.effort = Some(value);
+    }
+    if let Some(value) = settings.permission_mode {
+        spec.permission_mode = Some(value);
+    }
+    if let Some(value) = settings.sandbox {
+        spec.sandbox = Some(value);
+    }
+    spec.validate()
+        .map_err(|error| RegistryError::InvalidState(error.message))?;
+    let encoded = serde_json::to_string(&spec)
+        .map_err(|_| RegistryError::Integrity("encode fresh-agent launch spec".into()))?;
+    let changed = conn.execute(
+        "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE soul_id=?3 AND incarnation_id=?4 AND launch_state='running'",
+        params![encoded, now_millis(), soul_id.as_str(), incarnation_id.as_str()],
+    )?;
+    if changed != 1 {
+        return Err(RegistryError::UnknownIncarnation(incarnation_id.clone()));
+    }
+    Ok(())
+}
+
+fn input_payload_digest(data: &[u8], correlation: Option<&[u8]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update((data.len() as u64).to_be_bytes());
+    digest.update(data);
+    if let Some(correlation) = correlation {
+        digest.update((correlation.len() as u64).to_be_bytes());
+        digest.update(correlation);
+    }
+    format!("sha256:{:x}", digest.finalize())
 }
 
 fn reservation_totals(

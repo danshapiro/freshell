@@ -2332,6 +2332,33 @@ impl Supervisor {
         }
         let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
+        let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
+            Some(logical_attempt_id) => {
+                serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
+            }
+            None => serde_json::to_vec(&settings),
+        }
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "fresh-agent settings could not be correlated",
+            )
+        })?;
+        match self
+            .registry
+            .recorded_input_outcome(
+                soul_id.clone(),
+                request_id.clone(),
+                text.as_bytes(),
+                Some(&settings_correlation),
+            )
+            .await
+            .map_err(map_registry)?
+        {
+            Some(InputJournalDisposition::Completed) => return Ok(CommandState::Completed),
+            Some(InputJournalDisposition::Ambiguous) => return Ok(CommandState::Ambiguous),
+            Some(InputJournalDisposition::Dispatch) | None => {}
+        }
         let active = self
             .registry
             .active_handle_for_soul(soul_id.clone())
@@ -2346,25 +2373,14 @@ impl Supervisor {
         let host = self
             .authenticate_current_fresh_host(&soul_id, &active)
             .await?;
-        let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
-            Some(logical_attempt_id) => {
-                serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
-            }
-            None => serde_json::to_vec(&settings),
-        }
-        .map_err(|_| {
-            RuntimeError::new(
-                RuntimeErrorCode::InvalidRequest,
-                "fresh-agent settings could not be correlated",
-            )
-        })?;
         let (disposition, incarnation_id) = self
             .registry
-            .begin_input(
+            .begin_fresh_input(
                 soul_id.clone(),
                 request_id.clone(),
                 text.as_bytes(),
-                Some(&settings_correlation),
+                &settings_correlation,
+                settings.clone(),
             )
             .await
             .map_err(map_registry)?;
@@ -2372,12 +2388,6 @@ impl Supervisor {
             InputJournalDisposition::Completed => return Ok(CommandState::Completed),
             InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
             InputJournalDisposition::Dispatch => {}
-        }
-        if let Some(settings) = settings.clone() {
-            self.registry
-                .update_fresh_agent_settings(soul_id.clone(), incarnation_id.clone(), settings)
-                .await
-                .map_err(map_registry)?;
         }
         let handle = self
             .registry
@@ -7329,6 +7339,133 @@ mod opencode_transfer_restart_tests {
     }
 
     #[tokio::test]
+    async fn fresh_acknowledged_input_retry_survives_unreachable_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let prepared =
+            crate::registry::tests::materialize_fresh_runtime(&registry, soul.clone(), dir.path())
+                .await;
+        let runtime = dir.path().join("owned-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        Connection::open(dir.path().join("registry/runtime.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+            )
+            .unwrap();
+        let request = RequestId::new();
+        let correlation =
+            serde_json::to_vec(&Option::<freshell_runtime_protocol::FreshAgentTurnSettings>::None)
+                .unwrap();
+        registry
+            .begin_input(
+                soul.clone(),
+                request.clone(),
+                b"already acknowledged",
+                Some(&correlation),
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_input_completed(soul.clone(), request.clone())
+            .await
+            .unwrap();
+        // The registry still exposes the accepted incarnation after its
+        // control socket disappears. A retry reads the durable result and
+        // must not contact or re-send to that failed host.
+        registry.active_handle_for_soul(soul.clone()).await.unwrap();
+        let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+            &dir,
+            registry.clone(),
+            crate::backend::BackendRuntimeState::Running,
+        );
+        for expected in [CommandState::Completed, CommandState::Ambiguous] {
+            if expected == CommandState::Ambiguous {
+                registry
+                    .mark_input_ambiguous(soul.clone(), request.clone())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                supervisor
+                    .fresh_agent_send(
+                        request.clone(),
+                        soul.clone(),
+                        "already acknowledged".into(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                expected,
+            );
+        }
+        assert_eq!(
+            supervisor
+                .fresh_agent_send(
+                    request.clone(),
+                    soul.clone(),
+                    "changed request".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::RequestIdConflict,
+        );
+        let new_request = RequestId::new();
+        assert!(supervisor
+            .fresh_agent_send(
+                new_request.clone(),
+                soul.clone(),
+                "new input".into(),
+                None,
+                None
+            )
+            .await
+            .is_err());
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        assert!(!conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM input_commands WHERE soul_id=?1 AND request_id=?2)",
+            params![soul.as_str(), new_request.as_str()],
+            |row| row.get::<_, bool>(0),
+        ).unwrap(), "unavailable host must not admit a new replayable request");
+        let queued_request = RequestId::new();
+        registry
+            .begin_input(
+                soul.clone(),
+                queued_request.clone(),
+                b"queued input",
+                Some(&correlation),
+            )
+            .await
+            .unwrap();
+        assert!(supervisor
+            .fresh_agent_send(
+                queued_request.clone(),
+                soul.clone(),
+                "queued input".into(),
+                None,
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM input_commands WHERE soul_id=?1 AND request_id=?2",
+                params![soul.as_str(), queued_request.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "queued"
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_native_transition_must_commit_before_input_and_recovery_probe() {
         use freshell_runtime_protocol::{
             NativeIdentityLaunch, NativeIdentityObservation, NativeIdentitySource, RecoveryProbe,
@@ -7519,6 +7656,36 @@ mod opencode_transfer_restart_tests {
         assert!(
             matches!(probe, RecoveryProbe::ReattachReady { .. }),
             "current child proof should reach actual probe policy: {probe:?}"
+        );
+        assert!(supervisor
+            .fresh_agent_send(
+                RequestId::new(),
+                soul.clone(),
+                "rejected settings input".into(),
+                Some(freshell_runtime_protocol::FreshAgentTurnSettings {
+                    cwd: Some(
+                        dir.path()
+                            .join("missing-cwd")
+                            .to_string_lossy()
+                            .into_owned()
+                    ),
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    sandbox: None,
+                }),
+                None,
+            )
+            .await
+            .is_err());
+        assert_eq!(inputs.load(Ordering::SeqCst), 0);
+        assert!(
+            registry
+                .claim_next_queued_input(soul.clone(), prepared.incarnation_id.clone())
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected settings request must not enter recovery's replay queue"
         );
         assert_eq!(
             supervisor
