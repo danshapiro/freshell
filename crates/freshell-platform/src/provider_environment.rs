@@ -3641,7 +3641,7 @@ mod tests {
             destination_relative: "provider/settings.json".into(),
         };
         fs::write(&source, "first settings").unwrap();
-        copy_environment(&[selection.clone()], &home, &[], Default::default()).unwrap();
+        copy_environment(std::slice::from_ref(&selection), &home, &[], Default::default()).unwrap();
         assert_eq!(
             fs::read(home.join("provider/settings.json")).unwrap(),
             b"first settings"
