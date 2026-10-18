@@ -94,7 +94,7 @@ test('outage fixture reaches native refusal with Freshell service worker and cac
       expect(facts.outage.tcp).toMatchObject({ state: 'refused', code: 'ECONNREFUSED' })
     } finally {
       facts.responses = responses
-      facts.finalDocument = await page.evaluate(() => ({ uri: document.documentURI, body: document.body.innerText })).catch(() => ({ unavailable: true }))
+      // Renderer state is already retained by the helper's bounded diagnostics.
       await native.dispose()
     }
   } finally {
