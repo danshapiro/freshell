@@ -3408,6 +3408,30 @@ export async function runExternalBrowserCli(args: readonly string[], environment
   return counts
 }
 
+// Preserve the exception chain in the existing private artifact store, never
+// arbitrary child-process, request, response or environment properties.
+function externalBrowserErrorDetails(error: unknown, seen = new Set<Error>()): Record<string, unknown> {
+  if (!(error instanceof Error)) return { name: 'unknown', message: String(error) }
+  const details: Record<string, unknown> = { name: error.name, message: error.message, stack: error.stack }
+  if (seen.has(error)) return { name: error.name, message: error.message }
+  seen.add(error)
+  if (error.cause !== undefined) details.cause = externalBrowserErrorDetails(error.cause, seen)
+  if (error instanceof AggregateError) details.errors = error.errors.map(cause => externalBrowserErrorDetails(cause, seen))
+  return details
+}
+
+export function captureExternalBrowserFailure(error: unknown, repoRoot = process.cwd()) {
+  const details = externalBrowserErrorDetails(error)
+  const reason = JSON.stringify(details).includes('No such image:')
+    ? 'Workload image is unavailable; omit FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST to build an owned image.'
+    : error instanceof Error ? error.message.split(/\r?\n/, 1)[0] : 'Unknown external browser failure'
+  let diagnosticPath: string | undefined
+  emitExternalDiagnostic('client', () => {
+    diagnosticPath = new RuntimeHarness(repoRoot).writeArtifact('external-browser-failure-private.json', { error: details })
+  })
+  return { ...safeExternalFailure(error), reason, diagnosticPath }
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const cancellation = new AbortController()
   const cancel = () => cancellation.abort(new Error('owned external run cancelled'))
@@ -3415,8 +3439,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   process.once('SIGINT', cancel)
   runExternalBrowserCli(process.argv.slice(2), process.env, undefined, cancellation.signal).then(counts => {
     process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'managed_external_browser_passed', counts: { selected: counts.selected, executed: counts.executed, passed: counts.passed, failed: counts.failed, skipped: counts.skipped, timedOut: counts.timedOut }, originals: counts.originals })}\n`)
-  }).catch(() => {
-    process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_admission_or_run_failed' })}\n`)
+  }).catch(error => {
+    const failure = captureExternalBrowserFailure(error)
+    emitExternalDiagnostic('client', () => process.stderr.write(`${JSON.stringify({ severity: 'error',
+      event: 'managed_external_admission_or_run_failed', ...failure })}\n`))
     process.exitCode = 1
   }).finally(() => {
     process.removeListener('SIGTERM', cancel)

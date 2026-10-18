@@ -827,13 +827,43 @@ describe('owned external descriptor and explicit selection', () => {
 
 describe('executable external runner admission', () => {
   it('fails an unsupported actual CLI selector before owning any resources', () => {
-    const child = spawnSync('pnpm', ['exec', 'tsx', 'scripts/testing/runtime-external-browser.ts',
+    const child = spawnSync(process.execPath, ['--import', createRequire(import.meta.url).resolve('tsx'),
+      path.join(sourceRoot, 'scripts/testing/runtime-external-browser.ts'),
       '--spec', 'test/e2e-browser/specs/auth.spec.ts'], {
-      cwd: process.cwd(), env: { ...process.env, FRESHELL_E2E_BACKEND: 'cloud' },
+      cwd: fixtureRepoRoot, env: { ...process.env, FRESHELL_E2E_BACKEND: 'cloud' },
       encoding: 'utf8', timeout: 15_000,
     })
     expect(child.status).toBe(1)
-    expect(child.stderr).toMatch(/allowlisted|selection|admission/)
+    const failure = child.stderr.split('\n').filter(Boolean).map(line => {
+      try { return JSON.parse(line) } catch { return null }
+    }).find(row => row?.event === 'managed_external_admission_or_run_failed')
+    expect(failure?.diagnosticPath).toEqual(expect.any(String))
+    const artifact = JSON.parse(fs.readFileSync(failure.diagnosticPath, 'utf8'))
+    let original: unknown
+    try { runner.parseExternalBrowserArguments(['--spec', 'test/e2e-browser/specs/auth.spec.ts'], {}) }
+    catch (error) { original = error }
+    expect(artifact.error).toMatchObject({ name: 'Error', message: (original as Error).message })
+    expect(failure.reason).toBe((original as Error).message)
+    expect(fs.statSync(failure.diagnosticPath).mode & 0o077).toBe(0)
+    expect(fs.statSync(path.dirname(failure.diagnosticPath)).mode & 0o077).toBe(0)
+  })
+
+  it('retains the original child failure through its cause and explains a missing workload image', () => {
+    let cause: Error | undefined
+    try {
+      execFileSync(process.execPath, ['-e', 'process.stderr.write("Error response from daemon: No such image: sha256:" + "a".repeat(64)); process.exit(1)'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) { cause = error as Error }
+    expect(cause).toBeInstanceOf(Error)
+    Object.assign(cause!, { request: { body: 'request-body-sentinel' }, response: { body: 'response-body-sentinel' },
+      env: { PRIVATE_TOKEN: 'environment-sentinel' } })
+    const failure = runner.captureExternalBrowserFailure(new Error('owned runtime admission failed', { cause }), fixtureRepoRoot)
+    expect(failure.reason).toMatch(/workload image.*(?:missing|unavailable)/i)
+    expect(failure.reason).toContain('FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST')
+    const bytes = fs.readFileSync(failure.diagnosticPath!, 'utf8')
+    const artifact = JSON.parse(bytes)
+    expect(artifact.error.cause).toMatchObject({ name: cause!.name, message: cause!.message, stack: cause!.stack })
+    expect(bytes).not.toMatch(/request-body-sentinel|response-body-sentinel|environment-sentinel/)
   })
 })
 
