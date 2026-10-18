@@ -2976,6 +2976,7 @@ impl Supervisor {
             .map_err(map_registry)?;
         let handle = context.prior_handle.clone();
         let mut fence = context.write_fence();
+        let mut current_native = context.native_session_id;
         let host = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await?;
@@ -2993,10 +2994,21 @@ impl Supervisor {
             .await?
         {
             HostResult::FreshAgentEvents(events) => {
+                let mut observed_current_start = false;
                 for event in &events.events {
                     if let freshell_runtime_protocol::AgentEvent::Started { native_session_id } =
                         &event.event
                     {
+                        // The retained journal includes the original start
+                        // after an in-soul fork. Replaying that parent is not
+                        // a new provider observation or authority to undo the
+                        // committed child; leave it readable as history.
+                        if current_native
+                            .as_deref()
+                            .is_some_and(|current| current != native_session_id)
+                        {
+                            continue;
+                        }
                         fence = self
                             .registry
                             .record_native_session_fenced(
@@ -3007,18 +3019,15 @@ impl Supervisor {
                             )
                             .await
                             .map_err(map_registry)?;
+                        current_native = Some(native_session_id.clone());
+                        observed_current_start = true;
                         // The host journal is the durable identity edge for
                         // fresh agents. Materialize recovery evidence at the
                         // same boundary instead of waiting for a terminal
                         // output read that these workloads never perform.
                     }
                 }
-                if events.events.iter().any(|event| {
-                    matches!(
-                        event.event,
-                        freshell_runtime_protocol::AgentEvent::Started { .. }
-                    )
-                }) {
+                if observed_current_start {
                     let _ = self.probe_recovery_locked(soul_id.clone()).await;
                 }
                 Ok(events)
@@ -7581,6 +7590,29 @@ mod opencode_transfer_restart_tests {
                                 parent_retired_by_runtime: true,
                             },
                         ),
+                        HostCommand::FreshAgentReadEvents { after_sequence, .. } => {
+                            assert_eq!(after_sequence, 0, "web restart replays the host journal");
+                            HostResult::FreshAgentEvents(
+                                freshell_runtime_protocol::AgentEventBatch {
+                                    retained_from: 1,
+                                    head: 2,
+                                    reset_required: false,
+                                    events: ["native-parent", "native-child"]
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(index, native_session_id)| {
+                                            freshell_runtime_protocol::AgentJournalEvent {
+                                                sequence: index as u64 + 1,
+                                                event:
+                                                    freshell_runtime_protocol::AgentEvent::Started {
+                                                        native_session_id: native_session_id.into(),
+                                                    },
+                                            }
+                                        })
+                                        .collect(),
+                                },
+                            )
+                        }
                         HostCommand::ProbeRecovery {
                             resume_spec: Some(spec),
                             ..
@@ -7649,6 +7681,22 @@ mod opencode_transfer_restart_tests {
             .await
             .unwrap();
         assert_eq!(transition.child_session_id, "native-child");
+        let replay = supervisor
+            .fresh_agent_read_events(soul.clone(), 0, 128)
+            .await
+            .expect("historical parent Started must not block the committed child's journal");
+        assert_eq!(replay.events.len(), 2);
+        assert_eq!(replay.head, 2);
+        assert_eq!(
+            registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native-child"),
+            "historical Started must not replace the committed native identity"
+        );
         let probe = supervisor
             .probe_recovery_locked(soul.clone())
             .await
