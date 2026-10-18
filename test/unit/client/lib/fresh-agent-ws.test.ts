@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
-import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
+import turnCompletionReducer, { markPaneAttention, markTabAttention, resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
 import {
   foldReadyRuntimeOwners,
   foldSessionRuntimeOwnerFrame,
@@ -480,6 +480,38 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key].status).toBe('exited')
     expect(sendEvent({ type: 'freshAgent.killed' })).toBe(true)
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
+  })
+
+  it('rebuilds managed state without attention and accepts current edges after a server restart', () => {
+    const store = createFreshAgentPaneStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-restored', paneId: 'pane-restored',
+      content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        sessionId: 'native-child', createRequestId: 'restored', status: 'running',
+      },
+    }))
+    store.dispatch(resetCompletionDedupeBaselines())
+    const receive = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex',
+      sessionId: 'native-child', event: { sessionId: 'native-child', ...event },
+    })
+    // The managed proxy replays state while withholding old attention edges.
+    expect(receive({ type: 'freshAgent.session.snapshot', latestTurnId: 'restored-turn', status: 'waiting', revision: 1 })).toBe(true)
+    expect(receive({ type: 'freshAgent.status', status: 'waiting' })).toBe(true)
+    expect(receive({ type: 'freshAgent.session.changed' })).toBe(true)
+    expect(receive({ type: 'freshAgent.permission.request', requestId: 'pending-tool', tool: { name: 'exec_command', input: { cmd: 'pwd' } } })).toBe(true)
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    const restored = store.getState().freshAgent.sessions['freshcodex:codex:native-child']
+    expect(restored.status).toBe('waiting')
+    expect(restored.latestTurnId).toBe('restored-turn')
+    expect(restored.pendingPermissions['pending-tool']).toMatchObject({ toolName: 'exec_command', input: { cmd: 'pwd' } })
+    expect(receive({ type: 'freshAgent.turn.complete', at: 43, outcome: 'completed' })).toBe(true)
+    expect(receive({ type: 'freshAgent.turn.waiting', at: 44 })).toBe(true)
+    expect(store.getState().turnCompletion.pendingEvents).toMatchObject([
+      { terminalId: 'codex:native-child', at: 43, outcome: 'completed' },
+      { terminalId: 'codex:native-child#waiting', at: 44 },
+    ])
   })
 
   it('folds freshAgent.status(stuck) with no attention action; a companion turn.complete edge folds attention independently', () => {

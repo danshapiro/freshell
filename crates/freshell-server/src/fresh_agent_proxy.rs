@@ -258,6 +258,7 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Attach(message) => {
+                let attention_since = chrono::Utc::now().timestamp_millis();
                 if let Some(soul) = self
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
@@ -270,6 +271,7 @@ impl HostedFreshAgentProxy {
                             provider_name.clone(),
                             message.session_id.clone(),
                             session_type.clone(),
+                            attention_since,
                         )
                         .await;
                     if !started {
@@ -500,6 +502,9 @@ impl HostedFreshAgentProxy {
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
     ) -> Result<(), FreshAgentCreateFailure> {
+        // A fast provider may finish before its creation reply arrives. Keep
+        // those new edges while suppressing older retained journal history.
+        let attention_since = chrono::Utc::now().timestamp_millis();
         let provider =
             fresh_provider(&message.provider, message.session_type).ok_or_else(|| {
                 tracing::warn!(
@@ -555,73 +560,18 @@ impl HostedFreshAgentProxy {
                 .rev()
                 .find(|view| resume_view_matches(view, provider.as_str(), &session_ref.session_id));
             if let Some(view) = view {
-                let public_session_id = session_ref.session_id.clone();
-                if view.native_session_id.as_deref() == Some(public_session_id.as_str()) {
-                    self.observe_native_session(&view.soul_id, &public_session_id)
-                        .await;
-                }
-                let projection = session_projection(
-                    &self.naming.get().cloned(),
-                    named_provider(&provider),
-                    &public_session_id,
+                self.reuse_created_view(
+                    &message,
+                    &provider,
+                    view,
+                    session_ref.session_id.clone(),
+                    attention_since,
                 )
                 .await;
-                let soul = view.soul_id;
-                let provider_name = public_provider.to_string();
-                let canonical_session_id = view.fresh_agent_session_id;
-                {
-                    let mut aliases = self.aliases.lock().await;
-                    aliases.insert(
-                        (provider_name.clone(), public_session_id.clone()),
-                        soul.clone(),
-                    );
-                    if let Some(canonical_session_id) = canonical_session_id {
-                        aliases.insert((provider_name.clone(), canonical_session_id), soul.clone());
-                    }
-                }
-                self.send(ServerMessage::FreshAgentCreated(FreshAgentCreated {
-                    provider: provider_name.clone(),
-                    request_id: message.request_id,
-                    runtime_provider: provider.as_str().into(),
-                    session_id: public_session_id.clone(),
-                    session_type: session_type_wire(message.session_type),
-                    session_ref: Some(SessionLocator {
-                        provider: provider_name.clone(),
-                        session_id: public_session_id.clone(),
-                    }),
-                    session_name: projection.as_ref().map(|(_, record)| record.clone()),
-                    name_ref: projection.map(|(reference, _)| reference),
-                }));
-                let started = self
-                    .start_poller(
-                        soul.clone(),
-                        provider_name,
-                        public_session_id.clone(),
-                        session_type_wire(message.session_type),
-                    )
-                    .await;
-                if !started {
-                    self.replay_once(
-                        soul,
-                        public_provider,
-                        &public_session_id,
-                        &session_type_wire(message.session_type),
-                    )
-                    .await;
-                }
                 return Ok(());
             }
         }
-        let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| {
-            tracing::warn!(
-                event = "fresh_agent.create.preparation_failed",
-                reason = "cwd_unavailable",
-                request_id = message.request_id.as_str(),
-                provider = provider.as_str(),
-                session_type = session_type_wire(message.session_type).as_str()
-            );
-        })?;
-        let workspace = workspace_root(&cwd);
+
         let soul = stable_soul_id(provider.as_str(), &message.request_id).map_err(|_| {
             tracing::warn!(
                 event = "fresh_agent.create.preparation_failed",
@@ -639,6 +589,43 @@ impl HostedFreshAgentProxy {
                 .as_ref()
                 .map(|value| value.session_id.as_str()),
         );
+        if message.session_ref.is_none() {
+            // A lost creation ACK retries the same deterministic soul. Once it
+            // is running, input preparation belongs to that original launch;
+            // trying to reserve it again would reject an otherwise valid retry.
+            let inventory = self.client.inventory().await.map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.inventory_failed",
+                    reason=create_client_error_reason(&error), request_id=message.request_id.as_str(),
+                    provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+            })?;
+            if let Some(view) = inventory.into_iter().rev().find(|view| {
+                view.soul_id == soul
+                    && view.desired_state == DesiredState::Running
+                    && view.launch_state == freshell_runtime_protocol::LaunchState::Running
+                    && view.provider.as_deref() == Some(provider.as_str())
+                    && view.fresh_agent_session_id.as_deref() == Some(public_session_id.as_str())
+            }) {
+                self.reuse_created_view(
+                    &message,
+                    &provider,
+                    view,
+                    public_session_id,
+                    attention_since,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+        let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| {
+            tracing::warn!(
+                event = "fresh_agent.create.preparation_failed",
+                reason = "cwd_unavailable",
+                request_id = message.request_id.as_str(),
+                provider = provider.as_str(),
+                session_type = session_type_wire(message.session_type).as_str()
+            );
+        })?;
+        let workspace = workspace_root(&cwd);
         let native_session_id = message
             .session_ref
             .as_ref()
@@ -966,9 +953,87 @@ impl HostedFreshAgentProxy {
             public_provider.into(),
             public_session_id,
             session_type,
+            attention_since,
         )
         .await;
         Ok(())
+    }
+
+    async fn reuse_created_view(
+        self: &Arc<Self>,
+        message: &freshell_protocol::FreshAgentCreate,
+        provider: &FreshProvider,
+        view: freshell_runtime_protocol::RuntimeView,
+        public_session_id: String,
+        attention_since: i64,
+    ) {
+        let public_provider = fresh_provider_wire(provider);
+        let session_ref = message
+            .session_ref
+            .as_ref()
+            .map(|reference| SessionLocator {
+                provider: reference.provider.clone(),
+                session_id: reference.session_id.clone(),
+            })
+            .or_else(|| {
+                view.native_session_id
+                    .as_ref()
+                    .map(|session_id| SessionLocator {
+                        provider: public_provider.into(),
+                        session_id: session_id.clone(),
+                    })
+            });
+        if view.native_session_id.as_deref() == Some(public_session_id.as_str()) {
+            self.observe_native_session(&view.soul_id, &public_session_id)
+                .await;
+        }
+        let projection = session_projection(
+            &self.naming.get().cloned(),
+            named_provider(provider),
+            &public_session_id,
+        )
+        .await;
+        let soul = view.soul_id;
+        let provider_name = public_provider.to_string();
+        let canonical_session_id = view.fresh_agent_session_id;
+        {
+            let mut aliases = self.aliases.lock().await;
+            aliases.insert(
+                (provider_name.clone(), public_session_id.clone()),
+                soul.clone(),
+            );
+            if let Some(canonical_session_id) = canonical_session_id {
+                aliases.insert((provider_name.clone(), canonical_session_id), soul.clone());
+            }
+        }
+        self.send(ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: provider_name.clone(),
+            request_id: message.request_id.clone(),
+            runtime_provider: provider.as_str().into(),
+            session_id: public_session_id.clone(),
+            session_type: session_type_wire(message.session_type),
+            session_ref,
+            session_name: projection.as_ref().map(|(_, record)| record.clone()),
+            name_ref: projection.map(|(reference, _)| reference),
+        }));
+        let started = self
+            .start_poller(
+                soul.clone(),
+                provider_name,
+                public_session_id.clone(),
+                session_type_wire(message.session_type),
+                attention_since,
+            )
+            .await;
+        if !started {
+            self.replay_once(
+                soul,
+                public_provider,
+                &public_session_id,
+                &session_type_wire(message.session_type),
+            )
+            .await;
+        }
     }
 
     async fn resolve_decision(
@@ -1089,6 +1154,7 @@ impl HostedFreshAgentProxy {
         provider: String,
         presentation_session_id: String,
         session_type: String,
+        attention_since: i64,
     ) -> bool {
         self.presentation_routes
             .lock()
@@ -1138,6 +1204,7 @@ impl HostedFreshAgentProxy {
                                     &provider,
                                     &presentation_session_id,
                                     &session_type,
+                                    Some(attention_since),
                                 )
                                 .await;
                         }
@@ -1182,6 +1249,7 @@ impl HostedFreshAgentProxy {
                 provider,
                 presentation_session_id,
                 session_type,
+                None,
             )
             .await;
         }
@@ -1194,6 +1262,7 @@ impl HostedFreshAgentProxy {
         provider: &str,
         fallback_presentation_id: &str,
         session_type: &str,
+        attention_since: Option<i64>,
     ) {
         let materialized_session_id = materialized_session_id(&event);
         let mut presentation_routes = self.presentation_routes.lock().await;
@@ -1208,6 +1277,36 @@ impl HostedFreshAgentProxy {
             // parent materialization must not move this soul back off its
             // current native session.
             return;
+        }
+
+        if let AgentEvent::Provider { payload } = &event {
+            if let Some(edge) = payload.get("event").filter(|event| {
+                matches!(
+                    event.get("type").and_then(serde_json::Value::as_str),
+                    Some("freshAgent.turn.complete" | "freshAgent.turn.waiting")
+                )
+            }) {
+                // Reattachment needs state, transcript invalidations and pending
+                // approvals. Completion/waiting are discrete notifications;
+                // replaying them creates new attention for already finished work.
+                let new_edge = attention_since.is_some_and(|since| {
+                    edge.get("at")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|at| at >= since)
+                });
+                // Claude's sidecar can retain its original public envelope ID
+                // after native materialization. Codex/OpenCode envelopes name
+                // native sessions and can also reject a retired fork parent.
+                let retired_route = matches!(provider, "codex" | "opencode")
+                    && route.materialized
+                    && payload
+                        .get("sessionId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|session_id| session_id != route.session_id);
+                if !new_edge || retired_route {
+                    return;
+                }
+            }
         }
 
         self.forward_host_event(event, provider, &route.session_id, session_type);
