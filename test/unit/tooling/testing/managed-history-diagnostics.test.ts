@@ -61,6 +61,17 @@ function reporterPath() {
 }
 
 describe('managed History original awaited phase diagnostics', () => {
+  it.each(['success', 'failure'] as const)('preserves the original operation %s when the diagnostic sink throws', async outcome => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const observe = new external.ManagedHistoryAwaitedPhases(() => { throw new Error('diagnostic output unavailable') })
+    const originalError = new Error('original browser operation failed')
+    const operation = vi.fn(async () => { if (outcome === 'failure') throw originalError; return 42 })
+    const result = observe.run('harness', 'bootstrap', operation)
+    if (outcome === 'failure') await expect(result).rejects.toBe(originalError)
+    else await expect(result).resolves.toBe(42)
+    expect(operation).toHaveBeenCalledOnce()
+  })
+
   it('retains the cancelled original await and timeout category while cleanup runs', async () => {
     const { reporter, retained, emit } = reporterPath()
     const observe = new external.ManagedHistoryAwaitedPhases(emit)

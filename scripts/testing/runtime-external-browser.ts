@@ -2333,7 +2333,7 @@ export class ManagedHistoryAwaitedPhases {
   private record(event: HistoryDiagnostic): void {
     if (this.emitted++ >= 256) return
     const parsed = HistoryDiagnosticSchema.safeParse(event)
-    if (parsed.success) this.emit(`${HISTORY_DIAGNOSTIC_PREFIX}${JSON.stringify(parsed.data)}\n`)
+    if (parsed.success) emitExternalDiagnostic('client', () => this.emit(`${HISTORY_DIAGNOSTIC_PREFIX}${JSON.stringify(parsed.data)}\n`))
   }
   async run<T>(phase: z.infer<typeof HistoryPhaseSchema>, mode: z.infer<typeof HistoryModeSchema>, operation: () => T | Promise<T>): Promise<T> {
     const location = new Error().stack?.split('\n').filter(line => !/\bat phase\b/.test(line))
