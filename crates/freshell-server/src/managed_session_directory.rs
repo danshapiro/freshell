@@ -1362,6 +1362,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_directory_keeps_history_from_non_git_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let provider_home = root.path().join("provider");
+        let native_id = "63333000-0000-4333-8333-000000000188";
+        native_fixture(&provider_home, "codex", native_id);
+        let workspace = root.path().join("ordinary-folder");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let cwd = workspace.to_str().unwrap();
+        let (registry, view) = register(root.path(), "codex", "freshcodex", native_id, cwd).await;
+        let (socket, control) = start_control(
+            root.path(),
+            registry,
+            Arc::new(NativeBackend {
+                history_home: Some(provider_home),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let client = RuntimeClient::new(socket, "test-control-secret");
+        let saved = client.fresh_agent_history(view.soul_id).await.unwrap();
+        assert!(!saved["turns"].as_array().unwrap().is_empty());
+        let page =
+            directory_page(router(directory_state(web.path())).layer(axum::Extension(client)))
+                .await;
+        control.abort();
+        let row = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["sessionId"] == native_id)
+            .expect("saved managed history from an ordinary folder must remain discoverable");
+        assert_eq!(row["projectPath"], cwd);
+        assert_eq!(row["cwd"], cwd);
+    }
+
+    #[tokio::test]
     async fn managed_history_directory_reads_owned_native_store_with_empty_web_home() {
         for (provider, session_type) in [
             ("claude", "freshclaude"),
