@@ -24,7 +24,9 @@ export function runtimeCargoCommand(
   const targetDirectory = runtimeCargoTargetDirectory(repoRoot, env)
   fs.mkdirSync(targetDirectory, { recursive: true })
   const lock = path.join(fs.realpathSync(targetDirectory), '.freshell-runtime-artifacts.lock')
-  return { command: 'flock', args: [lock, command, ...args] }
+  // The flock parent keeps ownership through the command (and snapshot copy),
+  // while surviving Cargo descendants must not retain its lock descriptor.
+  return { command: 'flock', args: ['--close', lock, command, ...args] }
 }
 
 export function runtimeCargoBuildAndCopy(
