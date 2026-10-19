@@ -280,8 +280,7 @@ async fn assert_queued_capability_retry_preserves_newer_block(
         capability_snapshot[0].native_session_id
     );
     assert_eq!(
-        protected_snapshot[0].intent_revision,
-        capability_snapshot[0].intent_revision,
+        protected_snapshot[0].intent_revision, capability_snapshot[0].intent_revision,
         "this verdict must exercise the same-intent race"
     );
     assert_eq!(protected_snapshot[0].recovery_state, RecoveryState::Blocked);
