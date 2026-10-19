@@ -47,13 +47,45 @@ describe('native Claude profile digest', () => {
     expect(changedTarget).not.toBe(changedDirectoryContent)
   })
 
-  it('fails clearly when a selected plugin contains a directory link cycle', async () => {
+  it('visits circular shared plugin dependencies once and still observes their content changes', async () => {
     directory = await mkdtemp(join(tmpdir(), 'native-profile-cycle-'))
     const plugin = join(directory, 'plugin')
-    await mkdir(plugin)
-    await symlink(plugin, join(plugin, 'self'), 'dir')
+    const dependency = join(directory, 'dependency')
+    await mkdir(join(plugin, 'node_modules'), { recursive: true })
+    await mkdir(join(dependency, 'node_modules'), { recursive: true })
+    await writeFile(join(dependency, 'index.js'), 'export const value = 1')
+    await symlink(dependency, join(plugin, 'node_modules/dependency'), 'dir')
+    await symlink(plugin, join(dependency, 'node_modules/plugin'), 'dir')
 
+    const request = { cwd: directory, plugins: [plugin] }
+    const initial = await nativeProfileDigest(request, {}, { HOME: directory })
+    expect(await nativeProfileDigest(request, {}, { HOME: directory })).toBe(initial)
+    await writeFile(join(dependency, 'index.js'), 'export const value = 2')
+    expect(await nativeProfileDigest(request, {}, { HOME: directory })).not.toBe(initial)
+  })
+
+  it('reads plugin payloads above the former 32MiB cap within the accepted projection profile', async () => {
+    directory = await mkdtemp(join(tmpdir(), 'native-profile-large-'))
+    const plugin = join(directory, 'plugin')
+    await mkdir(plugin)
+    const payload = Buffer.alloc(33 * 1024 * 1024, 'a')
+    await writeFile(join(plugin, 'dependency.js'), payload)
+    const request = { cwd: directory, plugins: [plugin] }
+    const initial = await nativeProfileDigest(request, {}, { HOME: directory })
+    payload[payload.length - 1] = 98
+    await writeFile(join(plugin, 'dependency.js'), payload)
+    expect(await nativeProfileDigest(request, {}, { HOME: directory })).not.toBe(initial)
+  })
+
+  it('reads more than ten thousand accepted plugin entries', async () => {
+    directory = await mkdtemp(join(tmpdir(), 'native-profile-entries-'))
+    const plugin = join(directory, 'plugin')
+    await mkdir(plugin)
+    for (let offset = 0; offset < 10_001; offset += 100) {
+      await Promise.all(Array.from({ length: Math.min(100, 10_001 - offset) }, (_, index) =>
+        writeFile(join(plugin, `resource-${offset + index}.js`), 'export default 1')))
+    }
     await expect(nativeProfileDigest({ cwd: directory, plugins: [plugin] }, {}, { HOME: directory }))
-      .rejects.toThrow('selected native plugin contains a directory link cycle')
+      .resolves.toEqual(expect.any(String))
   })
 })

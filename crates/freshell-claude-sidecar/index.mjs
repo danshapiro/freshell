@@ -79,7 +79,7 @@
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
-import { nativeProfileDigest } from './native-profile-digest.mjs'
+import { nativeProfileDigest, nativeResourceDigest } from './native-profile-digest.mjs'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
@@ -677,7 +677,6 @@ async function openSessionQuery(sessionId, state, req, launch, announceCreated =
         if (observation.native.source !== expectedSource) throw new Error(`native rollback did not acknowledge a ${expectedSource}`)
         if (observation.nativeSessionId === state.nativeIdentityTransition.parentNativeSessionId) throw new Error('native rollback retained the retired root')
       } else if (req.resumeSessionId && observation.nativeSessionId !== req.resumeSessionId) throw new Error('native exact resume changed root')
-      if (await nativeProfileDigest(req, state.settings) !== state.nativeProfileDigest) throw new Error('selected native profile changed during startup')
       if (state.queryGeneration !== generation || abort.signal.aborted) return
       if (!process.env.HOME || !isAbsolute(process.env.HOME)) throw new Error('managed native checkpoint HOME is unavailable')
       state.nativeStore = createNativeCheckpointStore({ nativeSessionId: observation.nativeSessionId,
@@ -863,7 +862,10 @@ async function handleCreate(req) {
     }
     state.createRequest = req
     state.launch = launch
-    if (launch) state.nativeProfileDigest = await nativeProfileDigest(req, state.settings)
+    if (launch) {
+      state.nativeResourceDigest = await nativeResourceDigest(req)
+      state.nativeProfileDigest = await nativeProfileDigest(req, state.settings, process.env, state.nativeResourceDigest)
+    }
     await openSessionQuery(sessionId, state, req, launch)
   } catch (err) {
     if (sessionId) sessions.delete(sessionId)
@@ -955,7 +957,7 @@ async function handleConfigure(req) {
     if (st.nativeStore && Object.keys(st.settings).some(key => st.settings[key] !== previousSettings[key])) {
       try {
         const resumeRequest = { ...st.createRequest, ...st.settings }
-        const digest = await nativeProfileDigest(resumeRequest, st.settings)
+        const digest = await nativeProfileDigest(resumeRequest, st.settings, process.env, st.nativeResourceDigest)
         await st.nativeStore.setProfileDigest(digest)
         st.nativeProfileDigest = digest
         st.createRequest = resumeRequest
