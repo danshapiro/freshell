@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
-    io::Read,
+    io::{BufRead, BufReader, Read},
     path::Path,
 };
 
@@ -1135,12 +1135,12 @@ fn read_stable_claude_transcript(path: &Path) -> Result<String, String> {
     let before = file
         .metadata()
         .map_err(|_| "Claude transcript metadata unavailable")?;
-    if !before.is_file() || before.len() == 0 || before.len() > 32 * 1024 * 1024 {
-        return Err("Claude transcript exceeds bounded complete read".into());
+    if !before.is_file() || before.len() == 0 {
+        return Err("Claude transcript is not a complete file".into());
     }
     let mut bytes = Vec::new();
     (&file)
-        .take(32 * 1024 * 1024 + 1)
+        .take(before.len().saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| "Claude transcript read failed")?;
     let after = file
@@ -2140,17 +2140,21 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
     }
     let mut matches = Vec::new();
     let mut unresolved_absence = false;
+    let mut first_problem = None;
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
     let mut visited = 0_usize;
     while let Some((path, depth)) = queue.pop_front() {
         visited += 1;
         if visited > 50_000 {
-            return blocked(
-                RecoveryBlockReason::AmbiguousIdentity,
-                "provider store exceeded the bounded exact-identity probe",
-                vec![root.display().to_string()],
-                None,
-            );
+            first_problem.get_or_insert_with(|| {
+                blocked(
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "provider store exceeded the bounded exact-identity probe",
+                    vec![root.display().to_string()],
+                    None,
+                )
+            });
+            break;
         }
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -2163,64 +2167,81 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
                 );
             }
             Err(_) => {
-                return blocked(
-                    RecoveryBlockReason::StoreUnreadable,
-                    "provider native artifact could not be inspected",
-                    vec![path.display().to_string()],
-                    None,
-                );
+                first_problem.get_or_insert_with(|| {
+                    blocked(
+                        RecoveryBlockReason::StoreUnreadable,
+                        "provider native artifact could not be inspected",
+                        vec![path.display().to_string()],
+                        None,
+                    )
+                });
+                continue;
             }
         };
         if metadata.file_type().is_symlink() {
-            return blocked(
-                RecoveryBlockReason::AmbiguousIdentity,
-                "provider native store contains an unresolved symlink",
-                vec![path.display().to_string()],
-                None,
-            );
+            first_problem.get_or_insert_with(|| {
+                blocked(
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "provider native store contains an unresolved symlink",
+                    vec![path.display().to_string()],
+                    None,
+                )
+            });
+            continue;
         }
         if metadata.is_dir() {
             if depth >= 8 {
-                return blocked(
-                    RecoveryBlockReason::AmbiguousIdentity,
-                    "provider native store exceeds the bounded directory inspection",
-                    vec![path.display().to_string()],
-                    None,
-                );
+                first_problem.get_or_insert_with(|| {
+                    blocked(
+                        RecoveryBlockReason::AmbiguousIdentity,
+                        "provider native store exceeds the bounded directory inspection",
+                        vec![path.display().to_string()],
+                        None,
+                    )
+                });
+                continue;
             }
             let entries = match fs::read_dir(&path) {
                 Ok(entries) => entries,
                 Err(_) => {
-                    return blocked(
-                        RecoveryBlockReason::StoreUnreadable,
-                        "provider native directory could not be read",
-                        vec![path.display().to_string()],
-                        None,
-                    );
+                    first_problem.get_or_insert_with(|| {
+                        blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            "provider native directory could not be read",
+                            vec![path.display().to_string()],
+                            None,
+                        )
+                    });
+                    continue;
                 }
             };
             for entry in entries {
                 match entry {
                     Ok(entry) => queue.push_back((entry.path(), depth + 1)),
                     Err(_) => {
-                        return blocked(
-                            RecoveryBlockReason::StoreUnreadable,
-                            "provider native directory entry could not be inspected",
-                            vec![path.display().to_string()],
-                            None,
-                        );
+                        first_problem.get_or_insert_with(|| {
+                            blocked(
+                                RecoveryBlockReason::StoreUnreadable,
+                                "provider native directory entry could not be inspected",
+                                vec![path.display().to_string()],
+                                None,
+                            )
+                        });
                     }
                 }
             }
             continue;
         }
         if !metadata.is_file() {
-            return blocked(
-                RecoveryBlockReason::StoreUnreadable,
-                "provider native artifact is not a regular file",
-                vec![path.display().to_string()],
-                None,
-            );
+            first_problem.get_or_insert_with(|| {
+                blocked(
+                    RecoveryBlockReason::StoreUnreadable,
+                    "provider native artifact is not a regular file",
+                    vec![path.display().to_string()],
+                    None,
+                )
+            });
+            continue;
         }
         if matches!(provider, "claude" | "kilroy")
             && (path
@@ -2237,20 +2258,41 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
             unresolved_absence = true;
             continue;
         }
-        let Ok((owner, complete)) = read_native_rollout_owner(&path, provider) else {
-            return blocked(
-                RecoveryBlockReason::StoreUnreadable,
-                "provider native artifact has no readable unambiguous owner",
-                vec![path.display().to_string()],
-                None,
-            );
-        };
+        let (owner, complete) =
+            match read_native_rollout_owner(&path, provider, expected) {
+                Ok(owner) => owner,
+                Err(true) => return blocked(
+                    RecoveryBlockReason::StoreUnreadable,
+                    "the selected provider native root contains unreadable or conflicting records",
+                    vec![path.display().to_string()],
+                    None,
+                ),
+                Err(false) => {
+                    first_problem.get_or_insert_with(|| {
+                        blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            "provider native artifact has no readable unambiguous owner",
+                            vec![path.display().to_string()],
+                            None,
+                        )
+                    });
+                    continue;
+                }
+            };
         unresolved_absence |= !complete;
         if owner == expected {
             matches.push(path.display().to_string());
         }
     }
     matches.sort();
+    // A positive belongs to the selected root itself. An unfinished sibling
+    // cannot invalidate it, but still prevents proving that a missing root is
+    // absent. Continue inspecting readable siblings to detect real duplicates.
+    if matches.is_empty() {
+        if let Some(problem) = first_problem {
+            return problem;
+        }
+    }
     match matches.len() {
         0 if unresolved_absence => blocked(
             RecoveryBlockReason::StoreUnreadable,
@@ -2274,31 +2316,61 @@ fn probe_bounded_tree(root: &Path, expected: &str, provider: &str) -> ProviderSt
     }
 }
 
-fn read_native_rollout_owner(path: &Path, provider: &str) -> Result<(String, bool), ()> {
+// An error records whether readable metadata already identified the requested
+// root. Corrupt copies of that root cannot be treated as unrelated siblings.
+fn read_native_rollout_owner(
+    path: &Path,
+    provider: &str,
+    expected: &str,
+) -> Result<(String, bool), bool> {
     const MAX_INSPECTED_BYTES: u64 = 1024 * 1024;
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(MAX_INSPECTED_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|_| ())?;
-    let complete = bytes.len() as u64 <= MAX_INSPECTED_BYTES;
-    if !complete {
-        // Native owner metadata precedes a potentially large message body.
-        // Inspect complete prefix records for positives; a partial body can
-        // never establish absence.
-        let last_newline = bytes.iter().rposition(|byte| *byte == b'\n').ok_or(())?;
-        bytes.truncate(last_newline + 1);
-    }
+    let file = fs::File::open(path).map_err(|_| false)?;
+    let extent = file.metadata().map_err(|_| false)?.len();
+    let mut reader = BufReader::new(file.take(extent));
+    let mut inspected = 0_u64;
     let mut owner = None;
-    for (index, line) in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        .enumerate()
-    {
-        let row: serde_json::Value = serde_json::from_slice(line).map_err(|_| ())?;
+    let mut index = 0;
+    loop {
+        // Native bookends can precede the first actual user/image record.
+        // Finish that owning record through the captured file extent. Once
+        // ownership is known, retain the ordinary small history-prefix scan.
+        let limit = if owner.is_none() {
+            extent - inspected
+        } else {
+            MAX_INSPECTED_BYTES
+                .saturating_sub(inspected)
+                .min(extent - inspected)
+        };
+        if limit == 0 {
+            break;
+        }
+        let mut line = Vec::new();
+        let count = reader
+            .by_ref()
+            .take(limit)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| owner.as_deref() == Some(expected))? as u64;
+        inspected += count;
+        if count == 0 {
+            return Err(owner.as_deref() == Some(expected));
+        }
+        if line.last() != Some(&b'\n') && inspected < extent {
+            if count < limit {
+                return Err(owner.as_deref() == Some(expected));
+            }
+            break; // The bounded prefix ended inside a later record.
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let row: serde_json::Value =
+            serde_json::from_slice(&line).map_err(|_| owner.as_deref() == Some(expected))?;
+        let first_record = index == 0;
+        index += 1;
         let identity = if provider == "codex" {
             if row["type"] != "session_meta" {
-                if index == 0 {
-                    return Err(());
+                if first_record {
+                    return Err(false);
                 }
                 continue;
             }
@@ -2311,20 +2383,21 @@ fn read_native_rollout_owner(path: &Path, provider: &str) -> Result<(String, boo
                 continue;
             };
             if row["message"]["role"] != role || row["message"].get("content").is_none() {
-                return Err(());
+                return Err(owner.as_deref() == Some(expected)
+                    || row.get("sessionId").and_then(serde_json::Value::as_str) == Some(expected));
             }
             row.get("sessionId")
         };
         let identity = identity
             .and_then(serde_json::Value::as_str)
             .filter(|identity| !identity.trim().is_empty())
-            .ok_or(())?;
+            .ok_or_else(|| owner.as_deref() == Some(expected))?;
         if owner.as_deref().is_some_and(|owner| owner != identity) {
-            return Err(());
+            return Err(owner.as_deref() == Some(expected) || identity == expected);
         }
         owner = Some(identity.to_string());
     }
-    owner.map(|owner| (owner, complete)).ok_or(())
+    owner.map(|owner| (owner, inspected == extent)).ok_or(false)
 }
 
 // Loss evidence is stricter than the independent best-effort stub GC policy.
@@ -3441,6 +3514,115 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_probe_reads_exact_claude_owner_from_a_large_first_record() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".claude/projects/work");
+        fs::create_dir_all(&root).unwrap();
+        let expected = "11111111-2222-4333-8444-555555555555";
+        let record = serde_json::json!({
+            "type":"user", "sessionId":expected,
+            "message":{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"A".repeat(1024 * 1024 + 4)}},
+                {"type":"text","text":"Inspect this image"},
+            ]},
+        });
+        let bookend = serde_json::json!({"type":"queue-operation","operation":"dequeue",
+            "timestamp":"2026-10-19T00:00:00.000Z","sessionId":expected});
+        for prefix in [String::new(), format!("{bookend}\n")] {
+            fs::write(
+                root.join("image-first.jsonl"),
+                format!("{prefix}{record}\n"),
+            )
+            .unwrap();
+            let probe = probe_provider_store(
+                home.path(),
+                &resume_spec_for_test("claude", expected, home.path()),
+            );
+            assert!(matches!(probe, ProviderStoreProbe::Ready { .. }),
+                "a complete native first turn can exceed the ordinary prefix after native bookends: {probe:?}");
+        }
+        let mut incomplete = record.to_string();
+        incomplete.pop();
+        fs::write(root.join("image-first.jsonl"), incomplete).unwrap();
+        assert!(
+            matches!(
+                probe_provider_store(
+                    home.path(),
+                    &resume_spec_for_test("claude", expected, home.path())
+                ),
+                ProviderStoreProbe::Blocked { .. }
+            ),
+            "an incomplete first record still cannot qualify the selected root"
+        );
+    }
+
+    #[test]
+    fn native_probe_exact_positive_survives_unrelated_partial_transcript() {
+        let expected = "11111111-2222-4333-8444-555555555555";
+        for provider in ["claude", "codex"] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join(if provider == "codex" {
+                ".codex/sessions/2026/10/19"
+            } else {
+                ".claude/projects/work"
+            });
+            fs::create_dir_all(&root).unwrap();
+            let exact = root.join("exact.jsonl");
+            fs::write(&exact, native_rollout_for_test(provider, expected, false)).unwrap();
+            let spec = resume_spec_for_test(provider, expected, home.path());
+            assert!(matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Ready { .. }
+            ));
+            let partial = root.join("starting-child.jsonl");
+            fs::write(&partial, b"{\"type\":\"user\",\"message\":").unwrap();
+            let current = probe_provider_store(home.path(), &spec);
+            assert!(matches!(current, ProviderStoreProbe::Ready { .. }), "{provider}: exact readable root must survive an unrelated unfinished write: {current:?}");
+            fs::remove_file(&exact).unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "an unfinished neighbor cannot prove the selected root absent"
+            );
+            fs::write(&exact, native_rollout_for_test(provider, expected, false)).unwrap();
+            let corrupt_copy = root.join("corrupt-copy.jsonl");
+            fs::write(
+                &corrupt_copy,
+                format!("{}{{", native_rollout_for_test(provider, expected, false)),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked {
+                        reason: RecoveryBlockReason::StoreUnreadable,
+                        ..
+                    }
+                ),
+                "a malformed copy identifying the selected root is not an unrelated sibling"
+            );
+            fs::remove_file(corrupt_copy).unwrap();
+            fs::write(
+                root.join("duplicate.jsonl"),
+                native_rollout_for_test(provider, expected, false),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked {
+                        reason: RecoveryBlockReason::AmbiguousIdentity,
+                        ..
+                    }
+                ),
+                "two readable owners of the same native ID remain ambiguous"
+            );
+        }
+    }
+
     fn native_rollout_for_test(provider: &str, id: &str, large: bool) -> String {
         let text = if large {
             "x".repeat(1024 * 1024 + 1)
@@ -3532,14 +3714,8 @@ mod tests {
         .unwrap();
         let probe = probe_provider_store(home.path(), &spec);
         assert!(
-            matches!(
-                probe,
-                ProviderStoreProbe::Blocked {
-                    reason: RecoveryBlockReason::StoreUnreadable,
-                    ..
-                }
-            ),
-            "an uninspectable sibling owner must remain unresolved: {probe:?}"
+            matches!(probe, ProviderStoreProbe::Ready { .. }),
+            "an exact readable owner does not depend on inspecting its sibling: {probe:?}"
         );
     }
 

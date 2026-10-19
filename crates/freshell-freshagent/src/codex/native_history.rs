@@ -90,6 +90,14 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
             native_activity = Some(native_activity.map_or(at, |prior: i64| prior.max(at)));
         }
         let payload = &row["payload"];
+        if row["type"] == "session_meta" {
+            let owner = payload["id"]
+                .as_str()
+                .or_else(|| payload["session_id"].as_str());
+            if owner != Some(id) {
+                return Err("selected Codex rollout names another native root".into());
+            }
+        }
         match row["type"].as_str() {
             Some("turn_context") => {
                 if let Some(next) = payload["turn_id"].as_str() {

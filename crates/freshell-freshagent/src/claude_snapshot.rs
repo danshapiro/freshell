@@ -1105,6 +1105,29 @@ pub(crate) fn redo_resume_target(
     }
 }
 
+fn raw_chain_tip_from_path(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let extent = file.metadata().map_err(|error| error.to_string())?.len();
+    let retention = crate::native_history::Retention::new();
+    let records =
+        crate::native_history::Records::new(std::io::BufReader::new(file.take(extent)), &retention);
+    let mut tip = None;
+    // raw_chain's last UUID is the last non-bookend candidate, even when its
+    // earlier parent links dangle after native compaction.
+    for record in records {
+        let Some((record, _)) = record.map_err(|error| error.to_string())? else {
+            continue;
+        };
+        if !FORK_BOOKEND_KINDS.contains(&record["type"].as_str().unwrap_or("")) {
+            if let Some(uuid) = record["uuid"].as_str().filter(|uuid| !uuid.is_empty()) {
+                tip = Some(uuid.to_owned());
+            }
+        }
+    }
+    Ok(tip)
+}
+
 /// The canRedo chain-root RECHECK (kata 1wxv Task 5): the stored bit is a
 /// necessary but NOT sufficient condition — the CURRENT-epoch redo state comes
 /// from the chain root, so when `original_session_id` resolves, the original's
@@ -1121,8 +1144,8 @@ fn claude_can_redo_now(record: &crate::rollback_record::RollbackRecord) -> bool 
         return true;
     };
     let tip = locate_transcript(original)
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| raw_chain_tip(&text));
+        .and_then(|path| raw_chain_tip_from_path(&path).ok())
+        .flatten();
     tip == record.original_tip_uuid
 }
 
@@ -1202,6 +1225,7 @@ pub(crate) fn build_claude_snapshot_json(
         );
         snapshot["revision"] = json!(floored);
     }
+    crate::native_history::retain_snapshot_display("claude", &mut snapshot);
     snapshot
 }
 
@@ -1223,26 +1247,15 @@ pub(crate) async fn get_claude_snapshot(
     }
     // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
     let path = locate_transcript(thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
-    let mtime_ms = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64);
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
-    let mut snapshot = build_claude_snapshot_json(session_type, thread_id, &content, 0, rollback);
-    let turn_count = snapshot["turns"]
-        .as_array()
-        .map(|a| a.len() as i64)
-        .unwrap_or(0);
-    let basis = mtime_ms.unwrap_or(turn_count).max(0);
-    let floored = match rollback {
-        Some(record) => basis.max(record.last_op_at_ms),
-        None => basis,
-    };
-    snapshot["revision"] = json!(floored);
-    Ok(snapshot)
+    let session_type = session_type.to_owned();
+    let thread_id = thread_id.to_owned();
+    let rollback = rollback.cloned();
+    tokio::task::spawn_blocking(move || {
+        crate::native_history::read_claude_path(&path, &thread_id, &session_type, rollback.as_ref())
+    })
+    .await
+    .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?
+    .map_err(ClaudeSnapshotError::Io)
 }
 
 /// Task 3 (reload-while-pending): overlay a session's LIVE pending approvals/questions

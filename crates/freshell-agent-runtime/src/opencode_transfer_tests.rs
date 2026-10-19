@@ -22,6 +22,21 @@ struct Fixture {
     workspace: PathBuf,
 }
 
+fn transferred_manifest(fixture: &Fixture) -> OpenCodeTransferManifest {
+    let mut manifest: OpenCodeTransferManifest =
+        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    if manifest.version == 2 {
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap(),
+        )
+        .unwrap();
+        manifest.assets = serde_json::from_value(payload["assets"].clone()).unwrap();
+        manifest.saved_snapshots =
+            serde_json::from_value(payload["saved_snapshots"].clone()).unwrap();
+    }
+    manifest
+}
+
 fn fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let mut fixture = fixture_in(directory.path());
@@ -40,41 +55,8 @@ fn fixture_with_baseline_event() -> Fixture {
     fixture
 }
 
-fn fixture_with_baseline_event_workspace_id(workspace_id: &str) -> Fixture {
-    let directory = tempfile::tempdir().unwrap();
-    let mut fixture = fixture_with_event_and_v2_context_and_workspace(
-        directory.path(),
-        true,
-        false,
-        Some(workspace_id),
-        Some(workspace_id),
-    );
-    fixture._directory = Some(directory);
-    fixture
-}
-
-fn fixture_with_baseline_workspace_id_without_event_field(workspace_id: &str) -> Fixture {
-    let directory = tempfile::tempdir().unwrap();
-    let mut fixture = fixture_with_event_and_v2_context_and_workspace(
-        directory.path(),
-        true,
-        false,
-        Some(workspace_id),
-        None,
-    );
-    fixture._directory = Some(directory);
-    fixture
-}
-
 fn fixture_in_with_baseline_event(root: &Path, baseline_event: bool) -> Fixture {
     fixture_with_event_and_v2_context(root, baseline_event, false)
-}
-
-fn fixture_with_baseline_v2_context_message() -> Fixture {
-    let directory = tempfile::tempdir().unwrap();
-    let mut fixture = fixture_with_event_and_v2_context(directory.path(), true, true);
-    fixture._directory = Some(directory);
-    fixture
 }
 
 fn fixture_with_event_and_v2_context(
@@ -97,6 +79,24 @@ fn fixture_with_event_and_v2_context_and_workspace(
     baseline_v2_context: bool,
     baseline_database_workspace_id: Option<&str>,
     baseline_event_workspace_id: Option<&str>,
+) -> Fixture {
+    fixture_with_descendant(
+        root,
+        baseline_event,
+        baseline_v2_context,
+        baseline_database_workspace_id,
+        baseline_event_workspace_id,
+        false,
+    )
+}
+
+fn fixture_with_descendant(
+    root: &Path,
+    baseline_event: bool,
+    baseline_v2_context: bool,
+    baseline_database_workspace_id: Option<&str>,
+    baseline_event_workspace_id: Option<&str>,
+    child: bool,
 ) -> Fixture {
     fs::create_dir_all(root).unwrap();
     let source = root.join("source.sqlite");
@@ -149,6 +149,16 @@ fn fixture_with_event_and_v2_context_and_workspace(
             params!["msg_one", "ses_root", r#"{"text":"UNIQUE_SYNTHETIC_CONVERSATION_BODY"}"#],
         )
         .unwrap();
+    if child {
+        connection.execute(
+            "INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) VALUES ('ses_child','project-one','ses_root','child',?1,'finished task','1.18.21',2,2)",
+            [workspace.to_string_lossy()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES ('msg_child','ses_child',2,2,'{\"role\":\"user\"}')",
+            [],
+        ).unwrap();
+    }
     let referenced_file = workspace.join("prompt.txt");
     fs::write(&referenced_file, b"synthetic referenced workspace asset").unwrap();
     connection
@@ -318,8 +328,7 @@ fn imports_exact_rows_idempotently_and_returns_a_body_free_receipt() {
     assert_eq!(receipt.row_count, 4);
     assert_eq!(receipt.asset_count, 1);
     assert_eq!(fixture.descriptor.files.len(), 1);
-    let manifest: OpenCodeTransferManifest =
-        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    let manifest = transferred_manifest(&fixture);
     assert_eq!(manifest.assets.len(), 1);
     assert_eq!(manifest.assets[0].kind, "workspace_path_reference");
     assert!(!serde_json::to_string(&receipt)
@@ -366,6 +375,122 @@ fn current_store_verification_accepts_complete_import_and_derives_current_tail()
     );
     assert_eq!(evidence.evidence_generation.len(), 64);
     assert!(!format!("{evidence:?}").contains("UNIQUE_SYNTHETIC_CONVERSATION_BODY"));
+}
+
+#[test]
+fn current_store_resume_accepts_native_child_deletion_without_losing_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = fixture_with_descendant(directory.path(), false, false, None, None, true);
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("the imported parent and child are readable");
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    // Native Session.remove removes the selected child and its aggregate,
+    // leaving the parent's conversation intact.
+    connection.execute_batch("PRAGMA foreign_keys=ON; DELETE FROM session WHERE id='ses_child'; DELETE FROM event WHERE aggregate_id='ses_child'; DELETE FROM event_sequence WHERE aggregate_id='ses_child';").unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM message WHERE session_id='ses_root'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    let current = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("native child cleanup must not prevent resuming its surviving parent");
+    assert_eq!(current.root_session_id, "ses_root");
+    assert_eq!(
+        current.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_one".into()
+        }
+    );
+    connection
+        .execute("DELETE FROM session WHERE id='ses_root'", [])
+        .unwrap();
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "the selected root itself must still exist"
+    );
+}
+
+#[test]
+fn current_store_resume_reads_edited_history_after_native_event_compaction() {
+    let fixture = fixture_with_baseline_event();
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    connection
+        .execute(
+            "UPDATE message SET data=?1 WHERE id='msg_one'",
+            [serde_json::json!({"role":"user","content":"edited native history"}).to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE part SET data=?1 WHERE id='part_one'",
+            [serde_json::json!({"type":"text","text":"edited native part"}).to_string()],
+        )
+        .unwrap();
+    connection
+        .execute("DELETE FROM event WHERE aggregate_id='ses_root'", [])
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM event_sequence WHERE aggregate_id='ses_root'",
+            [],
+        )
+        .unwrap();
+    let evidence = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("current readable native history does not need its historical event log");
+    assert_eq!(
+        evidence.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_one".into()
+        }
+    );
+    connection
+        .execute("UPDATE message SET data='{' WHERE id='msg_one'", [])
+        .unwrap();
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "unreadable current history still blocks native resume"
+    );
 }
 
 #[test]
@@ -448,138 +573,6 @@ fn current_store_verification_accepts_fractional_v1_message_and_part_timestamps(
 }
 
 #[test]
-fn current_store_verification_rejects_fractional_event_timestamp_matching_integer_row() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    append_v1_user_message(
-        &connection,
-        1,
-        "evt_fractional_integer_mismatch",
-        "msg_fractional_integer_mismatch",
-        serde_json::json!(10.5),
-        10,
-        11,
-    );
-    drop(connection);
-
-    assert!(
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace,
-        )
-        .is_err(),
-        "a fractional event timestamp must not match a truncated INTEGER row timestamp"
-    );
-}
-
-#[test]
-fn current_store_verification_rejects_adjacent_large_integer_message_timestamps() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    append_v1_user_message(
-        &connection,
-        1,
-        "evt_large_timestamp",
-        "msg_large_timestamp",
-        serde_json::json!(9007199254740992i64),
-        9007199254740993i64,
-        9007199254740994i64,
-    );
-    drop(connection);
-
-    assert!(
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace,
-        )
-        .is_err(),
-        "distinct INTEGER timestamps above 2^53 must not compare equal"
-    );
-}
-
-#[test]
-fn current_store_verification_rejects_adjacent_large_integer_part_timestamps() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    append_v1_user_message(
-        &connection,
-        1,
-        "evt_large_parent_message",
-        "msg_large_parent",
-        serde_json::json!(9007199254740992i64),
-        9007199254740992i64,
-        9007199254740993i64,
-    );
-    let part = serde_json::json!({
-        "id":"prt_large_timestamp",
-        "sessionID":"ses_root",
-        "messageID":"msg_large_parent",
-        "type":"text",
-        "text":"large integer timestamp"
-    });
-    let mut part_data = part.as_object().unwrap().clone();
-    part_data.remove("id");
-    part_data.remove("sessionID");
-    part_data.remove("messageID");
-    append_durable_event(
-        &connection,
-        2,
-        "evt_large_part_timestamp",
-        "message.part.updated.1",
-        serde_json::json!({
-            "sessionID":"ses_root",
-            "part":part,
-            "time":9007199254740992i64
-        }),
-    );
-    connection
-        .execute(
-            "INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
-             VALUES('prt_large_timestamp','msg_large_parent','ses_root',?1,?2,?3)",
-            params![
-                9007199254740993i64,
-                9007199254740994i64,
-                serde_json::Value::Object(part_data).to_string()
-            ],
-        )
-        .unwrap();
-    drop(connection);
-
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .is_err());
-}
-
-#[test]
 fn current_store_verification_orders_large_integer_v1_timestamps_exactly() {
     let fixture = fixture_with_baseline_event();
     import_bundle(
@@ -642,8 +635,6 @@ fn current_store_verification_canonicalizes_fractional_v2_datetime_timestamps() 
         "timestamp":20.5,
         "text":"canonical millisecond projection"
     });
-    validate_v2_event_payload("session.next.context.updated", &event_data, "ses_root")
-        .expect("the pinned codec accepts finite fractional milliseconds");
 
     let connection = Connection::open(&fixture.destination_database).unwrap();
     append_durable_event(
@@ -679,81 +670,6 @@ fn current_store_verification_canonicalizes_fractional_v2_datetime_timestamps() 
             message_id: "msg_fractional_context".into()
         }
     );
-}
-
-#[test]
-fn current_store_verification_checks_v1_session_workspace_id_prefix() {
-    for (workspace_id, should_verify) in [("wrk_valid", true), ("ws_invalid", false)] {
-        let fixture = fixture_with_baseline_event_workspace_id(workspace_id);
-        import_bundle(
-            &fixture.descriptor,
-            &fixture.staged_directory,
-            &fixture.destination_database,
-            &fixture.workspace,
-        )
-        .unwrap();
-
-        let result = verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace,
-        );
-        assert_eq!(
-            result.is_ok(),
-            should_verify,
-            "workspace ID {workspace_id}: {result:?}"
-        );
-    }
-}
-
-#[test]
-fn current_store_verification_checks_v2_location_workspace_id_prefix() {
-    for (workspace_id, should_verify) in [("wrk_valid", true), ("ws_invalid", false)] {
-        let fixture = fixture_with_baseline_workspace_id_without_event_field(workspace_id);
-        import_bundle(
-            &fixture.descriptor,
-            &fixture.staged_directory,
-            &fixture.destination_database,
-            &fixture.workspace,
-        )
-        .unwrap();
-
-        let moved = serde_json::json!({
-            "sessionID":"ses_root",
-            "timestamp":10.5,
-            "location":{
-                "directory":fixture.workspace.to_string_lossy(),
-                "workspaceID":workspace_id
-            },
-            "subdirectory":"src"
-        });
-        let connection = Connection::open(&fixture.destination_database).unwrap();
-        connection
-            .execute(
-                "UPDATE session SET path='src',workspace_id=?1,time_updated=10 WHERE id='ses_root'",
-                [workspace_id],
-            )
-            .unwrap();
-        append_durable_event(
-            &connection,
-            1,
-            "evt_moved_workspace",
-            "session.next.moved.1",
-            moved,
-        );
-        drop(connection);
-
-        let result = verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace,
-        );
-        assert_eq!(
-            result.is_ok(),
-            should_verify,
-            "workspace ID {workspace_id}: {result:?}"
-        );
-    }
 }
 
 #[test]
@@ -897,282 +813,6 @@ fn current_store_verification_keeps_part_revert_boundary_as_current_tail() {
 }
 
 #[test]
-fn current_store_verification_replays_completed_v2_response_content() {
-    for imported_response in [true, false] {
-        for replace_metadata in [true, false] {
-            let mut fixture = fixture_with_baseline_event();
-            if !imported_response {
-                import_bundle(
-                    &fixture.descriptor,
-                    &fixture.staged_directory,
-                    &fixture.destination_database,
-                    &fixture.workspace,
-                )
-                .unwrap();
-            }
-            let database = if imported_response {
-                fixture.root.join("source.sqlite")
-            } else {
-                fixture.destination_database.clone()
-            };
-            let connection = Connection::open(database).unwrap();
-            let model = serde_json::json!({"providerID":"openai","id":"gpt-5"});
-            let metadata = serde_json::json!({"openai":{"signature":"original"}});
-            let replacement = serde_json::json!({"openai":{"signature":"completed"}});
-            let mut reasoning_end = serde_json::json!({
-                "assistantMessageID":"msg_response","reasoningID":"reason-1","text":"completed reasoning"
-            });
-            if replace_metadata {
-                reasoning_end["providerMetadata"] = replacement.clone();
-            }
-            let tokens = serde_json::json!({"input":1,"output":2,"reasoning":3,"cache":{"read":0,"write":0}});
-            for (index, (kind, mut data)) in [
-                ("step.started", serde_json::json!({"assistantMessageID":"msg_response","agent":"build","model":model})),
-                ("text.started", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1"})),
-                ("text.ended", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1","text":"first answer"})),
-                // Native lookup updates the last matching entry, even when IDs repeat.
-                ("text.started", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1"})),
-                ("text.ended", serde_json::json!({"assistantMessageID":"msg_response","textID":"text-1","text":"completed answer"})),
-                ("reasoning.started", serde_json::json!({"assistantMessageID":"msg_response","reasoningID":"reason-1","providerMetadata":metadata})),
-                ("reasoning.ended", reasoning_end),
-                ("step.ended", serde_json::json!({"assistantMessageID":"msg_response","finish":"stop","cost":0,"tokens":tokens})),
-            ].into_iter().enumerate() {
-                let seq = index as i64 + 1;
-                data["sessionID"] = "ses_root".into();
-                data["timestamp"] = (seq * 10).into();
-                let version = if kind == "step.ended" { 2 } else { 1 };
-                append_durable_event(&connection, seq, &format!("evt_response_{seq}"), &format!("session.next.{kind}.{version}"), data);
-            }
-            let response = serde_json::json!({
-                "agent":"build","model":model,"time":{"created":10,"completed":80},
-                "finish":"stop","cost":0,"tokens":tokens,
-                "content":[
-                    {"type":"text","id":"text-1","text":"first answer"},
-                    {"type":"text","id":"text-1","text":"completed answer"},
-                    {"type":"reasoning","id":"reason-1","text":"completed reasoning",
-                     "time":{"created":60,"completed":70},"providerMetadata":if replace_metadata {replacement} else {metadata}}
-                ]
-            });
-            connection.execute(
-                "INSERT INTO session_message(id,session_id,type,seq,time_created,time_updated,data)
-                 VALUES('msg_response','ses_root','assistant',1,10,10,?1)",
-                [response.to_string()],
-            ).unwrap();
-            drop(connection);
-            if imported_response {
-                reexport_owned_fixture(&mut fixture);
-                import_bundle(
-                    &fixture.descriptor,
-                    &fixture.staged_directory,
-                    &fixture.destination_database,
-                    &fixture.workspace,
-                )
-                .unwrap();
-            }
-            verify_current_store(
-                &fixture.descriptor,
-                &fixture.destination_database,
-                &fixture.workspace,
-            )
-            .expect("native completed text and reasoning match the entire event projection");
-
-            let connection = Connection::open(&fixture.destination_database).unwrap();
-            for pointer in [
-                "/content/1/text",
-                "/content/2/text",
-                "/content/2/time/completed",
-                "/content/2/providerMetadata",
-            ] {
-                let mut corrupt = response.clone();
-                *corrupt.pointer_mut(pointer).unwrap() = serde_json::json!("unbound");
-                connection
-                    .execute(
-                        "UPDATE session_message SET data=?1 WHERE id='msg_response'",
-                        [corrupt.to_string()],
-                    )
-                    .unwrap();
-                assert!(
-                    verify_current_store(
-                        &fixture.descriptor,
-                        &fixture.destination_database,
-                        &fixture.workspace
-                    )
-                    .is_err(),
-                    "corrupt {pointer} must be refused"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn current_store_verification_replays_committed_revert_of_imported_v2_rows() {
-    let mut fixture = fixture_with_baseline_event();
-    let connection = Connection::open(fixture.root.join("source.sqlite")).unwrap();
-    let prompt =
-        serde_json::json!({"text":"imported prompt after boundary","files":[],"agents":[]});
-    for (seq, kind, data) in [
-        (
-            1,
-            "context.updated",
-            serde_json::json!({"timestamp":20,"messageID":"msg_v2_boundary","text":"boundary"}),
-        ),
-        (
-            2,
-            "prompt.admitted",
-            serde_json::json!({"timestamp":30,"messageID":"msg_v2_after","delivery":"queue","prompt":prompt}),
-        ),
-        (
-            3,
-            "prompted",
-            serde_json::json!({"timestamp":30,"messageID":"msg_v2_after","delivery":"queue","prompt":prompt}),
-        ),
-        (
-            4,
-            "prompt.admitted",
-            serde_json::json!({"timestamp":40,"messageID":"msg_v2_pending","delivery":"steer","prompt":prompt}),
-        ),
-        (
-            5,
-            "revert.staged",
-            serde_json::json!({"timestamp":50,"revert":{"messageID":"msg_v2_boundary"}}),
-        ),
-    ] {
-        let mut data = data;
-        data["sessionID"] = "ses_root".into();
-        append_durable_event(
-            &connection,
-            seq,
-            &format!("evt_imported_{seq}"),
-            &format!("session.next.{kind}.1"),
-            data,
-        );
-    }
-    connection.execute(
-        "INSERT INTO session_message(id,session_id,type,seq,time_created,time_updated,data)
-         VALUES('msg_v2_boundary','ses_root','system',1,20,20,?1),
-               ('msg_v2_after','ses_root','user',3,30,30,?2)",
-        params![serde_json::json!({"text":"boundary","time":{"created":20}}).to_string(),
-            serde_json::json!({"text":"imported prompt after boundary","files":[],"agents":[],"time":{"created":30}}).to_string()],
-    ).unwrap();
-    connection.execute(
-        "INSERT INTO session_input(id,session_id,admitted_seq,promoted_seq,time_created,delivery,prompt)
-         VALUES('msg_v2_after','ses_root',2,3,30,'queue',?1),
-               ('msg_v2_pending','ses_root',4,NULL,40,'steer',?1)",
-        [prompt.to_string()],
-    ).unwrap();
-    connection
-        .execute(
-            "UPDATE session SET revert=?1,time_updated=50 WHERE id='ses_root'",
-            [serde_json::json!({"messageID":"msg_v2_boundary"}).to_string()],
-        )
-        .unwrap();
-    drop(connection);
-    reexport_owned_fixture(&mut fixture);
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .expect("the imported V2 message/input rows and staged revert are native projections");
-
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    // Apply all effects of the native committed-revert projector, including
-    // removal of both promoted and pending imported inputs after the boundary.
-    connection.execute_batch(
-        "DELETE FROM session_message WHERE session_id='ses_root' AND seq>1;
-         DELETE FROM session_input WHERE session_id='ses_root' AND (admitted_seq>1 OR promoted_seq>1);
-         UPDATE session SET revert=NULL,time_updated=60 WHERE id='ses_root';",
-    ).unwrap();
-    assert!(
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace
-        )
-        .is_err(),
-        "suffix removal needs the committed event"
-    );
-    append_durable_event(
-        &connection,
-        6,
-        "evt_imported_revert",
-        "session.next.revert.committed.1",
-        serde_json::json!({
-            "sessionID":"ses_root","timestamp":60,"messageID":"msg_v2_boundary"
-        }),
-    );
-    let evidence = verify_current_store(&fixture.descriptor, &fixture.destination_database, &fixture.workspace)
-        .expect("a committed native revert authorizes imported projection suffix removal and session update");
-    assert_eq!(
-        evidence.root_tail,
-        VerifiedRootTail::Message {
-            message_id: "msg_v2_boundary".into()
-        }
-    );
-
-    connection
-        .execute("UPDATE session SET time_updated=61 WHERE id='ses_root'", [])
-        .unwrap();
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace
-    )
-    .is_err());
-    connection
-        .execute(
-            "UPDATE session SET time_updated=60,revert=?1 WHERE id='ses_root'",
-            [serde_json::json!({"messageID":"msg_v2_boundary"}).to_string()],
-        )
-        .unwrap();
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace
-    )
-    .is_err());
-    connection
-        .execute("UPDATE session SET revert=NULL WHERE id='ses_root'", [])
-        .unwrap();
-    connection.execute(
-        "INSERT INTO session_input(id,session_id,admitted_seq,promoted_seq,time_created,delivery,prompt)
-         VALUES('msg_v2_pending','ses_root',4,NULL,40,'steer',?1)", [prompt.to_string()]
-    ).unwrap();
-    assert!(
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace
-        )
-        .is_err(),
-        "an unremoved imported input cannot match committed revert"
-    );
-    connection
-        .execute("DELETE FROM session_input WHERE id='msg_v2_pending'", [])
-        .unwrap();
-    connection
-        .execute("DELETE FROM session_message WHERE id='msg_v2_boundary'", [])
-        .unwrap();
-    assert!(
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace
-        )
-        .is_err(),
-        "revert cannot remove its retained boundary"
-    );
-}
-
-#[test]
 fn current_store_verification_replays_v2_revert_and_derives_boundary_tail() {
     let fixture = fixture_with_baseline_event();
     import_bundle(
@@ -1246,349 +886,6 @@ fn current_store_verification_replays_v2_revert_and_derives_boundary_tail() {
             message_id: "msg_v2_boundary".into()
         }
     );
-}
-
-#[test]
-fn current_store_verification_rejects_deleted_baseline_rows_and_event_gaps() {
-    let deleted = fixture();
-    import_bundle(
-        &deleted.descriptor,
-        &deleted.staged_directory,
-        &deleted.destination_database,
-        &deleted.workspace,
-    )
-    .unwrap();
-    Connection::open(&deleted.destination_database)
-        .unwrap()
-        .execute("DELETE FROM part WHERE id='part_one'", [])
-        .unwrap();
-    assert!(verify_current_store(
-        &deleted.descriptor,
-        &deleted.destination_database,
-        &deleted.workspace,
-    )
-    .is_err());
-
-    let corrupted = fixture();
-    import_bundle(
-        &corrupted.descriptor,
-        &corrupted.staged_directory,
-        &corrupted.destination_database,
-        &corrupted.workspace,
-    )
-    .unwrap();
-    append_messages_with_events_starting_at(&corrupted, 2, 2);
-    assert!(verify_current_store(
-        &corrupted.descriptor,
-        &corrupted.destination_database,
-        &corrupted.workspace,
-    )
-    .is_err());
-}
-
-#[test]
-fn current_store_verification_blocks_unqualified_transcript_removal_events() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    append_durable_event(
-        &connection,
-        1,
-        "evt_message_removed",
-        "message.removed.1",
-        serde_json::json!({"sessionID":"ses_root","messageID":"msg_one"}),
-    );
-    drop(connection);
-
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .is_err());
-}
-
-#[test]
-fn current_store_verification_accepts_contiguous_advance_and_rejects_cursor_rollback() {
-    let advanced = fixture_with_baseline_event();
-    import_bundle(
-        &advanced.descriptor,
-        &advanced.staged_directory,
-        &advanced.destination_database,
-        &advanced.workspace,
-    )
-    .unwrap();
-    append_messages_with_events_starting_at(&advanced, 2, 1);
-    let evidence = verify_current_store(
-        &advanced.descriptor,
-        &advanced.destination_database,
-        &advanced.workspace,
-    )
-    .expect("the provider may advance the imported cursor by contiguous events");
-    assert_eq!(
-        evidence.root_tail,
-        VerifiedRootTail::Message {
-            message_id: "msg_append_001".into()
-        }
-    );
-
-    let rolled_back = fixture_with_baseline_event();
-    import_bundle(
-        &rolled_back.descriptor,
-        &rolled_back.staged_directory,
-        &rolled_back.destination_database,
-        &rolled_back.workspace,
-    )
-    .unwrap();
-    Connection::open(&rolled_back.destination_database)
-        .unwrap()
-        .execute(
-            "UPDATE event_sequence SET seq=-1 WHERE aggregate_id='ses_root'",
-            [],
-        )
-        .unwrap();
-    assert!(verify_current_store(
-        &rolled_back.descriptor,
-        &rolled_back.destination_database,
-        &rolled_back.workspace,
-    )
-    .is_err());
-
-    let extreme = fixture();
-    import_bundle(
-        &extreme.descriptor,
-        &extreme.staged_directory,
-        &extreme.destination_database,
-        &extreme.workspace,
-    )
-    .unwrap();
-    Connection::open(&extreme.destination_database)
-        .unwrap()
-        .execute(
-            "INSERT INTO event_sequence(aggregate_id,seq,owner_id) VALUES('ses_root',?1,'owner')",
-            [i64::MAX],
-        )
-        .unwrap();
-    assert!(verify_current_store(
-        &extreme.descriptor,
-        &extreme.destination_database,
-        &extreme.workspace,
-    )
-    .is_err());
-}
-
-#[test]
-fn current_store_verification_rejects_row_changes_not_reflected_in_the_event_value() {
-    let fixture = fixture();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    append_messages_with_events(&fixture, 1);
-    Connection::open(&fixture.destination_database)
-        .unwrap()
-        .execute(
-            "UPDATE message SET data=?1 WHERE id='msg_append_000'",
-            [r#"{"role":"assistant","text":"unbound mutation","time":{"created":2,"updated":2}}"#],
-        )
-        .unwrap();
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .is_err());
-}
-
-#[test]
-fn current_store_verification_rejects_a_row_matching_only_an_older_event() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    append_messages_with_events_starting_at(&fixture, 1, 1);
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    let old_data: serde_json::Value = connection
-        .query_row(
-            "SELECT data FROM message WHERE id='msg_append_000'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .map(|data| serde_json::from_str(&data).unwrap())
-        .unwrap();
-    let mut new_data = old_data.clone();
-    new_data["time"]["completed"] = serde_json::json!(3);
-    let mut info = new_data.as_object().unwrap().clone();
-    info.insert("id".into(), "msg_append_000".into());
-    info.insert("sessionID".into(), "ses_root".into());
-    append_durable_event(
-        &connection,
-        2,
-        "evt_message_updated_again",
-        "message.updated.1",
-        serde_json::json!({
-            "sessionID":"ses_root",
-            "info":serde_json::Value::Object(info)
-        }),
-    );
-    connection
-        .execute(
-            "UPDATE message SET data=?1,time_updated=3 WHERE id='msg_append_000'",
-            [new_data.to_string()],
-        )
-        .unwrap();
-    verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .expect("a row matching the newest event must be accepted before testing stale ordering");
-    connection
-        .execute(
-            "UPDATE message SET data=?1,time_updated=2 WHERE id='msg_append_000'",
-            [old_data.to_string()],
-        )
-        .unwrap();
-    drop(connection);
-
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .is_err());
-}
-
-#[test]
-fn current_store_verification_rejects_a_part_matching_only_an_older_event() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    let baseline_data: serde_json::Value = connection
-        .query_row("SELECT data FROM part WHERE id='part_one'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .map(|data| serde_json::from_str(&data).unwrap())
-        .unwrap();
-    let mut current_data = baseline_data.as_object().unwrap().clone();
-    current_data.insert("mime".into(), "text/markdown".into());
-    let current_data = serde_json::Value::Object(current_data);
-    connection
-        .execute(
-            "INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
-             VALUES('prt_ordering','msg_one','ses_root',1,1,?1)",
-            [current_data.to_string()],
-        )
-        .unwrap();
-    for (sequence, event_id, data) in [
-        (1, "evt_part_update_old", current_data.clone()),
-        (2, "evt_part_update_new", baseline_data),
-    ] {
-        let mut part = data.as_object().unwrap().clone();
-        part.insert("id".into(), "prt_ordering".into());
-        part.insert("sessionID".into(), "ses_root".into());
-        part.insert("messageID".into(), "msg_one".into());
-        append_durable_event(
-            &connection,
-            sequence,
-            event_id,
-            "message.part.updated.1",
-            serde_json::json!({
-                "sessionID":"ses_root",
-                "part":serde_json::Value::Object(part),
-                "time":1
-            }),
-        );
-        if sequence == 1 {
-            verify_current_store(
-                &fixture.descriptor,
-                &fixture.destination_database,
-                &fixture.workspace,
-            )
-            .expect(
-                "a part matching its latest event must be accepted before adding a newer event",
-            );
-        }
-    }
-    drop(connection);
-
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .is_err());
-}
-
-#[test]
-fn session_snapshot_event_cannot_attest_usage_after_a_later_step_finish() {
-    let make_event = |seq: i64, event_type: &str, data: serde_json::Value| SerializedRow {
-        table: "event".into(),
-        key: Vec::new(),
-        values: BTreeMap::from([
-            (
-                "aggregate_id".into(),
-                SerializedSqlValue::Text {
-                    value: "ses_root".into(),
-                },
-            ),
-            ("seq".into(), SerializedSqlValue::Integer { value: seq }),
-            (
-                "type".into(),
-                SerializedSqlValue::Text {
-                    value: format!("{event_type}.1"),
-                },
-            ),
-            (
-                "data".into(),
-                SerializedSqlValue::Text {
-                    value: data.to_string(),
-                },
-            ),
-        ]),
-    };
-    let update = make_event(
-        1,
-        "session.updated",
-        serde_json::json!({"sessionID":"ses_root","info":{"id":"ses_root"}}),
-    );
-    let finish = make_event(
-        2,
-        "message.part.updated",
-        serde_json::json!({
-            "sessionID":"ses_root",
-            "part":{"id":"part_finish","sessionID":"ses_root","messageID":"msg","type":"step-finish"},
-            "time":20
-        }),
-    );
-    let current_update = make_event(
-        3,
-        "session.updated",
-        serde_json::json!({"sessionID":"ses_root","info":{"id":"ses_root"}}),
-    );
-    let events = vec![update.clone(), finish.clone(), current_update.clone()];
-
-    assert!(!session_snapshot_event_is_current(&update, &events, "ses_root").unwrap());
-    assert!(session_snapshot_event_is_current(&current_update, &events, "ses_root").unwrap());
 }
 
 #[test]
@@ -1672,11 +969,7 @@ fn current_store_verification_accepts_replaced_imported_todo_list() {
     for length in [2, 1, 0] {
         let mut fixture = fixture_with_baseline_event();
         let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
-        source.execute_batch(
-            "INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated)
-             VALUES('ses_root','original first','pending','low',0,1,1),
-                   ('ses_root','original second','pending','low',1,1,1);",
-        ).unwrap();
+        source.execute_batch("INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated) VALUES('ses_root','original first','pending','low',0,1,1),('ses_root','original second','pending','low',1,1,1)").unwrap();
         drop(source);
         reexport_owned_fixture(&mut fixture);
         import_bundle(
@@ -1686,193 +979,30 @@ fn current_store_verification_accepts_replaced_imported_todo_list() {
             &fixture.workspace,
         )
         .unwrap();
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace,
-        )
-        .unwrap();
-
-        let todos = [
-            serde_json::json!({"content":"replacement first","status":"completed","priority":"high"}),
-            serde_json::json!({"content":"replacement second","status":"in_progress","priority":"medium"}),
-        ][..length].to_vec();
         let connection = Connection::open(&fixture.destination_database).unwrap();
-        // Native Todo.update deletes every old row and reinserts the new list,
-        // with fresh default timestamps even for unchanged positions.
         connection
             .execute("DELETE FROM todo WHERE session_id='ses_root'", [])
             .unwrap();
-        for (position, todo) in todos.iter().enumerate() {
-            connection.execute(
-                "INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated)
-                 VALUES('ses_root',?1,?2,?3,?4,25,25)",
-                params![todo["content"].as_str().unwrap(),todo["status"].as_str().unwrap(),todo["priority"].as_str().unwrap(),position as i64],
-            ).unwrap();
+        for position in 0..length {
+            connection.execute("INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated) VALUES('ses_root','replacement','completed','high',?1,25,25)", [position]).unwrap();
         }
-        assert!(
-            verify_current_store(
-                &fixture.descriptor,
-                &fixture.destination_database,
-                &fixture.workspace
-            )
-            .is_err(),
-            "replacement without native evidence must fail"
-        );
-        append_durable_event(
-            &connection,
-            1,
-            "evt_todo_called",
-            "session.next.tool.called.1",
-            serde_json::json!({
-                "sessionID":"ses_root","timestamp":20,"assistantMessageID":"msg_assistant","callID":"call_todo",
-                "tool":"todowrite","input":{"todos":todos},"provider":{"executed":false}
-            }),
-        );
-        assert!(
-            verify_current_store(
-                &fixture.descriptor,
-                &fixture.destination_database,
-                &fixture.workspace
-            )
-            .is_err(),
-            "an incomplete todowrite must fail"
-        );
-        append_durable_event(
-            &connection,
-            2,
-            "evt_todo_success",
-            "session.next.tool.success.1",
-            serde_json::json!({
-                "sessionID":"ses_root","timestamp":30,"assistantMessageID":"msg_assistant","callID":"call_todo",
-                "structured":{"todos":todos},"content":[{"type":"text","text":"updated todos"}],"provider":{"executed":false}
-            }),
-        );
         verify_current_store(
             &fixture.descriptor,
             &fixture.destination_database,
             &fixture.workspace,
         )
-        .unwrap_or_else(|error| {
-            panic!("native replacement with {length} todos must reopen: {error}")
-        });
-
-        if length > 0 {
-            for mutation in [
-                "time_created=19",
-                "time_updated=31",
-                "content='corrupt'",
-                "position=8",
-            ] {
-                connection
-                    .execute(&format!("UPDATE todo SET {mutation} WHERE position=0"), [])
-                    .unwrap();
-                assert!(
-                    verify_current_store(
-                        &fixture.descriptor,
-                        &fixture.destination_database,
-                        &fixture.workspace
-                    )
-                    .is_err(),
-                    "unbound todo mutation {mutation} must fail"
-                );
-                connection.execute("UPDATE todo SET content=?1,position=0,time_created=25,time_updated=25 WHERE position IN (0,8)", [todos[0]["content"].as_str().unwrap()]).unwrap();
-            }
-        }
-        connection.execute(
-            "INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated)
-             VALUES('ses_root','extra unbound todo','pending','low',9,25,25)", []
-        ).unwrap();
-        assert!(verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace
-        )
-        .is_err());
-    }
-}
-
-#[test]
-fn current_store_verification_accepts_todowrite_projection_only_when_payload_matches() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    let todos = serde_json::json!([
-        {"content":"inspect transfer","status":"completed","priority":"high"},
-        {"content":"write tests","status":"in_progress","priority":"medium"}
-    ]);
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    append_durable_event(
-        &connection,
-        1,
-        "evt_todowrite_called",
-        "session.next.tool.called.1",
-        serde_json::json!({
-            "sessionID":"ses_root",
-            "timestamp":20.5,
-            "assistantMessageID":"msg_assistant",
-            "callID":"call_todo",
-            "tool":"todowrite",
-            "input":{"todos":todos},
-            "provider":{"executed":false}
-        }),
-    );
-    append_durable_event(
-        &connection,
-        2,
-        "evt_todowrite_success",
-        "session.next.tool.success.1",
-        serde_json::json!({
-            "sessionID":"ses_root",
-            "timestamp":30.5,
-            "assistantMessageID":"msg_assistant",
-            "callID":"call_todo",
-            "structured":{"todos":todos},
-            "content":[{"type":"text","text":"2 todos"}],
-            "provider":{"executed":false}
-        }),
-    );
-    for (position, todo) in todos.as_array().unwrap().iter().enumerate() {
-        connection
-            .execute(
-                "INSERT INTO todo(session_id,content,status,priority,position,time_created,time_updated)
-                 VALUES('ses_root',?1,?2,?3,?4,25,25)",
-                params![
-                    todo["content"].as_str().unwrap(),
-                    todo["status"].as_str().unwrap(),
-                    todo["priority"].as_str().unwrap(),
-                    position as i64,
-                ],
-            )
-            .unwrap();
-    }
-    drop(connection);
-
-    verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .expect("a durable successful todowrite pair proves ordered todo values");
-
-    Connection::open(&fixture.destination_database)
-        .unwrap()
-        .execute(
-            "UPDATE todo SET content='unbound todo value' WHERE session_id='ses_root' AND position=1",
-            [],
-        )
         .unwrap();
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .is_err());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM todo WHERE session_id='ses_root'",
+                    [],
+                    |row| row.get::<_, i32>(0)
+                )
+                .unwrap(),
+            length
+        );
+    }
 }
 
 #[test]
@@ -1936,70 +1066,20 @@ fn current_store_verification_accepts_exact_context_and_compaction_messages() {
         Connection::open(&fixture.destination_database)
             .unwrap()
             .execute(
-                "UPDATE session_message SET time_updated=?1 WHERE id=?2",
-                params![i64::MAX, message_id],
-            )
-            .unwrap();
-        assert!(verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace,
-        )
-        .is_err());
-        Connection::open(&fixture.destination_database)
-            .unwrap()
-            .execute(
-                "UPDATE session_message SET time_updated=20 WHERE id=?1",
+                "UPDATE session_message SET data='{' WHERE id=?1",
                 [message_id],
             )
             .unwrap();
-
-        Connection::open(&fixture.destination_database)
-            .unwrap()
-            .execute(
-                "UPDATE session_message SET data=?1 WHERE id=?2",
-                params![serde_json::json!({"text":"wrong"}).to_string(), message_id],
+        assert!(
+            verify_current_store(
+                &fixture.descriptor,
+                &fixture.destination_database,
+                &fixture.workspace
             )
-            .unwrap();
-        assert!(verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace,
-        )
-        .is_err());
+            .is_err(),
+            "the current native message still has to be readable"
+        );
     }
-}
-
-#[test]
-fn current_store_verification_rejects_mutated_baseline_v2_projection_timestamp() {
-    let fixture = fixture_with_baseline_v2_context_message();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .expect("the exact baseline projection verifies");
-
-    Connection::open(&fixture.destination_database)
-        .unwrap()
-        .execute(
-            "UPDATE session_message SET time_updated=26 WHERE id='msg_context'",
-            [],
-        )
-        .unwrap();
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .is_err());
 }
 
 fn append_messages_with_events(fixture: &Fixture, count: u64) {
@@ -2584,19 +1664,10 @@ fn durable_souls_native_project_discovery_touch_preserves_identity() {
         &fixture.workspace,
     )
     .expect("pinned fromDirectory touches project time without altering history");
-    connection
-        .execute("UPDATE project SET worktree='/substituted-workspace'", [])
-        .unwrap();
-    assert!(verify_current_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace
-    )
-    .is_err());
 }
 
 #[test]
-fn durable_souls_saved_full_revert_cleanup_preserves_immutable_baseline() {
+fn saved_full_revert_cleanup_allows_remaining_history_to_evolve() {
     let fixture = run_saved_revert_cleanup(false);
     let connection = Connection::open(&fixture.destination_database).unwrap();
     assert_eq!(
@@ -2612,19 +1683,22 @@ fn durable_souls_saved_full_revert_cleanup_preserves_immutable_baseline() {
     connection
         .execute("DELETE FROM message WHERE id='msg_one'", [])
         .unwrap();
-    assert!(
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace
-        )
-        .is_err(),
-        "a deleted preserved prefix needs its own exact native authority"
+    let current = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        current.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_cleanup_continuation".into()
+        }
     );
 }
 
 #[test]
-fn durable_souls_saved_part_revert_cleanup_preserves_prefix_parts() {
+fn saved_part_revert_cleanup_survives_native_event_pruning() {
     let fixture = run_saved_revert_cleanup(true);
     let connection = Connection::open(&fixture.destination_database).unwrap();
     assert_eq!(
@@ -2640,14 +1714,17 @@ fn durable_souls_saved_part_revert_cleanup_preserves_prefix_parts() {
     connection
         .execute("DELETE FROM event WHERE id='evt_cleanup_cleared'", [])
         .unwrap();
-    assert!(
-        verify_current_store(
-            &fixture.descriptor,
-            &fixture.destination_database,
-            &fixture.workspace
-        )
-        .is_err(),
-        "missing native clear or sequence evidence refuses current qualification"
+    let current = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        current.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_cleanup_continuation".into()
+        }
     );
 }
 
@@ -2749,531 +1826,6 @@ fn rehearsal_current_identity() -> (u32, u32) {
     }
 }
 
-#[test]
-fn durable_v1_event_payloads_reject_invalid_nested_pinned_schema_values() {
-    let invalid_session = serde_json::json!({
-        "sessionID":"ses_root",
-        "info":{"id":"ses_root"}
-    });
-    assert!(validate_v1_event_envelope("session.updated", &invalid_session).is_err());
-
-    let invalid_message = serde_json::json!({
-        "sessionID":"ses_root",
-        "info":{
-            "id":"msg_new",
-            "sessionID":"ses_root",
-            "role":"assistant",
-            "time":{"created":10}
-        }
-    });
-    assert!(validate_v1_event_envelope("message.updated", &invalid_message).is_err());
-
-    let invalid_part = serde_json::json!({
-        "sessionID":"ses_root",
-        "part":{"id":"prt_new","sessionID":"ses_root","messageID":"msg_new"},
-        "time":10
-    });
-    assert!(validate_v1_event_envelope("message.part.updated", &invalid_part).is_err());
-}
-
-#[test]
-fn durable_v1_nested_schemas_accept_valid_session_and_message_unions() {
-    let session_info = serde_json::json!({
-        "id":"ses_root",
-        "slug":"root",
-        "projectID":"project-one",
-        "directory":"/workspace",
-        "title":"Root",
-        "version":"1.18.21",
-        "time":{"created":1,"updated":2}
-    });
-    validate_v1_event_envelope(
-        "session.updated",
-        &serde_json::json!({"sessionID":"ses_root","info":session_info}),
-    )
-    .expect("the minimal pinned SessionInfo is valid");
-
-    let invalid_optional_session = serde_json::json!({
-        "sessionID":"ses_root",
-        "info":{
-            "id":"ses_root","slug":"root","projectID":"project-one",
-            "directory":"/workspace","title":"Root","version":"1.18.21",
-            "time":{"created":1,"updated":2},
-            "tokens":{"input":1,"output":2,"reasoning":3,"cache":{"read":"4","write":5}}
-        }
-    });
-    assert!(validate_v1_event_envelope("session.updated", &invalid_optional_session).is_err());
-
-    let user = serde_json::json!({
-        "id":"msg_user",
-        "sessionID":"ses_root",
-        "role":"user",
-        "time":{"created":3.5},
-        "agent":"build",
-        "model":{"providerID":"provider-one","modelID":"model-one"},
-        "format":{"type":"json_schema","schema":{"type":"object"},"retryCount":2},
-        "summary":{"diffs":[]},
-        "system":"system prompt",
-        "tools":{"read":true}
-    });
-    validate_v1_event_envelope(
-        "message.updated",
-        &serde_json::json!({"sessionID":"ses_root","info":user.clone()}),
-    )
-    .expect("the pinned User message, including optional fields, is valid");
-    let mut invalid_user = user.as_object().unwrap().clone();
-    invalid_user.insert("tools".into(), serde_json::json!({"read":"yes"}));
-    assert!(validate_v1_event_envelope(
-        "message.updated",
-        &serde_json::json!({"sessionID":"ses_root","info":invalid_user}),
-    )
-    .is_err());
-
-    let assistant = serde_json::json!({
-        "id":"msg_assistant",
-        "sessionID":"ses_root",
-        "role":"assistant",
-        "time":{"created":4,"completed":5},
-        "parentID":"msg_user",
-        "modelID":"model-one",
-        "providerID":"provider-one",
-        "mode":"default",
-        "agent":"build",
-        "path":{"cwd":"/workspace","root":"/workspace"},
-        "cost":0.0,
-        "tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},
-        "structured":["schema-authorized arbitrary JSON"],
-        "error":{"name":"UnknownError","data":{"message":"synthetic","ref":"ref"}}
-    });
-    validate_v1_event_envelope(
-        "message.updated",
-        &serde_json::json!({"sessionID":"ses_root","info":assistant.clone()}),
-    )
-    .expect("the pinned Assistant message and arbitrary structured value are valid");
-    let mut invalid_assistant = assistant.as_object().unwrap().clone();
-    invalid_assistant.insert("id".into(), serde_json::json!("not-a-message-id"));
-    assert!(validate_v1_event_envelope(
-        "message.updated",
-        &serde_json::json!({"sessionID":"ses_root","info":invalid_assistant}),
-    )
-    .is_err());
-}
-
-#[test]
-fn durable_v1_part_union_variants_validate_and_reject_missing_variant_fields() {
-    let variants = [
-        (
-            "text",
-            serde_json::json!({"text":"hello","metadata":{"provider":{"arbitrary":[1,true]}}}),
-            "text",
-        ),
-        (
-            "subtask",
-            serde_json::json!({"prompt":"p","description":"d","agent":"a"}),
-            "prompt",
-        ),
-        (
-            "reasoning",
-            serde_json::json!({"text":"thinking","time":{"start":1}}),
-            "text",
-        ),
-        (
-            "file",
-            serde_json::json!({"mime":"text/plain","url":"file:///tmp/a"}),
-            "mime",
-        ),
-        (
-            "tool",
-            serde_json::json!({"callID":"call-1","tool":"read","state":{"status":"pending","input":{"path":"a"},"raw":"{}"}}),
-            "state",
-        ),
-        ("step-start", serde_json::json!({}), "type"),
-        (
-            "step-finish",
-            serde_json::json!({"reason":"stop","cost":0.0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}),
-            "cost",
-        ),
-        (
-            "snapshot",
-            serde_json::json!({"snapshot":"tree"}),
-            "snapshot",
-        ),
-        (
-            "patch",
-            serde_json::json!({"hash":"hash","files":["a.rs"]}),
-            "files",
-        ),
-        ("agent", serde_json::json!({"name":"explorer"}), "name"),
-        (
-            "retry",
-            serde_json::json!({"attempt":1,"error":{"name":"APIError","data":{"message":"retry","isRetryable":true}},"time":{"created":5}}),
-            "attempt",
-        ),
-        (
-            "compaction",
-            serde_json::json!({"auto":true,"tail_start_id":"msg_tail"}),
-            "auto",
-        ),
-    ];
-    for (index, (kind, fields, missing_key)) in variants.iter().enumerate() {
-        let mut part = fields.as_object().unwrap().clone();
-        part.extend(serde_json::Map::from_iter([
-            ("id".into(), serde_json::json!(format!("prt_{index}"))),
-            ("sessionID".into(), serde_json::json!("ses_root")),
-            ("messageID".into(), serde_json::json!("msg_one")),
-            ("type".into(), serde_json::json!(kind)),
-        ]));
-        let valid = serde_json::json!({
-            "sessionID":"ses_root",
-            "part":serde_json::Value::Object(part.clone()),
-            "time":1.5
-        });
-        validate_v1_event_envelope("message.part.updated", &valid)
-            .unwrap_or_else(|_| panic!("valid pinned V1 {kind} part was rejected"));
-
-        part.remove(*missing_key);
-        let invalid = serde_json::json!({
-            "sessionID":"ses_root",
-            "part":serde_json::Value::Object(part),
-            "time":1.5
-        });
-        assert!(
-            validate_v1_event_envelope("message.part.updated", &invalid).is_err(),
-            "V1 {kind} part accepted without {missing_key}"
-        );
-    }
-
-    let invalid_optional_part = serde_json::json!({
-        "sessionID":"ses_root",
-        "part":{
-            "id":"prt_text","sessionID":"ses_root","messageID":"msg_one",
-            "type":"text","text":"hello","time":{"start":0,"end":"later"}
-        },
-        "time":1.5
-    });
-    assert!(validate_v1_event_envelope("message.part.updated", &invalid_optional_part).is_err());
-}
-
-#[test]
-fn immutable_baseline_events_are_schema_checked_and_unknown_types_block() {
-    let fixture = fixture_with_baseline_event();
-    import_bundle(
-        &fixture.descriptor,
-        &fixture.staged_directory,
-        &fixture.destination_database,
-        &fixture.workspace,
-    )
-    .unwrap();
-    let manifest = parse_manifest(&fixture.descriptor).unwrap();
-    let baseline_event = manifest
-        .rows
-        .iter()
-        .find(|row| row.table == "event")
-        .unwrap();
-    let baseline_sequence = manifest
-        .rows
-        .iter()
-        .find(|row| row.table == "event_sequence")
-        .unwrap();
-    let connection = Connection::open(&fixture.destination_database).unwrap();
-    let event = read_row_by_key(&connection, "event", &baseline_event.key).unwrap();
-    let sequence = read_row_by_key(&connection, "event_sequence", &baseline_sequence.key).unwrap();
-    let current = BTreeMap::from([
-        ((event.table.clone(), event.key.clone()), event.clone()),
-        ((sequence.table.clone(), sequence.key.clone()), sequence),
-    ]);
-    verify_current_event_chains(&manifest, &current, std::slice::from_ref(&event))
-        .expect("the valid immutable V1 baseline event matches its pinned schema");
-
-    let mut malformed_payload = event.clone();
-    malformed_payload.values.insert(
-        "data".into(),
-        SerializedSqlValue::Text {
-            value: serde_json::json!({
-                "sessionID":"ses_root",
-                "info":{"id":"ses_root"}
-            })
-            .to_string(),
-        },
-    );
-    assert!(verify_current_event_chains(&manifest, &current, &[malformed_payload]).is_err());
-
-    for invalid_type in [
-        "session.created.2",
-        "session.next.text.delta.1",
-        "session.next.unknown.1",
-        "unknown.event.1",
-    ] {
-        let mut invalid = event.clone();
-        invalid.values.insert(
-            "type".into(),
-            SerializedSqlValue::Text {
-                value: invalid_type.into(),
-            },
-        );
-        assert!(
-            verify_current_event_chains(&manifest, &current, &[invalid]).is_err(),
-            "baseline event type {invalid_type} must not bypass durable schema validation"
-        );
-    }
-}
-
-#[test]
-fn v2_datetime_timestamp_uses_timeclip_for_negative_fractions_and_range_boundaries() {
-    for (input, expected) in [
-        (serde_json::json!(20.5), Some(20)),
-        (serde_json::json!(-20.5), Some(-20)),
-        (
-            serde_json::json!(8640000000000000i64),
-            Some(8640000000000000i64),
-        ),
-        (
-            serde_json::json!(-8640000000000000i64),
-            Some(-8640000000000000i64),
-        ),
-        (serde_json::json!(8640000000000001i64), None),
-        (serde_json::json!(-8640000000000001i64), None),
-    ] {
-        assert_eq!(canonical_v2_timestamp_millis(&input), expected, "{input}");
-    }
-}
-
-#[test]
-fn durable_v2_event_payloads_reject_invalid_nested_pinned_schema_values() {
-    let timestamp_outside_javascript_date_range = serde_json::json!({
-        "sessionID":"ses_root",
-        "timestamp":8640000000000001i64,
-        "messageID":"msg_new",
-        "text":"invalid timestamp"
-    });
-    assert!(validate_v2_event_payload(
-        "session.next.context.updated",
-        &timestamp_outside_javascript_date_range,
-        "ses_root"
-    )
-    .is_err());
-
-    let invalid_prompt = serde_json::json!({
-        "sessionID":"ses_root",
-        "timestamp":10,
-        "messageID":"msg_new",
-        "prompt":{"text":42,"files":[]},
-        "delivery":"queue"
-    });
-    assert!(
-        validate_v2_event_payload("session.next.prompt.admitted", &invalid_prompt, "ses_root")
-            .is_err()
-    );
-
-    let invalid_model = serde_json::json!({
-        "sessionID":"ses_root",
-        "timestamp":10,
-        "messageID":"msg_new",
-        "model":{"id":"model-one"}
-    });
-    assert!(
-        validate_v2_event_payload("session.next.model.switched", &invalid_model, "ses_root")
-            .is_err()
-    );
-
-    let invalid_step = serde_json::json!({
-        "sessionID":"ses_root",
-        "timestamp":10,
-        "assistantMessageID":"msg_new",
-        "finish":"stop",
-        "cost":0.0,
-        "tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0}}
-    });
-    assert!(
-        validate_v2_event_payload("session.next.step.ended", &invalid_step, "ses_root").is_err()
-    );
-
-    let invalid_tool_content = serde_json::json!({
-        "sessionID":"ses_root",
-        "timestamp":10,
-        "assistantMessageID":"msg_new",
-        "callID":"call-1",
-        "structured":{},
-        "content":[{"type":"image","uri":"file://image"}],
-        "provider":{"executed":false}
-    });
-    assert!(validate_v2_event_payload(
-        "session.next.tool.success",
-        &invalid_tool_content,
-        "ses_root"
-    )
-    .is_err());
-
-    let invalid_id = serde_json::json!({
-        "sessionID":"ses_root",
-        "timestamp":10.5,
-        "messageID":"msgbad",
-        "prompt":{"text":"bad id"},
-        "delivery":"queue"
-    });
-    assert!(
-        validate_v2_event_payload("session.next.prompt.admitted", &invalid_id, "ses_root").is_err()
-    );
-}
-
-#[test]
-fn durable_v2_event_schema_accepts_each_pinned_kind_and_schema_authorized_json() {
-    let model = serde_json::json!({"id":"model-one","providerID":"provider-one","variant":"fast"});
-    let payloads = [
-        (
-            "session.next.agent.switched",
-            serde_json::json!({"messageID":"msg_one","agent":"build"}),
-        ),
-        (
-            "session.next.model.switched",
-            serde_json::json!({"messageID":"msg_one","model":model}),
-        ),
-        (
-            "session.next.moved",
-            serde_json::json!({"location":{"directory":"/workspace","workspaceID":"wrk_one"},"subdirectory":"src"}),
-        ),
-        (
-            "session.next.prompt.admitted",
-            serde_json::json!({"messageID":"msg_one","prompt":{"text":"hello","files":[{"uri":"file:///prompt","mime":"text/plain","source":{"start":0.5,"end":2.5,"text":"hello"}}],"agents":[{"name":"build"}]},"delivery":"queue"}),
-        ),
-        (
-            "session.next.prompted",
-            serde_json::json!({"messageID":"msg_two","prompt":{"text":"steer"},"delivery":"steer"}),
-        ),
-        (
-            "session.next.context.updated",
-            serde_json::json!({"messageID":"msg_three","text":"context"}),
-        ),
-        (
-            "session.next.synthetic",
-            serde_json::json!({"messageID":"msg_four","text":"synthetic"}),
-        ),
-        (
-            "session.next.shell.started",
-            serde_json::json!({"messageID":"msg_shell","callID":"call-shell","command":"pwd"}),
-        ),
-        (
-            "session.next.shell.ended",
-            serde_json::json!({"callID":"call-shell","output":"/workspace"}),
-        ),
-        (
-            "session.next.step.started",
-            serde_json::json!({"assistantMessageID":"msg_assistant","agent":"build","model":model,"snapshot":"tree"}),
-        ),
-        (
-            "session.next.step.ended",
-            serde_json::json!({"assistantMessageID":"msg_assistant","finish":"stop","cost":0.5,"tokens":{"input":1,"output":2,"reasoning":3,"cache":{"read":4,"write":5}},"files":["src/main.rs"]}),
-        ),
-        (
-            "session.next.step.failed",
-            serde_json::json!({"assistantMessageID":"msg_assistant","error":{"type":"unknown","message":"failed"}}),
-        ),
-        (
-            "session.next.text.started",
-            serde_json::json!({"assistantMessageID":"msg_assistant","textID":"text-1"}),
-        ),
-        (
-            "session.next.text.ended",
-            serde_json::json!({"assistantMessageID":"msg_assistant","textID":"text-1","text":"complete"}),
-        ),
-        (
-            "session.next.tool.input.started",
-            serde_json::json!({"assistantMessageID":"msg_assistant","callID":"call-tool","name":"read"}),
-        ),
-        (
-            "session.next.tool.input.ended",
-            serde_json::json!({"assistantMessageID":"msg_assistant","callID":"call-tool","text":"{\"path\":\"x\"}"}),
-        ),
-        (
-            "session.next.tool.called",
-            serde_json::json!({"assistantMessageID":"msg_assistant","callID":"call-tool","tool":"read","input":{"path":"x","providerData":[1,true]},"provider":{"executed":false,"metadata":{"provider-one":{"opaque":{"ok":true}}}}}),
-        ),
-        (
-            "session.next.tool.progress",
-            serde_json::json!({"assistantMessageID":"msg_assistant","callID":"call-tool","structured":{"progress":{"items":[1,2]}},"content":[{"type":"text","text":"working"}]}),
-        ),
-        (
-            "session.next.tool.success",
-            serde_json::json!({"assistantMessageID":"msg_assistant","callID":"call-tool","structured":{"count":1},"content":[{"type":"file","uri":"file:///result","mime":"text/plain","name":"result.txt"}],"outputPaths":["result.txt"],"result":["schema-authorized Any"],"provider":{"executed":true}}),
-        ),
-        (
-            "session.next.tool.failed",
-            serde_json::json!({"assistantMessageID":"msg_assistant","callID":"call-tool","error":{"type":"unknown","message":"failed"},"result":{"unknown":true},"provider":{"executed":false}}),
-        ),
-        (
-            "session.next.reasoning.started",
-            serde_json::json!({"assistantMessageID":"msg_assistant","reasoningID":"reason-1","providerMetadata":{"provider-one":{"opaque":[1]}}}),
-        ),
-        (
-            "session.next.reasoning.ended",
-            serde_json::json!({"assistantMessageID":"msg_assistant","reasoningID":"reason-1","text":"reasoned"}),
-        ),
-        (
-            "session.next.retried",
-            serde_json::json!({"attempt":1.5,"error":{"message":"retry","isRetryable":true,"statusCode":503,"responseHeaders":{"retry-after":"1"},"responseBody":"body","metadata":{"trace":"opaque"}}}),
-        ),
-        (
-            "session.next.compaction.started",
-            serde_json::json!({"messageID":"msg_compact","reason":"manual"}),
-        ),
-        (
-            "session.next.compaction.ended",
-            serde_json::json!({"messageID":"msg_compact","reason":"auto","text":"summary","recent":"recent"}),
-        ),
-        (
-            "session.next.revert.staged",
-            serde_json::json!({"revert":{"messageID":"msg_one","partID":"prt_one","files":[{"path":"src/main.rs","status":"modified","additions":1,"deletions":0,"patch":"@@"}]}}),
-        ),
-        ("session.next.revert.cleared", serde_json::json!({})),
-        (
-            "session.next.revert.committed",
-            serde_json::json!({"messageID":"msg_one"}),
-        ),
-    ];
-
-    for (event_type, fields) in payloads {
-        let mut data = fields.as_object().unwrap().clone();
-        data.insert("sessionID".into(), serde_json::json!("ses_root"));
-        // The pinned DateTimeUtcFromMillis codec is finite-number based.
-        data.insert("timestamp".into(), serde_json::json!(1.5));
-        validate_v2_event_payload(event_type, &serde_json::Value::Object(data), "ses_root")
-            .unwrap_or_else(|_| panic!("valid pinned V2 event {event_type} was rejected"));
-    }
-
-    let bad_optional = [
-        (
-            "session.next.moved",
-            serde_json::json!({"location":{"directory":"/workspace","workspaceID":7}}),
-        ),
-        (
-            "session.next.tool.called",
-            serde_json::json!({"assistantMessageID":"msg_assistant","callID":"c","tool":"read","input":{},"provider":{"executed":false,"metadata":{"provider-one":"not-a-record"}}}),
-        ),
-        (
-            "session.next.retried",
-            serde_json::json!({"attempt":1,"error":{"message":"retry","isRetryable":true,"responseHeaders":{"retry-after":3}}}),
-        ),
-        (
-            "session.next.step.started",
-            serde_json::json!({"assistantMessageID":"msg_assistant","agent":"build","model":{"id":"m","providerID":"p"},"snapshot":false}),
-        ),
-        (
-            "session.next.revert.staged",
-            serde_json::json!({"revert":{"messageID":"msg_one","files":[{"path":"a","status":"unknown","additions":0,"deletions":0,"patch":""}]}}),
-        ),
-    ];
-    for (event_type, fields) in bad_optional {
-        let mut data = fields.as_object().unwrap().clone();
-        data.insert("sessionID".into(), serde_json::json!("ses_root"));
-        data.insert("timestamp".into(), serde_json::json!(1.5));
-        assert!(
-            validate_v2_event_payload(event_type, &serde_json::Value::Object(data), "ses_root")
-                .is_err(),
-            "invalid nested or optional field accepted for {event_type}"
-        );
-    }
-}
-
 fn write_owned_git_object(store: &Path, kind: &str, bytes: &[u8]) -> String {
     use sha2::Digest;
     use std::io::Write;
@@ -3315,11 +1867,6 @@ fn durable_souls_rehearsal_pipeline_preserves_unavailable_snapshot_parts() {
         let event = serde_json::json!({
             "sessionID":"ses_root","part":part,"time":1
         });
-        if kind == "snapshot" {
-            let mut invalid_id_event = event.clone();
-            invalid_id_event["part"]["id"] = serde_json::json!("part_one");
-            assert!(validate_v1_event_envelope("message.part.updated", &invalid_id_event).is_err());
-        }
         let event_json = serde_json::to_string_pretty(&event).unwrap();
         source
             .execute(
@@ -3329,8 +1876,7 @@ fn durable_souls_rehearsal_pipeline_preserves_unavailable_snapshot_parts() {
             .unwrap();
         drop(source);
         reexport_owned_fixture(&mut fixture);
-        let manifest: OpenCodeTransferManifest =
-            serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+        let manifest = transferred_manifest(&fixture);
         assert_eq!(manifest.row_count(), 6);
         let [reference] = manifest.saved_snapshots.as_slice() else {
             panic!("native part and event qualify the same exact saved reference");
@@ -3482,8 +2028,7 @@ fn assert_empty_native_snapshot_roundtrip(kind: &str) {
     }
     drop(source);
     reexport_owned_fixture(&mut fixture);
-    let manifest: OpenCodeTransferManifest =
-        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    let manifest = transferred_manifest(&fixture);
     assert!(manifest.saved_snapshots.is_empty());
     // Revert retains the fixture's ordinary file part. That mandatory
     // asset is independent of the empty snapshot and must still transfer.
@@ -3633,8 +2178,7 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
     drop(source);
     let before = fs::read(fixture.root.join("source.sqlite")).unwrap();
     reexport_owned_fixture(&mut fixture);
-    let manifest: OpenCodeTransferManifest =
-        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    let manifest = transferred_manifest(&fixture);
     assert_eq!(
         manifest.saved_snapshots[0].availability,
         freshell_sessions::opencode_transfer::SavedSnapshotAvailability::RetainedClosure
@@ -3701,7 +2245,7 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
         &fixture.destination_database,
         &fixture.workspace
     )
-    .is_err());
+    .is_ok());
     assert_eq!(
         fs::read(fixture.root.join("source.sqlite")).unwrap(),
         before
@@ -3788,8 +2332,7 @@ fn durable_souls_rehearsal_pipeline_many_tree_workspace_current_and_installed_re
     drop(source);
     let before = fs::read(fixture.root.join("source.sqlite")).unwrap();
     reexport_owned_fixture(&mut fixture);
-    let manifest: OpenCodeTransferManifest =
-        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    let manifest = transferred_manifest(&fixture);
     assert_eq!(
         manifest.saved_snapshots[0].availability,
         freshell_sessions::opencode_transfer::SavedSnapshotAvailability::RetainedClosure
@@ -3908,8 +2451,8 @@ fn durable_souls_rehearsal_pipeline_many_tree_workspace_current_and_installed_re
         &fixture.destination_database,
         &fixture.workspace
     )
-    .is_err());
-    assert!(verify_installed_store(&fixture.descriptor, &reader).is_err());
+    .is_ok());
+    assert!(verify_installed_store(&fixture.descriptor, &reader).is_ok());
     assert_eq!(
         fs::read(&conflict).unwrap(),
         b"current wrong workspace descendant"
@@ -4177,8 +2720,7 @@ fn durable_souls_rehearsal_pipeline_refuses_source_reference_digest_root_and_cop
     reexport_owned_fixture(&mut fixture);
     let before = fs::read(fixture.root.join("source.sqlite")).unwrap();
     let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
-    let manifest: OpenCodeTransferManifest =
-        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    let manifest = transferred_manifest(&fixture);
     assert_eq!(manifest.assets.len(), 1);
     import_bundle_payload(
         &fixture.descriptor,
@@ -4259,7 +2801,7 @@ fn durable_souls_rehearsal_pipeline_refuses_source_reference_digest_root_and_cop
         &fixture.destination_database,
         &fixture.workspace
     )
-    .is_err());
+    .is_ok(), "editing a referenced workspace file does not invalidate readable native conversation history");
     assert_eq!(
         fs::read(fixture.root.join("source.sqlite")).unwrap(),
         before

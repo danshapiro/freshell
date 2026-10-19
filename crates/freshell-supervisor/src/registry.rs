@@ -1776,12 +1776,14 @@ impl Registry {
                 params![source_store_id, root_session_id, source_generation, soul_id.as_str()],
                 |row| row.get(0),
             )?;
-            let completed_repair: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM stopped_repair_root_receipts r JOIN stopped_repair_operations o ON o.operation_id=r.operation_id WHERE o.status='complete' AND r.canonical_soul_id=?1 AND r.root_session_id=?2)",
-                params![soul_id.as_str(), root_session_id],
+            // Native publication commits before diagnostic withdrawal. A
+            // malformed old log must not keep a verified repaired root stopped.
+            let applied_repair: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stopped_repair_root_receipts r JOIN stopped_repair_operations o ON o.operation_id=r.operation_id WHERE o.status IN ('withdraw_pending','complete') AND r.status='verified' AND r.canonical_soul_id=?1 AND r.root_session_id=?2 AND r.source_store_id=?3 AND r.source_generation=?4)",
+                params![soul_id.as_str(), root_session_id, source_store_id, source_generation],
                 |row| row.get(0),
             )?;
-            if !canonical_owner || !completed_repair {
+            if !canonical_owner || !applied_repair {
                 return Err(RegistryError::RecoveryBlocked {
                     soul_id,
                     reason: "DATA_REPAIR_RECEIPT_MISSING".into(),
@@ -2342,7 +2344,7 @@ impl Registry {
                 .transpose().map_err(|_| RegistryError::Integrity("invalid terminal launch spec".into()))?;
             match (&fresh_spec, &terminal_spec) {
                 (Some(spec), _) if spec.native_session_id.as_deref() == Some(expected_parent.as_str()) => {},
-                (None, Some(spec)) if provider == "opencode" && spec.mode == "opencode" => {},
+                (None, Some(spec)) if matches!(provider.as_str(), "claude" | "opencode") && spec.mode == provider => {},
                 _ => return Err(RegistryError::NativeIdentityConflict),
             }
             let conflicting: Option<String> = tx.query_row(
@@ -9019,6 +9021,134 @@ pub(crate) mod tests {
             )
             .unwrap()["recoveryDisabled"],
             true
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_claude_clear_persists_new_root_and_retires_parent_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let original = materialize_test_runtime(&registry, soul.clone()).await;
+        let parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"clear-terminal", "streamId":"clear-stream", "mode":"claude", "program":"claude",
+            "cwd":"/workspace", "workspacePath":"/workspace", "projectKey":"clear",
+            "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "resumeSessionId":parent,
+            "env":{"HOME":"/home/freshell/provider"}
+        })).unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='claude' WHERE soul_id=?1",
+            params![soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::to_string(&terminal).unwrap(),
+                original.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        registry
+            .record_native_session(soul.clone(), original.incarnation_id.clone(), parent.into())
+            .await
+            .unwrap();
+        let before = registry.recovery_context(soul.clone()).await.unwrap();
+        let binding = registry
+            .bind_native_identity_launch(freshell_runtime_protocol::NativeIdentityLaunch {
+                incarnation_id: original.incarnation_id.clone(),
+                launch_nonce: before.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: before.evidence_revision,
+                execution_generation: 0,
+                requested_native_session_id: Some(parent.into()),
+            })
+            .await
+            .unwrap();
+        conn.execute("UPDATE souls SET resume_spec='{}',checkpoint_revision=4,durability_state='checkpoint_captured',allocation_state='verified_durable' WHERE soul_id=?1",params![soul.as_str()]).unwrap();
+        crate::service::record_terminal_identity_observation(&registry, &before, child)
+            .await
+            .expect("qualified clear should reuse the atomic terminal reroot");
+        assert!(
+            crate::service::record_terminal_identity_observation(&registry, &before, parent)
+                .await
+                .is_err(),
+            "an older output read cannot restore the retired root"
+        );
+        let current = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(current.native_session_id.as_deref(), Some(child));
+        assert_eq!(
+            current.resume_spec, None,
+            "parent resume proof must be rebuilt from the new root"
+        );
+        assert_eq!(current.checkpoint_revision, 0);
+        let observed = freshell_runtime_protocol::NativeIdentityObservation {
+            native_session_id: child.into(),
+            incarnation_id: original.incarnation_id.clone(),
+            launch_nonce: binding.launch_nonce.clone(),
+            evidence_revision: binding.evidence_revision,
+            source: freshell_runtime_protocol::NativeIdentitySource::ClaudeNativeClear,
+            evidence_digest: "a".repeat(64),
+        };
+        registry
+            .record_native_identity_observation(
+                soul.clone(),
+                observed.clone(),
+                current.write_fence(),
+            )
+            .await
+            .expect("the same live launch can qualify its cleared root");
+        let mut foreign = observed.clone();
+        foreign.launch_nonce = "another-launch".into();
+        assert!(registry
+            .record_native_identity_observation(soul.clone(), foreign, current.write_fence())
+            .await
+            .is_err());
+        let mut retired = observed;
+        retired.native_session_id = parent.into();
+        assert!(registry
+            .record_native_identity_observation(soul.clone(), retired, current.write_fence())
+            .await
+            .is_err());
+        let roots: Vec<String> = conn
+            .prepare("SELECT native_session_id FROM writer_claims WHERE soul_id=?1")
+            .unwrap()
+            .query_map(params![soul.as_str()], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(roots, vec![child.to_string()]);
+        drop(conn);
+        drop(registry);
+        let reopened = Registry::open(dir.path(), None).unwrap();
+        let current = reopened.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(
+            current.native_session_id.as_deref(),
+            Some(child),
+            "a restarted supervisor must recover the new root"
+        );
+        let candidate = crate::resume_catalog::exact_resume_candidate(&current, None)
+            .unwrap()
+            .unwrap();
+        let replacement =
+            freshell_agent_runtime::prepare_terminal_for_resume(&terminal, &candidate).unwrap();
+        assert_eq!(replacement.resume_session_id.as_deref(), Some(child));
+        assert!(
+            replacement
+                .args
+                .windows(2)
+                .any(|args| args == ["--resume", child]),
+            "the actual replacement adapter must resume the persisted cleared root"
+        );
+        let pending = current.clone();
+        reopened.begin_stop(soul.clone()).await.unwrap();
+        assert!(
+            crate::service::record_terminal_identity_observation(&reopened, &pending, parent)
+                .await
+                .is_err(),
+            "a late clear observation cannot override Stop"
         );
     }
 

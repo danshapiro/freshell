@@ -4636,7 +4636,7 @@ pub(crate) async fn record_terminal_identity_observation(
         .as_deref()
         .filter(|prior| *prior != native_session_id)
     {
-        if context.provider != "opencode" {
+        if !matches!(context.provider.as_str(), "claude" | "opencode") {
             return Err(map_registry(RegistryError::NativeIdentityConflict));
         }
         registry

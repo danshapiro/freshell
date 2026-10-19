@@ -121,25 +121,251 @@ struct ClaudeRollbackTranscript {
     modified_ms: Option<i64>,
 }
 
-fn managed_transcript_identity() -> Result<Option<(u32, u32)>, String> {
-    match (
-        std::env::var("FRESHELL_PROVIDER_RUN_AS_UID").ok(),
-        std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok(),
-    ) {
-        (None, None) => Ok(None),
-        (Some(uid), Some(gid)) => {
-            let identity = (
-                uid.parse().map_err(|_| "invalid managed provider uid")?,
-                gid.parse().map_err(|_| "invalid managed provider gid")?,
-            );
-            #[cfg(unix)]
-            if identity == (unsafe { libc::geteuid() }, unsafe { libc::getegid() }) {
-                return Ok(None);
-            }
-            Ok(Some(identity))
-        }
-        _ => Err("incomplete managed provider identity".into()),
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClaudeRollbackSource {
+    path: PathBuf,
+    cwd: Option<String>,
+    sha256: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClaudeRollbackResolution {
+    resume_from: String,
+    resume_at_uuid: Option<String>,
+    removed_turns: Vec<Value>,
+    prompt_text: String,
+    chain_root: String,
+    original_tip_uuid: Option<String>,
+    can_redo_after: bool,
+    guard_uuid: Option<String>,
+}
+
+type ClaudeRollbackFailure = (String, String);
+
+// Native chain operations stay next to the transcript. Only their anchors and
+// retained display results cross the existing provider-UID worker boundary.
+fn read_claude_operation_transcript(
+    request: &Value,
+) -> Result<Option<ClaudeRollbackTranscript>, String> {
+    let session_id = request["sessionId"]
+        .as_str()
+        .ok_or("invalid Claude history identity")?;
+    let transcript =
+        read_claude_transcript_local(session_id, request["allowRemoved"] == true, false)?;
+    if transcript.is_some() || request["fork"].is_null() {
+        return Ok(transcript);
     }
+    let recipe: freshell_agent_runtime::ClaudeForkRecipe =
+        serde_json::from_value(request["fork"].clone())
+            .map_err(|_| "invalid Claude fork recipe")?;
+    recipe.validate(session_id)?;
+    let home = std::env::var("HOME").map_err(|_| "managed provider HOME unavailable")?;
+    let parent = freshell_agent_runtime::read_verified_claude_fork_parent(
+        std::path::Path::new(&home),
+        &recipe,
+    )?;
+    let path = PathBuf::from(home).join(&recipe.parent_transcript);
+    let cwd = crate::claude_snapshot::transcript_cwd(&path)
+        .filter(|cwd| std::path::Path::new(cwd).is_dir());
+    let modified_ms = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as i64);
+    let cutoff = match &recipe.target {
+        freshell_agent_runtime::ClaudeForkTarget::Prefix { cutoff_uuid, .. } => {
+            Some(cutoff_uuid.as_str())
+        }
+        freshell_agent_runtime::ClaudeForkTarget::Empty => None,
+    };
+    Ok(Some(ClaudeRollbackTranscript {
+        path,
+        cwd,
+        modified_ms,
+        content: crate::claude_snapshot::fork_prefix(&parent, cutoff)?,
+    }))
+}
+
+fn read_claude_rollback_source(request: &Value) -> Result<Option<ClaudeRollbackSource>, String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let session_id = request["sessionId"]
+        .as_str()
+        .ok_or("invalid Claude history identity")?;
+    let path = if let Some(path) = crate::claude_snapshot::locate_transcript(session_id) {
+        path
+    } else if !request["fork"].is_null() {
+        let recipe: freshell_agent_runtime::ClaudeForkRecipe =
+            serde_json::from_value(request["fork"].clone())
+                .map_err(|_| "invalid Claude fork recipe")?;
+        let home = std::env::var("HOME").map_err(|_| "managed provider HOME unavailable")?;
+        freshell_agent_runtime::read_verified_claude_fork_parent(
+            std::path::Path::new(&home),
+            &recipe,
+        )?;
+        PathBuf::from(home).join(&recipe.parent_transcript)
+    } else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    let mut reader = (&file).take(before.len().saturating_add(1));
+    let mut hash = sha2::Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut bytes = 0;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        hash.update(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(|error| error.to_string())?;
+    let current = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+    if !before.is_file()
+        || bytes != before.len()
+        || after.len() != before.len()
+        || before.modified().ok() != after.modified().ok()
+        || current.len() != after.len()
+        || current.modified().ok() != after.modified().ok()
+    {
+        return Err("Claude fork source changed during read".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != current.dev() || before.ino() != current.ino() {
+            return Err("Claude fork source changed during read".into());
+        }
+    }
+    let cwd = crate::claude_snapshot::transcript_cwd(&path)
+        .filter(|cwd| std::path::Path::new(cwd).is_dir());
+    Ok(Some(ClaudeRollbackSource {
+        path,
+        cwd,
+        sha256: format!("{:x}", hash.finalize()),
+    }))
+}
+
+fn resolve_claude_rollback(
+    request: &Value,
+) -> Result<ClaudeRollbackResolution, ClaudeRollbackFailure> {
+    use crate::claude_snapshot as snap;
+    use crate::rollback_record::*;
+    let failure = |code: &str, message: &str| (code.to_owned(), message.to_owned());
+    let session_id = request["sessionId"]
+        .as_str()
+        .ok_or_else(|| failure("INTERNAL_ERROR", "invalid Claude history identity"))?;
+    let record: Option<RollbackRecord> = serde_json::from_value(request["rollback"].clone())
+        .map_err(|_| failure("INTERNAL_ERROR", "invalid Claude rollback record"))?;
+    let read = |read_request: &Value| {
+        read_claude_operation_transcript(read_request)
+            .map_err(|message| failure("INTERNAL_ERROR", &message))
+    };
+    let to_turn = request["toTurn"].as_str();
+    let mut resolution = if request["redo"] != true {
+        let current =
+            read(request)?.ok_or_else(|| failure("NOTHING_TO_UNDO", UNDO_EMPTY_MESSAGE))?;
+        let target = to_turn.map_or(snap::ResumeTarget::Step, |id| {
+            snap::ResumeTarget::ToTurn(id.to_owned())
+        });
+        let point =
+            snap::resolve_resume_point(&current.content, session_id, target).map_err(|error| {
+                match error {
+                    snap::ResumeResolveError::Empty => {
+                        failure("NOTHING_TO_UNDO", UNDO_EMPTY_MESSAGE)
+                    }
+                    _ => failure(
+                        "INVALID_ROLLBACK_TARGET",
+                        &format!("turn {:?} is not in this conversation", to_turn),
+                    ),
+                }
+            })?;
+        let chain_root = record
+            .as_ref()
+            .filter(|record| !record.redo_destroyed)
+            .and_then(|record| record.original_session_id.clone())
+            .unwrap_or_else(|| session_id.to_owned());
+        let original_tip_uuid = if chain_root == session_id {
+            snap::raw_chain_tip(&current.content)
+        } else {
+            let root = read(&json!({"sessionId":chain_root}))?
+                .ok_or_else(|| failure("INTERNAL_ERROR", "chain-root transcript unreadable"))?;
+            snap::raw_chain_tip(&root.content)
+        };
+        ClaudeRollbackResolution {
+            resume_from: session_id.to_owned(),
+            resume_at_uuid: point.resume_at_uuid,
+            removed_turns: point.removed_turns,
+            prompt_text: point.prompt_text,
+            chain_root,
+            original_tip_uuid,
+            can_redo_after: true,
+            guard_uuid: point.guard_uuid,
+        }
+    } else {
+        let record = record.ok_or_else(|| failure("REDO_UNAVAILABLE", REDO_EMPTY_MESSAGE))?;
+        if record.redo_destroyed {
+            return Err(failure("REDO_UNAVAILABLE", REDO_DESTROYED_MESSAGE));
+        }
+        let original_id = record
+            .original_session_id
+            .as_deref()
+            .ok_or_else(|| failure("REDO_UNAVAILABLE", REDO_EMPTY_MESSAGE))?;
+        let original = read(&json!({"sessionId":original_id}))?
+            .ok_or_else(|| failure("REDO_UNAVAILABLE", REDO_REMOVED_HISTORY_COPY))?;
+        let current = read(request)?
+            .ok_or_else(|| failure("INTERNAL_ERROR", "current transcript missing"))?;
+        let original_tip = snap::raw_chain_tip(&original.content);
+        if original_tip != record.original_tip_uuid
+            || snap::raw_lcp_end(&current.content, &original.content)
+                != snap::raw_chain_tip(&current.content)
+        {
+            return Err(failure("REDO_UNAVAILABLE", REDO_REMOVED_HISTORY_COPY));
+        }
+        let op = RollbackRequest {
+            direction: RollbackDirection::Redo,
+            mode: if to_turn.is_some() {
+                RollbackModeReq::ToTurn
+            } else {
+                RollbackModeReq::Step
+            },
+            turn_id: to_turn.map(str::to_owned),
+            session_id: session_id.to_owned(),
+            session_type: SessionType::Freshclaude,
+            provider: freshell_protocol::AgentProvider::Claude,
+            request_id: String::new(),
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        };
+        let resume_at = snap::redo_resume_target(&original.content, &current.content, &op)
+            .map_err(|message| failure("INVALID_ROLLBACK_TARGET", &message))?
+            .ok_or_else(|| failure("REDO_UNAVAILABLE", REDO_EMPTY_MESSAGE))?;
+        let restored = snap::restored_slice_turns(&original.content, &current.content, &resume_at);
+        let guard_uuid = snap::raw_chain_successor(&original.content, &resume_at);
+        let can_redo_after = original_tip.as_deref() != Some(resume_at.as_str());
+        ClaudeRollbackResolution {
+            resume_from: original_id.to_owned(),
+            resume_at_uuid: Some(resume_at),
+            removed_turns: restored.turns,
+            prompt_text: restored.prompt_text,
+            chain_root: original_id.to_owned(),
+            original_tip_uuid: record.original_tip_uuid,
+            can_redo_after,
+            guard_uuid,
+        }
+    };
+    let mut display = json!({"turns":std::mem::take(&mut resolution.removed_turns)});
+    crate::native_history::retain_snapshot_display("claude", &mut display);
+    resolution.removed_turns = display["turns"]
+        .as_array_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    Ok(resolution)
 }
 
 fn read_claude_transcript_local(
@@ -192,11 +418,12 @@ fn read_claude_transcript_local(
     }))
 }
 
+#[cfg(test)]
 async fn read_claude_rollback_transcript(
     session_id: &str,
     allow_removed: bool,
 ) -> Result<Option<ClaudeRollbackTranscript>, String> {
-    if managed_transcript_identity()?.is_some() {
+    if crate::native_history::managed_provider_identity()?.is_some() {
         let value = managed_claude_history_read(json!({
             "kind":"transcript", "sessionId":session_id, "allowRemoved":allow_removed,
         }))
@@ -210,7 +437,8 @@ async fn read_claude_rollback_transcript(
 
 async fn managed_claude_history_read(request: Value) -> Result<Value, String> {
     use tokio::io::AsyncReadExt;
-    let (uid, gid) = managed_transcript_identity()?.ok_or("managed provider identity is absent")?;
+    let (uid, gid) = crate::native_history::managed_provider_identity()?
+        .ok_or("managed provider identity is absent")?;
     let mut command = tokio::process::Command::new("/usr/bin/setpriv");
     command
         .args([
@@ -291,8 +519,39 @@ fn claude_history_read(request: &Value) -> Result<Value, String> {
             !id.is_empty() && !id.contains(['/', '\\']) && !id.chars().any(char::is_control)
         })
         .ok_or("invalid Claude history identity")?;
-    let mut transcript =
-        read_claude_transcript_local(session_id, request["allowRemoved"] == true, true)?;
+    match request["kind"].as_str() {
+        Some("rollback") => {
+            return serde_json::to_value(resolve_claude_rollback(request))
+                .map_err(|error| error.to_string())
+        }
+        Some("source") => {
+            return serde_json::to_value(read_claude_rollback_source(request)?)
+                .map_err(|error| error.to_string())
+        }
+        _ => {}
+    }
+    if request["kind"] == "snapshot" {
+        if let Some(path) = crate::claude_snapshot::locate_transcript(session_id) {
+            let session_type = request["sessionType"]
+                .as_str()
+                .filter(|kind| matches!(*kind, "freshclaude" | "kilroy"))
+                .ok_or("invalid Claude history session type")?;
+            let rollback: Option<crate::rollback_record::RollbackRecord> =
+                serde_json::from_value(request["rollback"].clone())
+                    .map_err(|_| "invalid Claude rollback record")?;
+            return crate::native_history::read_claude_path(
+                &path,
+                session_id,
+                session_type,
+                rollback.as_ref(),
+            );
+        }
+    }
+    let mut transcript = if request["kind"] == "snapshot" {
+        read_claude_operation_transcript(request)?
+    } else {
+        read_claude_transcript_local(session_id, request["allowRemoved"] == true, true)?
+    };
     if transcript.is_none() && !request["fork"].is_null() {
         let recipe: freshell_agent_runtime::ClaudeForkRecipe =
             serde_json::from_value(request["fork"].clone())
@@ -328,7 +587,7 @@ fn claude_history_read(request: &Value) -> Result<Value, String> {
                 .as_ref()
                 .and_then(|record| record.original_session_id.as_deref())
             {
-                let _ = read_claude_transcript_local(original, false, true)?;
+                let _ = read_claude_rollback_source(&json!({"sessionId":original}))?;
             }
             let session_type = request["sessionType"]
                 .as_str()
@@ -1098,9 +1357,10 @@ impl FreshClaudeState {
                 .map_err(|_| "invalid private Claude rollback state")?;
         }
         if state.recipe.is_some()
-            && read_claude_rollback_transcript(&state.native_session_id, false)
+            && !self
+                .read_managed_history(json!({"kind":"source","sessionId":state.native_session_id}))
                 .await?
-                .is_some()
+                .is_null()
         {
             state.recipe = None;
         }
@@ -1142,13 +1402,30 @@ impl FreshClaudeState {
     }
 
     async fn read_managed_history(&self, request: Value) -> Result<Value, String> {
-        if managed_transcript_identity()?.is_some() {
+        if crate::native_history::managed_provider_identity()?.is_some() {
             managed_claude_history_read(request).await
         } else {
             claude_history_read(&request)
         }
     }
 
+    async fn read_rollback_source(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ClaudeRollbackSource>, String> {
+        let recipe = self
+            .managed_prefix
+            .lock()
+            .await
+            .clone()
+            .filter(|recipe| recipe.child_session_id == session_id);
+        let value = self
+            .read_managed_history(json!({"kind":"source","sessionId":session_id,"fork":recipe}))
+            .await?;
+        serde_json::from_value(value).map_err(|_| "invalid managed Claude source metadata".into())
+    }
+
+    #[cfg(test)]
     async fn read_current_rollback_transcript(
         &self,
         session_id: &str,
@@ -5677,28 +5954,29 @@ impl FreshClaudeState {
             .await
             .clone()
             .filter(|recipe| recipe.child_session_id == thread_id);
-        let mut snapshot = if managed_transcript_identity()?.is_some() || fork.is_some() {
-            self.read_managed_history(json!({
-                "kind":"snapshot", "sessionType":session_type_str(session_type),
-                "sessionId":thread_id, "rollback":rollback, "fork":fork,
-            }))
-            .await?
-        } else {
-            crate::claude_snapshot::get_claude_snapshot(
-                session_type_str(session_type),
-                thread_id,
-                rollback.as_ref(),
-            )
-            .await
-            .map_err(|error| match error {
-                crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
-                    "claude session not found".to_string()
-                }
-                crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
-                    "claude snapshot unavailable".to_string()
-                }
-            })?
-        };
+        let mut snapshot =
+            if crate::native_history::managed_provider_identity()?.is_some() || fork.is_some() {
+                self.read_managed_history(json!({
+                    "kind":"snapshot", "sessionType":session_type_str(session_type),
+                    "sessionId":thread_id, "rollback":rollback, "fork":fork,
+                }))
+                .await?
+            } else {
+                crate::claude_snapshot::get_claude_snapshot(
+                    session_type_str(session_type),
+                    thread_id,
+                    rollback.as_ref(),
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                        "claude session not found".to_string()
+                    }
+                    crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
+                        "claude snapshot unavailable".to_string()
+                    }
+                })?
+            };
         let (approvals, questions) = self.snapshot_pending_overlay(thread_id).await;
         crate::claude_snapshot::apply_pending_overlay(&mut snapshot, approvals, questions);
         self.apply_snapshot_metadata(thread_id, &mut snapshot).await;
@@ -5989,7 +6267,6 @@ impl FreshClaudeState {
         reply_sink: freshell_terminal::FrameSink,
         native_launch: Option<Value>,
     ) {
-        use crate::claude_snapshot as snap;
         use crate::rollback_record::*;
 
         let Some(map_key) = self.resolve_session_key(&op.session_id).await else {
@@ -6366,7 +6643,39 @@ impl FreshClaudeState {
         let now = now_ms();
         let existing = self.load_rollback_record(&durable_id).await;
 
-        let (
+        let recipe = self
+            .managed_prefix
+            .lock()
+            .await
+            .clone()
+            .filter(|recipe| recipe.child_session_id == durable_id);
+        let rollback_basis = existing.as_ref().map(|record| {
+            let mut record = record.clone();
+            record.entries.clear();
+            record
+        });
+        let result = self
+            .read_managed_history(json!({"kind":"rollback","sessionId":durable_id,
+            "redo":matches!(op.direction, RollbackDirection::Redo),
+            "allowRemoved":matches!(op.direction, RollbackDirection::Redo),
+            "toTurn":if matches!(op.mode, RollbackModeReq::ToTurn) {op.turn_id.clone()} else {None},
+            "rollback":rollback_basis,"fork":recipe}))
+            .await;
+        let resolution = match result.and_then(|value| {
+            serde_json::from_value::<Result<ClaudeRollbackResolution, ClaudeRollbackFailure>>(value)
+                .map_err(|_| "invalid managed Claude rollback response".into())
+        }) {
+            Ok(Ok(resolution)) => resolution,
+            Ok(Err((code, message))) => {
+                reply_sink(rollback_error_frame(&op, &code, &message));
+                return;
+            }
+            Err(message) => {
+                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &message));
+                return;
+            }
+        };
+        let ClaudeRollbackResolution {
             resume_from,
             resume_at_uuid,
             removed_turns,
@@ -6375,227 +6684,7 @@ impl FreshClaudeState {
             original_tip_uuid,
             can_redo_after,
             guard_uuid,
-        ) = match op.direction {
-            RollbackDirection::Undo => {
-                let text = match self
-                    .read_current_rollback_transcript(&durable_id, false)
-                    .await
-                {
-                    Ok(Some(transcript)) => transcript.content,
-                    Ok(None) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e));
-                        return;
-                    }
-                };
-                let target = match op.mode {
-                    RollbackModeReq::Step => snap::ResumeTarget::Step,
-                    RollbackModeReq::ToTurn => {
-                        snap::ResumeTarget::ToTurn(op.turn_id.clone().expect("validated"))
-                    }
-                };
-                let point = match snap::resolve_resume_point(&text, &durable_id, target) {
-                    Ok(p) => p, // resume_at_uuid None = "before the first message" — LEGAL (r2)
-                    Err(snap::ResumeResolveError::Empty) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(_) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "INVALID_ROLLBACK_TARGET",
-                            &format!("turn {:?} is not in this conversation", op.turn_id),
-                        ));
-                        return;
-                    }
-                };
-                // Epoch rule (r2/r3): an undo landing while redo_destroyed is set
-                // re-roots the chain to the CURRENT durable id — the retained old
-                // original describes a branch a resend already permanently
-                // replaced; O's redo stays permanently dead.
-                let chain_root = existing
-                    .as_ref()
-                    .filter(|r| !r.redo_destroyed)
-                    .and_then(|r| r.original_session_id.clone())
-                    .unwrap_or_else(|| durable_id.clone());
-                // Tip anchor at UNDO time = the last raw-chain uuid of the
-                // CHAIN-ROOT transcript (at the first undo the current file IS the root).
-                let root_text = if chain_root == durable_id {
-                    text.clone()
-                } else {
-                    match read_claude_rollback_transcript(&chain_root, false).await {
-                        Ok(Some(transcript)) => transcript.content,
-                        _ => {
-                            reply_sink(rollback_error_frame(
-                                &op,
-                                "INTERNAL_ERROR",
-                                "chain-root transcript unreadable",
-                            ));
-                            return;
-                        }
-                    }
-                };
-                let tip = snap::raw_chain_tip(&root_text);
-                // The resumeDropsTurn guard uuid = the RAW chain entry at the
-                // removed step's first position (task 4 review nit 4 — SDK-exact
-                // + cheaper than the display projection; brief/SDK semantics:
-                // the guard declares the discarded turn's prompt).
-                let guard = point.guard_uuid.clone();
-                // can_redo after the undo: the removed content provably exists in
-                // the original beyond the resume point (on the r2 first-turn leg
-                // the fresh conversation's tip is NONE — strictly beyond holds
-                // whenever a tip exists).
-                (
-                    durable_id.clone(),
-                    point.resume_at_uuid,
-                    point.removed_turns,
-                    point.prompt_text,
-                    chain_root,
-                    tip,
-                    true,
-                    guard,
-                )
-            }
-            RollbackDirection::Redo => {
-                let Some(record) = existing.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                if record.redo_destroyed {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_DESTROYED_MESSAGE,
-                    ));
-                    return;
-                }
-                let Some(original) = record.original_session_id.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                let original_text = match read_claude_rollback_transcript(&original, false).await {
-                    Ok(Some(transcript)) => transcript.content,
-                    Ok(None) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "REDO_UNAVAILABLE",
-                            REDO_REMOVED_HISTORY_COPY,
-                        ));
-                        return;
-                    }
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e));
-                        return;
-                    }
-                };
-                // Task 4 review (Minor-2): classify the read OUTCOME — a missing
-                // file (or a raced deletion) is the DELIBERATE vacuous-empty leg
-                // (the post-first-turn-undo empty transcript; LCP admits the
-                // first group end), but any REAL read error on this
-                // existing-expected path is a loud INTERNAL_ERROR, exactly like
-                // the original's read leg above — never a silent empty-chain
-                // degradation yielding a false `redone` ack plus a pointless fork.
-                let current_text = match self
-                    .read_current_rollback_transcript(&durable_id, true)
-                    .await
-                {
-                    Ok(Some(transcript)) => transcript.content,
-                    Ok(None) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "INTERNAL_ERROR",
-                            "current transcript missing",
-                        ));
-                        return;
-                    }
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e));
-                        return;
-                    }
-                };
-                // Redo validity contract (wire design; LBC-9): the original must
-                // BE the history the undo observed — raw-chain tip == the
-                // recorded tip — AND the current chain must still be a strict
-                // prefix of it (the LCP resolves PAST the current tip). Any
-                // miss => loud REDO_UNAVAILABLE + REDO_REMOVED_HISTORY_COPY;
-                // never silently re-fork over moved history.
-                let original_tip = snap::raw_chain_tip(&original_text);
-                if original_tip != record.original_tip_uuid {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                if snap::raw_lcp_end(&current_text, &original_text)
-                    != snap::raw_chain_tip(&current_text)
-                {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                // The resume point = the LAST raw-chain uuid of the restored
-                // step's group — its assistant tail (r3 boundary rule).
-                let resume_at = match snap::redo_resume_target(&original_text, &current_text, &op) {
-                    Ok(Some(uuid)) => uuid,
-                    Ok(None) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "REDO_UNAVAILABLE",
-                            REDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(msg) => {
-                        reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", &msg));
-                        return;
-                    }
-                };
-                // The ack payload for a redo = the RESTORED slice (display
-                // projection of the original's range just-after-the-prefix
-                // through the resume point).
-                let restored =
-                    snap::restored_slice_turns(&original_text, &current_text, &resume_at);
-                let can_redo_after_redo = original_tip.as_deref() != Some(resume_at.as_str());
-                // The guard = the first ORIGINAL chain entry strictly AFTER the
-                // resume point (`None` — redoing TO the tip — omits it: the
-                // discard range is vacuous, never fabricated).
-                let guard = snap::raw_chain_successor(&original_text, &resume_at);
-                (
-                    original,
-                    Some(resume_at),
-                    restored.turns,
-                    restored.prompt_text,
-                    record.original_session_id.clone().expect("checked above"),
-                    record.original_tip_uuid.clone(),
-                    can_redo_after_redo,
-                    guard,
-                )
-            }
-        };
+        } = resolution;
 
         // Durable record FIRST (durable-BEFORE-mutation): computed from the
         // pre-mutation reads, keyed by the CURRENT durable id, AWAITED before
@@ -6865,11 +6954,7 @@ impl FreshClaudeState {
                 .await
                 .get(&map_key)
                 .map(|session| session.configuration.settings.clone()));
-        let source_transcript = self
-            .read_current_rollback_transcript(&resume_from, false)
-            .await
-            .ok()
-            .flatten();
+        let source_transcript = self.read_rollback_source(&resume_from).await.ok().flatten();
         let source_native_id = source_transcript
             .as_ref()
             .and_then(|source| source.path.file_stem())
@@ -6946,7 +7031,7 @@ impl FreshClaudeState {
         }
 
         let managed_source = if native_launch.is_some() && self.managed_forks {
-            match read_claude_rollback_transcript(&source_native_id, false).await {
+            match self.read_rollback_source(&source_native_id).await {
                 Ok(Some(source)) => Some(source),
                 _ => {
                     reply_sink(rollback_error_frame(
@@ -7013,7 +7098,6 @@ impl FreshClaudeState {
                 }
             }
             let recipe = if let Some(source) = &managed_source {
-                use sha2::Digest;
                 let home = std::env::var("HOME").unwrap_or_default();
                 let relative = source
                     .path
@@ -7043,7 +7127,7 @@ impl FreshClaudeState {
                         .unwrap()
                         .to_string_lossy()
                         .into_owned(),
-                    parent_sha256: format!("{:x}", sha2::Sha256::digest(source.content.as_bytes())),
+                    parent_sha256: source.sha256.clone(),
                     target: match &resume_at_uuid {
                         Some(cutoff) => freshell_agent_runtime::ClaudeForkTarget::Prefix {
                             cutoff_uuid: cutoff.clone(),
@@ -21408,6 +21492,79 @@ rl.on('line', (line) => {
     }
 
     #[tokio::test]
+    async fn live_claude_snapshot_retains_large_native_history_and_pending_controls() {
+        use std::io::Write;
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let prior_config = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let id = "large-live-history";
+        let directory = home.path().join("projects/-large");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{id}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let text = "ordinary large output ".repeat(50_000);
+        for index in 0..34 {
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"assistant","uuid":format!("message-{index}"),
+                "message":{"role":"assistant","content":[{"type":"text","text":text}]}})
+            )
+            .unwrap();
+        }
+        assert!(file.metadata().unwrap().len() > MANAGED_HISTORY_BYTES);
+        let direct = claude_history_read(
+            &json!({"kind":"snapshot", "sessionId":id, "sessionType":"freshclaude", "rollback":null}),
+        );
+        let (state, _rx) = state_with_bus();
+        insert_rollback_fixture_session(&state, "large-live", id).await;
+        {
+            let sessions = state.sessions.lock().await;
+            let live = &sessions["large-live"];
+            *live.last_status.lock().unwrap() = "running".into();
+            fold_pending_frame(
+                &live.pending,
+                &json!({"type":"sdk.permission.request","requestId":"pending-real-request",
+                "nativeRequestId":"native-request","tool":{"name":"Bash","input":{"command":"pwd"}}}),
+            );
+        }
+        let snapshot = state.get_snapshot(SessionType::Freshclaude, id).await;
+        state.teardown_rollback_fork("large-live").await;
+        match prior_config {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let direct = direct.expect("managed display read must stream large transcripts");
+        assert!(
+            serde_json::to_vec(&direct).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot["threadId"], id);
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["capabilities"]["approvals"], true);
+        assert_eq!(
+            snapshot["pendingApprovals"][0]["requestId"],
+            "pending-real-request"
+        );
+        assert_eq!(
+            snapshot["extensions"]["claude"]["statusFromLiveState"],
+            true
+        );
+        assert_eq!(
+            snapshot["turns"].as_array().unwrap().last().unwrap()["turnId"],
+            "message-33"
+        );
+        assert_eq!(
+            snapshot["extensions"]["claude"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_ne!(snapshot["extensions"]["claude"]["ownerKind"], "vacant");
+    }
+
+    #[tokio::test]
     async fn managed_claude_history_worker_reads_native_snapshot_and_rollback_anchors_without_writes(
     ) {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -21469,6 +21626,17 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_parent_backed_undo_redo_preserves_native_anchors_after_reopen() {
+        assert_managed_parent_backed_undo_redo(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_parent_backed_undo_redo_retains_large_history_controls() {
+        assert_managed_parent_backed_undo_redo(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_managed_parent_backed_undo_redo(large_history: bool) {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let _sidecar = FakeClaudeSidecarEnv::install();
         struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -21503,7 +21671,10 @@ rl.on('line', (line) => {
         let anchors: Vec<_> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
         let content: String = (0..4).map(|i| format!("{}\n", json!({"type":if i % 2 == 0 {"user"} else {"assistant"},
             "uuid":anchors[i], "parentUuid":if i == 0 {None} else {Some(&anchors[i-1])}, "sessionId":parent,
-            "cwd":"/tmp", "message":{"role":if i % 2 == 0 {"user"} else {"assistant"},"content":[{"type":"text","text":format!("native turn {i}")}]}}))).collect();
+            "cwd":"/tmp", "message":{"role":if i % 2 == 0 {"user"} else {"assistant"},"content":[{"type":"text","text":if large_history && i % 2 == 1 { "native reply ".repeat(1_500_000) } else { format!("native turn {i}") }}]}}))).collect();
+        if large_history {
+            assert!(content.len() as u64 > MANAGED_HISTORY_BYTES);
+        }
         let project = config.join("projects/-t");
         std::fs::create_dir_all(&project).unwrap();
         let source = project.join(format!("{parent}.jsonl"));
@@ -21539,20 +21710,19 @@ rl.on('line', (line) => {
                 !project.join(format!("{current}.jsonl")).exists(),
                 "controlled native child has no invented transcript"
             );
-            let projected = st
-                .read_current_rollback_transcript(&current, false)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                crate::claude_snapshot::raw_chain_tip(&projected.content),
-                tip.map(|i| anchors[i].clone())
-            );
             let snapshot = st
                 .get_snapshot(SessionType::Freshclaude, &current)
                 .await
                 .unwrap();
             assert_eq!(snapshot["threadId"], current);
+            assert_eq!(
+                snapshot["latestTurnId"],
+                json!(tip.map(|i| anchors[i].clone()))
+            );
+            assert!(
+                serde_json::to_vec(&snapshot).unwrap().len()
+                    < crate::native_history::MAX_HISTORY_BYTES as usize
+            );
             if index == 0 {
                 let durable: freshell_agent_runtime::host_actor::ClaudeForkState =
                     serde_json::from_slice(&serde_json::to_vec(&context).unwrap()).unwrap();

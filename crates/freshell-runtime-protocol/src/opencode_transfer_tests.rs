@@ -92,6 +92,38 @@ fn opencode_session_transfer_descriptor_is_bounded_and_identity_bound() {
 }
 
 #[test]
+fn opencode_control_manifest_uses_streamed_bulk_metadata() {
+    let mut descriptor = descriptor();
+    let mut manifest: serde_json::Value = serde_json::from_str(&descriptor.manifest_json).unwrap();
+    manifest["version"] = serde_json::json!(2);
+    manifest["row_count"] = serde_json::json!(1);
+    manifest["asset_count"] = serde_json::json!(0);
+    manifest["saved_snapshot_summary"] = serde_json::json!({
+        "status":"qualified_references", "retained_closure_count":0,
+        "unavailable_reference_count":0,
+    });
+    manifest.as_object_mut().unwrap().remove("rows");
+    manifest.as_object_mut().unwrap().remove("assets");
+    descriptor.manifest_json = manifest.to_string();
+    descriptor.bundle_sha256 =
+        opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+    descriptor
+        .validate()
+        .expect("the checksummed bulk stream carries the variable row and asset metadata");
+    for field in ["row_count", "asset_count", "saved_snapshot_summary"] {
+        let mut invalid = manifest.clone();
+        invalid.as_object_mut().unwrap().remove(field);
+        descriptor.manifest_json = invalid.to_string();
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        assert!(
+            descriptor.validate().is_err(),
+            "missing {field} must not form a valid transfer descriptor"
+        );
+    }
+}
+
+#[test]
 fn opencode_begin_action_round_trips_descriptor_and_attempt_token() {
     let descriptor = descriptor();
     let wire_value = serde_json::json!({

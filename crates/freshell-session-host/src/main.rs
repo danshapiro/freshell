@@ -553,6 +553,14 @@ async fn run() -> Result<(), String> {
             let result = freshell_agent_runtime::probe_provider_store(Path::new(&spec.provider_home), &spec);
             serde_json::to_writer(std::io::stdout(), &result).map_err(|error| format!("encode native census: {error}"))
         }
+        Some("native-history-only") if args.iter().any(|arg| arg == "--if-large") => {
+            if required_arg(&args[2..], "--provider")? != "codex" { return Err("optional retained display only supports Codex".into()); }
+            let snapshot=freshell_freshagent::native_history::read_large_codex_display(
+                Path::new(&required_arg(&args[2..], "--codex-home")?),
+                &required_arg(&args[2..], "--session-id")?,
+            )?;
+            serde_json::to_writer(std::io::stdout(), &snapshot).map_err(|error| error.to_string())
+        }
         Some("native-history-only") => {
             let snapshot = freshell_freshagent::native_history::read(
                 &required_arg(&args[2..], "--provider")?,
@@ -3726,7 +3734,7 @@ fn validate_import_receipt_binding(
         || receipt.target_build_receipt != descriptor.target_build_receipt
         || receipt.bundle_sha256 != descriptor.bundle_sha256
         || receipt.row_count != manifest.row_count as u64
-        || receipt.asset_count != manifest.assets.len() as u64
+        || receipt.asset_count != manifest.asset_count() as u64
         || !is_lower_hex_64(&receipt.structural_sha256)
     {
         return Err("provider importer receipt does not bind to the transfer".into());

@@ -1514,6 +1514,125 @@ mod native_startup_source_tests {
     }
 
     #[tokio::test]
+    async fn claude_clear_updates_live_identity_and_keeps_input_ready_after_replacement() {
+        use crate::providers::native_identity::{signal_directory, LAUNCH_ENV};
+        use freshell_runtime_protocol::{
+            CommandState, IncarnationId, NativeIdentityLaunch, RequestId,
+        };
+        use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
+
+        let owned = crate::tests::executable_fixture();
+        let controlled = owned.path().join("controlled-claude");
+        std::fs::write(&controlled, "#!/bin/sh\nexec /usr/bin/cat\n").unwrap();
+        std::fs::set_permissions(&controlled, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let original = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let cleared = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let cleared_again = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        for replacement in [false, true] {
+            let incarnation = IncarnationId::new();
+            let current = if replacement { cleared } else { original };
+            let next = if replacement { cleared_again } else { cleared };
+            let binding = NativeIdentityLaunch {
+                incarnation_id: incarnation.clone(),
+                launch_nonce: if replacement {
+                    "replacement"
+                } else {
+                    "initial"
+                }
+                .into(),
+                evidence_revision: 1,
+                execution_generation: 1,
+                requested_native_session_id: Some(current.into()),
+            };
+            // The controlled executable accepts the ordinary CLI flags and
+            // lets the test observe actual PTY input without a model request.
+            let args = if replacement {
+                vec!["--resume", current]
+            } else {
+                vec![]
+            };
+            let launch = serde_json::from_value(serde_json::json!({
+                "terminalId":"clear-terminal", "streamId":"clear-stream", "mode":"claude",
+                "program":controlled, "args":args, "cwd":owned.path(), "workspacePath":owned.path(),
+                "projectKey":"clear", "cols":80, "rows":24,
+                "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+                "env":{"HOME":owned.path(),"PATH":"/usr/bin:/bin"}
+            }))
+            .unwrap();
+            let mut pty = super::HostedPty::spawn(
+                &owned.path().join(&binding.launch_nonce),
+                incarnation.clone(),
+                &launch,
+                BTreeMap::from([(LAUNCH_ENV.into(), serde_json::to_string(&binding).unwrap())]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let signals = signal_directory(owned.path(), &binding).unwrap();
+            let source = if replacement { "resume" } else { "startup" };
+            publish_claude(owned.path(), &signals, &binding, current, source);
+            let initial_input = pty.write_input(&RequestId::new(), "initial input\n");
+            let mut foreign = binding.clone();
+            foreign.launch_nonce = "another-process".into();
+            publish_claude(owned.path(), &signals, &foreign, next, "clear");
+            let foreign_input = pty.write_input(&RequestId::new(), "foreign input\n");
+            publish_claude(owned.path(), &signals, &binding, next, source);
+            let unrelated_input = pty.write_input(&RequestId::new(), "unrelated input\n");
+            publish_claude(owned.path(), &signals, &binding, next, "clear");
+            let observed = pty.native_identity_observation();
+            let next_input = pty.write_input(&RequestId::new(), "input after clear\n");
+            publish_claude(owned.path(), &signals, &binding, next, "compact");
+            let compact_input = pty.write_input(&RequestId::new(), "input after compact\n");
+            let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let output = pty
+                        .read_output(incarnation.clone(), 0, 65_536, None)
+                        .unwrap();
+                    let text = output
+                        .frames
+                        .iter()
+                        .map(|frame| frame.data.as_str())
+                        .collect::<String>();
+                    if text.contains("input after compact") {
+                        break (output, text);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            pty.stop().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !pty.exited() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(initial_input.unwrap(), CommandState::Completed);
+            assert!(
+                foreign_input.is_err(),
+                "a clear from another launch cannot route input"
+            );
+            assert!(
+                unrelated_input.is_err(),
+                "a different root without a clear is not a transition"
+            );
+            let observed = observed.expect("clear must qualify the current root");
+            assert_eq!(observed.native_session_id, next);
+            assert!(observed.matches_launch(&binding));
+            assert_eq!(next_input.unwrap(), CommandState::Completed);
+            assert_eq!(compact_input.unwrap(), CommandState::Completed);
+            let (output, text) = output.expect("actual accepted input reaches the controlled PTY");
+            assert_eq!(output.native_session_id.as_deref(), Some(next));
+            assert!(text.contains("initial input") && text.contains("input after clear"));
+            assert!(!text.contains("foreign input") && !text.contains("unrelated input"));
+        }
+    }
+
+    #[tokio::test]
     async fn native_output_reads_current_producer_without_legacy_cache_fallback() {
         use crate::providers::native_identity::{signal_directory, LAUNCH_ENV};
         let owned = tempfile::tempdir().unwrap();

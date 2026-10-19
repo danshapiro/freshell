@@ -3611,6 +3611,8 @@ pub enum NativeIdentitySource {
     CodexAppServer,
     OpencodeTui,
     ClaudeNativeEvent,
+    /// The same CLI selected a new session through its native /clear command.
+    ClaudeNativeClear,
     AmplifierNativeLoadedContext,
     FreshProviderHandshake,
 }
@@ -3645,6 +3647,7 @@ impl NativeIdentityObservation {
         matches!(
             (provider, &self.source),
             ("claude", NativeIdentitySource::ClaudeNativeEvent)
+                | ("claude", NativeIdentitySource::ClaudeNativeClear)
                 | ("codex", NativeIdentitySource::CodexAppServer)
                 | ("opencode", NativeIdentitySource::OpencodeTui)
                 | (
@@ -3661,10 +3664,13 @@ impl NativeIdentityObservation {
             && !self.launch_nonce.is_empty()
             && self.launch_nonce == launch.launch_nonce
             && self.evidence_revision == launch.evidence_revision
-            && launch
-                .requested_native_session_id
-                .as_deref()
-                .is_none_or(|root| root == self.native_session_id)
+            // A native clear replaces the root within this same launched CLI.
+            // Other loader observations must still acknowledge the requested root.
+            && (self.source == NativeIdentitySource::ClaudeNativeClear
+                || launch
+                    .requested_native_session_id
+                    .as_deref()
+                    .is_none_or(|root| root == self.native_session_id))
             && self.evidence_digest.len() == 64
             && self
                 .evidence_digest
@@ -3863,7 +3869,10 @@ impl OpenCodeTransferDescriptor {
                 .get("migration_journal_fingerprint")
                 .and_then(serde_json::Value::as_str)
                 != Some(self.migration_journal_fingerprint.as_str())
-            || manifest.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || !matches!(
+                manifest.get("version").and_then(serde_json::Value::as_u64),
+                Some(1 | 2)
+            )
             || manifest
                 .get("payload_bytes")
                 .and_then(serde_json::Value::as_u64)
@@ -3876,10 +3885,33 @@ impl OpenCodeTransferDescriptor {
             return Err(invalid());
         }
 
-        let assets = manifest
-            .get("assets")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(invalid)?;
+        // New transfers put variable row/asset/snapshot metadata in the
+        // existing checksummed bulk stream. Control messages stay bounded as
+        // a conversation grows. Legacy descriptors retain their old arrays.
+        let assets: &[serde_json::Value] = if manifest["version"] == 1 {
+            manifest
+                .get("assets")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(invalid)?
+        } else {
+            let summary = &manifest["saved_snapshot_summary"];
+            let valid_summary = match summary["status"].as_str() {
+                Some("legacy_unqualified") => true,
+                Some("qualified_references") => {
+                    summary["retained_closure_count"].as_u64().is_some()
+                        && summary["unavailable_reference_count"].as_u64().is_some()
+                }
+                _ => false,
+            };
+            if manifest["row_count"].as_u64().is_none()
+                || manifest["asset_count"].as_u64().is_none()
+                || !valid_summary
+                || self.files.len() != 1
+            {
+                return Err(invalid());
+            }
+            &[]
+        };
         let mut seen_indices = std::collections::BTreeSet::new();
         let mut seen_paths = std::collections::BTreeSet::new();
         let mut asset_metadata = std::collections::BTreeSet::new();

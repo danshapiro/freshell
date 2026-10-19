@@ -807,7 +807,7 @@ fn verified_stopped_repair_receipt(
         || imported.target_build_receipt != descriptor.target_build_receipt
         || imported.bundle_sha256 != descriptor.bundle_sha256
         || imported.row_count != manifest.row_count as u64
-        || imported.asset_count != manifest.assets.len() as u64
+        || imported.asset_count != manifest.asset_count() as u64
         || imported.saved_snapshot_summary
             != freshell_sessions::opencode_transfer::saved_snapshot_summary(manifest)
         || imported.structural_sha256.is_empty()

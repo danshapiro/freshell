@@ -1761,6 +1761,114 @@ mod tests {
         json!({"incidentId": id, "event": "soul.loss.finalized"}).to_string()
     }
 
+    #[tokio::test]
+    async fn verified_repaired_root_resumes_while_unrelated_log_withdrawal_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let operation = RequestId::new();
+        let targets = test_targets();
+        let roots = test_roots(&targets);
+        seed_pending_operation(&registry, &operation, &targets, &roots);
+        let receipt = &roots[0];
+        let conn = Connection::open(registry.database_path()).unwrap();
+        conn.execute(
+            "INSERT INTO souls(soul_id,provider,provider_store_id,native_session_id,creation_seed_ref,desired_state,intent_revision,recovery_state,durability_state,allocation_state,checkpoint_revision,evidence_revision,successful_recoveries_in_window,project_key,resource_profile,provider_volume_name,created_at,updated_at,native_import_state,native_import_authority,native_import_source_store_id,native_import_root_session_id,native_import_source_generation) VALUES(?1,'opencode',?2,?3,'seed','stopped',?4,'data_repair_complete','resume_captured','verified_durable',0,10,0,'project','interactive','volume',1,1,'completed','verified_import_receipt',?5,?3,?6)",
+            params![receipt.canonical_soul_id.as_str(), receipt.destination_store_id, receipt.root_session_id, receipt.captured_intent_revision, receipt.source_store_id, receipt.source_generation],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO native_origin_owners(provider,source_store_id,native_root_session_id,owner_soul_id,source_generation,ownership_state,updated_at) VALUES('opencode',?1,?2,?3,?4,'owned',1)",
+            params![receipt.source_store_id, receipt.root_session_id, receipt.canonical_soul_id.as_str(), receipt.source_generation],
+        ).unwrap();
+        let log = dir.path().join("lifecycle.jsonl");
+        let partial = b"{\"event\":\"unrelated interrupted write";
+        std::fs::write(&log, partial).unwrap();
+        assert!(matches!(
+            registry
+                .resume_pending_stopped_repair_withdrawal_status(
+                    dir.path().join("incidents"),
+                    log.clone()
+                )
+                .await
+                .unwrap(),
+            StoppedRepairWithdrawalStatus::FilesPending,
+        ));
+        let preserved_log = std::fs::read(&log).unwrap();
+        assert!(
+            preserved_log.starts_with(partial),
+            "withdrawal must preserve the interrupted diagnostic row"
+        );
+        assert!(matches!(
+            registry
+                .start_stopped_data_repair(
+                    receipt.canonical_soul_id.clone(),
+                    receipt.captured_intent_revision - 1
+                )
+                .await,
+            Err(RegistryError::StaleIntentRevision { .. }),
+        ));
+        conn.execute("UPDATE stopped_repair_root_receipts SET source_generation=?1 WHERE operation_id=?2 AND root_session_id=?3",
+            params!["f".repeat(64), operation.as_str(), receipt.root_session_id]).unwrap();
+        assert!(
+            registry
+                .start_stopped_data_repair(
+                    receipt.canonical_soul_id.clone(),
+                    receipt.captured_intent_revision
+                )
+                .await
+                .is_err(),
+            "a receipt from a different native import cannot authorize Resume"
+        );
+        conn.execute("UPDATE stopped_repair_root_receipts SET source_generation=?1 WHERE operation_id=?2 AND root_session_id=?3",
+            params![receipt.source_generation, operation.as_str(), receipt.root_session_id]).unwrap();
+        conn.execute(
+            "UPDATE stopped_repair_operations SET status='importing' WHERE operation_id=?1",
+            [operation.as_str()],
+        )
+        .unwrap();
+        assert!(
+            registry
+                .start_stopped_data_repair(
+                    receipt.canonical_soul_id.clone(),
+                    receipt.captured_intent_revision
+                )
+                .await
+                .is_err(),
+            "an unapplied repair cannot authorize Resume"
+        );
+        conn.execute(
+            "UPDATE stopped_repair_operations SET status='withdraw_pending' WHERE operation_id=?1",
+            [operation.as_str()],
+        )
+        .unwrap();
+        let next = registry
+            .start_stopped_data_repair(
+                receipt.canonical_soul_id.clone(),
+                receipt.captured_intent_revision,
+            )
+            .await
+            .expect("verified native repair must be resumable while diagnostic cleanup is pending");
+        assert_eq!(next, receipt.captured_intent_revision + 1);
+        assert_eq!(std::fs::read(&log).unwrap(), preserved_log);
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "withdraw_pending"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT desired_state FROM souls WHERE soul_id=?1",
+                [receipt.canonical_soul_id.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "running"
+        );
+    }
+
     #[test]
     fn view_projection_retraction_requires_exact_view_and_revision_suffix() {
         let mut conn = Connection::open_in_memory().unwrap();

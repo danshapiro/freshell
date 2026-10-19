@@ -182,6 +182,89 @@ fn locate_thread_rollout(
     hit
 }
 
+pub(crate) fn read_large_native_display(
+    codex_home: &std::path::Path,
+    thread_id: &str,
+) -> Result<Option<Value>, String> {
+    let Some(path) = locate_thread_rollout(&codex_home.join("sessions"), thread_id) else {
+        return Err("selected Codex rollout is unavailable".into());
+    };
+    if std::fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len()
+        <= crate::native_history::RETAINED_TURN_BYTES as u64
+    {
+        return Ok(None);
+    }
+    native_history::read_rollout(&path, thread_id).map(Some)
+}
+
+fn join_retained_codex_display(snapshot: &mut Value, mut saved: Value) {
+    let live = snapshot["turns"]
+        .as_array_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let live_roots = live
+        .iter()
+        .filter_map(|turn| turn["turnId"].as_str())
+        .map(|id| {
+            id.rsplit_once(":row-")
+                .filter(|(_, index)| index.parse::<usize>().is_ok())
+                .map_or(id, |(id, _)| id)
+                .to_owned()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut turns = saved["turns"]
+        .as_array_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let replacement_ordinal = turns
+        .iter()
+        .filter(|turn| {
+            let id = turn["turnId"].as_str().unwrap_or("");
+            live_roots.iter().any(|root| {
+                id == root
+                    || id
+                        .strip_prefix(root)
+                        .is_some_and(|suffix| suffix.starts_with(":row-"))
+            })
+        })
+        .filter_map(|turn| turn["ordinal"].as_u64())
+        .min();
+    turns.retain(|turn| {
+        let id = turn["turnId"].as_str().unwrap_or("");
+        !live_roots.iter().any(|root| {
+            id == root
+                || id
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with(":row-"))
+        })
+    });
+    let ordinal = replacement_ordinal.unwrap_or_else(|| {
+        turns
+            .iter()
+            .filter_map(|turn| turn["ordinal"].as_u64())
+            .max()
+            .map_or(0, |value| value + 1)
+    });
+    turns.extend(live.into_iter().enumerate().map(|(index, mut turn)| {
+        turn["ordinal"] = json!(ordinal + index as u64);
+        turn
+    }));
+    let (diffs, children) = metadata::transcript_metadata(&turns);
+    snapshot["capabilities"]["diffs"] = json!(!diffs.is_empty());
+    snapshot["capabilities"]["childThreads"] = json!(!children.is_empty());
+    snapshot["diffs"] = json!(diffs);
+    snapshot["childThreads"] = json!(children);
+    snapshot["turns"] = json!(turns);
+    for key in ["nativeHistoryRetention", "nativeHistoryActivity"] {
+        if let Some(value) = saved["extensions"]["codex"].get(key) {
+            snapshot["extensions"]["codex"][key] = value.clone();
+        }
+    }
+    crate::native_history::retain_snapshot_display("codex", snapshot);
+}
+
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
 
@@ -8053,13 +8136,58 @@ impl FreshCodexState {
         // this port previously had no fallback at all, so ANY such rejection became an
         // unconditional 500. Retry once with `includeTurns:false`, matching the reference
         // exactly (still a valid, if turn-less, snapshot).
-        let raw = match client.read_thread(thread_id, true).await {
-            Ok(raw) => raw,
-            Err(err) if is_codex_include_turns_unavailable(&err) => client
+        client
+            .initialize()
+            .await
+            .map_err(CodexSnapshotError::AppServer)?;
+        let codex_home = client.codex_home().await;
+        let (retained, mut older_history_unavailable) = if let Some(home) = codex_home {
+            match crate::native_history::large_codex_display(std::path::Path::new(&home), thread_id)
+                .await
+            {
+                Ok(retained) => (retained, false),
+                Err(error) => {
+                    tracing::warn!(provider = PROVIDER, session_id = %thread_id, %error,
+                        "freshagent.codex.older_display_unavailable");
+                    (None, true)
+                }
+            }
+        } else {
+            (None, false)
+        };
+        let raw = if retained.is_some() || older_history_unavailable {
+            let mut metadata = client
                 .read_thread(thread_id, false)
                 .await
-                .map_err(CodexSnapshotError::AppServer)?,
-            Err(err) => return Err(CodexSnapshotError::AppServer(err)),
+                .map_err(CodexSnapshotError::AppServer)?;
+            if metadata["thread"]["id"] != thread_id {
+                return Err(CodexSnapshotError::Protocol(
+                    "live native metadata names another Codex root".into(),
+                ));
+            }
+            let page = match client.read_recent_turn(thread_id).await {
+                Ok(page) => page,
+                Err(error) if is_codex_include_turns_unavailable(&error) => json!({"data":[]}),
+                Err(error) => return Err(CodexSnapshotError::AppServer(error)),
+            };
+            let turns = page["data"].as_array().ok_or_else(|| {
+                CodexSnapshotError::Protocol("native recent-turn page has no turn array".into())
+            })?;
+            // Native zero-turn state confirms no older conversation was omitted.
+            if turns.is_empty() {
+                older_history_unavailable = false;
+            }
+            metadata["thread"]["turns"] = json!(turns);
+            metadata
+        } else {
+            match client.read_thread(thread_id, true).await {
+                Ok(raw) => raw,
+                Err(err) if is_codex_include_turns_unavailable(&err) => client
+                    .read_thread(thread_id, false)
+                    .await
+                    .map_err(CodexSnapshotError::AppServer)?,
+                Err(err) => return Err(CodexSnapshotError::AppServer(err)),
+            }
         };
         // U-1 repair (wedged-sidecar deadman): a thread restored MID-TURN has no
         // adapter-observed `turn/started` (this process never saw one), so
@@ -8151,6 +8279,14 @@ impl FreshCodexState {
             stuck,
         )
         .map_err(CodexSnapshotError::Protocol)?;
+        if let Some(retained) = retained {
+            join_retained_codex_display(&mut snapshot, retained);
+        }
+        if older_history_unavailable {
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["partial"] = json!(true);
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["olderHistoryUnavailable"] =
+                json!(true);
+        }
         self.overlay_controls(thread_id, &mut snapshot).await;
         if let Some(session) = self.sessions.lock().await.get(thread_id) {
             let mut settings = Map::new();
@@ -9861,6 +9997,7 @@ fn build_codex_snapshot_json(
         );
         snapshot["revision"] = json!(floored);
     }
+    crate::native_history::retain_snapshot_display(PROVIDER, &mut snapshot);
     Ok(snapshot)
 }
 
@@ -11700,6 +11837,21 @@ pub(crate) mod tests {
     use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
+    pub(crate) fn small_native_home(thread_id: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-{thread_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":thread_id}})
+            ),
+        )
+        .unwrap();
+        home
+    }
+
     #[test]
     fn codex_startup_diagnostics_use_only_safe_categories() {
         assert_eq!(
@@ -12436,6 +12588,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn get_snapshot_reports_sendable_after_a_turn_completes_via_the_real_notification_stream()
     {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -12482,7 +12635,7 @@ pub(crate) mod tests {
         assert_eq!(init_method, "initialize");
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -12941,6 +13094,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_fires_stuck_and_rings_the_unified_attention_edge() {
+        let native_home = small_native_home("thread-quiet-stuck");
         let (st, mut frame_rx) = state_with_bus();
         st.set_codex_quiet_window_ms_for_tests(150);
         let capture = tracing_capture::capture_by_session("thread-quiet-stuck");
@@ -12964,7 +13118,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.handle_send(send_msg("thread-quiet-stuck", "run")).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "turn/start");
         peer.respond(&id, json!({ "turn": { "id": "turn-1" } }));
@@ -13058,6 +13212,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_resets_on_lane_events_and_resolves_on_turn_completion() {
+        let native_home = small_native_home("thread-quiet-reset");
         let (st, mut frame_rx) = state_with_bus();
         st.set_codex_quiet_window_ms_for_tests(300);
         let capture = tracing_capture::capture_by_session("thread-quiet-reset");
@@ -13079,7 +13234,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.handle_send(send_msg("thread-quiet-reset", "run")).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "turn/start");
         peer.respond(&id, json!({ "turn": { "id": "turn-1" } }));
@@ -13248,6 +13403,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_arms_from_snapshot_observed_in_flight_turn() {
+        let native_home = small_native_home("thread-quiet-midrestore");
         // U-1 repair: a session registered WITHOUT any adapter-observed turn (a thread
         // restored mid-turn), then a live thread read sees an in-flight turn -> seed
         // `active_turn` (side-state only) and arm the window; the wedge still fires.
@@ -13281,7 +13437,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.get_snapshot("thread-quiet-midrestore", None).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "thread/read");
         peer.respond(&id, snapshot_payload());
@@ -13398,6 +13554,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quiet_deadman_rearms_after_terminal_status_clearance() {
+        let native_home = small_native_home("thread-quiet-rearm");
         // M1 regression: a terminal status (`turn/completed` here) must DISARM the
         // quiet deadman, not merely suppress its fire by clearing `active_turn`
         // (the waiter's `has_turn` re-check). A stale `Some(deadline)` left behind
@@ -13427,7 +13584,7 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move { st.handle_send(send_msg("thread-quiet-rearm", "run")).await })
         };
-        answer_initialize(&peer).await;
+        answer_initialize_in_home(&peer, native_home.path()).await;
         let (id, method, _params) = peer.expect_request().await;
         assert_eq!(method, "turn/start");
         peer.respond(&id, json!({ "turn": { "id": "turn-1" } }));
@@ -13813,6 +13970,119 @@ pub(crate) mod tests {
         assert!(
             refused,
             "the refused refresh is logged typed, never silently dropped: {events:?}"
+        );
+    }
+
+    #[test]
+    fn live_codex_snapshot_retains_recent_history_without_changing_running_controls() {
+        let text = "large ordinary tool output ".repeat(50_000);
+        let turns: Vec<_> = (0..32)
+            .map(|index| {
+                json!({"id":format!("turn-{index}"),
+            "items":[{"id":format!("answer-{index}"),"type":"agentMessage","text":text}]})
+            })
+            .collect();
+        let raw = json!({"thread":{"id":"live-root","status":{"type":"active"},"turns":turns}});
+        let snapshot = build_codex_snapshot_json(
+            "live-root",
+            &raw,
+            true,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(serde_json::to_vec(&raw).unwrap().len() > 32 * 1024 * 1024);
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["threadId"], "live-root");
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["interrupt"], true);
+        assert_eq!(snapshot["capabilities"]["send"], false);
+        assert_eq!(snapshot["capabilities"]["undo"], true);
+        assert_eq!(
+            snapshot["turns"].as_array().unwrap().last().unwrap()["turnId"],
+            "turn-31"
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_ne!(snapshot["extensions"]["codex"]["ownerKind"], "vacant");
+    }
+
+    #[test]
+    fn live_codex_snapshot_retains_short_items_within_one_large_native_turn() {
+        let text = "x".repeat(3000);
+        let items: Vec<_> = (0..12_000)
+            .map(|index| json!({"id":format!("answer-{index}"),"type":"agentMessage","text":text}))
+            .collect();
+        let raw = json!({"thread":{"id":"live-root","status":{"type":"active"},"turns":[{"id":"long-turn","items":items}]}});
+        assert!(serde_json::to_vec(&raw).unwrap().len() > 32 * 1024 * 1024);
+        let snapshot = build_codex_snapshot_json(
+            "live-root",
+            &raw,
+            true,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["interrupt"], true);
+        assert_eq!(snapshot["turns"][0]["turnId"], "long-turn");
+        assert_eq!(
+            snapshot["turns"][0]["items"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["id"],
+            "answer-11999"
+        );
+        assert!(
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["omittedItems"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn live_codex_snapshot_retains_large_file_change_diff_and_raw_display_metadata() {
+        let diff = format!("-{}\n+{}", "old".repeat(4_000_000), "new".repeat(4_000_000));
+        let raw = json!({"thread":{"id":"live-root","status":{"type":"active"},"turns":[{"id":"edit-turn","items":[{
+            "id":"edit-1","type":"fileChange","status":"completed","changes":[{"path":"generated.txt","kind":{"type":"update"},"diff":diff}]
+        }]}]}});
+        let snapshot = build_codex_snapshot_json(
+            "live-root",
+            &raw,
+            true,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < crate::native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["capabilities"]["interrupt"], true);
+        assert_eq!(snapshot["turns"][0]["turnId"], "edit-turn");
+        let item = &snapshot["turns"][0]["items"][0];
+        assert_eq!(item["id"], "edit-1");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["changes"][0]["path"], "generated.txt");
+        assert_eq!(snapshot["diffs"][0]["path"], "generated.txt");
+        assert_eq!(
+            snapshot["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+            true
         );
     }
 
@@ -15320,11 +15590,15 @@ pub(crate) mod tests {
 
     /// Complete the initialize handshake a first RPC triggers (client.ts:777-778).
     async fn answer_initialize(peer: &freshell_codex::ChannelPeer) {
+        answer_initialize_in_home(peer, std::path::Path::new("/h")).await;
+    }
+
+    async fn answer_initialize_in_home(peer: &freshell_codex::ChannelPeer, home: &std::path::Path) {
         let (init_id, init_method, _p) = peer.expect_request().await;
         assert_eq!(init_method, "initialize");
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": home, "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await; // initialized
     }
@@ -26452,6 +26726,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_returns_a_schema_shaped_snapshot_with_turn_text() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -26478,7 +26753,7 @@ pub(crate) mod tests {
         assert_eq!(init_method, "initialize");
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -26546,6 +26821,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_reports_running_capabilities_when_a_turn_is_tracked_active() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -26569,7 +26845,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -26602,6 +26878,7 @@ pub(crate) mod tests {
     /// full stop -- matching the legacy adapter, which has no such fallback to begin with.
     #[tokio::test]
     async fn get_snapshot_is_sendable_once_thread_status_is_idle_even_if_active_turn_is_stale() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -26628,7 +26905,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -26992,6 +27269,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_renders_tool_reasoning_and_file_change_items_end_to_end() {
+        let native_home = small_native_home("thread-rich");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -27015,7 +27293,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
 
@@ -27671,6 +27949,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn get_snapshot_surfaces_the_durable_rollback_record_and_floors_the_revision() {
+        let native_home = small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -27696,7 +27975,7 @@ pub(crate) mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
         let (id, method, _params) = peer.expect_request().await;

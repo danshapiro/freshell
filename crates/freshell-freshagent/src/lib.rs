@@ -3321,6 +3321,7 @@ impl FreshAgentState {
         // replay.
         self.ensure_child_watchers(&manager, thread_id, &snapshot);
         attach_child_activity(&manager, &route, &mut snapshot).await;
+        native_history::retain_snapshot_display(PROVIDER, &mut snapshot);
         Ok(snapshot)
     }
 
@@ -4669,6 +4670,7 @@ fn build_opencode_snapshot_json(
         );
         snapshot["revision"] = json!(floored);
     }
+    native_history::retain_snapshot_display(PROVIDER, &mut snapshot);
     snapshot
 }
 
@@ -7987,6 +7989,42 @@ mod ownership_watch_tests {
 mod tests {
     use super::*;
     use crate::ownership_lane::OwnershipStamps;
+
+    #[test]
+    fn live_opencode_snapshot_retains_recent_history_and_native_rollback_controls() {
+        let text = "large ordinary tool output ".repeat(50_000);
+        let messages: Vec<_> = (0..32)
+            .map(|index| {
+                json!({"info":{"id":format!("msg-{index}"),"role":"assistant"},
+            "parts":[{"id":format!("part-{index}"),"type":"text","text":text}]})
+            })
+            .collect();
+        let messages = json!(messages);
+        assert!(serde_json::to_vec(&messages).unwrap().len() > 32 * 1024 * 1024);
+        let snapshot = build_opencode_snapshot_json(
+            "ses_live",
+            &json!({"id":"ses_live","time":{"updated":42}}),
+            &messages,
+            None,
+        );
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                < native_history::MAX_HISTORY_BYTES as usize
+        );
+        assert_eq!(snapshot["threadId"], "ses_live");
+        assert_eq!(snapshot["revision"], 42);
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["capabilities"]["undo"], true);
+        assert_eq!(
+            snapshot["turns"].as_array().unwrap().last().unwrap()["turnId"],
+            "msg-31"
+        );
+        assert_eq!(
+            snapshot["extensions"]["opencode"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_ne!(snapshot["extensions"]["opencode"]["ownerKind"], "vacant");
+    }
 
     fn state() -> FreshAgentState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);

@@ -408,13 +408,11 @@ fn exports_exact_recursive_native_closure_and_omits_account_and_derived_rows() {
         .collect()
     );
     let manifest = serde_json::to_value(snapshot.manifest()).unwrap();
-    for (index, row) in decoded["rows"].as_array().unwrap().iter().enumerate() {
-        let row_bytes = serde_json::to_vec(row).unwrap();
-        let expected_hash = format!("{:x}", Sha256::digest(row_bytes));
-        assert_eq!(manifest["rows"][index]["table"], row["table"]);
-        assert_eq!(manifest["rows"][index]["key"], row["key"]);
-        assert_eq!(manifest["rows"][index]["sha256"], expected_hash);
-    }
+    assert_eq!(manifest["version"], 2);
+    assert!(manifest.get("rows").is_none());
+    assert!(manifest.get("native_cleanup_baselines").is_none());
+    assert_eq!(decoded["version"], 2);
+    assert_eq!(decoded["saved_snapshots"], serde_json::json!([]));
     assert_eq!(manifest["payload_bytes"], payload.len() as u64);
     assert_eq!(
         manifest["payload_sha256"],
@@ -490,7 +488,7 @@ fn blocks_reachable_session_descendant_with_null_primary_key() {
 }
 
 #[test]
-fn exports_distinct_manifest_keys_for_each_selected_context_epoch() {
+fn exports_distinct_bulk_keys_for_each_selected_context_epoch() {
     let fixture = TestDir::new("context-epoch-keys");
     let database = fixture.path().join("opencode.db");
     let source = create_synthetic_source(&database);
@@ -513,12 +511,13 @@ fn exports_distinct_manifest_keys_for_each_selected_context_epoch() {
     )
     .expect("context epochs for selected descendants are exported");
 
-    let keys = snapshot
-        .manifest()
-        .row_digests()
+    let payload: Value = serde_json::from_reader(snapshot.open_payload().unwrap()).unwrap();
+    let keys = payload["rows"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|row| row.table == "session_context_epoch")
-        .map(|row| serde_json::to_value(&row.key).unwrap())
+        .filter(|row| row["table"] == "session_context_epoch")
+        .map(|row| row["key"].clone())
         .collect::<Vec<_>>();
     assert_eq!(
         keys,
@@ -2871,6 +2870,165 @@ fn run_git_command(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn native_export_preserves_snapshot_gitlinks_without_copying_submodule_commits() {
+    for native_store in [false, true] {
+        let fixture = TestDir::new("snapshot-gitlink");
+        let workspace = fixture.path().join("workspace");
+        let child = fixture.path().join("child");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        for root in [&workspace, &child] {
+            run_git_command(root, &["init", "-q"], None);
+            fs::write(root.join("ordinary.txt"), "ordinary tracked file\n").unwrap();
+            run_git_command(root, &["add", "ordinary.txt"], None);
+            run_git_command(
+                root,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "initial",
+                ],
+                None,
+            );
+        }
+        run_git_command(
+            &workspace,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                child.to_str().unwrap(),
+                "sub",
+            ],
+            None,
+        );
+        let child_commit = run_git_command(&child, &["rev-parse", "HEAD"], None)
+            .trim()
+            .to_string();
+        let tree = run_git_command(&workspace, &["write-tree"], None)
+            .trim()
+            .to_string();
+        assert!(run_git_command(&workspace, &["ls-tree", &tree], None).contains("160000 commit"));
+        let database = fixture.path().join("provider/opencode.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let source = create_synthetic_source(&database);
+        source
+            .execute(
+                "UPDATE part SET data=?1 WHERE id='part_ses_root'",
+                [serde_json::json!({"type":"step-start","snapshot":tree}).to_string()],
+            )
+            .unwrap();
+        if native_store {
+            // The pinned native snapshot seeds its index and alternates from the workspace.
+            let bucket = database
+                .parent()
+                .unwrap()
+                .join("snapshot/prj_kept")
+                .join(format!(
+                    "{:x}",
+                    sha1::Sha1::digest(workspace.to_string_lossy().as_bytes())
+                ));
+            fs::create_dir_all(&bucket).unwrap();
+            run_git_command(
+                &workspace,
+                &["--git-dir", bucket.to_str().unwrap(), "init", "-q"],
+                None,
+            );
+            fs::copy(workspace.join(".git/index"), bucket.join("index")).unwrap();
+            fs::create_dir_all(bucket.join("objects/info")).unwrap();
+            fs::write(
+                bucket.join("objects/info/alternates"),
+                format!("{}\n", workspace.join(".git/objects").display()),
+            )
+            .unwrap();
+        }
+        let inventory =
+            with_selected_workspace_mount(HostOpenCodeInventory::new(database), workspace);
+        let exported = export_exact_session(
+            &inventory,
+            "ses_root",
+            ExportOptions::new(fixture.path().join("extract")),
+        )
+        .expect("valid Gitlinks do not require objects from a separate repository");
+        let payload: Value = serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+        let objects = payload["snapshot_objects"].as_array().unwrap();
+        assert!(objects.iter().any(|object| object["object_id"] == tree));
+        assert!(!objects
+            .iter()
+            .any(|object| object["object_id"] == child_commit));
+        let saved_tree = objects
+            .iter()
+            .find(|object| object["object_id"] == tree)
+            .unwrap();
+        let compressed = hex::decode(saved_tree["compressed_hex"].as_str().unwrap()).unwrap();
+        let mut native_tree = Vec::new();
+        flate2::read::ZlibDecoder::new(compressed.as_slice())
+            .read_to_end(&mut native_tree)
+            .unwrap();
+        let mut gitlink = b"160000 sub\0".to_vec();
+        gitlink.extend(hex::decode(&child_commit).unwrap());
+        assert!(
+            native_tree
+                .windows(gitlink.len())
+                .any(|bytes| bytes == gitlink),
+            "the exported tree retains its exact submodule identity"
+        );
+    }
+}
+
+#[test]
+fn large_native_export_keeps_control_metadata_bounded_and_all_bulk_rows() {
+    let fixture = TestDir::new("large-control-manifest");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    for index in 0..300 {
+        let message_id = format!("msg_large_{index:06}");
+        source.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES(?1,'ses_root',?2,?2,?3)",
+            params![message_id, index + 100, serde_json::json!({"role":"assistant","time":{"created":index+100},"modelID":"example","providerID":"example","mode":"build","cost":0,"tokens":{"input":100,"output":100,"reasoning":0,"cache":{"read":0,"write":0}}}).to_string()]).unwrap();
+        for part in 0..2 {
+            source.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES(?1,?2,'ses_root',?3,?3,?4)",
+                params![format!("part_large_{index:06}_{part}"), message_id, index+100, serde_json::json!({"type":"text","text":"ordinary short assistant output"}).to_string()]).unwrap();
+        }
+    }
+    let exported = export_exact_session(
+        &HostOpenCodeInventory::new(database),
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .unwrap();
+    let payload: Value = serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+    assert_eq!(payload["rows"].as_array().unwrap().len(), 919);
+    assert!(payload["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["table"] == "part" && row["key"][0]["value"] == "part_large_000299_1"));
+    let wire = serde_json::to_vec(exported.manifest()).unwrap();
+    assert!(
+        wire.len() < 16 * 1024,
+        "growing bulk metadata must not consume the control frame: {} bytes",
+        wire.len()
+    );
+    assert_eq!(exported.manifest().row_count, 919);
+    let mut payload_bytes = Vec::new();
+    exported
+        .open_payload()
+        .unwrap()
+        .read_to_end(&mut payload_bytes)
+        .unwrap();
+    assert_eq!(
+        exported.manifest().payload_sha256,
+        format!("{:x}", Sha256::digest(&payload_bytes))
+    );
 }
 
 #[test]

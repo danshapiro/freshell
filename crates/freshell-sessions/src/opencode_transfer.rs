@@ -24,7 +24,7 @@ use tempfile::{Builder, TempDir};
 
 use crate::provider_layout::ProviderLayout;
 
-const EXPORT_VERSION: u32 = 1;
+const EXPORT_VERSION: u32 = 2;
 const OPENCODE_SCHEMA_VERSION: &str = "opencode-1.18.21";
 const PINNED_SCHEMA_SQL: &str = include_str!("opencode_schema_v1_18_21.sql");
 const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -537,6 +537,17 @@ impl QualifiedSourceSnapshot {
 pub fn source_graph_fingerprint(
     manifest: &OpenCodeTransferManifest,
 ) -> Result<String, TransferError> {
+    if manifest.version >= 2 {
+        return digest_serializable(&(
+            &manifest.provider_schema,
+            &manifest.source_schema_fingerprint,
+            &manifest.migration_journal_fingerprint,
+            &manifest.root_session_id,
+            manifest.row_count,
+            manifest.asset_count(),
+            &manifest.payload_sha256,
+        ));
+    }
     digest_serializable(&(
         &manifest.provider_schema,
         &manifest.source_schema_fingerprint,
@@ -1332,15 +1343,23 @@ pub struct OpenCodeTransferManifest {
     pub migration_journal_fingerprint: String,
     pub sqlite_version: String,
     pub row_count: usize,
+    #[serde(default)]
+    pub asset_count: usize,
+    #[serde(default)]
+    pub saved_snapshot_summary: SavedSnapshotSummary,
+    // Legacy metadata remains readable. Growing metadata belongs only in the
+    // checksummed bulk payload, never in launch/control frames.
+    #[serde(default, skip_serializing)]
     pub rows: Vec<RowDigest>,
+    #[serde(default, skip_serializing)]
     pub assets: Vec<SerializedAssetMetadata>,
     /// Body-free native ordering and saved boundary evidence. Older manifests
     /// omit it and cannot authorize removal of imported messages or parts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub native_cleanup_baselines: Vec<NativeCleanupBaseline>,
     /// Exact saved references remain history even when their undo object is
     /// unavailable in the qualified retained stores.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub saved_snapshots: Vec<SavedSnapshotReference>,
     pub payload_bytes: u64,
     pub payload_sha256: String,
@@ -1366,6 +1385,9 @@ pub enum SavedSnapshotSummary {
 }
 
 pub fn saved_snapshot_summary(manifest: &OpenCodeTransferManifest) -> SavedSnapshotSummary {
+    if manifest.version >= 2 {
+        return manifest.saved_snapshot_summary.clone();
+    }
     if manifest.native_cleanup_baselines.is_empty() {
         return SavedSnapshotSummary::LegacyUnqualified;
     }
@@ -1430,81 +1452,6 @@ pub struct NativeCleanupBaseline {
     pub session_id: String,
     pub revert: Option<NativeRevertBoundary>,
     pub messages: Vec<NativeMessageBaseline>,
-}
-
-fn capture_native_cleanup_baselines(
-    rows: &[SerializedRow],
-) -> Result<Vec<NativeCleanupBaseline>, TransferError> {
-    let mut parts = HashMap::<String, Vec<String>>::new();
-    for row in rows.iter().filter(|row| row.table == "part") {
-        parts
-            .entry(required_text(row, "message_id")?)
-            .or_default()
-            .push(required_text(row, "id")?);
-    }
-    for ids in parts.values_mut() {
-        ids.sort();
-    }
-    let mut messages = HashMap::<String, Vec<NativeMessageBaseline>>::new();
-    for row in rows.iter().filter(|row| row.table == "message") {
-        let message_id = required_text(row, "id")?;
-        messages
-            .entry(required_text(row, "session_id")?)
-            .or_default()
-            .push(NativeMessageBaseline {
-                part_ids: parts.remove(&message_id).unwrap_or_default(),
-                message_id,
-                time_created: row.values.get("time_created").cloned().ok_or_else(|| {
-                    TransferError::Blocked("native message ordering is missing".into())
-                })?,
-            });
-    }
-    for selected in messages.values_mut() {
-        selected.sort_by(|left, right| left.message_id.cmp(&right.message_id));
-    }
-    let mut baselines = rows
-        .iter()
-        .filter(|row| row.table == "session")
-        .map(|session| {
-            let session_id = required_text(session, "id")?;
-            let revert = value_text(session, "revert")?
-                .map(|raw| serde_json::from_str::<serde_json::Value>(&raw))
-                .transpose()
-                .map_err(|_| TransferError::Blocked("saved native revert is malformed".into()))?
-                .and_then(|value| {
-                    value
-                        .get("messageID")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|message_id| NativeRevertBoundary {
-                            message_id: message_id.into(),
-                            part_id: value
-                                .get("partID")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string),
-                        })
-                });
-            let selected_messages = messages.remove(&session_id).unwrap_or_default();
-            Ok(NativeCleanupBaseline {
-                session_id,
-                revert,
-                messages: selected_messages,
-            })
-        })
-        .collect::<Result<Vec<_>, TransferError>>()?;
-    baselines.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    Ok(baselines)
-}
-
-pub fn verify_native_cleanup_baselines(
-    expected: &[NativeCleanupBaseline],
-    rows: &[SerializedRow],
-) -> Result<(), TransferError> {
-    if !expected.is_empty() && capture_native_cleanup_baselines(rows)? != expected {
-        return Err(TransferError::Blocked(
-            "native cleanup baseline differs from the complete installed rows".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// The exact DDL and migration IDs qualified for the supported OpenCode
@@ -1624,6 +1571,13 @@ fn checked_relative_path(path: &str) -> Result<&Path, TransferError> {
 }
 
 impl OpenCodeTransferManifest {
+    pub fn asset_count(&self) -> usize {
+        if self.version >= 2 {
+            self.asset_count
+        } else {
+            self.assets.len()
+        }
+    }
     pub fn row_count(&self) -> usize {
         self.row_count
     }
@@ -1854,9 +1808,7 @@ fn export_exact_session_inner<W: Write>(
                 },
             )
             .collect::<Vec<_>>();
-        let native_cleanup_baselines = capture_native_cleanup_baselines(&rows)?;
         let payload_path = extraction.path().join("bundle.json");
-        let mut row_digests = Vec::with_capacity(rows.len());
         let (payload_bytes, payload_sha256) =
             options.run_phase("serialize", Some(root_session_id), "bytes", |phase| {
                 let file = create_payload_writer(&payload_path)?;
@@ -1867,6 +1819,7 @@ fn export_exact_session_inner<W: Write>(
                         root_session_id,
                         rows: &rows,
                         assets: &assets,
+                        saved_snapshots: &saved_snapshots,
                         snapshot_objects: &snapshot_objects,
                     },
                     MAX_BUNDLE_BYTES,
@@ -1874,24 +1827,6 @@ fn export_exact_session_inner<W: Write>(
                 phase.progress(payload_bytes, Some(payload_bytes));
                 Ok((payload_bytes, payload_sha256))
             })?;
-        options.run_phase("row_digests", Some(root_session_id), "rows", |phase| {
-            for (index, row) in rows.iter().enumerate() {
-                row_digests.push(RowDigest {
-                    table: row.table.clone(),
-                    key: row.key.clone(),
-                    sha256: digest_serializable(row)?,
-                    column_sha256: serialized_column_digests(row)?,
-                    json_node_sha256: serialized_json_node_digests(row)?,
-                    transition_cursor: match row.table.as_str() {
-                        "event_sequence" => value_integer(row, "seq")?,
-                        "project" => value_integer(row, "time_updated")?,
-                        _ => None,
-                    },
-                });
-                phase.progress(index as u64 + 1, Some(rows.len() as u64));
-            }
-            Ok(())
-        })?;
         let source_store_id = match &inventory.qualified_snapshot {
             Some(qualified) => qualified.receipt.source_store_id.clone(),
             None => digest(source_path.canonicalize()?.to_string_lossy().as_bytes()),
@@ -1904,10 +1839,26 @@ fn export_exact_session_inner<W: Write>(
             source_schema_fingerprint,
             migration_journal_fingerprint,
             sqlite_version,
-            row_count: row_digests.len(),
-            rows: row_digests,
+            row_count: rows.len(),
+            asset_count: assets.len(),
+            saved_snapshot_summary: SavedSnapshotSummary::QualifiedReferences {
+                retained_closure_count: saved_snapshots
+                    .iter()
+                    .filter(|reference| {
+                        reference.availability == SavedSnapshotAvailability::RetainedClosure
+                    })
+                    .count() as u64,
+                unavailable_reference_count: saved_snapshots
+                    .iter()
+                    .filter(|reference| {
+                        reference.availability
+                            == SavedSnapshotAvailability::UnavailableInQualifiedLocations
+                    })
+                    .count() as u64,
+            },
+            rows: Vec::new(),
             assets,
-            native_cleanup_baselines,
+            native_cleanup_baselines: Vec::new(),
             saved_snapshots,
             payload_bytes,
             payload_sha256,
@@ -1965,6 +1916,7 @@ struct TransferPayload<'a> {
     root_session_id: &'a str,
     rows: &'a [SerializedRow],
     assets: &'a [SerializedAssetMetadata],
+    saved_snapshots: &'a [SavedSnapshotReference],
     snapshot_objects: &'a [SerializedSnapshotObject],
 }
 
@@ -4029,8 +3981,10 @@ fn snapshot_tree_children(bytes: &[u8]) -> Result<Vec<(String, bool)>, TransferE
             .ok_or_else(|| TransferError::Blocked("snapshot tree entry name is absent".into()))?;
         let mode = std::str::from_utf8(&bytes[cursor..space]).unwrap_or("");
         let name = &bytes[space + 1..nul];
-        if !matches!(mode, "40000" | "040000" | "100644" | "100755" | "120000")
-            || name.is_empty()
+        if !matches!(
+            mode,
+            "40000" | "040000" | "100644" | "100755" | "120000" | "160000"
+        ) || name.is_empty()
             || name == b"."
             || name == b".."
             || name.contains(&b'/')
@@ -4040,10 +3994,14 @@ fn snapshot_tree_children(bytes: &[u8]) -> Result<Vec<(String, bool)>, TransferE
                 "snapshot tree contains an unsupported entry".into(),
             ));
         }
-        children.push((
-            hex::encode(&bytes[nul + 1..nul + 21]),
-            matches!(mode, "40000" | "040000"),
-        ));
+        // A Gitlink names a commit in the submodule's separate repository.
+        // Its mode/name/OID stay in this tree; it is not part of our closure.
+        if mode != "160000" {
+            children.push((
+                hex::encode(&bytes[nul + 1..nul + 21]),
+                matches!(mode, "40000" | "040000"),
+            ));
+        }
         cursor = nul + 21;
     }
     Ok(children)
@@ -5087,9 +5045,17 @@ fn inspect_git_tree_with_costs(
                     TransferError::Blocked("Git tree entry metadata is not UTF-8".into())
                 })?;
                 let fields: Vec<_> = header.split_whitespace().collect();
-                if fields.len() != 3 || fields[1] == "commit" {
+                if fields.len() != 3 {
                     return Err(TransferError::Blocked(
-                        "snapshot tree contains an unsupported submodule entry".into(),
+                        "snapshot tree contains an unsupported entry".into(),
+                    ));
+                }
+                if fields[0] == "160000" && fields[1] == "commit" {
+                    continue;
+                }
+                if !matches!(fields[1], "tree" | "blob") {
+                    return Err(TransferError::Blocked(
+                        "snapshot tree contains an unsupported object".into(),
                     ));
                 }
                 let object = fields[2].to_string();
@@ -5718,12 +5684,11 @@ impl WorkspaceTreeParser {
                     self.oid_used += 1;
                     if self.oid_used == width {
                         let class = self.mode & 0o170000;
-                        if !matches!(class, 0o040000 | 0o100000 | 0o120000) {
-                            return Err(TransferError::Blocked(
-                                "snapshot tree contains an unsupported submodule entry".into(),
-                            ));
+                        // Git normalizes every other mode class to an external
+                        // commit. Preserve its raw tree bytes without following it.
+                        if matches!(class, 0o040000 | 0o100000 | 0o120000) {
+                            edge(hex::encode(&self.oid[..width]), class == 0o040000);
                         }
-                        edge(hex::encode(&self.oid[..width]), class == 0o040000);
                         *self = Self::default();
                     }
                 }
@@ -7745,16 +7710,6 @@ fn required_text(row: &SerializedRow, key: &str) -> Result<String, TransferError
     })
 }
 
-fn value_integer(row: &SerializedRow, key: &str) -> Result<Option<i64>, TransferError> {
-    match row.values.get(key) {
-        Some(SerializedSqlValue::Integer { value }) => Ok(Some(*value)),
-        Some(SerializedSqlValue::Null) | None => Ok(None),
-        _ => Err(TransferError::Blocked(format!(
-            "native row has an invalid {key} sequence"
-        ))),
-    }
-}
-
 fn unique_text_values(rows: &[SerializedRow], key: &str) -> Result<Vec<String>, TransferError> {
     let mut values = BTreeSet::new();
     for row in rows {
@@ -7793,61 +7748,6 @@ fn digest_serializable(value: &impl Serialize) -> Result<String, TransferError> 
         result.map_err(|error| TransferError::Serialization(error.to_string()))?;
     }
     Ok(hex::encode(hasher.finalize()))
-}
-
-fn serialized_column_digests(
-    row: &SerializedRow,
-) -> Result<BTreeMap<String, String>, TransferError> {
-    row.values
-        .iter()
-        .map(|(name, value)| {
-            let bytes = serde_json::to_vec(value)
-                .map_err(|error| TransferError::Serialization(error.to_string()))?;
-            Ok((name.clone(), digest(&bytes)))
-        })
-        .collect()
-}
-
-fn serialized_json_node_digests(
-    row: &SerializedRow,
-) -> Result<BTreeMap<String, String>, TransferError> {
-    let mut digests = BTreeMap::new();
-    for (column, value) in &row.values {
-        let SerializedSqlValue::Text { value } = value else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(value) else {
-            continue;
-        };
-        collect_json_node_digests(column, &json, "", &mut digests)?;
-    }
-    Ok(digests)
-}
-
-fn collect_json_node_digests(
-    column: &str,
-    value: &serde_json::Value,
-    pointer: &str,
-    digests: &mut BTreeMap<String, String>,
-) -> Result<(), TransferError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| TransferError::Serialization(error.to_string()))?;
-    digests.insert(format!("{column}#{pointer}"), digest(&bytes));
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, child) in object {
-                let escaped = key.replace('~', "~0").replace('/', "~1");
-                collect_json_node_digests(column, child, &format!("{pointer}/{escaped}"), digests)?;
-            }
-        }
-        serde_json::Value::Array(array) => {
-            for (index, child) in array.iter().enumerate() {
-                collect_json_node_digests(column, child, &format!("{pointer}/{index}"), digests)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 fn digest_reader(reader: &mut impl Read) -> Result<String, TransferError> {
@@ -8201,6 +8101,7 @@ mod native_source_inventory_tests {
             root_session_id: "ses_exact",
             rows: &rows,
             assets: &assets,
+            saved_snapshots: &exported.manifest.saved_snapshots,
             snapshot_objects: &objects,
         };
         let mut unbuffered = PayloadWriter::default();
@@ -8262,6 +8163,7 @@ mod native_source_inventory_tests {
             root_session_id: "ses_escaped_\"\\\n",
             rows: &[],
             assets: &[],
+            saved_snapshots: &[],
             snapshot_objects: &[],
         };
         let expected = serde_json::to_vec(&payload).unwrap();
@@ -12217,10 +12119,7 @@ mod native_source_inventory_tests {
                 b"100",
                 b"160000 link\0",
             ] {
-                let mut bad = bad.to_vec();
-                if bad.starts_with(b"160000") {
-                    bad.extend(&leaf);
-                }
+                let bad = bad.to_vec();
                 let bad_oid = oid_for(&bad);
                 cases.push((
                     "malformed_tree",
@@ -12232,6 +12131,18 @@ mod native_source_inventory_tests {
                     false,
                 ));
             }
+            let mut gitlink = b"160000 link\0".to_vec();
+            gitlink.extend(&leaf);
+            let gitlink_oid = oid_for(&gitlink);
+            cases.push((
+                "gitlink",
+                gitlink_oid.clone(),
+                frame(&gitlink_oid, &gitlink),
+                vec![],
+                0,
+                true,
+                true,
+            ));
             for (name, request, response, tail, status, immediate, success) in cases {
                 workspace_metadata_test_hooks::STATE
                     .with(|state| *state.borrow_mut() = Default::default());
@@ -12258,6 +12169,11 @@ mod native_source_inventory_tests {
                 assert_eq!(result.is_ok(), success, "{width}/{name}");
                 if name == "valid" {
                     assert_eq!(result.unwrap(), [(hex::encode(&leaf), false)]);
+                } else if name == "gitlink" {
+                    assert!(
+                        result.unwrap().is_empty(),
+                        "submodule commits are external to the parent object closure"
+                    );
                 }
                 workspace_metadata_test_hooks::STATE.with(|state| {
                     let state = state.borrow();
@@ -13830,7 +13746,6 @@ mod native_source_inventory_tests {
             "root_export",
             "saved_objects",
             "serialize",
-            "row_digests",
         ] {
             let lifecycle = captured
                 .iter()

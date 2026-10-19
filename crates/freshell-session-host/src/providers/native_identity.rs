@@ -189,9 +189,14 @@ pub fn read_claude_observation(
         return Ok(None);
     }
     let native = &value["native"];
-    if native["hook_event_name"] != "SessionStart" || native["source"] != expected_source {
+    if native["hook_event_name"] != "SessionStart" {
         return Ok(None);
     }
+    let source = match native["source"].as_str() {
+        Some("clear") => NativeIdentitySource::ClaudeNativeClear,
+        Some(source) if source == expected_source => NativeIdentitySource::ClaudeNativeEvent,
+        _ => return Ok(None),
+    };
     let Some(root) = native["session_id"]
         .as_str()
         .filter(|root| uuid::Uuid::parse_str(root).is_ok())
@@ -233,7 +238,7 @@ pub fn read_claude_observation(
     Ok(bind_provider_observation(
         launch,
         root,
-        NativeIdentitySource::ClaudeNativeEvent,
+        source,
         &serde_json::json!({"sessionStart":value,"loadedContext":loaded}),
     ))
 }
@@ -467,6 +472,82 @@ fn validate_amplifier_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_terminal_compaction_preserves_current_loader_observation() {
+        let root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        for source in ["startup", "resume"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session-start.json");
+            let launch = NativeIdentityLaunch {
+                incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+                launch_nonce: "current".into(),
+                evidence_revision: 1,
+                execution_generation: 1,
+                requested_native_session_id: (source == "resume").then(|| root.into()),
+            };
+            let native = serde_json::json!({"hook_event_name":"SessionStart","source":source,
+                "session_id":root,"cwd":"/owned","transcript_path":"/owned/session.jsonl"});
+            let loaded = serde_json::json!({"launch":launch,"native":{"session_id":root,
+                "transcript_path":"/owned/session.jsonl","workspace":{"current_dir":"/owned"},
+                "version":"2.1.263","model":{"id":"synthetic"},
+                "context_window":{"context_window_size":200000,"current_usage":null}}});
+            std::fs::write(
+                directory.path().join("statusline-loaded.json"),
+                serde_json::to_vec(&loaded).unwrap(),
+            )
+            .unwrap();
+            let publish = |native: &Value| {
+                let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../freshell-claude-sidecar/native-session-channel.mjs");
+                let output = std::process::Command::new("node")
+                    .args(["--input-type=module", "--eval",
+                        "const {writeNativeSessionSignal}=await import(process.argv[1]);await writeNativeSessionSignal(JSON.parse(process.argv[2]));"])
+                    .arg(module)
+                    .arg(serde_json::to_string(native).unwrap())
+                    .env(LAUNCH_ENV, serde_json::to_string(&launch).unwrap())
+                    .env(SIGNAL_DIR_ENV, directory.path())
+                    .output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let read = || {
+                read_claude_observation(
+                    &path,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                    &launch,
+                    source,
+                    std::path::Path::new("/owned"),
+                )
+                .unwrap()
+            };
+            publish(&native);
+            assert_eq!(read().unwrap().native_session_id, root);
+            for _ in 0..2 {
+                let mut compact = native.clone();
+                compact["source"] = "compact".into();
+                publish(&compact);
+                assert_eq!(
+                    read()
+                        .expect("same-session compaction keeps terminal input ready")
+                        .native_session_id,
+                    root
+                );
+            }
+            let mut switched = native.clone();
+            switched["source"] = "compact".into();
+            switched["session_id"] = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into();
+            publish(&switched);
+            assert!(
+                read().is_none(),
+                "another native root cannot reuse the original receipt"
+            );
+        }
+    }
 
     #[test]
     fn amplifier_ack_file_replacement_truncation_or_reset_cannot_recertify_identity() {

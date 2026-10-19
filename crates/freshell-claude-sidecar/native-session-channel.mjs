@@ -333,6 +333,19 @@ export async function writeNativeSessionSignal(input, env = process.env) {
     || !validRoot(input.session_id) || !sessionStartSources.has(input.source)) {
     throw new Error('invalid native SessionStart')
   }
+  if (input.source === 'compact') {
+    // Compaction continues the admitted session; it is not another launch.
+    // Keep the receipt that selected its current root, including a clear,
+    // so the statusline can still prove it. Changed roots/launches remain visible.
+    try {
+      const prior = JSON.parse(await readFile(join(env[signalKey], 'session-start.json'), 'utf8'))
+      if (canonicalJson(prior.launch) === canonicalJson(JSON.parse(env[launchKey] ?? 'null'))
+        && ['startup', 'resume', 'clear'].includes(prior.native?.source)
+        && ['session_id', 'cwd', 'transcript_path'].every(key => prior.native[key] === input[key])) return
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error
+    }
+  }
   await writeNativeSignal('session-start.json', input, env)
 }
 

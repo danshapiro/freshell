@@ -1036,6 +1036,8 @@ mod tests {
         );
         // `revision` is transcript-mtime-derived — not the shape under test.
         expected["revision"] = value["revision"].clone();
+        expected["extensions"]["claude"]["nativeHistoryActivity"] =
+            json!({"at":1_786_788_000_000_i64,"source":"native_timestamp"});
         expected["extensions"]["claude"]["statusFromLiveState"] = json!(true);
         assert_eq!(
             value, expected,
@@ -1250,6 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_snapshot_success_returns_200_with_camelcase_body() {
+        let native_home = crate::codex::tests::small_native_home("thread-1");
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -1282,7 +1285,7 @@ mod tests {
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
             &init_id,
-            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+            json!({ "userAgent": "x", "codexHome": native_home.path(), "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await;
         let (id, method, _params) = peer.expect_request().await;
