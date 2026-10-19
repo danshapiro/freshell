@@ -1243,12 +1243,16 @@ mod tests {
 
         const TEST_NAME: &str = "managed_mcp_capability::tests::startup_rehydrate_preserves_stopped_runtime_mounts_until_replacement";
         const CHILD_ENV: &str = "FRESHELL_TEST_MCP_STARTUP_LIFETIME_CHILD";
+        const ROOT_ENV: &str = "FRESHELL_TEST_MCP_STARTUP_LIFETIME_ROOT";
         // Re-exec just this case: SETTINGS, STORE and Docker's capability path
         // are process-wide OnceLocks, also used by the existing callback test.
         if std::env::var(CHILD_ENV).as_deref() != Ok(TEST_NAME) {
+            // Keep cleanup ownership here even when the child must be killed.
+            let root = tempfile::tempdir().unwrap();
             let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env(CHILD_ENV, TEST_NAME)
+                .env(ROOT_ENV, root.path())
                 .kill_on_drop(true)
                 .spawn()
                 .expect("start the isolated startup lifetime case");
@@ -1328,9 +1332,11 @@ mod tests {
             prepared.incarnation_id
         }
 
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        let workspace = root.path().join("workspace");
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV).expect("use the parent-owned startup lifetime directory"),
+        );
+        let home = root.join("home");
+        let workspace = root.join("workspace");
         let config_home = home.join(".config");
         std::fs::create_dir_all(config_home.join("opencode")).unwrap();
         std::fs::create_dir(&workspace).unwrap();
@@ -1338,12 +1344,9 @@ mod tests {
         // These variables belong only to this exact-test child process.
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::set_var(
-            "FRESHELL_RUNTIME_CAPABILITY_DIR",
-            root.path().join("mcp-capabilities"),
-        );
-        let socket = root.path().join("control.sock");
-        let secret_file = root.path().join("control-secret");
+        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", root.join("mcp-capabilities"));
+        let socket = root.join("control.sock");
+        let secret_file = root.join("control-secret");
         let secret = "startup-lifetime-private-test-control";
         std::fs::write(&secret_file, secret).unwrap();
         configure("0.0.0.0", 4001, &socket, &secret_file).unwrap();
@@ -1400,7 +1403,12 @@ mod tests {
             provider_launch_context: Some(ProviderLaunchContext {
                 preparation: ProviderPreparation::Opencode {
                     project_config: Vec::new(),
-                    tui_config: None,
+                    tui_config: Some(ProviderConfigReference {
+                        root: ProviderConfigRoot::Ephemeral,
+                        relative_path: "tui-config.jsonc".into(),
+                        provider_relative_path: ".freshell/opencode/user-tui.jsonc".into(),
+                        format: "jsonc".into(),
+                    }),
                     tui_source: Some(tui_source.clone()),
                     inline_config: true,
                 },
@@ -1408,8 +1416,8 @@ mod tests {
                 config: Vec::new(),
             }),
         };
-        let registry = Registry::open(&root.path().join("registry"), None).unwrap();
-        let incarnation = register_terminal(&registry, root.path(), &soul, terminal.clone()).await;
+        let registry = Registry::open(&root.join("registry"), None).unwrap();
+        let incarnation = register_terminal(&registry, &root, &soul, terminal.clone()).await;
         prior
             .activate(
                 &reference.grant_id,
@@ -1442,8 +1450,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .mcp_capability = Some(live_reference.clone());
-        let live_incarnation =
-            register_terminal(&registry, root.path(), &live_soul, live_terminal).await;
+        let live_incarnation = register_terminal(&registry, &root, &live_soul, live_terminal).await;
         prior
             .activate(
                 &live_reference.grant_id,
@@ -1473,18 +1480,18 @@ mod tests {
 
         // The inventory route uses the production registry/control transport.
         // No runtime operation is needed; the private Docker socket is absent.
-        let unused_docker = root.path().join("unused-docker.sock");
+        let unused_docker = root.join("unused-docker.sock");
         let supervisor = Supervisor::new(
             registry.clone(),
             default_backend(&unused_docker),
             SupervisorConfig {
-                runtime_root: root.path().into(),
+                runtime_root: root.clone(),
                 control_socket_path: socket.clone(),
                 host_binary_path: std::env::current_exe().unwrap(),
                 image_ref: format!("sha256:{}", "b".repeat(64)),
                 test_run_id: "startup-lifetime".into(),
                 control_secret: secret.into(),
-                lifecycle_log: root.path().join("lifecycle.jsonl"),
+                lifecycle_log: root.join("lifecycle.jsonl"),
                 admission: AdmissionPolicy::default(),
             },
         )
