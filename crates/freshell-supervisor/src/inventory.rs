@@ -304,14 +304,17 @@ impl Supervisor {
                             "outcome": "scheduled",
                         }),
                     );
-                    let _ = supervisor
-                        .recover(RecoverRequest {
-                            soul_id: view.soul_id,
-                            trigger,
-                            expected_intent_revision: Some(view.intent_revision),
-                            expected_control_epoch: Some(supervisor.registry.control_epoch()),
-                        })
-                        .await?;
+                    let request = RecoverRequest {
+                        soul_id: view.soul_id,
+                        trigger,
+                        expected_intent_revision: Some(view.intent_revision),
+                        expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                    };
+                    if retry_capability {
+                        supervisor.retry_capability_pending(request).await?;
+                    } else {
+                        let _ = supervisor.recover(request).await?;
+                    }
                 }
                 Ok::<(), RuntimeError>(())
             });

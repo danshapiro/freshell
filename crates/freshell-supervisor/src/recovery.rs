@@ -227,12 +227,62 @@ impl Supervisor {
         }
     }
 
+    pub(crate) async fn retry_capability_pending(
+        &self,
+        request: RecoverRequest,
+    ) -> Result<(), RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        let _recovery_guard = lifecycle_lock.lock().await;
+        let current = self
+            .registry
+            .inventory()
+            .await
+            .map_err(map_registry)?
+            .into_iter()
+            .rev()
+            .find(|view| view.soul_id == request.soul_id);
+        if !current.as_ref().is_some_and(|view| {
+            view.desired_state == DesiredState::Running
+                && view.recovery_state == freshell_runtime_protocol::RecoveryState::Blocked
+                && view.recovery_reason.as_deref() == Some("CAPABILITY_PENDING")
+                && Some(view.intent_revision) == request.expected_intent_revision
+        }) {
+            crate::service::append_event(
+                &self.config.lifecycle_log,
+                "supervisor.runtime_observer.recovery_skipped",
+                serde_json::json!({
+                    "soulId": request.soul_id,
+                    "intentRevision": request.expected_intent_revision,
+                    "currentIntentRevision": current.as_ref().map(|view| view.intent_revision),
+                    "currentRecoveryReason": current.as_ref().and_then(|view| view.recovery_reason.as_deref()),
+                    "severity": "info",
+                    "cause": "capability_retry_superseded",
+                    "action": "skip_recovery",
+                    "outcome": "unchanged",
+                }),
+            );
+            return Ok(());
+        }
+        // Keep this guard through recovery entry; unlocking before recover
+        // would allow another same-intent verdict to supersede eligibility.
+        self.recover_locked(request).await?;
+        Ok(())
+    }
+
     pub(crate) async fn recover(
         &self,
         request: RecoverRequest,
     ) -> Result<RecoveryResult, RuntimeError> {
         let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
         let _recovery_guard = lifecycle_lock.lock().await;
+        self.recover_locked(request).await
+    }
+
+    // Both entry points hold the same per-soul lifecycle lock for this body.
+    async fn recover_locked(
+        &self,
+        request: RecoverRequest,
+    ) -> Result<RecoveryResult, RuntimeError> {
         self.registry
             .assert_soul_intent_revision(request.soul_id.clone(), request.expected_intent_revision)
             .await
