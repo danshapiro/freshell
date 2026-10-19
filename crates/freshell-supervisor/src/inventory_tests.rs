@@ -195,3 +195,138 @@ async fn observer_leaves_lost_soul_inert() {
     assert_eq!(supervisor.registry.inventory().await.unwrap(), before);
     assert!(!supervisor.config.lifecycle_log.exists());
 }
+
+async fn assert_queued_capability_retry_preserves_newer_block(
+    reason: RecoveryBlockReason,
+    expected_reason: &str,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, soul, incarnation) = stopped_supervisor(root.path()).await;
+    supervisor
+        .registry
+        .mark_recovery_blocked(
+            soul.clone(),
+            None,
+            RecoveryBlockReason::CapabilityPending,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let capability_snapshot = supervisor.registry.inventory().await.unwrap();
+    assert_eq!(capability_snapshot.len(), 1);
+    assert_eq!(capability_snapshot[0].desired_state, DesiredState::Running);
+    assert_eq!(capability_snapshot[0].launch_state, LaunchState::Stopped);
+    assert_eq!(
+        capability_snapshot[0].recovery_reason.as_deref(),
+        Some("CAPABILITY_PENDING")
+    );
+
+    // Hold the real lock that the observer's recovery transaction must enter.
+    let lifecycle_lock = supervisor.lifecycle_lock(&soul).await;
+    let lifecycle_guard = lifecycle_lock.lock().await;
+    let observer = supervisor.observe_once();
+    tokio::pin!(observer);
+
+    // This existing event is emitted after the observer has consumed its CAP
+    // snapshot and before it can acquire the held lifecycle lock. Registry
+    // reads drive progress; no sleep, yield count or scheduler ordering is used.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut observer => {
+                    panic!("observer completed while its lifecycle lock was held: {result:?}");
+                }
+                snapshot = supervisor.registry.inventory() => {
+                    assert_eq!(snapshot.unwrap(), capability_snapshot);
+                    let log = match std::fs::read_to_string(&supervisor.config.lifecycle_log) {
+                        Ok(log) => log,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => panic!("cannot read observer scheduling event: {error}"),
+                    };
+                    for line in log.split_inclusive('\n').filter(|line| line.ends_with('\n')) {
+                        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                        if event["event"].as_str()
+                            == Some("supervisor.runtime_observer.recovery_scheduled")
+                            && event["data"]["soulId"].as_str() == Some(soul.as_str())
+                            && event["data"]["intentRevision"].as_u64()
+                                == Some(capability_snapshot[0].intent_revision)
+                            && event["data"]["cause"].as_str() == Some("CAPABILITY_PENDING")
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("observer did not schedule the capability retry before the safety bound");
+
+    supervisor
+        .registry
+        .mark_recovery_blocked(
+            soul.clone(),
+            None,
+            reason,
+            vec!["a newer recovery verdict superseded the queued capability retry".into()],
+        )
+        .await
+        .unwrap();
+    let protected_snapshot = supervisor.registry.inventory().await.unwrap();
+    assert_eq!(protected_snapshot.len(), 1);
+    assert_eq!(protected_snapshot[0].incarnation_id, incarnation);
+    assert_eq!(
+        protected_snapshot[0].native_session_id,
+        capability_snapshot[0].native_session_id
+    );
+    assert_eq!(
+        protected_snapshot[0].intent_revision,
+        capability_snapshot[0].intent_revision,
+        "this verdict must exercise the same-intent race"
+    );
+    assert_eq!(protected_snapshot[0].recovery_state, RecoveryState::Blocked);
+    assert_eq!(
+        protected_snapshot[0].recovery_reason.as_deref(),
+        Some(expected_reason)
+    );
+
+    drop(lifecycle_guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut observer)
+        .await
+        .expect("queued observer did not settle after lock release")
+        .unwrap();
+
+    assert_eq!(
+        supervisor.registry.inventory().await.unwrap(),
+        protected_snapshot,
+        "a queued capability retry must preserve a newer same-intent block"
+    );
+    let log = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+    for line in log.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            !event["event"]
+                .as_str()
+                .is_some_and(|event| event.starts_with("supervisor.recovery.")),
+            "superseded capability retry entered recovery work: {event}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn observer_queued_capability_retry_preserves_newer_manual_block() {
+    assert_queued_capability_retry_preserves_newer_block(
+        RecoveryBlockReason::RetryBudget,
+        "RETRY_BUDGET",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn observer_queued_capability_retry_preserves_newer_dependency_block() {
+    assert_queued_capability_retry_preserves_newer_block(
+        RecoveryBlockReason::CredentialsExpired,
+        "CREDENTIALS_EXPIRED",
+    )
+    .await;
+}
