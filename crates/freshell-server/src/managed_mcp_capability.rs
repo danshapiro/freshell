@@ -1224,6 +1224,413 @@ pub(crate) async fn scoped_auth_middleware(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn startup_rehydrate_preserves_stopped_runtime_mounts_until_replacement() {
+        use freshell_runtime_client::RuntimeClient;
+        use freshell_runtime_protocol::{
+            DockerDaemonId, HostBootId, ProviderLaunchContext, ProviderPreparation,
+            RecoveryBlockReason, RequestId, RuntimeLimits, RuntimeProfile, StopOutcome,
+            TerminalLaunchSpec,
+        };
+        use freshell_supervisor::{
+            admission::AdmissionPolicy,
+            backend::docker,
+            registry::{BackendCreatedRecord, LaunchPreparation, Registry},
+            service::{default_backend, serve_control, Supervisor, SupervisorConfig},
+        };
+        use futures_util::FutureExt;
+        use std::time::Duration;
+
+        const TEST_NAME: &str = "managed_mcp_capability::tests::startup_rehydrate_preserves_stopped_runtime_mounts_until_replacement";
+        const CHILD_ENV: &str = "FRESHELL_TEST_MCP_STARTUP_LIFETIME_CHILD";
+        // Re-exec just this case: SETTINGS, STORE and Docker's capability path
+        // are process-wide OnceLocks, also used by the existing callback test.
+        if std::env::var(CHILD_ENV).as_deref() != Ok(TEST_NAME) {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, TEST_NAME)
+                .kill_on_drop(true)
+                .spawn()
+                .expect("start the isolated startup lifetime case");
+            let status = match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
+                Ok(status) => status.expect("reap the isolated startup lifetime case"),
+                Err(_) => {
+                    child
+                        .kill()
+                        .await
+                        .expect("kill and reap the owned test child");
+                    panic!("isolated startup lifetime case exceeded its deadline");
+                }
+            };
+            assert!(status.success(), "isolated startup lifetime case failed");
+            return;
+        }
+
+        async fn register_terminal(
+            registry: &Registry,
+            root: &Path,
+            soul: &SoulId,
+            terminal: TerminalLaunchSpec,
+        ) -> IncarnationId {
+            let limits = RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 64 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 32,
+            };
+            let container_id = format!("{:x}", Sha256::digest(terminal.terminal_id.as_bytes()));
+            let prepared = registry
+                .prepare_launch(LaunchPreparation {
+                    soul_id: soul.clone(),
+                    provider: "opencode".into(),
+                    provider_store_id: soul.to_string(),
+                    native_session_id: Some(format!("native-{}", terminal.terminal_id)),
+                    creation_seed_ref: "startup-lifetime-seed".into(),
+                    request_id: RequestId::new(),
+                    payload_digest: container_id.clone(),
+                    requested_limits: limits,
+                    profile: RuntimeProfile::Custom,
+                    project_key: terminal.project_key.clone(),
+                    fixture: None,
+                    terminal: Some(terminal),
+                    fresh_agent: None,
+                    view_intent: None,
+                    admission: AdmissionPolicy::default(),
+                })
+                .await
+                .unwrap();
+            registry
+                .commit_created(
+                    prepared.incarnation_id.clone(),
+                    BackendCreatedRecord {
+                        daemon_id: DockerDaemonId::new(),
+                        container_id,
+                        image_ref: format!("sha256:{}", "b".repeat(64)),
+                        runtime_dir: root.join(prepared.incarnation_id.as_str()),
+                        host_binary_path: std::env::current_exe().unwrap(),
+                        immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                    },
+                )
+                .await
+                .unwrap();
+            registry
+                .commit_execution_grant(
+                    prepared.incarnation_id.clone(),
+                    HostBootId::new(),
+                    limits,
+                )
+                .await
+                .unwrap();
+            registry
+                .mark_running(prepared.incarnation_id.clone())
+                .await
+                .unwrap();
+            prepared.incarnation_id
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let config_home = home.join(".config");
+        std::fs::create_dir_all(config_home.join("opencode")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        // These variables belong only to this exact-test child process.
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::set_var(
+            "FRESHELL_RUNTIME_CAPABILITY_DIR",
+            root.path().join("mcp-capabilities"),
+        );
+        let socket = root.path().join("control.sock");
+        let secret_file = root.path().join("control-secret");
+        let secret = "startup-lifetime-private-test-control";
+        std::fs::write(&secret_file, secret).unwrap();
+        configure("0.0.0.0", 4001, &socket, &secret_file).unwrap();
+        docker::configure_capability_dir(&socket).unwrap();
+        let directory = capability_dir().unwrap();
+        let current_endpoint = endpoint().unwrap();
+        let tui = config_home.join("opencode/tui.jsonc");
+        let initial_tui = "{ // before restart\n\"theme\":\"dark\" }\n";
+        let edited_tui = "{ // edited while web was down\n\"theme\":\"solarized\" }\n";
+        std::fs::write(&tui, initial_tui).unwrap();
+        let tui_source = approved_tui_source(tui.to_str().unwrap(), &workspace, &workspace, &home)
+            .unwrap();
+        let inline = r#"{"model":"startup-lifetime-model"}"#;
+        let prior = CapabilityStore::default();
+        let soul = SoulId::new();
+        let reference = prior
+            .issue(
+                soul.clone(),
+                &directory,
+                current_endpoint.clone(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    inline_config: Some(inline),
+                    tui_source: Some(&tui_source),
+                    workspace: Some(&workspace),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let terminal = TerminalLaunchSpec {
+            terminal_id: "startup-stopped".into(),
+            stream_id: "startup-stopped-stream".into(),
+            mode: "opencode".into(),
+            program: "opencode".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            cwd: workspace.to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "startup-lifetime".into(),
+            workspace_path: workspace.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: Some(ProviderLaunchContext {
+                preparation: ProviderPreparation::Opencode {
+                    project_config: Vec::new(),
+                    tui_config: None,
+                    tui_source: Some(tui_source.clone()),
+                    inline_config: true,
+                },
+                mcp_capability: Some(reference.clone()),
+                config: Vec::new(),
+            }),
+        };
+        let registry = Registry::open(&root.path().join("registry"), None).unwrap();
+        let incarnation = register_terminal(&registry, root.path(), &soul, terminal.clone()).await;
+        prior
+            .activate(
+                &reference.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                &directory,
+                &current_endpoint,
+            )
+            .unwrap();
+        let original_file = grant_path(&directory, &reference.grant_id).unwrap();
+        let original_stage = staged_provider_root_path(&directory, &reference.grant_id).unwrap();
+        let original_grant: StoredCapabilityFile =
+            serde_json::from_slice(&std::fs::read(&original_file).unwrap()).unwrap();
+        let live_soul = SoulId::new();
+        let live_reference = prior
+            .issue(
+                live_soul.clone(),
+                &directory,
+                current_endpoint.clone(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput::default(),
+                None,
+            )
+            .unwrap();
+        let mut live_terminal = terminal.clone();
+        live_terminal.terminal_id = "startup-live".into();
+        live_terminal.stream_id = "startup-live-stream".into();
+        live_terminal
+            .provider_launch_context
+            .as_mut()
+            .unwrap()
+            .mcp_capability = Some(live_reference.clone());
+        let live_incarnation =
+            register_terminal(&registry, root.path(), &live_soul, live_terminal).await;
+        prior
+            .activate(
+                &live_reference.grant_id,
+                live_soul.clone(),
+                live_incarnation.clone(),
+                &directory,
+                &current_endpoint,
+            )
+            .unwrap();
+        let live_file = grant_path(&directory, &live_reference.grant_id).unwrap();
+        let live_stage = staged_provider_root_path(&directory, &live_reference.grant_id).unwrap();
+        let live_grant: StoredCapabilityFile =
+            serde_json::from_slice(&std::fs::read(&live_file).unwrap()).unwrap();
+        let orphan = prior
+            .issue(
+                SoulId::new(),
+                &directory,
+                current_endpoint.clone(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput::default(),
+                None,
+            )
+            .unwrap();
+        let orphan_file = grant_path(&directory, &orphan.grant_id).unwrap();
+        let orphan_stage = staged_provider_root_path(&directory, &orphan.grant_id).unwrap();
+        drop(prior);
+
+        // The inventory route uses the production registry/control transport.
+        // No runtime operation is needed; the private Docker socket is absent.
+        let unused_docker = root.path().join("unused-docker.sock");
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            default_backend(&unused_docker),
+            SupervisorConfig {
+                runtime_root: root.path().into(),
+                control_socket_path: socket.clone(),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                test_run_id: "startup-lifetime".into(),
+                control_secret: secret.into(),
+                lifecycle_log: root.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        let control_socket = socket.clone();
+        let control = tokio::spawn(async move { serve_control(supervisor, &control_socket).await });
+        let result = std::panic::AssertUnwindSafe(tokio::time::timeout(
+            Duration::from_secs(15),
+            async {
+                while !socket.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let client = RuntimeClient::new(&socket, secret);
+                let stale_active = client
+                    .inventory()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|view| (view.soul_id, view.incarnation_id))
+                    .collect::<HashSet<_>>();
+                registry
+                    .mark_stop_outcome(incarnation.clone(), StopOutcome::VerifiedEmpty)
+                    .await
+                    .unwrap();
+                registry
+                    .mark_recovery_blocked(
+                        soul.clone(),
+                        None,
+                        RecoveryBlockReason::CapabilityPending,
+                        vec!["web callback unavailable".into()],
+                    )
+                    .await
+                    .unwrap();
+                let before_views = client.inventory().await.unwrap();
+                assert_eq!(before_views.len(), 2);
+                let stopped = before_views
+                    .iter()
+                    .find(|view| view.soul_id == soul)
+                    .unwrap();
+                assert_eq!(stopped.desired_state, DesiredState::Running);
+                assert_eq!(stopped.launch_state, LaunchState::Stopped);
+                assert_eq!(
+                    stopped.recovery_reason.as_deref(),
+                    Some("CAPABILITY_PENDING")
+                );
+                let handle = registry.owned_handle(incarnation.clone()).await.unwrap();
+                let persisted_terminal = handle.terminal().unwrap();
+                let original_mounts = docker::terminal_mounts(persisted_terminal).unwrap();
+                assert!(
+                    original_mounts.provider_user_root.as_deref() == Some(original_stage.as_path())
+                );
+                assert!(
+                    original_mounts.mcp_capability_file.as_deref() == Some(original_file.as_path())
+                );
+                std::fs::write(&tui, edited_tui).unwrap();
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "severity": "info",
+                        "cause": "web_restart_with_stopped_incarnation",
+                        "action": "rehydrate",
+                        "outcome": "started",
+                    })
+                );
+
+                rehydrate_running_capabilities(&client).await.unwrap();
+
+                let after_mounts = docker::terminal_mounts(persisted_terminal);
+                assert!(
+                    after_mounts.is_ok(),
+                    "startup must retain stopped incarnation mount sources until replacement"
+                );
+                assert!(after_mounts.unwrap() == original_mounts);
+                assert!(!store().authenticates(&original_grant.scope));
+                let before_renewal = std::fs::read(&original_file).unwrap();
+                store().renew_active_at(now_secs() + GRANT_LIFETIME_SECS, &stale_active);
+                assert!(
+                    std::fs::read(&original_file).unwrap() == before_renewal,
+                    "a stale active inventory must not renew a stopped incarnation grant"
+                );
+                assert!(!store().authenticates(&original_grant.scope));
+                assert!(live_file.is_file() && live_stage.is_dir());
+                assert!(store().authenticates(&live_grant.scope));
+                assert!(!orphan_file.exists() && !orphan_stage.exists());
+                assert!(client.inventory().await.unwrap() == before_views);
+
+                // The prior registry state is verified_empty before the same
+                // replacement issue boundary used by fenced recovery.
+                assert_eq!(
+                    stopped.cleanup_state,
+                    freshell_runtime_protocol::CleanupState::VerifiedEmpty
+                );
+                let replacement = store()
+                    .issue_replacement(
+                        soul.clone(),
+                        &directory,
+                        current_endpoint.clone(),
+                        Some(("opencode", &home, &[])),
+                        Some(&tui_source),
+                        Some(&workspace),
+                    )
+                    .unwrap();
+                let replacement_stage =
+                    staged_provider_root_path(&directory, &replacement.grant_id).unwrap();
+                assert!(
+                    std::fs::read_to_string(replacement_stage.join("ephemeral/inline-config.json"))
+                        .unwrap()
+                        == inline
+                );
+                assert!(
+                    std::fs::read_to_string(replacement_stage.join("ephemeral/tui-config.jsonc"))
+                        .unwrap()
+                        == edited_tui
+                );
+                assert!(std::fs::read_to_string(&tui).unwrap() == edited_tui);
+                assert!(!original_file.exists() && !original_stage.exists());
+                assert!(!store().authenticates(&original_grant.scope));
+                assert!(live_file.is_file() && live_stage.is_dir());
+                assert!(store().authenticates(&live_grant.scope));
+                assert!(client.inventory().await.unwrap() == before_views);
+                assert!(!unused_docker.exists());
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "severity": "info",
+                        "cause": "startup_lifetime_checked",
+                        "action": "issue_replacement",
+                        "outcome": "completed",
+                    })
+                );
+            },
+        ))
+        .catch_unwind()
+        .await;
+        control.abort();
+        let stopped_control = control.await.unwrap_err();
+        assert!(
+            stopped_control.is_cancelled(),
+            "reap the owned inventory listener"
+        );
+        match result {
+            Ok(result) => result.expect("startup lifetime case exceeded its deadline"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     #[test]
     fn managed_mcp_stages_only_approved_provider_config() {
         use freshell_runtime_protocol::{ProviderConfigReference, ProviderConfigRoot};
