@@ -1,7 +1,11 @@
 //! Read a selected native transcript without creating a provider runtime.
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
-use std::{collections::VecDeque, io::Read, path::Path};
+use std::{
+    collections::VecDeque,
+    io::{Read, Seek},
+    path::Path,
+};
 
 #[path = "native_history_source.rs"]
 mod source;
@@ -597,19 +601,21 @@ pub(crate) fn read_claude_path(
     session_type: &str,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, String> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     let extent = metadata.len();
     let retention = Retention::new();
-    let source = Records::new(std::io::BufReader::new(file.take(extent)), &retention);
+    let source = Records::new(std::io::BufReader::new((&file).take(extent)), &retention);
     let mut turns = RetainedTurns::new(&retention);
     let mut ordinal = 0;
     let mut omitted_items = 0;
     let mut native_activity = None;
+    let mut has_record = false;
     for record in source {
         let Some((record, omitted)) = record.map_err(|e| e.to_string())? else {
             continue;
         };
+        has_record = true;
         if let Some(at) = freshell_sessions::time::parse_timestamp_ms(&record["timestamp"]) {
             native_activity = Some(native_activity.map_or(at, |prior: i64| prior.max(at)));
         }
@@ -622,6 +628,17 @@ pub(crate) fn read_claude_path(
             omitted_items += omitted;
             turns.push(turn);
             ordinal += 1;
+        }
+    }
+    if !has_record && extent > 0 {
+        // Preserve empty/new and valid partial JSONL sources, but do not claim
+        // unreadable bytes are an available empty conversation. A valid prefix
+        // already supplies readable history even if a crash interrupted its tail.
+        file.rewind().map_err(|error| error.to_string())?;
+        if let Err(error) = validate_utf8_text(file.take(extent)) {
+            tracing::warn!(event = "freshagent.native_history.unreadable_claude_source",
+                session_id = id, source_bytes = extent, reason = %error);
+            return Err(format!("selected Claude transcript is unreadable: {error}"));
         }
     }
     let omitted = turns.omitted;
@@ -657,4 +674,100 @@ pub(crate) fn read_claude_path(
         Some(&retention),
     )?;
     Ok(snapshot)
+}
+
+fn validate_utf8_text(mut source: impl Read) -> std::io::Result<()> {
+    let mut bytes = [0; 64 * 1024];
+    let mut pending = 0;
+    loop {
+        let read = match source.read(&mut bytes[pending..]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let used = pending + read;
+        match std::str::from_utf8(&bytes[..used]) {
+            Ok(_) => pending = 0,
+            Err(error) if read == 0 || error.error_len().is_some() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+            }
+            Err(error) => {
+                pending = used - error.valid_up_to();
+                bytes.copy_within(error.valid_up_to()..used, 0);
+            }
+        }
+        if read == 0 {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_claude_source(bytes: &[u8]) -> Result<Value, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved-native.jsonl");
+        std::fs::write(&path, bytes).unwrap();
+        let result = read_claude_path(&path, "saved-native", "freshclaude", None);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        result
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_rejects_wholly_unreadable_native_bytes() {
+        for bytes in [
+            vec![0xff, 0xfe],
+            b"{\"type\":\"user\",\xff".to_vec(),
+            vec![0xf0, 0x9f],
+        ] {
+            assert!(
+                read_claude_source(&bytes).is_err(),
+                "unreadable bytes must not become an available empty conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_keeps_empty_and_metadata_only_sources() {
+        for bytes in [
+            b"".as_slice(),
+            b"\n \t\n",
+            b"{\"type\":\"system\",\"subtype\":\"init\"}\n",
+        ] {
+            let snapshot = read_claude_source(bytes).unwrap();
+            assert_eq!(snapshot["turns"], json!([]));
+            assert_eq!(snapshot["threadId"], "saved-native");
+        }
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_keeps_partial_utf8_sources_across_buffer_boundaries() {
+        for character in ['é', '中', '🙂'] {
+            let mut bytes = vec![b'"'];
+            bytes.extend(std::iter::repeat_n(b'x', 64 * 1024 - 2));
+            bytes.extend(character.to_string().repeat(4).as_bytes());
+            let snapshot = read_claude_source(&bytes).unwrap();
+            assert_eq!(snapshot["turns"], json!([]));
+            bytes.pop();
+            assert!(
+                read_claude_source(&bytes).is_err(),
+                "an incomplete UTF8 character with no readable record is unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_claude_snapshot_preserves_complete_prefix_before_crash_tail() {
+        let mut bytes = b"{\"type\":\"user\",\"uuid\":\"first-user\",\"message\":{\"role\":\"user\",\"content\":\"Saved prompt before interrupted append\"}}\n".to_vec();
+        bytes.extend(b"{\"type\":\"assistant\",\"message\":\xff\xfe");
+        let snapshot = read_claude_source(&bytes).unwrap();
+        assert_eq!(snapshot["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["turns"][0]["turnId"], "first-user");
+        assert_eq!(
+            snapshot["turns"][0]["items"][0]["text"],
+            "Saved prompt before interrupted append"
+        );
+    }
 }
