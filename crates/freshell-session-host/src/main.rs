@@ -14317,7 +14317,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
     async fn baseline_only_unavailable_saved_undo_preserves_native_reference() {
         use freshell_sessions::opencode_transfer::{
             saved_snapshot_summary, OpenCodeTransferManifest, SavedSnapshotAvailability,
-            SavedSnapshotSummary,
+            SavedSnapshotReference, SavedSnapshotSummary,
         };
 
         let fixture =
@@ -14325,8 +14325,14 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 .unwrap();
         let manifest: OpenCodeTransferManifest =
             serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
-        assert_eq!(manifest.saved_snapshots.len(), 1);
-        let reference = &manifest.saved_snapshots[0];
+        let payload: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(fixture.ready.join("entry-0000.bin")).unwrap(),
+        )
+        .unwrap();
+        let references: Vec<SavedSnapshotReference> =
+            serde_json::from_value(payload["saved_snapshots"].clone()).unwrap();
+        assert_eq!(references.len(), 1);
+        let reference = &references[0];
         assert_eq!(
             reference.availability,
             SavedSnapshotAvailability::UnavailableInQualifiedLocations
@@ -14344,6 +14350,16 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             .unwrap();
         assert!(imported.result.is_ok(), "{:?}", imported.result);
         let root = imported.root.path();
+        let receipt: freshell_agent_runtime::opencode_transfer::ImportReceipt =
+            serde_json::from_slice(
+                &std::fs::read(root.join("host-state/opencode-synthetic-transfer-import.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.saved_snapshot_summary,
+            saved_snapshot_summary(&manifest)
+        );
         let database = root.join("provider-home/.local/share/opencode/opencode.db");
         let preserved = [
             root.join("source.sqlite"),
@@ -14407,7 +14423,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
     }
 
     #[tokio::test]
-    async fn baseline_only_unreadable_store_asset_and_interrupted_gate_retry() {
+    async fn baseline_only_resume_allows_missing_workspace_asset_and_retries_unreadable_store() {
         for case in ["store", "asset", "pre_pty_log"] {
             let missing_asset = case == "asset";
             let fixture = stage_synthetic_opencode_transfer_with_asset(missing_asset).unwrap();
@@ -14438,16 +14454,34 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             if case == "pre_pty_log" {
                 std::fs::create_dir(&unavailable).unwrap();
             }
-            let blocked = run_synthetic_exact_resume(&imported, None, true)
+            let attempt = run_synthetic_exact_resume(&imported, None, true)
                 .await
                 .unwrap();
-            assert!(blocked.result.is_err(), "{case}");
-            assert!(blocked.state.persisted.lock().await.grant_id.is_none());
-            assert_eq!(*blocked.events.lock().unwrap(), ["current"]);
-            assert!(!blocked
-                .pty_callback_invoked
-                .load(std::sync::atomic::Ordering::SeqCst));
-            assert!(blocked.adoption_expectation.lock().unwrap().is_none());
+            if case == "asset" {
+                assert!(attempt.result.is_ok(), "{:?}", attempt.result);
+                assert!(attempt.state.persisted.lock().await.grant_id.is_some());
+                assert_eq!(*attempt.events.lock().unwrap(), ["current", "pty"]);
+                assert!(attempt
+                    .pty_callback_invoked
+                    .load(std::sync::atomic::Ordering::SeqCst));
+                assert!(attempt.adoption_expectation.lock().unwrap().is_some());
+                assert!(
+                    !unavailable.exists(),
+                    "resume must not recreate workspace files"
+                );
+                assert_eq!(
+                    std::fs::read(&retained).unwrap(),
+                    b"fictional saved prompt asset"
+                );
+            } else {
+                assert!(attempt.result.is_err(), "{case}");
+                assert!(attempt.state.persisted.lock().await.grant_id.is_none());
+                assert_eq!(*attempt.events.lock().unwrap(), ["current"]);
+                assert!(!attempt
+                    .pty_callback_invoked
+                    .load(std::sync::atomic::Ordering::SeqCst));
+                assert!(attempt.adoption_expectation.lock().unwrap().is_none());
+            }
             assert!(!root.join("missing-transfer-mount").exists());
             if case == "pre_pty_log" {
                 std::fs::remove_dir(&unavailable).unwrap();
@@ -15260,13 +15294,30 @@ process.stdout.write(JSON.stringify(source.families.map(f=>f.rootId)));
                     )
                     .unwrap();
                 assert!(
-                    verify_installed_store(descriptor, &reader).is_err(),
-                    "{table} full row mutation must be refused"
+                    verify_installed_store(descriptor, &reader).is_ok(),
+                    "current readable {table} data does not need historical mutation proof"
                 );
+                let actual: String = connection
+                    .query_row(
+                        &format!("SELECT {column} FROM {table} WHERE {predicate}=?1 LIMIT 1"),
+                        [&descriptor.root_session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(actual, changed);
                 assert_eq!(
                     export(&database, &format!("{table}-changed")).row_count,
                     installed.row_count
                 );
+                if table == "message" {
+                    connection
+                        .execute(&change, rusqlite::params!["{", descriptor.root_session_id])
+                        .unwrap();
+                    assert!(
+                        verify_installed_store(descriptor, &reader).is_err(),
+                        "unreadable current native JSON must still be refused"
+                    );
+                }
                 connection
                     .execute(
                         &change,
