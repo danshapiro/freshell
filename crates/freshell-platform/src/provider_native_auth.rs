@@ -64,6 +64,7 @@ pub fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<BTreeSet<Strin
                 return Err(invalid());
             };
             let mut oauth_providers = BTreeSet::new();
+            let mut has_credential = false;
             for (model_provider, entry) in entries {
                 match entry["type"].as_str() {
                     Some("oauth")
@@ -72,13 +73,56 @@ pub fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<BTreeSet<Strin
                             && entry["expires"].as_i64().is_some_and(|expiry| expiry > 0) =>
                     {
                         oauth_providers.insert(model_provider.clone());
+                        has_credential = true;
                     }
-                    Some("api") if string(entry, "key") => {}
+                    Some("api") if string(entry, "key") => has_credential = true,
+                    // Native OpenCode keeps organization environment/config
+                    // overlays in this same file, beside model credentials.
+                    // They are supported input, but do not authorize egress.
+                    Some("wellknown") if entry["key"].is_string() && entry["token"].is_string() => {
+                    }
                     _ => return Err(invalid()),
                 }
             }
-            Ok(oauth_providers)
+            if has_credential {
+                Ok(oauth_providers)
+            } else {
+                Err(invalid())
+            }
         }
         _ => Err(invalid()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_native_auth_admits_supported_wellknown_entries_beside_real_credentials() {
+        for credential in [
+            serde_json::json!({"type":"api","key":"synthetic-api"}),
+            serde_json::json!({"type":"oauth","access":"synthetic-access","refresh":"synthetic-refresh","expires":1}),
+        ] {
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "openai":credential,
+                "https://organization.invalid":{"type":"wellknown","key":"RULE_ROOT","token":"/synthetic/rules"}
+            })).unwrap();
+            let providers = validate_native_auth("opencode", &raw).unwrap();
+            assert_eq!(providers.contains("openai"), credential["type"] == "oauth");
+            assert!(!providers.contains("https://organization.invalid"));
+        }
+    }
+
+    #[test]
+    fn opencode_wellknown_only_or_malformed_overlay_does_not_authorize_model_transport() {
+        for value in [
+            serde_json::json!({"organization":{"type":"wellknown","key":"RULE_ROOT","token":"/synthetic/rules"}}),
+            serde_json::json!({"openai":{"type":"api","key":"synthetic-api"},"organization":{"type":"wellknown","key":"RULE_ROOT"}}),
+        ] {
+            assert!(
+                validate_native_auth("opencode", &serde_json::to_vec(&value).unwrap()).is_err()
+            );
+        }
     }
 }
