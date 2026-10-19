@@ -2851,9 +2851,11 @@ async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_au
             "55555555-5555-4555-8555-555555555555",
         ),
     ] {
+        let (status, value) = snapshot_route_value(&app, kind, provider, id).await;
         assert_eq!(
-            snapshot_route_value(&app, kind, provider, id).await.0,
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "unreadable {kind}/{id} must not become available saved history: {value}"
         );
     }
     for (path, (bytes, modified)) in paths.iter().zip(before) {
