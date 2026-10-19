@@ -659,16 +659,44 @@ describe('ordinary and managed terminal provider parity', () => {
       return view?.containerId ? view : undefined
     })
     if (!before.containerId) throw new Error('initial OpenCode container missing')
+    expect(before.nativeSessionId).toMatch(/\S/)
+    let lastObservedTargetState: Record<string, string | undefined> | undefined
+    const pollTargetViews = async () => {
+      const views = (await rig.inventory()).filter(row => row.terminalId === terminalId)
+      const latest = views.at(-1)
+      if (latest) {
+        lastObservedTargetState = {
+          terminalId: latest.terminalId,
+          soulId: latest.soulId,
+          incarnationId: latest.incarnationId,
+          desiredState: latest.desiredState,
+          launchState: latest.launchState,
+          recoveryState: latest.recoveryState,
+          recoveryReason: latest.recoveryReason,
+        }
+      }
+      return views
+    }
+    const recoveryFailed = (error: unknown): never => {
+      throw new Error(`${String(error)}; last observed target state: ${JSON.stringify(lastObservedTargetState)}`)
+    }
     await rig.web.kill()
     const editedTui = '{ // changed while web is down\n  "theme": "solarized"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
     rig.runtime.killOwnedRuntimeExact(before.containerId)
+    await waitFor('OpenCode capability recovery blocked while web is down', async () => (
+      (await pollTargetViews()).find(view => view.incarnationId === before.incarnationId
+        && view.desiredState === 'running'
+        && view.recoveryState === 'blocked'
+        && view.recoveryReason === 'CAPABILITY_PENDING')
+    )).catch(recoveryFailed)
     await rig.restartWebGracefully()
     const after = await waitFor('replacement after web restart', async () => {
-      const view = await rig.runningViewForTerminal(terminalId)
+      const view = (await pollTargetViews()).find(row => row.launchState === 'running')
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
-    }, 300_000)
+    }, 300_000).catch(recoveryFailed)
     expect(after.soulId).toBe(before.soulId)
+    expect(after.nativeSessionId).toBe(before.nativeSessionId)
     const recoveredWire = await TerminalWire.connect(rig.info, true)
     sockets.push(recoveredWire)
     const reconcileId = `provider-parity-reconcile-${randomUUID()}`
