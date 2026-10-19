@@ -203,9 +203,12 @@ impl Supervisor {
         let mut tasks = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(startup_concurrency_limit()));
         for (_, view) in latest {
+            let retry_capability = view.recovery_state == RecoveryState::Blocked
+                && view.recovery_reason.as_deref() == Some("CAPABILITY_PENDING");
             if view.desired_state != DesiredState::Running
-                || view.recovery_state != RecoveryState::Live
-                || view.launch_state != LaunchState::Running
+                || (!retry_capability
+                    && (view.recovery_state != RecoveryState::Live
+                        || view.launch_state != LaunchState::Running))
             {
                 continue;
             }
@@ -215,67 +218,79 @@ impl Supervisor {
                 let _permit = semaphore.acquire_owned().await.map_err(|error| {
                     RuntimeError::new(RuntimeErrorCode::RegistryFailure, error.to_string())
                 })?;
-                let handle = supervisor
-                    .registry
-                    .active_handle_for_soul(view.soul_id.clone())
-                    .await
-                    .map_err(map_registry)?;
-                let trigger = match supervisor.backend.inspect(&handle).await {
-                    Ok(inspection)
-                        if matches!(
-                            inspection.state,
-                            BackendRuntimeState::Missing
-                                | BackendRuntimeState::Exited
-                                | BackendRuntimeState::Dead
-                        ) =>
-                    {
-                        Some(RecoveryTrigger::ProviderExit)
-                    }
-                    Ok(inspection) if inspection.state == BackendRuntimeState::Running => {
-                        match supervisor
-                            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-                            .await
+                let trigger = if retry_capability {
+                    // A transient web callback failure can leave the prior
+                    // incarnation stopped. Re-enter the fenced recovery path;
+                    // the live-only handle lookup below cannot serve this row.
+                    Some(RecoveryTrigger::HostUnreachable)
+                } else {
+                    let handle = supervisor
+                        .registry
+                        .active_handle_for_soul(view.soul_id.clone())
+                        .await
+                        .map_err(map_registry)?;
+                    match supervisor.backend.inspect(&handle).await {
+                        Ok(inspection)
+                            if matches!(
+                                inspection.state,
+                                BackendRuntimeState::Missing
+                                    | BackendRuntimeState::Exited
+                                    | BackendRuntimeState::Dead
+                            ) =>
                         {
-                            Ok(host) => match supervisor
-                                .host_status(
-                                    handle.incarnation_id().clone(),
-                                    handle.runtime_dir(),
-                                    &host,
-                                )
+                            Some(RecoveryTrigger::ProviderExit)
+                        }
+                        Ok(inspection) if inspection.state == BackendRuntimeState::Running => {
+                            match supervisor
+                                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
                                 .await
                             {
-                                Ok(status) if status.exited => Some(RecoveryTrigger::ProviderExit),
-                                Ok(_) => None,
+                                Ok(host) => match supervisor
+                                    .host_status(
+                                        handle.incarnation_id().clone(),
+                                        handle.runtime_dir(),
+                                        &host,
+                                    )
+                                    .await
+                                {
+                                    Ok(status) if status.exited => Some(RecoveryTrigger::ProviderExit),
+                                    Ok(_) => None,
+                                    Err(error) => {
+                                        append_event(
+                                            &supervisor.config.lifecycle_log,
+                                            "supervisor.runtime_observer.host_status_failed",
+                                            serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                        );
+                                        Some(RecoveryTrigger::HostUnreachable)
+                                    }
+                                },
                                 Err(error) => {
                                     append_event(
                                         &supervisor.config.lifecycle_log,
-                                        "supervisor.runtime_observer.host_status_failed",
+                                        "supervisor.runtime_observer.authenticate_failed",
                                         serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
                                     );
                                     Some(RecoveryTrigger::HostUnreachable)
                                 }
-                            },
-                            Err(error) => {
-                                append_event(
-                                    &supervisor.config.lifecycle_log,
-                                    "supervisor.runtime_observer.authenticate_failed",
-                                    serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
-                                );
-                                Some(RecoveryTrigger::HostUnreachable)
                             }
                         }
-                    }
-                    Ok(_) => None,
-                    Err(error) => {
-                        append_event(
-                            &supervisor.config.lifecycle_log,
-                            "supervisor.runtime_observer.inspect_failed",
-                            serde_json::json!({"soulId":view.soul_id,"message":error.to_string()}),
-                        );
-                        Some(RecoveryTrigger::HostUnreachable)
+                        Ok(_) => None,
+                        Err(error) => {
+                            append_event(
+                                &supervisor.config.lifecycle_log,
+                                "supervisor.runtime_observer.inspect_failed",
+                                serde_json::json!({"soulId":view.soul_id,"message":error.to_string()}),
+                            );
+                            Some(RecoveryTrigger::HostUnreachable)
+                        }
                     }
                 };
                 if let Some(trigger) = trigger {
+                    let cause = if retry_capability {
+                        "CAPABILITY_PENDING"
+                    } else {
+                        "runtime_unavailable"
+                    };
                     append_event(
                         &supervisor.config.lifecycle_log,
                         "supervisor.runtime_observer.recovery_scheduled",
@@ -283,6 +298,10 @@ impl Supervisor {
                             "soulId": view.soul_id,
                             "intentRevision": view.intent_revision,
                             "trigger": trigger,
+                            "severity": "info",
+                            "cause": cause,
+                            "action": "recover",
+                            "outcome": "scheduled",
                         }),
                     );
                     let _ = supervisor
@@ -356,3 +375,7 @@ fn map_registry(error: crate::registry::RegistryError) -> RuntimeError {
     };
     RuntimeError::new(code, error.to_string())
 }
+
+#[cfg(test)]
+#[path = "inventory_tests.rs"]
+mod tests;
