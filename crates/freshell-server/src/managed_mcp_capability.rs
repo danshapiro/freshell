@@ -1048,6 +1048,35 @@ impl CapabilityStore {
         Ok(())
     }
 
+    fn deactivate(
+        &self,
+        grant_id: &str,
+        stored: StoredCapabilityFile,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        // Keep the stopped incarnation's mount sources available for ownership
+        // verification and replacement without retaining its authorization.
+        let grant = Grant {
+            soul_id: stored.soul_id,
+            incarnation_id: stored.incarnation_id,
+            token: String::new(),
+            expires_at: 0,
+            endpoint: stored.endpoint,
+            path,
+        };
+        write_capability(&grant.path, &grant)?;
+        self.grants.lock().unwrap().insert(grant_id.into(), grant);
+        tracing::info!(
+            severity = "info",
+            grant_id,
+            cause = "stopped_incarnation_at_startup",
+            action = "deactivate_grant",
+            outcome = "mount_sources_retained",
+            "managed_mcp.grant_deactivated"
+        );
+        Ok(())
+    }
+
     fn revoke(&self, grant_id: &str, directory: &Path) -> Result<(), String> {
         let path = grant_path(directory, grant_id)?;
         let staged = staged_provider_root_path(directory, grant_id)?;
@@ -1098,9 +1127,9 @@ pub(crate) fn issue_mcp_capability(
     )
 }
 
-/// A web-server restart restores only grants whose exact incarnation remains
-/// live in the supervisor inventory. Recoverable souls retain their private
-/// OpenCode inputs before stale scopes and incarnation stages are revoked.
+/// A web-server restart restores authorization only for exact live incarnations.
+/// Recoverable stopped incarnations keep inactive grants and mount sources until
+/// verified-empty replacement; stale grants retain private inputs before removal.
 pub(crate) async fn rehydrate_running_capabilities(
     client: &freshell_runtime_client::RuntimeClient,
 ) -> Result<(), String> {
@@ -1150,16 +1179,23 @@ pub(crate) async fn rehydrate_running_capabilities(
             store().revoke(&grant_id, &directory)?;
             continue;
         };
-        if !views.iter().any(|view| {
-            view.soul_id == stored.soul_id
-                && view.incarnation_id == incarnation_id
-                && view.desired_state == DesiredState::Running
-                && view.launch_state == LaunchState::Running
+        let view = views.iter().find(|view| {
+            view.soul_id == stored.soul_id && view.incarnation_id == incarnation_id
+        });
+        if !view.is_some_and(|view| {
+            view.desired_state == DesiredState::Running && view.launch_state == LaunchState::Running
         }) {
             if soul_wants_recovery(&views, &stored.soul_id) {
                 retain_recoverable_inputs(&directory, &stored.soul_id, &grant_id)?;
             }
-            store().revoke(&grant_id, &directory)?;
+            if view.is_some_and(|view| {
+                view.desired_state == DesiredState::Running
+                    && view.launch_state == LaunchState::Stopped
+            }) {
+                store().deactivate(&grant_id, stored, path)?;
+            } else {
+                store().revoke(&grant_id, &directory)?;
+            }
             continue;
         }
         let grant = restored_grant(stored, incarnation_id, path, &endpoint()?);
