@@ -1179,9 +1179,9 @@ pub(crate) async fn rehydrate_running_capabilities(
             store().revoke(&grant_id, &directory)?;
             continue;
         };
-        let view = views.iter().find(|view| {
-            view.soul_id == stored.soul_id && view.incarnation_id == incarnation_id
-        });
+        let view = views
+            .iter()
+            .find(|view| view.soul_id == stored.soul_id && view.incarnation_id == incarnation_id);
         if !view.is_some_and(|view| {
             view.desired_state == DesiredState::Running && view.launch_state == LaunchState::Running
         }) {
@@ -1354,11 +1354,7 @@ mod tests {
                 .await
                 .unwrap();
             registry
-                .commit_execution_grant(
-                    prepared.incarnation_id.clone(),
-                    HostBootId::new(),
-                    limits,
-                )
+                .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits)
                 .await
                 .unwrap();
             registry
@@ -1380,7 +1376,10 @@ mod tests {
         // These variables belong only to this exact-test child process.
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", root.join("mcp-capabilities"));
+        std::env::set_var(
+            "FRESHELL_RUNTIME_CAPABILITY_DIR",
+            root.join("mcp-capabilities"),
+        );
         let socket = root.join("control.sock");
         let secret_file = root.join("control-secret");
         let secret = "startup-lifetime-private-test-control";
@@ -1393,8 +1392,8 @@ mod tests {
         let initial_tui = "{ // before restart\n\"theme\":\"dark\" }\n";
         let edited_tui = "{ // edited while web was down\n\"theme\":\"solarized\" }\n";
         std::fs::write(&tui, initial_tui).unwrap();
-        let tui_source = approved_tui_source(tui.to_str().unwrap(), &workspace, &workspace, &home)
-            .unwrap();
+        let tui_source =
+            approved_tui_source(tui.to_str().unwrap(), &workspace, &workspace, &home).unwrap();
         let inline = r#"{"model":"startup-lifetime-model"}"#;
         let prior = CapabilityStore::default();
         let soul = SoulId::new();
@@ -1534,9 +1533,8 @@ mod tests {
         .unwrap();
         let control_socket = socket.clone();
         let control = tokio::spawn(async move { serve_control(supervisor, &control_socket).await });
-        let result = std::panic::AssertUnwindSafe(tokio::time::timeout(
-            Duration::from_secs(15),
-            async {
+        let result =
+            std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(15), async {
                 while !socket.exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1658,10 +1656,9 @@ mod tests {
                         "outcome": "completed",
                     })
                 );
-            },
-        ))
-        .catch_unwind()
-        .await;
+            }))
+            .catch_unwind()
+            .await;
         control.abort();
         let stopped_control = control.await.unwrap_err();
         assert!(
