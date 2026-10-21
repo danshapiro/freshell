@@ -4,6 +4,24 @@
 **Branch:** `codex-proxy-ws-frame-cap` (from `origin/main` @ `dc666e73f`)
 **Status:** final — one fresheyes review round commissioned (which failed the draft; findings were addressed), followed by a threat-model trim that removed the measurement apparatus the review loop had accumulated
 
+## User Request
+
+### Requested result
+- Implement the committed plan at docs/plans/2026-10-20-codex-proxy-ws-frame-cap.md in full, via the-usual's execution stages: raise the codex proxy WebSocket frame caps to a 256 MiB policy with equality transport caps at all five production call sites, add the independent 64 MiB fresh-lane cap, the 32 MiB hub growth canary, the classified rate-limited Capacity-error triggers with generic-teardown suppression, and zero-copy relay writes, together with the full §5 TDD test list (items 1-11) and the dual-role e2e spec.
+
+### Explicit constraints
+- Skip the-usual Stages 1-3 (plan writing, load-bearing validation, plan review); the plan is already committed on main (PR #850) after its commissioned independent review round. Run Stage 0 (workspace + baseline), Stage 4 (task-by-task execution with per-task reviews), Stage 5 (delta Fresh Eyes, up to five rounds), and Stage 6 (recap).
+- Red-green-refactor TDD for every behavior change; never skip the tests or the refactor step.
+- Repo rules: branch the-usual/codex-proxy-ws-frame-cap from origin/main in .worktrees/; the pre-worktree green-base check runs via scripts/base-gate.sh test; broad tests go through the shared coordinator.
+- The affected e2e specs must pass on the configured FRESHELL_E2E_BACKEND (cloud) before any PR is filed; a spec that matches no tests is not coverage.
+- Do not restart or redeploy the live 3001 production server; deploy is out of scope and the change is inert until a user-approved deploy.
+- Do not create a PR, merge, push finalization, or clean up the branch; PR creation requires explicit user approval — stop after the recap.
+
+### Accepted tradeoffs and residuals
+- The memory decision is stated arithmetic with no measurement apparatus (user-approved overbuild cut); the hub's unbounded channels are pre-existing and stay out of scope.
+- Panes keep blinking until the user-approved production deploy; this change is inert until then.
+- The plan's independent review loop ran once by user commission (verdict FAILED, both findings fixed); no further plan reviews run in this execution.
+
 ## 1. Problem
 
 Since ~11:47 AM PDT on 2026-10-19, every Freshell-managed codex terminal pane blinks:
