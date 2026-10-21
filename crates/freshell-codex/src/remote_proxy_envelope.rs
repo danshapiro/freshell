@@ -26,9 +26,39 @@ use crate::json_scan::{
 /// mirrors `MAX_FULL_PARSE_BYTES` (`json-rpc-envelope.ts:25`, `1 * 1024 * 1024`).
 pub const MAX_FULL_PARSE_BYTES: usize = 1024 * 1024;
 
-/// The upper bound on a frame this proxy will ever forward raw, regardless of parseability;
-/// mirrors `MAX_RAW_FORWARD_BYTES` (`json-rpc-envelope.ts:26`, `64 * 1024 * 1024`).
-pub const MAX_RAW_FORWARD_BYTES: usize = 64 * 1024 * 1024;
+/// The single source of truth for the PROXIED raw-forward path: the per-frame
+/// app-level policy. Hub policy = this value; proxy transport caps = THE SAME
+/// value (equality — see docs/plans/2026-10-20-codex-proxy-ws-frame-cap.md §4.1).
+/// Bump THIS ONE literal for proxy-cap maintenance; every proxied limit derives
+/// from it and the invariant tests revalidate.
+pub const MAX_CODEX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+pub const MAX_WS_FRAME_BYTES: usize = MAX_CODEX_FRAME_BYTES; // proxy transport
+pub const MAX_WS_MESSAGE_BYTES: usize = MAX_CODEX_FRAME_BYTES; // proxy transport
+
+/// Independent, conservative cap for the fresh-lane client. This lane
+/// full-parses responses (`serde_json::Value`) and clones values, so its
+/// memory cost amplifies ~3-4x per byte. Its large traffic is thread reads —
+/// paginated in the normal reveal path, BUT snapshot/rollback issue
+/// `thread/read` with `includeTurns: true` (full thread in one response;
+/// `app_server.rs:530–545`, `freshell-freshagent/src/codex.rs:7854–7902`),
+/// so a very large session can legitimately exceed this cap. 64 MiB is
+/// legacy-parity (the Node proxy's maxPayload-tied policy), 4x the legacy
+/// Rust behavior (tungstenite's 16 MiB default, under which those same
+/// full-thread reads die SILENTLY today — `transport.rs` collapses recv
+/// errors to `None`), and ~3.6x today's largest real frame. If a real
+/// session's full-thread read exceeds it, the production-visible error
+/// (plan §4.3.1) says so; raising it is this one constant, same arithmetic.
+/// Do NOT derive it from the proxy policy.
+pub const MAX_LANE_FRAME_BYTES: usize = 64 * 1024 * 1024; // fresh lane
+
+/// Growth-canary threshold (plan §4.3.2): the hub warns — rate-limited per
+/// proxy, once per interval — when a relayed frame exceeding this reaches hub
+/// ingest. At cap equality an over-cap frame is rejected by the transport and
+/// never reaches the hub, so the canary covers the growth zone BELOW the cap
+/// (32 MiB → 256 MiB): months of runway warning before real traffic approaches
+/// [`MAX_CODEX_FRAME_BYTES`].
+pub const CANARY_BYTES: usize = 32 * 1024 * 1024; // growth canary
 
 /// The byte bound on any individually-scanned top-level token (an `id` or `method`
 /// string); mirrors `MAX_SCANNED_TOKEN_BYTES` (`json-rpc-envelope.ts:27`, `8 * 1024`).
@@ -595,5 +625,24 @@ mod tests {
                 "method mismatch for {json}"
             );
         }
+    }
+
+    // ── plan 2026-10-20-codex-proxy-ws-frame-cap.md §5.6: cap-derivation invariant ──
+
+    /// Deliberately a runtime test (not a const block): the plan's derivation
+    /// guard reports a broken coupling by NAME in the test run.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn proxy_transport_caps_equal_the_policy_and_the_lane_cap_is_smaller() {
+        // Equality design (plan §4.1): the proxy transport caps sit at EXACT
+        // equality with the hub policy, and the lane cap is deliberately
+        // independent and conservative — so a future one-literal bump of
+        // MAX_CODEX_FRAME_BYTES cannot leave the proxied limits coupled wrong.
+        assert_eq!(MAX_WS_FRAME_BYTES, MAX_CODEX_FRAME_BYTES);
+        assert_eq!(MAX_WS_MESSAGE_BYTES, MAX_CODEX_FRAME_BYTES);
+        assert!(
+            MAX_LANE_FRAME_BYTES < MAX_CODEX_FRAME_BYTES,
+            "the fresh-lane cap must stay independent and conservative"
+        );
     }
 }

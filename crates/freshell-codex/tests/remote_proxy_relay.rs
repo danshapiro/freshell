@@ -20,13 +20,17 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, connect_async};
+use tokio_tungstenite::{
+    accept_async, accept_async_with_config, connect_async, connect_async_with_config,
+};
 
 use freshell_codex::remote_proxy::{
     CodexRemoteProxy, CodexRemoteProxyOptions, RemoteProxyEvent, RemoteProxyRepairTrigger,
 };
 use freshell_codex::remote_proxy_side_effects::CandidateSource;
+use freshell_codex::ws_config::proxy_ws_config;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -45,6 +49,18 @@ struct FakeUpstreamConn {
 }
 
 async fn start_fake_upstream() -> FakeUpstream {
+    start_fake_upstream_inner(None).await
+}
+
+/// Like [`start_fake_upstream`], but the accepted peer-side sockets get the
+/// PROXY read caps: the large-frame tests relay frames over the production
+/// policy, which a default-capped (16 MiB frame) peer would reject on read
+/// (plan §4.2: the new tests' client/peer sides use the shared configs).
+async fn start_large_frame_upstream() -> FakeUpstream {
+    start_fake_upstream_inner(Some(proxy_ws_config())).await
+}
+
+async fn start_fake_upstream_inner(ws_config: Option<WebSocketConfig>) -> FakeUpstream {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let ws_url = format!("ws://{}:{}", addr.ip(), addr.port());
@@ -55,7 +71,10 @@ async fn start_fake_upstream() -> FakeUpstream {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
-            let Ok(ws) = accept_async(stream).await else {
+            let Ok(ws) = (match ws_config {
+                Some(config) => accept_async_with_config(stream, Some(config)).await,
+                None => accept_async(stream).await,
+            }) else {
                 continue;
             };
             let (mut sink, mut stream) = ws.split();
@@ -128,10 +147,24 @@ impl FakeUpstreamConn {
 async fn connect_tui(
     ws_url: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let (ws, _) = timeout(RECV_TIMEOUT, connect_async(ws_url))
-        .await
-        .expect("TUI: timed out connecting to the proxy")
-        .expect("TUI: failed to connect to the proxy");
+    connect_tui_with_ws_config(ws_url, WebSocketConfig::default()).await
+}
+
+/// Connect with explicit read caps — the large-frame tests need this: a
+/// default-capped (16 MiB frame) test client would reject the very frames the
+/// tests assert on (plan §4.2). `disable_nagle = false` matches bare
+/// `connect_async` exactly.
+async fn connect_tui_with_ws_config(
+    ws_url: &str,
+    config: WebSocketConfig,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let (ws, _) = timeout(
+        RECV_TIMEOUT,
+        connect_async_with_config(ws_url, Some(config), false),
+    )
+    .await
+    .expect("TUI: timed out connecting to the proxy")
+    .expect("TUI: failed to connect to the proxy");
     ws
 }
 
@@ -257,7 +290,72 @@ async fn frames_are_relayed_in_order_in_both_directions() {
     proxy.close().await;
 }
 
-// ── 2. oversized-frame rejection (MAX_RAW_FORWARD_BYTES hard cap) ──────────────────
+// ── 1b. large-frame relay at the production cap policy (plan §5.1, §5.2) ────────────
+
+/// A single-frame payload comfortably OVER tungstenite's 16 MiB default
+/// `max_frame_size` (the incident class: the 17.8 MB `plugin/list` response)
+/// and comfortably under the 256 MiB production policy.
+const LARGE_FRAME_BYTES: usize = 20 * 1024 * 1024;
+
+#[tokio::test]
+async fn relays_an_oversized_upstream_frame_with_production_default_options() {
+    // Plan §5.1, upstream direction — the incident's exact shape: a real peer
+    // app-server answers a request with a single 20 MiB text frame, and the
+    // proxy (production-default options, NO cap injection) must relay it. This
+    // proves the DIAL side is configured; a bare (16 MiB) upstream reader dies
+    // with a tungstenite Capacity error and tears the relay down.
+    let mut upstream = start_large_frame_upstream().await;
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui_with_ws_config(proxy.ws_url(), proxy_ws_config()).await;
+
+    let request = json!({"id": 1, "method": "foo/bar", "params": {}}).to_string();
+    tui.send(Message::Text(request)).await.unwrap();
+    let mut conn = upstream.accept().await;
+    let _ = conn.recv_text().await;
+
+    let response =
+        json!({"id": 1, "result": {"payload": huge_string(LARGE_FRAME_BYTES)}}).to_string();
+    conn.send_text(response.clone());
+    let received = recv_text(&mut tui).await;
+    assert_eq!(
+        received, response,
+        "a 20 MiB upstream frame must relay byte-identical"
+    );
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn relays_an_oversized_client_frame_with_production_default_options() {
+    // Plan §5.2, client direction — proves the TUI-facing ACCEPT side is
+    // configured: without it, the proxy's own 16 MiB default read cap kills
+    // the client frame at ingest and the upstream peer never sees it.
+    let mut upstream = start_large_frame_upstream().await;
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui_with_ws_config(proxy.ws_url(), proxy_ws_config()).await;
+
+    let request =
+        json!({"id": 3, "method": "foo/big", "params": {"payload": huge_string(LARGE_FRAME_BYTES)}})
+            .to_string();
+    tui.send(Message::Text(request.clone())).await.unwrap();
+
+    let mut conn = upstream.accept().await;
+    let forwarded = conn.recv_text().await;
+    assert_eq!(
+        forwarded, request,
+        "a 20 MiB client frame must relay byte-identical"
+    );
+
+    proxy.close().await;
+}
+
+// ── 2. oversized-frame rejection (MAX_CODEX_FRAME_BYTES hard cap) ──────────────────
 
 #[tokio::test]
 async fn rejects_client_frames_over_max_raw_forward_bytes_with_error_and_closes() {

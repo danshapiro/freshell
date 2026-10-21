@@ -52,13 +52,14 @@ use serde_json::{Map, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, connect_async};
+use tokio_tungstenite::{accept_async_with_config, connect_async_with_config};
 
 use crate::protocol::RequestId;
 use crate::remote_proxy_envelope::{
-    scan_json_rpc_envelope, JsonRpcEnvelopeId, JsonRpcEnvelopeScanError, MAX_FULL_PARSE_BYTES,
-    MAX_RAW_FORWARD_BYTES,
+    scan_json_rpc_envelope, JsonRpcEnvelopeId, JsonRpcEnvelopeScanError, CANARY_BYTES,
+    MAX_CODEX_FRAME_BYTES, MAX_FULL_PARSE_BYTES, MAX_WS_FRAME_BYTES, MAX_WS_MESSAGE_BYTES,
 };
 use crate::remote_proxy_side_effects::{
     extract_fork_response_candidate, extract_fs_changed_repair_trigger,
@@ -69,6 +70,7 @@ use crate::remote_proxy_side_effects::{
     ForkResponseOptions, RemoteProxyCandidate, ThreadLifecycleEvent, ThreadStartResponseOptions,
     ThreadStartedLifecycle, TurnEvent as SideEffectTurnEvent,
 };
+use crate::ws_config::ws_config_with_caps;
 
 /// Upstream notification methods that get side-effect extraction
 /// (`STATEFUL_NOTIFICATION_METHODS`, `remote-proxy.ts:103-110`).
@@ -120,6 +122,13 @@ pub const CANDIDATE_CAPTURE_TIMEOUT_MS: u64 = 45_000;
 pub const IDENTITY_GATE_HOLD_TIMEOUT_MS: u64 = 5_000;
 /// Legacy cap on held gate frames (`remote-proxy.ts` initial_capture hold queue).
 pub const MAX_HELD_IDENTITY_GATE_FRAMES: usize = 32;
+/// Default minimum spacing between growth-canary warnings (plan §4.3.2): one
+/// warning line per interval PER PROXY, regardless of connection churn.
+pub const CANARY_MIN_WARN_INTERVAL_MS: u64 = 10 * 60 * 1000;
+/// Default minimum spacing between classified Capacity repair triggers
+/// (plan §4.3.1) — a limiter SEPARATE from the canary's, so a canary warning
+/// can never suppress the first over-cap diagnostic.
+pub const CAPACITY_TRIGGER_MIN_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 // ── public options / errors ─────────────────────────────────────────────────────────
 
@@ -128,8 +137,27 @@ pub const MAX_HELD_IDENTITY_GATE_FRAMES: usize = 32;
 #[derive(Clone, Debug)]
 pub struct CodexRemoteProxyOptions {
     pub upstream_ws_url: String,
-    /// `maxRawForwardBytes` (`remote-proxy.ts:90,141`); default [`MAX_RAW_FORWARD_BYTES`].
+    /// `maxRawForwardBytes` (`remote-proxy.ts:90,141`); default
+    /// [`MAX_CODEX_FRAME_BYTES`]. This is the HUB-side policy; the proxy
+    /// transport caps below default to the SAME value (equality, plan §4.1).
     pub max_raw_forward_bytes: usize,
+    /// Proxy transport tungstenite `max_frame_size`, applied to BOTH the
+    /// TUI-facing accept and the upstream dial; default [`MAX_WS_FRAME_BYTES`].
+    /// Tests inject small values so boundary tests don't allocate hundreds of
+    /// MiB.
+    pub max_ws_frame_bytes: usize,
+    /// Proxy transport tungstenite `max_message_size`, applied to both legs;
+    /// default [`MAX_WS_MESSAGE_BYTES`].
+    pub max_ws_message_bytes: usize,
+    /// Growth-canary threshold (plan §4.3.2): hub ingest warns once per
+    /// interval when a frame exceeds this; default [`CANARY_BYTES`].
+    pub canary_warn_bytes: usize,
+    /// Minimum spacing between growth-canary warnings, per proxy; default
+    /// [`CANARY_MIN_WARN_INTERVAL_MS`].
+    pub canary_min_warn_interval_ms: u64,
+    /// Minimum spacing between classified Capacity repair triggers
+    /// (plan §4.3.1); default [`CAPACITY_TRIGGER_MIN_INTERVAL_MS`].
+    pub capacity_trigger_min_interval_ms: u64,
     /// `requireCandidatePersistence` (`remote-proxy.ts:89,140`). Legacy defaults this to
     /// `true` AT THE PROXY; the Rust options carry NO default — the launch planner passes
     /// the plan's value explicitly on both the fresh and resume branches (S3 review
@@ -149,11 +177,24 @@ impl CodexRemoteProxyOptions {
     pub fn new(upstream_ws_url: impl Into<String>, require_candidate_persistence: bool) -> Self {
         Self {
             upstream_ws_url: upstream_ws_url.into(),
-            max_raw_forward_bytes: MAX_RAW_FORWARD_BYTES,
+            max_raw_forward_bytes: MAX_CODEX_FRAME_BYTES,
+            max_ws_frame_bytes: MAX_WS_FRAME_BYTES,
+            max_ws_message_bytes: MAX_WS_MESSAGE_BYTES,
+            canary_warn_bytes: CANARY_BYTES,
+            canary_min_warn_interval_ms: CANARY_MIN_WARN_INTERVAL_MS,
+            capacity_trigger_min_interval_ms: CAPACITY_TRIGGER_MIN_INTERVAL_MS,
             require_candidate_persistence,
             candidate_capture_timeout_ms: CANDIDATE_CAPTURE_TIMEOUT_MS,
             identity_gate_hold_timeout_ms: IDENTITY_GATE_HOLD_TIMEOUT_MS,
         }
+    }
+
+    /// The transport config BOTH proxy legs run with, built from this
+    /// options' cap fields — the single place the options-to-WebSocketConfig
+    /// mapping lives. [`CodexRemoteProxy::start`] builds its config exactly
+    /// once through here and threads the `Copy` value down to both legs.
+    pub(crate) fn ws_config(&self) -> WebSocketConfig {
+        ws_config_with_caps(self.max_ws_frame_bytes, self.max_ws_message_bytes)
     }
 }
 
@@ -326,6 +367,7 @@ impl CodexRemoteProxy {
             });
         }
 
+        let ws_config = options.ws_config();
         let upstream_ws_url = options.upstream_ws_url;
         let accept_hub_tx = hub_tx.clone();
         let accept_task = tokio::spawn(async move {
@@ -340,7 +382,8 @@ impl CodexRemoteProxy {
                 let upstream_ws_url = upstream_ws_url.clone();
                 let hub_tx = accept_hub_tx.clone();
                 tokio::spawn(async move {
-                    handle_client_connection(conn_id, stream, upstream_ws_url, hub_tx).await;
+                    handle_client_connection(conn_id, stream, upstream_ws_url, hub_tx, ws_config)
+                        .await;
                 });
             }
         });
@@ -461,8 +504,9 @@ async fn handle_client_connection(
     stream: TcpStream,
     upstream_ws_url: String,
     hub_tx: mpsc::UnboundedSender<HubMsg>,
+    ws_config: WebSocketConfig,
 ) {
-    let ws = match accept_async(stream).await {
+    let ws = match accept_async_with_config(stream, Some(ws_config)).await {
         Ok(ws) => ws,
         Err(_) => return,
     };
@@ -499,7 +543,12 @@ async fn handle_client_connection(
     // Dial upstream concurrently — mirrors `new WebSocket(this.upstreamWsUrl)` firing
     // immediately on accept without blocking further client reads.
     let dial_hub_tx = hub_tx.clone();
-    tokio::spawn(dial_upstream(conn_id, upstream_ws_url, dial_hub_tx));
+    tokio::spawn(dial_upstream(
+        conn_id,
+        upstream_ws_url,
+        dial_hub_tx,
+        ws_config,
+    ));
 
     loop {
         match client_stream.next().await {
@@ -545,8 +594,11 @@ async fn dial_upstream(
     conn_id: u64,
     upstream_ws_url: String,
     hub_tx: mpsc::UnboundedSender<HubMsg>,
+    ws_config: WebSocketConfig,
 ) {
-    let (ws, _) = match connect_async(&upstream_ws_url).await {
+    // `disable_nagle = false` is exactly what bare `connect_async` passed
+    // (verified against the vendored 0.24 source) — behavior unchanged.
+    let (ws, _) = match connect_async_with_config(&upstream_ws_url, Some(ws_config), false).await {
         Ok(pair) => pair,
         Err(_) => {
             let _ = hub_tx.send(HubMsg::UpstreamDialFailed { conn_id });

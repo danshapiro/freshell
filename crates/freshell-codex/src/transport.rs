@@ -18,9 +18,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 use crate::app_server::{BoxFuture, WsTransport};
+use crate::ws_config::lane_ws_config;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
@@ -35,8 +36,13 @@ pub struct TungsteniteTransport {
 
 impl TungsteniteTransport {
     /// Connect to the app-server WS endpoint (`ensureSocket`, `client.ts:521-556`).
+    /// Read caps come from [`lane_ws_config`] — the independent, conservative
+    /// lane constant (plan §4.1); `disable_nagle = false` matches bare
+    /// `connect_async` exactly.
     pub async fn connect(ws_url: &str) -> Result<Self, String> {
-        let (stream, _response) = connect_async(ws_url).await.map_err(|e| e.to_string())?;
+        let (stream, _response) = connect_async_with_config(ws_url, Some(lane_ws_config()), false)
+            .await
+            .map_err(|e| e.to_string())?;
         let (write, read) = stream.split();
         Ok(Self {
             write: TokioMutex::new(write),
