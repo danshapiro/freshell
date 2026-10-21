@@ -678,8 +678,14 @@ fn to_ws_message(frame: OutFrame) -> Message {
         Message::Binary(frame.data)
     } else {
         // Every producer of an OutFrame (the raw client/upstream bytes, or a
-        // rewritten/normalized/error/success frame we constructed) is valid UTF-8 JSON.
-        Message::Text(String::from_utf8_lossy(&frame.data).into_owned())
+        // rewritten/normalized/error/success frame we constructed) is valid UTF-8
+        // JSON, so the common path is a zero-copy partial move of the owned Vec
+        // into the String; only an actual invariant violation pays for the lossy
+        // replacement (and the copy it entails) via FromUtf8Error::into_bytes().
+        Message::Text(
+            String::from_utf8(frame.data)
+                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
+        )
     }
 }
 
@@ -2001,5 +2007,60 @@ mod tests {
             extract_thread_fork_parent_thread_id(br#"{"id":1,"method":"thread/fork","params":{}}"#),
             None
         );
+    }
+
+    #[test]
+    fn to_ws_message_text_frames_reuse_the_moved_buffer_allocation() {
+        // §5.9 copy-elimination pin: the returned String must be the exact
+        // allocation the OutFrame owned, with no second (full-copy) allocation.
+        let mut data = Vec::with_capacity(96);
+        data.extend_from_slice(b"{\"id\":1,\"result\":{\"threadId\":\"t1\"}}");
+        let frame = OutFrame {
+            data,
+            binary: false,
+        };
+        let buffer_ptr = frame.data.as_ptr();
+        let Message::Text(text) = to_ws_message(frame) else {
+            panic!("a text OutFrame must convert to Message::Text");
+        };
+        assert_eq!(text, "{\"id\":1,\"result\":{\"threadId\":\"t1\"}}");
+        assert_eq!(
+            text.as_ptr(),
+            buffer_ptr,
+            "the returned String must reuse the moved Vec's allocation (zero-copy)"
+        );
+    }
+
+    #[test]
+    fn to_ws_message_binary_frames_move_the_payload_unchanged() {
+        let data = b"\x00\x01not-utf8\xff".to_vec();
+        let frame = OutFrame { data, binary: true };
+        let buffer_ptr = frame.data.as_ptr();
+        match to_ws_message(frame) {
+            Message::Binary(bytes) => {
+                assert_eq!(bytes, b"\x00\x01not-utf8\xff");
+                assert_eq!(
+                    bytes.as_ptr(),
+                    buffer_ptr,
+                    "the binary branch must move the Vec, not copy it"
+                );
+            }
+            _ => panic!("a binary OutFrame must convert to Message::Binary"),
+        }
+    }
+
+    #[test]
+    fn to_ws_message_falls_back_to_lossy_replacement_text_on_invalid_utf8() {
+        // 0xFF is invalid in every UTF-8 sequence, so this frame violates the
+        // module's UTF-8 invariant; conversion must degrade to lossy
+        // replacement text, not fail.
+        let frame = OutFrame {
+            data: vec![b'a', 0xFF, b'b'],
+            binary: false,
+        };
+        let Message::Text(text) = to_ws_message(frame) else {
+            panic!("even an invalid-UTF-8 text OutFrame must convert to Message::Text");
+        };
+        assert_eq!(text, "a\u{FFFD}b");
     }
 }
