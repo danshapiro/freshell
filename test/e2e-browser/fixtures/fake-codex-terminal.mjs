@@ -31,6 +31,21 @@ import process from 'node:process'
  * first Enter this fixture does the same handshake (best-effort, async, only
  * when `--remote` is present), then writes the rollout with the APP-SERVER'S
  * thread id, so the proxy-bound identity and the on-disk artifact agree.
+ *
+ * OPT-IN persistent plugin/list mode (FAKE_CODEX_TERMINAL_PLUGIN_LIST=1,
+ * delivered via installDualRoleCodexCli's terminalEnv): after the
+ * initialize/thread-start handshake the connection is NOT closed. Instead —
+ * the real TUI's mention-autocomplete poll shape — plugin/list is requested
+ * ASYNCHRONOUSLY ON THE SAME persistent socket (startup never blocks on
+ * it), the full (deliberately oversized) response is consumed, and two
+ * PTY-observable markers are echoed:
+ *   `codex: plugin list consumed <N> bytes` (N = bytes actually received)
+ *   `codex: followup rpc ok <json>` (a follow-up RPC on the same socket,
+ *   proving the connection survived the large frame)
+ * Best-effort like the rest of the handshake: a plugin/list failure (the
+ * 2026-10-19 incident's Capacity teardown at the proxy's frame cap) is
+ * swallowed, so the visible symptom is exactly the incident's — the markers
+ * never appear.
  */
 
 const argv = process.argv.slice(2)
@@ -94,9 +109,9 @@ async function managedThread(sessionId) {
   try {
     const { WebSocket } = await import('ws')
     const ws = new WebSocket(argv[remoteIdx + 1])
-    const rpc = (method, params) => new Promise((resolve, reject) => {
+    const rpc = (method, params, timeoutMs = 3000) => new Promise((resolve, reject) => {
       const id = `${method}-${Date.now()}`
-      const to = setTimeout(() => reject(new Error('rpc timeout')), 3000)
+      const to = setTimeout(() => reject(new Error('rpc timeout')), timeoutMs)
       const onMsg = (data) => {
         try {
           const m = JSON.parse(data.toString())
@@ -120,8 +135,27 @@ async function managedThread(sessionId) {
     const result = sessionId
       ? await rpc('thread/resume', { threadId: sessionId, cwd: process.cwd() })
       : await rpc('thread/start', { cwd: process.cwd() })
+    const threadId = result?.thread?.id ?? null
+    if (process.env.FAKE_CODEX_TERMINAL_PLUGIN_LIST === '1') {
+      // Detached continuation — the real TUI's mention-autocomplete poll is
+      // async and never blocks startup: the session marker lands promptly,
+      // and the plugin markers appear only if the large frame actually
+      // relays (the incident shape: startup succeeds, then the connection
+      // dies on plugin/list). The generous budgets cover a multi-MB relay
+      // under load; a failure stays best-effort (markers absent).
+      void (async () => {
+        try {
+          const pluginList = await rpc('plugin/list', {}, 30_000)
+          const bytes = Buffer.byteLength(JSON.stringify(pluginList))
+          process.stdout.write(`codex: plugin list consumed ${bytes} bytes\r\n`)
+          const followUp = await rpc('thread/loaded/list', {}, 30_000)
+          process.stdout.write(`codex: followup rpc ok ${JSON.stringify(followUp)}\r\n`)
+        } catch { /* incident shape: the connection died; markers never appear */ }
+      })()
+      return threadId // persistent connection: skip ws.close()
+    }
     ws.close()
-    return result?.thread?.id ?? null
+    return threadId
   } catch {
     return null
   }
