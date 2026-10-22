@@ -1,6 +1,6 @@
 //! Host-owned fresh-agent operation contracts.
 
-use crate::{FreshProvider, SoulId};
+use crate::{FreshAgentTurnSettings, FreshProvider, SoulId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +11,17 @@ pub struct FreshAgentCompactRequest {
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+/// Apply settings to a hosted fresh agent's live session without a turn.
+/// Absent settings keep their stored values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentConfigureRequest {
+    pub soul_id: SoulId,
+    pub settings: FreshAgentTurnSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }

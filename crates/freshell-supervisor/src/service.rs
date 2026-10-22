@@ -542,6 +542,15 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
             }
+            AdminCommand::FreshAgentConfigure(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_configure(envelope.request_id, request.soul_id, request.settings)
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
             AdminCommand::FreshAgentRollback(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1709,6 +1718,62 @@ impl Supervisor {
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
                 "unexpected fresh-agent compact reply",
+            )),
+        }
+    }
+
+    /// Persists the settings as the soul's recovery profile, then asks the
+    /// owning host to persist and apply them live, so a recovered incarnation
+    /// launches with exactly the profile the host actor holds. The host is
+    /// authenticated first: a host that is already gone never saves the
+    /// configure, so the recovery profile must not save it either.
+    async fn fresh_agent_configure(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        settings: freshell_runtime_protocol::FreshAgentTurnSettings,
+    ) -> Result<CommandState, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if handle.fresh_agent().is_none() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        self.registry
+            .configure_fresh_agent_settings(
+                soul_id,
+                handle.incarnation_id().clone(),
+                settings.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
+                    settings,
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentCommand { state, .. } => Ok(state),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent configure reply",
             )),
         }
     }
@@ -2917,16 +2982,7 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, RuntimeError> {
-        let is_slow_fresh_agent_command = matches!(
-            &command,
-            HostCommand::FreshAgentSend { .. }
-                | HostCommand::FreshAgentCompact { .. }
-                | HostCommand::FreshAgentRollback { .. }
-                | HostCommand::GrantExecution {
-                    fresh_agent: Some(_),
-                    ..
-                }
-        );
+        let is_slow_fresh_agent_command = uses_fresh_agent_command_budget(&command);
         let mut envelope = Envelope::new(RequestId::new(), ControlRole::Supervisor, command);
         envelope.auth = Some(host_proof(
             &host.secret,
@@ -3276,6 +3332,27 @@ fn release_qualified_workload(
         || has_fresh_agent
         || (has_terminal && freshell_agent_runtime::managed_provider_enabled(provider))
 }
+
+/// Host commands that wait on a provider (a turn, a compaction, a settings
+/// apply, a rollback, a launch) get the long fresh-agent budget instead of
+/// the control budget.
+pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
+    matches!(
+        command,
+        HostCommand::FreshAgentSend { .. }
+            | HostCommand::FreshAgentCompact { .. }
+            | HostCommand::FreshAgentConfigure { .. }
+            | HostCommand::FreshAgentRollback { .. }
+            | HostCommand::GrantExecution {
+                fresh_agent: Some(_),
+                ..
+            }
+    )
+}
+
+#[cfg(test)]
+#[path = "fresh_agent_configure_tests.rs"]
+mod fresh_agent_configure_tests;
 
 #[cfg(test)]
 mod host_actor_storage_tests {
