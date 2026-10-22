@@ -347,7 +347,7 @@ Retiring at the result, and closing `turn_open` there, is what makes a single ri
 
 ```
 aborted = terminalReason ∈ {aborted_streaming, aborted_tools}
-          || (terminalReason absent && subtype == error_during_execution && stop armed)   // older CLIs
+          || (terminalReason absent && subtype == error_during_execution && num_turns > 0 && stop armed)   // older CLIs; a T5 boot refusal (num_turns 0) is never a stopped turn
 silent  = aborted && stop armed
           && (retired non-empty && retired ⊆ stop.targets  ||  retired empty && stop.target == CliTurn)
 on sdk.result:

@@ -67,10 +67,22 @@ describe('freshell-claude-sidecar turn-complete gate', () => {
   })
 
   it('treats error_during_execution as the stopped turn on a CLI that reports no terminal_reason', () => {
+    const olderCliStopped = { ...result('error_during_execution'), num_turns: 1 }
     const gate = stoppedGate()
-    expect(gate.resultEmitsAttention(result('error_during_execution'))).toBe(false)
+    expect(gate.resultEmitsAttention(olderCliStopped)).toBe(false)
     // Without a Stop pending, the same result rings.
-    expect(createTurnCompleteGate().resultEmitsAttention(result('error_during_execution'))).toBe(true)
+    expect(createTurnCompleteGate().resultEmitsAttention(olderCliStopped)).toBe(true)
+  })
+
+  it('a boot refusal under a pending Stop rings: it ran no turn, so no Stop ended it (T5)', () => {
+    // The pinned CLI's refusal of a missing resume or a bad fork point:
+    // error_during_execution with no terminal_reason and num_turns 0.
+    const refusal = {
+      ...result('error_during_execution'),
+      num_turns: 0,
+      errors: ['No conversation found with session ID: 2fb6caa2-8b35-41d7-ba0c-f6f6acaffaa0'],
+    }
+    expect(stoppedGate().resultEmitsAttention(refusal)).toBe(true)
   })
 
   it('a rejected interrupt (ok:false) never silences a later result', () => {

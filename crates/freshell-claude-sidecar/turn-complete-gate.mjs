@@ -16,7 +16,8 @@
  *
  * The next result consumes the mark, and it is silenced only when it was
  * aborted (terminal_reason aborted_streaming/aborted_tools, T11; or, on a
- * CLI that reports no terminal_reason, error_during_execution). A Stop that
+ * CLI that reports no terminal_reason, error_during_execution after at least
+ * one turn — a boot refusal (T5, num_turns 0) is never a stopped turn). A Stop that
  * missed its turn — one sent while the CLI was still starting, whose receipt
  * comes back ok while the turn then runs to success/completed (T13) — must
  * not silence that turn (G06): the user believes it stopped, and it did not.
@@ -37,8 +38,12 @@ import { isAbortedResult } from './sdk-message-frames.mjs'
 function wasStopped(result) {
   if (isAbortedResult(result)) return true
   // A CLI that predates terminal_reason reports a stopped turn only as
-  // error_during_execution.
-  return result?.terminal_reason == null && result?.subtype === 'error_during_execution'
+  // error_during_execution. A boot refusal has the same shape on the pinned
+  // CLI (T5) but ran no turn (num_turns 0), so no Stop ended it: it rings and
+  // keeps its refusal text.
+  return result?.terminal_reason == null
+    && result?.subtype === 'error_during_execution'
+    && result?.num_turns > 0
 }
 
 export function createTurnCompleteGate() {

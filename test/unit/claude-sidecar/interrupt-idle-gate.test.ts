@@ -108,6 +108,23 @@ describe('Claude sidecar interrupt gate arming (unified attention edge)', () => 
     expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
   })
 
+  // A boot refusal (T5) is also error_during_execution with no
+  // terminal_reason, but it ran no turn (num_turns 0): no Stop ended it. So a
+  // Stop sent while the CLI was still starting does not hide it: the turn the
+  // user sent never ran, which rings, and the refusal says why.
+  it('a cold Stop during a refused resume boot still rings and shows the refusal', async () => {
+    const bridge = await startRealSidecar()
+    const missing = '0f5a2a8e-5a0c-4d6b-9a52-3c1f7f0d2b11'
+    const sessionId = await bridge.create({ requestId: 'create', model: 'opus', resumeSessionId: missing })
+    expect(bridge.ledger().filter((row) => row.kind === 'boot')).toEqual([])
+    bridge.sendLines([{ type: 'send', sessionId, text: 'hello' }, { type: 'interrupt', sessionId }])
+
+    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, result: 'error_during_execution' })
+    expect(await bridge.waitFor((frame) => frame.type === 'sdk.error' && frame.turnFailure === true, 'the refusal banner'))
+      .toMatchObject({ sessionId, message: `No conversation found with session ID: ${missing}` })
+    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
+  })
+
   it('a stale Stop mark never swallows the next turn\'s bell', async () => {
     const bridge = await startRealSidecar()
     const sessionId = await createSession(bridge)
