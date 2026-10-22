@@ -29,8 +29,20 @@
  *
  * A failed write never throws and never blocks anything else (the layout
  * save in particular): it is logged as `legacy_name_capture_failed` and the
- * evidence is dropped, not the user's state (RC10). When no envelope at all
- * could be written, the next boot tries the capture again.
+ * evidence is dropped, not the user's state (RC10). The connection-ready
+ * submit then finds nothing pending for that source and marks the device
+ * done; only a page load that never reaches a ready connection leaves the
+ * capture to the next boot. Envelopes the storage-version wipe deletes
+ * (`@/store/storage-migration` on a device older than the current storage
+ * version removes every `freshell.session-names.*` key right after this
+ * pass) are dropped the same way. This is the accepted tradeoff: once the
+ * server's own boot consolidation has completed, it acknowledges a browser
+ * import without writing anything (name reliability Task 3).
+ *
+ * The pass runs while `main.tsx` evaluates its imports, before it installs
+ * client log forwarding, so the pass's errors first reach only the browser
+ * console. `main.tsx` then calls `reportBootCaptureFailures`, which replays
+ * them once so they also reach the server log.
  *
  * This module must never import the Redux store: it runs from `main.tsx`
  * (through `@/lib/session-name-migration`) before the store and the storage
@@ -311,20 +323,36 @@ export type LegacyCaptureOutcome =
   | 'done'
   /** Genuine envelopes wait for the connection-ready submit. */
   | 'pending'
-  /** A capture write failed (the next boot retries if nothing was written). */
+  /** A capture read or write failed; that source's evidence is dropped (see
+   * the module comment). */
   | 'failed'
 
-/** Copy each genuine source into its own envelope. */
-function captureGenuineSources(storage: CaptureStorage): { captured: number; failed: boolean } {
+/** One content-free capture failure (never the stored bytes). */
+type CaptureFailure = { storageKey?: string; reason: string }
+
+/**
+ * This page load's boot-pass failures, kept for `reportBootCaptureFailures`
+ * (the pass logs before client log forwarding exists). Each pass replaces
+ * the list.
+ */
+let unreportedBootFailures: CaptureFailure[] = []
+
+/** Log one capture failure now and keep it for the replay. */
+function recordCaptureFailure(failures: CaptureFailure[], failure: CaptureFailure): void {
+  log.error('legacy_name_capture_failed', failure)
+  failures.push(failure)
+}
+
+/** Copy each genuine source into its own envelope; returns how many were
+ * written. Every failure goes to `failures`. */
+function captureGenuineSources(storage: CaptureStorage, failures: CaptureFailure[]): number {
   let captured = 0
-  let failed = false
   for (const storageKey of GENUINE_PRE_MIGRATION_SOURCE_KEYS) {
     let raw: string | null
     try {
       raw = storage.getItem(storageKey)
     } catch (error) {
-      log.error('legacy_name_capture_failed', { storageKey, reason: failureReason(error) })
-      failed = true
+      recordCaptureFailure(failures, { storageKey, reason: failureReason(error) })
       continue
     }
     if (raw === null || !isGenuinePreMigrationSource(storageKey, raw)) continue
@@ -341,11 +369,10 @@ function captureGenuineSources(storage: CaptureStorage): { captured: number; fai
     } catch (error) {
       // Drop the evidence, never the user's state: nothing else waits on
       // this write. The source is left as it is.
-      log.error('legacy_name_capture_failed', { storageKey, reason: failureReason(error) })
-      failed = true
+      recordCaptureFailure(failures, { storageKey, reason: failureReason(error) })
     }
   }
-  return { captured, failed }
+  return captured
 }
 
 /**
@@ -355,6 +382,8 @@ function captureGenuineSources(storage: CaptureStorage): { captured: number; fai
 export function runOneTimeLegacyCapture(
   storage: CaptureStorage | null = defaultStorage(),
 ): LegacyCaptureOutcome {
+  const failures: CaptureFailure[] = []
+  unreportedBootFailures = failures
   if (!storage) return 'already_done'
   let outcome: LegacyCaptureOutcome
   try {
@@ -369,15 +398,31 @@ export function runOneTimeLegacyCapture(
         // pending, never capture again.
         outcome = pending.length > 0 ? 'pending' : 'done'
       } else {
-        const { captured, failed } = captureGenuineSources(storage)
-        outcome = failed ? 'failed' : captured > 0 ? 'pending' : 'done'
+        const captured = captureGenuineSources(storage, failures)
+        outcome = failures.length > 0 ? 'failed' : captured > 0 ? 'pending' : 'done'
       }
       if (outcome === 'done') markCaptureDone(storage)
     }
   } catch (error) {
-    log.error('legacy_name_capture_failed', { reason: failureReason(error) })
+    recordCaptureFailure(failures, { reason: failureReason(error) })
     outcome = 'failed'
   }
   log.debug('legacy_name_capture_pass', { outcome })
   return outcome
+}
+
+/**
+ * Replay this page load's boot-pass failures, once. `main.tsx` calls this
+ * right after it installs client log forwarding, so a failure the pass
+ * could only log to the browser console also reaches the server log
+ * (`/api/logs/client`). Each replayed entry carries the original
+ * `legacy_name_capture_failed` fields plus `replayed: true`; a clean pass
+ * replays nothing.
+ */
+export function reportBootCaptureFailures(): void {
+  const failures = unreportedBootFailures
+  unreportedBootFailures = []
+  for (const failure of failures) {
+    log.error('legacy_name_capture_failed', { ...failure, replayed: true })
+  }
 }
