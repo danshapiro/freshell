@@ -98,8 +98,9 @@ tracing = "0.1"
 # Linux /proc ownership reaper for the claude Node sidecar + its `claude` CLI grandchild
 # (SIGTERM anything carrying our FRESHELL_CLAUDE_SIDECAR_ID tag) — the claude analog of the
 # codex reaper, so a freshclaude T2 run leaves no orphan (the oracle `ownership.cleanup`
-# invariant). Linux-only (matches the reference's platform guard).
-[target.'cfg(target_os = "linux")'.dependencies]
+# invariant). On every Unix, `claude_spawn` also signals the sidecar and its process
+# group (SIGTERM escalation, `killpg`), so the dependency covers all of `cfg(unix)`.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
