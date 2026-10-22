@@ -608,7 +608,10 @@ const CONTEXT_COMPACTED_LABEL: &str = "Context compacted";
 /// The one turn-JSON builder every projection arm shares. `error` is the
 /// durable error module's `{name, message}`; an error-only turn (no items)
 /// keeps a BLANK summary (LB-4: the client renders a zero-item turn's summary
-/// as its body, which would duplicate the error module).
+/// as its body, which would duplicate the error module). This departs from
+/// transcript-live plan §4.3, which put the error message in the summary for
+/// the session-host text capture; that capture (`render_snapshot_text` in
+/// freshell-session-host) reads an error-only turn's `error.message` instead.
 fn turn_json(
     turn_id: &str,
     ordinal: usize,

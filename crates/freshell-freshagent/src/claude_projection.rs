@@ -15,6 +15,17 @@
 //!   `system/compact_boundary` line still gets a `context_compaction` marker;
 //! - the diff panel's changed files, from the main thread's edit tools and
 //!   each delegation's subagent transcript.
+//!
+//! The `Agent`/`Task` → `task_delegation` conversion lives here, not in the
+//! per-line layer as transcript-live plan §4.3 first placed it. A per-line
+//! delegation could never absorb its tool result or completion notice, so a
+//! reader that only has the per-line layer (the bounded native-history
+//! reader, `native_history::read_claude`) would show it spinning forever next
+//! to an orphan "Result" row. Such a reader shows the `Agent` call as a plain
+//! tool row with its tool result instead; it does not show a background
+//! agent's completion notice, because the per-line layer drops
+//! `task-notification` lines (as the plan specifies) and only this layer
+//! folds them.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
