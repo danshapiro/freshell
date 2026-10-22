@@ -113,6 +113,15 @@ impl LocateError {
             message: error.to_string(),
         }
     }
+
+    /// Stable short label (`PermissionDenied`, `no_store_root`) for structured
+    /// logs and user-facing refusals.
+    pub fn kind_label(&self) -> String {
+        match self {
+            Self::NoStoreRoot => "no_store_root".to_string(),
+            Self::Io { kind, .. } => format!("{kind:?}"),
+        }
+    }
 }
 
 impl std::fmt::Display for LocateError {
@@ -152,11 +161,9 @@ pub(crate) fn log_transcript_unreadable(
     session_id: &str,
     error: &LocateError,
 ) {
-    let (root, kind) = match error {
-        LocateError::NoStoreRoot => (None, "no_store_root".to_string()),
-        LocateError::Io { root, kind, .. } => {
-            (Some(root.display().to_string()), format!("{kind:?}"))
-        }
+    let root = match error {
+        LocateError::NoStoreRoot => None,
+        LocateError::Io { root, .. } => Some(root.display().to_string()),
     };
     tracing::warn!(
         component = "freshagent.claude",
@@ -164,10 +171,27 @@ pub(crate) fn log_transcript_unreadable(
         context,
         session_id = %session_id,
         root = ?root,
-        kind = %kind,
+        kind = %error.kind_label(),
         error = %error,
         "claude transcript store unreadable; answering transiently, never as a lost session"
     );
+}
+
+/// The rollback refusal for a transcript store that cannot be read (G28): the
+/// retryable `INTERNAL_ERROR` the rollback read-error legs already answer --
+/// never `NOTHING_TO_UNDO` / `REDO_UNAVAILABLE`, which tell the user the
+/// history is gone. Logs the structured unreadable warning.
+pub(crate) fn unreadable_rollback_refusal(
+    op: &crate::rollback_record::RollbackRequest,
+    session_id: &str,
+    error: &LocateError,
+) -> freshell_protocol::ServerMessage {
+    log_transcript_unreadable("rollback", session_id, error);
+    crate::rollback_record::rollback_error_frame(
+        op,
+        "INTERNAL_ERROR",
+        &format!("claude transcript store unreadable: {}", error.kind_label()),
+    )
 }
 
 /// [`locate_transcript_state`] over explicit roots: the first hit wins;

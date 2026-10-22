@@ -5780,13 +5780,20 @@ impl FreshClaudeState {
             guard_uuid,
         ) = match op.direction {
             RollbackDirection::Undo => {
-                let Some(path) = snap::locate_transcript(&durable_id) else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "NOTHING_TO_UNDO",
-                        UNDO_EMPTY_MESSAGE,
-                    ));
-                    return;
+                let path = match snap::locate_transcript_state(&durable_id) {
+                    snap::TranscriptLocation::Found(path) => path,
+                    snap::TranscriptLocation::Absent => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "NOTHING_TO_UNDO",
+                            UNDO_EMPTY_MESSAGE,
+                        ));
+                        return;
+                    }
+                    snap::TranscriptLocation::Unreadable(error) => {
+                        reply_sink(snap::unreadable_rollback_refusal(&op, &durable_id, &error));
+                        return;
+                    }
                 };
                 let text = match std::fs::read_to_string(&path) {
                     Ok(t) => t,
@@ -5894,13 +5901,20 @@ impl FreshClaudeState {
                     ));
                     return;
                 };
-                let Some(original_path) = snap::locate_transcript(&original) else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
+                let original_path = match snap::locate_transcript_state(&original) {
+                    snap::TranscriptLocation::Found(path) => path,
+                    snap::TranscriptLocation::Absent => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "REDO_UNAVAILABLE",
+                            REDO_REMOVED_HISTORY_COPY,
+                        ));
+                        return;
+                    }
+                    snap::TranscriptLocation::Unreadable(error) => {
+                        reply_sink(snap::unreadable_rollback_refusal(&op, &original, &error));
+                        return;
+                    }
                 };
                 let original_text = match std::fs::read_to_string(&original_path) {
                     Ok(t) => t,
