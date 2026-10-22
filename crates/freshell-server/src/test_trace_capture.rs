@@ -104,7 +104,11 @@ where
             return;
         }
         if is_session_names_info
-            && visitor.message != "session_names.import_ignored_after_completion"
+            && !matches!(
+                visitor.message.as_str(),
+                "session_names.import_ignored_after_completion"
+                    | "session_names.bind_collision_import_label_lost"
+            )
         {
             return;
         }

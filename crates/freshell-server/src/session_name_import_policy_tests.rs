@@ -23,7 +23,7 @@ use serde_json::json;
 
 use crate::session_name_generation::IndexedNameInput;
 use crate::session_names::{
-    test_store_transaction_count, SessionNames, StoredDocument, DOCUMENT_FILE_NAME,
+    name_ref_key, test_store_transaction_count, SessionNames, StoredDocument, DOCUMENT_FILE_NAME,
     NAME_MIGRATION_BOOT_IMPORT_ID, NAME_MIGRATION_DIR_NAME, NAME_MIGRATION_IMPORTS_DIR_NAME,
 };
 
@@ -159,36 +159,78 @@ fn verified_claude_acquisition() -> NativeAcquisition {
     }
 }
 
-/// Before completion, the trusted boot lane installs `name` at
-/// `provider_ai` on `session:claude:<session_id>` (an import-owned record),
-/// then the consolidation completes.
-async fn boot_install_then_complete(names: &SessionNames, session_id: &str, name: &str) {
+/// One import through the trusted boot lane (the consolidation runner's
+/// reserved import id), before completion.
+async fn boot_import(names: &SessionNames, candidates: Vec<LegacyNameCandidate>) {
     names
         .import_legacy(LegacyNameImport {
             version: 1,
             import_id: NAME_MIGRATION_BOOT_IMPORT_ID.to_string(),
             evidence: vec![],
-            candidates: vec![candidate(
-                "boot-1",
-                LegacyNameTarget::Canonical(claude_session(session_id)),
-                name,
-                NameSource::ProviderAi,
-                LegacyCandidateScope::SourceTab,
-                &format!("tabs-registry:device-1:claude:{session_id}:source-tab"),
-                LegacyProtectionEvidence::None,
-            )],
+            candidates,
         })
         .await
         .expect("boot import succeeds");
+}
+
+/// A boot-lane source-tab label for `session:claude:<session_id>`.
+fn boot_session_label(
+    id: &str,
+    session_id: &str,
+    name: &str,
+    source: NameSource,
+    protection: LegacyProtectionEvidence,
+) -> LegacyNameCandidate {
+    candidate(
+        id,
+        LegacyNameTarget::Canonical(claude_session(session_id)),
+        name,
+        source,
+        LegacyCandidateScope::SourceTab,
+        &format!("tabs-registry:device-1:claude:{session_id}:source-tab"),
+        protection,
+    )
+}
+
+/// Before completion, the trusted boot lane installs `name` on
+/// `session:claude:<session_id>` (an import-owned record) with the source
+/// the boot lane classifies `source` + `protection` as (`installed_as`),
+/// then the consolidation completes.
+async fn boot_install_as_then_complete(
+    names: &SessionNames,
+    session_id: &str,
+    name: &str,
+    (source, protection): (NameSource, LegacyProtectionEvidence),
+    installed_as: NameSource,
+) {
+    boot_import(
+        names,
+        vec![boot_session_label(
+            "boot-1", session_id, name, source, protection,
+        )],
+    )
+    .await;
     let installed = record_of(names, claude_session(session_id))
         .await
         .expect("the boot import installed the record");
     assert_eq!(installed.record.name, name);
-    assert_eq!(installed.record.source, NameSource::ProviderAi);
+    assert_eq!(installed.record.source, installed_as);
     names
         .complete_legacy_migration()
         .await
         .expect("completion commits");
+}
+
+/// [`boot_install_as_then_complete`] for an automatic `provider_ai` label.
+async fn boot_install_then_complete(names: &SessionNames, session_id: &str, name: &str) {
+    boot_install_as_then_complete(
+        names,
+        session_id,
+        name,
+        (NameSource::ProviderAi, LegacyProtectionEvidence::None),
+        NameSource::ProviderAi,
+    )
+    .await;
 }
 
 /// A live pending handle whose create-time name is the folder `work`
@@ -552,6 +594,166 @@ async fn import_owned_real_label_keeps_the_rank_rule() {
     assert_eq!(
         collision_losers(dir.path()),
         vec![("work".to_string(), "bind_collision_loser".to_string())],
+    );
+}
+
+/// Pinning test: only an automatic import-owned label gives way. A
+/// protected import-owned "Tab 4" — a legacy-flagged label, a proven
+/// explicit rename, an accepted Freshell AI name — keeps the rank rule, so
+/// a bind never demotes a name a person may have typed.
+#[tokio::test]
+async fn import_owned_protected_default_label_keeps_the_rank_rule() {
+    for (evidence, installed_as) in [
+        (
+            (
+                NameSource::LegacyProtected,
+                LegacyProtectionEvidence::LegacyFlag,
+            ),
+            NameSource::LegacyProtected,
+        ),
+        (
+            (NameSource::Manual, LegacyProtectionEvidence::ExplicitRename),
+            NameSource::Manual,
+        ),
+        (
+            (NameSource::FreshellAi, LegacyProtectionEvidence::None),
+            NameSource::FreshellAi,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let names = open_store(dir.path());
+        boot_install_as_then_complete(&names, "X", "Tab 4", evidence, installed_as).await;
+
+        bind_work_pending_to(&names, "P", "X").await;
+
+        let bound = record_of(&names, claude_session("X")).await.unwrap();
+        assert_eq!(
+            bound.record.name, "Tab 4",
+            "{installed_as:?}: the protected label stays"
+        );
+        assert_eq!(bound.record.source, installed_as);
+        assert_eq!(
+            collision_losers(dir.path()),
+            vec![("work".to_string(), "bind_collision_loser".to_string())],
+            "{installed_as:?}: the pending name is the retained loser"
+        );
+    }
+}
+
+/// Pinning test: the rule covers only a record still at the revision the
+/// migration installed. The boot consolidation labels both a pane's pending
+/// handle and its session "Tab 4"; the pane binds, so the session record
+/// carries the pane's "Tab 4" at a revision past its install. A later
+/// pending "work" bound to the same session meets the rank rule:
+/// `provider_ai` outranks `directory`.
+#[tokio::test]
+async fn a_default_label_moved_past_its_install_keeps_the_rank_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = open_store(dir.path());
+    boot_import(
+        &names,
+        vec![
+            boot_session_label(
+                "boot-session",
+                "X",
+                "Tab 4",
+                NameSource::ProviderAi,
+                LegacyProtectionEvidence::None,
+            ),
+            candidate(
+                "boot-pane",
+                LegacyNameTarget::Canonical(SessionNameRef::Pending { id: "P1".into() }),
+                "Tab 4",
+                NameSource::ProviderAi,
+                LegacyCandidateScope::Pane,
+                "tabs-registry:device-1:tab-1:pane-1",
+                LegacyProtectionEvidence::None,
+            ),
+        ],
+    )
+    .await;
+    names.complete_legacy_migration().await.unwrap();
+    names
+        .bind_pending(BindNameInput {
+            pending: SessionNameRef::Pending { id: "P1".into() },
+            target: claude_session("X"),
+            acquisition: verified_claude_acquisition(),
+        })
+        .await
+        .expect("the pane binds");
+
+    let key = name_ref_key(&claude_session("X"));
+    let document = read_document(dir.path());
+    let moved = document.record_at(&key).expect("the session record exists");
+    assert_eq!(moved.name, "Tab 4");
+    assert_eq!(moved.source, NameSource::ProviderAi);
+    let installed = document
+        .migration
+        .winning_evidence
+        .get(&key)
+        .expect("the migration's winning evidence is retained")
+        .installed_revision;
+    assert!(
+        moved.revision > installed,
+        "the record moved past its installed revision ({} vs {installed})",
+        moved.revision
+    );
+    let work_lost = |dir: &Path| {
+        collision_losers(dir)
+            .iter()
+            .filter(|(name, _)| name == "work")
+            .count()
+    };
+    assert_eq!(work_lost(dir.path()), 0);
+
+    bind_work_pending_to(&names, "P2", "X").await;
+
+    let bound = record_of(&names, claude_session("X")).await.unwrap();
+    assert_eq!(bound.record.name, "Tab 4", "the rank rule keeps the label");
+    assert_eq!(bound.record.source, NameSource::ProviderAi);
+    assert_eq!(
+        work_lost(dir.path()),
+        1,
+        "the pending name is the retained loser"
+    );
+}
+
+/// The decision log spells sources the way the stored document, the wire
+/// and the other naming logs do (`provider_ai`, `directory`), so a log
+/// search for a source finds these lines too.
+#[tokio::test]
+async fn bind_collision_log_spells_sources_as_the_wire_does() {
+    let events = crate::test_trace_capture::captured_trace_events();
+    let dir = tempfile::tempdir().unwrap();
+    let names = open_store(dir.path());
+    let session_id = format!("log-{}", uuid::Uuid::new_v4());
+    boot_install_then_complete(&names, &session_id, "Tab 4").await;
+
+    bind_work_pending_to(&names, "P", &session_id).await;
+
+    let key = name_ref_key(&claude_session(&session_id));
+    let lines: Vec<_> = events
+        .snapshot()
+        .into_iter()
+        .filter(|event| {
+            event.message == "session_names.bind_collision_import_label_lost"
+                && event.fields.get("name_ref") == Some(&key)
+        })
+        .collect();
+    assert_eq!(lines.len(), 1, "one decision line: {lines:?}");
+    let line = &lines[0];
+    assert_eq!(line.level, tracing::Level::INFO);
+    assert_eq!(
+        line.fields.get("op").map(String::as_str),
+        Some("bind_pending")
+    );
+    assert_eq!(
+        line.fields.get("loser_source").map(String::as_str),
+        Some("provider_ai")
+    );
+    assert_eq!(
+        line.fields.get("winner_source").map(String::as_str),
+        Some("directory")
     );
 }
 
