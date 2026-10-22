@@ -3,7 +3,7 @@
 import { describe, expect, it, vi } from 'vitest'
 // The sidecar runs directly in Node, so its shared settings logic is plain ESM.
 // @ts-expect-error JavaScript sidecar module has no declaration file.
-import { configureSession, userMessageContent, resultErrorMessage } from '../../../crates/freshell-claude-sidecar/session-settings.mjs'
+import { configureSession, userMessageContent } from '../../../crates/freshell-claude-sidecar/session-settings.mjs'
 import { startRealSidecar, type RealSidecar } from './harness'
 
 function session() {
@@ -64,18 +64,12 @@ describe('Claude sidecar settings', () => {
   })
 })
 
-describe('Claude message content and failures', () => {
+describe('Claude message content', () => {
   it('forwards native images together with text', () => {
     expect(userMessageContent('Describe it', [{ kind: 'data', mediaType: 'image/png', data: 'YWJj' }])).toEqual([
       { type: 'text', text: 'Describe it' },
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } },
     ])
-  })
-
-  it('explains unsuccessful results without treating successful results as errors', () => {
-    expect(resultErrorMessage({ subtype: 'error_during_execution', errors: ['Request timed out'] })).toBe('Request timed out')
-    expect(resultErrorMessage({ subtype: 'error_max_turns' })).toContain('turn limit')
-    expect(resultErrorMessage({ subtype: 'success' })).toBeUndefined()
   })
 })
 
@@ -89,7 +83,9 @@ const FAILING_TURN_PROGRAM = {
   rules: [{
     on: 'msg:prompt',
     match: { text: '__fail__' },
-    emit: [{ kind: 'completion', data: { subtype: 'error_during_execution', errors: ['Request timed out'] } }],
+    // The CLI puts an internal diagnostic line next to the real error; only
+    // the real error may reach the user.
+    emit: [{ kind: 'completion', data: { subtype: 'error_during_execution', errors: ['[ede_diagnostic] result_type=assistant last_content_type=text stop_reason=null', 'Request timed out'] } }],
   }],
 }
 const UNKNOWN_MODE_REFUSAL = 'Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan'

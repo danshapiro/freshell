@@ -39,7 +39,8 @@
 //                                  stays silent
 //     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
 //     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
-//     { type:'sdk.error',               sessionId, message }
+//     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
+//                                  (sanitized text, no [ede_diagnostic] lines); never for the user's own Stop
 //     { type:'sdk.exit',                sessionId }
 //     { type:'sdk.permission.request',  sessionId, requestId, subtype:'can_use_tool', tool:{name,input}, toolUseID, suggestions, blockedPath, decisionReason }
 //     { type:'sdk.question.request',    sessionId, requestId, questions }
@@ -75,7 +76,8 @@
 
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
-import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
+import { configureSession, userMessageContent } from './session-settings.mjs'
+import { resultFrames } from './sdk-message-frames.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
@@ -303,22 +305,13 @@ function handleSdkMessage(sessionId, msg) {
       // The awaited turn's terminal frame arrived: drop one pending send
       // (clamped at 0 — an unsolicited result must not underflow the counter).
       st.pendingResults = Math.max(0, st.pendingResults - 1)
-      const usage = msg.usage
-        ? {
-            input_tokens: msg.usage.input_tokens,
-            output_tokens: msg.usage.output_tokens,
-            cache_creation_input_tokens: msg.usage.cache_creation_input_tokens,
-            cache_read_input_tokens: msg.usage.cache_read_input_tokens,
-          }
-        : undefined
-      emit({ type: 'sdk.result', sessionId, result: msg.subtype, durationMs: msg.duration_ms, costUsd: msg.total_cost_usd, usage })
-      const failure = resultErrorMessage(msg)
-      if (failure) emit({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
-      // Unified attention edge: any turn end rings unless this result is the
-      // interrupted turn's own (the SDK contract orders the settle receipt
-      // before it). No outcome rides the wire — the client treats all ends
-      // identically.
-      if (st.turnCompleteGate.resultEmitsAttention()) {
+      // The gate's verdict comes first: the interrupted turn's own result is
+      // the user's Stop, so it carries neither a bell nor a failure banner
+      // (G03). Any other turn end rings; a failed one also reports why. No
+      // outcome rides the edge — the client treats all ends identically.
+      const rings = st.turnCompleteGate.resultEmitsAttention()
+      for (const frame of resultFrames(sessionId, msg, { userStopped: !rings })) emit(frame)
+      if (rings) {
         const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
         st.lastTurnCompleteAt = at
         emit({ type: 'sdk.turn.complete', sessionId, at })

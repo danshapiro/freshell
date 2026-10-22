@@ -43,15 +43,3 @@ export function userMessageContent(text, images = []) {
   }
   return content
 }
-
-export function resultErrorMessage(result) {
-  if (result.subtype === 'success') return undefined
-  const messages = Array.isArray(result.errors) ? result.errors.filter((message) => typeof message === 'string' && message.trim()) : []
-  if (messages.length) return messages.join('\n')
-  switch (result.subtype) {
-    case 'error_max_turns': return 'Claude reached its turn limit. Send a message to continue.'
-    case 'error_max_budget_usd': return 'Claude reached the configured spending limit.'
-    case 'error_max_structured_output_retries': return 'Claude could not produce the requested response format.'
-    default: return 'Claude could not complete this turn. Try sending your message again.'
-  }
-}

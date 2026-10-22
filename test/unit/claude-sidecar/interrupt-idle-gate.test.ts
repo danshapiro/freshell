@@ -62,4 +62,33 @@ describe('Claude sidecar interrupt gate arming (unified attention edge)', () => 
     expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
     expect(bridge.frames.filter((frame) => frame.type === 'sdk.turn.complete')).toHaveLength(1)
   })
+
+  // G03: the CLI ends a stopped turn with error_during_execution and an
+  // `[ede_diagnostic]` error (T11). That is the user's own Stop, not a
+  // failure, so no error frame (the client's "Agent error" banner) follows.
+  it.each([
+    { stage: 'streamed text', prompt: 'HANG', started: (frame: Record<string, any>) => frame.type === 'sdk.session.init' },
+    {
+      stage: 'a tool call',
+      prompt: 'TOOL:sleep=30',
+      started: (frame: Record<string, any>) => frame.type === 'sdk.assistant' && frame.content?.some((block: { type: string }) => block.type === 'tool_use'),
+    },
+  ])('a Stop during $stage ends the turn silently and with no error', async ({ prompt, started }) => {
+    const bridge = await startRealSidecar()
+    const sessionId = await createSession(bridge)
+
+    bridge.send({ type: 'send', sessionId, text: prompt })
+    await bridge.waitFor(started, `${prompt} under way`)
+    bridge.send({ type: 'interrupt', sessionId })
+    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
+    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, result: 'error_during_execution' })
+
+    // Everything the stopped turn produces has arrived once the next turn has
+    // rung: it is still exactly one edge, and no error frame at all.
+    bridge.send({ type: 'send', sessionId, text: 'after the stop' })
+    await bridge.waitFor((frame) => frame.type === 'sdk.result' && frame.result === 'success', 'the next turn result')
+    await bridge.waitFor('sdk.turn.complete')
+    expect(bridge.frames.filter((frame) => frame.type === 'sdk.turn.complete')).toHaveLength(1)
+    expect(bridge.frames.filter((frame) => frame.type === 'sdk.error')).toEqual([])
+  })
 })
