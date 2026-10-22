@@ -1,3 +1,5 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -17,6 +19,11 @@ import {
 // then fills the rest of the quota, leaving only a little room. The client
 // must delete the stale copies, never block the layout save, and keep a
 // renamed shell tab's name across reloads.
+//
+// A capture that fails on quota is logged as `legacy_name_capture_failed`.
+// The capture runs before the client starts forwarding its logs, so the
+// client replays that error once forwarding is on; the second case checks
+// the error lands in the server's own log.
 
 test.setTimeout(240_000)
 
@@ -92,6 +99,60 @@ function fillStorageWithStaleEnvelopes(opts: {
   sessionStorage.setItem('e2e.storage-quota.capacity', String(low))
 }
 
+const LEGACY_LAYOUT_KEY = 'freshell.layout.v3'
+
+/** A genuine pre-names legacy layout (no saved-name fields), so the boot
+ * capture copies it. */
+function legacyShellLayout(): string {
+  return JSON.stringify({
+    version: 4,
+    persistedAt: 1,
+    tabs: { activeTabId: 'legacy-tab', tabs: [{ id: 'legacy-tab', title: 'Legacy shell' }] },
+    panes: {
+      version: 7,
+      layouts: { 'legacy-tab': { type: 'leaf', id: 'legacy-pane', content: { kind: 'terminal', mode: 'shell', createRequestId: 'legacy-req' } } },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    },
+  })
+}
+
+/** Runs in the page before any app script: seeds the genuine legacy layout
+ * once, and makes every migration-envelope write fail as a full storage
+ * does (every other write still succeeds). */
+function failEnvelopeWrites(opts: { origin: string; prefix: string; legacyKey: string; legacyRaw: string }): void {
+  if (window.location.origin !== opts.origin) return
+  if (localStorage.getItem(opts.legacyKey) === null) localStorage.setItem(opts.legacyKey, opts.legacyRaw)
+  const realSetItem = Storage.prototype.setItem
+  Storage.prototype.setItem = function setItem(this: Storage, key: string, value: string): void {
+    if (key.startsWith(opts.prefix)) {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
+    }
+    realSetItem.call(this, key, value)
+  }
+}
+
+/** Every browser log entry the server accepted from `/api/logs/client`,
+ * as that entry's arguments: the server writes each one to its JSONL log
+ * (`rust-server.jsonl`) as a `client_log` event whose `args` field holds
+ * the arguments as JSON text. */
+async function serverClientLogArgs(logsDir: string): Promise<unknown[][]> {
+  const raw = await fs.readFile(path.join(logsDir, 'rust-server.jsonl'), 'utf8').catch(() => '')
+  const entries: unknown[][] = []
+  for (const line of raw.split('\n')) {
+    if (!line.includes('client_log')) continue
+    try {
+      const event = JSON.parse(line) as { event?: unknown; args?: unknown }
+      if (event.event !== 'client_log') continue
+      const args = typeof event.args === 'string' ? JSON.parse(event.args) as unknown : event.args
+      if (Array.isArray(args)) entries.push(args)
+    } catch {
+      // A line still being written.
+    }
+  }
+  return entries
+}
+
 async function persistedTabTitle(page: Page, tabId: string): Promise<string | null> {
   return page.evaluate((id) => {
     const windowId = sessionStorage.getItem('freshell.layout-window-id.v1')
@@ -162,6 +223,42 @@ test.describe('name storage quota', () => {
       // A second rename after a boot that started full again.
       await renameAndExpectSaved(page, tabId, 'Quota Survivor Two')
       await reloadAndExpectName(page, tabId, 'Quota Survivor Two')
+      expect(await migrationKeys(page)).toEqual([])
+      await context.close()
+    } finally {
+      await server.stop()
+    }
+  })
+
+  test('a boot capture that fails on quota reports its error to the server log', async ({ browser }) => {
+    const server = await bootUnifiedNamesServer()
+    try {
+      const context = await browser.newContext()
+      await context.addInitScript(failEnvelopeWrites, {
+        origin: new URL(server.info.baseUrl).origin,
+        prefix: MIGRATION_PREFIX,
+        legacyKey: LEGACY_LAYOUT_KEY,
+        legacyRaw: legacyShellLayout(),
+      })
+      // The failed capture blocks nothing: the page boots and connects. (No
+      // terminal is created here, so the picker bootstrap is skipped.)
+      const { page } = await connectUnifiedPage({ browser, info: server.info, context, skipPicker: true })
+
+      // The browser forwards its log entries in order, so once a marker
+      // logged now is in the server log, everything the boot replayed is too.
+      const marker = `e2e-forwarding-marker-${Date.now()}`
+      await page.evaluate((text) => console.warn(text), marker)
+      await expect.poll(async () => (
+        (await serverClientLogArgs(server.info.logsDir)).some((args) => args.includes(marker))
+      ), { message: 'the forwarding marker never reached the server log', timeout: 30_000 }).toBe(true)
+
+      const captureEntries = (await serverClientLogArgs(server.info.logsDir))
+        .filter((args) => args.some((arg) => typeof arg === 'string' && arg.includes('LegacyNameCapture')))
+      const failures = captureEntries
+        .filter((args) => args.includes('legacy_name_capture_failed'))
+        .flatMap((args) => args.filter((arg) => typeof arg === 'object' && arg !== null))
+      expect(failures, `capture entries in the server log: ${JSON.stringify(captureEntries)}`)
+        .toContainEqual({ storageKey: LEGACY_LAYOUT_KEY, reason: 'QuotaExceededError', replayed: true })
       expect(await migrationKeys(page)).toEqual([])
       await context.close()
     } finally {

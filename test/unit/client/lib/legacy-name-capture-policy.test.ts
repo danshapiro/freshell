@@ -20,9 +20,11 @@ import {
   SESSION_NAME_MIGRATION_KEY_PREFIX,
   isCaptureDone,
   listCapturedMigrationEnvelopes,
+  reportBootCaptureFailures,
   runOneTimeLegacyCapture,
 } from '@/lib/legacy-name-capture-policy'
 import { submitPendingLegacyNameImports } from '@/lib/session-name-migration'
+import { createClientLogger } from '@/lib/client-logger'
 
 // Name reliability (Task 2): the browser captures legacy name evidence at
 // most once per device, only from genuine pre-migration keys, and deletes
@@ -92,23 +94,16 @@ function acknowledgeAllCandidates(): void {
   }))
 }
 
-/** A Storage stub whose setItem can be made to throw (a full quota). */
-function failingStorage(): Storage & { failSetItem: (fail: boolean) => void } {
-  const map = new Map<string, string>()
-  let fail = false
-  const storage = {
-    get length() { return map.size },
-    key(index: number) { return Array.from(map.keys())[index] ?? null },
-    getItem(key: string) { return map.get(key) ?? null },
-    setItem(key: string, value: string) {
-      if (fail) throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
-      map.set(key, value)
-    },
-    removeItem(key: string) { map.delete(key) },
-    clear() { map.clear() },
-    failSetItem(next: boolean) { fail = next },
-  }
-  return storage as Storage & { failSetItem: (fail: boolean) => void }
+/** Make every envelope write to the real localStorage throw a quota error
+ * (the source keys stay writable). Restore with `mockRestore()`. */
+function failEnvelopeWrites() {
+  const realSetItem = Storage.prototype.setItem
+  return vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+    if (key.startsWith(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.`)) {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
+    }
+    realSetItem.call(this, key, value)
+  })
 }
 
 beforeEach(() => {
@@ -290,17 +285,19 @@ describe('one-time legacy name capture', () => {
     }
   })
 
-  it('a capture write failure is logged as a structured error, leaves the source untouched, and the next boot retries', () => {
+  it('a capture write failure is logged as a structured error and drops the evidence: the next ready submit marks the device done', async () => {
     ;(globalThis as { __ALLOW_CONSOLE_ERROR__?: boolean }).__ALLOW_CONSOLE_ERROR__ = true
-    const storage = failingStorage()
     const bare = preNamesLayout()
-    storage.setItem('freshell.layout.v3', bare)
-    storage.failSetItem(true)
-
-    expect(() => runOneTimeLegacyCapture(storage)).not.toThrow()
-    expect(listCapturedMigrationEnvelopes(storage)).toEqual([])
-    expect(storage.getItem('freshell.layout.v3')).toBe(bare)
-    expect(isCaptureDone(storage)).toBe(false)
+    localStorage.setItem('freshell.layout.v3', bare)
+    const setItem = failEnvelopeWrites()
+    try {
+      expect(() => runOneTimeLegacyCapture(localStorage)).not.toThrow()
+    } finally {
+      setItem.mockRestore()
+    }
+    expect(listCapturedMigrationEnvelopes(localStorage)).toEqual([])
+    expect(localStorage.getItem('freshell.layout.v3')).toBe(bare)
+    expect(isCaptureDone(localStorage)).toBe(false)
     const logged = vi.mocked(console.error).mock.calls.find((args) => args.includes('legacy_name_capture_failed'))
     expect(logged).toBeTruthy()
     expect(logged?.find((arg) => typeof arg === 'object' && arg !== null)).toEqual({
@@ -308,8 +305,97 @@ describe('one-time legacy name capture', () => {
       reason: 'QuotaExceededError',
     })
 
-    storage.failSetItem(false)
-    runOneTimeLegacyCapture(storage)
-    expect(listCapturedMigrationEnvelopes(storage).map((envelope) => envelope.storageKey)).toEqual(['freshell.layout.v3'])
+    // The connection-ready submit finds nothing pending and marks the device
+    // done, even though the storage has room again.
+    acknowledgeAllCandidates()
+    await submitPendingLegacyNameImports()
+    expect(apiMocks.post).not.toHaveBeenCalled()
+    expect(isCaptureDone(localStorage)).toBe(true)
+
+    // The next boot never captures the (still genuine) bare key again.
+    runOneTimeLegacyCapture(localStorage)
+    await submitPendingLegacyNameImports()
+    expect(migrationKeys()).toEqual([])
+    expect(apiMocks.post).not.toHaveBeenCalled()
+  })
+
+  it('a page load whose capture failed and that never reached a ready connection leaves the capture to the next boot', () => {
+    ;(globalThis as { __ALLOW_CONSOLE_ERROR__?: boolean }).__ALLOW_CONSOLE_ERROR__ = true
+    localStorage.setItem('freshell.layout.v3', preNamesLayout())
+    const setItem = failEnvelopeWrites()
+    try {
+      runOneTimeLegacyCapture(localStorage)
+    } finally {
+      setItem.mockRestore()
+    }
+    expect(listCapturedMigrationEnvelopes(localStorage)).toEqual([])
+
+    // No submit ran (the page closed before its connection was ready), so
+    // the device is not done and the next boot captures.
+    runOneTimeLegacyCapture(localStorage)
+    expect(listCapturedMigrationEnvelopes(localStorage).map((envelope) => envelope.storageKey)).toEqual(['freshell.layout.v3'])
+  })
+
+  it('replays a boot capture failure to the client log endpoint once forwarding is installed, exactly once', async () => {
+    ;(globalThis as { __ALLOW_CONSOLE_ERROR__?: boolean }).__ALLOW_CONSOLE_ERROR__ = true
+    localStorage.setItem('freshell.layout.v3', preNamesLayout())
+    // The test setup's console.error spy (forwarding wraps it below).
+    const consoleError = vi.mocked(console.error)
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+    const logger = createClientLogger({ flushIntervalMs: 0, maxBatchSize: 50, enableNetwork: true })
+    // main.tsx order: the boot pass runs while the entry's imports evaluate;
+    // forwarding is installed only afterwards, so the pass's own error
+    // reaches the console alone.
+    const setItem = failEnvelopeWrites()
+    try {
+      runOneTimeLegacyCapture(localStorage)
+    } finally {
+      setItem.mockRestore()
+    }
+    const uninstall = logger.installConsoleCapture()
+    try {
+      reportBootCaptureFailures()
+      reportBootCaptureFailures()
+      await logger.flush()
+    } finally {
+      uninstall()
+      vi.unstubAllGlobals()
+    }
+
+    const entries = fetchMock.mock.calls.flatMap(([, init]) => (
+      JSON.parse((init as { body: string }).body) as { entries: Array<{ severity: string; args?: unknown[] }> }
+    ).entries)
+    const forwarded = entries.filter((entry) => entry.severity === 'error'
+      && entry.args?.includes('legacy_name_capture_failed'))
+    expect(forwarded).toHaveLength(1)
+    expect(forwarded[0].args).toContainEqual({
+      storageKey: 'freshell.layout.v3',
+      reason: 'QuotaExceededError',
+      replayed: true,
+    })
+    // Replayed once, not once per call (the logger's duplicate filter alone
+    // would hide a second replay from the endpoint).
+    const replays = consoleError.mock.calls.filter((args) => args.some((arg) => (
+      typeof arg === 'object' && arg !== null && (arg as { replayed?: unknown }).replayed === true
+    )))
+    expect(replays).toHaveLength(1)
+  })
+
+  it('a clean boot pass replays nothing', async () => {
+    localStorage.setItem('freshell.layout.v3', preNamesLayout())
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+    const logger = createClientLogger({ flushIntervalMs: 0, maxBatchSize: 50, enableNetwork: true })
+    runOneTimeLegacyCapture(localStorage)
+    const uninstall = logger.installConsoleCapture()
+    try {
+      reportBootCaptureFailures()
+      await logger.flush()
+    } finally {
+      uninstall()
+      vi.unstubAllGlobals()
+    }
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

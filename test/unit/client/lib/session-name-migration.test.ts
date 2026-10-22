@@ -112,27 +112,6 @@ function envelopeKeysIn(storage: Storage): string[] {
   return keys
 }
 
-/** A localStorage stub that can be made to fail setItem. */
-function failingStorage(): Storage & { failSetItem: (fail: boolean) => void } {
-  const map = new Map<string, string>()
-  const storage = {
-    fail: false,
-    get length() { return map.size },
-    key(index: number) { return Array.from(map.keys())[index] ?? null },
-    getItem(key: string) { return map.get(key) ?? null },
-    setItem(key: string, value: string) {
-      if ((storage as unknown as { fail: boolean }).fail) {
-        throw new Error('quota')
-      }
-      map.set(key, value)
-    },
-    removeItem(key: string) { map.delete(key) },
-    clear() { map.clear() },
-    failSetItem(fail: boolean) { (storage as unknown as { fail: boolean }).fail = fail },
-  }
-  return storage as Storage & { failSetItem: (fail: boolean) => void }
-}
-
 beforeEach(() => {
   localStorage.clear()
   apiMocks.post.mockReset()
@@ -197,25 +176,36 @@ describe('legacy-name capture', () => {
     expect(first[0].raw).toBe(layoutEnvelope())
   })
 
-  it('a capture write failure never throws, logs legacy_name_capture_failed, keeps the source, and retries next boot', () => {
+  it('a capture write failure never throws, logs legacy_name_capture_failed, keeps the source, and the next ready submit marks the device done without sending', async () => {
     ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the failure path logs
-    const storage = failingStorage()
-    storage.setItem('freshell.layout.v3', layoutEnvelope())
-    storage.failSetItem(true)
-    expect(() => runOneTimeLegacyCapture(storage)).not.toThrow()
+    localStorage.setItem('freshell.layout.v3', layoutEnvelope())
+    const realSetItem = Storage.prototype.setItem
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+      if (key.startsWith(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.`)) throw new Error('quota')
+      realSetItem.call(this, key, value)
+    })
+    try {
+      expect(() => runOneTimeLegacyCapture(localStorage)).not.toThrow()
+    } finally {
+      setItem.mockRestore()
+    }
     // The source is untouched, nothing was captured, and the device is not
-    // marked done (the capture is retried).
-    expect(storage.getItem('freshell.layout.v3')).toBe(layoutEnvelope())
-    expect(listCapturedMigrationEnvelopes(storage)).toHaveLength(0)
-    expect(isCaptureDone(storage)).toBe(false)
+    // done yet.
+    expect(localStorage.getItem('freshell.layout.v3')).toBe(layoutEnvelope())
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(0)
+    expect(isCaptureDone(localStorage)).toBe(false)
     const logged = vi.mocked(console.error).mock.calls.find((args) => args.includes('legacy_name_capture_failed'))
     expect(logged?.find((arg) => typeof arg === 'object' && arg !== null))
       .toMatchObject({ storageKey: 'freshell.layout.v3', reason: expect.any(String) })
 
-    // The next boot, once writable, captures.
-    storage.failSetItem(false)
-    runOneTimeLegacyCapture(storage)
-    expect(listCapturedMigrationEnvelopes(storage)).toHaveLength(1)
+    // The connection-ready submit finds nothing pending: the evidence is
+    // dropped and the device is done, so no later boot captures it.
+    apiMocks.post.mockResolvedValue({ acknowledged: [], names: [] })
+    await submitPendingLegacyNameImports()
+    expect(apiMocks.post).not.toHaveBeenCalled()
+    expect(isCaptureDone(localStorage)).toBe(true)
+    runOneTimeLegacyCapture(localStorage)
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(0)
   })
 
   it('an envelope an old client window adds later is never submitted, and is deleted', async () => {

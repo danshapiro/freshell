@@ -26,9 +26,13 @@ import { createClientLogger } from '@/lib/client-logger'
 import { initClientPerfLogging } from '@/lib/perf-logger'
 import { registerServiceWorker } from '@/lib/pwa'
 import { initChunkErrorRecovery } from '@/lib/import-retry'
+import { reportBootCaptureFailures } from '@/lib/legacy-name-capture-policy'
 
 initializeAuthToken()
 createClientLogger().installConsoleCapture()
+// The legacy-name capture pass ran during the imports above, before
+// forwarding existed: replay its failures so they reach the server log.
+reportBootCaptureFailures()
 initClientPerfLogging()
 registerServiceWorker()
 initChunkErrorRecovery()
