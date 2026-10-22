@@ -7,7 +7,9 @@ import {
   connectUnifiedPage,
   createNamedAgent,
   expectSharedName,
+  paneContentFromLayoutSnapshot,
   renameThroughTabEdit,
+  type NamedAgentHandle,
   type UnifiedNamesServer,
 } from '../helpers/unified-agent-names.js'
 
@@ -53,6 +55,25 @@ async function runCli(
   return run
 }
 
+/**
+ * The CLI addresses a pane through the SERVER's layout mirror, which adopts
+ * a UI-created agent pane only when the browser's layout sync lands (the
+ * handle is read from the browser's own state, so it can be ready first).
+ * Until then the tab route sees a plain tab and renames its layout label —
+ * the documented capture-less behavior, not the naming record. An agent
+ * can only act on panes the server knows, so wait for that first.
+ */
+async function waitForServerNamingIdentity(server: UnifiedNamesServer, handle: NamedAgentHandle): Promise<void> {
+  await expect.poll(async () => {
+    const content = await paneContentFromLayoutSnapshot(server, handle.tabId, handle.paneId).catch(() => null)
+    return Boolean(content && (content.nameRef || (typeof content.namingHandle === 'string' && content.namingHandle)))
+  }, {
+    message: `the server's layout mirror knows pane ${handle.paneId}'s naming identity`,
+    timeout: 30_000,
+    intervals: [250, 500, 1_000],
+  }).toBe(true)
+}
+
 test.describe('automation rename outcome', () => {
   test('a refused automation rename says so, and on a fresh pane it applies', async ({ browser }) => {
     const server = await bootUnifiedNamesServer({ mode: 'claude' })
@@ -68,6 +89,7 @@ test.describe('automation rename outcome', () => {
       })
 
       // An agent's automatic rename is refused, and the CLI says why.
+      await waitForServerNamingIdentity(server, first)
       const refused = await runCli(server, ['rename-tab', '--target', first.tabId, 'Bot name'])
       expect(refused.code, refused.stderr).toBe(0)
       expect(refused.stderr).toContain('name not applied: protected_name')
@@ -79,9 +101,19 @@ test.describe('automation rename outcome', () => {
       // On a fresh pane (its folder name is only a fallback) it applies.
       const second = await createNamedAgent(harness, 'claude', { entry: 'ui', page, server })
       expect(second.nameRef).toBeTruthy()
+      await waitForServerNamingIdentity(server, second)
       const applied = await runCli(server, ['rename-tab', '--target', second.tabId, 'Bot name'])
       expect(applied.code, applied.stderr).toBe(0)
       expect(applied.stderr).not.toContain('name not applied')
+      // The response reached the naming record (the tab route nests the
+      // update under `data.sessionName`) and says it applied — not a
+      // layout-label rename, which carries no outcome at all.
+      const appliedBody = JSON.parse(
+        applied.stdout.slice(applied.stdout.indexOf('{'), applied.stdout.lastIndexOf('}') + 1),
+      ) as {
+        data?: { sessionName?: { outcome?: { applied?: boolean } } }
+      }
+      expect(appliedBody.data?.sessionName?.outcome?.applied, applied.stdout).toBe(true)
       await expectSharedName(harness, second.nameRef!, 'Bot name', {
         page, server, tabId: second.tabId, surfaces: ['http', 'redux', 'tab'],
       })
