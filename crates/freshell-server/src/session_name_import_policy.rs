@@ -29,12 +29,9 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use freshell_protocol::session_names::{
-    LegacyImportResult, LegacyNameImport, NameSource, SessionNameRef,
-};
-use freshell_sessions::{is_default_or_derived_name, NameEvidenceContext};
+use freshell_protocol::session_names::{LegacyImportResult, LegacyNameImport, NameSource};
 
-use super::{NameError, StoredDocument, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT};
+use super::{wire_source, NameError, StoredDocument, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT};
 
 /// The per-process set of import ids already logged as ignored is cleared
 /// when it reaches this size, which bounds its memory; an id seen again after
@@ -112,31 +109,16 @@ pub(super) fn is_import_owned(document: &StoredDocument, key: &str) -> bool {
 }
 
 /// Rule 2: whether the durable record at `key` loses a pending→durable bind
-/// collision because it is an import-owned, unprotected default label. The
-/// classifier gets the record's provider (so a provider placeholder counts
-/// only for its own provider) and no folder.
+/// collision because it is an import-owned, unprotected default label —
+/// exactly a self-heal record (`session_name_policy`, the one server-side
+/// meaning of "default label": the record's provider, so a provider
+/// placeholder counts only for its own provider) under no folder, since
+/// bind inputs carry none.
 pub(super) fn import_owned_label_loses_bind(document: &StoredDocument, key: &str) -> bool {
     let Some(record) = document.record_at(key) else {
         return false;
     };
-    let automatic = matches!(
-        record.source,
-        NameSource::Directory | NameSource::FirstMessage | NameSource::ProviderAi
-    );
-    let provider = match &record.name_ref {
-        SessionNameRef::Session { provider, .. } => Some(provider.as_str()),
-        SessionNameRef::Pending { .. } => None,
-    };
-    automatic
-        && is_import_owned(document, key)
-        && is_default_or_derived_name(
-            &record.name,
-            &NameEvidenceContext {
-                cwd: None,
-                provider,
-                mode: None,
-            },
-        )
+    super::session_name_policy::is_self_heal_record(record, None) && is_import_owned(document, key)
 }
 
 /// The bind decision's use of rule 2: `true` when the pending record wins
@@ -164,16 +146,6 @@ pub(super) fn pending_beats_import_owned_label(
         "session_names.bind_collision_import_label_lost"
     );
     true
-}
-
-/// A source as the stored document and the wire spell it (`provider_ai`,
-/// `directory`), taken from its serde form so a log line matches a search
-/// for that spelling.
-fn wire_source(source: NameSource) -> String {
-    serde_json::to_value(source)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("{source:?}"))
 }
 
 /// True the first time this process sees `import_id` (until the bounded set

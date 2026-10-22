@@ -6,6 +6,7 @@ import {
   pendingNameSurvivesMaterializeAndReopen,
   twoBrowsersAndAnloadedHistoryConverge,
 } from '../helpers/unified-agent-names-modes.js'
+import { providerRealTitleNeverThePlaceholder } from '../helpers/native-title-journeys.js'
 
 // UNIFIED AGENT NAMES (plan Task 8) — the [opencode] slice of the six-mode
 // acceptance, split per coordinator ruling (task-008-decisions.md,
@@ -54,5 +55,11 @@ test.describe('[opencode] unified agent names', () => {
 
   test('manual name survives late generation and conversation switch', async ({ browser }) => {
     await manualNameSurvivesLateGenerationAndSwitch('opencode', browser)
+  })
+
+  // Name-reliability Task 4: OpenCode's temporary "New session - <ISO>"
+  // title is never saved; the real title it reports next is the name.
+  test('shows the provider real title, never the placeholder', async ({ browser }) => {
+    await providerRealTitleNeverThePlaceholder('opencode', browser)
   })
 })

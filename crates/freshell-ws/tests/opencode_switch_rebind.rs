@@ -730,6 +730,7 @@ async fn cli_db_association_transfers_pending_and_switch_surfaces_own_record() {
         name: "Pre Identity Opencode".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
@@ -827,6 +828,7 @@ async fn cli_db_association_transfers_pending_and_switch_surfaces_own_record() {
         name: "Switch Own Name".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();

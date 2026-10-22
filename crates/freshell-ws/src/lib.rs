@@ -57,6 +57,7 @@ pub mod invariants;
 pub mod opencode_association;
 pub mod opencode_lane;
 pub mod opencode_signal;
+pub mod opencode_title_naming;
 pub mod origin;
 pub(crate) mod paced_replay;
 pub mod pane_identity_binder;

@@ -772,6 +772,7 @@ async fn seed_named_durable_record(
         name: name.to_string(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
@@ -823,6 +824,7 @@ async fn cli_adoption_transfers_the_pending_naming_record() {
         name: "Pre Identity Codex".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
@@ -924,6 +926,7 @@ async fn cli_fork_retarget_surfaces_the_new_sessions_own_record() {
         name: "Old Own Name".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();

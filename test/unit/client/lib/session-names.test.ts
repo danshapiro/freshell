@@ -355,6 +355,26 @@ describe('renameSessionName', () => {
     expect(result).toEqual(update)
   })
 
+  it('keeps the rename outcome a server reports (name-reliability Task 4)', async () => {
+    const refused = { ...acceptedUpdate('LotL', 3), changed: false, outcome: { applied: false, reason: 'protected_name' } }
+    apiMocks.patch.mockResolvedValueOnce(refused)
+    const result = await renameSessionName({ target: sessionRef('s1'), name: 'Bot name' })
+    expect(result.outcome).toEqual({ applied: false, reason: 'protected_name' })
+    expect(result.record.name).toBe('LotL')
+  })
+
+  it('accepts a rename update without an outcome, and one with an unknown reason, keeping the record', async () => {
+    apiMocks.patch.mockResolvedValueOnce(acceptedUpdate('Old server', 2))
+    const old = await renameSessionName({ target: sessionRef('s1'), name: 'Old server' })
+    expect(old.outcome).toBeUndefined()
+    expect(old.record.name).toBe('Old server')
+
+    apiMocks.patch.mockResolvedValueOnce({ ...acceptedUpdate('Newer server', 4), outcome: { applied: false, reason: 'some_future_reason' } })
+    const newer = await renameSessionName({ target: sessionRef('s1'), name: 'Newer server' })
+    expect(newer.record.name).toBe('Newer server')
+    expect(newer.outcome).toBeUndefined()
+  })
+
   it('retains the server error code and accepted record on a conflict (the bare-record payload the scoped routes really answer)', async () => {
     // The scoped rename routes answer a conflict with the CURRENT record
     // as a bare `sessionName` — not the update envelope (an envelope

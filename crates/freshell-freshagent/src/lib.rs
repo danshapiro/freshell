@@ -47,9 +47,11 @@ pub mod layout_tree;
 pub mod model_capabilities;
 pub mod naming;
 pub mod native_history;
+pub mod native_observation_retry;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
+mod rename_target_cwd;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;
@@ -4979,6 +4981,7 @@ async fn create_tab(
                                 name: seed.to_string(),
                                 intent: freshell_protocol::session_names::NameIntent::Automatic,
                                 if_revision: None,
+                                cwd: cwd.clone(),
                             })
                             .await
                         {
@@ -5606,6 +5609,7 @@ async fn resume_session_ref_tab(
                 name: seed.to_string(),
                 intent: freshell_protocol::session_names::NameIntent::Automatic,
                 if_revision: None,
+                cwd: cwd.clone(),
             })
             .await
         {
@@ -6053,12 +6057,15 @@ pub(crate) async fn rename_scoped_session(
             "session naming is unavailable on this server".to_string(),
         );
     };
+    // Name-reliability Task 4 (LB-B8): the pane's best-known folder.
+    let cwd = pane_id.and_then(|pane_id| rename_target_cwd::pane_rename_cwd(state, pane_id));
     match sink
         .rename(naming::RenameNameInput {
             target: target.clone(),
             name: name.clone(),
             intent,
             if_revision,
+            cwd: cwd.clone(),
         })
         .await
     {
@@ -6106,6 +6113,7 @@ pub(crate) async fn rename_scoped_session(
                                 name,
                                 intent,
                                 if_revision,
+                                cwd,
                             })
                             .await
                         {

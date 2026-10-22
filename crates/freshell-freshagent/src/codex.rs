@@ -12344,6 +12344,7 @@ pub(crate) mod tests {
                 document_generation: 1,
                 changed: false,
                 native_sync: None,
+                outcome: None,
             }
         }
     }

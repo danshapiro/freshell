@@ -807,6 +807,47 @@ function currentSessionStatus(sessionId) {
   return sessionStatuses.get(sessionId) || 'idle'
 }
 
+// Name-reliability Task 4: FAKE_OPENCODE_TITLE_SEQUENCE (pipe-separated
+// titles) mimics opencode naming a session after its first exchange: after
+// a session's FIRST prompt, each title is written to the session row and
+// emitted as the serve's `session.updated` event (`sessionID` +
+// `info.{id,title}`, the shape the server's event parser reads), ~300 ms
+// apart, starting FAKE_OPENCODE_TITLE_SEQUENCE_DELAY_MS (default 500) after
+// the prompt. The final title is re-reported every 2 s, as the real serve
+// does on later session updates. Off by default.
+const titleSequence = (process.env.FAKE_OPENCODE_TITLE_SEQUENCE || '')
+  .split('|')
+  .map((title) => title.trim())
+  .filter(Boolean)
+const titleSequenceStarted = new Set()
+
+function runTitleSequence(sessionId) {
+  if (titleSequence.length === 0 || titleSequenceStarted.has(sessionId)) return
+  titleSequenceStarted.add(sessionId)
+  const delay = Number(process.env.FAKE_OPENCODE_TITLE_SEQUENCE_DELAY_MS || 500)
+  const emit = (title) => {
+    const db = openDatabase()
+    let session
+    try {
+      ensureSchema(db)
+      db.prepare('UPDATE session SET title = ?, time_updated = ? WHERE id = ?').run(title, Date.now(), sessionId)
+      session = sessionRow(db, sessionId)
+    } finally {
+      db.close()
+    }
+    if (!session) return
+    appendAudit({ event: 'title_sequence_emitted', sessionId, title })
+    broadcastServeEvent({ type: 'session.updated', properties: { sessionID: sessionId, info: readSessionInfo(session) } })
+  }
+  titleSequence.forEach((title, index) => {
+    setTimeout(() => emit(title), delay + index * 300).unref?.()
+  })
+  const last = titleSequence[titleSequence.length - 1]
+  setTimeout(() => {
+    setInterval(() => emit(last), 2000).unref?.()
+  }, delay + titleSequence.length * 300).unref?.()
+}
+
 function broadcastServeEvent(payload) {
   const frame = `data: ${JSON.stringify(payload)}\n\n`
   for (const client of Array.from(eventClients)) {
@@ -1368,6 +1409,7 @@ const server = http.createServer(async (req, res) => {
           prompt: appended.promptText,
         })
       }, 25).unref?.()
+      runTitleSequence(sessionId)
       return
     }
 
