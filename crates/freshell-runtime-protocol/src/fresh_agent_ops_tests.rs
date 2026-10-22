@@ -84,3 +84,58 @@ fn admin_and_host_envelopes_keep_the_same_semantic_request_id() {
         } if restored_id == request_id
     ));
 }
+
+#[test]
+fn configure_request_round_trips_settings_and_the_epoch_fence() {
+    let configure = FreshAgentConfigureRequest {
+        soul_id: SoulId::parse("soul-configure").unwrap(),
+        settings: FreshAgentTurnSettings {
+            cwd: None,
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            permission_mode: Some("acceptEdits".into()),
+            sandbox: None,
+        },
+        expected_control_epoch: Some(9),
+    };
+    let wire = serde_json::to_value(&configure).unwrap();
+    assert_eq!(wire["soulId"], "soul-configure");
+    assert_eq!(wire["settings"]["model"], "opus");
+    assert_eq!(wire["settings"]["permissionMode"], "acceptEdits");
+    assert_eq!(wire["expectedControlEpoch"], 9);
+    assert!(
+        wire["settings"].get("cwd").is_none(),
+        "absent settings stay absent so they keep the stored value"
+    );
+    assert_eq!(
+        serde_json::from_value::<FreshAgentConfigureRequest>(wire).unwrap(),
+        configure
+    );
+}
+
+#[test]
+fn host_configure_command_keeps_the_semantic_request_id_and_settings() {
+    let request_id = RequestId::parse("request-configure-1").unwrap();
+    let settings = FreshAgentTurnSettings {
+        cwd: Some("/workspace/nested".into()),
+        model: Some("opus".into()),
+        effort: None,
+        permission_mode: None,
+        sandbox: Some("workspace-write".into()),
+    };
+    let host = HostCommand::FreshAgentConfigure {
+        incarnation_id: IncarnationId::parse("incarnation-configure-1").unwrap(),
+        request_id: request_id.clone(),
+        settings: settings.clone(),
+    };
+    let restored: HostCommand =
+        serde_json::from_value(serde_json::to_value(host).unwrap()).unwrap();
+    assert!(matches!(
+        restored,
+        HostCommand::FreshAgentConfigure {
+            request_id: restored_id,
+            settings: restored_settings,
+            ..
+        } if restored_id == request_id && restored_settings == settings
+    ));
+}

@@ -3471,6 +3471,11 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+    FreshAgentConfigure {
+        incarnation_id: IncarnationId,
+        request_id: RequestId,
+        settings: FreshAgentTurnSettings,
+    },
     FreshAgentRollback {
         incarnation_id: IncarnationId,
         request_id: RequestId,

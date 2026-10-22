@@ -647,6 +647,40 @@ async fn dispatch(
                         native_session_id: actor.profile().await.native_session_id,
                     })
                 }
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id,
+                    request_id,
+                    settings,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    let outcome = actor.configure(request_id.clone(), settings).await;
+                    match &outcome {
+                        Ok(command_state) => tracing::info!(
+                            event = "fresh_agent.configure.applied",
+                            stage = "session_host",
+                            request_id = %request_id,
+                            state = ?command_state,
+                            "hosted fresh-agent configure persisted"
+                        ),
+                        Err(error) => tracing::warn!(
+                            event = "fresh_agent.configure.refused",
+                            stage = "session_host",
+                            request_id = %request_id,
+                            error = %error,
+                            "hosted fresh-agent configure was not applied live"
+                        ),
+                    }
+                    Ok(HostResult::FreshAgentCommand {
+                        state: outcome.map_err(map_actor_error)?,
+                        native_session_id: actor.profile().await.native_session_id,
+                    })
+                }
                 HostCommand::FreshAgentRollback {
                     incarnation_id,
                     request_id,
@@ -9888,6 +9922,79 @@ mod tests {
         assert!(limits.cpu_milli > 0);
         assert!(limits.memory_bytes > 0);
         assert!(limits.pids_max > 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_fresh_agent_configure_rpc_persists_settings_through_the_host_actor() {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("rpc-configure-agent"),
+            FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "fixture-sdk".into(),
+                cwd: "/workspace".into(),
+                model: Some("fixture-model".into()),
+                effort: Some("low".into()),
+                permission_mode: Some("ask".into()),
+                sandbox: None,
+                provider_store_id: "fixture-store".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(Arc::clone(&actor));
+        let configure = || {
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::parse("rpc-configure-one").unwrap(),
+                    settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                        cwd: None,
+                        model: Some("opus".into()),
+                        effort: Some("high".into()),
+                        permission_mode: None,
+                        sandbox: None,
+                    },
+                },
+            )
+        };
+
+        for _ in 0..2 {
+            let result = dispatch(configure(), &state).await.unwrap();
+            assert!(matches!(
+                result,
+                HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    native_session_id: Some(ref native),
+                } if native == "fixture-native-thread"
+            ));
+        }
+        let profile = actor.profile().await;
+        assert_eq!(profile.model.as_deref(), Some("opus"));
+        assert_eq!(profile.effort.as_deref(), Some("high"));
+        assert_eq!(profile.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(
+            transport.operations.load(Ordering::SeqCst),
+            1,
+            "a retried configure request is applied once"
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
