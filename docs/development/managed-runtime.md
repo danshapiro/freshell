@@ -127,6 +127,24 @@ handshake included — is bounded by
 typed `HostUnreachable`, after which the caller proceeds through the
 Docker-level path it already owns.
 
+An execution grant is not a control round trip, so it has its own bound. The
+host answers a grant only after it has prepared the selected provider inputs
+and started the provider, and several of those steps carry their own inner
+bounds (Codex's app-server start alone may take up to 45s). A terminal grant is
+bounded by `FRESHELL_RUNTIME_TERMINAL_DISPATCH_TIMEOUT_MS` and a fresh-agent
+grant or turn operation by `FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS`
+(both default 60s). An outer bound shorter than the host's inner bounds would
+abandon a healthy dispatch half-way: the host still consumes the grant and
+starts the provider, while the supervisor has already torn the incarnation
+down. Every grant records a `host.grant_timing` event (in the incarnation's
+`host-lifecycle.jsonl` and on the host's stderr) naming how long each dispatch
+stage took, for accepted and refused grants alike.
+
+The provider projection inside a grant makes every staged file durable before
+it is published. Those flushes overlap (`PROVIDER_PROJECTION_SYNC_WORKERS`) so
+the filesystem journal commits them together; one at a time, a selected
+plugin with a 4,200-file `node_modules` spent 8-13s of the grant flushing.
+
 This matters most for `stop`: the durable stop intent commits first, then the
 graceful host stop is *attempted*. A host that accepts the control connection
 and then goes silent used to hold the authoritative stop open forever. It is
