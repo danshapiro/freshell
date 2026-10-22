@@ -98,7 +98,8 @@ pub struct SidecarExit {
     /// Node exited by itself within the grace period after the shutdown
     /// request (no signal was needed).
     pub graceful: bool,
-    /// Wall time from the shutdown request to node's reaped exit.
+    /// Wall time of the whole stop: from the shutdown request until node
+    /// was reaped and the guard settled the rest of the tree.
     pub elapsed: Duration,
     /// Node's exit status, or `None` when even the SIGKILL reap timed out.
     pub status: Option<ExitStatus>,
@@ -181,11 +182,6 @@ impl ClaudeNodeCommand {
     /// The node binary this command runs (for error messages).
     pub fn node(&self) -> &str {
         &self.node
-    }
-
-    /// The entry script this command runs (for error messages).
-    pub fn entry(&self) -> &std::path::Path {
-        &self.entry
     }
 
     fn run_as_ids(&self) -> Option<&(String, String)> {
