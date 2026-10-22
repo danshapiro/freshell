@@ -22,6 +22,11 @@
 // - FAKE_CLAUDE_SIDECAR_HOLD_TURN_ONCE_MARKER=<path> -> first send wedges, rest work
 // - resumeSessionId on create -> cliSessionId uses that (resume continuity)
 // - transcripts: create ensures, each send appends to <store>/projects/-fixture/<cliSessionId>.jsonl
+// - FAKE_CLAUDE_SIDECAR_INIT_AT=turn -> report the session (sdk.session.init)
+//   at the start of every turn and never at create, the REAL CLI's order: it
+//   emits system/init only once a prompt runs, so a new pane has no durable id
+//   (and the server no owner record for it) until its first message runs.
+//   Default (unset or 'create'): report once, right after `created`.
 import readline from 'node:readline'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -41,6 +46,7 @@ const HOLD_ONCE_MARKER = process.env.FAKE_CLAUDE_SIDECAR_HOLD_TURN_ONCE_MARKER
 // override remains for specs that need a caller-chosen id.
 const CLI_SESSION_ID = process.env.FAKE_CLAUDE_SIDECAR_CLI_SESSION_ID ?? randomUUID()
 const REQUEST_LOG = process.env.FAKE_CLAUDE_SIDECAR_LOG
+const INIT_AT_TURN = process.env.FAKE_CLAUDE_SIDECAR_INIT_AT === 'turn'
 
 // sessionId (bridge nanoid) -> { cliSessionId (durable uuid), cwd }
 const sessions = new Map()
@@ -83,6 +89,17 @@ function appendTranscript(cliSessionId, role, text, cwd) {
   fs.appendFileSync(transcriptPath(cliSessionId), `${JSON.stringify(line)}\n`)
 }
 
+function emitSessionInit(sessionId, { cliSessionId, cwd, model }) {
+  emit({
+    type: 'sdk.session.init',
+    sessionId,
+    cliSessionId,
+    model,
+    cwd,
+    tools: [],
+  })
+}
+
 const rl = readline.createInterface({ input: process.stdin })
 rl.on('line', (line) => {
   let msg
@@ -103,14 +120,9 @@ rl.on('line', (line) => {
     // transcript-present gate reads it before any send happens post-restart).
     fs.closeSync(fs.openSync(transcriptPath(cliSessionId), 'a'))
     emit({ type: 'created', requestId: msg.requestId, sessionId })
-    emit({
-      type: 'sdk.session.init',
-      sessionId,
-      cliSessionId,
-      model: msg.model ?? 'claude-opus-4-6',
-      cwd,
-      tools: [],
-    })
+    if (!INIT_AT_TURN) {
+      emitSessionInit(sessionId, { cliSessionId, cwd, model: msg.model ?? 'claude-opus-4-6' })
+    }
     if (msg.resumeSessionId) {
       emit({ type: 'sdk.session.snapshot', sessionId, messages: [] })
     }
@@ -128,6 +140,7 @@ rl.on('line', (line) => {
   } else if (msg.type === 'send') {
     const { cliSessionId, cwd, model, effort, permissionMode } = sessions.get(msg.sessionId) ?? { cliSessionId: CLI_SESSION_ID }
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'running' })
+    if (INIT_AT_TURN) emitSessionInit(msg.sessionId, { cliSessionId, cwd, model })
     appendTranscript(cliSessionId, 'user', msg.text, cwd)
     const holdOnce = HOLD_ONCE_MARKER && !fs.existsSync(HOLD_ONCE_MARKER)
     if (holdOnce) {

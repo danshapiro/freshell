@@ -2478,7 +2478,7 @@ pub struct TerminalInputRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentTurnSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2491,6 +2491,40 @@ pub struct FreshAgentTurnSettings {
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+}
+
+impl FreshAgentTurnSettings {
+    /// The effort a provider's live `freshAgent.configure` ends on. A
+    /// configure states only what changed, except that the model selector's
+    /// Default thinking row is sent as an absent effort. Claude and Kilroy
+    /// read that absence as Default when the model changes, OpenCode always
+    /// does, and Codex keeps the session's effort. Every durable copy of a
+    /// hosted profile (the host actor's and the supervisor's recovery record)
+    /// applies this same rule, so they agree with the live session and with
+    /// each other.
+    pub fn effort_after_configure(
+        &self,
+        provider: &FreshProvider,
+        current_model: Option<&str>,
+        current_effort: Option<&str>,
+    ) -> Option<String> {
+        if let Some(effort) = &self.effort {
+            return Some(effort.clone());
+        }
+        let absent_means_default = match provider {
+            FreshProvider::Claude | FreshProvider::Kilroy => self
+                .model
+                .as_deref()
+                .is_some_and(|model| Some(model) != current_model),
+            FreshProvider::Opencode => true,
+            FreshProvider::Codex => false,
+        };
+        if absent_means_default {
+            None
+        } else {
+            current_effort.map(str::to_string)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2861,6 +2895,7 @@ pub enum AdminCommand {
     FreshAgentSend(FreshAgentSendRequest),
     FreshAgentFork(FreshAgentForkRequest),
     FreshAgentCompact(FreshAgentCompactRequest),
+    FreshAgentConfigure(FreshAgentConfigureRequest),
     FreshAgentRollback(FreshAgentRollbackRequest),
     FreshAgentCapture(FreshAgentCaptureRequest),
     FreshAgentResolve(FreshAgentResolveRequest),
@@ -3470,6 +3505,11 @@ pub enum HostCommand {
         instructions: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+    },
+    FreshAgentConfigure {
+        incarnation_id: IncarnationId,
+        request_id: RequestId,
+        settings: FreshAgentTurnSettings,
     },
     FreshAgentRollback {
         incarnation_id: IncarnationId,
