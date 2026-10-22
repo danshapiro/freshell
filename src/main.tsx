@@ -3,13 +3,13 @@ import ReactDOM from 'react-dom/client'
 import { Provider } from 'react-redux'
 // MUST stay the FIRST side-effectful import — before
 // '@/store/storage-migration', the store, and App (unified-agent-names
-// Task 7): the legacy-name capture is a side-effect-only synchronous module
-// that preserves every raw legacy layout/backup envelope under its own
-// `freshell.session-names.migration.v1.<importId>` key BEFORE the storage
-// migrations, the slice initial-state loads, or the machine-workspace
-// bootstrap can clear or rewrite them. It never imports the Redux store
-// (react/react-dom/react-redux above are side-effect-free), and running it
-// twice is safe (the capture dedupes by storageKey+raw).
+// Task 7; name reliability Task 2): its synchronous one-time capture copies
+// each genuine pre-migration legacy key (never this window's own layout)
+// into its own `freshell.session-names.migration.v1.<importId>` envelope
+// BEFORE the storage migrations or the slice initial-state loads can
+// rewrite it, at most once per device, and deletes envelopes no longer
+// needed. It never imports the Redux store (react/react-dom/react-redux
+// above are side-effect-free).
 import '@/lib/session-name-migration'
 // MUST stay ahead of the store/App imports: recover-my-panes boot-state (D1) depends on
 // migrations having re-materialized this window's per-window layout key
