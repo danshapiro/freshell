@@ -7490,6 +7490,55 @@ mod tests {
         }
         .expect("owned executable fixture directory")
     }
+
+    /// Run a fixture executable a test has just written, retrying the
+    /// transient ETXTBSY a concurrently forking test thread can cause (see the
+    /// test below). Every other outcome, and a refusal that outlasts the short
+    /// deadline, is returned as is.
+    fn execute_fixture_with_transient_text_file_busy_retry(
+        path: &Path,
+    ) -> std::io::Result<std::process::Output> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match std::process::Command::new(path).output() {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Another test thread that forks while a fixture is still open for
+    /// writing hands its child a copy of that write descriptor until the child
+    /// execs, and exec of a file open for writing fails with ETXTBSY. Running
+    /// a fixture must outlast that transient refusal.
+    #[test]
+    fn fixture_execution_outlasts_a_transient_text_file_busy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = executable_fixture();
+        let script = root.path().join("run");
+        std::fs::write(&script, "#!/bin/sh\nprintf busy-nonce\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(writer);
+        });
+
+        let output = execute_fixture_with_transient_text_file_busy_retry(&script)
+            .expect("the fixture runs once no write descriptor remains");
+
+        release.join().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"busy-nonce");
+    }
     #[test]
     fn provider_config_precreated_home_needs_no_empty_bootstrap_handoff() {
         use super::*;
@@ -8226,7 +8275,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn provider_config_two_stage_script_is_runnable() {
-        use std::{os::unix::fs::PermissionsExt, process::Command};
+        use std::os::unix::fs::PermissionsExt;
         let root = executable_fixture();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -8237,8 +8286,7 @@ mod tests {
         let home = root.path().join("home");
         copy_provider_config_entry(&source, &source, &stage, &mut Vec::new(), &mut 0, 0).unwrap();
         copy_provider_config_entry(&stage, &stage, &home, &mut Vec::new(), &mut 0, 0).unwrap();
-        let output = Command::new(home.join("run"))
-            .output()
+        let output = execute_fixture_with_transient_text_file_busy_retry(&home.join("run"))
             .expect("two-stage executable spawn");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"resource-nonce");
@@ -9681,9 +9729,9 @@ mod tests {
                 ".codex/skills/fixture/scripts/run",
                 ".codex/skills/freshell-discovered-agents/fixture/scripts/run",
             ] {
-                let output = std::process::Command::new(home.join(relative))
-                    .output()
-                    .unwrap();
+                let output =
+                    execute_fixture_with_transient_text_file_busy_retry(&home.join(relative))
+                        .unwrap();
                 assert!(output.status.success(), "{output:?}");
                 assert_eq!(output.stdout, b"resource-nonce\n");
             }
