@@ -932,10 +932,9 @@ fn opencode_session_to_indexed(
     // override rows (auto_title_sweep.rs::overlay_session_title). Deliberate
     // mainline deviation from the retired Node reference, which never
     // populated titleSource or firstUserMessage for opencode.
-    let provider_named = s
-        .title
-        .as_deref()
-        .is_some_and(|t| !t.trim().is_empty() && !crate::parse::is_opencode_placeholder_title(t));
+    let provider_named = s.title.as_deref().is_some_and(|t| {
+        !t.trim().is_empty() && !crate::name_evidence::is_provider_placeholder_title("opencode", t)
+    });
     // Compute BEFORE the literal: the IndexedSession construction below
     // moves fields out of `s`, and the helper borrows the whole struct.
     let token_usage = opencode_token_usage(&s, resolver);

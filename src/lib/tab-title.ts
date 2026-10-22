@@ -4,6 +4,7 @@ import { matchesDerivedPaneTitle } from './pane-title'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import { isTabNumberLabel } from '@shared/name-evidence'
 
 function getSinglePaneOverrideTitle(
   layout: PaneNode | undefined,
@@ -31,7 +32,7 @@ export function getTabDisplayTitle(
   if (singlePaneTitle) {
     return singlePaneTitle
   }
-  if (title && !title.match(/^Tab \d+$/) && title !== derivedName) {
+  if (title && !isTabNumberLabel(title) && title !== derivedName) {
     return title
   }
   return derivedName ?? (title || 'Tab')
