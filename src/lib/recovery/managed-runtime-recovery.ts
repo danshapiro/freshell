@@ -5,6 +5,10 @@ import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
 import type { PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab, TerminalStatus } from '@/store/types'
+import { isScopedPaneContent } from '@/store/selectors/sessionNameSelectors'
+import { collectNameSourceLeaves, firstNameSourceLeaf } from '@/lib/tab-name-source'
+import { createLogger } from '@/lib/client-logger'
+import { isDefaultOrDerivedName } from '@shared/name-evidence'
 import {
   getManagedRuntimeInventory,
   isTransientRequestFailure,
@@ -41,6 +45,8 @@ export type ManagedRuntimeMergePlan = {
   updates: ManagedRuntimePaneUpdate[]
   representedViewCount: number
 }
+
+const log = createLogger('ManagedRuntimeRecovery')
 
 type LayoutState = Pick<RootState, 'tabs' | 'panes'>
 type PaneLocation = { tabId: string; paneId: string; content: PaneContent }
@@ -283,6 +289,36 @@ function collisionFreePaneId(
 }
 
 /**
+ * The pane whose runtime facts a tab mirrors at tab level (its naming pane):
+ * a session-owned tab's source pane while it is in the layout, else the
+ * tab's first leaf (its original pane).
+ */
+function tabNamingPaneId(tab: Tab | undefined, layout: PaneNode | undefined): string | undefined {
+  if (!layout) return undefined
+  if (tab?.nameSource?.kind === 'session') {
+    const sourceId = tab.nameSource.paneId
+    if (collectNameSourceLeaves(layout).some((leaf) => leaf.paneId === sourceId)) return sourceId
+  }
+  return firstNameSourceLeaf(layout)?.paneId
+}
+
+/**
+ * A view title a reconstructed (non-session) tab may store: a real name, never
+ * empty and never a default or derived label ("Shell agent", "Recovered Shell
+ * agent", "Tab 4", the soul's folder name).
+ */
+function realViewTitle(view: ManagedRuntimeViewIntent, content: TerminalPaneContent): string | undefined {
+  const title = view.title.trim()
+  if (isDefaultOrDerivedName(title, { cwd: content.initialCwd, mode: content.mode })) {
+    log.debug('managed view title is a default label; reconstructed tab stays unnamed', {
+      viewId: view.viewId, mode: content.mode,
+    })
+    return undefined
+  }
+  return title
+}
+
+/**
  * Pure supervisor-snapshot × local-layout merge. Local layout is never
  * replaced. Existing panes are updated in place; only missing visible view
  * intents produce deterministic recovered tabs. Explicit views match by their
@@ -315,12 +351,17 @@ export function buildManagedRuntimeMergePlan(
       claimed.add(`${location.tabId}:${location.paneId}`)
       if (view.visibility === 'visible') representedViewCount += 1
       const tab = state.tabs.tabs.find((candidate) => candidate.id === location.tabId)
+      const namingPaneId = tabNamingPaneId(tab, state.panes.layouts[location.tabId])
+      if (namingPaneId !== location.paneId) {
+        log.debug('managed view matched a pane that does not name its tab; tab fields left alone', {
+          tabId: location.tabId, paneId: location.paneId, namingPaneId, viewId: view.viewId,
+        })
+      }
       updates.push({
         tabId: location.tabId,
         paneId: location.paneId,
         content: updateExistingContent(location.content, soul, view),
-        tabUpdates: {
-          ...(tab?.titleSetByUser ? {} : { title: view.title }),
+        tabUpdates: namingPaneId !== location.paneId ? {} : {
           status,
           mode: (soul.terminalMode || soul.provider || tab?.mode || 'shell') as Tab['mode'],
           codingCliProvider: soul.provider && soul.provider !== 'shell'
@@ -348,6 +389,11 @@ export function buildManagedRuntimeMergePlan(
     const tabId = collisionFreeTabId(state, view)
     const paneId = collisionFreePaneId(state, tabId, view)
     const content = managedTerminalContent(soul, view)
+    // A scoped agent tab is owned by its session from the start: the
+    // saved-name mirror writes its title once the session's record is known.
+    // Any other tab keeps a real view title, never a default label.
+    const scoped = isScopedPaneContent(content)
+    const title = scoped ? undefined : realViewTitle(view, content)
     representedViewCount += 1
     creates.push({
       tabId,
@@ -356,7 +402,8 @@ export function buildManagedRuntimeMergePlan(
       tab: {
         id: tabId,
         createRequestId: content.createRequestId,
-        title: view.title,
+        ...(title ? { title } : {}),
+        ...(scoped ? { nameSource: { kind: 'session' as const, paneId } } : {}),
         codingCliProvider: soul.provider && soul.provider !== 'shell'
           ? soul.provider as Tab['codingCliProvider']
           : undefined,
@@ -384,7 +431,11 @@ export function applyManagedRuntimeMergePlan(
       paneId: update.paneId,
       content: update.content,
     }))
-    store.dispatch(updateTab({ id: update.tabId, updates: update.tabUpdates }))
+    // Runtime facts are not a user action: they never change the tab's
+    // recency (cross-window last-writer-wins keys off updatedAt).
+    if (Object.keys(update.tabUpdates).length > 0) {
+      store.dispatch(updateTab({ id: update.tabId, updates: update.tabUpdates, touchUpdatedAt: false }))
+    }
   }
   for (const create of plan.creates) {
     // A concurrent refresh may have created it since the pure plan snapshot.

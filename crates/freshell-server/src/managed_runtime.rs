@@ -773,7 +773,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     kind: ViewIntentKind::AutomaticPrimary,
                     preferred_tab_id: request.view_tab_id.clone(),
                     preferred_pane_id: request.view_pane_id.clone(),
-                    title: Some(format!("{} agent", provider_label(&request.mode))),
+                    title: None,
                     placement_group: None,
                     visibility: ViewVisibilityIntent::Visible,
                 }),
@@ -1812,3 +1812,7 @@ mod managed_output_rpc_tests;
 #[cfg(all(test, unix))]
 #[path = "managed_runtime_opencode_replan_tests.rs"]
 mod opencode_replan_tests;
+
+#[cfg(all(test, unix))]
+#[path = "managed_launch_view_title_tests.rs"]
+mod launch_view_title_tests;
