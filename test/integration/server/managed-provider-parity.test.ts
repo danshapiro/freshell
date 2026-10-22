@@ -525,6 +525,8 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     // Vitest shuffles cases. Each case sees the same user-owned inputs even
     // when a prior recovery case edited them to exercise refresh semantics.
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), homeTuiConfig())
+    // The refreshed-config recovery case deletes the whole project directory.
+    fs.mkdirSync(path.join(workspace, '.opencode'), { recursive: true })
     fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), projectOpencodeConfig())
     // Every provider observes this shared project file. Prepare the selected
     // owned subtree for the provider user independently of shuffled case order.
