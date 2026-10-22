@@ -1113,6 +1113,34 @@ impl FreshClaudeState {
         &self.leases
     }
 
+    /// The coordinator key that fences an operation on the session behind
+    /// `map_key`, addressed on the wire as `wire_id`. The coordinator keys a
+    /// claude session by its durable id — the map key and a new pane's wire id
+    /// are the lane's own placeholder — so once the CLI has reported the
+    /// session, its durable id is the key (the rule `handle_attach` and
+    /// `handle_kill` follow). Before the report (`system/init`, which the CLI
+    /// emits only once a prompt runs) the wire id is the key if the
+    /// coordinator holds a record for it; otherwise nothing owns the session
+    /// yet and there is nothing to fence: `None`. Such a session has no
+    /// durable id to hand off, reattach or roll back, and a close removes it
+    /// from the sessions map.
+    async fn fence_owner_key(&self, map_key: &str, wire_id: &str) -> Option<String> {
+        let durable = self
+            .sessions
+            .lock()
+            .await
+            .get(map_key)
+            .and_then(|session| session.cli_session_id.clone());
+        if let Some(durable) = durable {
+            return Some(self.resolve_ownership_key(&durable));
+        }
+        let key = self.resolve_ownership_key(wire_id);
+        match self.ownership_snapshot(PROVIDER, &key).state {
+            freshell_ownership::OwnershipState::Vacant => None,
+            _ => Some(key),
+        }
+    }
+
     /// Side-effect-free coordinator read for `(provider, session_id)`
     /// (kata b8ke Task 3). `Vacant`/0 when the registry is unwired.
     /// b8ke focused episode-2 round-2 F1: the wire id resolves through the
@@ -4387,24 +4415,40 @@ impl FreshClaudeState {
         // will actually receive this prompt. Checkpointed sends always require
         // the fence when the coordinator is wired; ordinary legacy sends keep
         // their existing unfenced behavior, while any supplied fence is honored.
+        // The fence keys on the record that owns the session (its durable id
+        // once reported), never on a new pane's placeholder wire id.
         let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
-            let owner_key = self.resolve_ownership_key(&session_id);
-            match crate::ownership_lane::arm_reclaimless_op_guard(
-                &self.ownership,
-                PROVIDER,
-                &owner_key,
-                &format!("send-{}", uuid::Uuid::new_v4()),
-                send_fence,
-                "freshclaude/send",
-            ) {
-                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
-                crate::ownership_lane::LaneOpGuard::Unwired => None,
-                crate::ownership_lane::LaneOpGuard::Refused { message } => {
-                    tracing::warn!(target: "freshell_freshagent::claude",
+            match self.fence_owner_key(&map_key, &session_id).await {
+                Some(owner_key) => match crate::ownership_lane::arm_reclaimless_op_guard(
+                    &self.ownership,
+                    PROVIDER,
+                    &owner_key,
+                    &format!("send-{}", uuid::Uuid::new_v4()),
+                    send_fence,
+                    "freshclaude/send",
+                ) {
+                    crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                    crate::ownership_lane::LaneOpGuard::Unwired => None,
+                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                        tracing::warn!(target: "freshell_freshagent::claude",
+                            session_id = %session_id, owner_key = %owner_key,
+                            request_id = ?request_id,
+                            "fresh_agent_send_refused: ownership guard refused");
+                        self.send_error(&request_id, "SESSION_RESERVED", &message);
+                        return;
+                    }
+                },
+                None => {
+                    // Nothing owns the session in the coordinator yet: the CLI
+                    // reports the session only once a prompt runs, and this
+                    // send is what makes it run. Refusing it would refuse
+                    // every new pane's first message.
+                    tracing::debug!(target: "freshell_freshagent::claude",
                         session_id = %session_id, request_id = ?request_id,
-                        "fresh_agent_send_refused: ownership guard refused");
-                    self.send_error(&request_id, "SESSION_RESERVED", &message);
-                    return;
+                        event = "freshagent.claude.send_before_session_report",
+                        "the send runs unfenced: the CLI has not reported the session \
+                         yet and the coordinator holds no record for it");
+                    None
                 }
             }
         } else {
