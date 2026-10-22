@@ -1513,27 +1513,53 @@ lines.on('line', line=>{
         }
     }
 
-    #[tokio::test]
-    async fn hosted_claude_configure_applies_live_and_relays_the_session_metadata_frame() {
+    /// What one hosted Claude configure produced: the actor's answer, the
+    /// durable profile afterwards, every configure line the scripted sidecar
+    /// received, and the provider event named `settled_on` once it reached
+    /// the host journal.
+    struct HostedClaudeConfigure {
+        outcome: Result<
+            freshell_runtime_protocol::CommandState,
+            freshell_agent_runtime::host_actor::ActorError,
+        >,
+        profile: FreshAgentProfile,
+        applied: Vec<Value>,
+        settled: Option<Value>,
+    }
+
+    /// Runs one configure through the real `FreshClaudeState` behind a hosted
+    /// actor whose profile starts on sonnet/low. The scripted sidecar answers
+    /// the configure line with `receipt`, a JavaScript expression over `req`.
+    async fn hosted_claude_configure(
+        settings: freshell_runtime_protocol::FreshAgentTurnSettings,
+        receipt: &str,
+        settled_on: &str,
+    ) -> HostedClaudeConfigure {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("sidecar.mjs");
-        let receipt = dir.path().join("configure.jsonl");
-        std::fs::write(&script, r#"
-import {createInterface} from 'node:readline';
-import {appendFileSync} from 'node:fs';
-const lines=createInterface({input:process.stdin});
+        let receipt_log = dir.path().join("configure.jsonl");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+import {{createInterface}} from 'node:readline';
+import {{appendFileSync}} from 'node:fs';
+const lines=createInterface({{input:process.stdin}});
 const emit=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
-lines.on('line', line=>{
+lines.on('line', line=>{{
   const req=JSON.parse(line);
-  if(req.type==='create')emit({type:'created',requestId:req.requestId,sessionId:'owned-configure'});
-  if(req.type==='configure'){
+  if(req.type==='create')emit({{type:'created',requestId:req.requestId,sessionId:'owned-configure'}});
+  if(req.type==='configure'){{
     appendFileSync(process.env.FRESHELL_TEST_CONFIGURE_RECEIPT,JSON.stringify(req)+'\n');
-    emit({type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:true,settings:req.settings});
-  }
+    emit({receipt});
+  }}
   if(req.type==='shutdown')process.exit(0);
-});
-"#).unwrap();
+}});
+"#
+            ),
+        )
+        .unwrap();
         let keys = [
             "FRESHELL_CLAUDE_SIDECAR",
             "FRESHELL_CLAUDE_NODE",
@@ -1546,7 +1572,7 @@ lines.on('line', line=>{
         );
         std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
         std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-        std::env::set_var("FRESHELL_TEST_CONFIGURE_RECEIPT", &receipt);
+        std::env::set_var("FRESHELL_TEST_CONFIGURE_RECEIPT", &receipt_log);
         let transport = HostedTransport::new(FreshProvider::Claude).await;
         let profile = FreshAgentProfile {
             provider: FreshProvider::Claude,
@@ -1569,24 +1595,13 @@ lines.on('line', line=>{
             .unwrap();
 
         let outcome = actor
-            .configure(
-                RequestId::parse("hosted-configure-1").unwrap(),
-                freshell_runtime_protocol::FreshAgentTurnSettings {
-                    cwd: None,
-                    model: Some("opus".into()),
-                    effort: Some("high".into()),
-                    permission_mode: None,
-                    sandbox: None,
-                },
-            )
+            .configure(RequestId::parse("hosted-configure-1").unwrap(), settings)
             .await;
-        let metadata = tokio::time::timeout(Duration::from_secs(5), async {
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let events = actor.read_events(0, 256).await.events;
                 if let Some(event) = events.iter().find_map(|entry| match &entry.event {
-                    AgentEvent::Provider { payload }
-                        if payload["event"]["type"] == "freshAgent.session.metadata" =>
-                    {
+                    AgentEvent::Provider { payload } if payload["event"]["type"] == settled_on => {
                         Some(payload["event"].clone())
                     }
                     _ => None,
@@ -1596,27 +1611,92 @@ lines.on('line', line=>{
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await;
-        let configured_model = actor.profile().await.model;
-        let applied = std::fs::read_to_string(&receipt).unwrap_or_default();
-        Arc::clone(&transport).stop().await.unwrap();
-
-        assert_eq!(
-            outcome.unwrap(),
-            freshell_runtime_protocol::CommandState::ProviderAcked
-        );
-        assert_eq!(configured_model.as_deref(), Some("opus"));
-        let applied: Vec<Value> = applied
+        .await
+        .ok();
+        let profile = actor.profile().await;
+        let applied = std::fs::read_to_string(&receipt_log)
+            .unwrap_or_default()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(applied.len(), 1, "one live configure reaches the sidecar");
-        assert_eq!(applied[0]["settings"]["model"], "opus");
-        assert_eq!(applied[0]["settings"]["effort"], "high");
-        let metadata = metadata.expect("the provider's metadata frame reaches the host journal");
+        Arc::clone(&transport).stop().await.unwrap();
+        HostedClaudeConfigure {
+            outcome,
+            profile,
+            applied,
+            settled,
+        }
+    }
+
+    const CLAUDE_CONFIGURED_OK: &str =
+        "{type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:true,settings:req.settings}";
+
+    #[tokio::test]
+    async fn hosted_claude_configure_applies_live_and_relays_the_session_metadata_frame() {
+        let run = hosted_claude_configure(
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+            CLAUDE_CONFIGURED_OK,
+            "freshAgent.session.metadata",
+        )
+        .await;
+
+        assert_eq!(
+            run.outcome.unwrap(),
+            freshell_runtime_protocol::CommandState::ProviderAcked
+        );
+        assert_eq!(run.profile.model.as_deref(), Some("opus"));
+        assert_eq!(
+            run.applied.len(),
+            1,
+            "one live configure reaches the sidecar"
+        );
+        assert_eq!(run.applied[0]["settings"]["model"], "opus");
+        assert_eq!(run.applied[0]["settings"]["effort"], "high");
+        let metadata = run
+            .settled
+            .expect("the provider's metadata frame reaches the host journal");
         assert_eq!(metadata["sessionId"], "owned-configure");
         assert_eq!(metadata["model"], "opus");
         assert_eq!(metadata["effort"], "high");
+    }
+
+    /// The model selector's Default row is a model change with no effort.
+    /// Claude clears the effort live; the durable profile, which every later
+    /// send restates, must end on that same effort.
+    #[tokio::test]
+    async fn hosted_claude_configure_to_the_default_effort_persists_the_effort_claude_reports() {
+        let run = hosted_claude_configure(
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                model: Some("opus".into()),
+                ..Default::default()
+            },
+            CLAUDE_CONFIGURED_OK,
+            "freshAgent.session.metadata",
+        )
+        .await;
+
+        assert_eq!(
+            run.outcome.unwrap(),
+            freshell_runtime_protocol::CommandState::ProviderAcked
+        );
+        let metadata = run
+            .settled
+            .expect("the provider's metadata frame reaches the host journal");
+        assert_eq!(metadata["model"], "opus");
+        assert_eq!(run.profile.model.as_deref(), Some("opus"));
+        assert_eq!(
+            run.profile.effort.as_ref().map(|effort| json!(effort)),
+            metadata
+                .get("effort")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            "the durable effort equals the effort the live session reports"
+        );
+        assert!(run.profile.effort.is_none());
     }
 
     #[tokio::test]
@@ -2647,7 +2727,7 @@ lines.on('line', line=>{
             // The direct route stores configured settings on the live
             // session, so its later resume launches with them.
             if let FreshAgentOperation::Configure { settings } = operation {
-                profile.apply_turn_settings(settings);
+                profile.apply_configure_settings(settings);
             }
         }
         transport.capture(4096).await.unwrap();

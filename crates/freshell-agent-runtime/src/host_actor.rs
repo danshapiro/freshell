@@ -96,6 +96,20 @@ impl FreshAgentProfile {
         }
     }
 
+    /// Folds a `freshAgent.configure` into the durable launch profile. It is
+    /// the per-turn fold, except that an absent effort follows the
+    /// provider's live configure rule
+    /// ([`FreshAgentTurnSettings::effort_after_configure`]).
+    pub fn apply_configure_settings(&mut self, settings: &FreshAgentTurnSettings) {
+        let effort = settings.effort_after_configure(
+            &self.provider,
+            self.model.as_deref(),
+            self.effort.as_deref(),
+        );
+        self.apply_turn_settings(settings);
+        self.effort = effort;
+    }
+
     pub fn validate(&self) -> Result<(), ActorError> {
         if self.runtime_variant.is_empty()
             || self.cwd.is_empty()
@@ -916,7 +930,7 @@ impl FreshAgentHostActor {
             let mut state = self.state.lock().await;
             if let Some(settings) = staged_settings {
                 let mut configured = state.profile.clone();
-                configured.apply_turn_settings(settings);
+                configured.apply_configure_settings(settings);
                 configured.validate()?;
                 state.profile = configured;
             }

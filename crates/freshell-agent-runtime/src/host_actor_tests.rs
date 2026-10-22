@@ -1826,3 +1826,108 @@ async fn invalid_configure_changes_neither_the_profile_nor_the_journal() {
             .unwrap();
     assert_eq!(persisted["commands"].as_object().unwrap().len(), 0);
 }
+
+/// The model selector's Default thinking row is sent as a configure with no
+/// effort. Each provider's live configure reads that absence its own way;
+/// the durable profile (which every later send restates) must end on the
+/// same effort the provider does, or the next send undoes the user's choice.
+#[tokio::test]
+async fn configure_without_an_effort_keeps_the_profile_on_the_providers_effort() {
+    struct Case {
+        provider: FreshProvider,
+        model: Option<&'static str>,
+        expected_effort: Option<&'static str>,
+        why: &'static str,
+    }
+    let cases = [
+        Case {
+            provider: FreshProvider::Claude,
+            model: Some("opus"),
+            expected_effort: None,
+            why: "claude clears the effort when the model changes without one",
+        },
+        Case {
+            provider: FreshProvider::Kilroy,
+            model: Some("opus"),
+            expected_effort: None,
+            why: "kilroy runs the claude configure lane",
+        },
+        Case {
+            provider: FreshProvider::Claude,
+            model: Some("fixture-model"),
+            expected_effort: Some("low"),
+            why: "claude keeps the effort when the model is unchanged",
+        },
+        Case {
+            provider: FreshProvider::Claude,
+            model: None,
+            expected_effort: Some("low"),
+            why: "claude keeps the effort when no model is stated",
+        },
+        Case {
+            provider: FreshProvider::Opencode,
+            model: Some("opus"),
+            expected_effort: None,
+            why: "opencode reads an absent effort as its Default row",
+        },
+        Case {
+            provider: FreshProvider::Opencode,
+            model: None,
+            expected_effort: None,
+            why: "opencode reads an absent effort as Default even without a model change",
+        },
+        Case {
+            provider: FreshProvider::Codex,
+            model: Some("opus"),
+            expected_effort: Some("low"),
+            why: "codex keeps the session's effort",
+        },
+    ];
+    for case in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = ConfigureTransport::new(dir.path(), true, None);
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(case.provider.clone(), "configure-default-effort", None),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+
+        actor
+            .configure(
+                RequestId::parse("configure-default-effort").unwrap(),
+                FreshAgentTurnSettings {
+                    model: case.model.map(str::to_string),
+                    permission_mode: Some("acceptEdits".into()),
+                    ..FreshAgentTurnSettings::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let configured = actor.profile().await;
+        assert_eq!(
+            configured.effort.as_deref(),
+            case.expected_effort,
+            "{:?}: {}",
+            case.provider,
+            case.why
+        );
+        assert_eq!(configured.permission_mode.as_deref(), Some("acceptEdits"));
+        drop(actor);
+        let reopened = FreshAgentHostActor::open(
+            dir.path(),
+            configured.clone(),
+            ConfigureTransport::new(dir.path(), true, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.profile().await.effort.as_deref(),
+            case.expected_effort,
+            "{:?}: the configured effort is durable",
+            case.provider
+        );
+    }
+}

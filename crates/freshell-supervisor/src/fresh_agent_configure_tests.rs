@@ -210,12 +210,21 @@ fn configure_envelope(
     request_id: &RequestId,
     expected_control_epoch: Option<u64>,
 ) -> Envelope<AdminCommand> {
+    configure_envelope_with(soul, request_id, expected_control_epoch, opus_high())
+}
+
+fn configure_envelope_with(
+    soul: &SoulId,
+    request_id: &RequestId,
+    expected_control_epoch: Option<u64>,
+    settings: FreshAgentTurnSettings,
+) -> Envelope<AdminCommand> {
     let mut envelope = Envelope::new(
         request_id.clone(),
         ControlRole::Web,
         AdminCommand::FreshAgentConfigure(FreshAgentConfigureRequest {
             soul_id: soul.clone(),
-            settings: opus_high(),
+            settings,
             expected_control_epoch,
         }),
     );
@@ -286,6 +295,51 @@ async fn admin_configure_routes_to_the_souls_host_and_updates_the_recovery_profi
     );
     assert_eq!(recovered.effort.as_deref(), Some("high"));
     assert_eq!(recovered.permission_mode.as_deref(), Some("default"));
+}
+
+/// The model selector's Default thinking row arrives as a model change with
+/// no effort, which Claude's live configure reads as "clear the effort". The
+/// recovery profile must agree with the host actor, which follows the same
+/// rule, or the next recovery refuses the soul as a different identity.
+#[tokio::test]
+async fn admin_configure_to_the_default_effort_clears_the_recovery_effort() {
+    let fixture = running_fresh_claude().await;
+    let (received, host) = fake_host(&fixture.runtime_dir);
+    let epoch = fixture.supervisor.registry.control_epoch();
+
+    let reply = fixture
+        .supervisor
+        .dispatch(configure_envelope_with(
+            &fixture.soul,
+            &RequestId::parse("configure-default-effort").unwrap(),
+            Some(epoch),
+            FreshAgentTurnSettings {
+                model: Some("opus".into()),
+                ..FreshAgentTurnSettings::default()
+            },
+        ))
+        .await;
+    host.abort();
+
+    assert!(reply.result.is_ok(), "{:?}", reply.result);
+    assert!(received
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|command| matches!(command, HostCommand::FreshAgentConfigure { .. })));
+    let recovered = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap()
+        .fresh_agent
+        .unwrap();
+    assert_eq!(recovered.model.as_deref(), Some("opus"));
+    assert_eq!(
+        recovered.effort, None,
+        "the recovery profile ends on the provider's default effort"
+    );
 }
 
 #[tokio::test]

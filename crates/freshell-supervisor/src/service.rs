@@ -1746,7 +1746,11 @@ impl Supervisor {
             ));
         }
         self.registry
-            .update_fresh_agent_settings(soul_id, handle.incarnation_id().clone(), settings.clone())
+            .configure_fresh_agent_settings(
+                soul_id,
+                handle.incarnation_id().clone(),
+                settings.clone(),
+            )
             .await
             .map_err(map_registry)?;
         let host = self

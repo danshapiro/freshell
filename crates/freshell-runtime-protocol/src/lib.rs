@@ -2493,6 +2493,40 @@ pub struct FreshAgentTurnSettings {
     pub sandbox: Option<String>,
 }
 
+impl FreshAgentTurnSettings {
+    /// The effort a provider's live `freshAgent.configure` ends on. A
+    /// configure states only what changed, except that the model selector's
+    /// Default thinking row is sent as an absent effort. Claude and Kilroy
+    /// read that absence as Default when the model changes, OpenCode always
+    /// does, and Codex keeps the session's effort. Every durable copy of a
+    /// hosted profile (the host actor's and the supervisor's recovery record)
+    /// applies this same rule, so they agree with the live session and with
+    /// each other.
+    pub fn effort_after_configure(
+        &self,
+        provider: &FreshProvider,
+        current_model: Option<&str>,
+        current_effort: Option<&str>,
+    ) -> Option<String> {
+        if let Some(effort) = &self.effort {
+            return Some(effort.clone());
+        }
+        let absent_means_default = match provider {
+            FreshProvider::Claude | FreshProvider::Kilroy => self
+                .model
+                .as_deref()
+                .is_some_and(|model| Some(model) != current_model),
+            FreshProvider::Opencode => true,
+            FreshProvider::Codex => false,
+        };
+        if absent_means_default {
+            None
+        } else {
+            current_effort.map(str::to_string)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentSendRequest {
