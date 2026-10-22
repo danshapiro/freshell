@@ -6,8 +6,10 @@
  * mirror of the saved name, written only by the saved-name tab title mirror
  * (`src/store/savedNameTabTitleMirror.ts`). Every legacy title writer —
  * terminal OSC titles, the shell exit suffix, session reopen retitles, the
- * kilroy first-message name — asks this one gate first, so none of them can
- * replace the mirrored name. Legacy tabs keep their writers unchanged.
+ * kilroy first-message name, a sidebar click on an unscoped session row, an
+ * unscoped terminal rename from the overview or its context menu — asks
+ * this one gate first, so none of them can replace the mirrored name.
+ * Legacy tabs keep their writers unchanged.
  */
 import { selectTabNameSourcePaneId } from '@/store/selectors/sessionNameSelectors'
 import type { RootState } from '@/store/store'

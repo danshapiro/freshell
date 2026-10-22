@@ -4,8 +4,8 @@ import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 
-import tabsReducer, { updateTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout, updatePaneContent } from '@/store/panesSlice'
+import tabsReducer, { addTab, updateTab } from '@/store/tabsSlice'
+import panesReducer, { initLayout, splitPane, updatePaneContent } from '@/store/panesSlice'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
@@ -3693,6 +3693,84 @@ describe('ContextMenuProvider', () => {
       expect(call[0]).toEqual({ preventScroll: true })
     }
     focusSpy.mockRestore()
+  })
+
+  describe('Rename on an unscoped terminal (name reliability, Task 7)', () => {
+    const shellPane = {
+      kind: 'terminal',
+      mode: 'shell',
+      createRequestId: 'crid-shell',
+      status: 'running',
+      terminalId: 'term-shell',
+    } as const
+
+    /** Rename the shell terminal through its overview context menu. */
+    async function renameShellTerminal(setup: (store: ReturnType<typeof createTestStore>) => void) {
+      const user = userEvent.setup()
+      apiMocks.get.mockImplementation(async (path: string) => (
+        path === '/api/terminals'
+          ? [{ terminalId: 'term-shell', title: 'Shell terminal title', mode: 'shell' }]
+          : []
+      ))
+      const promptSpy = vi.spyOn(window, 'prompt')
+        .mockReturnValueOnce('Build watcher')
+        .mockReturnValueOnce('')
+      try {
+        const { store } = renderWithProvider(
+          <div data-context={ContextIds.OverviewTerminal} data-terminal-id="term-shell">
+            Shell card
+          </div>,
+        )
+        act(() => setup(store))
+        await user.pointer({ target: screen.getByText('Shell card'), keys: '[MouseRight]' })
+        await user.click(screen.getByText('Rename'))
+        // The handler's last write is the shell pane's title.
+        await waitFor(() => {
+          expect(Object.values(store.getState().panes.paneTitles)
+            .some((titles) => titles['pane-shell'] === 'Build watcher')).toBe(true)
+        })
+        return store
+      } finally {
+        promptSpy.mockRestore()
+        apiMocks.get.mockResolvedValue([])
+      }
+    }
+
+    function tabTitle(store: ReturnType<typeof createTestStore>, tabId: string) {
+      return store.getState().tabs.tabs.find((tab) => tab.id === tabId)?.title
+    }
+
+    it('retitles the legacy tab holding the terminal', async () => {
+      const store = await renameShellTerminal((s) => {
+        s.dispatch(addTab({ id: 'tab-shell', title: 'old shell', mode: 'shell' }))
+        s.dispatch(initLayout({ tabId: 'tab-shell', paneId: 'pane-shell', content: shellPane }))
+      })
+      expect(tabTitle(store, 'tab-shell')).toBe('Build watcher')
+    })
+
+    it('never retitles a session-owned tab holding the terminal', async () => {
+      const store = await renameShellTerminal((s) => {
+        s.dispatch(addTab({
+          id: 'tab-owned',
+          title: 'LotL',
+          mode: 'claude',
+          nameSource: { kind: 'session', paneId: 'pane-claude' },
+        }))
+        s.dispatch(initLayout({
+          tabId: 'tab-owned',
+          paneId: 'pane-claude',
+          content: { kind: 'terminal', mode: 'claude', createRequestId: 'crid-claude', status: 'running', sessionRef: { provider: 'claude', sessionId: VALID_SESSION_ID } },
+        }))
+        s.dispatch(splitPane({
+          tabId: 'tab-owned',
+          paneId: 'pane-claude',
+          direction: 'horizontal',
+          newContent: shellPane,
+          newPaneId: 'pane-shell',
+        }))
+      })
+      expect(tabTitle(store, 'tab-owned')).toBe('LotL')
+    })
   })
 })
 

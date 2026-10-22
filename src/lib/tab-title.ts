@@ -17,6 +17,15 @@ function getSinglePaneOverrideTitle(
   return matchesDerivedPaneTitle(storedTitle, layout.content, extensions) ? null : storedTitle
 }
 
+/**
+ * The title a tab without a name stores: `Tab <position>`. Every display
+ * treats it as no title (`isTabNumberLabel`) and shows the derived label
+ * instead, and it is never name evidence.
+ */
+export function unnamedTabTitle(position: number): string {
+  return `Tab ${position}`
+}
+
 export function getTabDisplayTitle(
   tab: Tab,
   layout?: PaneNode,

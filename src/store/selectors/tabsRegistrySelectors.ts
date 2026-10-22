@@ -184,10 +184,11 @@ export const selectLiveLocalTabRecords = createSelector(
         updatedAt,
       })
       // A session-owned local tab's registry summary shows its saved name
-      // when the record is cached. Without one it keeps the built title,
-      // which for a session-owned tab is the mirrored last-known saved name
-      // (name reliability, Task 7) — never a fallback label. Legacy tabs
-      // keep the built title.
+      // when the record is cached. Without one it keeps the built title (the
+      // tab bar's legacy display): the mirrored last-known saved name when
+      // the tab has one (name reliability, Task 7), never the overlay's
+      // fallback label; a tab with no mirrored title shows the legacy
+      // display. Legacy tabs keep the built title.
       const savedName = savedTabNames?.[tab.id]
       if (savedName) {
         record.tabName = savedName
