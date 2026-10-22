@@ -144,6 +144,32 @@ pub fn locate_transcript_state(session_id: &str) -> TranscriptLocation {
     locate_transcript_state_in(&claude_home_candidates(), session_id)
 }
 
+/// One structured warn per "cannot check" decision (G28): which caller, the
+/// session, the failing store root and the io error kind -- never transcript
+/// contents. Callers then answer transiently instead of "lost".
+pub(crate) fn log_transcript_unreadable(
+    context: &'static str,
+    session_id: &str,
+    error: &LocateError,
+) {
+    let (root, kind) = match error {
+        LocateError::NoStoreRoot => (None, "no_store_root".to_string()),
+        LocateError::Io { root, kind, .. } => {
+            (Some(root.display().to_string()), format!("{kind:?}"))
+        }
+    };
+    tracing::warn!(
+        component = "freshagent.claude",
+        event = "freshagent.claude.transcript_unreadable",
+        context,
+        session_id = %session_id,
+        root = ?root,
+        kind = %kind,
+        error = %error,
+        "claude transcript store unreadable; answering transiently, never as a lost session"
+    );
+}
+
 /// [`locate_transcript_state`] over explicit roots: the first hit wins;
 /// otherwise the first root error makes the answer Unreadable; only an
 /// all-clean miss is Absent; no roots at all is `Unreadable(NoStoreRoot)`.
@@ -1323,20 +1349,19 @@ async fn get_claude_snapshot_in(
     thread_id: &str,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, ClaudeSnapshotError> {
-    // Cannot check => must not deny (the attach arm in claude.rs treats this exact
-    // state as Transient): with NO resolvable store root we cannot assert the
-    // session is gone, so this is Io (-> 500), never NotFound (-> 404 lost).
-    if roots.is_empty() {
-        return Err(ClaudeSnapshotError::Io(
-            "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/platform home all unset)"
-                .into(),
-        ));
-    }
-    // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
-    let path = roots
-        .iter()
-        .find_map(|root| find_transcript(root, thread_id))
-        .ok_or(ClaudeSnapshotError::NotFound)?;
+    let path = match locate_transcript_state_in(roots, thread_id) {
+        TranscriptLocation::Found(path) => path,
+        // Clean miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
+        TranscriptLocation::Absent => return Err(ClaudeSnapshotError::NotFound),
+        // Cannot check => must not deny (the attach arm in claude.rs treats this
+        // exact state as Transient): no store root, or a store read error, cannot
+        // assert the session is gone, so this is Io (-> 500), never NotFound
+        // (-> 404 lost).
+        TranscriptLocation::Unreadable(error) => {
+            log_transcript_unreadable("snapshot", thread_id, &error);
+            return Err(ClaudeSnapshotError::Io(error.to_string()));
+        }
+    };
     let mtime_ms = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -1381,7 +1406,7 @@ pub(crate) fn apply_pending_overlay(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1600,10 +1625,10 @@ mod tests {
     /// process bypasses permission bits (root / CAP_DAC_OVERRIDE): those
     /// runs cannot produce the EACCES under test, so the caller skips.
     #[cfg(unix)]
-    struct UnreadableDir(PathBuf);
+    pub(crate) struct UnreadableDir(PathBuf);
     #[cfg(unix)]
     impl UnreadableDir {
-        fn make(dir: &Path) -> Option<Self> {
+        pub(crate) fn make(dir: &Path) -> Option<Self> {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
             let guard = Self(dir.to_path_buf());
@@ -2156,6 +2181,31 @@ mod tests {
         // env (passwd-entry fallback), so "no roots" is an injected input.
         let result = get_claude_snapshot_in(
             &[],
+            "freshclaude",
+            "55555555-5555-4555-8555-555555555555",
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ClaudeSnapshotError::Io(_))),
+            "expected Io (cannot-check must not deny), got {result:?}"
+        );
+    }
+
+    /// G28: an unreadable store (EACCES on `projects/`) cannot prove the
+    /// session gone, so the snapshot is Io (-> 500), never NotFound (-> 404
+    /// FRESH_AGENT_LOST_SESSION, which the client folds into "session lost").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_with_an_unreadable_store_is_io_not_notfound() {
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let Some(_locked) = UnreadableDir::make(&projects) else {
+            return;
+        };
+        let result = get_claude_snapshot_in(
+            &[home.path().to_path_buf()],
             "freshclaude",
             "55555555-5555-4555-8555-555555555555",
             None,
