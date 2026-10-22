@@ -180,3 +180,55 @@ describe('resolveFreshAgentPaneModelDefaults', () => {
     expect(result.persistModel).toBe(persistModel)
   })
 })
+
+describe('resolveFreshAgentPaneModelDefaults effort levels', () => {
+  it('returns the saved levels when they are paired with the resolved claude model', () => {
+    expect(resolveFreshAgentPaneModelDefaults({
+      entry: registryEntry('kilroy'),
+      providerSettings: {
+        modelSelection: { modelId: 'sonnet' },
+        modelEffortLevels: { modelId: 'sonnet', levels: ['low', 'high'] },
+      },
+    }).modelEffortLevels).toEqual(['low', 'high'])
+  })
+
+  it('ignores levels paired with another model', () => {
+    expect(resolveFreshAgentPaneModelDefaults({
+      entry: registryEntry('freshclaude'),
+      providerSettings: {
+        modelSelection: { modelId: 'sonnet' },
+        modelEffortLevels: { modelId: 'haiku', levels: [] },
+      },
+    }).modelEffortLevels).toBeUndefined()
+  })
+
+  it('ignores levels for non-claude providers', () => {
+    expect(resolveFreshAgentPaneModelDefaults({
+      entry: registryEntry('freshcodex'),
+      providerSettings: {
+        modelSelection: { modelId: 'gpt-5.6-luna' },
+        modelEffortLevels: { modelId: 'gpt-5.6-luna', levels: ['low'] },
+      },
+    }).modelEffortLevels).toBeUndefined()
+  })
+})
+
+describe('resolveFreshAgentPaneCreateEffort with stamped levels', () => {
+  it('clamps a catalog-only claude model against its stamped levels', () => {
+    const base = { sessionType: 'freshclaude' as const, provider: 'claude' as const, model: 'sonnet', fallbackEffort: 'high' }
+    expect(resolveFreshAgentPaneCreateEffort({ ...base, providerEffort: 'beta', modelEffortLevels: ['alpha', 'beta'] })).toBe('beta')
+    expect(resolveFreshAgentPaneCreateEffort({ ...base, providerEffort: 'max', modelEffortLevels: ['alpha', 'beta'] })).toBe('alpha')
+    expect(resolveFreshAgentPaneCreateEffort({ ...base, providerEffort: undefined, modelEffortLevels: [] })).toBeUndefined()
+  })
+
+  it('keeps the static table for the static claude model', () => {
+    expect(resolveFreshAgentPaneCreateEffort({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      providerEffort: 'max',
+      fallbackEffort: 'high',
+      modelEffortLevels: ['low'],
+    })).toBe('max')
+  })
+})

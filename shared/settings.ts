@@ -141,11 +141,23 @@ export type CodingCliSettings = {
   mcpServer: boolean
 }
 
+/**
+ * The effort levels a fresh-pane default model offers, captured when the
+ * model was picked (catalog-only claude models are absent from the static
+ * model table). Paired with the model id so a later model change can never
+ * pick up the wrong levels; an empty list means the model declares none.
+ */
+export type FreshAgentModelEffortLevels = {
+  modelId: string
+  levels: string[]
+}
+
 export type FreshAgentProviderDefaults = {
   modelSelection?: FreshAgentModelSelection
   defaultPermissionMode?: string
   effort?: FreshAgentEffort
   style?: FreshAgentStyle
+  modelEffortLevels?: FreshAgentModelEffortLevels
 }
 
 export type ServerSettings = {
@@ -746,6 +758,13 @@ function createCodingCliProviderConfigPatchSchema() {
     .strict()
 }
 
+const FreshAgentModelEffortLevelsSchema = z
+  .object({
+    modelId: z.string().min(1),
+    levels: z.array(z.string()),
+  })
+  .strict()
+
 function createFreshAgentProviderDefaultsSchema() {
   return z
     .object({
@@ -753,6 +772,7 @@ function createFreshAgentProviderDefaultsSchema() {
       defaultPermissionMode: z.string().optional(),
       effort: FreshAgentModelCapabilitiesOpaqueStringSchema.optional(),
       style: FreshAgentStyleSchema.optional(),
+      modelEffortLevels: FreshAgentModelEffortLevelsSchema.optional(),
     })
     .strict()
 }
@@ -764,6 +784,7 @@ function createFreshAgentProviderDefaultsPatchSchema() {
       defaultPermissionMode: z.string().optional(),
       effort: z.union([FreshAgentModelCapabilitiesOpaqueStringSchema, z.literal('')]).nullable().optional(),
       style: FreshAgentStyleSchema.optional(),
+      modelEffortLevels: FreshAgentModelEffortLevelsSchema.nullable().optional(),
     })
     .strict()
 }
@@ -1030,6 +1051,9 @@ function sanitizeFreshAgentServerSettingsPatchInput(
         if (hasOwn(normalizedProviderPatchInput, 'style')) {
           normalizedProviderPatch.style = parsed.data.style
         }
+        if (hasOwn(normalizedProviderPatchInput, 'modelEffortLevels')) {
+          normalizedProviderPatch.modelEffortLevels = parsed.data.modelEffortLevels ?? undefined
+        }
         providers[providerName] = normalizedProviderPatch
       }
     }
@@ -1268,7 +1292,7 @@ function normalizeLegacyFreshAgentProviderDefaultsInput(
 
   const normalized = pickOwnKeysPreservingUndefined(
     providerPatch,
-    ['modelSelection', 'defaultPermissionMode', 'effort', 'style'],
+    ['modelSelection', 'defaultPermissionMode', 'effort', 'style', 'modelEffortLevels'],
   )
 
   if (

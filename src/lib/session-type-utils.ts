@@ -223,6 +223,7 @@ export function buildResumeContent(opts: {
       ...(opts.checkpointWorkspace ? { checkpointWorkspace: opts.checkpointWorkspace } : {}),
       modelSelection: ps?.modelSelection,
       ...(modelDefaults.persistModel ? { model: modelDefaults.model } : {}),
+      ...(modelDefaults.modelEffortLevels ? { modelEffortLevels: modelDefaults.modelEffortLevels } : {}),
       ...(permissionMode ? { permissionMode } : {}),
       effort: ps?.effort,
     }

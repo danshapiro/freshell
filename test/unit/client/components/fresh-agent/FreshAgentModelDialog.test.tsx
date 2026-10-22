@@ -756,12 +756,15 @@ describe('FreshAgentModelDialog (freshclaude)', () => {
     // would otherwise render their raw id until a probe resolves)
     expect(content.modelLabel).toEqual({ modelId: 'sonnet', label: 'Sonnet' })
 
+    // The levels travel with the saved default, paired with their model, so
+    // a new pane on this default clamps effort against them too.
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {
         providers: {
           freshclaude: {
             modelSelection: { kind: 'exact', modelId: 'sonnet' },
             effort: 'low',
+            modelEffortLevels: { modelId: 'sonnet', levels: ['low', 'medium', 'high'] },
           },
         },
       },
@@ -815,6 +818,17 @@ describe('FreshAgentModelDialog (freshclaude)', () => {
     expect(content.model).toBe('haiku')
     expect(content.effort).toBeUndefined()
     expect(content.modelEffortLevels).toEqual([])
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'haiku' },
+            effort: undefined,
+            modelEffortLevels: { modelId: 'haiku', levels: [] },
+          },
+        },
+      },
+    })
   })
 
   it('degrades to the static claude rows when the claude catalog probe fails (dialog stays open, no unavailable notice)', async () => {

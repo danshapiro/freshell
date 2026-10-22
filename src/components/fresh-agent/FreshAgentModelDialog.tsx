@@ -345,6 +345,15 @@ export function FreshAgentModelDialog({
     // delete). On the wire that means no variant — opencode applies the
     // model's own provider-side default.
     const level = highlightedLevelRow.kind === 'level' ? highlightedLevelRow.id : undefined
+    // Claude providers stamp the switched-to row's known levels (static or
+    // probed) so effort normalization clamps against THEM — the same idiom
+    // the settings popover's radio commit uses. An empty stamp is deliberate:
+    // the selected model declares no levels. The same levels are saved with
+    // the provider default, paired with the model, so a new pane on this
+    // default clamps against them too.
+    const modelEffortLevels = paneContent.provider === 'claude'
+      ? (model.supportsEffort ? [...model.supportedEffortLevels] : [])
+      : undefined
     dispatch(mergePaneContent({
       tabId,
       paneId,
@@ -361,13 +370,7 @@ export function FreshAgentModelDialog({
           ? { modelLabel: { modelId: model.id, label: model.displayName } }
           : {}),
         effort: level,
-        // Claude providers stamp the switched-to row's known levels (static
-        // or probed) so post-commit effort normalization clamps against THEM
-        // — the same idiom the settings popover's radio commit uses. An
-        // empty stamp is deliberate: the selected model declares no levels.
-        ...(paneContent.provider === 'claude'
-          ? { modelEffortLevels: model.supportsEffort ? [...model.supportedEffortLevels] : [] }
-          : {}),
+        ...(modelEffortLevels ? { modelEffortLevels } : {}),
       },
     }))
     // Apply the change to the LIVE session too (fire-and-forget): the server
@@ -387,6 +390,7 @@ export function FreshAgentModelDialog({
           [sessionType]: {
             modelSelection: { kind: 'exact', modelId: model.id },
             effort: level,
+            ...(modelEffortLevels ? { modelEffortLevels: { modelId: model.id, levels: modelEffortLevels } } : {}),
           },
         },
       },

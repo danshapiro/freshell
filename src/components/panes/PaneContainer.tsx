@@ -709,7 +709,7 @@ function PickerWrapper({
         ? getFreshAgentProviderConfig(type)
         : undefined
       const providerSettings = freshAgentSettings?.providers?.[type]
-      const { model, persistModel: shouldPersistPaneModel } = resolveFreshAgentPaneModelDefaults({
+      const { model, persistModel: shouldPersistPaneModel, modelEffortLevels } = resolveFreshAgentPaneModelDefaults({
         entry: freshAgentType,
         providerSettings,
         runtimeProviderModel: settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model,
@@ -728,6 +728,7 @@ function PickerWrapper({
         model,
         providerEffort: normalizeFreshAgentEffortOverride(providerSettings?.effort),
         fallbackEffort: freshAgentType.defaultEffort,
+        modelEffortLevels,
       })
       return {
         kind: 'fresh-agent',
@@ -737,6 +738,7 @@ function PickerWrapper({
         status: 'creating',
         modelSelection: normalizeFreshAgentModelSelection(providerSettings?.modelSelection),
         ...(shouldPersistPaneModel ? { model } : {}),
+        ...(modelEffortLevels ? { modelEffortLevels } : {}),
         ...(permissionMode ? { permissionMode } : {}),
         sandbox: freshAgentType.runtimeProvider === 'codex'
           ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox

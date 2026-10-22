@@ -632,6 +632,73 @@ describe('createContentForType with ext: prefix', () => {
       expect(content.model).toBe('opus[1m]')
     })
 
+    it('carries the effort levels saved with a catalog-only default model, so effort clamps against them', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: {
+                modelSelection: { kind: 'exact', modelId: 'claude-haiku-x' },
+                modelEffortLevels: { modelId: 'claude-haiku-x', levels: [] },
+                effort: 'high',
+              },
+            },
+          },
+        },
+      })
+
+      expect(content.model).toBe('claude-haiku-x')
+      expect(content.modelEffortLevels).toEqual([])
+      // The model declares no effort levels: never the opus table's 'high'.
+      expect(content.effort).toBeUndefined()
+    })
+
+    it('clamps a saved effort the saved catalog-only model does not offer to its first level', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: {
+                modelSelection: { kind: 'exact', modelId: 'sonnet' },
+                modelEffortLevels: { modelId: 'sonnet', levels: ['alpha', 'beta'] },
+                effort: 'max',
+              },
+            },
+          },
+        },
+      })
+
+      expect(content.modelEffortLevels).toEqual(['alpha', 'beta'])
+      expect(content.effort).toBe('alpha')
+    })
+
+    it('ignores saved effort levels paired with a different model', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: {
+                modelSelection: { kind: 'exact', modelId: 'sonnet' },
+                modelEffortLevels: { modelId: 'claude-haiku-x', levels: [] },
+              },
+            },
+          },
+        },
+      })
+
+      expect(content.model).toBe('sonnet')
+      expect(content.modelEffortLevels).toBeUndefined()
+    })
+
     it('does not fall back to the terminal Claude CLI model (decision D1)', async () => {
       const content = await createClaudeFamilyPane({
         label: 'Freshclaude',

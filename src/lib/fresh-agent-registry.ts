@@ -170,6 +170,7 @@ export type FreshAgentProviderDefaultsForModel = {
 /** The saved per-type fresh-pane defaults the model resolver reads. */
 export type FreshAgentPaneModelDefaultsSettings = {
   modelSelection?: { modelId?: string }
+  modelEffortLevels?: { modelId: string; levels: string[] }
 }
 
 export type FreshAgentPaneModelDefaults = {
@@ -178,6 +179,10 @@ export type FreshAgentPaneModelDefaults = {
   /** Whether to stamp `model` into the pane content. An opencode pane with
    * nothing configured persists no model, so its provider default applies. */
   persistModel: boolean
+  /** Claude only: the effort levels saved with `model` (captured when it was
+   * picked), to stamp as the pane's `modelEffortLevels`. Absent when none were
+   * saved for exactly this model. */
+  modelEffortLevels?: string[]
 }
 
 function nonBlank(value: string | undefined): string | undefined {
@@ -212,7 +217,16 @@ export function resolveFreshAgentPaneModelDefaults(args: {
   const persistModel = entry.runtimeProvider !== 'opencode'
     || saved !== undefined
     || runtimeProviderModel !== undefined
-  return { model, persistModel }
+  // Levels are saved paired with their model: a mismatched pair (levels for
+  // another model) is stale and ignored.
+  const savedLevels = args.providerSettings?.modelEffortLevels
+  const modelEffortLevels = entry.runtimeProvider === 'claude'
+    && model !== undefined
+    && savedLevels?.modelId === model
+    && Array.isArray(savedLevels.levels)
+    ? [...savedLevels.levels]
+    : undefined
+  return { model, persistModel, ...(modelEffortLevels ? { modelEffortLevels } : {}) }
 }
 
 /**
@@ -229,6 +243,32 @@ export function resolveEffectiveFreshAgentModel(
     ?? content.modelSelection?.modelId
     ?? providerDefaults?.modelSelection?.modelId
   return normalizeFreshAgentModel(content.sessionType, content.provider, configured)
+}
+
+/**
+ * Probed-only claude models clamp effort against the levels stamped when the
+ * model was picked: the staged value survives when the stamp knows it, an
+ * unknown staged value re-clamps to the stamp's first level, and an empty
+ * stamp (the model declared no levels) clears the effort.
+ */
+export function clampEffortToStampedLevels(levels: readonly string[], staged: string | undefined): string | undefined {
+  if (staged && levels.includes(staged)) return staged
+  return levels.length > 0 ? levels[0] : undefined
+}
+
+/** Whether stamped levels govern this model's effort: claude, a stamp, and a
+ * model absent from the static menu (static rows keep the static table). */
+function usesStampedEffortLevels(
+  sessionType: FreshAgentSessionType,
+  provider: FreshAgentRuntimeProvider,
+  model: string | undefined,
+  levels: readonly string[] | undefined,
+): levels is readonly string[] {
+  return provider === 'claude'
+    && Boolean(model)
+    && Array.isArray(levels)
+    && !(FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[sessionType] ?? [])
+      .some((option) => option.value === model)
 }
 
 /**
@@ -250,17 +290,8 @@ export function getEffectiveFreshAgentEffort(
   providerDefaults?: FreshAgentProviderDefaultsForModel,
 ): string | undefined {
   const resolvedModel = resolveEffectiveFreshAgentModel(content, providerDefaults)
-  if (
-    content.provider === 'claude'
-    && resolvedModel
-    && Array.isArray(content.modelEffortLevels)
-    && !(FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[content.sessionType] ?? [])
-      .some((option) => option.value === resolvedModel)
-  ) {
-    const levels = content.modelEffortLevels
-    const staged = content.effort ?? providerDefaults?.effort
-    if (staged && levels.includes(staged)) return staged
-    return levels.length > 0 ? levels[0] : undefined
+  if (usesStampedEffortLevels(content.sessionType, content.provider, resolvedModel, content.modelEffortLevels)) {
+    return clampEffortToStampedLevels(content.modelEffortLevels, content.effort ?? providerDefaults?.effort)
   }
   return normalizeFreshAgentEffort(
     content.sessionType,
@@ -283,8 +314,14 @@ export function resolveFreshAgentPaneCreateEffort(args: {
   model: string | undefined
   providerEffort: string | undefined
   fallbackEffort: string
+  /** Claude: the levels saved with a probed-only model (see
+   * resolveFreshAgentPaneModelDefaults); effort clamps against them. */
+  modelEffortLevels?: readonly string[]
 }): string | undefined {
-  const { sessionType, provider, model, providerEffort, fallbackEffort } = args
+  const { sessionType, provider, model, providerEffort, fallbackEffort, modelEffortLevels } = args
+  if (usesStampedEffortLevels(sessionType, provider, model, modelEffortLevels)) {
+    return clampEffortToStampedLevels(modelEffortLevels, providerEffort ?? fallbackEffort)
+  }
   if (provider === 'opencode') {
     return normalizeFreshAgentEffort(sessionType, provider, model, providerEffort)
   }

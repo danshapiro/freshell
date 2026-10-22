@@ -271,6 +271,20 @@ describe('buildResumeContent', () => {
       expect(unsaved.model).toBe('opus[1m]')
     })
 
+    it('carries the effort levels saved with the default model into resumed claude panes', () => {
+      const content = buildResumeContent({
+        sessionType: 'freshclaude',
+        sessionId: 'abc-123',
+        freshAgentProviderSettings: {
+          modelSelection: { kind: 'exact', modelId: 'claude-haiku-x' },
+          modelEffortLevels: { modelId: 'claude-haiku-x', levels: [] },
+        },
+      })
+      if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+      expect(content.model).toBe('claude-haiku-x')
+      expect(content.modelEffortLevels).toEqual([])
+    })
+
     it('resumes a Freshcodex session on the saved Freshcodex default model', () => {
       const content = buildResumeContent({
         sessionType: 'freshcodex',
