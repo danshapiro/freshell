@@ -1546,3 +1546,259 @@ async fn classified_capacity_trigger_text_embeds_the_actual_error_and_configured
 
     proxy.close().await;
 }
+
+// ── 13. growth canary at hub ingest: per-proxy rate limit, division of
+//         coverage, and limiter independence (plan §4.3.2, tests §5.7) ─────────
+
+/// Options for the canary tests: production-equality caps at 1 MiB (transport
+/// == hub policy, plan §4.1), a 512 KiB growth-canary threshold sitting in the
+/// growth zone BELOW the cap, and BOTH rate-limit intervals stretched to 60 s
+/// so each whole test runs inside a single interval of each limiter (mirrors
+/// `candidate_gate.rs`'s keep-inert injection pattern).
+fn canary_options(upstream: &str) -> CodexRemoteProxyOptions {
+    let mut options = equality_options(upstream, 1024 * 1024);
+    options.canary_warn_bytes = 512 * 1024;
+    options.canary_min_warn_interval_ms = 60_000;
+    options.capacity_trigger_min_interval_ms = 60_000;
+    options
+}
+
+/// A valid JSON-RPC response frame of EXACTLY `total_bytes` bytes. The
+/// canary-zone traffic (over the 512 KiB threshold, under the 1 MiB caps)
+/// must be a well-formed envelope so it passes the hub's scan and relays
+/// instead of dying on the malformed-frame path — the canary observes real
+/// traffic, it does not get fed garbage.
+fn upstream_result_frame_of(total_bytes: usize) -> String {
+    let with_empty = json!({"id": 1, "result": {"pad": ""}}).to_string();
+    assert!(
+        total_bytes > with_empty.len(),
+        "frame target {total_bytes} is smaller than the envelope scaffold"
+    );
+    json!({"id": 1, "result": {"pad": "x".repeat(total_bytes - with_empty.len())}}).to_string()
+}
+
+/// The over-cap single-frame death (the incident shape): with equality caps at
+/// 1 MiB the 2 MiB frame is rejected by the transport from its header — before
+/// any payload buffers — and never reaches hub ingest. The exact size keeps
+/// the classified trigger's embedded error text assertable.
+const OVER_CAP_DEATH_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+#[tokio::test]
+async fn canary_zone_reconnect_loop_yields_at_most_one_warning_line_per_interval() {
+    // Plan §5.7(a): several connect / send / teardown cycles within the
+    // interval stay bounded — the growth canary and the classified Capacity
+    // trigger each emit at most one line per interval PER PROXY (not per
+    // connection), and the generic teardown pair is suppressed behind the
+    // classified line (Task 004, §4.3.1c). The loop runs in the UPSTREAM
+    // direction (the incident shape, where the bound holds across all
+    // trigger variants): each cycle first carries canary-zone traffic
+    // (768 KiB: over the threshold, under the caps) and then dies on an
+    // over-cap frame, so a per-connection or unrate-limited canary would
+    // emit one line per cycle. Expected total across three cycles: exactly
+    // the two first lines (canary + classified), nothing else — not 2x the
+    // cycles.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) = CodexRemoteProxy::start(canary_options(&upstream.ws_url))
+        .await
+        .unwrap();
+
+    for cycle in 0..3 {
+        let mut tui = connect_tui(proxy.ws_url()).await;
+        let mut conn = upstream.accept().await;
+        conn.send_text(upstream_result_frame_of(768 * 1024));
+        conn.send_text("x".repeat(OVER_CAP_DEATH_FRAME_BYTES));
+
+        if cycle == 0 {
+            let received = recv_events(&mut events, 2).await;
+            match &received[0] {
+                RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
+                    message,
+                }) => {
+                    assert!(
+                        message.contains("growth-canary"),
+                        "cycle 0's first line must be the growth-canary warning, got: {message}"
+                    );
+                    assert!(
+                        message.contains("786432 bytes") && message.contains("524288"),
+                        "the canary warning must state the frame size and the threshold, got: {message}"
+                    );
+                }
+                other => panic!("expected the growth-canary warning first, got {other:?}"),
+            }
+            match &received[1] {
+                RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
+                    message,
+                }) => {
+                    assert!(
+                        message.contains("failed on the WebSocket capacity limit"),
+                        "cycle 0's second line must be the classified Capacity trigger, got: {message}"
+                    );
+                }
+                other => panic!("expected the classified Capacity trigger second, got {other:?}"),
+            }
+            // The canary is warn-only: the 768 KiB frame still relays.
+            let relayed = recv_text(&mut tui).await;
+            assert_eq!(
+                relayed.len(),
+                768 * 1024,
+                "the canary must not reject or alter the frame"
+            );
+        } else {
+            // Within the interval: the canary and the classified trigger are
+            // both rate-limited and the generic pair is suppressed — the
+            // whole cycle is silent.
+            assert_no_event(&mut events).await;
+        }
+
+        // Wait for the teardown to reach the fake upstream, then drop the
+        // TUI abruptly — the client leg's generic error stays suppressed
+        // behind the classified mark (the incident's exact pair shape).
+        let closed = timeout(RECV_TIMEOUT, conn.incoming.recv()).await.unwrap();
+        assert!(
+            matches!(closed, None | Some(Message::Close(_))),
+            "the fake upstream must observe the teardown of cycle {cycle}, got {closed:?}"
+        );
+        drop(tui);
+        assert_no_event(&mut events).await;
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn over_cap_frame_fires_the_capacity_trigger_not_the_hub_canary() {
+    // Plan §5.7(b) — division of coverage: at production equality an over-cap
+    // frame is rejected by the TRANSPORT from its header and never reaches
+    // hub ingest, so the over-cap zone belongs to the classified, rate-limited
+    // Capacity trigger (§4.3.1) and the hub canary must stay silent for it —
+    // even though the 2 MiB frame would also exceed the 512 KiB canary
+    // threshold had it reached the hub. The contrast leg pins the other side
+    // of the division: a canary-zone frame that DOES reach ingest still warns
+    // within the same interval — the over-cap death consumed the Capacity
+    // limiter only, never the canary's (the limiters are separate, §4.3.1a).
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) = CodexRemoteProxy::start(canary_options(&upstream.ws_url))
+        .await
+        .unwrap();
+
+    // Leg 1: the over-cap death — the classified Capacity trigger, NO canary.
+    let tui1 = connect_tui(proxy.ws_url()).await;
+    let mut conn1 = upstream.accept().await;
+    conn1.send_text("x".repeat(OVER_CAP_DEATH_FRAME_BYTES));
+
+    let received = recv_events(&mut events, 1).await;
+    match &received[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert!(
+                message.contains("upstream connection failed on the WebSocket capacity limit"),
+                "the over-cap frame must produce the classified Capacity trigger, got: {message}"
+            );
+        }
+        other => panic!("expected the classified Capacity trigger, got {other:?}"),
+    }
+    // The canary stays silent for the over-cap frame — and no generic pair.
+    assert_no_event(&mut events).await;
+    let closed = timeout(RECV_TIMEOUT, conn1.incoming.recv()).await.unwrap();
+    assert!(
+        matches!(closed, None | Some(Message::Close(_))),
+        "the fake upstream must observe the teardown, got {closed:?}"
+    );
+    drop(tui1);
+    assert_no_event(&mut events).await;
+
+    // Leg 2, same interval: a canary-zone frame reaches ingest and warns.
+    // (_tui2 stays bound so the connection is alive through the warning.)
+    let _tui2 = connect_tui(proxy.ws_url()).await;
+    let conn2 = upstream.accept().await;
+    conn2.send_text(upstream_result_frame_of(768 * 1024));
+    let received = recv_events(&mut events, 1).await;
+    match &received[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert!(
+                message.contains("growth-canary") && message.contains("786432 bytes"),
+                "the canary-zone frame must warn even though the Capacity limiter already fired this interval, got: {message}"
+            );
+        }
+        other => panic!("expected the growth-canary warning, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn canary_warning_does_not_suppress_the_first_over_cap_capacity_trigger() {
+    // Plan §5.7(c) — limiter independence (§4.3.1a): a growth sequence
+    // inherently crosses the canary BEFORE the cap, so the canary warning
+    // must never consume the Capacity trigger's first line: an under-cap
+    // over-threshold frame (canary warns), followed WITHIN the interval by an
+    // over-cap frame, STILL produces the classified Capacity trigger. Also
+    // pins: the canary is warn-only (the flagged frame relays), and frames
+    // below the canary threshold never warn.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) = CodexRemoteProxy::start(canary_options(&upstream.ws_url))
+        .await
+        .unwrap();
+
+    // Phase 1: the canary-zone frame — the canary warns, the frame relays.
+    let mut tui1 = connect_tui(proxy.ws_url()).await;
+    let mut conn1 = upstream.accept().await;
+    conn1.send_text(upstream_result_frame_of(768 * 1024));
+    let received = recv_events(&mut events, 1).await;
+    match &received[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert!(
+                message.contains("growth-canary"),
+                "the canary-zone frame must warn, got: {message}"
+            );
+            assert!(
+                message.contains("786432 bytes") && message.contains("524288"),
+                "the canary warning must state the frame size and the threshold, got: {message}"
+            );
+        }
+        other => panic!("expected the growth-canary warning, got {other:?}"),
+    }
+    assert_no_event(&mut events).await;
+    let relayed = recv_text(&mut tui1).await;
+    assert_eq!(
+        relayed.len(),
+        768 * 1024,
+        "the canary must not reject or alter the frame"
+    );
+
+    // Phase 2, WITHIN the interval: the over-cap death — the classified
+    // Capacity trigger STILL fires (a shared limiter would have swallowed
+    // the first over-cap diagnostic).
+    conn1.send_text("x".repeat(OVER_CAP_DEATH_FRAME_BYTES));
+    let received = recv_events(&mut events, 1).await;
+    match &received[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert!(
+                message.contains("failed on the WebSocket capacity limit")
+                    && message.contains("Message too long: 2097152 > 1048576"),
+                "the first over-cap frame after a canary warning must still produce the full classified Capacity trigger, got: {message}"
+            );
+        }
+        other => panic!("expected the classified Capacity trigger, got {other:?}"),
+    }
+    let closed = timeout(RECV_TIMEOUT, conn1.incoming.recv()).await.unwrap();
+    assert!(
+        matches!(closed, None | Some(Message::Close(_))),
+        "the fake upstream must observe the teardown, got {closed:?}"
+    );
+    drop(tui1);
+    assert_no_event(&mut events).await;
+
+    // Phase 3: a BELOW-threshold frame never warns (and still relays).
+    let mut tui2 = connect_tui(proxy.ws_url()).await;
+    let conn2 = upstream.accept().await;
+    conn2.send_text(upstream_result_frame_of(64 * 1024));
+    assert_no_event(&mut events).await;
+    let relayed = recv_text(&mut tui2).await;
+    assert_eq!(
+        relayed.len(),
+        64 * 1024,
+        "the below-threshold frame must relay"
+    );
+
+    proxy.close().await;
+}

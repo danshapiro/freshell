@@ -26,10 +26,31 @@
 //!   tears down the WS listener and all active client/upstream socket pairs (mirrors
 //!   `remote-proxy.ts:178-204` exactly); it does NOT touch any child process — that's the
 //!   Slice-3 launch-planner's sidecar handle, not this proxy's.
-//! - **No protocol-level (tungstenite) frame-size cap is configured.** The app-level
-//!   `max_raw_forward_bytes` guard (mirroring `maxRawForwardBytes`) is enforced in the hub
-//!   after a message is fully buffered, matching legacy's own belt on top of `ws`'s
-//!   `maxPayload` — see the module's tests for the exact rejection behavior.
+//! - **Protocol-level (tungstenite) frame-size caps ARE configured, at
+//!   equality with the app-level policy** (plan
+//!   `docs/plans/2026-10-20-codex-proxy-ws-frame-cap.md` §4.1): both proxy
+//!   legs — the TUI-facing accept AND the upstream dial — run with
+//!   `max_frame_size`/`max_message_size` = [`MAX_WS_FRAME_BYTES`]/
+//!   [`MAX_WS_MESSAGE_BYTES`], which default to [`MAX_CODEX_FRAME_BYTES`]:
+//!   the SAME 256 MiB value as the hub's `max_raw_forward_bytes` policy
+//!   (equality: transport == policy). This is exact legacy parity — the
+//!   retired Node proxy tied its `ws` server's `maxPayload` to
+//!   `maxRawForwardBytes`; the Rust port had silently dropped to
+//!   tungstenite's 16 MiB default, BELOW the policy it was supposed to sit
+//!   under, which caused the 2026-10-19 blinking-pane incident. At equality
+//!   an over-policy single frame is rejected by the transport from its
+//!   header — zero payload buffering — and surfaces as the classified,
+//!   per-proxy-rate-limited Capacity repair trigger (§4.3.1); the hub's own
+//!   `max_raw_forward_bytes` check remains as belt-and-suspenders (it still
+//!   guards rewritten/constructed frames and any injected asymmetry). A
+//!   growth canary (§4.3.2) — warn-only, rate-limited per proxy via
+//!   [`CANARY_MIN_WARN_INTERVAL_MS`] — fires when an ingested frame exceeds
+//!   [`CANARY_BYTES`] (32 MiB), covering the growth zone BELOW the cap
+//!   (over-cap frames never reach hub ingest). The fresh lane
+//!   (`transport.rs`) runs its own INDEPENDENT, deliberately smaller cap
+//!   ([`crate::remote_proxy_envelope::MAX_LANE_FRAME_BYTES`], 64 MiB)
+//!   because it full-parses responses — see [`crate::ws_config`] for both
+//!   config builders.
 //! - **Turn dedup state (`activeTurnKeys`/`completedTurnKeys`) is proxy-wide**, not
 //!   per-connection — this matches `remote-proxy.ts` exactly (the fields live on the
 //!   `CodexRemoteProxy` class, not `ProxyConnection`).
@@ -354,7 +375,7 @@ impl CodexRemoteProxy {
             options.require_candidate_persistence,
             options.identity_gate_hold_timeout_ms,
             hub_tx.clone(),
-            options.capacity_trigger_min_interval_ms,
+            EmissionConfig::from_options(&options),
         ));
 
         // Arm the candidate-capture timer (`DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS`,
@@ -782,6 +803,60 @@ enum IdentityGate {
     Failed,
 }
 
+/// The plan §4.3 emission knobs that travel together from
+/// [`CodexRemoteProxyOptions`] into [`run_hub`]: the growth-canary
+/// threshold and its per-proxy warn interval (§4.3.2), and the classified
+/// Capacity trigger's own interval (§4.3.1b).
+#[derive(Clone, Debug)]
+struct EmissionConfig {
+    canary_warn_bytes: usize,
+    canary_min_warn_interval_ms: u64,
+    capacity_trigger_min_interval_ms: u64,
+}
+
+impl EmissionConfig {
+    fn from_options(options: &CodexRemoteProxyOptions) -> Self {
+        Self {
+            canary_warn_bytes: options.canary_warn_bytes,
+            canary_min_warn_interval_ms: options.canary_min_warn_interval_ms,
+            capacity_trigger_min_interval_ms: options.capacity_trigger_min_interval_ms,
+        }
+    }
+}
+
+/// A per-proxy "one line per interval" emission gate (the repo's
+/// `freshell-ws` `connection_writer.rs` spill-event pattern): the first
+/// emission always fires; anything within `min_interval` of the last
+/// emission is suppressed. The hub keeps one gate for the classified
+/// Capacity trigger and one for the growth canary — SEPARATE values of this
+/// type, never a shared one (plan §4.3.1a/§4.3.2: neither limiter may
+/// suppress the other's first line).
+struct EmissionGate {
+    last_emitted: Option<Instant>,
+    min_interval: Duration,
+}
+
+impl EmissionGate {
+    fn from_millis(min_interval_ms: u64) -> Self {
+        Self {
+            last_emitted: None,
+            min_interval: Duration::from_millis(min_interval_ms),
+        }
+    }
+
+    /// Stamps and reports whether an emission is due.
+    fn due(&mut self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last_emitted
+            .is_none_or(|last| now.duration_since(last) >= self.min_interval);
+        if due {
+            self.last_emitted = Some(now);
+        }
+        due
+    }
+}
+
 struct Hub {
     connections: HashMap<u64, ConnState>,
     max_raw_forward_bytes: usize,
@@ -793,17 +868,24 @@ struct Hub {
     /// The hub's own inbox — used to arm the hold timer on the FIRST held frame.
     hub_tx: mpsc::UnboundedSender<HubMsg>,
     hold_timeout_ms: u64,
-    /// Plan §4.3.1b: the classified Capacity trigger's OWN last-emitted stamp.
-    /// Deliberately SEPARATE from the growth canary's limiter (§4.3.2): a
-    /// growth sequence inherently fires the canary first, and a shared
-    /// limiter would then suppress the first Capacity line of the very next
-    /// over-cap incident.
-    capacity_trigger_last_emitted: Option<Instant>,
-    capacity_trigger_min_interval: Duration,
+    /// Plan §4.3.1b: the classified Capacity trigger's OWN emission gate.
+    /// Deliberately SEPARATE from the growth canary's (§4.3.2): a growth
+    /// sequence inherently fires the canary first, and a shared gate would
+    /// then suppress the first Capacity line of the very next over-cap
+    /// incident.
+    capacity_trigger_gate: EmissionGate,
     /// Plan §4.3.1c: connections whose latest teardown was Capacity-classified.
     /// The paired generic errored trigger for these is suppressed — the
     /// classified line IS the record for that connection's teardown.
     capacity_classified_conns: HashSet<u64>,
+    /// Plan §4.3.2: the growth canary's OWN emission gate — deliberately a
+    /// SEPARATE gate from the Capacity trigger's (§4.3.1b): a growth
+    /// sequence inherently fires the canary first (real traffic crosses
+    /// `CANARY_BYTES` long before the cap), and a shared gate would suppress
+    /// the first over-cap diagnostic of the very next incident — and vice
+    /// versa.
+    canary_gate: EmissionGate,
+    canary_warn_bytes: usize,
 }
 
 /// The FULL upstream side-effect bundle for one notification frame — mirrors
@@ -826,7 +908,7 @@ async fn run_hub(
     require_candidate_persistence: bool,
     hold_timeout_ms: u64,
     hub_tx: mpsc::UnboundedSender<HubMsg>,
-    capacity_trigger_min_interval_ms: u64,
+    emission: EmissionConfig,
 ) {
     let mut hub = Hub {
         connections: HashMap::new(),
@@ -846,9 +928,10 @@ async fn run_hub(
         },
         hub_tx,
         hold_timeout_ms,
-        capacity_trigger_last_emitted: None,
-        capacity_trigger_min_interval: Duration::from_millis(capacity_trigger_min_interval_ms),
+        capacity_trigger_gate: EmissionGate::from_millis(emission.capacity_trigger_min_interval_ms),
         capacity_classified_conns: HashSet::new(),
+        canary_gate: EmissionGate::from_millis(emission.canary_min_warn_interval_ms),
+        canary_warn_bytes: emission.canary_warn_bytes,
     };
 
     while let Some(msg) = rx.recv().await {
@@ -1009,7 +1092,7 @@ impl Hub {
         match kind {
             StreamErrorKind::Capacity { error_text } => {
                 self.capacity_classified_conns.insert(conn_id);
-                if self.capacity_trigger_due() {
+                if self.capacity_trigger_gate.due() {
                     self.emit(RemoteProxyEvent::RepairTrigger(
                         RemoteProxyRepairTrigger::ProxyError {
                             message: format!(
@@ -1036,19 +1119,47 @@ impl Hub {
         self.close_connection(conn_id);
     }
 
-    /// Plan §4.3.1b: the classified Capacity trigger's own rate-limit gate — at
-    /// most one classified line per [`Hub::capacity_trigger_min_interval`] per
-    /// proxy, first one always firing (mirrors `freshell-ws`'s
-    /// `connection_writer.rs` spill-event pattern).
-    fn capacity_trigger_due(&mut self) -> bool {
-        let now = Instant::now();
-        let due = self
-            .capacity_trigger_last_emitted
-            .is_none_or(|last| now.duration_since(last) >= self.capacity_trigger_min_interval);
-        if due {
-            self.capacity_trigger_last_emitted = Some(now);
+    /// Plan §4.3.1b: the classified Capacity trigger's rate limit lives in
+    /// [`Hub::capacity_trigger_gate`] — at most one classified line per
+    /// interval per proxy, first one always firing (the shared
+    /// [`EmissionGate`] pattern).
+    ///
+    /// Plan §4.3.2: the growth canary — WARN-ONLY ingest guard, called at the
+    /// top of BOTH hub frame-ingest arms, BEFORE the policy check.
+    ///
+    /// Scope (stated exactly): at production equality (transport caps ==
+    /// `max_raw_forward_bytes`, plan §4.1) an over-cap frame is rejected by
+    /// the transport from its header and NEVER reaches hub ingest, so this
+    /// canary covers the growth zone BELOW the cap (`CANARY_BYTES` → the
+    /// policy, 32 MiB → 256 MiB at defaults) — the months of warning as real
+    /// traffic grows toward the cap. The over-cap zone is covered by the
+    /// classified Capacity trigger (§4.3.1). This guard never rejects,
+    /// closes, or alters the frame.
+    ///
+    /// Rate limit: PER PROXY ([`Hub::canary_gate`]; default minimum spacing
+    /// [`CANARY_MIN_WARN_INTERVAL_MS`], injectable via
+    /// [`CodexRemoteProxyOptions::canary_min_warn_interval_ms`]) — NOT per
+    /// connection: per-connection emission would flood during a big-frame
+    /// reconnect loop, while a proxy-wide interval bounds the canary to one
+    /// line per interval regardless of connection churn. The gate is
+    /// deliberately a SEPARATE [`EmissionGate`] from the Capacity trigger's
+    /// (§4.3.1b), so a canary warning can never suppress the first over-cap
+    /// diagnostic and vice versa.
+    fn note_growth_canary(&mut self, len: usize) {
+        if len <= self.canary_warn_bytes {
+            return;
         }
-        due
+        if !self.canary_gate.due() {
+            return;
+        }
+        self.emit(RemoteProxyEvent::RepairTrigger(
+            RemoteProxyRepairTrigger::ProxyError {
+                message: format!(
+                    "Codex remote proxy frame exceeded the growth-canary threshold: {len} bytes (canary threshold {} bytes).",
+                    self.canary_warn_bytes
+                ),
+            },
+        ));
     }
 
     fn send_to_client(&self, conn_id: u64, data: Vec<u8>, binary: bool) {
@@ -1134,6 +1245,7 @@ impl Hub {
     // ── client -> upstream (`handleClientMessage`, `remote-proxy.ts:371-455`) ───────
 
     fn handle_client_frame(&mut self, conn_id: u64, data: Vec<u8>, binary: bool) {
+        self.note_growth_canary(data.len());
         if data.len() > self.max_raw_forward_bytes {
             let id = if data.len() <= MAX_FULL_PARSE_BYTES {
                 scan_json_rpc_envelope(&data).ok().and_then(|e| e.id)
@@ -1376,6 +1488,7 @@ impl Hub {
     // ── upstream -> client (`handleUpstreamMessage`, `remote-proxy.ts:457-511`) ─────
 
     fn handle_upstream_frame(&mut self, conn_id: u64, data: Vec<u8>, binary: bool) {
+        self.note_growth_canary(data.len());
         if data.len() > self.max_raw_forward_bytes {
             self.fail_unsafe_upstream_frame(conn_id, None, "raw_forward_cap_exceeded");
             return;
@@ -2193,7 +2306,11 @@ mod tests {
             false,
             60_000,
             hub_tx.clone(),
-            capacity_interval_ms,
+            EmissionConfig {
+                canary_warn_bytes: CANARY_BYTES,
+                canary_min_warn_interval_ms: CANARY_MIN_WARN_INTERVAL_MS,
+                capacity_trigger_min_interval_ms: capacity_interval_ms,
+            },
         ));
         (hub_tx, events_rx)
     }
