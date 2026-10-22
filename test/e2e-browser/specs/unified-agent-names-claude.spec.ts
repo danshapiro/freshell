@@ -1,5 +1,5 @@
 import { expect, test } from '../helpers/fixtures.js'
-import type { SessionNameRef } from '../../shared/session-names.js'
+import type { SessionNameRef } from '../../../shared/session-names.js'
 import {
   createNamedAgent,
   refreshHandle,

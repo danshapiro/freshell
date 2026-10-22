@@ -377,6 +377,68 @@ test.describe('agent crash auto-resume (rust only)', () => {
     }
   })
 
+  // Name reliability (Task 10): the CLI crashes BEFORE the pane's pending
+  // name ever bound onto a durable session (no transcript yet — a rename
+  // before the first message). The replacement row inherits the crashed
+  // row's still-pending naming handle, so the pre-durable name survives the
+  // auto-resume instead of being replaced by a fresh default.
+  test('the auto-resumed terminal keeps a name given before its first message', async ({ browser }) => {
+    test.setTimeout(240_000)
+    let rigPage: RigPage | undefined
+    try {
+      // No FAKE_CLAUDE_TRANSCRIPT: the session never materializes, so the
+      // row stays on its pending handle up to the crash.
+      rigPage = await bootRigPage(browser, 'pre-durable', {
+        FAKE_CRASH_ON_LINE: 'crash-now',
+      })
+      const { rig, page } = rigPage
+      await createClaudePane(page, rig.info)
+
+      let originalTerminalId = ''
+      let pendingRef: Record<string, unknown> | undefined
+      await expect(async () => {
+        const row = (await terminalRows(rig!.info)).find((candidate) =>
+          candidate.mode === 'claude' && candidate.status === 'running')
+        expect(row?.nameRef?.kind, 'the fresh claude row is bound to its pending handle').toBe('pending')
+        originalTerminalId = row!.terminalId
+        pendingRef = row!.nameRef
+      }).toPass({ timeout: 30_000 })
+
+      await renameTerminal(rig.info, originalTerminalId, 'Early name')
+      await expect(async () => {
+        const row = (await terminalRows(rig!.info)).find((candidate) =>
+          candidate.terminalId === originalTerminalId)
+        expect(row?.sessionName?.name).toBe('Early name')
+        expect(row?.nameRef, 'still pending at the crash').toEqual(pendingRef)
+      }).toPass({ timeout: 30_000 })
+      await page.evaluate((terminalId: string) => {
+        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+          type: 'terminal.input', terminalId, data: 'crash-now\r',
+        })
+      }, originalTerminalId)
+
+      await expect(async () => {
+        const entries = await readArgvLog(rig!.argvLog)
+        expect(entries.length, 'one crash + one auto-resume').toBe(2)
+      }).toPass({ timeout: 30_000 })
+
+      // The replacement row is bound to the SAME pending handle and shows the
+      // pre-durable name.
+      await expect(async () => {
+        const row = (await terminalRows(rig!.info)).find((candidate) =>
+          candidate.mode === 'claude'
+          && candidate.status === 'running'
+          && candidate.terminalId !== originalTerminalId)
+        expect(row, 'the auto-resumed row is listed').toBeTruthy()
+        expect(row!.nameRef).toEqual(pendingRef)
+        expect(row!.sessionName?.name).toBe('Early name')
+        expect(row!.title).toBe('Early name')
+      }).toPass({ timeout: 30_000 })
+    } finally {
+      await teardownRigPage(rigPage)
+    }
+  })
+
   test('instantly re-crashing CLI exhausts retries and settles with a loud banner', async ({ browser }) => {
     test.setTimeout(240_000)
     let rigPage: RigPage | undefined

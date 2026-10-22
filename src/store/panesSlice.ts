@@ -2358,7 +2358,12 @@ export const panesSlice = createSlice({
 
     reconcileTerminalSessionRefByTerminalId: (
       state,
-      action: PayloadAction<{ terminalId: string; sessionRef: unknown; previousSessionId?: string }>
+      action: PayloadAction<{
+        terminalId: string
+        sessionRef: unknown
+        previousSessionId?: string
+        spentNamingHandles?: string[]
+      }>
     ) => {
       const terminalId = action.payload.terminalId
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
@@ -2376,7 +2381,12 @@ export const panesSlice = createSlice({
           }
 
           if (!sessionRefsEqual(content.sessionRef, canonicalSessionRef)) {
-            releaseSupersededConversationNaming(content, canonicalSessionRef, action.payload.previousSessionId)
+            releaseSupersededConversationNaming(
+              content,
+              canonicalSessionRef,
+              action.payload.previousSessionId,
+              action.payload.spentNamingHandles,
+            )
             content.sessionRef = canonicalSessionRef
           }
           content.resumeSessionId = undefined

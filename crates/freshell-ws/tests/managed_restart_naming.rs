@@ -17,6 +17,13 @@
 //! `common::opencode_home`'s isolated home (whose contract asserts the TUI
 //! plugin install that a local spawn performs); the managed entries spawn
 //! nothing locally.
+//!
+//! The last case pins the other side of the managed descriptor: a FRESH
+//! managed Claude create's own server-preallocated `--session-id`, which a
+//! supervisor echoes back, is prospective and never binds as durable.
+//! Managed Claude exists only in a `provider-qualification` build with the
+//! qualification policy naming claude, so that case is feature-gated and
+//! re-runs itself alone in a child process with the policy set.
 
 mod common;
 
@@ -388,4 +395,158 @@ async fn restart_managed_create_binds_the_saved_name() {
         "managed create",
     )
     .await;
+}
+
+/// The qualification policy is a process-wide env var, so the case re-runs
+/// itself alone in a child process with it set (and a throwaway HOME) —
+/// never `set_var` in the shared test process. Answers true in the parent,
+/// after the child passed.
+#[cfg(feature = "provider-qualification")]
+fn run_with_claude_qualification(test: &str) -> bool {
+    const CHILD: &str = "FRESHELL_TEST_CLAUDE_QUALIFICATION_CHILD";
+    if let Ok(child) = std::env::var(CHILD) {
+        assert_eq!(child, test, "the qualification child ran the wrong case");
+        return false;
+    }
+    let home = tempfile::tempdir().expect("child home");
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD, test)
+        .env("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "claude")
+        .env("HOME", home.path())
+        .output()
+        .expect("run the qualification child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "the qualification child failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+/// A supervisor launching fresh souls the way the production controller
+/// does: the descriptor echoes the create's own launch session id.
+#[cfg(feature = "provider-qualification")]
+struct FreshLaunchSupervisor;
+
+#[cfg(feature = "provider-qualification")]
+impl ManagedTerminalController for FreshLaunchSupervisor {
+    fn lookup_terminal<'a>(
+        &'a self,
+        _terminal_id: &'a str,
+        _create_request_id: Option<String>,
+    ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn launch<'a>(
+        &'a self,
+        request: ManagedTerminalLaunch,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, ManagedTerminalLaunchError>>
+    {
+        Box::pin(async move {
+            Ok(ManagedTerminalDescriptor {
+                soul_id: format!("soul-{}", request.terminal_id),
+                incarnation_id: format!("incarnation-{}", request.terminal_id),
+                terminal_id: request.terminal_id,
+                stream_id: request.stream_id,
+                mode: request.mode,
+                cwd: request.spec.cwd.unwrap_or_else(|| "/workspace".into()),
+                resume_session_id: request.resume_session_id,
+                create_request_id: request.create_request_id,
+            })
+        })
+    }
+
+    fn input<'a>(
+        &'a self,
+        _terminal: ManagedTerminalDescriptor,
+        _data: String,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn resize<'a>(
+        &'a self,
+        _terminal: ManagedTerminalDescriptor,
+        _cols: u16,
+        _rows: u16,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn stop<'a>(
+        &'a self,
+        _terminal: ManagedTerminalDescriptor,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_output<'a>(
+        &'a self,
+        _terminal: ManagedTerminalDescriptor,
+        _after_seq: i64,
+        _max_bytes: u64,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+        Box::pin(async { Err("no output in the naming test".into()) })
+    }
+}
+
+/// A negotiated, handle-less FRESH managed Claude create: the server
+/// preallocates a `--session-id` and the supervisor echoes it in the
+/// descriptor. That id is prospective (no transcript, no record), so the row
+/// binds to a server-minted PENDING handle — the only binding the verified
+/// bind lane can transfer at materialization — never to the bare session.
+#[cfg(feature = "provider-qualification")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_managed_claude_create_binds_a_pending_handle_not_its_preallocated_id() {
+    if run_with_claude_qualification(
+        "fresh_managed_claude_create_binds_a_pending_handle_not_its_preallocated_id",
+    ) {
+        return;
+    }
+    let soul_dir = tempfile::tempdir().expect("soul folder");
+    let (url, registry, _sink) =
+        common::spawn_server_with_specs_and_naming(vec![common::sleeper_cli_spec("claude")]).await;
+    registry.set_managed_controller(Some(Arc::new(FreshLaunchSupervisor)));
+    let mut ws = connect(&url, serde_json::json!({ "managedRuntimeV1": true })).await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-fresh-managed-claude",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": soul_dir.path().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+    let created = common::next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminal.created carries terminalId")
+        .to_string();
+
+    assert!(
+        registry.is_managed(&terminal_id),
+        "the create must take the managed door"
+    );
+    let preallocated = registry
+        .managed_descriptor(&terminal_id)
+        .and_then(|descriptor| descriptor.resume_session_id)
+        .expect("a fresh claude create preallocates its --session-id");
+    let bound = registry
+        .name_ref_of(&terminal_id)
+        .expect("the row is bound before the created frame");
+    assert!(
+        matches!(bound, SessionNameRef::Pending { .. }),
+        "the row must bind a pending handle, not the prospective session {preallocated}: {bound:?}"
+    );
+    assert_eq!(
+        created["nameRef"]["kind"],
+        serde_json::json!("pending"),
+        "the created frame projects the pending binding: {created}"
+    );
 }

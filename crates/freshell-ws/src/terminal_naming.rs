@@ -17,6 +17,7 @@ use freshell_freshagent::naming::SessionNaming;
 use freshell_freshagent::terminal_name_binding::{
     bind_terminal_naming_from_identity, follow_identity_name_ref, reconcile_terminal_names,
     NamingBindHint, NamingBindOutcome, TerminalNameBinder, TerminalNamesReconcile,
+    TerminalNamesTick,
 };
 use freshell_protocol::session_names::SessionNameRef;
 
@@ -123,6 +124,17 @@ pub(crate) async fn bind_adopted_managed_row(
     bind_ws_terminal_naming(state, &descriptor.terminal_id, hint).await
 }
 
+/// A terminal's naming handle while its binding is STILL that pending
+/// handle (not yet transferred onto a durable session). A transferred
+/// handle is spent — it resolves to the old session's record — so it is
+/// never answered. Retired identities still answer (a crashed row's).
+pub(crate) fn still_pending_handle(state: &WsState, terminal_id: &str) -> Option<String> {
+    match state.identity.name_ref_for(terminal_id) {
+        Some(SessionNameRef::Pending { id }) => Some(id),
+        _ => None,
+    }
+}
+
 /// The reconcile pre-pass's managed adoption: reconstruct the supervisor's
 /// facade for `terminal_id` (titled by its mode, never "Shell") and bind its
 /// saved name. Answers whether a managed row now exists for the id.
@@ -166,23 +178,28 @@ pub async fn follow_identity_switch(state: &WsState, terminal_id: &str) {
 }
 
 /// One reconcile pass over every terminal row (the tick's body; `pub` so
-/// tests drive it deterministically).
-pub async fn reconcile_terminal_naming(state: &WsState) -> TerminalNamesReconcile {
+/// tests drive it deterministically). `tick` is the memory the passes share
+/// (the empty-answer back-off).
+pub async fn reconcile_terminal_naming(
+    state: &WsState,
+    tick: &TerminalNamesTick,
+) -> TerminalNamesReconcile {
     let (sink, binder) = door(state);
     let cli_commands = Arc::clone(&state.cli_commands);
     let label = move |mode: &str| mode_title(&cli_commands, mode);
-    reconcile_terminal_names(sink.as_ref(), &state.registry, &binder, &label).await
+    reconcile_terminal_names(sink.as_ref(), &state.registry, &binder, &label, tick).await
 }
 
 /// Spawned once by `freshell-server` boot: the 2 s terminal-naming reconcile
 /// tick (moved bindings, unbound scoped rows, empty name caches).
 pub fn spawn_terminal_naming_reconcile(state: WsState) {
     tokio::spawn(async move {
+        let memory = TerminalNamesTick::default();
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let report = reconcile_terminal_naming(&state).await;
+            let report = reconcile_terminal_naming(&state, &memory).await;
             if report != TerminalNamesReconcile::default() {
                 tracing::info!(
                     target: "freshell_ws::naming",

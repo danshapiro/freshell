@@ -17,10 +17,12 @@ use freshell_protocol::session_names::{
 };
 use freshell_terminal::registry::{HeadlessTerminal, ManagedTerminalDescriptor};
 use freshell_terminal::TerminalRegistry;
+use tokio::sync::Notify;
 
 use super::{
-    bind_terminal_naming_from_identity, reconcile_terminal_names, NameBinding, NamingBindHint,
-    NamingBindOutcome, TerminalNameBinder,
+    bind_terminal_naming_from_identity, follow_identity_name_ref, managed_reused_session,
+    reconcile_terminal_names, NameBinding, NamingBindHint, NamingBindOutcome, TerminalNameBinder,
+    TerminalNamesTick,
 };
 use crate::naming::test_support::{verified_claude_acquisition, RecordingSink};
 use crate::naming::{
@@ -31,7 +33,10 @@ use crate::naming::{
 // ── fakes ────────────────────────────────────────────────────────────────
 
 /// The recording sink with injectable store failures: each queued error is
-/// answered by one call; `fail_*` makes every call fail until cleared.
+/// answered by one call; `fail_*` makes every call fail until cleared. A
+/// [`ReadGate`] holds one read's ANSWER in flight, so a test can interleave
+/// a newer binding move (or a publisher write) between the store's answer and
+/// the caller acting on it.
 struct FaultySink {
     inner: Arc<RecordingSink>,
     get_failures: Mutex<VecDeque<NameError>>,
@@ -39,6 +44,17 @@ struct FaultySink {
     fail_ensures: AtomicBool,
     gets: AtomicUsize,
     ensures: AtomicUsize,
+    gate: Mutex<Option<ReadGate>>,
+    ensure_gate: Mutex<Option<ReadGate>>,
+}
+
+/// The first read that asks for `target` is answered by the store at once,
+/// then held: `entered` fires, and the answer is returned only after
+/// `release` fires.
+struct ReadGate {
+    target: SessionNameRef,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 impl FaultySink {
@@ -50,7 +66,37 @@ impl FaultySink {
             fail_ensures: AtomicBool::new(false),
             gets: AtomicUsize::new(0),
             ensures: AtomicUsize::new(0),
+            gate: Mutex::new(None),
+            ensure_gate: Mutex::new(None),
         })
+    }
+
+    /// Hold the next `ensure_pending` of `handle` the same way (its answer is
+    /// computed at once, then held until `release`).
+    fn hold_next_ensure_of(&self, handle: &str) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self.ensure_gate.lock().unwrap() = Some(ReadGate {
+            target: SessionNameRef::Pending {
+                id: handle.to_string(),
+            },
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
+    /// Hold the next read of `target` (see [`ReadGate`]); answers the
+    /// `(entered, release)` pair.
+    fn hold_next_read_of(&self, target: &SessionNameRef) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self.gate.lock().unwrap() = Some(ReadGate {
+            target: target.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
     }
 }
 
@@ -63,7 +109,27 @@ impl SessionNaming for FaultySink {
         if let Some(error) = self.get_failures.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(error) });
         }
-        self.inner.get(refs)
+        let gate = {
+            let mut gate = self.gate.lock().unwrap();
+            if gate
+                .as_ref()
+                .is_some_and(|gate| refs.contains(&gate.target))
+            {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        let answer = self.inner.get(refs);
+        match gate {
+            Some(gate) => Box::pin(async move {
+                let answer = answer.await;
+                gate.entered.notify_one();
+                gate.release.notified().await;
+                answer
+            }),
+            None => answer,
+        }
     }
 
     fn ensure_pending(&self, input: PendingNameInput) -> NameFuture<SessionNameUpdate> {
@@ -71,7 +137,27 @@ impl SessionNaming for FaultySink {
         if self.fail_ensures.load(Ordering::SeqCst) {
             return Box::pin(async { Err(NameError::LockUnavailable("lock busy".into())) });
         }
-        self.inner.ensure_pending(input)
+        let pending = SessionNameRef::Pending {
+            id: input.handle.clone(),
+        };
+        let gate = {
+            let mut gate = self.ensure_gate.lock().unwrap();
+            if gate.as_ref().is_some_and(|gate| gate.target == pending) {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        let answer = self.inner.ensure_pending(input);
+        match gate {
+            Some(gate) => Box::pin(async move {
+                let answer = answer.await;
+                gate.entered.notify_one();
+                gate.release.notified().await;
+                answer
+            }),
+            None => answer,
+        }
     }
 
     fn bind_pending(&self, input: BindNameInput) -> NameFuture<SessionNameUpdate> {
@@ -313,7 +399,14 @@ async fn resume_create_read_failure_never_falls_into_the_fresh_pending_path() {
 
     // The store recovers; the tick's empty-cache pass fills the row.
     sink.fail_gets.store(false, Ordering::SeqCst);
-    reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label).await;
+    reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &label,
+        &TerminalNamesTick::default(),
+    )
+    .await;
     assert_eq!(
         registry.session_name_of("T-unreadable").map(|r| r.name),
         Some("LotL".to_string())
@@ -363,7 +456,14 @@ async fn ensure_pending_failure_keeps_a_pending_binding_for_the_tick() {
     assert_eq!(registry.title_of("T-fresh").as_deref(), Some("codex-label"));
 
     sink.fail_ensures.store(false, Ordering::SeqCst);
-    reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label).await;
+    reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &label,
+        &TerminalNamesTick::default(),
+    )
+    .await;
     let record = registry
         .session_name_of("T-fresh")
         .expect("the tick created and cached the pending record");
@@ -483,7 +583,14 @@ async fn tick_binds_a_scoped_row_with_no_ref() {
         .unwrap()
         .insert("T-known".into(), ("codex".into(), "thread-known".into()));
 
-    reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label).await;
+    reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &label,
+        &TerminalNamesTick::default(),
+    )
+    .await;
 
     let (orphan_ref, orphan_handle) = binder
         .binding("T-orphan")
@@ -515,8 +622,14 @@ async fn tick_leaves_a_just_created_row_to_its_create_path() {
     headless_row_created_at(&registry, "T-creating", "claude", None);
     let binder = FakeBinder::default();
 
-    let report =
-        reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label).await;
+    let report = reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &label,
+        &TerminalNamesTick::default(),
+    )
+    .await;
 
     assert_eq!(report.bound, 0);
     assert!(registry.name_ref_of("T-creating").is_none());
@@ -541,7 +654,14 @@ async fn tick_reconciles_bound_rows_with_empty_cache() {
     registry.set_naming("T-bound", Some(durable.clone()), None);
     assert!(registry.session_name_of("T-bound").is_none());
 
-    reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label).await;
+    reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &label,
+        &TerminalNamesTick::default(),
+    )
+    .await;
 
     assert_eq!(
         registry.session_name_of("T-bound").map(|r| r.name),
@@ -571,7 +691,14 @@ async fn tick_moves_a_row_whose_identity_ref_moved() {
         binder.set_name_binding(terminal_id, moved_to, None);
     }
 
-    reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label).await;
+    reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &label,
+        &TerminalNamesTick::default(),
+    )
+    .await;
 
     assert_eq!(registry.name_ref_of("T-a"), Some(new_named));
     assert_eq!(registry.title_of("T-a").as_deref(), Some("Billing bug"));
@@ -583,4 +710,456 @@ async fn tick_moves_a_row_whose_identity_ref_moved() {
         kept[0].record.name, "LotL",
         "the old session keeps its name"
     );
+}
+
+// ── a read that a newer move superseded ──────────────────────────────────
+
+/// A claude row bound (in both homes) to `bound_to`, with `cached` on it.
+fn bound_row(
+    registry: &TerminalRegistry,
+    binder: &FakeBinder,
+    terminal_id: &str,
+    bound_to: &SessionNameRef,
+    cached: Option<&SessionNameRecord>,
+) {
+    headless_row(registry, terminal_id, "claude");
+    registry.set_naming(terminal_id, Some(bound_to.clone()), None);
+    binder.set_name_binding(terminal_id, bound_to, None);
+    if let Some(record) = cached {
+        registry.update_session_name(terminal_id, record);
+    }
+}
+
+/// Two quick switches A→B→C: B's read answers after C's follow finished.
+/// The row stays bound to C and keeps C's record — B's late answer is
+/// dropped instead of caching B's name on a row bound to C.
+#[tokio::test(start_paused = true)]
+async fn a_superseded_switch_read_never_overwrites_the_newer_binding() {
+    let sink = FaultySink::new();
+    let a = session(NamedProvider::Claude, "s-a");
+    let b = session(NamedProvider::Claude, "s-b");
+    let c = session(NamedProvider::Claude, "s-c");
+    let a_record = seed(sink.as_ref(), &a, "LotL").await;
+    seed(sink.as_ref(), &b, "Billing bug").await;
+    seed(sink.as_ref(), &c, "Cache layer").await;
+    let registry = TerminalRegistry::new();
+    let binder = FakeBinder::default();
+    bound_row(&registry, &binder, "T-switch", &a, Some(&a_record));
+    binder.set_name_binding("T-switch", &b, None);
+    let (entered, release) = sink.hold_next_read_of(&b);
+    let naming = dyn_sink(&sink);
+
+    let follow_b = follow_identity_name_ref(
+        naming.as_ref(),
+        &registry,
+        &binder,
+        "T-switch",
+        "claude-label",
+    );
+    let switch_to_c = async {
+        entered.notified().await; // B's answer is in flight
+        binder.set_name_binding("T-switch", &c, None);
+        let outcome = follow_identity_name_ref(
+            naming.as_ref(),
+            &registry,
+            &binder,
+            "T-switch",
+            "claude-label",
+        )
+        .await;
+        release.notify_one();
+        outcome
+    };
+    let (b_outcome, c_outcome) = tokio::join!(follow_b, switch_to_c);
+
+    assert!(
+        matches!(c_outcome, Some(NamingBindOutcome::Bound { .. })),
+        "{c_outcome:?}"
+    );
+    assert!(
+        matches!(b_outcome, Some(NamingBindOutcome::Superseded { .. })),
+        "the late answer reports that a newer move owns the row: {b_outcome:?}"
+    );
+    assert_eq!(registry.name_ref_of("T-switch"), Some(c.clone()));
+    assert_eq!(
+        registry.session_name_of("T-switch").map(|r| r.name),
+        Some("Cache layer".to_string()),
+        "the row bound to C must never cache B's record"
+    );
+    assert_eq!(
+        registry.title_of("T-switch").as_deref(),
+        Some("Cache layer")
+    );
+}
+
+/// A resume create's read of its durable session answers after a
+/// conversation switch moved the row on: the create drops that answer and
+/// projects nothing, leaving the switch's record on the row.
+#[tokio::test(start_paused = true)]
+async fn a_create_read_superseded_by_a_switch_drops_its_record() {
+    let sink = FaultySink::new();
+    let b = session(NamedProvider::Claude, "s-b");
+    let c = session(NamedProvider::Claude, "s-c");
+    seed(sink.as_ref(), &b, "Billing bug").await;
+    seed(sink.as_ref(), &c, "Cache layer").await;
+    let registry = TerminalRegistry::new();
+    headless_row(&registry, "T-create", "claude");
+    let binder = FakeBinder::default();
+    let (entered, release) = sink.hold_next_read_of(&b);
+    let naming = dyn_sink(&sink);
+
+    let create = bind_terminal_naming_from_identity(
+        naming.as_ref(),
+        &registry,
+        &binder,
+        "T-create",
+        hint("claude", Some("s-b"), None),
+    );
+    let switch_to_c = async {
+        entered.notified().await;
+        binder.set_name_binding("T-create", &c, None);
+        follow_identity_name_ref(
+            naming.as_ref(),
+            &registry,
+            &binder,
+            "T-create",
+            "claude-label",
+        )
+        .await;
+        release.notify_one();
+    };
+    let (created, ()) = tokio::join!(create, switch_to_c);
+
+    assert!(
+        matches!(created, NamingBindOutcome::Superseded { .. }),
+        "{created:?}"
+    );
+    assert_eq!(
+        created.projection(),
+        None,
+        "the created frame projects nothing stale"
+    );
+    assert_eq!(registry.name_ref_of("T-create"), Some(c.clone()));
+    assert_eq!(binder.name_ref_of("T-create"), Some(c));
+    assert_eq!(
+        registry.session_name_of("T-create").map(|r| r.name),
+        Some("Cache layer".to_string())
+    );
+    assert_eq!(
+        registry.title_of("T-create").as_deref(),
+        Some("Cache layer")
+    );
+}
+
+/// A recovery create against a record-less durable session falls back to its
+/// persisted pending handle; a conversation switch that lands while that
+/// handle's admission is in flight keeps the row — the late admission never
+/// re-binds it to the pending handle.
+#[tokio::test(start_paused = true)]
+async fn a_pending_fallback_superseded_by_a_switch_never_rebinds_the_row() {
+    let sink = FaultySink::new();
+    let c = session(NamedProvider::Claude, "s-c");
+    seed(sink.as_ref(), &c, "Cache layer").await;
+    let registry = TerminalRegistry::new();
+    headless_row(&registry, "T-fallback", "claude");
+    let binder = FakeBinder::default();
+    let (entered, release) = sink.hold_next_ensure_of("nh-persisted");
+    let naming = dyn_sink(&sink);
+
+    let create = bind_terminal_naming_from_identity(
+        naming.as_ref(),
+        &registry,
+        &binder,
+        "T-fallback",
+        hint("claude", Some("s-prospective"), Some("nh-persisted")),
+    );
+    // The switch's identity upsert lands during the admission; its
+    // follow-up runs only after the admission answered.
+    let switch_to_c = async {
+        entered.notified().await;
+        binder.set_name_binding("T-fallback", &c, None);
+        release.notify_one();
+    };
+    let (created, ()) = tokio::join!(create, switch_to_c);
+    follow_identity_name_ref(
+        naming.as_ref(),
+        &registry,
+        &binder,
+        "T-fallback",
+        "claude-label",
+    )
+    .await;
+
+    assert_eq!(registry.name_ref_of("T-fallback"), Some(c.clone()));
+    assert_eq!(binder.name_ref_of("T-fallback"), Some(c));
+    assert_eq!(
+        registry.session_name_of("T-fallback").map(|r| r.name),
+        Some("Cache layer".to_string())
+    );
+    assert!(
+        matches!(created, NamingBindOutcome::Superseded { .. }),
+        "{created:?}"
+    );
+}
+
+/// A switch onto a session whose read answered "no record" keeps the record
+/// the naming publisher wrote onto the row meanwhile (the session was named
+/// between the store's answer and the follow acting on it) — only the OLD
+/// session's cached name is dropped.
+#[tokio::test(start_paused = true)]
+async fn a_switch_to_a_bare_session_keeps_a_record_the_publisher_just_wrote() {
+    let sink = FaultySink::new();
+    let a = session(NamedProvider::Claude, "s-a");
+    let c = session(NamedProvider::Claude, "s-c");
+    let a_record = seed(sink.as_ref(), &a, "LotL").await;
+    let registry = TerminalRegistry::new();
+    let binder = FakeBinder::default();
+    bound_row(&registry, &binder, "T-named", &a, Some(&a_record));
+    binder.set_name_binding("T-named", &c, None);
+    let (entered, release) = sink.hold_next_read_of(&c);
+    let naming = dyn_sink(&sink);
+
+    let follow_c = follow_identity_name_ref(
+        naming.as_ref(),
+        &registry,
+        &binder,
+        "T-named",
+        "claude-label",
+    );
+    let publisher_names_c = async {
+        entered.notified().await; // the read already answered "no record"
+        let named = seed(sink.as_ref(), &c, "Fresh title").await;
+        for terminal_id in registry.terminals_bound_to(&c) {
+            registry.update_session_name(&terminal_id, &named);
+        }
+        release.notify_one();
+    };
+    tokio::join!(follow_c, publisher_names_c);
+
+    assert_eq!(registry.name_ref_of("T-named"), Some(c));
+    assert_eq!(
+        registry.session_name_of("T-named").map(|r| r.name),
+        Some("Fresh title".to_string()),
+        "the publisher's record for the new session survives the follow"
+    );
+    assert_eq!(registry.title_of("T-named").as_deref(), Some("Fresh title"));
+}
+
+/// The tick's batched cache fill drops an answer for a row whose binding
+/// moved while the read was in flight.
+#[tokio::test(start_paused = true)]
+async fn tick_fill_drops_an_answer_for_a_row_that_moved() {
+    let sink = FaultySink::new();
+    let b = session(NamedProvider::Claude, "s-b");
+    let c = session(NamedProvider::Claude, "s-c");
+    seed(sink.as_ref(), &b, "Billing bug").await;
+    seed(sink.as_ref(), &c, "Cache layer").await;
+    let registry = TerminalRegistry::new();
+    let binder = FakeBinder::default();
+    bound_row(&registry, &binder, "T-fill", &b, None);
+    let (entered, release) = sink.hold_next_read_of(&b);
+    let naming = dyn_sink(&sink);
+    let tick = TerminalNamesTick::default();
+
+    let fill = reconcile_terminal_names(naming.as_ref(), &registry, &binder, &label, &tick);
+    let switch_to_c = async {
+        entered.notified().await;
+        binder.set_name_binding("T-fill", &c, None);
+        follow_identity_name_ref(
+            naming.as_ref(),
+            &registry,
+            &binder,
+            "T-fill",
+            "claude-label",
+        )
+        .await;
+        release.notify_one();
+    };
+    let (report, ()) = tokio::join!(fill, switch_to_c);
+
+    assert_eq!(report.filled, 0, "the stale answer fills nothing");
+    assert_eq!(registry.name_ref_of("T-fill"), Some(c));
+    assert_eq!(
+        registry.session_name_of("T-fill").map(|r| r.name),
+        Some("Cache layer".to_string())
+    );
+}
+
+// ── the tick's cost bounds ───────────────────────────────────────────────
+
+/// An exited row is never re-read for its empty cache: its process is gone,
+/// and only the publisher (on a record commit) refreshes it from here on.
+#[tokio::test(start_paused = true)]
+async fn tick_never_reads_for_an_exited_rows_empty_cache() {
+    let sink = FaultySink::new();
+    let durable = session(NamedProvider::Opencode, "ses_exited");
+    seed(sink.as_ref(), &durable, "Finished").await;
+    let registry = TerminalRegistry::new();
+    registry.register_managed(
+        ManagedTerminalDescriptor {
+            soul_id: "soul-exited".into(),
+            incarnation_id: "incarnation-exited".into(),
+            terminal_id: "T-exited".into(),
+            stream_id: "S-exited".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_exited".into()),
+            create_request_id: Some("req-exited".into()),
+        },
+        "OpenCode".to_string(),
+    );
+    registry.finish_managed_exit("T-exited", 0);
+    let binder = FakeBinder::default();
+    registry.set_naming("T-exited", Some(durable.clone()), None);
+    binder.set_name_binding("T-exited", &durable, None);
+    let gets_before = sink.gets.load(Ordering::SeqCst);
+    let tick = TerminalNamesTick::default();
+
+    for _ in 0..3 {
+        reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label, &tick).await;
+    }
+
+    assert_eq!(sink.gets.load(Ordering::SeqCst), gets_before);
+    assert!(registry.session_name_of("T-exited").is_none());
+}
+
+/// A live row bound to a durable session that has no record yet is read on
+/// a back-off (passes 1, 3, 7, … — doubling, capped), not on every 2 s pass:
+/// the naming publisher fills the row the moment the session is named, so
+/// the tick only backstops a missed push. A due re-check still fills it.
+#[tokio::test(start_paused = true)]
+async fn tick_backs_off_a_bound_session_that_has_no_record() {
+    let sink = FaultySink::new();
+    let bare = session(NamedProvider::Claude, "s-bare");
+    let registry = TerminalRegistry::new();
+    let binder = FakeBinder::default();
+    bound_row(&registry, &binder, "T-bare", &bare, None);
+    let tick = TerminalNamesTick::default();
+    let mut reads_per_pass = Vec::new();
+
+    for _ in 0..7 {
+        let before = sink.gets.load(Ordering::SeqCst);
+        reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label, &tick).await;
+        reads_per_pass.push(sink.gets.load(Ordering::SeqCst) - before);
+    }
+    assert_eq!(reads_per_pass, vec![1, 0, 1, 0, 0, 0, 1]);
+
+    // The session is named but the push never reached the row: the next
+    // due re-check (8 passes after the third miss) fills it.
+    seed(sink.as_ref(), &bare, "Named later").await;
+    let mut filled_on = None;
+    for pass in 8..=15 {
+        let report =
+            reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label, &tick)
+                .await;
+        if report.filled == 1 {
+            filled_on = Some(pass);
+            break;
+        }
+    }
+    assert_eq!(filled_on, Some(15));
+    assert_eq!(registry.title_of("T-bare").as_deref(), Some("Named later"));
+}
+
+/// A row rebound to another session leaves the back-off of its old binding
+/// behind: the new binding is read on the very next pass.
+#[tokio::test(start_paused = true)]
+async fn tick_back_off_resets_when_the_binding_moves() {
+    let sink = FaultySink::new();
+    let first = session(NamedProvider::Claude, "s-first");
+    let second = session(NamedProvider::Claude, "s-second");
+    let registry = TerminalRegistry::new();
+    let binder = FakeBinder::default();
+    bound_row(&registry, &binder, "T-rebound", &first, None);
+    let tick = TerminalNamesTick::default();
+    reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label, &tick).await;
+
+    registry.set_naming("T-rebound", Some(second.clone()), None);
+    binder.set_name_binding("T-rebound", &second, None);
+    let before = sink.gets.load(Ordering::SeqCst);
+    reconcile_terminal_names(dyn_sink(&sink).as_ref(), &registry, &binder, &label, &tick).await;
+
+    assert_eq!(sink.gets.load(Ordering::SeqCst) - before, 1);
+}
+
+/// The tick binds an unbound row whose door-known session has NO record
+/// through a pending handle — never to the bare session. The door's session
+/// may be a fresh create's preallocated (prospective) id; only a pending
+/// binding lets the verified bind lanes transfer the name at
+/// materialization.
+#[tokio::test(start_paused = true)]
+async fn tick_binds_a_record_less_door_session_through_a_pending_handle() {
+    let sink = FaultySink::new();
+    let registry = TerminalRegistry::new();
+    headless_row(&registry, "T-prealloc", "claude");
+    let binder = FakeBinder::default();
+    binder
+        .durable
+        .lock()
+        .unwrap()
+        .insert("T-prealloc".into(), ("claude".into(), "s-prealloc".into()));
+
+    reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &label,
+        &TerminalNamesTick::default(),
+    )
+    .await;
+
+    let (bound, handle) = binder
+        .binding("T-prealloc")
+        .expect("the tick binds the row");
+    let handle = handle.expect("a pending binding retains its handle");
+    assert_eq!(bound, SessionNameRef::Pending { id: handle });
+    assert_eq!(registry.name_ref_of("T-prealloc"), Some(bound));
+    assert_eq!(
+        sink.ensures.load(Ordering::SeqCst),
+        1,
+        "the pending record was admitted"
+    );
+    assert!(registry.session_name_of("T-prealloc").is_some());
+}
+
+// ── the managed descriptor's session ─────────────────────────────────────
+
+/// The supervisor echoes a create's own launch session id into the managed
+/// descriptor. A fresh Claude create's server-preallocated `--session-id` is
+/// prospective, so it never counts as an established durable session; any
+/// other descriptor session (an existing soul's, reused by a retried create)
+/// does.
+#[test]
+fn a_managed_descriptor_names_a_durable_session_only_when_it_is_not_the_creates_own_preallocation()
+{
+    let registry = TerminalRegistry::new();
+    registry.register_managed(
+        ManagedTerminalDescriptor {
+            soul_id: "soul-T-managed".into(),
+            incarnation_id: "incarnation-T-managed".into(),
+            terminal_id: "T-managed".into(),
+            stream_id: "S-T-managed".into(),
+            mode: "claude".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("s-echoed".into()),
+            create_request_id: Some("req-T-managed".into()),
+        },
+        "Claude CLI".to_string(),
+    );
+
+    assert_eq!(
+        managed_reused_session(&registry, "T-managed", Some("s-echoed")),
+        None,
+        "this create's own preallocation is prospective"
+    );
+    assert_eq!(
+        managed_reused_session(&registry, "T-managed", Some("s-this-create")),
+        Some("s-echoed".to_string()),
+        "a reused soul's session differs from this create's preallocation"
+    );
+    assert_eq!(
+        managed_reused_session(&registry, "T-managed", None),
+        Some("s-echoed".to_string())
+    );
+    assert_eq!(managed_reused_session(&registry, "T-unknown", None), None);
 }

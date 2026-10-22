@@ -26,7 +26,10 @@ import { resolvePaneNameRef } from '../../../../src/store/selectors/sessionNameS
 // a naming ref for the superseded session) belonged to the OLD conversation
 // — the server bound that handle to it — so the pane's name must resolve
 // through the new session from then on, never back to the old session's
-// saved name.
+// saved name. A handle is released only once the server SPENT it (the
+// client's name cache holds its pending→durable redirect): a still-pending
+// handle (a zero-turn switch, before any transfer) stays, because the server
+// keeps the row on it and transfers it onto the NEW session.
 
 function emptyState(): PanesState {
   return {
@@ -75,6 +78,7 @@ describe('conversation switch moves the pane naming identity', () => {
       terminalId: 'term-1',
       sessionRef: { provider: 'claude', sessionId: 'session-b' },
       previousSessionId: 'session-a',
+      spentNamingHandles: ['nh-bound-to-a'],
     }))
 
     expect(content(next).sessionRef).toEqual({ provider: 'claude', sessionId: 'session-b' })
@@ -100,6 +104,24 @@ describe('conversation switch moves the pane naming identity', () => {
     expect(resolvePaneNameRef(content(next))).toEqual({
       kind: 'session', provider: 'claude', sessionId: 'session-b',
     })
+  })
+
+  it('a zero-turn switch keeps the still-pending handle (the server transfers it onto the new session)', () => {
+    const state = stateWithTerminalPane({
+      sessionRef: { provider: 'claude', sessionId: 'session-a' },
+      namingHandle: 'nh-never-transferred',
+      nameRef: { kind: 'pending', id: 'nh-never-transferred' },
+    })
+
+    const next = panesReducer(state, reconcileTerminalSessionRefByTerminalId({
+      terminalId: 'term-1',
+      sessionRef: { provider: 'claude', sessionId: 'session-b' },
+      previousSessionId: 'session-a',
+    }))
+
+    expect(content(next).sessionRef).toEqual({ provider: 'claude', sessionId: 'session-b' })
+    expect(content(next).namingHandle).toBe('nh-never-transferred')
+    expect(resolvePaneNameRef(content(next))).toEqual({ kind: 'pending', id: 'nh-never-transferred' })
   })
 
   it('a first association keeps the pending handle (it binds to that first session)', () => {

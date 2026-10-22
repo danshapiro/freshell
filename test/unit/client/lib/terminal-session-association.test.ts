@@ -13,6 +13,7 @@ import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { updateTab } from '@/store/tabsSlice'
 import sessionActivityReducer, { updateSessionActivity } from '@/store/sessionActivitySlice'
+import { sessionNameRefKey } from '@shared/session-names'
 
 function createState(content: Record<string, unknown>, tabOverrides: Record<string, unknown> = {}) {
   return {
@@ -497,6 +498,73 @@ describe('canonical activity fold on accepted rebind (previousSessionId)', () =>
     expect(result).toBe('reconciled')
     expect(harness.state.sessionActivity.sessions['codex:child-1']).toBeUndefined()
     expect(harness.state.sessionActivity.sessions['codex:parent-1']).toBe(1111)
+  })
+})
+
+describe('name reliability (Task 10): a rebind names the handles the server already spent', () => {
+  function stateWithPendingPane(redirects: Record<string, { toKey: string; revision: number }>) {
+    return {
+      ...createState({
+        kind: 'terminal',
+        terminalId: 't-claude',
+        createRequestId: 'req-1',
+        status: 'running',
+        mode: 'claude',
+        shell: 'system',
+        sessionRef: { provider: 'claude', sessionId: 'session-a' },
+        namingHandle: 'nh-pane',
+        nameRef: { kind: 'pending', id: 'nh-pane' },
+      }),
+      sessionNames: { records: {}, redirects, nativeSync: {} },
+    } as any
+  }
+
+  it('a handle the server transferred (its redirect is cached) rides the rebind as spent', () => {
+    const dispatch = vi.fn()
+    const state = stateWithPendingPane({
+      [sessionNameRefKey({ kind: 'pending', id: 'nh-pane' })]: {
+        toKey: sessionNameRefKey({ kind: 'session', provider: 'claude', sessionId: 'session-a' }),
+        revision: 3,
+      },
+    })
+
+    const result = reconcileTerminalSessionAssociation({
+      dispatch,
+      getState: () => state,
+      terminalId: 't-claude',
+      sessionRef: { provider: 'claude', sessionId: 'session-b' },
+      previousSessionId: 'session-a',
+    })
+
+    expect(result).toBe('reconciled')
+    expect(dispatch).toHaveBeenCalledWith(
+      reconcileTerminalSessionRefByTerminalId({
+        terminalId: 't-claude',
+        sessionRef: { provider: 'claude', sessionId: 'session-b' },
+        previousSessionId: 'session-a',
+        spentNamingHandles: ['nh-pane'],
+      }),
+    )
+  })
+
+  it('a still-pending handle (no redirect: a zero-turn switch) is not reported spent', () => {
+    const dispatch = vi.fn()
+
+    reconcileTerminalSessionAssociation({
+      dispatch,
+      getState: () => stateWithPendingPane({}),
+      terminalId: 't-claude',
+      sessionRef: { provider: 'claude', sessionId: 'session-b' },
+      previousSessionId: 'session-a',
+    })
+
+    expect(dispatch).toHaveBeenCalledWith(
+      reconcileTerminalSessionRefByTerminalId({
+        terminalId: 't-claude',
+        sessionRef: { provider: 'claude', sessionId: 'session-b' },
+        previousSessionId: 'session-a',
+      }),
+    )
   })
 })
 

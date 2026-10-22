@@ -246,7 +246,7 @@ fn assert_bound_to(state: &crate::WsState, terminal_id: &str, target: &SessionNa
     assert_eq!(
         state.registry.name_ref_of(terminal_id).as_ref(),
         Some(target),
-        "the registry row is bound to the durable session"
+        "the registry row carries the expected binding"
     );
     assert_eq!(
         state.identity.name_ref_for(terminal_id).as_ref(),
@@ -375,49 +375,249 @@ async fn compat_adoption_binds_naming() {
     assert_eq!(created.name_ref, Some(opencode("ses_compat_named")));
 }
 
+// ── create admission ─────────────────────────────────────────────────────
+
+fn claude_create(request_id: &str) -> freshell_protocol::TerminalCreate {
+    serde_json::from_value(serde_json::json!({
+        "requestId": request_id,
+        "mode": "claude",
+        "shell": "system",
+    }))
+    .expect("terminal create")
+}
+
+fn managed_claude_row(state: &crate::WsState, terminal_id: &str, descriptor_session: &str) {
+    let mut descriptor = soul(
+        terminal_id,
+        &format!("crid-{terminal_id}"),
+        descriptor_session,
+    );
+    descriptor.mode = "claude".into();
+    state
+        .registry
+        .register_managed(descriptor, "Claude CLI".to_string());
+}
+
+/// A handle-less fresh managed Claude create: the supervisor echoed the
+/// create's own server-preallocated `--session-id` into the descriptor. That
+/// id is prospective, so the admission binds a server-minted PENDING handle
+/// (the only binding the verified bind lane can transfer at
+/// materialization) — never the bare, record-less session.
+#[tokio::test]
+async fn fresh_managed_create_never_binds_its_own_preallocated_session() {
+    let (state, sink) = named_state(Vec::new());
+    managed_claude_row(&state, "T-fresh-claude", "s-prealloc");
+
+    let projection = super::admit_create_naming(
+        &state,
+        &claude_create("crid-T-fresh-claude"),
+        "T-fresh-claude",
+        "claude",
+        Some("/workspace"),
+        None,
+        "Claude CLI".to_string(),
+        Some("s-prealloc"),
+    )
+    .await;
+
+    let bound = state
+        .registry
+        .name_ref_of("T-fresh-claude")
+        .expect("the row is bound");
+    assert!(
+        matches!(bound, SessionNameRef::Pending { .. }),
+        "a prospective session never binds as durable: {bound:?}"
+    );
+    assert_eq!(
+        state.identity.name_ref_for("T-fresh-claude"),
+        Some(bound.clone())
+    );
+    assert_eq!(
+        sink.ensures.lock().unwrap().len(),
+        1,
+        "the pending record was admitted"
+    );
+    assert_eq!(projection.map(|(name_ref, _)| name_ref), Some(bound));
+}
+
+/// A managed create the supervisor answered with an EXISTING soul (its
+/// native session differs from this create's own preallocation) binds that
+/// soul's durable session and its saved name.
+#[tokio::test]
+async fn managed_create_reusing_a_soul_binds_the_souls_saved_name() {
+    let (state, sink) = named_state(Vec::new());
+    sink.seed(claude("s-soul"), "Survivor");
+    managed_claude_row(&state, "T-reused-claude", "s-soul");
+
+    let projection = super::admit_create_naming(
+        &state,
+        &claude_create("crid-T-reused-claude"),
+        "T-reused-claude",
+        "claude",
+        Some("/workspace"),
+        None,
+        "Claude CLI".to_string(),
+        Some("s-this-create"),
+    )
+    .await;
+
+    assert_bound_to(&state, "T-reused-claude", &claude("s-soul"), "Survivor");
+    assert_eq!(
+        projection.map(|(_, record)| record.name).as_deref(),
+        Some("Survivor")
+    );
+    assert!(sink.ensures.lock().unwrap().is_empty());
+}
+
 // ── auto-resume ──────────────────────────────────────────────────────────
+
+/// A sleeper claude CLI the auto-resume respawn can spawn (removed on drop).
+#[cfg(unix)]
+struct SleeperClaude {
+    script: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl SleeperClaude {
+    fn new(case: &str) -> Self {
+        let script = std::env::temp_dir().join(format!(
+            "freshell-terminal-naming-respawn-{case}-{}.sh",
+            std::process::id()
+        ));
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write sleeper");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self { script }
+    }
+
+    fn spec(&self) -> freshell_platform::CliCommandSpec {
+        freshell_platform::CliCommandSpec {
+            name: "claude".into(),
+            label: "Claude CLI".into(),
+            default_cmd: self.script.to_string_lossy().into_owned(),
+            resume_args: Some(vec!["--resume".into(), "{{sessionId}}".into()]),
+            create_session_args: Some(vec!["--session-id".into(), "{{sessionId}}".into()]),
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SleeperClaude {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.script);
+    }
+}
+
+#[cfg(unix)]
+fn respawn_request(session_id: &str, replaces: Option<&str>) -> super::AgentRespawnRequest {
+    super::AgentRespawnRequest {
+        mode: "claude".into(),
+        provider: "claude".into(),
+        session_id: session_id.into(),
+        create_request_id: format!("crid-{session_id}"),
+        cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        replaces_terminal_id: replaces.map(str::to_string),
+    }
+}
 
 /// The auto-resume respawn's replacement row carries the session binding
 /// and the saved name (it was titled "<Mode> (auto-resumed)" and unbound).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn respawned_agent_row_carries_binding_and_saved_name() {
-    let script = std::env::temp_dir().join(format!(
-        "freshell-terminal-naming-respawn-{}.sh",
-        std::process::id()
-    ));
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write sleeper");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let spec = freshell_platform::CliCommandSpec {
-        name: "claude".into(),
-        label: "Claude CLI".into(),
-        default_cmd: script.to_string_lossy().into_owned(),
-        resume_args: Some(vec!["--resume".into(), "{{sessionId}}".into()]),
-        create_session_args: Some(vec!["--session-id".into(), "{{sessionId}}".into()]),
-        ..Default::default()
-    };
-    let (state, sink) = named_state(vec![spec]);
+    let cli = SleeperClaude::new("survivor");
+    let (state, sink) = named_state(vec![cli.spec()]);
     sink.seed(claude("s-survivor"), "Survivor");
+
+    let terminal_id = super::respawn_agent_terminal(&state, &respawn_request("s-survivor", None))
+        .await
+        .expect("respawn spawns a replacement");
+
+    assert_bound_to(&state, &terminal_id, &claude("s-survivor"), "Survivor");
+    state.registry.kill(&terminal_id);
+}
+
+/// The CLI crashed before its row's pending handle transferred onto the
+/// durable session (a rename before the first message): the replacement
+/// inherits that STILL-PENDING handle, so it shows the pre-durable name and
+/// the bind lane can still transfer it — it neither binds the record-less
+/// session nor mints a new handle.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn respawn_inherits_the_crashed_rows_still_pending_handle() {
+    let cli = SleeperClaude::new("pending");
+    let (state, sink) = named_state(vec![cli.spec()]);
+    let pending = SessionNameRef::Pending {
+        id: "nh-before-first-message".into(),
+    };
+    sink.seed(pending.clone(), "Early name");
+    state
+        .identity
+        .upsert("T-crashed", Some("claude"), Some("s-early"), None, 1);
+    state.identity.set_name_binding(
+        "T-crashed",
+        Some(pending.clone()),
+        Some("nh-before-first-message".into()),
+    );
+    state.identity.retire("T-crashed");
+
+    let terminal_id =
+        super::respawn_agent_terminal(&state, &respawn_request("s-early", Some("T-crashed")))
+            .await
+            .expect("respawn spawns a replacement");
+
+    assert_bound_to(&state, &terminal_id, &pending, "Early name");
+    assert_eq!(
+        state.identity.naming_handle_of(&terminal_id).as_deref(),
+        Some("nh-before-first-message"),
+        "the replacement retains the handle the bind lane transfers"
+    );
+    assert_eq!(
+        *sink.ensures.lock().unwrap(),
+        vec!["nh-before-first-message".to_string()],
+        "no new handle was minted"
+    );
+    state.registry.kill(&terminal_id);
+}
+
+/// A crashed row whose handle ALREADY transferred onto a durable session
+/// passes nothing on: that spent handle resolves to the old session's
+/// record, so inheriting it would show the wrong conversation's name.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn respawn_never_inherits_a_transferred_handle() {
+    let cli = SleeperClaude::new("transferred");
+    let (state, sink) = named_state(vec![cli.spec()]);
+    state.identity.upsert(
+        "T-crashed-durable",
+        Some("claude"),
+        Some("s-moved-on"),
+        None,
+        1,
+    );
+    state.identity.set_name_binding(
+        "T-crashed-durable",
+        Some(claude("s-moved-on")),
+        Some("nh-spent".into()),
+    );
+    state.identity.retire("T-crashed-durable");
 
     let terminal_id = super::respawn_agent_terminal(
         &state,
-        &super::AgentRespawnRequest {
-            mode: "claude".into(),
-            provider: "claude".into(),
-            session_id: "s-survivor".into(),
-            create_request_id: "crid-respawn".into(),
-            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
-        },
+        &respawn_request("s-moved-on", Some("T-crashed-durable")),
     )
     .await
     .expect("respawn spawns a replacement");
 
-    assert_bound_to(&state, &terminal_id, &claude("s-survivor"), "Survivor");
+    assert_eq!(
+        state.registry.name_ref_of(&terminal_id),
+        Some(claude("s-moved-on"))
+    );
+    assert!(sink.ensures.lock().unwrap().is_empty());
     state.registry.kill(&terminal_id);
-    let _ = std::fs::remove_file(&script);
 }
 
 // ── conversation switch ──────────────────────────────────────────────────
@@ -472,7 +672,7 @@ async fn conversation_switch_adopts_the_new_sessions_record() {
     state
         .identity
         .upsert("T-tick", Some("claude"), Some("s-b"), None, 2);
-    crate::terminal_naming::reconcile_terminal_naming(&state).await;
+    crate::terminal_naming::reconcile_terminal_naming(&state, &Default::default()).await;
 
     for terminal_id in ["T-helper", "T-tick"] {
         assert_bound_to(&state, terminal_id, &claude("s-b"), "Billing bug");
@@ -498,7 +698,7 @@ async fn conversation_switch_to_a_session_without_a_record_shows_the_fallback() 
         .identity
         .upsert("T-bare", Some("claude"), Some("s-b"), None, 2);
     crate::terminal_naming::follow_identity_switch(&state, "T-bare").await;
-    crate::terminal_naming::reconcile_terminal_naming(&state).await;
+    crate::terminal_naming::reconcile_terminal_naming(&state, &Default::default()).await;
 
     assert_eq!(state.registry.name_ref_of("T-bare"), Some(claude("s-b")));
     assert!(state.registry.session_name_of("T-bare").is_none());
