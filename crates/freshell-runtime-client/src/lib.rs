@@ -1281,6 +1281,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fresh_agent_configure_sends_the_settings_under_the_semantic_request_and_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let settings = freshell_runtime_protocol::FreshAgentTurnSettings {
+            model: Some("opus".into()),
+            permission_mode: Some("acceptEdits".into()),
+            ..Default::default()
+        };
+        let expected = settings.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let AdminCommand::FreshAgentConfigure(request) = &envelope.body else {
+                panic!("expected managed fresh-agent configure: {envelope:?}");
+            };
+            assert_eq!(envelope.request_id.as_str(), "configure-ui-request");
+            assert_eq!(envelope.role, ControlRole::Web);
+            assert_eq!(request.soul_id, SoulId::parse("configure-soul").unwrap());
+            assert_eq!(request.settings, expected);
+            assert_eq!(request.expected_control_epoch, Some(23));
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(AdminResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::Cancelled,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(23);
+
+        let state = client
+            .fresh_agent_configure(
+                RequestId::parse("configure-ui-request").unwrap(),
+                SoulId::parse("configure-soul").unwrap(),
+                settings,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(state, freshell_runtime_protocol::CommandState::Cancelled);
+    }
+
     fn source_snapshot(kind: FreshAgentReadKind) -> serde_json::Value {
         let live = matches!(kind, FreshAgentReadKind::Snapshot);
         serde_json::json!({
