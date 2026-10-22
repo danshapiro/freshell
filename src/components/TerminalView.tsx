@@ -110,7 +110,7 @@ import {
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
 import { isUnifiedAgentMode } from '@shared/session-names'
-import { selectTabNameSourcePaneId } from '@/store/selectors/sessionNameSelectors'
+import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 import { recordTerminalTitleForReplay } from '@/lib/terminal-inventory-titles'
 import {
   clearTerminalCursor,
@@ -3220,10 +3220,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       lastTitleUpdateRef.current = now
 
       // Tab and pane titles are independently guarded:
-      // - Tab title gated by tab.titleSetByUser
+      // - Tab title gated by tab.titleSetByUser, and never written for a
+      //   session-owned tab (its title mirrors the saved name)
       // - Pane title gated by paneTitleSetByUser (in the reducer)
       const currentTab = tabRef.current
-      if (currentTab && !currentTab.titleSetByUser) {
+      if (
+        currentTab
+        && !currentTab.titleSetByUser
+        && canWriteLegacyTabTitle(appStore.getState() as never, currentTab.id)
+      ) {
         dispatch(updateTab({ id: currentTab.id, updates: { title: cleanTitle } }))
       }
       dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: cleanTitle, setByUser: false }))
@@ -3231,7 +3236,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     })
 
     return () => disposable.dispose()
-  }, [isTerminal, dispatch, tabId])
+  }, [isTerminal, dispatch, tabId, appStore])
 
   const tabOrderRef = useRef(tabOrder)
   tabOrderRef.current = tabOrder
@@ -6174,7 +6179,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // user hasn't manually set the title. Coding-agent terminals keep
             // their stable session name on exit.
             const updates: { status: 'exited'; title?: string } = { status: 'exited' }
-            if (!exitTab.titleSetByUser && terminalFollowsOscTitle(contentRef.current?.mode)) {
+            if (
+              !exitTab.titleSetByUser
+              && terminalFollowsOscTitle(contentRef.current?.mode)
+              && canWriteLegacyTabTitle(appStore.getState() as never, exitTab.id)
+            ) {
               updates.title = exitTab.title + (code !== undefined ? ` (exit ${code})` : '')
             }
             dispatch(updateTab({ id: exitTab.id, updates }))
@@ -6199,15 +6208,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // source pane's session owns that tab's display).
             // Task 6 (T5-M7 gate): the tab-write gate is tab-ownership-scoped,
             // not just pane-scoped — a non-agent sibling (a shell) in a
-            // session-OWNED tab cannot churn that tab's stored fallback
-            // title either. Legacy and mixed tabs (pointer legacy/undefined)
+            // session-OWNED tab cannot churn that tab's stored title (the
+            // saved-name mirror) either; one gate, canWriteLegacyTabTitle,
+            // serves every legacy tab-title writer. Legacy and mixed tabs
             // keep the existing shell OSC/exit write behavior verbatim.
             const scopedPane = isUnifiedAgentMode(contentRef.current?.mode, undefined)
             const titleTab = tabRef.current
-            const sessionOwnedTab = titleTab
-              ? selectTabNameSourcePaneId(appStore.getState() as never, titleTab.id) != null
-              : false
-            if (!scopedPane && !sessionOwnedTab && titleTab && !titleTab.titleSetByUser) {
+            if (
+              !scopedPane
+              && titleTab
+              && !titleTab.titleSetByUser
+              && canWriteLegacyTabTitle(appStore.getState() as never, titleTab.id)
+            ) {
               dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
             }
             if (!scopedPane) {

@@ -635,8 +635,10 @@ export function stripScopedPaneTitleMetadata(
  * The tabs half of the sanitizer: a session-owned tab's stored freeze flag
  * (`titleSetByUser`) is an old alias — its name follows the canonical
  * record through the naming-source pointer. The flag drops; the stored
- * title TEXT stays as the last-known canonical projection (offline
- * display), and every nameSource-less/legacy tab is preserved verbatim.
+ * title TEXT stays: the saved-name tab title mirror
+ * (`src/store/savedNameTabTitleMirror.ts`) keeps it equal to the session's
+ * last-known saved name, so it is the right offline display. Every
+ * nameSource-less/legacy tab is preserved verbatim.
  */
 export function stripSessionOwnedTabFreezeFlags<
   T extends { id: string; titleSetByUser?: boolean; nameSource?: unknown },

@@ -11,6 +11,7 @@ import { sessionTitleMirrorMiddleware } from './sessionTitleMirror'
 import { terminalInventoryTitleReplayMiddleware } from '@/lib/terminal-inventory-titles'
 import { sessionNamesIngestMiddleware } from './sessionNamesSlice'
 import { sessionNameLifecycleMiddleware } from './sessionNameLifecycleMiddleware'
+import { savedNameTabTitleMirrorMiddleware } from './savedNameTabTitleMirror'
 import {
   collectLegacyPendingHandleAssignments,
   submitPendingLegacyNameImports,
@@ -59,6 +60,12 @@ export const store = configureStore({
       sessionTitleMirrorMiddleware,
       terminalInventoryTitleReplayMiddleware,
       sessionNamesIngestMiddleware,
+      // Name reliability (Task 7): a session-owned tab's stored title
+      // mirrors its cached saved name. Outer to the lifecycle coordinator
+      // (it reads reconciled naming-source pointers) and inner to the
+      // persistence/layout-mirror subscribers (their post-action reads see
+      // the mirrored title).
+      savedNameTabTitleMirrorMiddleware,
       subagentInterestMiddleware,
       terminalDetachMiddleware,
       sessionActivityPersistMiddleware,

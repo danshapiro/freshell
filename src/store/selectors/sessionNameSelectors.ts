@@ -40,13 +40,17 @@ function resolveRefKey(cache: SessionNamesCache, ref: SessionNameRef): string {
   return key
 }
 
+/** The record a name cache holds for a naming ref (redirect-resolved). */
+function recordInCache(cache: SessionNamesCache | undefined, ref: SessionNameRef): SessionNameRecord | undefined {
+  if (!cache?.records) return undefined
+  return cache.records[resolveRefKey(cache, ref)]
+}
+
 /** The canonical record currently cached for a naming ref (redirect-resolved).
  * Guarded like its sibling selectors: a hand-built state lacking the slice
  * (or its maps) resolves to undefined instead of throwing. */
 export function selectSessionNameRecord(state: RootState, ref: SessionNameRef): SessionNameRecord | undefined {
-  const cache = state.sessionNames
-  if (!cache?.records) return undefined
-  return cache.records[resolveRefKey(cache, ref)]
+  return recordInCache(state.sessionNames, ref)
 }
 
 /** The native writeback status cached for a naming ref (redirect-resolved). */
@@ -182,7 +186,13 @@ export function selectPaneDisplayName(state: RootState, tabId: string, paneId: s
  * boundary). Returns null for legacy tabs. */
 export function selectTabNameSourcePaneId(state: RootState, tabId: string): string | null {
   const tab = state.tabs?.tabs?.find((candidate) => candidate.id === tabId)
-  const layout = state.panes?.layouts?.[tabId]
+  return resolveTabNameSourcePaneId(tab, state.panes?.layouts?.[tabId])
+}
+
+type NamedTab = Pick<RootState['tabs']['tabs'][number], 'id' | 'nameSource'>
+
+/** `selectTabNameSourcePaneId` for one tab and its layout. */
+function resolveTabNameSourcePaneId(tab: NamedTab | undefined, layout: PaneNode | undefined): string | null {
   if (!tab || !layout) return null
   if (tab.nameSource?.kind === 'session') {
     const sourceId = tab.nameSource.paneId
@@ -217,16 +227,26 @@ function findPaneContent(node: PaneNode | undefined, paneId: string): PaneConten
 export function selectTabDisplayName(state: RootState, tabId: string): string {
   const tab = state.tabs?.tabs?.find((candidate) => candidate.id === tabId)
   if (!tab) return ''
-  const sourcePaneId = selectTabNameSourcePaneId(state, tabId)
-  if (sourcePaneId) {
-    const content = findPaneContent(state.panes?.layouts?.[tabId], sourcePaneId)
-    if (content && isScopedPaneContent(content)) {
-      const ref = resolvePaneNameRef(content)
-      const record = ref ? selectSessionNameRecord(state, ref) : undefined
-      if (record) return record.name
-    }
-  }
-  return getTabDisplayTitle(tab, state.panes?.layouts?.[tabId], state.panes?.paneTitles?.[tabId], paneExtensions(state))
+  const layout = state.panes?.layouts?.[tabId]
+  const savedName = savedNameOfTab(tab, layout, state.sessionNames)
+  if (savedName !== undefined) return savedName
+  return getTabDisplayTitle(tab, layout, state.panes?.paneTitles?.[tabId], paneExtensions(state))
+}
+
+/** A session-owned tab's SAVED name: the record cached for its source
+ * pane's naming ref. Undefined for legacy tabs and whenever no record is
+ * cached — never a fallback label. */
+function savedNameOfTab(
+  tab: NamedTab,
+  layout: PaneNode | undefined,
+  cache: SessionNamesCache | undefined,
+): string | undefined {
+  const sourcePaneId = resolveTabNameSourcePaneId(tab, layout)
+  if (!sourcePaneId) return undefined
+  const content = findPaneContent(layout, sourcePaneId)
+  if (!content || !isScopedPaneContent(content)) return undefined
+  const ref = resolvePaneNameRef(content)
+  return ref ? recordInCache(cache, ref)?.name : undefined
 }
 
 /** The session display rule for directory/history/sidebar surfaces. */
@@ -310,28 +330,23 @@ export const selectTabDisplayTitles = createSelector(
 )
 
 /**
- * The session-owned tabs' canonical names only (empty for legacy tabs) —
- * registry summaries overlay exactly these, never re-deriving a legacy
- * tab's title.
+ * The session-owned tabs' SAVED names only (name reliability, Task 7):
+ * `{tabId: name}` for every session-owned tab whose source pane's saved
+ * record is cached. A tab with no cached record is absent — this selector
+ * never answers a fallback label (the provider label or folder name a
+ * display selector shows while names load), so its consumers (the
+ * saved-name tab title mirror and the registry overlay) can never store or
+ * advertise one. Legacy tabs are always absent.
  */
-export const selectScopedTabDisplayTitles = createSelector(
+export const selectSessionTabSavedNames = createSelector(
   (state: RootState) => state.tabs?.tabs,
-  (state: RootState) => state.panes,
+  (state: RootState) => state.panes?.layouts,
   (state: RootState) => state.sessionNames,
-  (state: RootState) => state.extensions?.entries,
-  (tabs, panes, sessionNames, extensions) => {
-    const state = {
-      tabs: { tabs: tabs ?? [] },
-      panes,
-      sessionNames,
-      extensions: { entries: extensions },
-    } as unknown as RootState
+  (tabs, layouts, sessionNames) => {
     const out: Record<string, string> = {}
     for (const tab of tabs ?? []) {
-      const sourcePaneId = selectTabNameSourcePaneId(state, tab.id)
-      if (sourcePaneId) {
-        out[tab.id] = selectPaneDisplayName(state, tab.id, sourcePaneId)
-      }
+      const savedName = savedNameOfTab(tab, layouts?.[tab.id], sessionNames)
+      if (savedName !== undefined) out[tab.id] = savedName
     }
     return out
   },
