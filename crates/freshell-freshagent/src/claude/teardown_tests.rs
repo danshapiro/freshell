@@ -18,7 +18,9 @@ process.on('SIGTERM', () => { fs.appendFileSync(out, 'sigterm\n'); process.exit(
 require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
   if (JSON.parse(line).type === 'shutdown') {
     fs.appendFileSync(out, 'shutdown-handled\n')
-    process.exit(0)
+    // Stopping takes a moment, as the real sidecar's SDK abort does, so a
+    // signal sent right behind the shutdown line reaches the trap above.
+    setTimeout(() => process.exit(0), 200)
   }
 })
 setInterval(() => {}, 1000)
