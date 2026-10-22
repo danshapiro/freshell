@@ -92,12 +92,38 @@ pub enum TreeConfirmation {
     Unguarded,
 }
 
+/// How node ended once its stop began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarStop {
+    /// Node exited 0 within the grace period after the shutdown request: its
+    /// shutdown handler ran (it aborts the SDK query, which stops the CLI)
+    /// and no signal was needed.
+    Graceful,
+    /// Node exited within the grace period, but not with status 0. It
+    /// crashed on its way down (for example on a write to a stdout nobody
+    /// reads any more), so nothing may have stopped the CLI; the guard
+    /// killed the rest of the tree at once.
+    AbnormalExit,
+    /// Node was still running when the grace period ended and was signaled.
+    Forced,
+}
+
+impl SidecarStop {
+    /// The log label (`freshagent.claude.teardown`'s `stop`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::AbnormalExit => "abnormal_exit",
+            Self::Forced => "forced",
+        }
+    }
+}
+
 /// What happened when a sidecar was stopped.
 #[derive(Debug)]
 pub struct SidecarExit {
-    /// Node exited by itself within the grace period after the shutdown
-    /// request (no signal was needed).
-    pub graceful: bool,
+    /// How node ended.
+    pub stop: SidecarStop,
     /// Wall time of the whole stop: from the shutdown request until node
     /// was reaped and the guard settled the rest of the tree.
     pub elapsed: Duration,
@@ -105,6 +131,13 @@ pub struct SidecarExit {
     pub status: Option<ExitStatus>,
     /// Whether the rest of the tree (the CLI) is confirmed gone too.
     pub tree: TreeConfirmation,
+}
+
+impl SidecarExit {
+    /// Node stopped on the shutdown request alone.
+    pub fn graceful(&self) -> bool {
+        self.stop == SidecarStop::Graceful
+    }
 }
 
 /// How a Claude Node child (`node <entry>`) is launched. Built from the
@@ -275,9 +308,11 @@ impl std::fmt::Display for ClaudeSpawnError {
 /// Stop a sidecar: write the shutdown request and close its stdin, wait up
 /// to `grace` for node to exit, and only then escalate (on Unix SIGTERM to
 /// the tree, then SIGKILL 250 ms later; on Windows termination). When node
-/// exits by itself, the rest of its tree gets what is left of `grace` to
-/// follow before the guard kills it. Never fails: every step is best-effort
-/// and the returned [`SidecarExit`] says what actually happened.
+/// exits 0 by itself, the rest of its tree gets what is left of `grace` to
+/// follow before the guard kills it; when node exits any other way, its
+/// shutdown handler may not have run, so the guard kills the rest of the
+/// tree at once. Never fails: every step is best-effort and the returned
+/// [`SidecarExit`] says what actually happened.
 pub async fn graceful_then_kill(
     mut child: Child,
     stdin: ChildStdin,
@@ -288,10 +323,17 @@ pub async fn graceful_then_kill(
     let deadline = started + grace;
     request_shutdown(stdin, deadline).await;
     if let Ok(Ok(status)) = tokio::time::timeout_at(deadline, child.wait()).await {
-        let drain = deadline.saturating_duration_since(Instant::now());
+        let (stop, drain) = if status.success() {
+            (
+                SidecarStop::Graceful,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+        } else {
+            (SidecarStop::AbnormalExit, Duration::ZERO)
+        };
         let tree = guard.settle(drain).await;
         return SidecarExit {
-            graceful: true,
+            stop,
             elapsed: started.elapsed(),
             status: Some(status),
             tree,
@@ -299,7 +341,7 @@ pub async fn graceful_then_kill(
     }
     let (status, tree) = escalate(&mut child, &mut guard).await;
     SidecarExit {
-        graceful: false,
+        stop: SidecarStop::Forced,
         elapsed: started.elapsed(),
         status,
         tree,

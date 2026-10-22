@@ -12,7 +12,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use freshell_freshagent::claude_spawn::{
-    graceful_then_kill, spawn_guarded, SidecarTreeGuard, TreeConfirmation, SIDECAR_GRACEFUL_EXIT,
+    graceful_then_kill, spawn_guarded, SidecarStop, SidecarTreeGuard, TreeConfirmation,
+    SIDECAR_GRACEFUL_EXIT,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -116,7 +117,7 @@ async fn a_sidecar_that_honors_shutdown_exits_gracefully_without_a_signal() {
     let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, SIDECAR_GRACEFUL_EXIT).await;
 
     assert!(
-        exit.graceful,
+        exit.graceful(),
         "the shutdown line alone stopped the sidecar: {exit:?}"
     );
     assert!(
@@ -144,8 +145,9 @@ async fn a_sidecar_that_ignores_shutdown_is_escalated_after_the_grace_period() {
 
     let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
 
-    assert!(
-        !exit.graceful,
+    assert_eq!(
+        exit.stop,
+        SidecarStop::Forced,
         "the sidecar ignored the shutdown line: {exit:?}"
     );
     assert!(
@@ -180,7 +182,7 @@ async fn a_sidecar_that_ignores_sigterm_is_killed() {
 
     let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
 
-    assert!(!exit.graceful, "{exit:?}");
+    assert_eq!(exit.stop, SidecarStop::Forced, "{exit:?}");
     assert_eq!(
         exit.status.and_then(|status| status.signal()),
         Some(libc_sigkill()),
@@ -299,7 +301,7 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
     let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
 
     assert!(
-        exit.graceful,
+        exit.graceful(),
         "node itself honored the shutdown line: {exit:?}"
     );
     assert!(
@@ -320,6 +322,53 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
         let pgid = pgid.expect("the sidecar ran in its own process group");
         assert!(!process_group_exists(pgid), "no group member survives");
     }
+}
+
+/// Exits 1 on the shutdown line WITHOUT stopping its grandchild: a sidecar
+/// that crashed on its way down (for example on a write to a stdout nobody
+/// reads any more) before its shutdown handler could abort the SDK query,
+/// so the CLI it started keeps running the turn. The readiness line carries
+/// the grandchild's pid.
+const FAKE_CRASHES_LEAVING_GRANDCHILD: &str = r#"
+const { spawn } = require('child_process')
+const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') process.exit(1)
+})
+setInterval(() => {}, 1000)
+grandchild.on('spawn', () => process.stdout.write(`ready ${grandchild.pid}\n`))
+"#;
+
+/// Node exiting inside the grace period is graceful only when it exited 0
+/// (its shutdown handler ran). Any other exit means nothing stopped the
+/// rest of the tree, so the guard kills it at once instead of granting it
+/// the rest of the grace period.
+#[tokio::test]
+async fn an_abnormal_exit_is_not_graceful_and_the_tree_is_killed_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let fake = spawn_fake(FAKE_CRASHES_LEAVING_GRANDCHILD, &record).await;
+    let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
+    assert!(grandchild.alive());
+
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, SIDECAR_GRACEFUL_EXIT).await;
+
+    assert_eq!(
+        exit.stop,
+        SidecarStop::AbnormalExit,
+        "a crash is not a graceful stop: {exit:?}"
+    );
+    assert_eq!(
+        exit.status.and_then(|status| status.code()),
+        Some(1),
+        "node's own exit status is reported: {exit:?}"
+    );
+    assert!(
+        exit.elapsed < SIDECAR_GRACEFUL_EXIT / 2,
+        "the orphaned tree did not get the rest of the grace period: {exit:?}"
+    );
+    assert!(!grandchild.alive(), "the grandchild was killed: {exit:?}");
+    assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
 }
 
 /// Windows: the guard's job holds node and every descendant; terminating it

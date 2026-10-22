@@ -10145,28 +10145,37 @@ async fn teardown_removed_session(
 }
 
 /// The one structured record of every sidecar stop (G31): `info` when the
-/// sidecar honored the shutdown request, `warn` when it had to be forced.
+/// sidecar honored the shutdown request, `warn` when it crashed on its way
+/// down or had to be forced.
 fn log_claude_teardown(
     session_id: &str,
     exit: &crate::claude_spawn::SidecarExit,
     started: std::time::Instant,
     confirmation: &TeardownConfirmation,
 ) {
+    use crate::claude_spawn::SidecarStop;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let confirmation = confirmation.label();
-    if exit.graceful {
-        tracing::info!(target: "freshell_freshagent::claude",
+    let graceful = exit.graceful();
+    let stop = exit.stop.label();
+    match exit.stop {
+        SidecarStop::Graceful => tracing::info!(target: "freshell_freshagent::claude",
             event = "freshagent.claude.teardown",
-            session_id, graceful = true, elapsed_ms, confirmation,
+            session_id, graceful, stop, elapsed_ms, confirmation,
             "claude sidecar stopped on its shutdown request"
-        );
-    } else {
-        tracing::warn!(target: "freshell_freshagent::claude",
+        ),
+        SidecarStop::AbnormalExit => tracing::warn!(target: "freshell_freshagent::claude",
             event = "freshagent.claude.teardown",
-            session_id, graceful = false, elapsed_ms, confirmation,
+            session_id, graceful, stop, elapsed_ms, confirmation,
+            exit_code = exit.status.and_then(|status| status.code()),
+            "claude sidecar exited abnormally while stopping; its process tree was killed at once"
+        ),
+        SidecarStop::Forced => tracing::warn!(target: "freshell_freshagent::claude",
+            event = "freshagent.claude.teardown",
+            session_id, graceful, stop, elapsed_ms, confirmation,
             node_reaped = exit.status.is_some(),
             "claude sidecar ignored its shutdown request for the grace period and was killed"
-        );
+        ),
     }
 }
 

@@ -51,6 +51,16 @@ setInterval(() => {}, 1000)
 process.stdout.write('ready\n')
 "#;
 
+/// Crashes (exit 1) on the shutdown line instead of running a shutdown
+/// handler.
+const FAKE_CRASHES_ON_SHUTDOWN: &str = r#"
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') process.exit(1)
+})
+setInterval(() => {}, 1000)
+process.stdout.write('ready\n')
+"#;
+
 fn node() -> String {
     std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string())
 }
@@ -228,6 +238,28 @@ async fn teardown_of_a_sidecar_that_ignores_shutdown_escalates_after_grace_and_s
     let (level, fields) = &logged[0];
     assert_eq!(*level, tracing::Level::WARN, "a forced stop is a warning");
     assert_eq!(fields.get("graceful").map(String::as_str), Some("false"));
+}
+
+#[tokio::test]
+async fn teardown_of_a_sidecar_that_crashes_on_its_way_down_is_logged_as_abnormal() {
+    let (events, _guard) = capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let (session, _) = fake_session(FAKE_CRASHES_ON_SHUTDOWN, &record, "crashes").await;
+
+    let _ = teardown_removed_session(session, TREE_DEATH_CONFIRM_ROUNDS).await;
+
+    let logged = capture::teardown_events(&events);
+    assert_eq!(logged.len(), 1, "one teardown event: {logged:?}");
+    let (level, fields) = &logged[0];
+    assert_eq!(*level, tracing::Level::WARN, "a crash is a warning");
+    assert_eq!(fields.get("graceful").map(String::as_str), Some("false"));
+    assert_eq!(
+        fields.get("stop").map(String::as_str),
+        Some("abnormal_exit"),
+        "{fields:?}"
+    );
+    assert_eq!(fields.get("exit_code").map(String::as_str), Some("1"));
 }
 
 #[tokio::test]
