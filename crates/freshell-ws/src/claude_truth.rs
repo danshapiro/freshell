@@ -51,57 +51,6 @@ const TAIL_PROBE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Read by GET /api/server-info as "claudeTruthAnomalies" (Task 10).
 pub static CLAUDE_TRUTH_ANOMALIES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(windows)]
-fn same_windows_path(left: &Path, right: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Component;
-
-    const CSTR_EQUAL: i32 = 2;
-    const TRUE: i32 = 1;
-
-    let components_match = |left: Component<'_>, right: Component<'_>| {
-        let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
-        let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
-        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
-        else {
-            return false;
-        };
-        if left_len == 0 || right_len == 0 {
-            return false;
-        }
-
-        // SAFETY: both buffers remain alive for the call, and each explicit
-        // length is the number of valid UTF-16 code units in that buffer.
-        unsafe {
-            compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, TRUE)
-                == CSTR_EQUAL
-        }
-    };
-
-    let mut left = left.components();
-    let mut right = right.components();
-    loop {
-        match (left.next(), right.next()) {
-            (Some(left), Some(right)) if components_match(left, right) => {}
-            (None, None) => return true,
-            _ => return false,
-        }
-    }
-}
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    #[link_name = "CompareStringOrdinal"]
-    fn compare_string_ordinal(
-        string1: *const u16,
-        count1: i32,
-        string2: *const u16,
-        count2: i32,
-        ignore_case: i32,
-    ) -> i32;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnProbe {
     /// Non-sidechain user/assistant activity after the last end-boundary
@@ -165,40 +114,16 @@ fn note_format_anomaly(session_id: &str, records: &[serde_json::Value], reason: 
 }
 
 impl FsClaudeTruth {
-    /// Candidate roots, priority order — the same ladder as
-    /// `claude_snapshot.rs`: CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform
-    /// default `~/.claude`.
-    /// Empty-string values are SKIPPED (claude_snapshot.rs precedent —
-    /// an empty env var must not produce a bogus relative root).
+    /// Candidate roots, priority order: the ONE shared claude store-root rule
+    /// (`freshell_freshagent::claude_home_candidates` — CLAUDE_CONFIG_DIR >
+    /// CLAUDE_HOME > platform home `.claude`, where the platform home is
+    /// `std::env::home_dir()`: USERPROFILE on Windows, HOME-else-passwd on
+    /// POSIX), so the PTY truth probe reads the same store the fresh-agent
+    /// snapshot, attach, rollback and reconcile paths read.
     pub fn from_env() -> Self {
-        let mut roots = Vec::new();
-        if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-            if !dir.is_empty() {
-                roots.push(PathBuf::from(dir));
-            }
+        Self {
+            roots: freshell_freshagent::claude_home_candidates(),
         }
-        if let Ok(dir) = std::env::var("CLAUDE_HOME") {
-            if !dir.is_empty() {
-                roots.push(PathBuf::from(dir));
-            }
-        }
-        #[cfg(windows)]
-        if let Some(home) = std::env::home_dir() {
-            let default_root = home.join(".claude");
-            if !roots
-                .iter()
-                .any(|root| same_windows_path(root, &default_root))
-            {
-                roots.push(default_root);
-            }
-        }
-        #[cfg(not(windows))]
-        if let Some(home) = std::env::var_os("HOME") {
-            if !home.is_empty() {
-                roots.push(PathBuf::from(home).join(".claude"));
-            }
-        }
-        Self { roots }
     }
 
     pub fn with_roots(roots: Vec<PathBuf>) -> Self {

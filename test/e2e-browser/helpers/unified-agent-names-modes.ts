@@ -106,7 +106,13 @@ export async function connect(journey: Journey, browser: Browser) {
 
 export async function resolveSessionId(journey: Journey, handle: NamedAgentHandle): Promise<string> {
   // The materialization bind is server-async: poll the naming authority
-  // (through redirects) until the durable identity resolves. The intervals
+  // (through redirects) until the durable identity resolves. A handle that
+  // already carries a non-placeholder runtime session id short-circuits to
+  // it WITHOUT waiting for the bind: that id names the session the bind
+  // will land on, but (freshcodex: before its first turn completes) the
+  // session-kind naming record may not exist yet — a caller that renames
+  // or reads that record directly must wait for the pending handle's
+  // redirect first (see refreshHandle's doc). The intervals
   // stay ≥500ms — the read route shares the API rate limiter (300-token
   // bucket, 5/sec refill), and a default-interval poll (100ms) drains it,
   // rate-limiting the LATER assertions in the same journey.
