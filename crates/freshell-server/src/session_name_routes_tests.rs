@@ -1553,6 +1553,106 @@ async fn import_endpoint_acknowledges_per_candidate_and_resolves_terminals() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Name-reliability Task 3: once the one-time consolidation is complete, an
+/// old browser's import is answered 200 with every candidate acknowledged,
+/// and nothing is written — no record, no stored candidate id, no backup
+/// file, no document generation.
+#[tokio::test]
+async fn import_route_after_completion_acknowledges_without_writing() {
+    let home = temp_home();
+    let state = names_state(&home);
+    state
+        .names
+        .hydrate_indexed(
+            crate::session_name_generation::IndexedNameInput {
+                provider: NamedProvider::Claude,
+                session_id: "sess-1".into(),
+                cwd: Some("/w/work".into()),
+                first_user_message: None,
+                provider_title: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    state.names.complete_legacy_migration().await.unwrap();
+    let data_dir = home.join(".freshell");
+    let document = |dir: &std::path::Path| -> Value {
+        serde_json::from_slice(&std::fs::read(dir.join("session-names.json")).unwrap()).unwrap()
+    };
+    let before = document(&data_dir);
+
+    let router = super::router(state.clone());
+    let body = json!({
+        "version": 1,
+        "importId": "old-client-window-import",
+        "evidence": [
+            { "storageKey": "freshell.layout.v3.layout-window-a", "raw": "{\"version\":4}" }
+        ],
+        "candidates": [
+            {
+                "id": "c-1",
+                "target": { "kind": "session", "provider": "claude", "sessionId": "sess-1" },
+                "name": "Tab 23",
+                "source": "provider_ai",
+                "scope": "source_tab",
+                "evidenceKey": "freshell.layout.v3.layout-window-a#tab-1",
+                "protectionEvidence": "none"
+            },
+            {
+                "id": "c-2",
+                "target": { "kind": "session", "provider": "claude", "sessionId": "sess-2" },
+                "name": "ms-people-summit",
+                "source": "legacy_protected",
+                "scope": "source_tab",
+                "evidenceKey": "freshell.layout.v3.layout-window-a#tab-2",
+                "protectionEvidence": "legacy_flag"
+            }
+        ]
+    });
+    let (status, response) = post_import(router, body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["acknowledged"],
+        json!(["c-1", "c-2"]),
+        "{response}"
+    );
+    assert_eq!(response["names"], json!([]), "{response}");
+
+    let after = document(&data_dir);
+    assert_eq!(
+        after["documentGeneration"], before["documentGeneration"],
+        "the import wrote no document generation"
+    );
+    assert_eq!(
+        after, before,
+        "the document is byte-for-byte the same value"
+    );
+    let record = state
+        .names
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-1".into(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(record[0].record.name, "work");
+    assert!(state
+        .names
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-2".into(),
+        }])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        !data_dir.join("name-migration-v1").join("imports").exists(),
+        "no per-import backup file"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[tokio::test]
 async fn import_endpoint_requires_auth() {
     let home = temp_home();
