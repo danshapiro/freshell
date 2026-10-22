@@ -59,6 +59,10 @@ async function askPermission(cli, turn, name, input, toolUseID, data) {
   turn.waiters.add(onAbort)
   try {
     const answer = Promise.resolve(canUseTool(name, input, { signal: controller.signal, ...permissionOptions(cli, name, input, toolUseID, data) }))
+    answer.then(
+      (decision) => cli.ledger('can_use_tool', { toolName: name, toolUseID, decision }),
+      (error) => cli.ledger('can_use_tool', { toolName: name, toolUseID, error: String(error?.message ?? error) }),
+    )
     const aborted = new Promise((resolve) => turn.waiters.add(() => resolve(null)))
     return await Promise.race([answer.catch((error) => ({ behavior: 'deny', message: `Tool permission request failed: ${error}` })), aborted])
   } finally {
@@ -75,12 +79,13 @@ function applyPermissionUpdates(cli, updates) {
 /** A tool call: its streamed tool_use block, permission, execution and result. */
 export async function toolCall(cli, turn, step) {
   const data = step.data ?? {}
-  const toolUseId = `toolu_sim_${++cli.toolSeq}`
+  // The model names its tool calls; a program may choose the id.
+  const toolUseId = data.id ?? `toolu_sim_${++cli.toolSeq}`
   let name
   let input
   switch (step.kind) {
     case 'approval': name = data.tool ?? 'Bash'; input = data.input ?? { command: 'ls' }; break
-    case 'question': name = 'AskUserQuestion'; input = { questions: data.questions ?? [] }; break
+    case 'question': name = 'AskUserQuestion'; input = data.input ?? { questions: data.questions ?? [] }; break
     case 'exit_plan': name = 'ExitPlanMode'; input = { plan: data.plan ?? PLAN_TEXT }; break
     case 'agent': name = 'Agent'; input = { description: 'local provider background agent', prompt: 'SUBAGENT-TASK SLOW', subagent_type: 'general-purpose', run_in_background: true }; break
     default: name = data.name ?? 'Bash'; input = data.input ?? {}
@@ -180,6 +185,7 @@ function startAbsorbed(cli, turn) {
     const uuid = cmd.uuid ?? randomUUID()
     cli.emit({ type: 'user', message: { role: 'user', content: cmd.content }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), isReplay: true })
     if (cmd.uuid) cli.emit({ type: 'command_lifecycle', command_uuid: cmd.uuid, state: 'started' })
+    cli.recordPrompt(cmd)
     cli.transcript.append({ type: 'user', uuid, message: { role: 'user', content: cmd.content }, promptSource: 'sdk', permissionMode: cli.permissionMode })
     turn.absorbedTexts.push(cmd.text)
   }

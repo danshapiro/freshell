@@ -232,6 +232,64 @@ describe('Claude CLI simulator programs', () => {
     expect(rows[0].options.envKeys).toContain('ANTHROPIC_API_KEY')
     expect(JSON.stringify(rows)).not.toContain('secret-value')
   })
+
+  it('records the boot, every prompt with the settings it ran under, and every canUseTool answer in the ledger, each tagged with its query() ordinal', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sim-ledger-'))
+    cleanups.push(() => fs.rm(dir, { recursive: true, force: true }))
+    const ledger = path.join(dir, 'ledger.jsonl')
+    const decision = { behavior: 'allow', updatedInput: { command: 'ls -la' } }
+    const s = await open({
+      model: 'opus',
+      effort: 'high',
+      permissionMode: 'default',
+      canUseTool: async () => decision,
+    }, { ...program([{ on: 'msg:prompt', match: { text: 'ask' }, emit: [{ kind: 'approval', data: { tool: 'Bash', input: { command: 'ls' } } }] }]), FRESHELL_CLAUDE_SIM_LEDGER: ledger })
+    s.prompt.push('first', '44444444-4444-4444-8444-444444444444')
+    await s.until(() => results(s.messages).length === 1)
+    await s.q.applyFlagSettings({ effortLevel: 'max' })
+    await s.q.setModel('sonnet')
+    s.prompt.push('ask')
+    await s.until(() => results(s.messages).length === 2)
+    const rows = (await fs.readFile(ledger, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    const sessionId = results(s.messages)[0].session_id
+    const query = rows[0].query
+    expect(rows[0]).toMatchObject({ kind: 'query', query: expect.any(Number) })
+    expect(rows.every((row) => row.query === query)).toBe(true)
+    expect(rows.find((row) => row.kind === 'boot')).toMatchObject({ sessionId, cliPid: expect.any(Number) })
+    expect(rows.filter((row) => row.kind === 'prompt')).toEqual([
+      expect.objectContaining({ sessionId, uuid: '44444444-4444-4444-8444-444444444444', text: 'first', content: [{ type: 'text', text: 'first' }], model: 'opus', effort: 'high', permissionMode: 'default' }),
+      expect.objectContaining({ sessionId, uuid: null, text: 'ask', model: 'sonnet', effort: 'max', permissionMode: 'default' }),
+    ])
+    expect(rows.filter((row) => row.kind === 'can_use_tool')).toEqual([
+      expect.objectContaining({ toolName: 'Bash', toolUseID: expect.stringMatching(/^toolu_/), decision }),
+    ])
+  })
+
+  it('a program chooses the tool_use id the model gives a tool call and the whole input of an AskUserQuestion call', async () => {
+    const seen: any[] = []
+    const s = await open({
+      canUseTool: async (toolName: string, toolInput: any, options: any) => {
+        seen.push({ toolName, toolInput, toolUseID: options.toolUseID })
+        return toolName === 'AskUserQuestion'
+          ? { behavior: 'allow', updatedInput: { ...toolInput, answers: { 'Pick one': 'A' } } }
+          : { behavior: 'allow', updatedInput: toolInput }
+      },
+    }, program([{
+      on: 'msg:prompt',
+      emit: [
+        { kind: 'approval', data: { id: 'toolu_fake_1', tool: 'Bash', input: { command: 'ls' } } },
+        { kind: 'question', data: { id: 'toolu_fake_2', input: { questions: [{ question: 'Pick one', header: 'Choice', options: [{ label: 'A', description: 'a' }], multiSelect: false }], marker: 'keep-me' } } },
+      ],
+    }]))
+    s.prompt.push('go')
+    await s.until(() => results(s.messages).length === 1)
+    expect(seen).toEqual([
+      { toolName: 'Bash', toolInput: { command: 'ls' }, toolUseID: 'toolu_fake_1' },
+      { toolName: 'AskUserQuestion', toolInput: { questions: [expect.objectContaining({ question: 'Pick one' })], marker: 'keep-me' }, toolUseID: 'toolu_fake_2' },
+    ])
+    const toolUses = s.messages.filter((m) => m.type === 'assistant').flatMap((m) => m.message.content).filter((b: any) => b.type === 'tool_use')
+    expect(toolUses.map((b: any) => b.id)).toEqual(['toolu_fake_1', 'toolu_fake_2'])
+  })
 })
 
 describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)', () => {

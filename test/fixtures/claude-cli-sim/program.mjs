@@ -15,10 +15,11 @@
 // turn; its emissions run in order as the model's side of the turn:
 //
 //   text / activity  { text?, chunks?, delayMs? }   one streamed assistant text block
-//   tool             { name, input, seconds?, output?, isError? }   a tool call and its result
-//   approval         { tool, input, suggestions?, blockedPath?, decisionReason? }
+//   tool             { name, input, id?, seconds?, output?, isError? }   a tool call and its result
+//   approval         { tool, input, id?, suggestions?, blockedPath?, decisionReason? }
 //                    a tool call that always asks canUseTool, with these fields
-//   question         { questions }                  AskUserQuestion through canUseTool
+//   question         { questions | input, id? }     AskUserQuestion through canUseTool
+//                                                   (`input`: the whole tool input)
 //   exit_plan        { plan? }                      ExitPlanMode through canUseTool
 //   completion       { subtype?, text?, errors? }   end the turn with this result subtype
 //   api_error        { status?, message? }          the model request fails
@@ -28,6 +29,8 @@
 //   cli_turn         { afterMs? }                   a background task finishes later and
 //                                                   starts a CLI-initiated turn
 //   marker           {}                             no effect (diagnostics)
+//
+// `id` is the tool_use id the model gives the call (default toolu_sim_<n>).
 //
 // "start" rules may use crash, stall_stdin, cli_turn and marker.
 //

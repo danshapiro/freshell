@@ -8,13 +8,8 @@
 // uuid), which only a hand-made message can reach.
 
 import { describe, expect, it } from 'vitest'
-import {
-  checkpointAttemptOf,
-  MAX_PENDING_CHECKPOINT_ATTEMPTS,
-  rememberCheckpointAttempt,
-  takeCheckpointIdentity,
-  // @ts-expect-error JavaScript sidecar module has no declaration file.
-} from '../../../crates/freshell-claude-sidecar/checkpoint-identity.mjs'
+// @ts-expect-error JavaScript sidecar module has no declaration file.
+import { checkpointAttemptOf, MAX_PENDING_CHECKPOINT_ATTEMPTS, rememberCheckpointAttempt, takeCheckpointIdentity } from '../../../crates/freshell-claude-sidecar/checkpoint-identity.mjs'
 
 const UUID = 'b3eaf0e1-c8fe-4fb3-8802-b3ce52ca0b16'
 const OTHER = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'

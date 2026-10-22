@@ -38,9 +38,16 @@
 //   FRESHELL_CLAUDE_SIM_STALL_STDIN     '1'/'boot' or 'prompt': the host process
 //                                       stops reading stdin after boot / at the
 //                                       first prompt
-//   FRESHELL_CLAUDE_SIM_LEDGER          JSONL path: one row per query() (its
-//                                       options, env reduced to key names) and per
-//                                       program emission
+//   FRESHELL_CLAUDE_SIM_LEDGER          JSONL path, for tests that need to see what
+//                                       the SDK side received. Every row carries
+//                                       `query`, the ordinal of its query() call in
+//                                       this process. Rows: `query` (the options, env
+//                                       reduced to key names), `boot` (the session id
+//                                       and the stand-in CLI's pid), `prompt` (each
+//                                       command as it starts: uuid, text, content and
+//                                       the model, effort and permission mode it runs
+//                                       under), `can_use_tool` (each answer the host's
+//                                       canUseTool gave) and `emission` (program steps)
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -79,6 +86,9 @@ export const SIMULATED_CLI_VERSION = CLI_VERSION
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const STAND_IN = path.join(here, 'stand-in-cli.mjs')
+
+/** query() calls made in this process, for the ledger's `query` ordinal. */
+let queryCount = 0
 
 /** `/name args` when the text is a slash command, else null. */
 function parseSlash(text) {
@@ -186,6 +196,7 @@ class SimulatedCli {
     this.configDir = claudeConfigDir(this.env)
     this.cwd = options.cwd || process.cwd()
     this.model = options.model || FAKE_MODEL
+    this.effort = options.effort
     this.permissionMode = options.permissionMode || 'default'
     this.partial = options.includePartialMessages === true
     this.stateEvents = this.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS === '1'
@@ -204,6 +215,7 @@ class SimulatedCli {
     this.modelTurnsSinceCompact = 0
     this.timers = new Set()
     this.init = deferred()
+    this.ordinal = ++queryCount
     this.ledger('query', { options: describeOptions(options) })
 
     this.sessionId = options.forkSession ? (options.sessionId ?? randomUUID()) : (options.resume ?? options.sessionId ?? randomUUID())
@@ -224,7 +236,12 @@ class SimulatedCli {
     const file = this.env.FRESHELL_CLAUDE_SIM_LEDGER
     if (!file) return
     fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.appendFileSync(file, `${JSON.stringify({ t: Date.now(), pid: process.pid, kind, ...row })}\n`)
+    fs.appendFileSync(file, `${JSON.stringify({ t: Date.now(), pid: process.pid, query: this.ordinal, kind, ...row })}\n`)
+  }
+
+  /** A command starts running: what the model is asked, and under which settings. */
+  recordPrompt(cmd) {
+    this.ledger('prompt', { sessionId: this.sessionId, uuid: cmd.uuid ?? null, text: cmd.text, content: cmd.content, model: this.model, effort: this.effort ?? null, permissionMode: this.permissionMode })
   }
 
   sleep(ms) {
@@ -354,6 +371,7 @@ class SimulatedCli {
       return
     }
     this.booted = true
+    this.ledger('boot', { sessionId: this.sessionId, cliPid: this.child.pid })
     this.init.resolve(this.bootSummary())
     for (const emission of this.program.match('start', {}) ?? []) this.background(this.runBackgroundEmission(emission))
     if (/^(1|boot)$/.test(this.env.FRESHELL_CLAUDE_SIM_STALL_STDIN ?? '')) process.stdin.pause()
@@ -519,6 +537,7 @@ class SimulatedCli {
     this.turn = turn
     await this.sleep(T.queuedToStarted)
     if (cmd.uuid) this.emit({ type: 'command_lifecycle', command_uuid: cmd.uuid, state: 'started' })
+    this.recordPrompt(cmd)
     this.transcript.materialize()
     if (/^prompt$/.test(this.env.FRESHELL_CLAUDE_SIM_STALL_STDIN ?? '')) process.stdin.pause()
     const slash = parseSlash(cmd.text)
@@ -868,7 +887,10 @@ class SimulatedCli {
   }
 
   async applyFlagSettings(settings) {
-    return this.control(() => { this.flagSettings = { ...(this.flagSettings ?? {}), ...(settings ?? {}) } })
+    return this.control(() => {
+      this.flagSettings = { ...(this.flagSettings ?? {}), ...(settings ?? {}) }
+      if (settings && 'effortLevel' in settings) this.effort = settings.effortLevel ?? undefined
+    })
   }
 
   async setMaxThinkingTokens() {
