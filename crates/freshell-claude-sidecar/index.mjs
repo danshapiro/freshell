@@ -678,6 +678,16 @@ rl.on('line', (line) => {
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
 // grandchild is left mid-stream.
 rl.on('close', () => { shutdown(); process.exit(0) })
+// stdout lost (Rust dropped our reader, e.g. a kill aborted its consumer before
+// it wrote the shutdown line): nobody hears us any more, the same request as
+// stdin EOF. Unhandled, the next emit's EPIPE kills node with exit 1 before
+// the SDK query is aborted, and nothing stops the claude CLI: it runs on until
+// it next writes into its own closed pipe or Rust kills the process tree.
+process.stdout.on('error', (err) => {
+  logerr(`stdout closed (${err?.code || err}); shutting down`)
+  shutdown()
+  process.exit(0)
+})
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 process.on('SIGINT', () => { shutdown(); process.exit(0) })
 

@@ -1,9 +1,16 @@
 // Contract harness (audit G31): the REAL Claude sidecar (crates/freshell-claude-sidecar/index.mjs)
 // over the pinned SDK 0.3.237 and bundled native CLI 2.1.237, against an isolated local
-// provider endpoint (the real Anthropic API is never contacted). Mid-turn, the sidecar gets the
-// same {"type":"shutdown"} line (followed by stdin EOF) that Rust's graceful teardown writes.
-// The receipt records how long node, the CLI process and the provider request took to go
-// away; the grace period the Rust teardown grants (2 s) depends on all three being fast.
+// provider endpoint (the real Anthropic API is never contacted). Mid-turn, the sidecar is
+// stopped the way Rust's graceful teardown stops it. The receipt records how long node, the CLI
+// process and the provider request took to go away; the grace period the Rust teardown grants
+// (2 s) depends on all three being fast.
+//
+// Modes (argv[3]):
+// - `shutdown` (default): the {"type":"shutdown"} line, then stdin EOF.
+// - `stdout-closed`: first the sidecar's stdout reader goes away (Rust aborts the session's
+//   stdout consumer before its teardown), then, 50 ms later (the teardown's ownership scan),
+//   the same shutdown line and stdin EOF. The provider streams a text delta every 25 ms, so
+//   the sidecar is writing into the closed pipe before the shutdown line can arrive.
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import http from 'node:http'
@@ -14,6 +21,8 @@ import { randomUUID } from 'node:crypto'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
+const mode = process.argv[3] ?? 'shutdown'
+if (mode !== 'shutdown' && mode !== 'stdout-closed') throw new Error(`unknown mode ${mode}`)
 
 const sidecarDir = path.join(repoRoot, 'crates/freshell-claude-sidecar')
 const sdkDir = path.join(sidecarDir, 'node_modules/@anthropic-ai/claude-agent-sdk')
@@ -68,7 +77,8 @@ try {
   if (!/^2\.1\.237(?:\s|$)/.test(nativeVersion.trim())) throw new Error('native CLI did not report version 2.1.237')
 
   failureStage = 'local provider'
-  // A turn that stays open: one text delta, then pings until the client goes away.
+  // A turn that stays open until the client goes away: one text delta, then pings (or, in
+  // `stdout-closed` mode, a text delta every 25 ms).
   server = http.createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1')
     for await (const _chunk of request) { /* drain */ }
@@ -87,9 +97,12 @@ try {
     send('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
     send('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'streaming' } })
     streamingStarted()
-    for (let i = 0; i < 120 && !response.destroyed; i++) {
-      await sleep(250)
-      if (!response.destroyed) send('ping', {})
+    const [interval, keepAlive] = mode === 'stdout-closed'
+      ? [25, () => send('content_block_delta', { index: 0, delta: { type: 'text_delta', text: ' more' } })]
+      : [250, () => send('ping', {})]
+    for (let elapsed = 0; elapsed < 30_000 && !response.destroyed; elapsed += interval) {
+      await sleep(interval)
+      if (!response.destroyed) keepAlive()
     }
     if (!response.destroyed) response.end()
   })
@@ -124,6 +137,9 @@ try {
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   sidecar.stderr.on('data', () => {})
+  // The shutdown line may reach a sidecar that already stopped on its own (`stdout-closed`
+  // mode); that write's EPIPE is expected, as it is for Rust's teardown.
+  sidecar.stdin.on('error', () => {})
   sidecar.once('exit', (code, signal) => { sidecarExitedAt = Date.now(); sidecarExit = { code, signal } })
   const frames = []
   const waiters = []
@@ -156,6 +172,10 @@ try {
 
   failureStage = 'shutdown'
   shutdownSentAt = Date.now()
+  if (mode === 'stdout-closed') {
+    sidecar.stdout.destroy()
+    await sleep(50)
+  }
   write({ type: 'shutdown' })
   sidecar.stdin.end()
   const deadline = shutdownSentAt + 10_000
@@ -187,6 +207,7 @@ const since = at => (at === undefined || shutdownSentAt === undefined ? null : a
 const fixtureRemoved = !(await fs.stat(fixture).catch(() => null))
 process.stdout.write(`${JSON.stringify({
   verdict,
+  mode,
   sdkVersion: sdkPackage.version,
   bundledCliVersion: sdkPackage.claudeCodeVersion,
   sidecarExit,

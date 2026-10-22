@@ -18,10 +18,15 @@ afterEach(() => {
 // The Rust teardown (claude_spawn::graceful_then_kill) gives the sidecar 2 s
 // to stop on its own before escalating. That grace period is only enough if
 // the real sidecar, the real CLI and the in-flight provider request all stop
-// well inside it; this pins that against the pinned SDK and CLI.
+// well inside it; this pins that against the pinned SDK and CLI, both for the
+// shutdown line alone and for the order a pane kill produces (the sidecar's
+// stdout reader is dropped before the shutdown line is written).
 describe('Claude sidecar shutdown against the pinned CLI and a local provider', () => {
-  it('stops node, the native CLI and the in-flight provider request within one second', async () => {
-    const child = spawn(process.execPath, [HARNESS, REPO_ROOT], {
+  it.each([
+    ['the shutdown line', 'shutdown'],
+    ['its stdout reader going away before the shutdown line', 'stdout-closed'],
+  ])('on %s, stops node (exit 0), the native CLI and the in-flight provider request within one second', async (_, mode) => {
+    const child = spawn(process.execPath, [HARNESS, REPO_ROOT, mode], {
       cwd: REPO_ROOT,
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
@@ -59,6 +64,7 @@ describe('Claude sidecar shutdown against the pinned CLI and a local provider', 
     const receipt = JSON.parse(lines[0]!) as Record<string, any>
     expect(receipt).toMatchObject({
       verdict: 'PASS',
+      mode,
       sdkVersion: '0.3.237',
       bundledCliVersion: '2.1.237',
       sidecarExit: { code: 0, signal: null },
