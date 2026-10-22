@@ -215,7 +215,7 @@ pub(super) fn apply_series_plan(
         SeriesPlan::DropInput => document
             .generation
             .get_mut(key)
-            .is_some_and(drop_refused_input),
+            .is_some_and(|series| drop_refused_input(series, RefusalSite::Activity)),
     }
 }
 
@@ -233,9 +233,31 @@ fn new_series() -> GenerationState {
     }
 }
 
+/// Which guard refused stored input (the `site` of the
+/// `session_names.generation_input_refused` event).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefusalSite {
+    /// An activity (sweep pass or live edge) without a real first message.
+    Activity,
+    /// A bind's explicit-open hook.
+    Bind,
+    /// The generation claim, the last line before the model.
+    Claim,
+}
+
+impl RefusalSite {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Activity => "activity",
+            Self::Bind => "bind",
+            Self::Claim => "claim",
+        }
+    }
+}
+
 /// The prompt-input guard's drop: no input, resting Idle, nothing consumed
-/// or refunded. `true` when the series changed.
-pub(super) fn drop_refused_input(series: &mut GenerationState) -> bool {
+/// or refunded. `true` when the series changed; logs which guard fired.
+pub(super) fn drop_refused_input(series: &mut GenerationState, site: RefusalSite) -> bool {
     if !droppable(series) || !holds_refused_input(series) {
         return false;
     }
@@ -246,6 +268,7 @@ pub(super) fn drop_refused_input(series: &mut GenerationState) -> bool {
     tracing::info!(
         target: "freshell_server::session_names",
         op = "generation_input_refused",
+        site = site.as_str(),
         series = %series.series_id,
         consumed = series.consumed,
         "session_names.generation_input_refused: stored AI-naming input is wrapper or derived text; it was dropped and the series rests"
@@ -261,7 +284,7 @@ pub(super) fn explicit_open(series: &mut GenerationState) -> bool {
         return false;
     }
     if holds_refused_input(series) {
-        return drop_refused_input(series);
+        return drop_refused_input(series, RefusalSite::Bind);
     }
     if series.input_fingerprint.is_none() {
         return false;

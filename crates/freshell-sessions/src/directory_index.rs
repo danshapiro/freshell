@@ -46,7 +46,9 @@ use crate::codex_segments::{
     compose_codex_segments, scan_codex_file_bytes_evidence, CodexComposition, CodexFileEvidence,
     CodexSegmentEntry, CodexUnresolvedIdentity,
 };
-use crate::first_message_rules::{cached_first_message_is_stale, FIRST_MESSAGE_RULES_VERSION};
+use crate::first_message_rules::{
+    cached_first_message_is_stale, log_reparse, FIRST_MESSAGE_RULES_VERSION,
+};
 use crate::meta::ParsedSessionMeta;
 use crate::provider_layout::ProviderLayout;
 use crate::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
@@ -322,11 +324,18 @@ pub trait SessionSource: Send + Sync {
     /// messages only for placeholder-titled rows — the naming sweep needs
     /// the single named session's first real user message on demand (one
     /// bounded read-only query, never a full-history pass). `None` (the
-    /// default) = this source has no targeted accessor.
-    fn targeted_first_user_message(&self, _session_id: &str) -> Option<String> {
+    /// default) = this source has no targeted accessor; otherwise the read's
+    /// answer or its failure ([`FirstUserMessageRead`]).
+    fn targeted_first_user_message(&self, _session_id: &str) -> Option<FirstUserMessageRead> {
         None
     }
 }
+
+/// One targeted first-user-message read: `Ok(Some(_))` the message,
+/// `Ok(None)` the session has no user message, `Err` the read failed — a
+/// failure is never the "no user message" answer (name-reliability Task 5
+/// review: the naming sweep remembers answers across passes).
+pub type FirstUserMessageRead = Result<Option<String>, crate::parse::OpencodeByIdError>;
 
 /// Open a provider ROOT directory for the SINGLE-PASS checked traversals
 /// below: a MISSING root (`NotFound`/`NotADirectory`) is a genuine empty
@@ -857,18 +866,21 @@ impl OpencodeSource {
     /// lookup for an already-named opencode session (see
     /// [`SessionSource::targeted_first_user_message`]) — one bounded
     /// read-only sqlite query through the same data home the listing uses.
-    pub fn first_user_message_for(&self, session_id: &str) -> Option<String> {
+    pub fn first_user_message_for(&self, session_id: &str) -> FirstUserMessageRead {
         let database_path = self.provider.database_path();
-        let data_home = database_path.parent()?;
+        let data_home = database_path
+            .parent()
+            .ok_or_else(|| crate::parse::OpencodeByIdError {
+                code: None,
+                message: "the opencode database path has no parent directory".to_string(),
+            })?;
         crate::parse::opencode::opencode_first_user_message_by_id(data_home, session_id)
-            .ok()
-            .flatten()
     }
 }
 
 impl SessionSource for OpencodeSource {
-    fn targeted_first_user_message(&self, session_id: &str) -> Option<String> {
-        self.first_user_message_for(session_id)
+    fn targeted_first_user_message(&self, session_id: &str) -> Option<FirstUserMessageRead> {
+        Some(self.first_user_message_for(session_id))
     }
 
     fn discover(&self) -> Vec<FileStat> {
@@ -1309,12 +1321,14 @@ impl SessionIndex {
     /// a targeted accessor (opencode — see
     /// [`SessionSource::targeted_first_user_message`]). One bounded
     /// read-only query per call; the naming sweep consults it only for
-    /// sessions whose generation can still use input, so exhausted or
-    /// protected sessions never pay the lookup.
-    pub fn opencode_first_user_message(&self, session_id: &str) -> Option<String> {
+    /// sessions that can still use the message, so exhausted or protected
+    /// sessions never pay the lookup. No source with a targeted accessor
+    /// answers `Ok(None)`; a failed read is an `Err`.
+    pub fn opencode_first_user_message(&self, session_id: &str) -> FirstUserMessageRead {
         self.sources
             .iter()
             .find_map(|source| source.targeted_first_user_message(session_id))
+            .unwrap_or(Ok(None))
     }
 
     /// Providers whose MOST RECENT listing attempt failed (unsearchable, not
@@ -2772,7 +2786,8 @@ fn load_cache_file(path: &Path) -> HashMap<PathBuf, FileEntry> {
         );
         return HashMap::new();
     }
-    parsed
+    let mut stale_first_messages = 0usize;
+    let entries = parsed
         .entries
         .into_iter()
         .filter_map(|(key, mut entry)| {
@@ -2801,12 +2816,15 @@ fn load_cache_file(path: &Path) -> HashMap<PathBuf, FileEntry> {
                 )
             });
             if stale_first_message {
+                stale_first_messages += 1;
                 return None;
             }
             entry.first_message_rules = FIRST_MESSAGE_RULES_VERSION;
             Some((path, entry))
         })
-        .collect()
+        .collect();
+    log_reparse(stale_first_messages);
+    entries
 }
 
 /// Atomically persist `cache` to `path`: write the full JSON payload to a
@@ -6725,6 +6743,133 @@ pub(crate) mod tests {
                 "load {load}: the cached row is served as stored"
             );
         }
+
+        std::fs::remove_dir_all(&codex_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// Name-reliability Task 5 review: the one-time re-parse is visible in
+    /// the JSONL log — ONE INFO `session_index.first_message_rules_reparse`
+    /// event per load that dropped stale entries, carrying how many and the
+    /// current rules version; a load with nothing stale logs nothing.
+    #[test]
+    fn load_cache_file_logs_the_one_time_reparse() {
+        // The tracing callsite interest cache is process-wide: a parallel
+        // test reaching the same log site with no subscriber of its own can
+        // mute it for this thread's capture. Run the capture alone in a
+        // child process (the codex_history warning-capture convention).
+        const CHILD_ENV: &str = "FRESHELL_REPARSE_LOG_CAPTURE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "directory_index::tests::load_cache_file_logs_the_one_time_reparse",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated reparse-log capture failed: {stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use tracing_subscriber::layer::SubscriberExt;
+        type Fields = std::collections::BTreeMap<String, String>;
+        #[derive(Clone, Default)]
+        struct Capture(Arc<StdMutex<Vec<(tracing::Level, Fields)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visit(Fields);
+                impl tracing::field::Visit for Visit {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.insert(field.name().into(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().into(), value.into());
+                    }
+                }
+                let mut visit = Visit(Fields::new());
+                event.record(&mut visit);
+                if visit.0.get("event").map(String::as_str)
+                    == Some("session_index.first_message_rules_reparse")
+                {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((*event.metadata().level(), visit.0));
+                }
+            }
+        }
+        let capture = Capture::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+
+        let codex_home = unique_temp_dir("persist-reparse-log-codex");
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let source = CodexSource::new(codex_home.clone());
+        let entry = |file: &str, id: &str, first: &str, stale: Option<&str>| {
+            let path = write_codex_rollout(&sessions, file, id, first, "Fix the sardine importer");
+            let entry = pre_task5_entry(&source, &path, stale);
+            (path, entry)
+        };
+        let stale_cache = HashMap::from([
+            entry(
+                "rollout-a.jsonl",
+                "44444444-0000-4000-8000-000000000004",
+                RECOMMENDED_PLUGINS_BLOCK,
+                Some(RECOMMENDED_PLUGINS_BLOCK),
+            ),
+            entry(
+                "rollout-b.jsonl",
+                "55555555-0000-4000-8000-000000000005",
+                RECOMMENDED_PLUGINS_BLOCK,
+                Some(RECOMMENDED_PLUGINS_BLOCK),
+            ),
+            entry(
+                "rollout-c.jsonl",
+                "66666666-0000-4000-8000-000000000006",
+                "Plan the offsite",
+                None,
+            ),
+        ]);
+        let cache_dir = unique_temp_dir("persist-reparse-log-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+        save_cache_file(&cache_path, &stale_cache).unwrap();
+
+        let kept = load_cache_file(&cache_path);
+        assert_eq!(kept.len(), 1, "sanity: the two tag-led entries are dropped");
+        let logged = capture.0.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1, "one event per load: {logged:?}");
+        let (level, fields) = &logged[0];
+        assert_eq!(*level, tracing::Level::INFO);
+        assert_eq!(fields.get("dropped").map(String::as_str), Some("2"));
+        assert_eq!(
+            fields.get("rules_version").map(String::as_str),
+            Some(FIRST_MESSAGE_RULES_VERSION.to_string().as_str())
+        );
+
+        // Nothing stale (the kept entry, now stamped): nothing logged.
+        save_cache_file(&cache_path, &kept).unwrap();
+        assert_eq!(load_cache_file(&cache_path).len(), 1);
+        assert_eq!(
+            capture.0.lock().unwrap().len(),
+            1,
+            "a clean load logs nothing"
+        );
 
         std::fs::remove_dir_all(&codex_home).ok();
         std::fs::remove_dir_all(&cache_dir).ok();

@@ -462,7 +462,8 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
             // for a record below `first_message` or stuck on a junk label
             // under this row's folder (name-reliability Task 5, C5). Answers
             // are remembered across passes per (session, row activity), so a
-            // session with no user message is read once, not every pass.
+            // session with no user message is read once, not every pass; a
+            // failed read is retried after a short window.
             let first_user_message = match s.first_user_message.clone() {
                 Some(message) => Some(message),
                 None => {

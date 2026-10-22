@@ -104,7 +104,7 @@ mod session_name_sweep_batch;
 #[path = "session_name_first_message.rs"]
 mod session_name_first_message;
 use session_name_apply::{indexed_key, replace_automatic, replace_heal, wire_source, with_outcome};
-use session_name_first_message::{first_message_fallback, SeriesPlan};
+use session_name_first_message::{first_message_fallback, RefusalSite, SeriesPlan};
 use session_name_sweep_batch::StagedNativeBaselines;
 pub(crate) use session_name_sweep_batch::{
     SweepMaintenanceItem, SweepMaintenanceQueue, SweepMaintenanceReport, SweepWork,
@@ -1044,11 +1044,16 @@ impl SessionNames {
     /// history. With `absorb`, a present first user message populates the
     /// series' input fingerprint/excerpt at rest (Idle — never eligible):
     /// the boot snapshot must not arm generation for every historical
-    /// session, while a genuinely newly observed message (a later pass, or
-    /// an explicit open's bind) arms it. An existing record is returned
-    /// unchanged — except a self-heal record (name-reliability Task 4: a
-    /// junk default label), which the ladder's first allowed rung replaces
-    /// (no series is created or absorbed on that path).
+    /// session. Wrapper or derived text is never absorbed (name-reliability
+    /// Task 5). The absorbed series arms only on an explicit open — the
+    /// bind's explicit-open hook, or the `Opened` edge of a session open in
+    /// a live terminal; a changed message that a later pass's index feeds
+    /// re-absorbs at rest instead (`session_name_first_message::plan_series`),
+    /// and a newly observed message arms only a session with no series yet.
+    /// An existing record is returned unchanged — except a self-heal record
+    /// (name-reliability Task 4: a junk default label), which the ladder's
+    /// first allowed rung replaces (no series is created or absorbed on that
+    /// path).
     pub(crate) fn hydrate_indexed(
         &self,
         input: IndexedNameInput,
@@ -3440,7 +3445,7 @@ fn claim_generation_start_decision(
     // or derived text is never sent to the model. The claim refuses it
     // without consuming a start and drops the input, so the series rests
     // and the worker is never offered it again.
-    if session_name_first_message::drop_refused_input(series) {
+    if session_name_first_message::drop_refused_input(series, RefusalSite::Claim) {
         return Ok(Decision::Write {
             value: None,
             publish: Vec::new(),

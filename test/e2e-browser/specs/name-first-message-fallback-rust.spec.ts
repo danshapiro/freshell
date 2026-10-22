@@ -20,10 +20,13 @@ import { startRefusingGemini } from '../helpers/native-title-journeys.js'
  * message, and the sweep reports a session open in a live terminal as
  * "opened" — so an open terminal pane kept its folder name.
  *
- * The second case starts the pane in a folder reached through a link with
- * another name: the pane's folder name ("sardine-link") is then not the
- * session's own folder ("project", what the provider records), so nothing
- * but the first-message name of the open session can replace it.
+ * The linked-folder cases start the pane in a folder reached through a link
+ * with another name: the pane's folder name ("sardine-link") is then not
+ * the session's own folder ("project", what each provider records — the
+ * fakes record their real working directory, as the real CLIs do), so
+ * nothing but the first-message name of the open session can replace it.
+ * Those are the cases that fail when the open-session fallback is removed;
+ * the same-folder cases are also healed by the folder-name self-heal.
  *
  * Owned servers only: an isolated home and an ephemeral loopback port per
  * case, stopped by their recorded PID.
@@ -100,7 +103,9 @@ test.describe('first-message name with AI naming failing', () => {
     })
   }
 
-  test('[claude] a pane opened through a linked folder gets the first-message name', async ({ browser }) => {
-    await firstMessageNamesTheTerminalPane('claude', browser, { linkedFolder: true })
-  })
+  for (const mode of ['claude', 'codex', 'opencode'] as const) {
+    test(`[${mode}] a pane opened through a linked folder gets the first-message name`, async ({ browser }) => {
+      await firstMessageNamesTheTerminalPane(mode, browser, { linkedFolder: true })
+    })
+  }
 })

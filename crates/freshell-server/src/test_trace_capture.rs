@@ -132,6 +132,8 @@ fn is_captured(metadata: &tracing::Metadata<'_>) -> bool {
         "freshell_server::session_names" => {
             level == tracing::Level::WARN || level == tracing::Level::INFO
         }
+        // Only first-message lookup failures are retained in on_event.
+        "freshell_server::auto_title_sweep" => level == tracing::Level::WARN,
         _ => false,
     }
 }
@@ -205,6 +207,12 @@ where
             && !visitor
                 .message
                 .contains("session_directory_identity_collision")
+        {
+            return;
+        }
+
+        if metadata.target() == "freshell_server::auto_title_sweep"
+            && visitor.message.split(':').next() != Some("session_names.first_message_lookup_failed")
         {
             return;
         }
