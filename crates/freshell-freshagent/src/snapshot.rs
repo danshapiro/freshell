@@ -707,6 +707,20 @@ mod tests {
         assert_ne!(body["code"], "FRESH_AGENT_LOST_SESSION");
     }
 
+    /// G28: a thread id that cannot be a file name (longer than one path
+    /// component allows) is a clean miss against a healthy store -- 404 lost
+    /// session, never a 500 that blames the store for a bad id.
+    #[tokio::test]
+    async fn claude_locator_with_an_id_no_file_can_be_named_is_404_not_500() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let (_home, _content) = stage_transcript("88888888-8888-4888-8888-888888888888");
+        let too_long = "8".repeat(300);
+        let (status, body) = get_json("freshclaude", "claude", &too_long).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "FRESH_AGENT_LOST_SESSION");
+    }
+
     /// Write a one-user-turn transcript for `durable` under a temp claude store root and
     /// point `CLAUDE_CONFIG_DIR` (the FIRST candidate root) at it. Returns the tempdir
     /// guard + the exact content written (the empty-shape test rebuilds its expectation

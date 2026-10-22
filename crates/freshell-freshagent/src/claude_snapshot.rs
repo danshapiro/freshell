@@ -410,7 +410,8 @@ pub(crate) fn find_transcript(claude_home: &Path, session_id: &str) -> Option<Pa
 /// The three-state traversal of ONE store root, same layout as
 /// [`find_transcript`] (direct, plus one nested level; only real directories
 /// are descended). Expected absence (`NotFound` / `NotADirectory`) is a clean
-/// miss. Any other error is REMEMBERED and the scan keeps going -- a later hit
+/// miss, and so is an id the OS refuses as a file name (no such transcript can
+/// exist). Any other error is REMEMBERED and the scan keeps going -- a later hit
 /// still wins -- so the root answers Unreadable only when nothing was found
 /// and something could not be checked.
 pub(crate) fn find_transcript_state(claude_home: &Path, session_id: &str) -> TranscriptLocation {
@@ -468,12 +469,31 @@ fn subdirs_sorted(dir: &Path, remember: &mut impl FnMut(std::io::Error)) -> Vec<
 }
 
 /// [`candidate_is_file`] with its non-absence error handed to `remember`
-/// (a miss for this candidate; the scan goes on).
+/// (a miss for this candidate; the scan goes on). An error that says the
+/// candidate's NAME is invalid is a plain miss instead: every other
+/// component of the path came from a successful listing, so the rejected
+/// name is the id-derived `<id>.jsonl`, and no transcript can exist under a
+/// name the OS refuses -- that is the id's fault, not the store's.
 fn is_file_or_remember(path: &Path, remember: &mut impl FnMut(std::io::Error)) -> bool {
-    candidate_is_file(path).unwrap_or_else(|e| {
-        remember(e);
-        false
-    })
+    match candidate_is_file(path) {
+        Ok(is_file) => is_file,
+        Err(e) if is_impossible_file_name(&e) => false,
+        Err(e) => {
+            remember(e);
+            false
+        }
+    }
+}
+
+/// The OS refused the path as a name, not as an unreadable place: too long
+/// for one path component (`ENAMETOOLONG`), a reserved character on Windows
+/// (`ERROR_INVALID_NAME`) -- both `InvalidFilename` -- or a NUL byte, which
+/// std rejects as `InvalidInput` before any syscall.
+fn is_impossible_file_name(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidFilename | std::io::ErrorKind::InvalidInput
+    )
 }
 
 /// Error-AWARE variant of [`locate_transcript`] for the resolve endpoint's
@@ -1814,6 +1834,27 @@ pub(crate) mod tests {
             locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
             TranscriptLocation::Absent
         );
+    }
+
+    /// An id the OS rejects as a file name (too long for one path component,
+    /// or carrying a NUL) cannot name a transcript, so a store that holds
+    /// project dirs answers a clean Absent -- never Unreadable, which would
+    /// blame the store for what is wrong with the id.
+    #[test]
+    fn locate_state_reads_an_id_no_file_can_be_named_as_absent() {
+        let home = temp_home();
+        // Real project dirs, both layouts: every candidate probe runs.
+        plant(home.path(), "-repo", LOCATE_ID);
+        std::fs::create_dir_all(home.path().join("projects").join("-repo").join("nested")).unwrap();
+        let too_long = "a".repeat(300);
+        for id in [too_long.as_str(), "abcd\0efgh"] {
+            assert_eq!(
+                locate_transcript_state_in(&[home.path().to_path_buf()], id),
+                TranscriptLocation::Absent,
+                "id {:?}... names no possible file",
+                &id[..id.len().min(12)]
+            );
+        }
     }
 
     #[cfg(unix)]
