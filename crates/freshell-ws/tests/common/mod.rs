@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_ws::WsState;
 
+pub mod claude_rig;
 pub mod opencode_home;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";

@@ -116,6 +116,13 @@ pub struct FreshClaudeState {
     /// Host-only selection of the fixed Freshell stdio MCP recipe. Its endpoint
     /// and grant remain in the child environment, never in create IPC.
     hosted_mcp: bool,
+    /// Test seam (`test-support` feature, C04 rigs): the complete environment of
+    /// every claude sidecar this state spawns, replacing the inherited one (the
+    /// ownership tag is still layered on). `None` in production: the sidecar
+    /// inherits the server's environment. Lets a rig point the real sidecar at
+    /// the CLI simulator or a local endpoint with an isolated HOME, without
+    /// mutating this process's environment.
+    sidecar_environment: Option<Arc<[(String, String)]>>,
     /// The shared WS broadcast bus (pre-serialized frames), fanned out by every
     /// `freshell-ws` connection so the oracle's capture socket records
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`.
@@ -782,6 +789,7 @@ impl FreshClaudeState {
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
             hosted_mcp: false,
+            sidecar_environment: None,
             broadcast_tx,
             checkpoint_event_sink: crate::CheckpointEventSink::default(),
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
@@ -819,6 +827,26 @@ impl FreshClaudeState {
     pub fn with_hosted_mcp(mut self, selected: bool) -> Self {
         self.hosted_mcp = selected;
         self
+    }
+
+    /// Test seam (see [`Self::sidecar_environment`]): every sidecar this state
+    /// spawns gets exactly `environment` (plus its ownership tag) instead of
+    /// inheriting the server's environment.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_sidecar_environment(
+        mut self,
+        environment: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.sidecar_environment = Some(environment.into_iter().collect());
+        self
+    }
+
+    /// Spawn one claude sidecar process (create, attach-resume and rollback all
+    /// come through here).
+    async fn spawn_sidecar_process(
+        &self,
+    ) -> Result<(Child, ChildStdin, ChildStdout, String), String> {
+        spawn_sidecar(self.sidecar_environment.as_deref()).await
     }
 
     pub fn set_checkpoint_event_persister(
@@ -2268,7 +2296,8 @@ impl FreshClaudeState {
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
 
-        let (mut child, mut stdin, stdout, ownership_id) = match spawn_sidecar().await {
+        let (mut child, mut stdin, stdout, ownership_id) = match self.spawn_sidecar_process().await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -7146,7 +7175,8 @@ impl FreshClaudeState {
         // advances the durable tombstone past it and the commit below
         // REFUSES instead of undoing the newer close.
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
-        let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
+        let (mut child, mut stdin, stdout, ownership_id) = self
+            .spawn_sidecar_process()
             .await
             .map_err(ResumeClaudeError::Transient)?;
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
@@ -9533,8 +9563,10 @@ impl FreshClaudeState {
         create_req: &Value,
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
     ) -> Result<RollbackSpawned, RollbackSpawnError> {
-        let (mut child, mut stdin, stdout, ownership_id) =
-            spawn_sidecar().await.map_err(RollbackSpawnError::Other)?;
+        let (mut child, mut stdin, stdout, ownership_id) = self
+            .spawn_sidecar_process()
+            .await
+            .map_err(RollbackSpawnError::Other)?;
         if let Some(g) = lease_guard {
             if let Some(pid) = child.id() {
                 g.set_kill_handle(pid, &ownership_id);
@@ -9636,7 +9668,11 @@ async fn read_session_init(
 /// Spawn `node <sidecar>/index.mjs`, ownership-tagged, inheriting the server's isolated HOME
 /// (so the SDK's `claude` CLI authenticates from + writes under `<isolatedHOME>/.claude`).
 /// Returns the owned child, its stdin, its stdout, and the ownership tag.
-async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), String> {
+/// `environment`: when set, the sidecar's complete environment (the
+/// `test-support` seam); otherwise it inherits this process's.
+async fn spawn_sidecar(
+    environment: Option<&[(String, String)]>,
+) -> Result<(Child, ChildStdin, ChildStdout, String), String> {
     let entry = sidecar_entry_path();
     if !entry.exists() {
         return Err(format!(
@@ -9674,7 +9710,12 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     // Inherit the parent env (HOME=<isolated>, CLAUDE_HOME=<isolated>/.claude) and layer the
     // ownership tag so the /proc reaper can find our sidecar AND the claude CLI grandchild
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
-    // CLAUDECODE + ANTHROPIC_API_KEY).
+    // CLAUDECODE + ANTHROPIC_API_KEY). A configured environment (test rigs) replaces the
+    // inherited one.
+    if let Some(environment) = environment {
+        cmd.env_clear();
+        cmd.envs(environment.iter().map(|(key, value)| (key, value)));
+    }
     cmd.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id);
     if let Some(environment) = freshell_platform::managed_child_secrets::snapshot() {
         if environment.contains_key("ANTHROPIC_API_KEY") {
@@ -9732,7 +9773,7 @@ mod provider_exec_tests {
                     .collect(),
             )
             .unwrap();
-            let mut result = spawn_sidecar().await;
+            let mut result = spawn_sidecar(None).await;
             if let Ok((child, _, _, _)) = &mut result {
                 let pid = child.id().unwrap();
                 child.kill().await.unwrap();
@@ -11239,6 +11280,71 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shutdown_is_safe_with_no_sessions() {
         state().shutdown().await;
+    }
+
+    /// C04 (`test-support` seam): a configured sidecar environment REPLACES the
+    /// inherited one (only the ownership tag is layered on), so a test rig can
+    /// point the real sidecar at the CLI simulator and an isolated HOME without
+    /// touching this process's environment. Unconfigured, the sidecar inherits it.
+    #[tokio::test]
+    async fn a_configured_sidecar_environment_replaces_the_inherited_one() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("print-env.mjs");
+        std::fs::write(
+            &script,
+            "process.stdout.write(JSON.stringify(process.env) + '\\n')\n",
+        )
+        .unwrap();
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_TEST_INHERITED_MARKER", "inherited");
+
+        async fn child_env(state: &FreshClaudeState) -> (HashMap<String, String>, String) {
+            let (mut child, _stdin, stdout, ownership_id) =
+                state.spawn_sidecar_process().await.expect("spawn sidecar");
+            let line = BufReader::new(stdout)
+                .lines()
+                .next_line()
+                .await
+                .expect("read sidecar stdout")
+                .expect("the sidecar prints its environment");
+            let _ = child.wait().await;
+            (serde_json::from_str(&line).expect("env json"), ownership_id)
+        }
+        let configured = state().with_sidecar_environment([
+            (
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_default(),
+            ),
+            (
+                "FRESHELL_TEST_SIDECAR_ENV".to_string(),
+                "chosen".to_string(),
+            ),
+        ]);
+        let (env, ownership_id) = child_env(&configured).await;
+        let (inherited, _) = child_env(&state()).await;
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+        std::env::remove_var("FRESHELL_TEST_INHERITED_MARKER");
+
+        let mut keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                "FRESHELL_TEST_SIDECAR_ENV",
+                "PATH"
+            ],
+            "the configured environment replaces the inherited one: {env:?}"
+        );
+        assert_eq!(env[CLAUDE_SIDECAR_OWNERSHIP_ENV], ownership_id);
+        assert_eq!(
+            inherited
+                .get("FRESHELL_TEST_INHERITED_MARKER")
+                .map(String::as_str),
+            Some("inherited"),
+            "without a configured environment the sidecar inherits this process's"
+        );
     }
 
     // ── freshAgent.create requestId dedup (parity gap fix) ──────────────────
