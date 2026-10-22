@@ -46,12 +46,10 @@ fn automatic_placement_for_owner(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn automatic_primary_intent(
     installation_id: &InstallationId,
     soul_id: SoulId,
     workspace_id: String,
-    provider: &str,
     title_hint: Option<&str>,
     soul_intent_revision: u64,
     now: i64,
@@ -64,19 +62,16 @@ pub fn automatic_primary_intent(
         installation_id,
         soul_id,
         workspace_id,
-        provider,
         Some(&request),
         soul_intent_revision,
         now,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn automatic_primary_intent_from_request(
     installation_id: &InstallationId,
     soul_id: SoulId,
     fallback_workspace_id: String,
-    provider: &str,
     request: Option<&ViewIntentRequest>,
     soul_intent_revision: u64,
     now: i64,
@@ -148,23 +143,11 @@ fn stable_hex(key: &str, domain: &[u8]) -> String {
         .collect()
 }
 
-fn provider_label(provider: &str) -> &str {
-    match provider {
-        "claude" => "Claude",
-        "codex" => "Codex",
-        "opencode" => "OpenCode",
-        "amplifier" => "Amplifier",
-        other => other,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_automatic_primary_in_tx(
     tx: &Transaction<'_>,
     installation_id: &InstallationId,
     soul_id: &SoulId,
     workspace_id: &str,
-    provider: &str,
     soul_intent_revision: u64,
     request: Option<&ViewIntentRequest>,
     now: i64,
@@ -176,7 +159,6 @@ pub(crate) fn ensure_automatic_primary_in_tx(
         installation_id,
         soul_id.clone(),
         workspace_id.to_string(),
-        provider,
         request,
         soul_intent_revision,
         now,
@@ -206,15 +188,14 @@ pub(crate) fn backfill_automatic_view_intents(
 ) -> Result<(), RegistryError> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut statement = tx.prepare(
-        "SELECT s.soul_id,s.project_key,s.provider,s.intent_revision,s.desired_state FROM souls s WHERE EXISTS (SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id AND i.terminal_spec IS NOT NULL) ORDER BY s.created_at,s.soul_id",
+        "SELECT s.soul_id,s.project_key,s.intent_revision,s.desired_state FROM souls s WHERE EXISTS (SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id AND i.terminal_spec IS NOT NULL) ORDER BY s.created_at,s.soul_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, u64>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, u64>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let mut values = Vec::new();
@@ -223,7 +204,7 @@ pub(crate) fn backfill_automatic_view_intents(
     }
     drop(statement);
     let now = now_millis();
-    for (soul, workspace, provider, revision, desired) in values {
+    for (soul, workspace, revision, desired) in values {
         let soul =
             SoulId::parse(soul).map_err(|_| RegistryError::Integrity("invalid soul id".into()))?;
         ensure_automatic_primary_in_tx(
@@ -231,7 +212,6 @@ pub(crate) fn backfill_automatic_view_intents(
             installation_id,
             &soul,
             &workspace,
-            &provider,
             revision,
             None,
             now,
@@ -600,11 +580,11 @@ impl Registry {
         let installation_id = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let (provider, workspace, soul_revision): (String, String, u64) = tx
+            let (workspace, soul_revision): (String, u64) = tx
                 .query_row(
-                    "SELECT provider,project_key,intent_revision FROM souls WHERE soul_id=?1",
+                    "SELECT project_key,intent_revision FROM souls WHERE soul_id=?1",
                     params![request.soul_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| RegistryError::UnknownSoul(request.soul_id.clone()))?;
@@ -960,7 +940,6 @@ mod tests {
             &installation,
             SoulId::parse("soul-one").unwrap(),
             "workspace-one".into(),
-            "opencode",
             None,
             4,
             10,
@@ -975,91 +954,8 @@ mod tests {
             projection_event_id(&intent.view_id, 1)
         );
     }
-
-    /// Name reliability (Task 8, D6): a view intent requested without a title
-    /// stays untitled on both durable write paths (the launch's automatic
-    /// primary and an upserted view), instead of the old "Recovered <X>
-    /// agent" provider label that clients then wrote over real tab names.
-    #[tokio::test]
-    async fn view_intent_without_title_stays_empty() {
-        use crate::admission::AdmissionPolicy;
-        use crate::registry::LaunchPreparation;
-        use freshell_runtime_protocol::{RequestId, RuntimeProfile, UpsertViewIntentRequest};
-
-        let dir = tempfile::tempdir().unwrap();
-        let registry = Registry::open(dir.path(), None).unwrap();
-        let soul = SoulId::new();
-        registry
-            .prepare_launch(LaunchPreparation {
-                soul_id: soul.clone(),
-                provider: "opencode".into(),
-                provider_store_id: "store".into(),
-                native_session_id: None,
-                creation_seed_ref: "seed".into(),
-                request_id: RequestId::new(),
-                payload_digest: "untitled".into(),
-                requested_limits: RuntimeLimits {
-                    cpu_milli: 500,
-                    memory_bytes: 64 * 1024 * 1024,
-                    swap_bytes: 0,
-                    pids_max: 32,
-                },
-                profile: RuntimeProfile::Custom,
-                project_key: "test-project".into(),
-                fixture: None,
-                terminal: None,
-                fresh_agent: None,
-                view_intent: Some(ViewIntentRequest::default()),
-                admission: AdmissionPolicy::default(),
-            })
-            .await
-            .unwrap();
-
-        let snapshot = registry.inventory_snapshot().await.unwrap();
-        let automatic = snapshot
-            .view_intents
-            .iter()
-            .find(|intent| intent.soul_id == soul && intent.kind == ViewIntentKind::AutomaticPrimary)
-            .expect("the launch records its automatic primary view");
-        assert_eq!(automatic.title, "");
-
-        let explicit = registry
-            .upsert_view_intent(UpsertViewIntentRequest {
-                soul_id: soul.clone(),
-                view_id: None,
-                intent: ViewIntentRequest {
-                    kind: ViewIntentKind::Explicit,
-                    preferred_tab_id: Some("tab-explicit".into()),
-                    preferred_pane_id: Some("pane-explicit".into()),
-                    title: Some("   ".into()),
-                    ..ViewIntentRequest::default()
-                },
-                expected_revision: None,
-                expected_soul_intent_revision: 1,
-                expected_control_epoch: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(explicit.title, "");
-
-        // A real title still passes through untouched.
-        let named = registry
-            .upsert_view_intent(UpsertViewIntentRequest {
-                soul_id: soul,
-                view_id: Some(explicit.view_id.clone()),
-                intent: ViewIntentRequest {
-                    kind: ViewIntentKind::Explicit,
-                    preferred_tab_id: Some("tab-explicit".into()),
-                    preferred_pane_id: Some("pane-explicit".into()),
-                    title: Some("Billing bug".into()),
-                    ..ViewIntentRequest::default()
-                },
-                expected_revision: Some(explicit.revision),
-                expected_soul_intent_revision: 1,
-                expected_control_epoch: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(named.title, "Billing bug");
-    }
 }
+
+#[cfg(test)]
+#[path = "view_intent_title_tests.rs"]
+mod title_tests;

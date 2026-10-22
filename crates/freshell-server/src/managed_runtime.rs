@@ -5,7 +5,6 @@ use freshell_runtime_protocol::{
     CleanupState, DesiredState, LaunchRequest, LaunchState, RecoveryBlockReason, RecoveryOutcome,
     RecoveryProbe, RecoveryResult, RecoveryState, RecoveryTrigger, RequestId, RuntimeErrorCode,
     RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
-    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_terminal::registry::{
     ManagedLifecycle, ManagedLifecycleState, ManagedOutputChunk, ManagedOutputCompletion,
@@ -767,16 +766,11 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_secret_references,
                     provider_launch_context,
                 }),
-                view_intent: Some(ViewIntentRequest {
-                    owner_id: String::new(),
-                    workspace_id: project_key.clone(),
-                    kind: ViewIntentKind::AutomaticPrimary,
-                    preferred_tab_id: request.view_tab_id.clone(),
-                    preferred_pane_id: request.view_pane_id.clone(),
-                    title: None,
-                    placement_group: None,
-                    visibility: ViewVisibilityIntent::Visible,
-                }),
+                view_intent: Some(crate::managed_view_intent::automatic_primary_view_request(
+                    project_key.clone(),
+                    request.view_tab_id.clone(),
+                    request.view_pane_id.clone(),
+                )),
                 expected_control_epoch: None,
             };
             // A view returned by this launch may arrive after a concurrent
@@ -1334,17 +1328,6 @@ fn managed_provider_args(mode: &str, args: Vec<String>) -> Result<Vec<String>, S
     });
     freshell_runtime_protocol::durable_managed_terminal_args(mode, args, settings.as_deref())
         .map_err(|error| error.message)
-}
-
-fn provider_label(provider: &str) -> &str {
-    match provider {
-        "claude" => "Claude",
-        "codex" => "Codex",
-        "opencode" => "OpenCode",
-        "amplifier" => "Amplifier",
-        "shell" => "Shell",
-        other => other,
-    }
 }
 
 fn stable_soul_id(key: &str) -> Result<SoulId, String> {

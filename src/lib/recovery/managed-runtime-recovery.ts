@@ -293,13 +293,54 @@ function collisionFreePaneId(
  * a session-owned tab's source pane while it is in the layout, else the
  * tab's first leaf (its original pane).
  */
-function tabNamingPaneId(tab: Tab | undefined, layout: PaneNode | undefined): string | undefined {
+function tabNamingPaneId(tab: Pick<Tab, 'nameSource'> | undefined, layout: PaneNode | undefined): string | undefined {
   if (!layout) return undefined
   if (tab?.nameSource?.kind === 'session') {
     const sourceId = tab.nameSource.paneId
     if (collectNameSourceLeaves(layout).some((leaf) => leaf.paneId === sourceId)) return sourceId
   }
   return firstNameSourceLeaf(layout)?.paneId
+}
+
+/** The tab-level runtime facts a managed view contributes. Never a title. */
+type TabRuntimeFields = Partial<Pick<Tab, 'status' | 'mode' | 'codingCliProvider' | 'initialCwd' | 'sessionRef'>>
+  & ManagedRuntimeProjectionFields
+
+/**
+ * The tab-level updates a pane matched to (or created for) a managed view
+ * makes to its tab: the view's runtime facts when the pane is the tab's
+ * naming pane, nothing otherwise (a managed pane split beside another must
+ * not repurpose the tab). Never a title or any other name field: names
+ * belong to the user and the saved-name mirror. A reconstructed tab passes
+ * its own new leaf, which is its naming pane by construction.
+ */
+function tabLevelUpdatesFromNamingPane(input: {
+  tabId: string
+  tab: Pick<Tab, 'mode' | 'nameSource'> | undefined
+  layout: PaneNode
+  paneId: string
+  soul: ManagedRuntimeSoul
+  view: ManagedRuntimeViewIntent
+}): TabRuntimeFields | Record<string, never> {
+  const { tabId, tab, layout, paneId, soul, view } = input
+  const namingPaneId = tabNamingPaneId(tab, layout)
+  if (namingPaneId !== paneId) {
+    log.debug('managed view matched a pane that does not name its tab; tab fields left alone', {
+      tabId, paneId, namingPaneId, viewId: view.viewId,
+    })
+    return {}
+  }
+  const sessionRef = sessionRefFor(soul)
+  return {
+    status: terminalStatus(soul),
+    mode: (soul.terminalMode || soul.provider || tab?.mode || 'shell') as Tab['mode'],
+    codingCliProvider: soul.provider && soul.provider !== 'shell'
+      ? soul.provider as Tab['codingCliProvider']
+      : undefined,
+    initialCwd: soul.terminalCwd,
+    ...(sessionRef ? { sessionRef } : {}),
+    ...managedProjectionFields(soul, view),
+  }
 }
 
 /**
@@ -323,6 +364,11 @@ function realViewTitle(view: ManagedRuntimeViewIntent, content: TerminalPaneCont
  * replaced. Existing panes are updated in place; only missing visible view
  * intents produce deterministic recovered tabs. Explicit views match by their
  * own view id so two views of one soul remain two views over one writer.
+ *
+ * It merges RUNTIME facts only (name reliability, D6): it never writes a tab
+ * title — a view title is the old provider label at best — and only the
+ * tab's naming pane drives its tab-level fields; applying the plan never
+ * changes a tab's recency.
  */
 export function buildManagedRuntimeMergePlan(
   snapshot: ManagedRuntimeInventorySnapshot,
@@ -343,34 +389,22 @@ export function buildManagedRuntimeMergePlan(
     if (!soul) continue
 
     const location = findPaneForView(locations, soul, view, claimed)
-    const fields = managedProjectionFields(soul, view)
-    const status = terminalStatus(soul)
-    const sessionRef = sessionRefFor(soul)
 
     if (location) {
       claimed.add(`${location.tabId}:${location.paneId}`)
       if (view.visibility === 'visible') representedViewCount += 1
-      const tab = state.tabs.tabs.find((candidate) => candidate.id === location.tabId)
-      const namingPaneId = tabNamingPaneId(tab, state.panes.layouts[location.tabId])
-      if (namingPaneId !== location.paneId) {
-        log.debug('managed view matched a pane that does not name its tab; tab fields left alone', {
-          tabId: location.tabId, paneId: location.paneId, namingPaneId, viewId: view.viewId,
-        })
-      }
       updates.push({
         tabId: location.tabId,
         paneId: location.paneId,
         content: updateExistingContent(location.content, soul, view),
-        tabUpdates: namingPaneId !== location.paneId ? {} : {
-          status,
-          mode: (soul.terminalMode || soul.provider || tab?.mode || 'shell') as Tab['mode'],
-          codingCliProvider: soul.provider && soul.provider !== 'shell'
-            ? soul.provider as Tab['codingCliProvider']
-            : undefined,
-          initialCwd: soul.terminalCwd,
-          ...(sessionRef ? { sessionRef } : {}),
-          ...fields,
-        },
+        tabUpdates: tabLevelUpdatesFromNamingPane({
+          tabId: location.tabId,
+          tab: state.tabs.tabs.find((candidate) => candidate.id === location.tabId),
+          layout: state.panes.layouts[location.tabId],
+          paneId: location.paneId,
+          soul,
+          view,
+        }),
       })
       continue
     }
@@ -404,15 +438,15 @@ export function buildManagedRuntimeMergePlan(
         createRequestId: content.createRequestId,
         ...(title ? { title } : {}),
         ...(scoped ? { nameSource: { kind: 'session' as const, paneId } } : {}),
-        codingCliProvider: soul.provider && soul.provider !== 'shell'
-          ? soul.provider as Tab['codingCliProvider']
-          : undefined,
-        status,
-        mode: content.mode as Tab['mode'],
+        ...tabLevelUpdatesFromNamingPane({
+          tabId,
+          tab: undefined,
+          layout: { type: 'leaf', id: paneId, content },
+          paneId,
+          soul,
+          view,
+        }),
         shell: 'system',
-        initialCwd: soul.terminalCwd,
-        ...(sessionRef ? { sessionRef } : {}),
-        ...fields,
         activate: false,
       },
     })

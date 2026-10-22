@@ -10,16 +10,22 @@
  * into the matched tab's STORED title and bumped its `updatedAt`. A tab the
  * user renamed was skipped, and a session-owned tab displays its cached saved
  * name, so the visible label alone can survive on the unfixed code (LB-B3):
- * these cases assert the stored state — the Redux tab's `title`/`updatedAt`
- * and the persisted layout — on an UNRENAMED shell tab and on a
- * session-owned OpenCode tab.
+ * this case asserts the stored state — the Redux tab's `title`/`updatedAt`
+ * and the persisted layout — on an UNRENAMED shell tab.
+ *
+ * The plan's second case (a managed OpenCode tab) is not here: with the
+ * three OneCLI grant variables unset the supervisor refuses to start a
+ * managed OpenCode TUI ("initial auth source observation failed"; twice in
+ * the Task 8 red receipt), and with them set a case could spend real model
+ * turns. Per the plan's LB-B4 fallback the unit tests and the cloud spec
+ * (`managed-runtime-title-merge.spec.ts`) cover the OpenCode merge.
  *
  * Only the WebSocket is dropped (`harness.forceDisconnect()`); the web server
  * is never restarted, which avoids the pre-existing managed reattach failure
  * after a web restart (out-of-scope finding, P2-G01).
  *
  * Run one case at a time, with the OneCLI grant files removed from the
- * environment so a managed OpenCode case can never spend real model turns:
+ * environment so no managed provider can ever spend real model turns:
  *   env -u FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE -u FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE \
  *     -u FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE pnpm run test:e2e:local --project=chromium \
  *     test/e2e-browser/specs/managed-runtime-names-local-rust.spec.ts --grep '<exact case name>'
@@ -30,8 +36,6 @@ import { test } from '../helpers/fixtures.js'
 import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
-import { openPanePicker } from '../helpers/pane-picker.js'
-import { renameThroughTabEdit } from '../helpers/unified-agent-names.js'
 
 type TerminalIdentity = { tabId: string; paneId: string; terminalId: string; createRequestId: string }
 type StoredTab = { title?: string; titleSetByUser?: boolean; updatedAt?: number }
@@ -168,66 +172,6 @@ test.describe('managed runtime names (local Docker supervisor)', () => {
       expect(await storedTab(harness, tabId)).toEqual(before)
       await expect.poll(() => persistedTabTitle(page, tabId), { timeout: 30_000 }).toBe(before.title)
       expect(await persistedTabTitle(page, tabId)).not.toBe('Shell agent')
-      expect(await terminalCreatesSent(harness)).toBe(0)
-      expect((await rig.inventory()).length).toBe(soulsBefore)
-    } finally {
-      const cleanup = await rig.stop()
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
-    }
-  })
-
-  test('a managed OpenCode tab keeps its stored title after a dropped WebSocket', async ({ page }) => {
-    test.setTimeout(1_200_000)
-    const savedName = 'Billing bug'
-    const rig = new ManagedRuntimeBrowserRig()
-    try {
-      const info = await rig.start()
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-      const harness = new TestHarness(page)
-      const terminal = new TerminalHelper(page)
-      await harness.waitForHarness()
-      await harness.waitForConnection()
-      await ensureShell(page, terminal)
-      await terminal.waitForPrompt({ timeout: 90_000 })
-
-      // A NEW tab whose first content is OpenCode: a session-owned tab.
-      await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.dispatch({
-        type: 'connection/setAvailableClis',
-        payload: { opencode: true },
-      }))
-      const tabsBefore = await harness.getTabCount()
-      await page.locator('[data-context="tab-add"]').click()
-      await harness.waitForTabCount(tabsBefore + 1)
-      const picker = await openPanePicker(page)
-      await picker.getByRole('button', { name: /^OpenCode$/i }).click({ force: true })
-      const directory = page.getByRole('combobox', { name: /Starting directory for OpenCode/i })
-      await expect(directory).toBeVisible({ timeout: 15_000 })
-      await directory.fill(rig.repoRoot)
-      await directory.press('Enter')
-
-      const tabId = (await harness.getActiveTabId())!
-      const pane = await waitForTerminalLeaf(harness, tabId)
-      const view = await waitForValue('the running managed OpenCode view', () => rig.runningViewForTerminal(pane.terminalId), 120_000)
-      await waitForMergedSoul(harness, pane, view)
-      expect((await harness.getState() as { tabs: { tabs: Array<{ id: string; nameSource?: unknown }> } })
-        .tabs.tabs.find((tab) => tab.id === tabId)?.nameSource).toEqual({ kind: 'session', paneId: pane.paneId })
-
-      await renameThroughTabEdit(page, tabId, savedName)
-      // The saved-name mirror holds the name as the stored title.
-      await expect.poll(async () => (await storedTab(harness, tabId)).title, { timeout: 30_000 }).toBe(savedName)
-      // Let the rename's own broadcasts and any refresh they trigger settle.
-      await page.waitForTimeout(2_000)
-      const before = await storedTab(harness, tabId)
-      await expect.poll(() => persistedTabTitle(page, tabId), { timeout: 30_000 }).toBe(savedName)
-      const soulsBefore = (await rig.inventory()).length
-      await harness.clearSentWsMessages()
-
-      await dropWebSocketAndRefresh(harness)
-
-      expect((await waitForTerminalLeaf(harness, tabId)).terminalId).toBe(pane.terminalId)
-      expect(await storedTab(harness, tabId)).toEqual(before)
-      await expect(page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)).toContainText(savedName)
-      await expect.poll(() => persistedTabTitle(page, tabId), { timeout: 30_000 }).toBe(savedName)
       expect(await terminalCreatesSent(harness)).toBe(0)
       expect((await rig.inventory()).length).toBe(soulsBefore)
     } finally {
