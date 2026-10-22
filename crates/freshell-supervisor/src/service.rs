@@ -3562,17 +3562,19 @@ mod host_command_budget_tests {
     /// Every non-control budget is generous; a control round trip is short.
     fn budgets(control_ms: &'static str, dispatch_ms: &'static str) -> HostCommandBudgets {
         HostCommandBudgets::from_lookup(move |name| {
-            Some(if name == HOST_COMMAND_TIMEOUT_ENV {
-                control_ms
-            } else {
-                dispatch_ms
-            })
-            .map(str::to_string)
+            Some(
+                if name == HOST_COMMAND_TIMEOUT_ENV {
+                    control_ms
+                } else {
+                    dispatch_ms
+                }
+                .to_string(),
+            )
         })
     }
 
     fn supervisor(root: &Path, budgets: HostCommandBudgets) -> Supervisor {
-        let registry = Registry::open(&root.join("registry"), None).unwrap();
+        let registry = Registry::open(root.join("registry"), None).unwrap();
         let host_binary_path = root.join("synthetic-host");
         std::fs::write(&host_binary_path, "synthetic-host-artifact").unwrap();
         let mut supervisor = Supervisor::new(
