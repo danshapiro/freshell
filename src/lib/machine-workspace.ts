@@ -1,5 +1,6 @@
 import { getRecoveryInventory } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
+import { captureLegacyNameEvidence } from '@/lib/session-name-migration'
 import {
   getMachineWorkspaceOriginId,
   persistMachineWorkspaceOriginId,
@@ -142,6 +143,15 @@ export async function restoreMachineWorkspace(
     reason: options.reason,
     machineId,
   })
+  // Unified agent names (Task 7): the belt beneath the module-import capture
+  // — preserve every raw legacy layout/backup envelope BEFORE this
+  // bootstrap clears the local cache below. Idempotent (the capture
+  // dedupes by storageKey+raw) and read-only w.r.t. the sources.
+  try {
+    captureLegacyNameEvidence(localStorage)
+  } catch (error) {
+    log.error('legacy-name evidence capture failed before the rebuild; retrying next boot', { error })
+  }
   // The recovery endpoint treats clientInstanceId as an opaque exclusion key.
   // The general recovery offer passes the real id so it cannot offer the page
   // its own already-loaded state. Machine bootstrap is different: a rebuild

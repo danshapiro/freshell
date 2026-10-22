@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
 import { getSelectedMachineId } from '@/lib/machine-identity'
+import { captureLegacyLayoutEnvelope } from '@/lib/session-name-migration'
 import { paneTitleMetadataEquals } from './hydrate-pane-metadata-merge'
 import type { PanesState } from './paneTypes'
 import { hydratePanes, hydratePaneTitles } from './panesSlice'
@@ -438,6 +439,18 @@ export function installCrossTabSync(store: StoreLike): () => void {
     if (isDerivedLayoutKey(key) && isForeignIncomingLayout(store, raw)) return
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
+    // Unified agent names (Task 7): an OLD envelope arriving later through
+    // crossTabSync (a pre-change window's flush, or a duplicate tab before
+    // its rotation remint) is captured as immutable legacy-name evidence
+    // BEFORE the sanitized hydrate below runs — its labels are preserved
+    // for the consolidation import, never evaporated by sanitization.
+    if (isDerivedLayoutKey(key)) {
+      try {
+        captureLegacyLayoutEnvelope(key, raw)
+      } catch {
+        // Capture is best-effort here; the next ready edge re-captures.
+      }
+    }
     // Resolve the own key DYNAMICALLY at every classification/floor point
     // (delta r5 finding 2): the registry lease-collision rotation can
     // remint the layout-window id mid-session
