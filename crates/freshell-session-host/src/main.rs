@@ -647,6 +647,28 @@ async fn dispatch(
                         native_session_id: actor.profile().await.native_session_id,
                     })
                 }
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id,
+                    request_id,
+                    settings,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    let outcome = actor
+                        .configure(request_id.clone(), settings)
+                        .await
+                        .map_err(map_actor_error);
+                    emit_environment_event(configure_outcome_event(&request_id, &outcome));
+                    Ok(HostResult::FreshAgentCommand {
+                        state: outcome?,
+                        native_session_id: actor.profile().await.native_session_id,
+                    })
+                }
                 HostCommand::FreshAgentRollback {
                     incarnation_id,
                     request_id,
@@ -845,6 +867,33 @@ fn unsupported_fresh_agent() -> RuntimeError {
         RuntimeErrorCode::UnsupportedWorkload,
         "incarnation is not a hosted fresh-agent",
     )
+}
+
+/// The JSONL event for one hosted configure, named for what happened to the
+/// settings. Every `Ok` state means the actor saved them for the next send;
+/// only `ProviderAcked` means the provider also applied them live.
+fn configure_outcome_event(
+    request_id: &freshell_runtime_protocol::RequestId,
+    outcome: &Result<freshell_runtime_protocol::CommandState, RuntimeError>,
+) -> serde_json::Value {
+    use freshell_runtime_protocol::CommandState;
+    let (severity, event) = match outcome {
+        Ok(CommandState::ProviderAcked) => ("info", "fresh_agent.configure.applied"),
+        Ok(CommandState::Completed) => ("info", "fresh_agent.configure.staged"),
+        Ok(_) => ("warn", "fresh_agent.configure.live_apply_refused"),
+        Err(_) => ("warn", "fresh_agent.configure.failed"),
+    };
+    let mut logged = serde_json::json!({
+        "severity": severity,
+        "event": event,
+        "stage": "session_host",
+        "request_id": request_id.as_str(),
+    });
+    match outcome {
+        Ok(state) => logged["state"] = serde_json::json!(state),
+        Err(error) => logged["code"] = serde_json::json!(error.code),
+    }
+    logged
 }
 
 fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> RuntimeError {
@@ -10100,6 +10149,164 @@ mod tests {
         assert!(limits.cpu_milli > 0);
         assert!(limits.memory_bytes > 0);
         assert!(limits.pids_max > 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_fresh_agent_configure_rpc_persists_settings_through_the_host_actor() {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("rpc-configure-agent"),
+            FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "fixture-sdk".into(),
+                cwd: "/workspace".into(),
+                model: Some("fixture-model".into()),
+                effort: Some("low".into()),
+                permission_mode: Some("ask".into()),
+                sandbox: None,
+                provider_store_id: "fixture-store".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(Arc::clone(&actor));
+        let configure = || {
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::parse("rpc-configure-one").unwrap(),
+                    settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                        cwd: None,
+                        model: Some("opus".into()),
+                        effort: Some("high".into()),
+                        permission_mode: None,
+                        sandbox: None,
+                    },
+                },
+            )
+        };
+
+        for _ in 0..2 {
+            let result = dispatch(configure(), &state).await.unwrap();
+            assert!(matches!(
+                result,
+                HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    native_session_id: Some(ref native),
+                } if native == "fixture-native-thread"
+            ));
+        }
+        let profile = actor.profile().await;
+        assert_eq!(profile.model.as_deref(), Some("opus"));
+        assert_eq!(profile.effort.as_deref(), Some("high"));
+        assert_eq!(profile.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(
+            transport.operations.load(Ordering::SeqCst),
+            1,
+            "a retried configure request is applied once"
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    /// Re-runs one test of this binary in a fresh process (which, like the
+    /// production host, installs no tracing subscriber) and returns the
+    /// JSONL events it wrote to stderr. Lines that are not JSON (a provider
+    /// child's own stderr) are skipped.
+    fn spawned_test_events(test: &str) -> Vec<serde_json::Value> {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    }
+
+    #[test]
+    fn hosted_configure_outcomes_are_logged_as_jsonl_with_severity() {
+        let applied = spawned_test_events(
+            "tests::authenticated_fresh_agent_configure_rpc_persists_settings_through_the_host_actor",
+        );
+        let event = applied
+            .iter()
+            .find(|event| event["event"] == "fresh_agent.configure.applied")
+            .unwrap_or_else(|| panic!("an applied configure is logged: {applied:?}"));
+        assert_eq!(event["severity"], "info");
+        assert_eq!(event["stage"], "session_host");
+        assert_eq!(event["request_id"], "rpc-configure-one");
+
+        let refused = spawned_test_events(
+            "providers::fresh_agent::tests::hosted_claude_configure_refused_live_keeps_the_intent_and_journals_the_refusal",
+        );
+        let event = refused
+            .iter()
+            .find(|event| event["event"] == "fresh_agent.configure.provider_refused")
+            .unwrap_or_else(|| panic!("a refused live apply is logged: {refused:?}"));
+        assert_eq!(event["severity"], "warn");
+        assert_eq!(event["provider"], "claude");
+        assert_eq!(event["request_id"], "hosted-configure-1");
+        assert_eq!(event["code"], "CLAUDE_SETTINGS_FAILED");
+        assert!(
+            refused
+                .iter()
+                .all(|event| event["event"] != "fresh_agent.configure.applied"),
+            "a refused live apply is never logged as applied: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn hosted_configure_outcome_events_name_what_happened_to_the_settings() {
+        use freshell_runtime_protocol::CommandState;
+        let request_id = RequestId::parse("configure-log").unwrap();
+        for (outcome, severity, event) in [
+            (
+                Ok(CommandState::ProviderAcked),
+                "info",
+                "fresh_agent.configure.applied",
+            ),
+            (
+                Ok(CommandState::Completed),
+                "info",
+                "fresh_agent.configure.staged",
+            ),
+            (
+                Ok(CommandState::Cancelled),
+                "warn",
+                "fresh_agent.configure.live_apply_refused",
+            ),
+            (
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "hosted fresh-agent command failed",
+                )),
+                "warn",
+                "fresh_agent.configure.failed",
+            ),
+        ] {
+            let logged = configure_outcome_event(&request_id, &outcome);
+            assert_eq!(logged["severity"], severity, "{outcome:?}");
+            assert_eq!(logged["event"], event, "{outcome:?}");
+            assert_eq!(logged["stage"], "session_host");
+            assert_eq!(logged["request_id"], "configure-log");
+        }
     }
 
     #[tokio::test]
