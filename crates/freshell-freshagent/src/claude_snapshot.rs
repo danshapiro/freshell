@@ -419,40 +419,55 @@ pub(crate) fn find_transcript_state(claude_home: &Path, session_id: &str) -> Tra
         return TranscriptLocation::Absent;
     }
     let filename = format!("{session_id}.jsonl");
-    let mut first_error: Option<std::io::Error> = None;
-    let mut remember = |e: std::io::Error| {
-        first_error.get_or_insert(e);
-    };
-    for dir in subdirs_sorted(&claude_home.join("projects"), &mut remember) {
+    let mut errors = ScanErrors::default();
+    for dir in subdirs_sorted(&claude_home.join("projects"), &mut errors) {
         let direct = dir.join(&filename);
-        if is_file_or_remember(&direct, &mut remember) {
+        if is_file_or_remember(&direct, &mut errors) {
             return TranscriptLocation::Found(direct);
         }
-        for sub in subdirs_sorted(&dir, &mut remember) {
+        for sub in subdirs_sorted(&dir, &mut errors) {
             let nested = sub.join(&filename);
-            if is_file_or_remember(&nested, &mut remember) {
+            if is_file_or_remember(&nested, &mut errors) {
                 return TranscriptLocation::Found(nested);
             }
         }
     }
-    match first_error {
-        Some(e) => TranscriptLocation::Unreadable(LocateError::io(claude_home, &e)),
+    match errors.first() {
+        Some(e) => TranscriptLocation::Unreadable(LocateError::io(claude_home, e)),
         None => TranscriptLocation::Absent,
     }
 }
 
+/// The one error sink of a [`find_transcript_state`] scan: every branch
+/// (opening a dir, reading one listed entry, probing a candidate) reports
+/// here, so the expected-absence rule lives in exactly one place. Expected
+/// absence (`NotFound` / `NotADirectory` -- e.g. an entry deleted between
+/// the listing and its type check) is never remembered; the FIRST real
+/// error is kept for the Unreadable answer.
+#[derive(Default)]
+struct ScanErrors(Option<std::io::Error>);
+
+impl ScanErrors {
+    fn remember(&mut self, e: std::io::Error) {
+        if !is_expected_absence(&e) {
+            self.0.get_or_insert(e);
+        }
+    }
+
+    fn first(&self) -> Option<&std::io::Error> {
+        self.0.as_ref()
+    }
+}
+
 /// Sorted child DIRECTORIES of `dir` -- the historic [`find_transcript`]
-/// filter (`DirEntry::file_type`, which does not follow symlinks). Expected
-/// absence reads as an empty listing; any other error -- opening `dir` or
-/// reading one entry -- goes to `remember` and the readable entries are
-/// still returned.
-fn subdirs_sorted(dir: &Path, remember: &mut impl FnMut(std::io::Error)) -> Vec<PathBuf> {
+/// filter (`DirEntry::file_type`, which does not follow symlinks). Any error
+/// -- opening `dir` or reading one entry -- goes to `errors` (which drops
+/// expected absence) and the readable entries are still returned.
+fn subdirs_sorted(dir: &Path, errors: &mut ScanErrors) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            if !is_expected_absence(&e) {
-                remember(e);
-            }
+            errors.remember(e);
             return Vec::new();
         }
     };
@@ -461,25 +476,25 @@ fn subdirs_sorted(dir: &Path, remember: &mut impl FnMut(std::io::Error)) -> Vec<
         match entry.and_then(|entry| Ok((entry.file_type()?, entry.path()))) {
             Ok((file_type, path)) if file_type.is_dir() => out.push(path),
             Ok(_) => {}
-            Err(e) => remember(e),
+            Err(e) => errors.remember(e),
         }
     }
     out.sort();
     out
 }
 
-/// [`candidate_is_file`] with its non-absence error handed to `remember`
-/// (a miss for this candidate; the scan goes on). An error that says the
-/// candidate's NAME is invalid is a plain miss instead: every other
-/// component of the path came from a successful listing, so the rejected
-/// name is the id-derived `<id>.jsonl`, and no transcript can exist under a
-/// name the OS refuses -- that is the id's fault, not the store's.
-fn is_file_or_remember(path: &Path, remember: &mut impl FnMut(std::io::Error)) -> bool {
+/// [`candidate_is_file`] with its error handed to `errors` (a miss for this
+/// candidate; the scan goes on). An error that says the candidate's NAME is
+/// invalid is a plain miss instead: every other component of the path came
+/// from a successful listing, so the rejected name is the id-derived
+/// `<id>.jsonl`, and no transcript can exist under a name the OS refuses --
+/// that is the id's fault, not the store's.
+fn is_file_or_remember(path: &Path, errors: &mut ScanErrors) -> bool {
     match candidate_is_file(path) {
         Ok(is_file) => is_file,
         Err(e) if is_impossible_file_name(&e) => false,
         Err(e) => {
-            remember(e);
+            errors.remember(e);
             false
         }
     }
@@ -1855,6 +1870,26 @@ pub(crate) mod tests {
                 &id[..id.len().min(12)]
             );
         }
+    }
+
+    /// The one error sink every scan branch reports to (listing a dir, reading
+    /// one listed entry, probing a candidate): expected absence -- including an
+    /// entry deleted between the listing and its type check -- is never an
+    /// error, and the FIRST real error is the one kept.
+    #[test]
+    fn scan_errors_ignore_expected_absence_and_keep_the_first_real_error() {
+        use std::io::{Error, ErrorKind};
+        let mut errors = ScanErrors::default();
+        errors.remember(Error::from(ErrorKind::NotFound));
+        errors.remember(Error::from(ErrorKind::NotADirectory));
+        assert!(errors.first().is_none(), "expected absence is a clean miss");
+        errors.remember(Error::from(ErrorKind::PermissionDenied));
+        errors.remember(Error::from(ErrorKind::NotFound));
+        errors.remember(Error::from(ErrorKind::Other));
+        assert_eq!(
+            errors.first().map(Error::kind),
+            Some(ErrorKind::PermissionDenied)
+        );
     }
 
     #[cfg(unix)]
