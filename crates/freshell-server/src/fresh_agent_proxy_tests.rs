@@ -1694,7 +1694,7 @@ async fn hosted_configure_reaches_the_owning_host_through_the_real_supervisor() 
             creation_seed_ref: "seed-configure".into(),
             request_id: RequestId::new(),
             payload_digest: "payload-configure".into(),
-            requested_limits: limits.clone(),
+            requested_limits: limits,
             profile: RuntimeProfile::Custom,
             project_key: "workspace".into(),
             fixture: None,
@@ -1725,7 +1725,7 @@ async fn hosted_configure_reaches_the_owning_host_through_the_real_supervisor() 
         .commit_execution_grant(
             prepared.incarnation_id.clone(),
             freshell_runtime_protocol::HostBootId::new(),
-            limits.clone(),
+            limits,
         )
         .await
         .unwrap();
@@ -1761,7 +1761,7 @@ async fn hosted_configure_reaches_the_owning_host_through_the_real_supervisor() 
                         &incarnation_id,
                     ),
                     capabilities: vec![],
-                    effective_limits: limits.clone(),
+                    effective_limits: limits,
                 },
                 HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
                     state: freshell_runtime_protocol::CommandState::ProviderAcked,

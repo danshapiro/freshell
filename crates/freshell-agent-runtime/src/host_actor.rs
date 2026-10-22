@@ -854,6 +854,11 @@ impl FreshAgentHostActor {
         }
     }
 
+    /// Changes this conversation's settings without a turn. The settings are
+    /// persisted into the durable profile (so every later send carries them)
+    /// in the same write that journals the command, before the provider is
+    /// asked to apply them live. A refused live apply keeps that intent; a
+    /// provider without live configure support only stages it.
     pub async fn configure(
         &self,
         request_id: RequestId,
