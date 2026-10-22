@@ -102,7 +102,9 @@ pub struct IndexedSession {
     ///   stamp; see `parse::is_opencode_placeholder_title`). opencode
     ///   names parent sessions itself after the first exchange. `None` for
     ///   placeholder-titled sessions (those instead carry
-    ///   `first_user_message` for the first-message/AI rungs).
+    ///   `first_user_message` for the first-message/AI rungs, and present
+    ///   its derived title — never the placeholder — as [`Self::title`];
+    ///   see `opencode_row_title`).
     pub title_source: Option<String>,
     pub last_activity_at: i64,
     pub created_at: Option<i64>,
@@ -932,18 +934,20 @@ fn opencode_session_to_indexed(
     // override rows (auto_title_sweep.rs::overlay_session_title). Deliberate
     // mainline deviation from the retired Node reference, which never
     // populated titleSource or firstUserMessage for opencode.
-    let provider_named = s.title.as_deref().is_some_and(|t| {
-        !t.trim().is_empty() && !crate::name_evidence::is_provider_placeholder_title("opencode", t)
-    });
+    let provider_named = crate::opencode_row_title::is_opencode_session_name(s.title.as_deref());
     // Compute BEFORE the literal: the IndexedSession construction below
     // moves fields out of `s`, and the helper borrows the whole struct.
     let token_usage = opencode_token_usage(&s, resolver);
+    // Name-reliability Task 4: a placeholder (or blank) title is never the
+    // row's title — the first message's title stands in, else none.
+    let title =
+        crate::opencode_row_title::opencode_row_title(s.title, s.first_user_message.as_deref());
     IndexedSession {
         session_id: s.session_id,
         legacy_session_id: None,
         provider: "opencode".to_string(),
         project_path: s.project_path,
-        title: s.title,
+        title,
         // bool twin of `title_source` -- same predicate, kept consistent
         // (see parse/claude.rs's identical convention).
         title_provider_generated: provider_named,
@@ -5316,6 +5320,113 @@ pub(crate) mod tests {
         // a placeholder title is NOT a provider name
         assert_eq!(items[0].title_source, None);
         assert!(!items[0].title_provider_generated);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// Name-reliability Task 4: opencode's temporary placeholder ("New
+    /// session - <ISO>") is never a row's title — the sidebar and history
+    /// render `title` whenever no saved name is known yet, so a placeholder
+    /// here showed on screen until the session was named. Such a row
+    /// presents the title derived from its first user message (the Claude
+    /// and Codex convention for a transcript without a provider title), else
+    /// no title; a blank stored title is treated the same way, and a real
+    /// opencode name is kept as it is.
+    #[test]
+    fn opencode_placeholder_title_is_never_the_row_title() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-placeholder-title",
+            &[
+                (
+                    "ses_with_message",
+                    "/repo/a",
+                    "New session - 2026-10-20T00:09:25.350Z",
+                    1000,
+                    5000,
+                ),
+                (
+                    "ses_without_message",
+                    "/repo/b",
+                    "New session - 2026-10-20T00:09:26.350Z",
+                    1000,
+                    4000,
+                ),
+                ("ses_blank", "/repo/c", "   ", 1000, 3000),
+                (
+                    "ses_named",
+                    "/repo/d",
+                    "Publishing blocked by token error",
+                    1000,
+                    2000,
+                ),
+            ],
+        );
+        seed_opencode_user_message(
+            &data_home,
+            "ses_with_message",
+            "msg_1",
+            100,
+            "user",
+            &[(
+                "prt_1",
+                r#"{"type":"text","text":"  Check the   publishing pipeline\nthen report back  "}"#,
+            )],
+        );
+        seed_opencode_user_message(
+            &data_home,
+            "ses_blank",
+            "msg_2",
+            100,
+            "user",
+            &[("prt_2", r#"{"type":"text","text":"Rename the blank one"}"#)],
+        );
+        let items = OpencodeSource::new(data_home.clone()).scan();
+        let title_of = |id: &str| {
+            items
+                .iter()
+                .find(|item| item.session_id == id)
+                .unwrap_or_else(|| panic!("{id} is listed"))
+                .title
+                .clone()
+        };
+        assert_eq!(
+            title_of("ses_with_message").as_deref(),
+            Some("Check the publishing pipeline"),
+            "a placeholder row presents its first message's title"
+        );
+        assert_eq!(
+            title_of("ses_without_message"),
+            None,
+            "a placeholder row with no user message presents no title"
+        );
+        assert_eq!(
+            title_of("ses_blank").as_deref(),
+            Some("Rename the blank one"),
+            "a blank stored title is not a name either"
+        );
+        assert_eq!(
+            title_of("ses_named").as_deref(),
+            Some("Publishing blocked by token error"),
+            "opencode's own name is the row title"
+        );
+        for item in &items {
+            let title = item.title.as_deref().unwrap_or_default();
+            assert!(
+                !crate::name_evidence::is_provider_placeholder_title("opencode", title),
+                "{} presents the placeholder {title:?}",
+                item.session_id
+            );
+        }
+        // The derived title is not a provider name: the auto-title ladder
+        // still treats these sessions as unnamed.
+        let unnamed = items
+            .iter()
+            .filter(|item| item.session_id != "ses_named")
+            .collect::<Vec<_>>();
+        assert_eq!(unnamed.len(), 3);
+        for item in unnamed {
+            assert_eq!(item.title_source, None, "{}", item.session_id);
+            assert!(!item.title_provider_generated, "{}", item.session_id);
+        }
         std::fs::remove_dir_all(&data_home).ok();
     }
 
