@@ -69,6 +69,26 @@ async function storedTab(harness: TestHarness, tabId: string): Promise<StoredTab
   return { title: tab.title, titleSetByUser: tab.titleSetByUser, updatedAt: tab.updatedAt }
 }
 
+/**
+ * The stored tab once two reads `quietMs` apart agree. A shell's first prompt
+ * may set an OSC window title, a legitimate legacy write that changes the
+ * stored title and bumps `updatedAt`; a baseline recorded before it settles
+ * would make the "refresh changed nothing" comparison fail without a bug.
+ */
+async function settledStoredTab(harness: TestHarness, tabId: string, quietMs = 1_000): Promise<StoredTab> {
+  let previous: string | null = null
+  let settled: StoredTab | null = null
+  await expect.poll(async () => {
+    const current = await storedTab(harness, tabId)
+    const serialized = JSON.stringify(current)
+    const stable = serialized === previous
+    previous = serialized
+    if (stable) settled = current
+    return stable
+  }, { timeout: 30_000, intervals: [quietMs] }).toBe(true)
+  return settled!
+}
+
 async function paneSoulId(harness: TestHarness, tabId: string): Promise<string | null> {
   const layout = await harness.getPaneLayout(tabId)
   return layout?.type === 'leaf' ? (layout.content?.soulId ?? null) : null
@@ -214,8 +234,11 @@ test.describe('managed runtime title merge', () => {
     const inventory = await routeManagedInventory(page, (revision) => inventoryFor(pane, {
       revision, mode: 'shell', viewTitle: 'Shell agent',
     }))
+    // Record the baseline only after the shell's start-up output (and any
+    // OSC title its first prompt sets) has landed.
+    await terminal.waitForPrompt({ timeout: 30_000, terminalId: pane.terminalId })
+    const before = await settledStoredTab(harness, tabId)
     const label = (await tabLabel(page, tabId).innerText()).trim()
-    const before = await storedTab(harness, tabId)
     expect(before.titleSetByUser).toBeFalsy()
 
     await inventory.enable()
