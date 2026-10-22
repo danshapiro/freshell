@@ -62,6 +62,11 @@ function createStore(
     opencodeActivity?: Partial<OpencodeActivityState>
     includeCodexActivity?: boolean
     includeOpencodeActivity?: boolean
+    attentionByTab?: Record<string, boolean>
+    attentionByPane?: Record<string, boolean>
+    watchedCompletionByTab?: Record<string, boolean>
+    tabAttentionStyle?: 'highlight' | 'pulse' | 'darken' | 'none'
+    attentionDismiss?: 'click' | 'type'
   },
 ) {
   const layouts: Record<string, PaneNode> = {}
@@ -117,8 +122,24 @@ function createStore(
       availableClis: {},
     },
     settings: {
-      settings: defaultSettings,
+      settings: {
+        ...defaultSettings,
+        panes: {
+          ...defaultSettings.panes,
+          ...(opts?.tabAttentionStyle ? { tabAttentionStyle: opts.tabAttentionStyle } : {}),
+          ...(opts?.attentionDismiss ? { attentionDismiss: opts.attentionDismiss } : {}),
+        },
+      },
       loaded: true,
+    },
+    turnCompletion: {
+      seq: 0,
+      lastAtByTerminalId: {},
+      lastIdleAtByTerminalId: {},
+      pendingEvents: [],
+      attentionByTab: opts?.attentionByTab ?? {},
+      attentionByPane: opts?.attentionByPane ?? {},
+      watchedCompletionByTab: opts?.watchedCompletionByTab ?? {},
     },
   }
   if (includeCodexActivity) {
@@ -410,5 +431,85 @@ describe('MobileTabStrip', () => {
     } finally {
       warnSpy.mockRestore()
     }
+  })
+
+  describe('needs-attention marks (G17)', () => {
+    const fourTabs = () => [
+      createTab('tab-1', 'Alpha'),
+      createTab('tab-2', 'Bravo'),
+      createTab('tab-3', 'Charlie'),
+      createTab('tab-4', 'Delta'),
+    ]
+
+    async function renderStrip(store: ReturnType<typeof createStore>) {
+      const { MobileTabStrip } = await import('@/components/MobileTabStrip')
+      render(
+        <Provider store={store}>
+          <MobileTabStrip />
+        </Provider>
+      )
+    }
+
+    it('marks the active tab title when the active tab needs attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', { attentionByTab: { 'tab-2': true } }))
+
+      expect(screen.getByText('Bravo')).toHaveClass('bg-emerald-100')
+      expect(screen.getByRole('button', { name: 'Open tab switcher' }))
+        .toHaveAccessibleDescription('This tab needs attention')
+      expect(screen.queryByRole('status', { name: /other tabs? needs? attention/ })).not.toBeInTheDocument()
+    })
+
+    it('counts the OTHER tabs that need attention in a status', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', {
+        attentionByTab: { 'tab-1': true, 'tab-2': true, 'tab-4': true },
+      }))
+
+      expect(screen.getByRole('status', { name: '2 other tabs need attention' })).toBeInTheDocument()
+    })
+
+    it('dots only the chevron toward the tabs that need attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', { attentionByTab: { 'tab-4': true } }))
+
+      expect(screen.getByRole('button', { name: 'Next tab' }))
+        .toHaveAccessibleDescription('A later tab needs attention')
+      expect(screen.getByRole('button', { name: 'Previous tab' })).toHaveAccessibleDescription('')
+      expect(screen.getByRole('status', { name: '1 other tab needs attention' })).toBeInTheDocument()
+    })
+
+    it('dots the previous chevron for an earlier tab that needs attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-3', { attentionByTab: { 'tab-1': true } }))
+
+      expect(screen.getByRole('button', { name: 'Previous tab' }))
+        .toHaveAccessibleDescription('An earlier tab needs attention')
+      expect(screen.getByRole('button', { name: 'Next tab' })).toHaveAccessibleDescription('')
+    })
+
+    it('counts watched-completion marks like attention marks', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-1', { watchedCompletionByTab: { 'tab-3': true } }))
+
+      expect(screen.getByRole('status', { name: '1 other tab needs attention' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Next tab' }))
+        .toHaveAccessibleDescription('A later tab needs attention')
+    })
+
+    it('shows no mark at all when the attention style is none', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', {
+        tabAttentionStyle: 'none',
+        attentionByTab: { 'tab-1': true, 'tab-2': true, 'tab-4': true },
+      }))
+
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+      expect(screen.getByText('Bravo')).not.toHaveClass('bg-emerald-100')
+      expect(screen.getByRole('button', { name: 'Open tab switcher' })).toHaveAccessibleDescription('')
+      expect(screen.getByRole('button', { name: 'Next tab' })).toHaveAccessibleDescription('')
+      expect(screen.getByRole('button', { name: 'Previous tab' })).toHaveAccessibleDescription('')
+    })
+
+    it('shows no mark when no tab needs attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2'))
+
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+      expect(screen.getByText('Bravo')).not.toHaveClass('bg-emerald-100')
+    })
   })
 })
