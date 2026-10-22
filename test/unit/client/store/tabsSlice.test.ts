@@ -9,6 +9,7 @@ import tabsReducer, {
   closeTab,
   reorderTabs,
   openSessionTab,
+  mirrorSessionTabTitles,
   TabsState,
 } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout, splitPane } from '../../../../src/store/panesSlice'
@@ -297,6 +298,54 @@ describe('tabsSlice', () => {
       )
 
       expect(state.tabs[0].title).toBe('Original')
+    })
+
+    it('bumps updatedAt by default', () => {
+      vi.useFakeTimers({ now: 1_000 })
+      try {
+        let state = tabsReducer(initialState, addTab({ title: 'Original' }))
+        vi.setSystemTime(5_000)
+        state = tabsReducer(state, updateTab({ id: state.tabs[0].id, updates: { status: 'running' } }))
+        expect(state.tabs[0].updatedAt).toBe(5_000)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('leaves updatedAt alone for a display-only refresh (touchUpdatedAt: false)', () => {
+      vi.useFakeTimers({ now: 1_000 })
+      try {
+        let state = tabsReducer(initialState, addTab({ title: 'Original' }))
+        vi.setSystemTime(5_000)
+        state = tabsReducer(state, updateTab({
+          id: state.tabs[0].id,
+          updates: { status: 'running' },
+          touchUpdatedAt: false,
+        }))
+        expect(state.tabs[0].status).toBe('running')
+        expect(state.tabs[0].updatedAt).toBe(1_000)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  describe('mirrorSessionTabTitles', () => {
+    it('sets only the stored title of the named tabs: no updatedAt bump, no freeze flag', () => {
+      vi.useFakeTimers({ now: 1_000 })
+      try {
+        let state = tabsReducer(initialState, addTab({ id: 'a', title: 'freshell', mode: 'claude' }))
+        state = tabsReducer(state, addTab({ id: 'b', title: 'other', mode: 'shell' }))
+        vi.setSystemTime(5_000)
+
+        state = tabsReducer(state, mirrorSessionTabTitles({ a: 'LotL', missing: 'Nobody' }))
+
+        expect(state.tabs.map((tab) => [tab.id, tab.title])).toEqual([['a', 'LotL'], ['b', 'other']])
+        expect(state.tabs[0].updatedAt).toBe(1_000)
+        expect(state.tabs[0].titleSetByUser).toBeUndefined()
+      } finally {
+        vi.useRealTimers()
+      }
     })
   })
 
@@ -1271,14 +1320,17 @@ describe('tabsSlice', () => {
       expect(tab?.title).toBe('User named this')
     })
 
-    it('updates the title of an existing tab found by terminalId when reopened with a new title', async () => {
+    it('updates the title of an existing legacy tab found by terminalId when reopened with a new title', async () => {
       const store = createOpenSessionStore('srv-local')
 
+      // A legacy (not session-owned) tab keeps the legacy retitle; a
+      // session-owned tab's title is the saved-name mirror (next case).
       store.dispatch(addTab({
         id: 'term-tab',
         mode: 'claude',
         title: 'Stale Title',
         sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        nameSource: { kind: 'legacy' },
       }))
       store.dispatch(initLayout({
         tabId: 'term-tab',
@@ -1295,6 +1347,62 @@ describe('tabsSlice', () => {
 
       const tab = store.getState().tabs.tabs.find((item) => item.id === 'term-tab')
       expect(tab?.title).toBe('Fresh Title')
+    })
+
+    it('openSessionTab never retitles an existing session-owned tab', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      // Found by terminalId.
+      store.dispatch(addTab({
+        id: 'owned-by-terminal',
+        mode: 'claude',
+        title: 'LotL',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        nameSource: { kind: 'session', paneId: 'pane-owned-terminal' },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'owned-by-terminal',
+        paneId: 'pane-owned-terminal',
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-owned', status: 'running' },
+      }))
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        terminalId: 'term-owned',
+        title: 'Directory title',
+        hasTitle: true,
+      }))
+      expect(store.getState().tabs.activeTabId).toBe('owned-by-terminal')
+
+      // Found by its session.
+      const otherSession = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+      store.dispatch(addTab({
+        id: 'owned-by-session',
+        mode: 'claude',
+        title: 'Billing bug',
+        sessionRef: { provider: 'claude', sessionId: otherSession },
+        nameSource: { kind: 'session', paneId: 'pane-owned-session' },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'owned-by-session',
+        paneId: 'pane-owned-session',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          status: 'running',
+          sessionRef: { provider: 'claude', sessionId: otherSession },
+        },
+      }))
+      await store.dispatch(openSessionTab({
+        sessionId: otherSession,
+        provider: 'claude',
+        title: 'Directory title',
+        hasTitle: true,
+      }))
+      expect(store.getState().tabs.activeTabId).toBe('owned-by-session')
+
+      const titles = Object.fromEntries(store.getState().tabs.tabs.map((tab) => [tab.id, tab.title]))
+      expect(titles).toEqual({ 'owned-by-terminal': 'LotL', 'owned-by-session': 'Billing bug' })
     })
 
     it('preserves user-set title when reopening by terminalId with titleSetByUser true', async () => {
