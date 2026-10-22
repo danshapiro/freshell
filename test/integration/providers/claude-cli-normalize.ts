@@ -1,6 +1,6 @@
 // Normalized traces for the simulator conformance suite.
 //
-// claude-cli-conformance.test.ts runs every scenario on the real CLI and on
+// claude-cli-conformance.ts runs every scenario on the real CLI and on
 // the simulator (test/fixtures/claude-cli-sim/query.mjs) and requires the two
 // normalized traces to be equal. Normalization keeps what the sidecar and the
 // Rust runtime depend on and drops what is timing noise:

@@ -4,8 +4,9 @@
 //
 // The contract suite (claude-cli-contract.test.ts) reads the labelled trace of
 // the real CLI and asserts the T1-T19 facts; the conformance suite
-// (claude-cli-conformance.test.ts) compares the simulator's normalized trace
-// with the real one (claude-cli-normalize.ts).
+// (claude-cli-conformance.ts, run by the contract file on the same traces)
+// compares the simulator's normalized trace with the real one
+// (claude-cli-normalize.ts).
 
 import { spawn } from 'node:child_process'
 import path from 'node:path'

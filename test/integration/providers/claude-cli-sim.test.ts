@@ -5,7 +5,7 @@
 // aliases), the options ledger, and the sidecar seam it plugs into; plus what
 // a normalized trace cannot see (nothing reaches the disk after the stream
 // ends). The behavior it shares with the real CLI is covered by
-// claude-cli-conformance.test.ts.
+// claude-cli-conformance.ts.
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'

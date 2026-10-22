@@ -2,7 +2,7 @@
 // (crates/freshell-claude-sidecar/index.mjs) running over the CLI simulator
 // (test/fixtures/claude-cli-sim/query.mjs), plugged in through the sidecar's
 // FRESHELL_CLAUDE_SDK_QUERY_MODULE seam. The simulator behaves like the pinned
-// SDK and CLI (claude-cli-conformance.test.ts keeps it honest), so a test
+// SDK and CLI (claude-cli-conformance.ts keeps it honest), so a test
 // written against this harness exercises the sidecar the way production does:
 // no init until a prompt (T1), lifecycle and replays, real result shapes.
 //

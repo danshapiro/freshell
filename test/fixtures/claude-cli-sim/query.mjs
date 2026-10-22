@@ -2,7 +2,7 @@
 // FRESHELL_CLAUDE_SDK_QUERY_MODULE seam that behaves like the pinned Claude
 // Agent SDK 0.3.237 driving its bundled CLI 2.1.237.
 //
-// It is valid only while test/integration/providers/claude-cli-conformance.test.ts
+// It is valid only while test/integration/providers/claude-cli-conformance.ts
 // is green: that suite runs every scenario on the real CLI and on this module
 // and requires equal normalized traces. The facts it reproduces are pinned by
 // claude-cli-contract.test.ts (T1-T19 of

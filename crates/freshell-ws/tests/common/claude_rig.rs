@@ -5,7 +5,7 @@
 //! - [`RigKind::Sim`] (RealSidecarSim): the sidecar over the CLI simulator
 //!   (`test/fixtures/claude-cli-sim/query.mjs`, through the sidecar's
 //!   `FRESHELL_CLAUDE_SDK_QUERY_MODULE` seam). The simulator matches the pinned CLI
-//!   (`test/integration/providers/claude-cli-conformance.test.ts`) and records what
+//!   (`test/integration/providers/claude-cli-conformance.ts`) and records what
 //!   the SDK side received in its ledger ([`ClaudeRig::ledger_rows`]).
 //! - [`RigKind::Cli`] (RealSidecarCli): the sidecar over the pinned SDK and its
 //!   bundled CLI, talking only to the local fake Anthropic endpoint

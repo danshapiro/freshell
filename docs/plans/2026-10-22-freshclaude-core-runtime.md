@@ -720,7 +720,7 @@ Every commit is red → green → refactor and leaves the suite green. Five rule
 ### 11.4 Real-CLI contract tests (vitest, default suite, `test/integration/providers`)
 
 - `claude-cli-contract.test.ts`: T1–T19 as named facts, so a CLI upgrade that breaks one fails by name.
-- `claude-cli-conformance.test.ts`: the same scenarios on `real` and `sim`, compared as normalized traces.
+- `claude-cli-conformance.ts`: the same scenarios on `real` and `sim`, compared as normalized traces. It runs inside `claude-cli-contract.test.ts` on that file's real traces, so each real scenario runs once per test run.
 - `claude-checkpoint-uuid-replay.test.ts`: unchanged.
 
 These are the upgrade gate for any pinned-CLI bump: a failure means the simulator or the design changes first.

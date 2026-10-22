@@ -9,6 +9,10 @@
 // simulator (test/fixtures/claude-cli-sim) or the design changes first. When
 // the pinned CLI is missing, every test FAILS (the scenario runner throws
 // PinnedClaudeMissingError); nothing here is ever skipped.
+//
+// The simulator conformance suite (claude-cli-conformance.ts) runs at the end
+// of this file on the same real-CLI traces, so each real scenario runs once
+// per test run.
 
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -24,6 +28,7 @@ import {
   type TraceEvent,
 } from './claude-cli-trace'
 import { PINNED_CLI_VERSION, PINNED_SDK_VERSION, resolvePinnedClaude } from './claude-local-provider.mjs'
+import { describeSimulatorConformance } from './claude-cli-conformance'
 
 const real = scenarioCache('real', { heartbeat: { timeoutMs: 150_000 } })
 const SCENARIO_TIMEOUT = 120_000
@@ -386,3 +391,5 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(messagesOf(r, 'S').filter((m) => m.type === 'command_lifecycle').every((m) => m.command_uuid === 'u1')).toBe(true)
   }, SCENARIO_TIMEOUT)
 })
+
+describeSimulatorConformance(real)
