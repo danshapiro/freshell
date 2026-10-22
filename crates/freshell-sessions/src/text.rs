@@ -133,6 +133,29 @@ const SYSTEM_CONTEXT_LEAD_TAGS: &[&str] = &[
     "skills_instructions",
 ];
 
+/// Whether `text` (after trimming) opens with a known system-context tag:
+/// `<tag>` or `<tag ` for a tag in `SYSTEM_CONTEXT_LEAD_TAGS`,
+/// case-insensitive (`/^<(environment_context|...)[>\s]/i`, the first
+/// `isSystemContext` alternation). This is ONLY the leading-tag check; the
+/// rest of [`is_system_context`] also flags text a person may use as a name
+/// (`$ cmd`, `1, 2, 3`), so the name classifier
+/// (`crate::name_evidence`) uses this check alone.
+pub fn starts_with_context_tag(text: &str) -> bool {
+    let Some(rest) = text.trim().strip_prefix('<') else {
+        return false;
+    };
+    let lower = rest.to_ascii_lowercase();
+    SYSTEM_CONTEXT_LEAD_TAGS.iter().any(|tag| {
+        // ASCII lowercasing keeps byte offsets, and the tag is ASCII, so
+        // `tag.len()` is a char boundary of `rest` whenever it matched.
+        lower.starts_with(tag)
+            && rest[tag.len()..]
+                .chars()
+                .next()
+                .is_some_and(|next| next == '>' || next.is_whitespace())
+    })
+}
+
 /// `server/coding-cli/utils.ts` `isSystemContext`.
 pub fn is_system_context(text: &str) -> bool {
     let trimmed = text.trim();
@@ -141,17 +164,8 @@ pub fn is_system_context(text: &str) -> bool {
     }
 
     // /^<(environment_context|...)[>\s]/i
-    if let Some(rest) = trimmed.strip_prefix('<') {
-        let lower = rest.to_ascii_lowercase();
-        for tag in SYSTEM_CONTEXT_LEAD_TAGS {
-            if lower.starts_with(tag) {
-                if let Some(next) = rest[tag.len()..].chars().next() {
-                    if next == '>' || next.is_whitespace() {
-                        return true;
-                    }
-                }
-            }
-        }
+    if starts_with_context_tag(trimmed) {
+        return true;
     }
 
     // /^#\s*(AGENTS|Instructions?|System)/i

@@ -31,7 +31,8 @@ const OPENCODE_DB_BUSY_TIMEOUT_MS: u64 = 5000;
 /// name (opencode retitles parent sessions itself after the first
 /// exchange); the directory index surfaces those as provider-generated.
 /// Deliberate mainline deviation: the retired Node reference never
-/// classified opencode titles at all.
+/// classified opencode titles at all. Callers reach it through the shared
+/// name classifier, `crate::name_evidence::is_provider_placeholder_title`.
 pub fn is_opencode_placeholder_title(title: &str) -> bool {
     let rest = ["New session - ", "Child session - ", "New Session - "]
         .iter()
@@ -1011,7 +1012,10 @@ impl OpencodeProvider {
             let needs_naming = row
                 .title
                 .as_deref()
-                .map(|t| t.trim().is_empty() || is_opencode_placeholder_title(t))
+                .map(|t| {
+                    t.trim().is_empty()
+                        || crate::name_evidence::is_provider_placeholder_title("opencode", t)
+                })
                 .unwrap_or(true);
             let first_user_message = if needs_naming {
                 first_user_message_for_session(&conn, &row.session_id)
