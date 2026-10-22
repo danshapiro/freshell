@@ -268,6 +268,19 @@ test.describe('fresh-agent checkpoint availability', () => {
       ]))
       expect(JSON.stringify(content.checkpointOutcomes)).not.toContain(marker)
 
+      // The exact provider turn identity binds to the outcome only after the
+      // accepted turn retires: the codex identity probe waits for the turn to
+      // complete, then reads the thread and broadcasts the identity. That can
+      // land just after the pane goes idle, so wait for it rather than reading
+      // the idle snapshot once.
+      let unavailableOutcome: any
+      await expect.poll(async () => {
+        const layout = await harness.getPaneLayout(tabId!)
+        unavailableOutcome = findFreshAgentLeaf(layout)?.content?.checkpointOutcomes
+          ?.find((entry: any) => entry.status === 'unavailable' && entry.code === 'checkpoint_path_unreadable')
+        return unavailableOutcome?.nativeTurnId
+      }, { timeout: 30_000 }).toEqual(expect.any(String))
+
       await page.evaluate(() => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
@@ -300,9 +313,6 @@ test.describe('fresh-agent checkpoint availability', () => {
       // settling back to idle.
       const threadId = content.sessionRef?.sessionId ?? content.sessionId
       expect(threadId).toBeTruthy()
-      const unavailableOutcome = content.checkpointOutcomes.find((entry: any) => entry.status === 'unavailable'
-        && entry.code === 'checkpoint_path_unreadable')
-      expect(unavailableOutcome?.nativeTurnId).toEqual(expect.any(String))
       const recordedTurnsPath = path.join(info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
       await expect.poll(async () => {
         const raw = await fs.readFile(recordedTurnsPath, 'utf8').catch(() => '[]')
