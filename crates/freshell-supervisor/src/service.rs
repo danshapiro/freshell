@@ -84,6 +84,9 @@ mod claude_source_observation;
 #[path = "native_auth_lookup_tests.rs"]
 mod native_auth_lookup_tests;
 #[cfg(test)]
+#[path = "provider_callback_budget_tests.rs"]
+mod provider_callback_budget_tests;
+#[cfg(test)]
 #[path = "provider_preparation_tests.rs"]
 mod provider_preparation_tests;
 impl Drop for AuthLookupScope {
@@ -119,6 +122,7 @@ pub struct Supervisor {
     provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
     /// Reply budgets for supervisor→session-host commands, read once.
     pub(crate) host_command_budgets: HostCommandBudgets,
+    pub(crate) provider_callback_budgets: ProviderCallbackBudgets,
 }
 
 impl Supervisor {
@@ -169,6 +173,7 @@ impl Supervisor {
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
             host_command_budgets: HostCommandBudgets::from_env(),
+            provider_callback_budgets: ProviderCallbackBudgets::default(),
         })
     }
 
@@ -682,7 +687,14 @@ impl Supervisor {
         }
     }
 
-    fn auth_lookup_scope(&self, start: &crate::registry::RecoveryStart) -> AuthLookupScope {
+    /// Register a recovery scope for nested lookups made inside one
+    /// provider-preparation callback. It lives as long as the supervisor waits
+    /// for that callback (`lifetime`) and is removed when the callback ends.
+    fn auth_lookup_scope(
+        &self,
+        start: &crate::registry::RecoveryStart,
+        lifetime: Duration,
+    ) -> AuthLookupScope {
         let key = uuid::Uuid::new_v4().to_string();
         let mut authorities = self
             .auth_lookup_authorities
@@ -693,7 +705,7 @@ impl Supervisor {
             key.clone(),
             AuthLookupAuthority {
                 start: start.clone(),
-                expires: Instant::now() + Duration::from_secs(30),
+                expires: Instant::now() + lifetime,
             },
         );
         AuthLookupScope {
@@ -2515,10 +2527,13 @@ impl Supervisor {
             }
             _ => None,
         };
-        let scope = self.auth_lookup_scope(start);
-        let claude_recovery_source = if provider == "claude"
-            && matches!(start.context.provider.as_str(), "claude" | "kilroy")
-        {
+        let claude_recovery =
+            provider == "claude" && matches!(start.context.provider.as_str(), "claude" | "kilroy");
+        let scope = self.auth_lookup_scope(
+            start,
+            self.provider_callback_budgets.for_callback(claude_recovery),
+        );
+        let claude_recovery_source = if claude_recovery {
             Some(self.claude_recovery_source_binding(start, &scope.key, context)?)
         } else {
             None
@@ -2605,12 +2620,18 @@ impl Supervisor {
             }
             Ok::<_, std::io::Error>(response)
         };
-        let response = tokio::time::timeout(Duration::from_secs(35), exchange)
+        let budget = self
+            .provider_callback_budgets
+            .for_callback(request.claude_recovery_source.is_some());
+        let response = tokio::time::timeout(budget, exchange)
             .await
             .map_err(|_| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
-                    "capability_pending: server callback timed out",
+                    format!(
+                        "capability_pending: server callback timed out after {}ms",
+                        budget.as_millis()
+                    ),
                 )
             })?
             .map_err(|error| {
@@ -3292,6 +3313,52 @@ impl HostCommandBudgets {
             self.terminal_dispatch
         } else {
             self.control
+        }
+    }
+}
+
+/// Bound on one Claude source observation: the fixed reader's 25-second
+/// operation and 5-second owned cleanup, with slack for the reply.
+pub(crate) const CLAUDE_SOURCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(35);
+
+/// Wait for one provider-preparation callback to the web server, covering the
+/// web server's own work for it (selecting and copying the provider's inputs).
+pub(crate) const PROVIDER_CALLBACK_BUDGET: Duration = Duration::from_secs(35);
+
+/// Wait for a Claude recovery's `issue` callback. Before it answers, the web
+/// server observes the current Claude sources and then the candidate
+/// projection, back to back, each through this supervisor and each bounded by
+/// [`CLAUDE_SOURCE_OBSERVATION_BUDGET`]. The callback's wait covers its own
+/// work plus both observations, so an observation that finishes inside its
+/// own bound is never cut off by the callback around it.
+pub(crate) const CLAUDE_RECOVERY_CALLBACK_BUDGET: Duration = Duration::from_secs(
+    PROVIDER_CALLBACK_BUDGET.as_secs() + 2 * CLAUDE_SOURCE_OBSERVATION_BUDGET.as_secs(),
+);
+
+/// How long the supervisor waits for a provider-preparation callback. The
+/// recovery scope a callback carries lives exactly as long, so a nested
+/// lookup made inside the callback's wait never finds its scope expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderCallbackBudgets {
+    pub(crate) ordinary: Duration,
+    pub(crate) claude_recovery: Duration,
+}
+
+impl Default for ProviderCallbackBudgets {
+    fn default() -> Self {
+        Self {
+            ordinary: PROVIDER_CALLBACK_BUDGET,
+            claude_recovery: CLAUDE_RECOVERY_CALLBACK_BUDGET,
+        }
+    }
+}
+
+impl ProviderCallbackBudgets {
+    pub(crate) fn for_callback(&self, claude_recovery: bool) -> Duration {
+        if claude_recovery {
+            self.claude_recovery
+        } else {
+            self.ordinary
         }
     }
 }

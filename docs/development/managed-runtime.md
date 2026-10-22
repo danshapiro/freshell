@@ -156,11 +156,20 @@ stage took, the budget it had (`budgetMs`) and, when it ran out, the stage it
 ran out before (`budgetExhaustedBefore`), for accepted and refused grants
 alike.
 
+Recovery also calls back to the web server to prepare the replacement's
+provider inputs. That callback waits 35s for the web server's own work; a
+Claude recovery's callback waits 105s, because before it answers the web
+server observes the current Claude sources and then the candidate projection,
+back to back, through the supervisor, and each observation is bounded at 35s
+(the fixed reader's 25s operation plus 5s cleanup). The recovery scope those
+nested lookups present lives exactly as long as the callback wait, so an
+observation that finishes inside its own bound never finds its scope expired.
+
 A launch or recovery holds the soul's lifecycle lock for its whole
-activation, grant included, and `stop` takes the same lock before it commits
-the stop intent. A stop issued during activation therefore waits for the
-activation to settle — up to the dispatch wait (60s by default) when the host
-is slow or silent.
+activation, callback and grant included, and `stop` takes the same lock
+before it commits the stop intent. A stop issued during activation therefore
+waits for the activation to settle — up to the dispatch wait (60s by default)
+when the host is slow or silent, plus the callback wait during a recovery.
 
 The provider projection inside a grant makes every staged file durable before
 it is published. Those flushes overlap (`PROVIDER_PROJECTION_SYNC_WORKERS`) so

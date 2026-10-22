@@ -174,7 +174,7 @@ impl Supervisor {
         // The backend owns a 25-second operation and five-second finite cleanup.
         // This outer deadline permits that cleanup to finish before returning.
         let reply = tokio::time::timeout(
-            Duration::from_secs(35),
+            CLAUDE_SOURCE_OBSERVATION_BUDGET,
             self.backend
                 .observe_claude_sources(&owner, &request, &self.config.test_run_id),
         )
@@ -461,7 +461,7 @@ mod tests {
             .unwrap();
             let lock = supervisor.lifecycle_lock(&soul).await;
             let _held = lock.lock().await;
-            let scope = supervisor.auth_lookup_scope(&start);
+            let scope = supervisor.auth_lookup_scope(&start, CLAUDE_RECOVERY_CALLBACK_BUDGET);
             if matches!(
                 mode,
                 "dropped" | "expired" | "candidate-dropped" | "candidate-expired"
