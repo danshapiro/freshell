@@ -9,6 +9,7 @@ import {
   findFreePort,
   applyIsolatedHomeEnvironment,
   ensureSetupWizardBypassConfig,
+  homeIsolationConflicts,
   type E2eServerInfo,
 } from './server-fixture-support.js'
 import type { E2eServerHandle } from './external-target.js'
@@ -282,7 +283,12 @@ export interface RustServerOptions {
   preserveHomeOnStop?: boolean
   /** Use a specific auth token instead of generating a random one. */
   token?: string
-  /** Extra env vars merged into (and able to override) the spawned server's environment. */
+  /**
+   * Extra env vars merged into (and able to override) the spawned server's
+   * environment — except the owned-home keys (HOME, CODEX_HOME, CLAUDE_HOME,
+   * CLAUDE_CONFIG_DIR, ...), which the isolation always pins under the owned
+   * HOME; start() refuses a conflicting value instead of dropping it.
+   */
   env?: Record<string, string>
   /**
    * Env var name PREFIXES deleted from the spawned server's environment after
@@ -578,6 +584,14 @@ export class RustServer implements E2eServerHandle {
 
   /** Spawn the binary bound to the given home/port/token and wait for health. */
   private async boot(homeDir: string, port: number, token: string): Promise<E2eServerInfo> {
+    const conflicts = homeIsolationConflicts(this.options.env ?? {}, homeDir)
+    if (conflicts.length > 0) {
+      throw new Error(
+        `RustServer options.env cannot set ${conflicts.join(', ')}: the server always runs under its owned `
+        + `HOME (${homeDir}) with provider homes beneath it, e.g. CODEX_HOME=${path.join(homeDir, '.codex')}. `
+        + 'Read provider state under info.homeDir instead.',
+      )
+    }
     const { bin, source } = resolveRustServerBin(process.env)
     if (source === 'override') {
       // eslint-disable-next-line no-console
