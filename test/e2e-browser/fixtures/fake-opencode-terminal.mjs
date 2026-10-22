@@ -145,9 +145,13 @@ function writeFirstUserMessage(sessionId, prompt) {
 
 // With a title sequence the row starts with the placeholder title real
 // opencode writes until it names the session (`New session - <ISO>`);
-// otherwise the historical fixture title (the session id) is kept.
+// FAKE_OPENCODE_UNNAMED=1 keeps that placeholder for good (a session
+// opencode never names, e.g. its own title call failed: name-reliability
+// Task 5's first-message journey); otherwise the historical fixture title
+// (the session id) is kept.
 function initialSessionTitle(sessionId) {
-  return titleSequence.length > 0 ? `New session - ${new Date().toISOString()}` : sessionId
+  const placeholder = titleSequence.length > 0 || process.env.FAKE_OPENCODE_UNNAMED === '1'
+  return placeholder ? `New session - ${new Date().toISOString()}` : sessionId
 }
 
 function writeSessionRow(sessionId, cwd) {

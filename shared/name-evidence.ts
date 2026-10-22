@@ -47,7 +47,9 @@ export type NameEvidenceContext = {
 /**
  * Copy of the server's `SYSTEM_CONTEXT_LEAD_TAGS`
  * (`crates/freshell-sessions/src/text.rs`). The fixture's wrapper-tag rows
- * keep the two lists in step.
+ * keep the two lists in step. The last ten are tool wrapper blocks no
+ * person typed (Codex's model-context fragments and Claude Code's
+ * slash-command and reminder blocks).
  */
 const SYSTEM_CONTEXT_LEAD_TAGS: readonly string[] = [
   'environment_context',
@@ -59,6 +61,16 @@ const SYSTEM_CONTEXT_LEAD_TAGS: readonly string[] = [
   'permissions',
   'collaboration_mode',
   'skills_instructions',
+  'recommended_plugins',
+  'user_shell_command',
+  'user_action',
+  'local-command-caveat',
+  'command-name',
+  'command-message',
+  'command-args',
+  'local-command-stdout',
+  'local-command-stderr',
+  'system-reminder',
 ]
 
 /** Provider and mode labels, lowercase; matched after an optional `recovered ` prefix / ` agent` suffix. */

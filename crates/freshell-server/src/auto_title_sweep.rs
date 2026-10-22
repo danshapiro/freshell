@@ -70,7 +70,17 @@ pub struct AutoTitleSweepState {
     /// messages (no paid titles across history); later passes feed activity
     /// so genuinely newly observed messages arm generation.
     pub index_hydrated: Arc<std::sync::atomic::AtomicBool>,
+    /// Name-reliability Task 5 (C5): the targeted OpenCode first-message
+    /// lookups' memo, kept ACROSS passes (keyed by session id + the index
+    /// row's last activity).
+    pub first_message_lookups: FirstMessageLookupMemo,
 }
+
+// Name-reliability Task 5 (C5): the targeted OpenCode first-message lookup
+// and its cross-pass memo.
+#[path = "auto_title_sweep_lookup.rs"]
+mod first_message_lookup;
+pub use first_message_lookup::FirstMessageLookupMemo;
 
 /// Minimum age before a cwd's git enrichment is re-run when its terminal-set
 /// signature is unchanged (throttled refresh so dirty-status drift still
@@ -187,6 +197,11 @@ pub struct SweepSession {
     /// `session.gitBranch ?? current.branch`, `terminal-metadata-service.ts:195`,
     /// then live git wins in `enrichFromCwd`, `:283`).
     pub git_branch: Option<String>,
+    /// The index row's last activity (`IndexedSession::last_activity_at`):
+    /// it moves whenever the session's transcript does, so it keys the
+    /// sweep's cross-pass first-message lookup memo (name-reliability
+    /// Task 5, C5).
+    pub last_activity_at: i64,
 }
 
 /// One of Node's two `terminal.title.updated` emit sites (the sweep push and
@@ -442,26 +457,20 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
                 session_id: s.session_id.clone(),
             };
             // OpenCode already-named sessions carry no first message in the
-            // bounded listing: the targeted lookup serves eligibility, but
-            // only while the session's generation can still use input (an
-            // exhausted or protected session never pays the read again).
+            // bounded listing: the targeted lookup serves it, but only while
+            // the store can still use it — as generation input, or as a name
+            // for a record below `first_message` or stuck on a junk label
+            // under this row's folder (name-reliability Task 5, C5). Answers
+            // are remembered across passes per (session, row activity), so a
+            // session with no user message is read once, not every pass.
             let first_user_message = match s.first_user_message.clone() {
                 Some(message) => Some(message),
                 None => {
                     if provider == freshell_protocol::session_names::NamedProvider::Opencode
-                        && names.needs_generation_input(&target)
+                        && (names.needs_generation_input(&target)
+                            || names.needs_first_message_input(&target, s.cwd.as_deref()))
                     {
-                        if let Some(index) = state.index.clone() {
-                            let session_id = s.session_id.clone();
-                            tokio::task::spawn_blocking(move || {
-                                index.opencode_first_user_message(&session_id)
-                            })
-                            .await
-                            .ok()
-                            .flatten()
-                        } else {
-                            None
-                        }
+                        first_message_lookup::opencode_first_message(state, s).await
                     } else {
                         None
                     }
@@ -581,6 +590,12 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
                 settled_this_pass.insert(session_key);
             }
         }
+        state.first_message_lookups.retain_sessions(
+            &sessions
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<HashSet<&str>>(),
+        );
         let items = maintenance.into_items();
         if !items.is_empty() || names.has_staged_native_baselines() {
             if let Err(error) = names.sweep_maintenance(items).await {
@@ -869,6 +884,7 @@ pub fn spawn_auto_title_sweep(
                         first_user_message: s.first_user_message.clone(),
                         title_source: s.title_source.clone(),
                         git_branch: s.git_branch.clone(),
+                        last_activity_at: s.last_activity_at,
                     }
                 })
                 .collect();
@@ -967,6 +983,7 @@ mod tests {
             metadata: crate::session_metadata::SessionMetadataStore::new(dir),
             index,
             index_hydrated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            first_message_lookups: Default::default(),
         };
         (state, rx)
     }
@@ -990,6 +1007,7 @@ mod tests {
             first_user_message: first.map(str::to_string),
             title_source: None,
             git_branch: None,
+            last_activity_at: 0,
         }
     }
 
@@ -1580,6 +1598,7 @@ mod tests {
                     first_user_message: s.first_user_message.clone(),
                     title_source: s.title_source.clone(),
                     git_branch: s.git_branch.clone(),
+                    last_activity_at: s.last_activity_at,
                 }
             })
             .collect();

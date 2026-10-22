@@ -24,6 +24,7 @@ pub mod codex_history;
 pub mod codex_locator;
 pub mod codex_segments;
 pub mod directory_index;
+mod first_message_rules;
 pub mod meta;
 pub mod name_evidence;
 pub mod opencode_locator;

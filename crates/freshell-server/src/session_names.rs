@@ -99,7 +99,12 @@ mod session_name_apply;
 mod session_name_policy;
 #[path = "session_name_sweep_batch.rs"]
 mod session_name_sweep_batch;
+// Name-reliability Task 5: the first-message fallback, re-absorb at rest
+// and the prompt-input guard.
+#[path = "session_name_first_message.rs"]
+mod session_name_first_message;
 use session_name_apply::{indexed_key, replace_automatic, replace_heal, wire_source, with_outcome};
+use session_name_first_message::{first_message_fallback, SeriesPlan};
 use session_name_sweep_batch::StagedNativeBaselines;
 pub(crate) use session_name_sweep_batch::{
     SweepMaintenanceItem, SweepMaintenanceQueue, SweepMaintenanceReport, SweepWork,
@@ -108,6 +113,11 @@ pub(crate) use session_name_sweep_batch::{
 #[cfg(test)]
 #[path = "session_names_tests.rs"]
 mod tests;
+// Name-reliability Task 5: the first-message fallback, wrapper-text and
+// generation-input rules, end to end through the store and the sweep.
+#[cfg(test)]
+#[path = "session_name_plan_activity_tests.rs"]
+mod plan_activity_tests;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -965,8 +975,11 @@ impl SessionNames {
     /// its input fingerprint the targeted first-message lookup has no
     /// remaining eligibility value — an armed-unexhausted named opencode
     /// session never pays the transcript read again on every pass).
-    /// Bounds the targeted first-message lookups: an input-carrying,
-    /// exhausted, or protected session never pays a transcript read.
+    /// One of the two conditions that gate the sweep's targeted
+    /// first-message lookups (with [`Self::needs_first_message_input`],
+    /// name-reliability Task 5): an input-carrying, exhausted, or protected
+    /// session pays a transcript read only while its NAME can still use the
+    /// message, and the sweep remembers each answer across passes.
     pub(crate) fn needs_generation_input(&self, target: &SessionNameRef) -> bool {
         let view = self.core.current_view();
         let document = &view.document;
@@ -984,6 +997,29 @@ impl SessionNames {
                 series.status != GenerationStatus::Exhausted && series.input_fingerprint.is_none()
             }
         }
+    }
+
+    /// Name-reliability Task 5 (C5): whether a scoped session's record can
+    /// still use its first user message as a NAME — true when no record
+    /// exists yet, the record is below `first_message`, or the record is a
+    /// self-heal record (a junk default label) under the index row's folder
+    /// `cwd`. The sweep's targeted OpenCode first-message lookup runs when
+    /// this OR [`Self::needs_generation_input`] holds, so a session stuck on
+    /// its folder name gets the lookup even after generation stopped
+    /// needing input. A lock-free read of the adopted view.
+    pub(crate) fn needs_first_message_input(
+        &self,
+        target: &SessionNameRef,
+        cwd: Option<&str>,
+    ) -> bool {
+        let view = self.core.current_view();
+        let document = &view.document;
+        let (resolved, _) = document.resolve_ref(target);
+        document
+            .record_at(&name_ref_key(&resolved))
+            .is_none_or(|record| {
+                session_name_first_message::record_needs_first_message(record, cwd)
+            })
     }
 
     /// Task 4 dispatch re-check: whether the target's CURRENT accepted
@@ -1087,11 +1123,16 @@ impl SessionNames {
     /// changed, not lost). A genuinely new record is always "pending" here,
     /// so a foreign process's hydration is never skipped over.
     ///
-    /// The answer classifies the work for the sweep: a plan that only
-    /// replaces a self-heal record rides the pass's maintenance batch
+    /// The answer classifies the work for the sweep: a plan that is only
+    /// maintenance — a self-heal replacement (Task 4), a re-derived first
+    /// message re-absorbed at rest, or refused wrapper input dropped
+    /// (Task 5) — rides the pass's maintenance batch
     /// ([`SweepWork::Maintenance`]); anything that arms generation, raises a
     /// real name's rank, or must surface NotFound transacts on its own
-    /// ([`SweepWork::Immediate`]).
+    /// ([`SweepWork::Immediate`]). Every non-boot pass feeds each indexed
+    /// session's first message, and an open or resumed session's message
+    /// now offers the fallback too, so the plan settles (None) once the
+    /// name and the series' input agree with the message.
     pub(crate) fn activity_work(&self, input: &NameActivity) -> SweepWork {
         let view = self.core.current_view();
         let Ok((key, _record)) = required_record(&view.document, &input.target) else {
@@ -1109,7 +1150,7 @@ impl SessionNames {
         );
         if plan.is_noop() {
             SweepWork::None
-        } else if plan.arm.is_none() && plan.offer_heals {
+        } else if plan.is_maintenance() {
             SweepWork::Maintenance
         } else {
             SweepWork::Immediate
@@ -2398,16 +2439,6 @@ fn directory_fallback_name(cwd: Option<&str>, provider: &NamedProvider) -> Strin
     validate_name(&candidate).unwrap_or(label)
 }
 
-/// The first-message fallback title (the existing 50-char extraction).
-fn first_message_fallback(message: &str) -> Option<String> {
-    let title = freshell_sessions::text::extract_title_from_message(message, 50);
-    if title.is_empty() {
-        None
-    } else {
-        Some(title)
-    }
-}
-
 /// Bounded first-message excerpt retained for generation (existing prompt cap).
 fn excerpt_of(message: &str) -> String {
     message
@@ -2948,16 +2979,12 @@ fn bind_pending_decision(
     // the session. An unattempted absorbed series (hydration installed the
     // fingerprint at rest so history alone never schedules the paid title)
     // becomes eligible now; an attempted series keeps its own schedule, and
-    // a protected winner keeps generation stopped.
+    // a protected winner keeps generation stopped. Name-reliability Task 5:
+    // a series whose stored input is wrapper or derived text stays Idle and
+    // drops it (never armed from it).
     if !source_is_protected(record.source) {
         if let Some(series) = document.generation.get_mut(&target_key) {
-            if series.status == GenerationStatus::Idle
-                && series.consumed == 0
-                && series.input_fingerprint.is_some()
-            {
-                series.status = GenerationStatus::Eligible;
-                series.next_due = None;
-            }
+            session_name_first_message::explicit_open(series);
         }
     }
 
@@ -2975,30 +3002,43 @@ struct ActivityPlan {
     /// The fallback replaces a self-heal record WITHOUT raising its rank
     /// (name-reliability Task 4): maintenance work the sweep may batch.
     offer_heals: bool,
-    /// The (fingerprint, excerpt) that would (re)arm the generation series.
-    arm: Option<(String, String)>,
+    /// What the activity does to the generation series
+    /// (`session_name_first_message::plan_series`).
+    series: Option<SeriesPlan>,
 }
 
 impl ActivityPlan {
     fn is_noop(&self) -> bool {
-        self.offer_fallback.is_none() && self.arm.is_none()
+        self.offer_fallback.is_none() && self.series.is_none()
+    }
+
+    /// Only maintenance (name-reliability Tasks 4–5): a self-heal
+    /// replacement, an input re-absorbed at rest, a refused input dropped —
+    /// nothing that arms generation or raises a real name. The sweep may
+    /// batch it.
+    fn is_maintenance(&self) -> bool {
+        let series_maintenance = self.series.as_ref().is_none_or(|plan| !plan.arms());
+        let offer_maintenance = self.offer_fallback.is_none() || self.offer_heals;
+        !self.is_noop() && series_maintenance && offer_maintenance
     }
 }
 
 /// Evaluate the activity acceptance/arming conditions (delta-review round 3,
-/// finding 2, extracted verbatim from the former inline decision so the
-/// pre-check and the transaction share ONE policy). Callers apply the
-/// unified-mode scope admission BEFORE planning:
-/// - the first-message fallback offer runs only for accepted/index user
-///   messages, only when the extraction is a valid name, and only when the
-///   automatic-offer rule accepts it (`session_name_policy`): it RAISES a
-///   real name's rank, or it replaces a self-heal record (a junk default
-///   label, classified with the activity's own `cwd`) — name-reliability
-///   Task 4;
-/// - arming is skipped for protected sources, duplicate delivery (same input
-///   fingerprint) and exhausted series; Opened/Resumed arm only an
-///   unattempted series, except the boot-absorbed Idle series an explicit
-///   open may still arm.
+/// finding 2: the pre-check and the transaction share ONE policy). Callers
+/// apply the unified-mode scope admission BEFORE planning:
+/// - the first-message fallback is offered for EVERY reason that carries a
+///   first user message — accepted, indexed, opened and resumed alike
+///   (name-reliability Task 5, D4: an open terminal pane's session no longer
+///   keeps its folder name when AI naming fails) — only when the extraction
+///   is a valid name that is not a default or derived label (never wrapper
+///   text, RC12), and only when the automatic-offer rule accepts it
+///   (`session_name_policy`): it RAISES a real name's rank, or it replaces a
+///   self-heal record (a junk default label, classified with the activity's
+///   own `cwd`) — Task 4;
+/// - the series plan (`session_name_first_message::plan_series`) is skipped
+///   for protected sources; it arms on new input or an explicit open of an
+///   unattempted series, re-absorbs a re-derived indexed message at rest,
+///   and drops refused (wrapper) input — Task 5.
 fn plan_activity(
     document: &StoredDocument,
     key: &str,
@@ -3009,76 +3049,27 @@ fn plan_activity(
     let mut plan = ActivityPlan {
         offer_fallback: None,
         offer_heals: false,
-        arm: None,
+        series: None,
     };
     let Some(record) = document.record_at(key) else {
         return plan;
     };
-    if matches!(
-        reason,
-        NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage
-    ) {
-        if let Some(message) = first_user_message {
-            if let Some(fallback) = first_message_fallback(message) {
-                if validate_name(&fallback).is_ok()
-                    && session_name_policy::automatic_offer_applies(
-                        record,
-                        &fallback,
-                        NameSource::FirstMessage,
-                        cwd,
-                    )
-                {
-                    plan.offer_heals =
-                        source_rank(NameSource::FirstMessage) <= source_rank(record.source);
-                    plan.offer_fallback = Some(fallback);
-                }
-            }
+    if let Some(fallback) = first_user_message.and_then(first_message_fallback) {
+        if validate_name(&fallback).is_ok()
+            && session_name_policy::automatic_offer_applies(
+                record,
+                &fallback,
+                NameSource::FirstMessage,
+                cwd,
+            )
+        {
+            plan.offer_heals = source_rank(NameSource::FirstMessage) <= source_rank(record.source);
+            plan.offer_fallback = Some(fallback);
         }
     }
     if !source_is_protected(record.source) {
-        if let Some(message) = first_user_message.map(str::trim).filter(|m| !m.is_empty()) {
-            let unattempted_only = match reason {
-                NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage => {
-                    true
-                }
-                NameActivityReason::Opened | NameActivityReason::Resumed => document
-                    .generation
-                    .get(key)
-                    .is_none_or(|series| series.consumed == 0),
-            };
-            if unattempted_only {
-                let fingerprint = fingerprint_message(message);
-                let needs_arm = match document.generation.get(key) {
-                    None => true,
-                    Some(series) => {
-                        if series.input_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                            true
-                        } else {
-                            // "Explicit open/resume may arm an unattempted
-                            // series": the boot snapshot's absorbed series
-                            // (Idle, consumed == 0) rests until the user
-                            // actually opens the session — the same message
-                            // then arms it. An attempted series (Eligible
-                            // retry, InFlight, Exhausted) never resets.
-                            reason == NameActivityReason::Opened
-                                && series.status == GenerationStatus::Idle
-                                && series.consumed == 0
-                        }
-                    }
-                };
-                if needs_arm {
-                    // An exhausted series never re-arms (the apply path's
-                    // own guard, mirrored so the pre-check is view-accurate).
-                    let exhausted = document
-                        .generation
-                        .get(key)
-                        .is_some_and(|series| series.status == GenerationStatus::Exhausted);
-                    if !exhausted {
-                        plan.arm = Some((fingerprint, excerpt_of(message)));
-                    }
-                }
-            }
-        }
+        plan.series =
+            session_name_first_message::plan_series(document, key, reason, first_user_message);
     }
     plan
 }
@@ -3162,31 +3153,10 @@ fn apply_activity(
         applied.visible = true;
     }
 
-    let mut armed_or_updated = false;
-    if let Some((fingerprint, excerpt)) = plan.arm {
-        let series = document
-            .generation
-            .entry(key.clone())
-            .or_insert_with(|| GenerationState {
-                status: GenerationStatus::Eligible,
-                series_id: Uuid::new_v4().to_string(),
-                input_fingerprint: None,
-                excerpt: None,
-                attempt_ids: Vec::new(),
-                attempt_starts: Vec::new(),
-                consumed: 0,
-                next_due: None,
-                exhausted_at: None,
-            });
-        if series.status != GenerationStatus::Exhausted {
-            series.status = GenerationStatus::Eligible;
-            series.input_fingerprint = Some(fingerprint);
-            series.excerpt = Some(excerpt);
-            series.next_due = None;
-            armed_or_updated = true;
-        }
+    if let Some(series_plan) = plan.series {
+        applied.bookkeeping =
+            session_name_first_message::apply_series_plan(document, &key, series_plan);
     }
-    applied.bookkeeping = armed_or_updated;
     Ok(applied)
 }
 
@@ -3466,6 +3436,16 @@ fn claim_generation_start_decision(
             return Ok(Decision::Read(None));
         }
     }
+    // Name-reliability Task 5, the prompt-input guard's last line: wrapper
+    // or derived text is never sent to the model. The claim refuses it
+    // without consuming a start and drops the input, so the series rests
+    // and the worker is never offered it again.
+    if session_name_first_message::drop_refused_input(series) {
+        return Ok(Decision::Write {
+            value: None,
+            publish: Vec::new(),
+        });
+    }
     // Persist the start before dispatch; empty/invalid answers and
     // interrupted starts consume it.
     let series_id = series.series_id.clone();
@@ -3681,10 +3661,12 @@ fn hydrate_indexed_decision(
     // genuinely new session), no series is created here: the activity feed
     // right after arms it with the newly observed message.
     if absorb {
+        // Name-reliability Task 5: wrapper or derived text is never absorbed
+        // as AI-naming input.
         if let Some(message) = first_user_message
             .as_deref()
             .map(str::trim)
-            .filter(|m| !m.is_empty())
+            .filter(|m| session_name_first_message::is_generation_input(m))
         {
             document.generation.insert(
                 key.clone(),

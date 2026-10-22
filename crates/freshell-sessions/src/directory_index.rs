@@ -46,6 +46,7 @@ use crate::codex_segments::{
     compose_codex_segments, scan_codex_file_bytes_evidence, CodexComposition, CodexFileEvidence,
     CodexSegmentEntry, CodexUnresolvedIdentity,
 };
+use crate::first_message_rules::{cached_first_message_is_stale, FIRST_MESSAGE_RULES_VERSION};
 use crate::meta::ParsedSessionMeta;
 use crate::provider_layout::ProviderLayout;
 use crate::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
@@ -1073,6 +1074,13 @@ struct FileEntry {
     /// partial composition.
     #[serde(default)]
     codex_evidence: Option<CodexFileEvidence>,
+    /// The first-message rules version this entry was derived under
+    /// (name-reliability Task 5; `crate::first_message_rules`). Older cache
+    /// files omit it (0); `load_cache_file` drops an older entry whose
+    /// cached first message the newer rules would derive differently, and
+    /// stamps every entry it keeps. An older binary ignores the field.
+    #[serde(default)]
+    first_message_rules: u32,
 }
 
 /// The cached, TTL-refreshed session index composed from one or more
@@ -2487,6 +2495,7 @@ fn refresh_snapshot(
                         size: stat.size,
                         item,
                         codex_evidence,
+                        first_message_rules: FIRST_MESSAGE_RULES_VERSION,
                     },
                 );
                 if content_moved {
@@ -2542,6 +2551,7 @@ fn refresh_snapshot(
                                 size: stat.size,
                                 item,
                                 codex_evidence,
+                                first_message_rules: FIRST_MESSAGE_RULES_VERSION,
                             },
                         );
                         if content_moved {
@@ -2765,7 +2775,7 @@ fn load_cache_file(path: &Path) -> HashMap<PathBuf, FileEntry> {
     parsed
         .entries
         .into_iter()
-        .filter_map(|(key, entry)| {
+        .filter_map(|(key, mut entry)| {
             let path = PathBuf::from(key);
             let has_legacy_claude_identity = entry.item.as_ref().is_some_and(|item| {
                 item.provider == "claude"
@@ -2776,7 +2786,25 @@ fn load_cache_file(path: &Path) -> HashMap<PathBuf, FileEntry> {
             // discard only legacy Claude rows that cached an embedded
             // (usually parent) sessionId. Matching Claude entries, exclusions
             // (`item: None`), and every other provider remain warm.
-            (!has_legacy_claude_identity).then_some((path, entry))
+            if has_legacy_claude_identity {
+                return None;
+            }
+            // Name-reliability Task 5: the same targeted invalidation for a
+            // first message the older rules derived from tool wrapper text
+            // (re-parsed once); every kept entry is stamped current, so it
+            // is never content-retested.
+            let stale_first_message = entry.item.as_ref().is_some_and(|item| {
+                cached_first_message_is_stale(
+                    entry.first_message_rules,
+                    &item.provider,
+                    item.first_user_message.as_deref(),
+                )
+            });
+            if stale_first_message {
+                return None;
+            }
+            entry.first_message_rules = FIRST_MESSAGE_RULES_VERSION;
+            Some((path, entry))
         })
         .collect()
 }
@@ -6365,6 +6393,7 @@ pub(crate) mod tests {
                     size: matching_stat.size,
                     item: source.parse(&matching_path),
                     codex_evidence: None,
+                    first_message_rules: 0,
                 },
             ),
             (
@@ -6375,6 +6404,7 @@ pub(crate) mod tests {
                     size: child_stat.size,
                     item: Some(legacy_child),
                     codex_evidence: None,
+                    first_message_rules: 0,
                 },
             ),
         ]);
@@ -6418,6 +6448,285 @@ pub(crate) mod tests {
         );
 
         std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// Name-reliability Task 5: a Codex source whose parses are counted while
+    /// every Codex-specific path (evidence, composition) stays the real one.
+    struct CountedCodexSource {
+        inner: CodexSource,
+        parse_calls: Arc<AtomicUsize>,
+    }
+
+    impl SessionSource for CountedCodexSource {
+        fn discover(&self) -> Vec<FileStat> {
+            self.inner.discover()
+        }
+
+        fn parse(&self, path: &Path) -> Option<IndexedSession> {
+            self.parse_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.parse(path)
+        }
+
+        fn parse_with_codex_evidence(
+            &self,
+            path: &Path,
+        ) -> (Option<IndexedSession>, Option<CodexFileEvidence>) {
+            self.parse_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.parse_with_codex_evidence(path)
+        }
+
+        fn compose_codex_segments(&self, entries: Vec<CodexSegmentEntry>) -> CodexComposition {
+            self.inner.compose_codex_segments(entries)
+        }
+
+        fn provider_name(&self) -> Option<&'static str> {
+            self.inner.provider_name()
+        }
+
+        fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+            self.inner.discover_checked()
+        }
+
+        fn stat_scoped(&self, path: &Path) -> Option<FileStat> {
+            self.inner.stat_scoped(path)
+        }
+    }
+
+    const RECOMMENDED_PLUGINS_BLOCK: &str =
+        "<recommended_plugins>\n- github: review pull requests\n</recommended_plugins>";
+
+    /// One Codex rollout whose first user record is the given text, then a
+    /// real prompt.
+    fn write_codex_rollout(
+        sessions: &Path,
+        file: &str,
+        id: &str,
+        first_record: &str,
+        prompt: &str,
+    ) -> PathBuf {
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-10-01T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": id, "cwd": "/project/sardines", "model_provider": "openai"},
+            }),
+            serde_json::json!({
+                "timestamp": "2026-10-01T00:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": first_record}],
+                },
+            }),
+            serde_json::json!({
+                "timestamp": "2026-10-01T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": prompt},
+            }),
+        ];
+        let body = lines
+            .iter()
+            .map(|line| serde_json::to_string(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let path = sessions.join(file);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// The cache entry the pre-Task-5 parser wrote for `path`: the current
+    /// parse with the old extraction's tag-led first message (and the title
+    /// derived from it), unstamped.
+    fn pre_task5_entry(source: &CodexSource, path: &Path, stale_first: Option<&str>) -> FileEntry {
+        let stat = stat_file(path).expect("rollout stat");
+        let (item, codex_evidence) = source.parse_with_codex_evidence(path);
+        let mut item = item.expect("rollout parses");
+        if let Some(stale) = stale_first {
+            item.first_user_message = Some(stale.to_string());
+            item.title = Some(crate::text::extract_title_from_message(stale, 200));
+        }
+        FileEntry {
+            source_name: Some("codex".to_string()),
+            mtime_ms: stat.mtime_ms,
+            size: stat.size,
+            item: Some(item),
+            codex_evidence,
+            first_message_rules: 0,
+        }
+    }
+
+    /// Name-reliability Task 5 (V2, LB-B11): an UNSTAMPED cached Codex entry
+    /// whose first message starts with a wrapper tag the old rules did not
+    /// know is dropped at load and re-parsed once, yielding the real first
+    /// message; an unstamped entry with a real first message and the same
+    /// `(mtime, size)` stays cached (no re-parse). Both persist stamped, and
+    /// the schema version an older binary expects is unchanged.
+    #[tokio::test]
+    async fn load_cache_file_reparses_stale_tag_led_entries_once() {
+        let codex_home = unique_temp_dir("persist-tag-led-codex");
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let stale_path = write_codex_rollout(
+            &sessions,
+            "rollout-stale.jsonl",
+            "11111111-0000-4000-8000-000000000001",
+            RECOMMENDED_PLUGINS_BLOCK,
+            "Fix the sardine importer",
+        );
+        let real_path = write_codex_rollout(
+            &sessions,
+            "rollout-real.jsonl",
+            "22222222-0000-4000-8000-000000000002",
+            "Plan the offsite",
+            "Book the venue",
+        );
+        let source = CodexSource::new(codex_home.clone());
+        let stale_cache = HashMap::from([
+            (
+                stale_path.clone(),
+                pre_task5_entry(&source, &stale_path, Some(RECOMMENDED_PLUGINS_BLOCK)),
+            ),
+            (
+                real_path.clone(),
+                pre_task5_entry(&source, &real_path, None),
+            ),
+        ]);
+        let cache_dir = unique_temp_dir("persist-tag-led-codex-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+        save_cache_file(&cache_path, &stale_cache).unwrap();
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(CountedCodexSource {
+                inner: CodexSource::new(codex_home.clone()),
+                parse_calls: Arc::clone(&parse_calls),
+            })],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snapshot = index.snapshot().await;
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            1,
+            "only the tag-led entry is re-parsed"
+        );
+        let first_message_of = |id: &str| {
+            snapshot
+                .iter()
+                .find(|row| row.session_id == id)
+                .and_then(|row| row.first_user_message.clone())
+        };
+        assert_eq!(
+            first_message_of("11111111-0000-4000-8000-000000000001").as_deref(),
+            Some("Fix the sardine importer")
+        );
+        assert_eq!(
+            first_message_of("22222222-0000-4000-8000-000000000002").as_deref(),
+            Some("Plan the offsite")
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                let persisted = load_cache_file(&cache_path);
+                persisted.len() == 2
+                    && persisted
+                        .values()
+                        .all(|entry| entry.first_message_rules == FIRST_MESSAGE_RULES_VERSION)
+                    && persisted.get(&stale_path).is_some_and(|entry| {
+                        entry
+                            .item
+                            .as_ref()
+                            .and_then(|item| item.first_user_message.as_deref())
+                            == Some("Fix the sardine importer")
+                    })
+            })
+            .await,
+            "both entries persist stamped, the re-parsed one with its real first message"
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).unwrap()).unwrap();
+        assert_eq!(
+            raw["schema_version"],
+            serde_json::json!(3),
+            "an older binary (schema 3) keeps this warm cache"
+        );
+
+        // A later boot re-parses nothing.
+        let later_calls = Arc::new(AtomicUsize::new(0));
+        let later = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(CountedCodexSource {
+                inner: CodexSource::new(codex_home.clone()),
+                parse_calls: Arc::clone(&later_calls),
+            })],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let _ = later.snapshot().await;
+        assert_eq!(later_calls.load(Ordering::SeqCst), 0, "re-parsed once only");
+
+        std::fs::remove_dir_all(&codex_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// Name-reliability Task 5 (LB-B11): a STAMPED entry is never content-
+    /// retested. Even one whose first message still starts with a wrapper
+    /// tag (an unclosed `<user_action` block the extraction could not strip)
+    /// is kept across two further loads with no re-parse — so no cached
+    /// message can cause a re-parse on every boot.
+    #[tokio::test]
+    async fn stamped_entry_is_never_retested() {
+        let codex_home = unique_temp_dir("persist-stamped-codex");
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let unclosed = "<user_action>\n  <context>User initiated a review task.";
+        let path = write_codex_rollout(
+            &sessions,
+            "rollout-stamped.jsonl",
+            "33333333-0000-4000-8000-000000000003",
+            unclosed,
+            "Review the importer",
+        );
+        let source = CodexSource::new(codex_home.clone());
+        let mut entry = pre_task5_entry(&source, &path, Some(unclosed));
+        entry.first_message_rules = FIRST_MESSAGE_RULES_VERSION;
+        let cache_dir = unique_temp_dir("persist-stamped-codex-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+        save_cache_file(&cache_path, &HashMap::from([(path.clone(), entry)])).unwrap();
+
+        for load in 0..2 {
+            assert_eq!(
+                load_cache_file(&cache_path).len(),
+                1,
+                "load {load}: the stamped entry is kept"
+            );
+            let parse_calls = Arc::new(AtomicUsize::new(0));
+            let index = SessionIndex::with_ttl_and_cache_path(
+                vec![Arc::new(CountedCodexSource {
+                    inner: CodexSource::new(codex_home.clone()),
+                    parse_calls: Arc::clone(&parse_calls),
+                })],
+                Duration::from_millis(10),
+                Some(cache_path.clone()),
+            );
+            let snapshot = index.snapshot().await;
+            assert_eq!(
+                parse_calls.load(Ordering::SeqCst),
+                0,
+                "load {load}: a stamped entry is never re-parsed"
+            );
+            assert_eq!(
+                snapshot[0].first_user_message.as_deref(),
+                Some(unclosed),
+                "load {load}: the cached row is served as stored"
+            );
+        }
+
+        std::fs::remove_dir_all(&codex_home).ok();
         std::fs::remove_dir_all(&cache_dir).ok();
     }
 
@@ -6592,6 +6901,7 @@ pub(crate) mod tests {
                     size: canonical_stat.size,
                     item: source.parse(&canonical_path),
                     codex_evidence: None,
+                    first_message_rules: 0,
                 },
             ),
             (
@@ -6602,6 +6912,7 @@ pub(crate) mod tests {
                     size: nested_stat.size,
                     item: source.parse(&nested_path),
                     codex_evidence: None,
+                    first_message_rules: 0,
                 },
             ),
         ]);
@@ -6693,6 +7004,7 @@ pub(crate) mod tests {
                 size: 2,
                 item: None,
                 codex_evidence: None,
+                first_message_rules: 0,
             },
         );
         let result = save_cache_file(&path, &cache);
