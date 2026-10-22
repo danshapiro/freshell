@@ -1,7 +1,20 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useAppSelector } from '@/store/hooks'
+import { createLogger } from '@/lib/client-logger'
+
+const log = createLogger('useNotificationSound')
 
 const NOTIFICATION_SOUND_SRC = '/your-code-is-ready.mp3'
+
+/**
+ * Per-ring safety backstop. Progression is driven by completion signals
+ * (`ended`, `pause`, the fallback tone's `ended`); this timer only releases a
+ * ring whose completion signal never arrives (e.g. an OS audio interruption
+ * pauses the element without `ended`), so one dead ring can never silence
+ * every later bell for the life of the page. The chime is ~1.03 s and the
+ * fallback tone 0.12 s, so 5 s never cuts an honest ring short.
+ */
+export const RING_WATCHDOG_MS = 5_000
 
 /**
  * Play the built-in fallback tone (the chime file is unusable — a rejected
@@ -63,11 +76,16 @@ export function useNotificationSound() {
   const queueLengthRef = useRef(0)
   const ringingRef = useRef(false)
   const drainRef = useRef<() => void>(() => {})
+  const activeWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     return () => {
       queueLengthRef.current = 0
       ringingRef.current = false
+      if (activeWatchdogRef.current !== null) {
+        clearTimeout(activeWatchdogRef.current)
+        activeWatchdogRef.current = null
+      }
 
       const ctx = audioContextRef.current
       audioContextRef.current = null
@@ -79,9 +97,15 @@ export function useNotificationSound() {
 
   const startRing = useCallback(() => {
     let finished = false
+    let watchdog: ReturnType<typeof setTimeout> | null = null
     const finish = () => {
       if (finished) return
       finished = true
+      if (watchdog !== null) {
+        clearTimeout(watchdog)
+        if (activeWatchdogRef.current === watchdog) activeWatchdogRef.current = null
+        watchdog = null
+      }
       ringingRef.current = false
       drainRef.current()
     }
@@ -97,6 +121,13 @@ export function useNotificationSound() {
       if (!playFallbackTone(audioContextRef, finish)) finish()
     }
 
+    watchdog = setTimeout(() => {
+      if (finished) return
+      log.warn({ event: 'notification_ring_watchdog_fired', stage: fallbackArmed ? 'fallback' : 'chime' })
+      finish()
+    }, RING_WATCHDOG_MS)
+    activeWatchdogRef.current = watchdog
+
     try {
       // A FRESH Audio instance per ring — restarting one shared element would
       // truncate an in-flight chime.
@@ -104,7 +135,13 @@ export function useNotificationSound() {
       audio.preload = 'auto'
       audio.volume = 1
       audio.addEventListener('ended', finish, { once: true })
+      // Per the HTML spec a natural end fires `pause` then `ended`; an
+      // external pause (OS audio interruption) fires `pause` alone. Either way
+      // the ring is over — `finish` is idempotent.
+      audio.addEventListener('pause', finish, { once: true })
       audio.addEventListener('error', armFallback, { once: true })
+      // An aborted fetch never plays the chime: substitute the tone.
+      audio.addEventListener('abort', armFallback, { once: true })
       const pending = audio.play()
       if (pending) {
         pending.catch(armFallback)
