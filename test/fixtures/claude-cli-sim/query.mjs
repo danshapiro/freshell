@@ -58,6 +58,7 @@ import {
   INTERRUPTED,
   INTERRUPTED_FOR_TOOL,
   isUuid,
+  PERMISSION_MODES,
   SUBAGENT_TEXT,
   T,
   textOf,
@@ -858,6 +859,8 @@ class SimulatedCli {
 
   async setPermissionMode(mode) {
     return this.control(() => {
+      // The only settings call the CLI validates (any model or effort name is accepted).
+      if (!PERMISSION_MODES.includes(mode)) throw new Error(`Cannot set permission mode: must be one of ${PERMISSION_MODES.join(', ')}`)
       this.permissionMode = mode
       // Reported after the call resolves, before anything sent after it is taken.
       setImmediate(() => this.emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode }))

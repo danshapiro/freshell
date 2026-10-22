@@ -358,6 +358,24 @@ const SCENARIOS = {
     await s.close()
   },
 
+  /**
+   * T7: which settings calls the CLI refuses. Any model or effort name is
+   * accepted (a model change replays its /model command); only an unknown
+   * permission mode is rejected, and the session keeps working.
+   */
+  async settings(ctx) {
+    const s = ctx.open('S', { options: { permissionMode: 'default' } })
+    await s.init()
+    await s.call('setModel', 'no-such-model')
+    await s.call('applyFlagSettings', { effortLevel: 'no-such-effort' })
+    await s.call('setPermissionMode', 'no-such-mode')
+    await s.call('setPermissionMode', 'plan')
+    s.push('after settings', 'u1')
+    await s.waitForResults(1)
+    await s.waitForCount(isStateIdle, 1, 3000, 'idle')
+    await s.close()
+  },
+
   /** T4: booting a fresh session with an id whose transcript already exists. */
   async 'session-in-use'(ctx) {
     const X = ctx.uuid('X')

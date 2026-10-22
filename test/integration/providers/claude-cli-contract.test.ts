@@ -174,6 +174,15 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(messagesOf(r, 'S').filter(isInit).every((m) => m.permissionMode === 'acceptEdits')).toBe(true)
   }, SCENARIO_TIMEOUT)
 
+  it('T7: the CLI accepts any model or effort name and refuses only an unknown permission mode; the session keeps working', async () => {
+    const r = await real('settings')
+    const calls = eventsOf(r, 'S').filter((e) => e.k === 'call')
+    expect(calls.map((e) => [e.name, e.ok])).toEqual([['setModel', true], ['applyFlagSettings', true], ['setPermissionMode', false], ['setPermissionMode', true]])
+    expect(calls[2].message).toBe('Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan')
+    expect(results(r, 'S').map((m) => m.subtype)).toEqual(['success'])
+    expect(messagesOf(r, 'S').find(isInit)).toMatchObject({ model: 'no-such-model', permissionMode: 'plan' })
+  }, SCENARIO_TIMEOUT)
+
   it('T8: every uuid-stamped send gets command_lifecycle queued, started, then completed or cancelled, and is replayed with our uuid', async () => {
     const boot = await real('boot')
     const bootMessages = messagesOf(boot, 'S')
