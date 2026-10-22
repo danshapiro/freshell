@@ -555,6 +555,10 @@ struct ClaudeSession {
     stdin: ChildStdin,
     /// The owned Node sidecar child (SIGKILL backstop; `kill_on_drop`).
     child: Child,
+    /// G31: owns the sidecar's whole process tree (node AND the SDK-spawned
+    /// claude CLI). Teardown escalates through it; dropping it (any path that
+    /// drops this record) kills whatever is left of the tree.
+    tree_guard: crate::claude_spawn::SidecarTreeGuard,
     /// The `/proc` reaper tag for this session's sidecar + its claude CLI grandchild.
     ownership_id: String,
     /// The stdout-consumer task (aborted on shutdown).
@@ -2266,7 +2270,7 @@ impl FreshClaudeState {
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
 
-        let (mut child, mut stdin, stdout, ownership_id) = match spawn_sidecar().await {
+        let (mut child, mut stdin, stdout, ownership_id, tree_guard) = match spawn_sidecar().await {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -2534,6 +2538,7 @@ impl FreshClaudeState {
                 },
                 stdin,
                 child,
+                tree_guard,
                 ownership_id: ownership_id.clone(),
                 consumer,
                 sidecar_session_id: created.clone(),
@@ -6371,6 +6376,7 @@ impl FreshClaudeState {
         };
         let RollbackSpawned {
             child,
+            tree_guard,
             stdin,
             reader,
             ownership_id,
@@ -6438,6 +6444,7 @@ impl FreshClaudeState {
                 },
                 stdin,
                 child,
+                tree_guard,
                 ownership_id,
                 consumer,
                 sidecar_session_id,
@@ -7144,7 +7151,7 @@ impl FreshClaudeState {
         // advances the durable tombstone past it and the commit below
         // REFUSES instead of undoing the newer close.
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
-        let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
+        let (mut child, mut stdin, stdout, ownership_id, tree_guard) = spawn_sidecar()
             .await
             .map_err(ResumeClaudeError::Transient)?;
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
@@ -7284,6 +7291,7 @@ impl FreshClaudeState {
                 },
                 stdin,
                 child,
+                tree_guard,
                 ownership_id,
                 consumer,
                 sidecar_session_id,
@@ -9491,6 +9499,7 @@ enum RollbackSpawnError {
 /// consumer's preseeded adoption.
 struct RollbackSpawned {
     child: Child,
+    tree_guard: crate::claude_spawn::SidecarTreeGuard,
     stdin: ChildStdin,
     /// The stdout line reader, positioned AFTER the preread `sdk.session.init`.
     reader: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -9531,7 +9540,7 @@ impl FreshClaudeState {
         create_req: &Value,
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
     ) -> Result<RollbackSpawned, RollbackSpawnError> {
-        let (mut child, mut stdin, stdout, ownership_id) =
+        let (mut child, mut stdin, stdout, ownership_id, tree_guard) =
             spawn_sidecar().await.map_err(RollbackSpawnError::Other)?;
         if let Some(g) = lease_guard {
             if let Some(pid) = child.id() {
@@ -9561,6 +9570,7 @@ impl FreshClaudeState {
                     .unwrap_or_default();
                 Ok(RollbackSpawned {
                     child,
+                    tree_guard,
                     stdin,
                     reader,
                     ownership_id,
@@ -9633,8 +9643,18 @@ async fn read_session_init(
 
 /// Spawn `node <sidecar>/index.mjs`, ownership-tagged, inheriting the server's isolated HOME
 /// (so the SDK's `claude` CLI authenticates from + writes under `<isolatedHOME>/.claude`).
-/// Returns the owned child, its stdin, its stdout, and the ownership tag.
-async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), String> {
+/// Returns the owned child, its stdin, its stdout, the ownership tag, and the guard that
+/// owns the child's whole process tree (G31).
+async fn spawn_sidecar() -> Result<
+    (
+        Child,
+        ChildStdin,
+        ChildStdout,
+        String,
+        crate::claude_spawn::SidecarTreeGuard,
+    ),
+    String,
+> {
     let entry = sidecar_entry_path();
     if !entry.exists() {
         return Err(format!(
@@ -9696,7 +9716,7 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
             .map_err(|error| error.to_string())?;
     }
-    let mut child = cmd.spawn().map_err(|e| {
+    let (mut child, tree_guard) = crate::claude_spawn::spawn_guarded(&mut cmd).map_err(|e| {
         format!(
             "claude sidecar spawn failed ({node} {}): {e}",
             entry.display()
@@ -9708,7 +9728,7 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     if let Some(err) = child.stderr.take() {
         drain_reader(err);
     }
-    Ok((child, stdin, stdout, ownership_id))
+    Ok((child, stdin, stdout, ownership_id, tree_guard))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -9731,7 +9751,7 @@ mod provider_exec_tests {
             )
             .unwrap();
             let mut result = spawn_sidecar().await;
-            if let Ok((child, _, _, _)) = &mut result {
+            if let Ok((child, _, _, _, _)) = &mut result {
                 let pid = child.id().unwrap();
                 child.kill().await.unwrap();
                 child.wait().await.unwrap();
@@ -10124,6 +10144,7 @@ async fn teardown_removed_session(
     let exit = crate::claude_spawn::graceful_then_kill(
         session.child,
         session.stdin,
+        session.tree_guard,
         crate::claude_spawn::SIDECAR_GRACEFUL_EXIT,
     )
     .await;
@@ -10142,18 +10163,25 @@ async fn teardown_removed_session(
             }
         }
     };
+    // Off Linux the process-tree guard is the confirmation (macOS: the
+    // sidecar's process group is empty). Without a guard the typed
+    // platform limitation stands: node's awaited exit is the only floor.
     #[cfg(not(target_os = "linux"))]
     let confirmation = {
-        // The typed platform limitation: the child's awaited exit is the
-        // confirmation floor; the descendant-tree walk needs Linux /proc.
-        tracing::warn!(target: "freshell_freshagent::claude",
-            session_id = %session.sidecar_session_id,
-            platform_limitation = "descendant_tree_unverifiable",
-            "freshagent.claude.teardown_platform_limited: the direct child's awaited exit is \
-             the portable confirmation; the tagged-descendant death check requires Linux /proc"
-        );
         let _ = (&mut tree, confirm_rounds);
-        TeardownConfirmation::PlatformLimited
+        if exit.tree == crate::claude_spawn::TreeConfirmation::Confirmed {
+            TeardownConfirmation::Confirmed
+        } else {
+            tracing::warn!(target: "freshell_freshagent::claude",
+                session_id = %session.sidecar_session_id,
+                platform_limitation = "descendant_tree_unverifiable",
+                tree = ?exit.tree,
+                "freshagent.claude.teardown_platform_limited: the process-tree guard could \
+                 not confirm the sidecar's descendants gone; node's awaited exit is the only \
+                 confirmation"
+            );
+            TeardownConfirmation::PlatformLimited
+        }
     };
     log_claude_teardown(&session.sidecar_session_id, &exit, started, &confirmation);
     confirmation
@@ -10282,6 +10310,7 @@ pub(crate) mod tests {
                 configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
+                tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-{session_id}"),
                 consumer,
                 sidecar_session_id: session_id.to_string(),
@@ -18918,6 +18947,7 @@ rl.on('line', (line) => {
                 configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
+                tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-{session_id}"),
                 consumer,
                 sidecar_session_id: session_id.to_string(),
@@ -20535,6 +20565,7 @@ rl.on('line', (line) => {
                 configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
+                tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-{map_key}"),
                 consumer,
                 sidecar_session_id: map_key.to_string(),
@@ -20586,6 +20617,7 @@ rl.on('line', (line) => {
                 configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
+                tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-{map_key}"),
                 consumer,
                 sidecar_session_id: map_key.to_string(),
@@ -20683,6 +20715,7 @@ rl.on('line', (line) => {
                 configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
+                tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-live-{map_key}"),
                 consumer,
                 sidecar_session_id: map_key.to_string(),

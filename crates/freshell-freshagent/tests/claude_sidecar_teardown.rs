@@ -11,7 +11,9 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use freshell_freshagent::claude_spawn::{graceful_then_kill, SIDECAR_GRACEFUL_EXIT};
+use freshell_freshagent::claude_spawn::{
+    graceful_then_kill, spawn_guarded, SidecarTreeGuard, TreeConfirmation, SIDECAR_GRACEFUL_EXIT,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
@@ -59,27 +61,45 @@ fn node() -> String {
     std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string())
 }
 
-/// Spawn a fake sidecar and wait until it has installed its handlers.
-async fn spawn_fake(script: &str, record: &Path) -> (Child, ChildStdin, ChildStdout) {
-    let mut child = tokio::process::Command::new(node())
+/// A fake sidecar spawned the way production spawns the real one: inside its
+/// own process-tree guard. Its first stdout line (`ready ...`) says the
+/// handlers are installed.
+struct Fake {
+    child: Child,
+    stdin: ChildStdin,
+    _stdout: ChildStdout,
+    guard: SidecarTreeGuard,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    ready: String,
+}
+
+async fn spawn_fake(script: &str, record: &Path) -> Fake {
+    let mut command = tokio::process::Command::new(node());
+    command
         .arg("-e")
         .arg(script)
         .arg(record)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn the fake sidecar with node");
+        .kill_on_drop(true);
+    let (mut child, guard) = spawn_guarded(&mut command).expect("spawn the fake sidecar with node");
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let mut lines = BufReader::new(stdout).lines();
     let ready = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
         .await
         .expect("the fake sidecar announces readiness")
-        .expect("read the fake sidecar's stdout");
-    assert_eq!(ready.as_deref(), Some("ready"));
-    (child, stdin, lines.into_inner().into_inner())
+        .expect("read the fake sidecar's stdout")
+        .expect("the fake sidecar wrote a readiness line");
+    assert!(ready.starts_with("ready"), "{ready}");
+    Fake {
+        child,
+        stdin,
+        _stdout: lines.into_inner().into_inner(),
+        guard,
+        ready,
+    }
 }
 
 fn record_of(path: &Path) -> String {
@@ -90,9 +110,9 @@ fn record_of(path: &Path) -> String {
 async fn a_sidecar_that_honors_shutdown_exits_gracefully_without_a_signal() {
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("record.txt");
-    let (child, stdin, _stdout) = spawn_fake(FAKE_HONORS_SHUTDOWN, &record).await;
+    let fake = spawn_fake(FAKE_HONORS_SHUTDOWN, &record).await;
 
-    let exit = graceful_then_kill(child, stdin, SIDECAR_GRACEFUL_EXIT).await;
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, SIDECAR_GRACEFUL_EXIT).await;
 
     assert!(
         exit.graceful,
@@ -111,16 +131,17 @@ async fn a_sidecar_that_honors_shutdown_exits_gracefully_without_a_signal() {
         "shutdown-handled\n",
         "only the shutdown handler ran; no signal was sent"
     );
+    assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
 }
 
 #[tokio::test]
 async fn a_sidecar_that_ignores_shutdown_is_escalated_after_the_grace_period() {
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("record.txt");
-    let (child, stdin, _stdout) = spawn_fake(FAKE_IGNORES_SHUTDOWN, &record).await;
+    let fake = spawn_fake(FAKE_IGNORES_SHUTDOWN, &record).await;
     let grace = Duration::from_millis(400);
 
-    let exit = graceful_then_kill(child, stdin, grace).await;
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
 
     assert!(
         !exit.graceful,
@@ -153,10 +174,10 @@ async fn a_sidecar_that_ignores_sigterm_is_killed() {
 
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("record.txt");
-    let (child, stdin, _stdout) = spawn_fake(FAKE_IGNORES_SIGTERM, &record).await;
+    let fake = spawn_fake(FAKE_IGNORES_SIGTERM, &record).await;
     let grace = Duration::from_millis(300);
 
-    let exit = graceful_then_kill(child, stdin, grace).await;
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
 
     assert!(!exit.graceful, "{exit:?}");
     assert_eq!(
@@ -178,4 +199,148 @@ async fn a_sidecar_that_ignores_sigterm_is_killed() {
 #[cfg(unix)]
 fn libc_sigkill() -> i32 {
     9
+}
+
+/// Exits 0 on the shutdown line WITHOUT stopping the grandchild it started
+/// (the CLI in production): the shape a hard-killed or buggy sidecar leaves
+/// behind. The readiness line carries the grandchild's pid.
+#[cfg(unix)]
+const FAKE_ORPHANS_GRANDCHILD: &str = r#"
+const { spawn } = require('child_process')
+const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') process.exit(0)
+})
+setInterval(() => {}, 1000)
+grandchild.on('spawn', () => process.stdout.write(`ready ${grandchild.pid}\n`))
+"#;
+
+#[cfg(unix)]
+fn grandchild_pid(ready: &str) -> u32 {
+    ready
+        .strip_prefix("ready ")
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("readiness line carries the grandchild pid: {ready}"))
+}
+
+#[cfg(unix)]
+fn process_group_exists(pgid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence.
+    let result = unsafe { libc::kill(-pgid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Observes one process's exit.
+#[cfg(unix)]
+struct ProcessProbe {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl ProcessProbe {
+    fn open(pid: u32) -> Self {
+        Self { pid }
+    }
+
+    fn alive(&self) -> bool {
+        // SAFETY: signal 0 only probes for existence.
+        let result = unsafe { libc::kill(self.pid as i32, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let fake = spawn_fake(FAKE_ORPHANS_GRANDCHILD, &record).await;
+    let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
+    #[cfg(unix)]
+    let pgid = fake.guard.process_group();
+    assert!(grandchild.alive());
+    let grace = Duration::from_millis(500);
+
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
+
+    assert!(
+        exit.graceful,
+        "node itself honored the shutdown line: {exit:?}"
+    );
+    assert!(
+        !grandchild.alive(),
+        "the grandchild node left behind was killed: {exit:?}"
+    );
+    assert_eq!(
+        exit.tree,
+        TreeConfirmation::Confirmed,
+        "the guard confirmed the whole tree gone: {exit:?}"
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            exit.elapsed >= grace,
+            "the grandchild got the rest of the grace period to exit by itself: {exit:?}"
+        );
+        let pgid = pgid.expect("the sidecar ran in its own process group");
+        assert!(!process_group_exists(pgid), "no group member survives");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminating_the_guard_kills_every_member_of_the_process_group() {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "sleep 300 & sleep 300"])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let (mut child, mut guard) = spawn_guarded(&mut command).expect("spawn sh");
+    let pgid = guard
+        .process_group()
+        .expect("the child runs in its own process group");
+    assert_eq!(Some(pgid as u32), child.id(), "the child leads its group");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let confirmation = guard.terminate(&mut child).await;
+
+    assert_eq!(confirmation, TreeConfirmation::Confirmed);
+    assert!(!process_group_exists(pgid), "no group member survives");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_the_guard_kills_the_process_group() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "sleep 300 & sleep 300"])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let (mut child, guard) = spawn_guarded(&mut command).expect("spawn sh");
+    let pgid = guard
+        .process_group()
+        .expect("the child runs in its own process group");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    drop(guard);
+
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("the guard's drop ended the child")
+        .expect("reap the child");
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "the drop sent SIGKILL: {status:?}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process_group_exists(pgid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background member of the group survived the drop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
