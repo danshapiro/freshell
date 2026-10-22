@@ -378,6 +378,7 @@ async fn dispatch(
                     terminal,
                     fresh_agent,
                     resume_spec,
+                    dispatch_budget_ms,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     if host_boot_id != state.host_boot_id {
@@ -398,6 +399,7 @@ async fn dispatch(
                             terminal: terminal.map(|terminal| *terminal),
                             fresh_agent: fresh_agent.map(|agent| *agent),
                             resume_spec: resume_spec.map(|resume_spec| *resume_spec),
+                            dispatch_budget: dispatch_budget_ms.map(Duration::from_millis),
                         },
                     )
                     .await
@@ -938,25 +940,89 @@ struct GrantExecutionRequest {
     terminal: Option<TerminalLaunchSpec>,
     fresh_agent: Option<FreshAgentLaunchSpec>,
     resume_spec: Option<ResumeSpec>,
+    /// The supervisor's bound on this dispatch; see [`GrantStageTimeline`].
+    dispatch_budget: Option<Duration>,
 }
 
-/// Wall-clock breakdown of one execution grant. The supervisor bounds the
-/// whole grant reply; this names the stage that spent the time, for every
-/// outcome, so a slow dispatch is diagnosable after the container is gone.
+/// Wall-clock breakdown of one execution grant, and its dispatch budget.
+///
+/// The supervisor sends the budget with the grant and waits a fixed reply
+/// allowance longer than it for the reply. The host, not the supervisor's
+/// wait, therefore ends a dispatch that runs long: every awaited stage runs
+/// inside the budget, the native dispatch boundary is never crossed once the
+/// budget is spent (the grant stays unconsumed), and the refusal names the
+/// stage the budget ran out before. A synchronous stage (the provider
+/// projection, the provider-owned config refresh) cannot be interrupted; the
+/// host notices when it returns, before the next stage starts.
+///
+/// The breakdown names the stage that spent the time, for every outcome, so
+/// a slow dispatch is diagnosable after the container is gone.
 struct GrantStageTimeline {
     started: std::time::Instant,
     stage_started: std::time::Instant,
     stages: Vec<(&'static str, u128)>,
+    budget: Option<Duration>,
+    exhausted_before: Option<&'static str>,
 }
 
 impl GrantStageTimeline {
-    fn start() -> Self {
+    fn start(budget: Option<Duration>) -> Self {
         let now = std::time::Instant::now();
         Self {
             started: now,
             stage_started: now,
             stages: Vec::new(),
+            budget,
+            exhausted_before: None,
         }
+    }
+
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.budget.map(|budget| self.started + budget)
+    }
+
+    fn budget_exhausted(&mut self, stage: &'static str) -> RuntimeError {
+        self.exhausted_before = Some(stage);
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!(
+                "execution grant spent its {}ms dispatch budget before {stage} completed",
+                self.budget.unwrap_or_default().as_millis()
+            ),
+        )
+    }
+
+    /// Refuse to begin `stage` once the dispatch budget is spent.
+    fn ensure_budget(&mut self, stage: &'static str) -> Result<(), RuntimeError> {
+        match self.deadline() {
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                Err(self.budget_exhausted(stage))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Run one awaited dispatch stage inside the budget and record it.
+    async fn run<T>(
+        &mut self,
+        stage: &'static str,
+        work: impl std::future::Future<Output = Result<T, RuntimeError>>,
+    ) -> Result<T, RuntimeError> {
+        self.ensure_budget(stage)?;
+        let result = match self.deadline() {
+            Some(deadline) => {
+                match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work).await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(self.budget_exhausted(stage)),
+                }
+            }
+            None => work.await,
+        };
+        if result.is_ok() {
+            self.completed(stage);
+        }
+        result
     }
 
     fn completed(&mut self, stage: &'static str) {
@@ -974,6 +1040,8 @@ impl GrantStageTimeline {
             "outcome": if outcome.is_ok() { "accepted" } else { "refused" },
             "errorCode": outcome.err().map(|error| error.code),
             "totalMs": self.started.elapsed().as_millis(),
+            "budgetMs": self.budget.map(|budget| budget.as_millis()),
+            "budgetExhaustedBefore": self.exhausted_before,
             "stages": self
                 .stages
                 .iter()
@@ -988,7 +1056,7 @@ async fn grant_execution(
     request: GrantExecutionRequest,
 ) -> Result<HostResult, RuntimeError> {
     let grant_id = request.grant_id.clone();
-    let mut timeline = GrantStageTimeline::start();
+    let mut timeline = GrantStageTimeline::start(request.dispatch_budget);
     let result = grant_execution_stages(state, request, &mut timeline).await;
     let event = timeline.event(&grant_id, result.as_ref().map(|_| ()));
     emit_environment_event(event.clone());
@@ -1011,6 +1079,7 @@ async fn grant_execution_stages(
         terminal,
         fresh_agent,
         resume_spec,
+        dispatch_budget: _,
     } = request;
     let provider = terminal
         .as_ref()
@@ -1103,30 +1172,33 @@ async fn grant_execution_stages(
         })?;
         timeline.completed("resolve_secrets");
         if matches!(provider, "opencode" | "codex" | "claude" | "amplifier") {
-            let generated = provider_input_preparation::prepare_for_identity(
-                context,
-                &mut secrets,
-                &provider_path_inputs,
-                &state
-                    .provider_config_paths
-                    .private_mount
-                    .join("user-provider"),
-                &state.provider_config_paths.provider_home,
-                identity,
-            )
-            .await
-            .map_err(|error| {
-                RuntimeError::new(
-                    if error.starts_with("configuration reference selection changed") {
-                        RuntimeErrorCode::ProviderInputsChanged
-                    } else {
-                        RuntimeErrorCode::HostUnreachable
-                    },
-                    error,
-                )
-            })?;
+            let generated = timeline
+                .run("prepare_provider_inputs", async {
+                    provider_input_preparation::prepare_for_identity(
+                        context,
+                        &mut secrets,
+                        &provider_path_inputs,
+                        &state
+                            .provider_config_paths
+                            .private_mount
+                            .join("user-provider"),
+                        &state.provider_config_paths.provider_home,
+                        identity,
+                    )
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            if error.starts_with("configuration reference selection changed") {
+                                RuntimeErrorCode::ProviderInputsChanged
+                            } else {
+                                RuntimeErrorCode::HostUnreachable
+                            },
+                            error,
+                        )
+                    })
+                })
+                .await?;
             secrets.environment.extend(generated);
-            timeline.completed("prepare_provider_inputs");
         } else if !provider_path_inputs.is_empty() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1189,6 +1261,7 @@ async fn grant_execution_stages(
                         .arg(&resume.provider_session.native_session_id);
                 }
             }
+            timeline.ensure_budget("consume_grant")?;
             consume_grant(&mut persisted)?;
             let child = command.spawn().map_err(|e| {
                 RuntimeError::new(
@@ -1263,57 +1336,72 @@ async fn grant_execution_stages(
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
             timeline.completed("prepare_provider_state");
-            let prepared = providers::prepare_terminal(
-                terminal,
-                &resolved_secrets.environment,
-                resolved_secrets.opencode_plan.as_ref(),
-                resolved_secrets.claude_settings_argument.as_deref(),
-            )
-            .await
-            .map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("prepare managed provider: {error}"),
+            let prepared = timeline
+                .run("prepare_terminal", async {
+                    providers::prepare_terminal(
+                        terminal,
+                        &resolved_secrets.environment,
+                        resolved_secrets.opencode_plan.as_ref(),
+                        resolved_secrets.claude_settings_argument.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            format!("prepare managed provider: {error}"),
+                        )
+                    })
+                })
+                .await?;
+            timeline
+                .run(
+                    "verify_claude_sources",
+                    claude_source_observation::verify_final(
+                        prepared.terminal.provider_launch_context.as_ref(),
+                        &state
+                            .provider_config_paths
+                            .private_mount
+                            .join("user-provider"),
+                        Path::new(&prepared.terminal.cwd),
+                        &state.provider_config_paths.provider_home,
+                        prepared.terminal.run_as_uid,
+                        prepared.terminal.run_as_gid,
+                        freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+                    ),
                 )
-            })?;
-            timeline.completed("prepare_terminal");
-            claude_source_observation::verify_final(
-                prepared.terminal.provider_launch_context.as_ref(),
-                &state
-                    .provider_config_paths
-                    .private_mount
-                    .join("user-provider"),
-                Path::new(&prepared.terminal.cwd),
-                &state.provider_config_paths.provider_home,
-                prepared.terminal.run_as_uid,
-                prepared.terminal.run_as_gid,
-                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
-            )
-            .await?;
-            timeline.completed("verify_claude_sources");
+                .await?;
+            timeline.ensure_budget("consume_grant")?;
             consume_grant(&mut persisted)?;
             timeline.completed("consume_grant");
-            let prepared = providers::start_terminal_sidecar(prepared)
-                .await
-                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
-            timeline.completed("start_sidecar");
+            let prepared = timeline
+                .run("start_sidecar", async {
+                    providers::start_terminal_sidecar(prepared)
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::new(RuntimeErrorCode::HostUnreachable, error)
+                        })
+                })
+                .await?;
             let terminal = prepared.terminal;
-            let hosted = HostedPty::spawn(
-                &state.state_dir,
-                state.incarnation_id.clone(),
-                &terminal,
-                prepared.child_env,
-                prepared.codex,
-                prepared.claude_settings,
-            )
-            .await
-            .map_err(|e| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("spawn managed terminal: {e}"),
-                )
-            })?;
-            timeline.completed("spawn_worker");
+            let hosted = timeline
+                .run("spawn_worker", async {
+                    HostedPty::spawn(
+                        &state.state_dir,
+                        state.incarnation_id.clone(),
+                        &terminal,
+                        prepared.child_env,
+                        prepared.codex,
+                        prepared.claude_settings,
+                    )
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            format!("spawn managed terminal: {e}"),
+                        )
+                    })
+                })
+                .await?;
             let pid = hosted.pid();
             let evidence = serde_json::json!({
                 "workload":"terminal",
@@ -1419,41 +1507,51 @@ async fn grant_execution_stages(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            providers::prepare_fresh_agent_child_environment(
-                &launch,
-                &mut resolved_secrets.environment,
-                resolved_secrets.opencode_plan.as_ref(),
-            )
-            .await
-            .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
-            timeline.completed("prepare_provider_state");
-            claude_source_observation::verify_final(
-                launch.provider_launch_context.as_ref(),
-                &state
-                    .provider_config_paths
-                    .private_mount
-                    .join("user-provider"),
-                Path::new(&launch.cwd),
-                &state.provider_config_paths.provider_home,
-                launch.run_as_uid,
-                launch.run_as_gid,
-                freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
-            )
-            .await?;
-            timeline.completed("verify_claude_sources");
+            timeline
+                .run("prepare_provider_state", async {
+                    providers::prepare_fresh_agent_child_environment(
+                        &launch,
+                        &mut resolved_secrets.environment,
+                        resolved_secrets.opencode_plan.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))
+                })
+                .await?;
+            timeline
+                .run(
+                    "verify_claude_sources",
+                    claude_source_observation::verify_final(
+                        launch.provider_launch_context.as_ref(),
+                        &state
+                            .provider_config_paths
+                            .private_mount
+                            .join("user-provider"),
+                        Path::new(&launch.cwd),
+                        &state.provider_config_paths.provider_home,
+                        launch.run_as_uid,
+                        launch.run_as_gid,
+                        freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
+                    ),
+                )
+                .await?;
+            timeline.ensure_budget("consume_grant")?;
             consume_grant(&mut persisted)?;
             timeline.completed("consume_grant");
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
-            let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::HostUnreachable,
-                        format!("hosted fresh-agent provider failed to start: {error}"),
-                    )
-                })?;
-            timeline.completed("start_fresh_agent");
+            let actor = timeline
+                .run("start_fresh_agent", async {
+                    providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::HostUnreachable,
+                                format!("hosted fresh-agent provider failed to start: {error}"),
+                            )
+                        })
+                })
+                .await?;
             let profile = actor.profile().await;
             let native_session_id = profile.native_session_id.clone();
             let evidence = serde_json::json!({
@@ -10578,6 +10676,7 @@ mod tests {
                 terminal: Some(terminal),
                 fresh_agent: None,
                 resume_spec: None,
+                dispatch_budget: None,
             },
         )
         .await;
@@ -10661,6 +10760,7 @@ mod tests {
                         terminal: terminal.clone(),
                         fresh_agent: fresh.clone(),
                         resume_spec: Some(resume.clone()),
+                        dispatch_budget: None,
                     },
                 )
                 .await
@@ -10733,6 +10833,7 @@ mod tests {
                         terminal: Some(terminal.clone()),
                         fresh_agent: None,
                         resume_spec: Some(resume.clone()),
+                        dispatch_budget: None,
                     },
                 )
                 .await
@@ -10825,6 +10926,7 @@ mod tests {
                 terminal: None,
                 fresh_agent: None,
                 resume_spec: None,
+                dispatch_budget_ms: None,
             },
         );
         let error = dispatch(envelope, &state).await.unwrap_err();
@@ -10836,6 +10938,97 @@ mod tests {
         assert_eq!(timing[0]["severity"], "warn");
         assert_eq!(timing[0]["errorCode"], "STALE_EXECUTION_GRANT");
         assert_eq!(timing[0]["stages"], serde_json::json!([]));
+    }
+
+    /// The supervisor stops waiting shortly after the dispatch budget it sent.
+    /// A host whose budget is already spent must not cross the native dispatch
+    /// boundary: it refuses typed, names where the budget ran out, and leaves
+    /// the grant unconsumed and no worker behind.
+    #[tokio::test]
+    async fn grant_whose_dispatch_budget_is_spent_is_refused_before_consumption() {
+        let state = test_host_state();
+        let grant_id = GrantId::new();
+        let envelope = authenticated_host_envelope(
+            &state,
+            HostCommand::GrantExecution {
+                incarnation_id: state.incarnation_id.clone(),
+                soul_id: SoulId::new(),
+                host_boot_id: state.host_boot_id.clone(),
+                control_epoch: 1,
+                execution_generation: 1,
+                grant_id: grant_id.clone(),
+                fixture: Some(FixtureKind::Heartbeat),
+                provider_path_inputs: Default::default(),
+                terminal: None,
+                fresh_agent: None,
+                resume_spec: None,
+                dispatch_budget_ms: Some(0),
+            },
+        );
+
+        let error = dispatch(envelope, &state).await.unwrap_err();
+
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error.message.contains("0ms dispatch budget")
+                && error.message.contains("consume_grant"),
+            "{}",
+            error.message
+        );
+        let persisted = state.persisted.lock().await.clone();
+        assert!(persisted.grant_id.is_none(), "the grant stays replayable");
+        assert_eq!(persisted.worker_launch_count, 0);
+        assert!(state.child.lock().await.is_none());
+        let timing = grant_timing_events(&state.state_dir);
+        assert_eq!(timing.len(), 1, "{timing:?}");
+        assert_eq!(timing[0]["grantId"], serde_json::json!(grant_id));
+        assert_eq!(timing[0]["outcome"], "refused");
+        assert_eq!(timing[0]["errorCode"], "HOST_UNREACHABLE");
+        assert_eq!(timing[0]["budgetMs"], 0);
+        assert_eq!(timing[0]["budgetExhaustedBefore"], "consume_grant");
+    }
+
+    /// An awaited stage (a provider start that keeps retrying, a source
+    /// reader) is cut at the dispatch deadline rather than allowed to run past
+    /// the supervisor's wait, and the refusal names that stage.
+    #[tokio::test]
+    async fn awaited_stage_is_cut_at_the_dispatch_deadline() {
+        let mut timeline = GrantStageTimeline::start(Some(Duration::from_millis(300)));
+        timeline
+            .run("prepare_terminal", async { Ok(()) })
+            .await
+            .expect("a stage inside the budget completes");
+        let started = std::time::Instant::now();
+
+        let error = timeline
+            .run("start_sidecar", async {
+                sleep(Duration::from_secs(30)).await;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stage was cut at the deadline, not allowed to finish"
+        );
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error.message.contains("300ms dispatch budget")
+                && error.message.contains("start_sidecar"),
+            "{}",
+            error.message
+        );
+        let event = timeline.event(&GrantId::new(), Err(&error));
+        assert_eq!(event["budgetMs"], 300);
+        assert_eq!(event["budgetExhaustedBefore"], "start_sidecar");
+        let stages = event["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stage| stage["stage"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(stages, ["prepare_terminal"], "a cut stage is not completed");
     }
 
     #[tokio::test]
@@ -10855,6 +11048,7 @@ mod tests {
                 terminal: None,
                 fresh_agent: None,
                 resume_spec: None,
+                dispatch_budget_ms: None,
             },
         );
         let error = dispatch(envelope, &state).await.unwrap_err();
@@ -11037,6 +11231,7 @@ mod tests {
                 terminal: Some(Box::new(terminal)),
                 fresh_agent: None,
                 resume_spec: Some(Box::new(resume_spec)),
+                dispatch_budget_ms: Some(60_000),
             },
         );
 
@@ -11077,6 +11272,8 @@ mod tests {
             "the accepted terminal dispatch names every stage it spent time in"
         );
         assert!(timing[0]["totalMs"].as_u64().is_some());
+        assert_eq!(timing[0]["budgetMs"], 60_000);
+        assert_eq!(timing[0]["budgetExhaustedBefore"], serde_json::Value::Null);
         let mut observed = None;
         for _ in 0..100 {
             if let Ok(value) = std::fs::read(&child_output) {

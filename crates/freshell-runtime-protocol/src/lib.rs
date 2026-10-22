@@ -3453,6 +3453,13 @@ pub enum HostCommand {
         fresh_agent: Option<Box<FreshAgentLaunchSpec>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume_spec: Option<Box<ResumeSpec>>,
+        /// How long the host may spend dispatching this grant before it must
+        /// reply. The supervisor waits a little longer than this for the
+        /// reply, so a host that runs out refuses the grant with a typed error
+        /// naming the stage it was in, instead of being abandoned mid-dispatch.
+        /// Absent means the host applies no bound of its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_budget_ms: Option<u64>,
     },
     Stop {
         incarnation_id: IncarnationId,
