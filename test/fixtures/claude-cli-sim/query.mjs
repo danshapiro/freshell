@@ -314,7 +314,9 @@ class SimulatedCli {
   terminate(error) {
     if (this.dead) return
     this.dead = true
-    this.transcript?.flush()
+    // Work still unwinding after the death (an aborted tool settling) must
+    // not reach the disk: the real CLI is gone and writes nothing more.
+    this.transcript?.close()
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
     this.turn?.abort()
@@ -484,7 +486,7 @@ class SimulatedCli {
 
   endWhenIdle() {
     if (!this.busy && !this.turn && !this.dead) {
-      this.transcript?.flush()
+      this.transcript?.close()
       this.closing = true
       this.channel.end()
       try { this.child.stdin?.end() } catch { /* already gone */ }

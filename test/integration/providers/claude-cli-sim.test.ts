@@ -2,8 +2,9 @@
 //
 // The CLI simulator's own features that have no real-CLI counterpart to
 // compare against: scenario programs (FRESHELL_CLAUDE_SIM_PROGRAM and its
-// aliases), the options ledger, and the sidecar seam it plugs into. The
-// behavior it shares with the real CLI is covered by
+// aliases), the options ledger, and the sidecar seam it plugs into; plus what
+// a normalized trace cannot see (nothing reaches the disk after the stream
+// ends). The behavior it shares with the real CLI is covered by
 // claude-cli-conformance.test.ts.
 
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -87,6 +88,22 @@ async function open(options: Record<string, unknown>, env: Record<string, string
     listeners.add(check)
   })
   return { q, prompt, messages, until, home, get ended() { return ended } }
+}
+
+/** Every file under `root` (relative path to contents). */
+async function snapshotTree(root: string): Promise<Record<string, string>> {
+  const out: Record<string, string> = {}
+  const walk = async (directory: string) => {
+    let entries
+    try { entries = await fs.readdir(directory, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      const target = path.join(directory, entry.name)
+      if (entry.isDirectory()) await walk(target)
+      else out[path.relative(root, target)] = await fs.readFile(target, 'utf8')
+    }
+  }
+  await walk(root)
+  return out
 }
 
 const program = (rules: unknown[]) => ({ FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify({ rules }), FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
@@ -185,6 +202,24 @@ describe('Claude CLI simulator programs', () => {
     }
     const home = await tempHome()
     expect(() => query({ prompt: input(), options: { cwd: home.cwd, env: { ...home.env, FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify({ rules: [{ on: 'msg:prompt', emit: [{ kind: 'teleport' }] }] }) } } })).toThrow(/Unknown simulator emission kind "teleport"/)
+  })
+
+  it.each([
+    ['a Bash call', 'TOOL:sleep=45'],
+    ['a hung MCP tool', 'MCP:hang'],
+  ])('a closed simulator writes nothing more under CLAUDE_CONFIG_DIR, even when it was closed during %s', async (_label, marker) => {
+    const s = await open({}, { FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    s.prompt.push(marker, '33333333-3333-4333-8333-333333333333')
+    await s.until(() => s.messages.some((m) => m.type === 'assistant' && m.message?.content?.some((b: any) => b.type === 'tool_use')))
+    // Let the prompt's buffered lines reach the transcript, so it exists before the close.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    s.q.close()
+    await s.until(() => s.ended !== null)
+    const atClose = await snapshotTree(s.home.env.CLAUDE_CONFIG_DIR)
+    expect(Object.keys(atClose).filter((file) => file.endsWith('.jsonl'))).toHaveLength(1)
+    // Well past the simulator's transcript buffering window at this time scale.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    expect(await snapshotTree(s.home.env.CLAUDE_CONFIG_DIR)).toEqual(atClose)
   })
 
   it('records each query() call\'s options in FRESHELL_CLAUDE_SIM_LEDGER, with env reduced to its key names', async () => {

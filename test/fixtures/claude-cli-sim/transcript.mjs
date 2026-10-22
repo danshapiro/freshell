@@ -5,6 +5,8 @@
 //   - lines are buffered and flushed in batches about 100 ms after they are
 //     produced, so a reader sees the transcript "around the result" (T3);
 //   - every line that carries a uuid extends one parentUuid chain;
+//   - once the CLI is gone (its stream ended) nothing more is written, so a
+//     caller may delete the config directory as soon as the stream ends;
 //   - a fork copies the parent's lines through the fork point with their
 //     uuids preserved, re-stamped with the child's session id (T6).
 
@@ -60,6 +62,7 @@ export class Transcript {
     this.file = existing ?? path.join(configDir, 'projects', projectSlug(cwd), `${sessionId}.jsonl`)
     this.pending = prefix.map((line) => ({ ...line, sessionId }))
     this.materialized = existing !== null
+    this.closed = false
     this.timer = null
     const known = existing ? readTranscriptLines(existing) : this.pending
     const chained = known.filter((line) => typeof line.uuid === 'string')
@@ -121,17 +124,23 @@ export class Transcript {
   }
 
   schedule() {
-    if (!this.materialized || this.timer || this.pending.length === 0) return
+    if (this.closed || !this.materialized || this.timer || this.pending.length === 0) return
     this.timer = setTimeout(() => this.flush(), this.flushMs(100))
   }
 
   flush() {
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
-    if (!this.materialized || this.pending.length === 0) return
+    if (this.closed || !this.materialized || this.pending.length === 0) return
     const lines = this.pending.splice(0)
     fs.mkdirSync(path.dirname(this.file), { recursive: true })
     fs.appendFileSync(this.file, lines.map((line) => `${JSON.stringify(line)}\n`).join(''))
+  }
+
+  /** The CLI is gone: write what is buffered, then nothing more. */
+  close() {
+    this.flush()
+    this.closed = true
   }
 }
 
