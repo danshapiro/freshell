@@ -38,6 +38,7 @@
 
 pub mod claude;
 pub(crate) mod claude_snapshot;
+pub mod claude_spawn;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
 pub mod hosted_rest;
