@@ -14,25 +14,28 @@
  *   3. an approval wait raised while the user is in another tab (the
  *      `waiting` edge) produces the same mark.
  *
- * The pane is a real Freshclaude pane on the real Rust server (fake
- * Claude-SDK sidecar). G17 is a client rendering change, so the attention
- * EDGES are delivered as the exact server wire frames
- * (`freshAgent.event{event:{type:'freshAgent.turn.complete'|'freshAgent.turn.waiting', at}}`)
- * through the harness's WS receive path, which runs the production fold
- * (fresh-agent-ws → applyFreshAgentCompletion/applyFreshAgentWaiting →
- * receipt-time watched classification). Injecting keeps this spec independent
- * of the fake sidecar's turn lanes, so it does NOT cover the server emitting
- * those edges. That is fresh-agent-error-turn-attention.spec.ts's job, but
- * that spec (like every fake-sidecar spec that drives a composer send) was
- * red on origin/main when this one was written: the send never reached the
- * fake sidecar. Until that send lane is fixed, nothing green covers
- * "server edge → mobile mark" end to end; once it is, switch this spec to a
- * real delayed turn as the plan (C6) describes.
+ * The pane is a real Freshclaude pane on the real Rust server, driven by the
+ * deterministic fake Claude-SDK sidecar. Every mark comes from a REAL turn:
+ * the composer sends the prompt, the Rust server forwards it to the sidecar,
+ * the sidecar's program lane ends the turn (or raises the approval), the
+ * server emits the `freshAgent.turn.complete` / `freshAgent.turn.waiting`
+ * edge, and the client's production fold puts the mark on the mobile strip
+ * and switcher. So this spec covers "server edge → mobile mark" end to end;
+ * nothing here injects a WS frame. Each step also checks the edge on the
+ * sidecar wire and on the client's received WS frames, so a failure says
+ * which hop broke.
  *
- * CLOUD-LEGALITY: no timing dependencies; every wait is a poll on observed
- * state. This spec must NOT be added to CLOUD_SKIP_SPECS.
+ * CLOUD-LEGALITY: the only timing is the fake's lane-controlled `delayMs`
+ * before the scripted emission (the same pattern as
+ * fresh-agent-error-turn-attention.spec.ts): it gives the spec a bounded
+ * window to move to the other tab BEFORE the turn ends. If that move were
+ * ever late, the ending would be WATCHED and the spec fails loudly on the
+ * "no watched mark" check instead of passing by accident. Every other wait
+ * is a poll on observed state. This spec must NOT be added to
+ * CLOUD_SKIP_SPECS.
  */
 import fs from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -46,6 +49,44 @@ const __dirname = path.dirname(__filename)
 
 const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fake-claude-sdk-sidecar.mjs')
 
+const BACKGROUND_TURN = 'BACKGROUND_TURN'
+const BACKGROUND_APPROVAL = 'BACKGROUND_APPROVAL'
+const APPROVAL_REQUEST_ID = 'perm-mobile-background'
+
+/**
+ * Deterministic fake-sidecar program. Each scripted emission waits 3 s after
+ * the sidecar receives the send, so the user is in the other tab when the
+ * turn ends or the approval is raised.
+ */
+const FAKE_PROGRAM = {
+  rules: [
+    {
+      on: 'msg:send',
+      match: { text: BACKGROUND_TURN },
+      emit: [
+        {
+          kind: 'completion',
+          data: { subtype: 'success', text: 'Fixture turn finished while the user was away.' },
+          delayMs: 3_000,
+        },
+      ],
+    },
+    {
+      // The approval parks the turn (no completion follows) and the sidecar
+      // emits sdk.turn.waiting on the 0→1 pending transition.
+      on: 'msg:send',
+      match: { text: BACKGROUND_APPROVAL },
+      emit: [
+        {
+          kind: 'approval',
+          data: { id: APPROVAL_REQUEST_ID, tool: 'Bash', input: { command: 'echo mobile-background' } },
+          delayMs: 3_000,
+        },
+      ],
+    },
+  ],
+}
+
 function findFreshAgentLeaf(node: any): any {
   if (!node) return null
   if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
@@ -58,12 +99,40 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
+function readJsonl(file: string): any[] {
+  if (!existsSync(file)) return []
+  return readFileSync(file, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line)
+      } catch {
+        return null
+      }
+    })
+    .filter(Boolean)
+}
+
+/** Every outbound sidecar frame of `type` (the fixture's wire audit rows). */
+function wireFrames(eventsLog: string, type: string): any[] {
+  return readJsonl(eventsLog)
+    .filter((row) => row.kind === 'wire' && row.frame?.type === type)
+    .map((row) => row.frame)
+}
+
+async function receivedFreshAgentEvents(harness: TestHarness, eventType: string): Promise<any[]> {
+  const received = (await harness.getReceivedWsMessages()) as any[]
+  return received.filter((msg) => msg?.type === 'freshAgent.event' && msg?.event?.type === eventType)
+}
+
 test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
   test.use({ viewport: { width: 390, height: 844 } })
   test.setTimeout(180_000)
 
   test('background turn endings and approvals mark the mobile strip and switcher; a tap dismisses', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-mobile-attention-'))
+    const eventsLog = path.join(sharedRoot, 'sidecar-events.jsonl')
     let server: RustServer | undefined
     try {
       const projectDir = path.join(sharedRoot, 'project')
@@ -73,8 +142,9 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
           FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR_FIXTURE,
           FRESHELL_CLAUDE_NODE: process.execPath,
           FRESHELL_FAKE_PROVIDER: 'freshclaude',
+          FRESHELL_FAKE_PROGRAM: JSON.stringify(FAKE_PROGRAM),
           FRESHELL_FAKE_STDIN: path.join(sharedRoot, 'sidecar-stdin.jsonl'),
-          FRESHELL_FAKE_EVENTS: path.join(sharedRoot, 'sidecar-events.jsonl'),
+          FRESHELL_FAKE_EVENTS: eventsLog,
         },
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
@@ -112,36 +182,27 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
       await directoryInput.fill(projectDir)
       await directoryInput.press('Enter')
 
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      await expect(paneRoot).toBeVisible({ timeout: 15_000 })
+      const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+      const sendButton = paneRoot.getByRole('button', { name: 'Send' })
+
       const tabA = (await harness.getActiveTabId())!
       expect(tabA).toBeTruthy()
       const paneStatus = () => expect.poll(async () => {
         const layout = await harness.getPaneLayout(tabA)
         return findFreshAgentLeaf(layout)?.content?.status ?? null
       }, { timeout: 30_000 })
-      // The pane's turn-completion key is its durable session id.
-      let durableId = ''
+      // The pane is ready to take a turn once it has its durable session id.
       await expect
-        .poll(async () => {
-          durableId = findFreshAgentLeaf(await harness.getPaneLayout(tabA))?.content?.sessionRef?.sessionId ?? ''
-          return durableId
-        }, { timeout: 30_000 })
+        .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabA))?.content?.sessionRef?.sessionId ?? '', {
+          timeout: 30_000,
+        })
         .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
       await paneStatus().toBe('idle')
 
       const turnCompletionState = () => harness.getState().then((s: any) => s?.turnCompletion ?? {})
       expect((await turnCompletionState()).seq ?? 0).toBe(0)
-
-      let lastAt = Date.now()
-      const deliverEdge = async (type: 'freshAgent.turn.complete' | 'freshAgent.turn.waiting') => {
-        lastAt += 1_000
-        await harness.receiveWsMessage({
-          type: 'freshAgent.event',
-          sessionId: durableId,
-          sessionType: 'freshclaude',
-          provider: 'claude',
-          event: { type, sessionId: durableId, at: lastAt },
-        })
-      }
 
       // The strip's "other tabs" count is a polite live region that stays
       // mounted (empty while nothing else is marked); its label is its text.
@@ -150,20 +211,35 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
       const previousTab = page.getByRole('button', { name: 'Previous tab' })
 
       // ── 1. A turn ends in a BACKGROUND tab ─────────────────────────────────
-      // Tab A is the last tab, so the strip's right action is "New tab".
+      // Send, then (inside the fake's 3 s window) open a new tab with the
+      // strip's right action — tab A is the last tab, so it reads "New tab".
+      await composer.fill(BACKGROUND_TURN)
+      await sendButton.click()
       await page.getByRole('button', { name: 'New tab' }).click()
       await harness.waitForTabCount(2)
       const tabB = (await harness.getActiveTabId())!
       expect(tabB).not.toBe(tabA)
-      await expect(otherTabsStatus).toHaveCount(0)
 
-      await deliverEdge('freshAgent.turn.complete')
       await expect
-        .poll(async () => (await turnCompletionState()).attentionByTab?.[tabA] ?? null, {
-          timeout: 15_000,
-          message: 'the background turn ending marks tab A',
+        .poll(async () => (await turnCompletionState()).seq ?? 0, {
+          timeout: 30_000,
+          message: 'the background turn ending rings exactly one event (seq 1)',
         })
-        .toBe(true)
+        .toBe(1)
+      const endedState = await turnCompletionState()
+      expect(endedState.attentionByTab?.[tabA], 'the background turn ending marks tab A').toBe(true)
+      expect(
+        endedState.watchedCompletionByTab?.[tabA],
+        'the turn ended while the user was in tab B (a watched mark means the tab move was late)',
+      ).toBeUndefined()
+      // The mark came from the server's edge for a real turn, not a stand-in.
+      expect(wireFrames(eventsLog, 'sdk.turn.complete'), 'the sidecar ended the turn with the attention edge').toHaveLength(1)
+      expect(
+        await receivedFreshAgentEvents(harness, 'freshAgent.turn.complete'),
+        'the server forwarded exactly one turn-complete edge to the client',
+      ).toHaveLength(1)
+      await paneStatus().toBe('idle')
+
       await expect(otherTabsStatus, 'the strip counts the other tab that needs attention').toBeVisible()
       await expect(previousTab, 'the Previous chevron points at the marked tab').toHaveAccessibleDescription(
         'An earlier tab needs attention',
@@ -188,17 +264,37 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
       await expect(previousTab).toHaveAccessibleDescription('')
 
       // ── 3. An approval wait raised while the user is in another tab ───────
-      // Tab A is first of two now: the strip's right action is "Next tab".
+      // Send from tab A, then move to tab B inside the 3 s window. Tab A is
+      // first of two now: the strip's right action is "Next tab".
+      await composer.fill(BACKGROUND_APPROVAL)
+      await sendButton.click()
       await page.getByRole('button', { name: 'Next tab' }).click()
       await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)
 
-      await deliverEdge('freshAgent.turn.waiting')
       await expect
-        .poll(async () => (await turnCompletionState()).attentionByTab?.[tabA] ?? null, {
-          timeout: 15_000,
-          message: 'the approval waiting edge marks the background tab',
+        .poll(async () => (await turnCompletionState()).seq ?? 0, {
+          timeout: 30_000,
+          message: 'the approval waiting edge rings exactly one more event (seq 2)',
         })
-        .toBe(true)
+        .toBe(2)
+      const waitingState = await turnCompletionState()
+      expect(waitingState.attentionByTab?.[tabA], 'the approval waiting edge marks the background tab').toBe(true)
+      expect(
+        waitingState.watchedCompletionByTab?.[tabA],
+        'the approval was raised while the user was in tab B',
+      ).toBeUndefined()
+      expect(
+        wireFrames(eventsLog, 'sdk.permission.request').map((frame) => frame.requestId),
+        'the sidecar raised the scripted approval',
+      ).toEqual([APPROVAL_REQUEST_ID])
+      expect(wireFrames(eventsLog, 'sdk.turn.waiting'), 'the sidecar emitted the waiting edge').toHaveLength(1)
+      expect(
+        await receivedFreshAgentEvents(harness, 'freshAgent.turn.waiting'),
+        'the server forwarded exactly one waiting edge to the client',
+      ).toHaveLength(1)
+      // The approval parks the turn: no second turn-complete edge.
+      expect(wireFrames(eventsLog, 'sdk.turn.complete')).toHaveLength(1)
+
       await expect(otherTabsStatus, 'the waiting tab is counted like a finished one').toBeVisible()
       await expect(previousTab).toHaveAccessibleDescription('An earlier tab needs attention')
 
