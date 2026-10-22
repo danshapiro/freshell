@@ -59,6 +59,9 @@ enum ProviderState {
 struct HostedTransport {
     provider: FreshProvider,
     state: ProviderState,
+    /// The providers' own outbound stream (the bridge relays it into the
+    /// journal); an operation subscribes to read the provider's answer.
+    provider_frames: Arc<broadcast::Sender<String>>,
     profile: std::sync::Mutex<Option<FreshAgentProfile>>,
     session_id: Mutex<Option<String>>,
     created_rx: Mutex<watch::Receiver<Option<Result<String, ()>>>>,
@@ -220,6 +223,7 @@ impl HostedTransport {
         Arc::new(Self {
             provider,
             state,
+            provider_frames: broadcast_tx,
             profile: std::sync::Mutex::new(None),
             session_id: Mutex::new(None),
             created_rx: Mutex::new(created_rx),
@@ -825,13 +829,17 @@ impl FreshAgentTransport for HostedTransport {
                 if let Some(profile) = self.profile.lock().expect("profile lock").as_mut() {
                     profile.apply_turn_settings(settings);
                 }
-                // The provider answers on its own event stream: a converged
-                // `freshAgent.session.metadata`, or a session-scoped error
-                // when it refuses the live apply (the actor has already
-                // persisted the intent for the next send).
+                // The provider answers on its own event stream, which the
+                // bridge relays to every device: a converged
+                // `freshAgent.session.metadata`, or an error when it refuses
+                // the live apply (the actor has already saved the intent for
+                // the next send). Each provider emits that answer before its
+                // configure handler returns, so a receiver opened first
+                // sees it.
+                let mut answers = self.provider_frames.subscribe();
                 let message = FreshAgentConfigure {
                     provider: self.provider_wire(),
-                    session_id,
+                    session_id: session_id.clone(),
                     session_type: self.session_type(),
                     cwd: settings.cwd.clone(),
                     request_id: Some(request_id.as_str().to_string()),
@@ -849,6 +857,21 @@ impl FreshAgentTransport for HostedTransport {
                     ProviderState::Opencode { runtime, .. } => {
                         runtime.handle_configure(message).await
                     }
+                }
+                if let Some(code) = configure_refusal_code(&mut answers, &session_id, request_id) {
+                    crate::emit_environment_event(json!({
+                        "severity": "warn",
+                        "event": "fresh_agent.configure.provider_refused",
+                        "stage": "session_host",
+                        "provider": self.provider.as_str(),
+                        "request_id": request_id.as_str(),
+                        "code": code,
+                    }));
+                    return Err(OperationFailure {
+                        kind: OperationFailureKind::Rejected,
+                        message: format!("provider refused the live configure ({code})"),
+                        acceptance_ambiguous: false,
+                    });
                 }
             }
             FreshAgentOperation::Rollback {
@@ -1283,6 +1306,48 @@ fn find_operation_error_code(value: &Value) -> Option<&str> {
     }
 }
 
+/// The code of the error a provider answered a configure with, if any: a
+/// `freshAgent.error` for the configured session, or a top-level `error`
+/// correlated to the configure's request id (the unknown-session answer).
+fn configure_refusal_code(
+    answers: &mut broadcast::Receiver<String>,
+    session_id: &str,
+    request_id: &RequestId,
+) -> Option<String> {
+    loop {
+        let frame = match answers.try_recv() {
+            Ok(frame) => frame,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => return None,
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&frame) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("error")
+            && value.get("requestId").and_then(Value::as_str) == Some(request_id.as_str())
+        {
+            return Some(
+                value
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+            );
+        }
+        if value.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+            continue;
+        }
+        if let Some(code) = value
+            .get("event")
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("freshAgent.error"))
+            .and_then(|event| event.get("code"))
+            .and_then(Value::as_str)
+        {
+            return Some(code.to_string());
+        }
+    }
+}
+
 fn find_operation_session_id(value: &Value) -> Option<String> {
     if matches!(
         value.get("type").and_then(Value::as_str),
@@ -1515,8 +1580,8 @@ lines.on('line', line=>{
 
     /// What one hosted Claude configure produced: the actor's answer, the
     /// durable profile afterwards, every configure line the scripted sidecar
-    /// received, and the provider event named `settled_on` once it reached
-    /// the host journal.
+    /// received, the provider event named `settled_on` once it reached the
+    /// host journal, and the whole journal at that point.
     struct HostedClaudeConfigure {
         outcome: Result<
             freshell_runtime_protocol::CommandState,
@@ -1525,6 +1590,7 @@ lines.on('line', line=>{
         profile: FreshAgentProfile,
         applied: Vec<Value>,
         settled: Option<Value>,
+        events: Vec<AgentEvent>,
     }
 
     /// Runs one configure through the real `FreshClaudeState` behind a hosted
@@ -1614,6 +1680,13 @@ lines.on('line', line=>{{
         .await
         .ok();
         let profile = actor.profile().await;
+        let events = actor
+            .read_events(0, 256)
+            .await
+            .events
+            .into_iter()
+            .map(|entry| entry.event)
+            .collect();
         let applied = std::fs::read_to_string(&receipt_log)
             .unwrap_or_default()
             .lines()
@@ -1625,6 +1698,7 @@ lines.on('line', line=>{{
             profile,
             applied,
             settled,
+            events,
         }
     }
 
@@ -1697,6 +1771,96 @@ lines.on('line', line=>{{
             "the durable effort equals the effort the live session reports"
         );
         assert!(run.profile.effort.is_none());
+    }
+
+    /// Claude refuses the live apply (here the sidecar cannot set the
+    /// model). The intent stays saved for the next send, the provider's own
+    /// error reaches the journal for every device, and the command journal
+    /// records the refusal instead of a provider acknowledgement.
+    #[tokio::test]
+    async fn hosted_claude_configure_refused_live_keeps_the_intent_and_journals_the_refusal() {
+        let run = hosted_claude_configure(
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+            "{type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:false,message:'Model or effort is unavailable'}",
+            "freshAgent.error",
+        )
+        .await;
+
+        assert_eq!(
+            run.outcome.unwrap(),
+            freshell_runtime_protocol::CommandState::Cancelled
+        );
+        assert_eq!(run.applied.len(), 1, "the live apply was attempted once");
+        let refusal = run
+            .settled
+            .expect("the provider's refusal reaches the host journal");
+        assert_eq!(refusal["code"], "CLAUDE_SETTINGS_FAILED");
+        assert_eq!(run.profile.model.as_deref(), Some("opus"));
+        assert_eq!(run.profile.effort.as_deref(), Some("high"));
+        assert!(
+            run.events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CommandOutcome {
+                    request_id,
+                    state: freshell_runtime_protocol::CommandState::Cancelled,
+                } if request_id.as_str() == "hosted-configure-1"
+            )),
+            "the command journal records the refused live apply: {:?}",
+            run.events
+        );
+    }
+
+    #[test]
+    fn configure_refusal_is_read_only_from_answers_to_this_configure() {
+        let request_id = RequestId::parse("configure-answer").unwrap();
+        let refusal = |frames: &[Value]| {
+            let (sender, mut answers) = broadcast::channel(16);
+            for frame in frames {
+                sender.send(frame.to_string()).unwrap();
+            }
+            configure_refusal_code(&mut answers, "session-a", &request_id)
+        };
+        let nested_error = |session: &str, code: &str| {
+            json!({"type":"freshAgent.event","provider":"codex","sessionId":session,
+                "sessionType":"freshcodex","event":{"type":"freshAgent.error","sessionId":session,
+                "code":code,"message":"refused"}})
+        };
+        let metadata = json!({"type":"freshAgent.event","provider":"claude","sessionId":"session-a",
+            "sessionType":"freshclaude","event":{"type":"freshAgent.session.metadata",
+            "sessionId":"session-a","model":"opus"}});
+
+        assert_eq!(
+            refusal(std::slice::from_ref(&metadata)),
+            None,
+            "a converged apply"
+        );
+        assert_eq!(
+            refusal(&[nested_error("session-b", "INVALID_EFFORT")]),
+            None,
+            "another session's error"
+        );
+        assert_eq!(
+            refusal(&[
+                json!({"type":"error","requestId":"another-request","code":"INTERNAL_ERROR"})
+            ]),
+            None,
+            "another request's error"
+        );
+        assert_eq!(
+            refusal(&[metadata, nested_error("session-a", "INVALID_EFFORT")]).as_deref(),
+            Some("INVALID_EFFORT")
+        );
+        assert_eq!(
+            refusal(&[json!({"type":"error","requestId":"configure-answer",
+                "code":"INTERNAL_ERROR","message":"SESSION_NOT_FOUND: claude session not found"})])
+            .as_deref(),
+            Some("INTERNAL_ERROR"),
+            "the unknown-session answer is correlated by request id"
+        );
     }
 
     #[tokio::test]

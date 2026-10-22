@@ -1747,11 +1747,39 @@ async fn refused_live_configure_keeps_the_intent_for_the_next_send() {
     .await
     .unwrap();
 
-    let refused = actor
-        .configure(RequestId::parse("configure-mid-turn").unwrap(), opus_high())
-        .await
-        .unwrap_err();
-    assert!(matches!(refused, ActorError::Transport(_)), "{refused:?}");
+    // The provider's own session-scoped error tells every device why the
+    // live apply was refused; the configure itself succeeded at saving the
+    // intent, so it answers the refused state instead of an error (an error
+    // here would add a second, generic banner over the provider's one).
+    let request_id = RequestId::parse("configure-mid-turn").unwrap();
+    assert_eq!(
+        actor
+            .configure(request_id.clone(), opus_high())
+            .await
+            .unwrap(),
+        CommandState::Cancelled
+    );
+    assert_eq!(
+        actor.configure(request_id, opus_high()).await.unwrap(),
+        CommandState::Cancelled,
+        "a retried refused configure answers the same and is not reapplied"
+    );
+    assert_eq!(transport.applied.lock().unwrap().len(), 1);
+    assert!(
+        actor
+            .read_events(0, 64)
+            .await
+            .events
+            .iter()
+            .any(|entry| matches!(
+                &entry.event,
+                AgentEvent::CommandOutcome {
+                    request_id,
+                    state: CommandState::Cancelled,
+                } if request_id.as_str() == "configure-mid-turn"
+            )),
+        "the journal records the refused live apply"
+    );
     assert_eq!(actor.profile().await.model.as_deref(), Some("opus"));
     assert_eq!(transport.durable_model().as_deref(), Some("opus"));
 

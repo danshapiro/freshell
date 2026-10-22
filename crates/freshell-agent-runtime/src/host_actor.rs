@@ -890,6 +890,10 @@ impl FreshAgentHostActor {
         let _dispatch_guard = self.dispatch_lock.lock().await;
         let material = serde_json::to_vec(&operation).map_err(persist)?;
         let payload_digest = digest(&material);
+        // A configure saves its settings before the live apply, so a refused
+        // live apply is its answer (Cancelled), not a failed command: the
+        // provider's own session-scoped error already tells every device why.
+        let saved_before_dispatch = matches!(operation, FreshAgentOperation::Configure { .. });
         {
             let state = self.state.lock().await;
             if let Some(existing) = state.commands.get(request_id.as_str()) {
@@ -897,6 +901,9 @@ impl FreshAgentHostActor {
                     return Err(ActorError::RequestConflict);
                 }
                 return match (existing.state, existing.operation_failure) {
+                    (CommandState::Cancelled, Some(_)) if saved_before_dispatch => {
+                        Ok(CommandState::Cancelled)
+                    }
                     (CommandState::Cancelled, Some(OperationFailureKind::Unsupported)) => {
                         Err(ActorError::UnsupportedOperation)
                     }
@@ -993,14 +1000,18 @@ impl FreshAgentHostActor {
                         CommandState::Cancelled
                     };
                     command.operation_failure = Some(failure.kind);
-                    let error = if failure.acceptance_ambiguous {
-                        ActorError::AmbiguousDispatch
-                    } else if failure.kind == OperationFailureKind::Unsupported {
-                        ActorError::UnsupportedOperation
+                    if saved_before_dispatch && !failure.acceptance_ambiguous {
+                        (Ok(CommandState::Cancelled), None)
                     } else {
-                        ActorError::Transport(failure.message)
-                    };
-                    (Err(error), None)
+                        let error = if failure.acceptance_ambiguous {
+                            ActorError::AmbiguousDispatch
+                        } else if failure.kind == OperationFailureKind::Unsupported {
+                            ActorError::UnsupportedOperation
+                        } else {
+                            ActorError::Transport(failure.message)
+                        };
+                        (Err(error), None)
+                    }
                 }
             }
         };
