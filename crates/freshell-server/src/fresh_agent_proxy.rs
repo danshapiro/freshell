@@ -271,17 +271,45 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Configure(message) => {
-                // Every hosted send already carries the pane's settings, so a
-                // configure is staged until that send (the protocol's
-                // accept-and-strip degradation). It must not reach the
-                // in-process provider states, which do not own this soul.
-                tracing::info!(
-                    event = "fresh_agent.configure.staged_until_next_send",
-                    provider = %provider_wire(&message.provider),
-                    session_id = %message.session_id,
-                    request_id = message.request_id.as_deref().unwrap_or(""),
-                    "managed fresh-agent configure staged until the next send"
-                );
+                let request_id = message
+                    .request_id
+                    .as_deref()
+                    .and_then(|value| RequestId::parse(value.to_string()).ok())
+                    .unwrap_or_default();
+                let settings =
+                    turn_settings(Some(message.settings), message.cwd).unwrap_or_default();
+                // The provider converges every device through its own
+                // `freshAgent.session.metadata` frame (or refuses with its own
+                // session-scoped error) on the host event relay; only a
+                // failure to reach the soul is answered here.
+                let result = match self
+                    .resolve_soul(&message.provider, message.session_type, &message.session_id)
+                    .await
+                {
+                    Some(soul) => self
+                        .client
+                        .fresh_agent_configure(request_id.clone(), soul, settings)
+                        .await
+                        .map(|_| ()),
+                    None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+                };
+                if let Err(error) = result {
+                    tracing::warn!(
+                        event = "fresh_agent.configure.failed",
+                        provider = %provider_wire(&message.provider),
+                        session_id = %message.session_id,
+                        request_id = %request_id,
+                        code = operation_error_code(&error),
+                        "managed fresh-agent configure was not accepted"
+                    );
+                    self.operation_error_event(
+                        &message.provider,
+                        &message.session_id,
+                        message.session_type,
+                        &error,
+                        "managed fresh-agent configure was not accepted",
+                    );
+                }
             }
             HostedFreshAgentCommand::Kill(message) => {
                 let success = if let Some(soul) = self
@@ -1224,13 +1252,7 @@ fn turn_settings(
     );
     if let Some(cwd) = cwd {
         settings
-            .get_or_insert(freshell_runtime_protocol::FreshAgentTurnSettings {
-                cwd: None,
-                model: None,
-                effort: None,
-                permission_mode: None,
-                sandbox: None,
-            })
+            .get_or_insert_with(Default::default)
             .cwd
             .get_or_insert(cwd);
     }

@@ -136,20 +136,15 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
     );
 }
 
-#[tokio::test]
-async fn hosted_configure_is_consumed_by_the_gateway_without_a_lost_session_frame() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("supervisor.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let soul = SoulId::parse("managed-claude-soul").unwrap();
-    let (broadcast, mut receiver) = broadcast::channel(16);
+fn configure_proxy(
+    socket: &Path,
+    aliases: HashMap<(String, String), SoulId>,
+) -> (Arc<HostedFreshAgentProxy>, broadcast::Receiver<String>) {
+    let (broadcast, receiver) = broadcast::channel(16);
     let proxy = Arc::new(HostedFreshAgentProxy {
-        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        client: RuntimeClient::new(socket, "0123456789abcdef"),
         broadcast: Arc::new(broadcast),
-        aliases: Mutex::new(HashMap::from([(
-            ("claude".into(), "public-1".into()),
-            soul,
-        )])),
+        aliases: Mutex::new(aliases),
         presentation_ids: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
@@ -157,26 +152,185 @@ async fn hosted_configure_is_consumed_by_the_gateway_without_a_lost_session_fram
         checkpoint_barrier: OnceLock::new(),
         ownership: OnceLock::new(),
     });
+    (proxy, receiver)
+}
 
-    proxy
-        .handle(HostedFreshAgentCommand::Configure(
-            serde_json::from_value(serde_json::json!({
-                "provider":"claude","sessionId":"public-1","sessionType":"freshclaude",
-                "requestId":"configure-1","settings":{"model":"opus","effort":"high"}
-            }))
-            .unwrap(),
-        ))
-        .await;
+/// The fake supervisor must have served every expected request by now; a
+/// proxy that never called it fails here instead of hanging the suite.
+async fn settled<T>(server: tokio::task::JoinHandle<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the proxy did not make the expected runtime calls")
+        .unwrap()
+}
 
-    assert!(
-        receiver.try_recv().is_err(),
-        "a hosted configure must not answer with an error or lost-session frame"
+fn configure_command(session_id: &str) -> HostedFreshAgentCommand {
+    HostedFreshAgentCommand::Configure(
+        serde_json::from_value(serde_json::json!({
+            "provider":"claude","sessionId":session_id,"sessionType":"freshclaude",
+            "cwd":"/workspace","requestId":"configure-ui-request",
+            "settings":{"model":"opus","effort":"high","permissionMode":"acceptEdits",
+                "sandbox":"workspace-write"}
+        }))
+        .unwrap(),
+    )
+}
+
+/// Answers Health and then one configure the way `answer` decides, and
+/// returns the admin methods it saw.
+fn configure_supervisor(
+    listener: UnixListener,
+    answer: impl Fn(
+            freshell_runtime_protocol::FreshAgentConfigureRequest,
+            RequestId,
+        ) -> Result<AdminResult, freshell_runtime_protocol::RuntimeError>
+        + Send
+        + 'static,
+) -> tokio::task::JoinHandle<Vec<&'static str>> {
+    tokio::spawn(async move {
+        let mut methods = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            assert_eq!(request.role, ControlRole::Web);
+            let result = match request.body {
+                AdminCommand::Health => {
+                    methods.push("health");
+                    Ok(AdminResult::Health {
+                        control_epoch: 77,
+                        installation_id: InstallationId::new(),
+                    })
+                }
+                AdminCommand::FreshAgentConfigure(configure) => {
+                    methods.push("fresh_agent_configure");
+                    answer(configure, request.request_id.clone())
+                }
+                other => panic!("configure must not send {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        methods
+    })
+}
+
+#[tokio::test]
+async fn hosted_configure_calls_the_runtime_with_the_mapped_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("managed-claude-soul").unwrap();
+    let expected_soul = soul.clone();
+    let server = configure_supervisor(listener, move |configure, request_id| {
+        assert_eq!(request_id.as_str(), "configure-ui-request");
+        assert_eq!(configure.soul_id, expected_soul);
+        assert_eq!(configure.expected_control_epoch, Some(77));
+        assert_eq!(
+            configure.settings,
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                cwd: Some("/workspace".into()),
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                permission_mode: Some("acceptEdits".into()),
+                sandbox: Some("workspace-write".into()),
+            }
+        );
+        Ok(AdminResult::FreshAgentCommand {
+            state: freshell_runtime_protocol::CommandState::ProviderAcked,
+        })
+    });
+    let (proxy, mut receiver) = configure_proxy(
+        &socket,
+        HashMap::from([(("claude".into(), "public-1".into()), soul)]),
+    );
+
+    proxy.handle(configure_command("public-1")).await;
+
+    assert_eq!(
+        settled(server).await,
+        vec!["health", "fresh_agent_configure"]
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err(),
-        "the staged configure is applied by the next send, not by a host call"
+        receiver.try_recv().is_err(),
+        "an accepted configure converges through the provider's own metadata frame"
+    );
+}
+
+#[tokio::test]
+async fn hosted_configure_rpc_failure_answers_a_typed_nested_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("managed-claude-soul").unwrap();
+    let server = configure_supervisor(listener, |_, _| {
+        Err(freshell_runtime_protocol::RuntimeError::new(
+            RuntimeErrorCode::UnsupportedOperation,
+            "redacted",
+        ))
+    });
+    let (proxy, mut receiver) = configure_proxy(
+        &socket,
+        HashMap::from([(("claude".into(), "public-1".into()), soul)]),
+    );
+
+    proxy.handle(configure_command("public-1")).await;
+    settled(server).await;
+
+    let frame = receiver.try_recv().expect("a refused configure is visible");
+    let ServerMessage::FreshAgentEvent(event) = serde_json::from_str(&frame).unwrap() else {
+        panic!("expected a nested fresh-agent event: {frame}")
+    };
+    assert_eq!(event.session_id, "public-1");
+    assert_eq!(event.session_type, "freshclaude");
+    assert_eq!(event.event["type"], "freshAgent.error");
+    assert_eq!(event.event["code"], "UNSUPPORTED_CAPABILITY");
+}
+
+#[tokio::test]
+async fn hosted_configure_for_an_unknown_soul_answers_a_nested_error_not_a_lost_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+        assert!(
+            matches!(request.body, AdminCommand::Inventory),
+            "an unknown soul is looked up, never configured: {:?}",
+            request.body
+        );
+        write_frame(
+            &mut stream,
+            &AdminReply {
+                request_id: request.request_id,
+                result: Ok(AdminResult::Inventory(Vec::new())),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let (proxy, mut receiver) = configure_proxy(&socket, HashMap::new());
+
+    proxy.handle(configure_command("public-unknown")).await;
+    settled(server).await;
+
+    let frame = receiver.try_recv().expect("an unknown soul is visible");
+    let ServerMessage::FreshAgentEvent(event) = serde_json::from_str(&frame).unwrap() else {
+        panic!("expected a nested fresh-agent event: {frame}")
+    };
+    assert_eq!(event.session_id, "public-unknown");
+    assert_eq!(event.event["type"], "freshAgent.error");
+    assert_eq!(event.event["code"], "MANAGED_FRESH_AGENT_ERROR");
+    assert_ne!(
+        event.event["code"], "INVALID_SESSION_ID",
+        "a hosted configure miss must not mark the pane lost"
     );
 }
 

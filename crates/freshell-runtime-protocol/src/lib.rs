@@ -2478,7 +2478,7 @@ pub struct TerminalInputRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentTurnSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -7,13 +7,13 @@
 use freshell_runtime_protocol::{
     write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply, AdminResult,
     ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest, FreshAgentCompactRequest,
-    FreshAgentForkRequest, FreshAgentInterruptRequest, FreshAgentReadEventsRequest,
-    FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
-    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, PendingNoticesRequest,
-    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
-    RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
+    FreshAgentConfigureRequest, FreshAgentForkRequest, FreshAgentInterruptRequest,
+    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
+    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan,
+    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
+    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
+    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
     RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
     RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
     TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
@@ -770,6 +770,29 @@ impl RuntimeClient {
                     soul_id,
                     instructions,
                     cwd,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_configure(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        settings: freshell_runtime_protocol::FreshAgentTurnSettings,
+    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                request_id,
+                AdminCommand::FreshAgentConfigure(FreshAgentConfigureRequest {
+                    soul_id,
+                    settings,
                     expected_control_epoch: Some(epoch),
                 }),
             )
