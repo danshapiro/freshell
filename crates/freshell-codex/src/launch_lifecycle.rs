@@ -1242,7 +1242,11 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                     .unwrap_or(Duration::ZERO);
                 let probe_error = match tokio::time::timeout(
                     remaining,
-                    tokio_tungstenite::connect_async(&ws_url),
+                    tokio_tungstenite::connect_async_with_config(
+                        &ws_url,
+                        Some(crate::ws_config::lane_ws_config()),
+                        false,
+                    ),
                 )
                 .await
                 {

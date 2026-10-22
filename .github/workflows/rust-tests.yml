@@ -74,6 +74,14 @@ jobs:
       - name: Install dependencies (Rust test fixtures)
         run: pnpm install --frozen-lockfile
       - name: Workspace tests
+        # Workspace feature unification turns freshell-codex's default-off
+        # `real-transport` feature ON in this step (freshell-ws,
+        # freshell-server, freshell-session-host, and freshell-freshagent all
+        # depend on freshell-codex with the feature), so the
+        # remote_proxy_relay integration tests run here without an explicit
+        # --features flag. A bare `cargo test -p freshell-codex` would skip
+        # them (verified 2026-10-21: workspace --test remote_proxy_relay --list
+        # reports 38 tests; the same -p invocation reports 0).
         run: cargo test --workspace --exclude freshell-tauri --locked
 
   gate:

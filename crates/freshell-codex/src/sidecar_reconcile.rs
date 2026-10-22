@@ -508,7 +508,11 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
                 IdentityVerdict::Verified => {
                     let probe_error = match tokio::time::timeout(
                         REATTACH_PROBE_BUDGET,
-                        tokio_tungstenite::connect_async(&record.ws_url),
+                        tokio_tungstenite::connect_async_with_config(
+                            &record.ws_url,
+                            Some(crate::ws_config::lane_ws_config()),
+                            false,
+                        ),
                     )
                     .await
                     {

@@ -65,6 +65,8 @@ pub mod sidecar_sweep;
 pub(crate) mod sidecar_test_support;
 #[cfg(feature = "real-transport")]
 pub mod transport;
+#[cfg(feature = "real-transport")]
+pub mod ws_config;
 
 pub use app_server::{
     new_channel_transport, BoxFuture, ChannelPeer, ChannelTransport, CodexAppServerClient,

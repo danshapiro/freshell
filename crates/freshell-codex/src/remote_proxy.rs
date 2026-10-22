@@ -26,10 +26,31 @@
 //!   tears down the WS listener and all active client/upstream socket pairs (mirrors
 //!   `remote-proxy.ts:178-204` exactly); it does NOT touch any child process — that's the
 //!   Slice-3 launch-planner's sidecar handle, not this proxy's.
-//! - **No protocol-level (tungstenite) frame-size cap is configured.** The app-level
-//!   `max_raw_forward_bytes` guard (mirroring `maxRawForwardBytes`) is enforced in the hub
-//!   after a message is fully buffered, matching legacy's own belt on top of `ws`'s
-//!   `maxPayload` — see the module's tests for the exact rejection behavior.
+//! - **Protocol-level (tungstenite) frame-size caps ARE configured, at
+//!   equality with the app-level policy** (plan
+//!   `docs/plans/2026-10-20-codex-proxy-ws-frame-cap.md` §4.1): both proxy
+//!   legs — the TUI-facing accept AND the upstream dial — run with
+//!   `max_frame_size`/`max_message_size` = [`MAX_WS_FRAME_BYTES`]/
+//!   [`MAX_WS_MESSAGE_BYTES`], which default to [`MAX_CODEX_FRAME_BYTES`]:
+//!   the SAME 256 MiB value as the hub's `max_raw_forward_bytes` policy
+//!   (equality: transport == policy). This is exact legacy parity — the
+//!   retired Node proxy tied its `ws` server's `maxPayload` to
+//!   `maxRawForwardBytes`; the Rust port had silently dropped to
+//!   tungstenite's 16 MiB default, BELOW the policy it was supposed to sit
+//!   under, which caused the 2026-10-19 blinking-pane incident. At equality
+//!   an over-policy single frame is rejected by the transport from its
+//!   header — zero payload buffering — and surfaces as the classified,
+//!   per-proxy-rate-limited Capacity repair trigger (§4.3.1); the hub's own
+//!   `max_raw_forward_bytes` check remains as belt-and-suspenders (it still
+//!   guards rewritten/constructed frames and any injected asymmetry). A
+//!   growth canary (§4.3.2) — warn-only, rate-limited per proxy via
+//!   [`CANARY_MIN_WARN_INTERVAL_MS`] — fires when an ingested frame exceeds
+//!   [`CANARY_BYTES`] (32 MiB), covering the growth zone BELOW the cap
+//!   (over-cap frames never reach hub ingest). The fresh lane
+//!   (`transport.rs`) runs its own INDEPENDENT, deliberately smaller cap
+//!   ([`crate::remote_proxy_envelope::MAX_LANE_FRAME_BYTES`], 64 MiB)
+//!   because it full-parses responses — see [`crate::ws_config`] for both
+//!   config builders.
 //! - **Turn dedup state (`activeTurnKeys`/`completedTurnKeys`) is proxy-wide**, not
 //!   per-connection — this matches `remote-proxy.ts` exactly (the fields live on the
 //!   `CodexRemoteProxy` class, not `ProxyConnection`).
@@ -45,20 +66,22 @@
 //!   sequential integers/strings) never hit this edge.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Map, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{accept_async, connect_async};
+use tokio_tungstenite::{accept_async_with_config, connect_async_with_config};
 
 use crate::protocol::RequestId;
 use crate::remote_proxy_envelope::{
-    scan_json_rpc_envelope, JsonRpcEnvelopeId, JsonRpcEnvelopeScanError, MAX_FULL_PARSE_BYTES,
-    MAX_RAW_FORWARD_BYTES,
+    scan_json_rpc_envelope, JsonRpcEnvelopeId, JsonRpcEnvelopeScanError, CANARY_BYTES,
+    MAX_CODEX_FRAME_BYTES, MAX_FULL_PARSE_BYTES, MAX_WS_FRAME_BYTES, MAX_WS_MESSAGE_BYTES,
 };
 use crate::remote_proxy_side_effects::{
     extract_fork_response_candidate, extract_fs_changed_repair_trigger,
@@ -69,6 +92,7 @@ use crate::remote_proxy_side_effects::{
     ForkResponseOptions, RemoteProxyCandidate, ThreadLifecycleEvent, ThreadStartResponseOptions,
     ThreadStartedLifecycle, TurnEvent as SideEffectTurnEvent,
 };
+use crate::ws_config::ws_config_with_caps;
 
 /// Upstream notification methods that get side-effect extraction
 /// (`STATEFUL_NOTIFICATION_METHODS`, `remote-proxy.ts:103-110`).
@@ -120,6 +144,13 @@ pub const CANDIDATE_CAPTURE_TIMEOUT_MS: u64 = 45_000;
 pub const IDENTITY_GATE_HOLD_TIMEOUT_MS: u64 = 5_000;
 /// Legacy cap on held gate frames (`remote-proxy.ts` initial_capture hold queue).
 pub const MAX_HELD_IDENTITY_GATE_FRAMES: usize = 32;
+/// Default minimum spacing between growth-canary warnings (plan §4.3.2): one
+/// warning line per interval PER PROXY, regardless of connection churn.
+pub const CANARY_MIN_WARN_INTERVAL_MS: u64 = 10 * 60 * 1000;
+/// Default minimum spacing between classified Capacity repair triggers
+/// (plan §4.3.1) — a limiter SEPARATE from the canary's, so a canary warning
+/// can never suppress the first over-cap diagnostic.
+pub const CAPACITY_TRIGGER_MIN_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 // ── public options / errors ─────────────────────────────────────────────────────────
 
@@ -128,8 +159,27 @@ pub const MAX_HELD_IDENTITY_GATE_FRAMES: usize = 32;
 #[derive(Clone, Debug)]
 pub struct CodexRemoteProxyOptions {
     pub upstream_ws_url: String,
-    /// `maxRawForwardBytes` (`remote-proxy.ts:90,141`); default [`MAX_RAW_FORWARD_BYTES`].
+    /// `maxRawForwardBytes` (`remote-proxy.ts:90,141`); default
+    /// [`MAX_CODEX_FRAME_BYTES`]. This is the HUB-side policy; the proxy
+    /// transport caps below default to the SAME value (equality, plan §4.1).
     pub max_raw_forward_bytes: usize,
+    /// Proxy transport tungstenite `max_frame_size`, applied to BOTH the
+    /// TUI-facing accept and the upstream dial; default [`MAX_WS_FRAME_BYTES`].
+    /// Tests inject small values so boundary tests don't allocate hundreds of
+    /// MiB.
+    pub max_ws_frame_bytes: usize,
+    /// Proxy transport tungstenite `max_message_size`, applied to both legs;
+    /// default [`MAX_WS_MESSAGE_BYTES`].
+    pub max_ws_message_bytes: usize,
+    /// Growth-canary threshold (plan §4.3.2): hub ingest warns once per
+    /// interval when a frame exceeds this; default [`CANARY_BYTES`].
+    pub canary_warn_bytes: usize,
+    /// Minimum spacing between growth-canary warnings, per proxy; default
+    /// [`CANARY_MIN_WARN_INTERVAL_MS`].
+    pub canary_min_warn_interval_ms: u64,
+    /// Minimum spacing between classified Capacity repair triggers
+    /// (plan §4.3.1); default [`CAPACITY_TRIGGER_MIN_INTERVAL_MS`].
+    pub capacity_trigger_min_interval_ms: u64,
     /// `requireCandidatePersistence` (`remote-proxy.ts:89,140`). Legacy defaults this to
     /// `true` AT THE PROXY; the Rust options carry NO default — the launch planner passes
     /// the plan's value explicitly on both the fresh and resume branches (S3 review
@@ -149,11 +199,24 @@ impl CodexRemoteProxyOptions {
     pub fn new(upstream_ws_url: impl Into<String>, require_candidate_persistence: bool) -> Self {
         Self {
             upstream_ws_url: upstream_ws_url.into(),
-            max_raw_forward_bytes: MAX_RAW_FORWARD_BYTES,
+            max_raw_forward_bytes: MAX_CODEX_FRAME_BYTES,
+            max_ws_frame_bytes: MAX_WS_FRAME_BYTES,
+            max_ws_message_bytes: MAX_WS_MESSAGE_BYTES,
+            canary_warn_bytes: CANARY_BYTES,
+            canary_min_warn_interval_ms: CANARY_MIN_WARN_INTERVAL_MS,
+            capacity_trigger_min_interval_ms: CAPACITY_TRIGGER_MIN_INTERVAL_MS,
             require_candidate_persistence,
             candidate_capture_timeout_ms: CANDIDATE_CAPTURE_TIMEOUT_MS,
             identity_gate_hold_timeout_ms: IDENTITY_GATE_HOLD_TIMEOUT_MS,
         }
+    }
+
+    /// The transport config BOTH proxy legs run with, built from this
+    /// options' cap fields — the single place the options-to-WebSocketConfig
+    /// mapping lives. [`CodexRemoteProxy::start`] builds its config exactly
+    /// once through here and threads the `Copy` value down to both legs.
+    pub(crate) fn ws_config(&self) -> WebSocketConfig {
+        ws_config_with_caps(self.max_ws_frame_bytes, self.max_ws_message_bytes)
     }
 }
 
@@ -312,6 +375,7 @@ impl CodexRemoteProxy {
             options.require_candidate_persistence,
             options.identity_gate_hold_timeout_ms,
             hub_tx.clone(),
+            EmissionConfig::from_options(&options),
         ));
 
         // Arm the candidate-capture timer (`DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS`,
@@ -326,6 +390,7 @@ impl CodexRemoteProxy {
             });
         }
 
+        let ws_config = options.ws_config();
         let upstream_ws_url = options.upstream_ws_url;
         let accept_hub_tx = hub_tx.clone();
         let accept_task = tokio::spawn(async move {
@@ -340,7 +405,8 @@ impl CodexRemoteProxy {
                 let upstream_ws_url = upstream_ws_url.clone();
                 let hub_tx = accept_hub_tx.clone();
                 tokio::spawn(async move {
-                    handle_client_connection(conn_id, stream, upstream_ws_url, hub_tx).await;
+                    handle_client_connection(conn_id, stream, upstream_ws_url, hub_tx, ws_config)
+                        .await;
                 });
             }
         });
@@ -433,12 +499,14 @@ enum HubMsg {
     },
     ClientErrored {
         conn_id: u64,
+        kind: StreamErrorKind,
     },
     UpstreamClosed {
         conn_id: u64,
     },
     UpstreamErrored {
         conn_id: u64,
+        kind: StreamErrorKind,
     },
     MarkCandidatePersisted,
     FailCandidateCapture {
@@ -451,6 +519,34 @@ enum HubMsg {
     },
 }
 
+/// Classification of the transport error that ended a read loop (plan
+/// 2026-10-20-codex-proxy-ws-frame-cap.md §4.3.1): a tungstenite `Capacity`
+/// error — the transport rejecting an over-cap frame/message from its header —
+/// is distinctly classified so the hub emits its own rate-limited trigger
+/// embedding the ACTUAL error text; every other error keeps the generic
+/// teardown trigger.
+#[derive(Clone, Debug)]
+enum StreamErrorKind {
+    /// `tungstenite::Error::Capacity(..)`. Carries the rendered error text
+    /// (e.g. "Space limit exceeded: Message too long: {size} > {max_size}") so
+    /// the classified trigger reports the real sizes and the configured limit
+    /// without inventing a size claim.
+    Capacity {
+        error_text: String,
+    },
+    Other,
+}
+
+fn classify_stream_error(error: WsError) -> StreamErrorKind {
+    if matches!(error, WsError::Capacity(_)) {
+        StreamErrorKind::Capacity {
+            error_text: error.to_string(),
+        }
+    } else {
+        StreamErrorKind::Other
+    }
+}
+
 // ── connection-supervisor task (per accepted TUI connection) ───────────────────────
 
 /// Accepts one TUI connection, dials one upstream connection for it (mirrors
@@ -461,8 +557,9 @@ async fn handle_client_connection(
     stream: TcpStream,
     upstream_ws_url: String,
     hub_tx: mpsc::UnboundedSender<HubMsg>,
+    ws_config: WebSocketConfig,
 ) {
-    let ws = match accept_async(stream).await {
+    let ws = match accept_async_with_config(stream, Some(ws_config)).await {
         Ok(ws) => ws,
         Err(_) => return,
     };
@@ -499,7 +596,12 @@ async fn handle_client_connection(
     // Dial upstream concurrently — mirrors `new WebSocket(this.upstreamWsUrl)` firing
     // immediately on accept without blocking further client reads.
     let dial_hub_tx = hub_tx.clone();
-    tokio::spawn(dial_upstream(conn_id, upstream_ws_url, dial_hub_tx));
+    tokio::spawn(dial_upstream(
+        conn_id,
+        upstream_ws_url,
+        dial_hub_tx,
+        ws_config,
+    ));
 
     loop {
         match client_stream.next().await {
@@ -528,8 +630,11 @@ async fn handle_client_connection(
                 }
             }
             Some(Ok(_)) => continue, // ping/pong/close frames: transport noise
-            Some(Err(_)) => {
-                let _ = hub_tx.send(HubMsg::ClientErrored { conn_id });
+            Some(Err(e)) => {
+                let _ = hub_tx.send(HubMsg::ClientErrored {
+                    conn_id,
+                    kind: classify_stream_error(e),
+                });
                 break;
             }
             None => {
@@ -545,8 +650,11 @@ async fn dial_upstream(
     conn_id: u64,
     upstream_ws_url: String,
     hub_tx: mpsc::UnboundedSender<HubMsg>,
+    ws_config: WebSocketConfig,
 ) {
-    let (ws, _) = match connect_async(&upstream_ws_url).await {
+    // `disable_nagle = false` is exactly what bare `connect_async` passed
+    // (verified against the vendored 0.24 source) — behavior unchanged.
+    let (ws, _) = match connect_async_with_config(&upstream_ws_url, Some(ws_config), false).await {
         Ok(pair) => pair,
         Err(_) => {
             let _ = hub_tx.send(HubMsg::UpstreamDialFailed { conn_id });
@@ -609,8 +717,11 @@ async fn dial_upstream(
                 }
             }
             Some(Ok(_)) => continue,
-            Some(Err(_)) => {
-                let _ = hub_tx.send(HubMsg::UpstreamErrored { conn_id });
+            Some(Err(e)) => {
+                let _ = hub_tx.send(HubMsg::UpstreamErrored {
+                    conn_id,
+                    kind: classify_stream_error(e),
+                });
                 break;
             }
             None => {
@@ -626,8 +737,14 @@ fn to_ws_message(frame: OutFrame) -> Message {
         Message::Binary(frame.data)
     } else {
         // Every producer of an OutFrame (the raw client/upstream bytes, or a
-        // rewritten/normalized/error/success frame we constructed) is valid UTF-8 JSON.
-        Message::Text(String::from_utf8_lossy(&frame.data).into_owned())
+        // rewritten/normalized/error/success frame we constructed) is valid UTF-8
+        // JSON, so the common path is a zero-copy partial move of the owned Vec
+        // into the String; only an actual invariant violation pays for the lossy
+        // replacement (and the copy it entails) via FromUtf8Error::into_bytes().
+        Message::Text(
+            String::from_utf8(frame.data)
+                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
+        )
     }
 }
 
@@ -686,6 +803,60 @@ enum IdentityGate {
     Failed,
 }
 
+/// The plan §4.3 emission knobs that travel together from
+/// [`CodexRemoteProxyOptions`] into [`run_hub`]: the growth-canary
+/// threshold and its per-proxy warn interval (§4.3.2), and the classified
+/// Capacity trigger's own interval (§4.3.1b).
+#[derive(Clone, Debug)]
+struct EmissionConfig {
+    canary_warn_bytes: usize,
+    canary_min_warn_interval_ms: u64,
+    capacity_trigger_min_interval_ms: u64,
+}
+
+impl EmissionConfig {
+    fn from_options(options: &CodexRemoteProxyOptions) -> Self {
+        Self {
+            canary_warn_bytes: options.canary_warn_bytes,
+            canary_min_warn_interval_ms: options.canary_min_warn_interval_ms,
+            capacity_trigger_min_interval_ms: options.capacity_trigger_min_interval_ms,
+        }
+    }
+}
+
+/// A per-proxy "one line per interval" emission gate (the repo's
+/// `freshell-ws` `connection_writer.rs` spill-event pattern): the first
+/// emission always fires; anything within `min_interval` of the last
+/// emission is suppressed. The hub keeps one gate for the classified
+/// Capacity trigger and one for the growth canary — SEPARATE values of this
+/// type, never a shared one (plan §4.3.1a/§4.3.2: neither limiter may
+/// suppress the other's first line).
+struct EmissionGate {
+    last_emitted: Option<Instant>,
+    min_interval: Duration,
+}
+
+impl EmissionGate {
+    fn from_millis(min_interval_ms: u64) -> Self {
+        Self {
+            last_emitted: None,
+            min_interval: Duration::from_millis(min_interval_ms),
+        }
+    }
+
+    /// Stamps and reports whether an emission is due.
+    fn due(&mut self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last_emitted
+            .is_none_or(|last| now.duration_since(last) >= self.min_interval);
+        if due {
+            self.last_emitted = Some(now);
+        }
+        due
+    }
+}
+
 struct Hub {
     connections: HashMap<u64, ConnState>,
     max_raw_forward_bytes: usize,
@@ -697,6 +868,26 @@ struct Hub {
     /// The hub's own inbox — used to arm the hold timer on the FIRST held frame.
     hub_tx: mpsc::UnboundedSender<HubMsg>,
     hold_timeout_ms: u64,
+    /// Plan §4.3.1b: the classified Capacity trigger's OWN emission gate.
+    /// Deliberately SEPARATE from the growth canary's (§4.3.2): a growth
+    /// sequence inherently fires the canary first, and a shared gate would
+    /// then suppress the first Capacity line of the very next over-cap
+    /// incident.
+    capacity_trigger_gate: EmissionGate,
+    /// Plan §4.3.1c: connections whose latest teardown was Capacity-classified.
+    /// BOTH halves of the generic teardown pair are suppressed for these — the
+    /// paired generic errored trigger (`handle_stream_error`'s Other arm) and
+    /// the teardown-close `ProxyClose` (`HubMsg::UpstreamClosed`) — the
+    /// classified line IS the record for that connection's teardown.
+    capacity_classified_conns: HashSet<u64>,
+    /// Plan §4.3.2: the growth canary's OWN emission gate — deliberately a
+    /// SEPARATE gate from the Capacity trigger's (§4.3.1b): a growth
+    /// sequence inherently fires the canary first (real traffic crosses
+    /// `CANARY_BYTES` long before the cap), and a shared gate would suppress
+    /// the first over-cap diagnostic of the very next incident — and vice
+    /// versa.
+    canary_gate: EmissionGate,
+    canary_warn_bytes: usize,
 }
 
 /// The FULL upstream side-effect bundle for one notification frame — mirrors
@@ -719,6 +910,7 @@ async fn run_hub(
     require_candidate_persistence: bool,
     hold_timeout_ms: u64,
     hub_tx: mpsc::UnboundedSender<HubMsg>,
+    emission: EmissionConfig,
 ) {
     let mut hub = Hub {
         connections: HashMap::new(),
@@ -738,6 +930,10 @@ async fn run_hub(
         },
         hub_tx,
         hold_timeout_ms,
+        capacity_trigger_gate: EmissionGate::from_millis(emission.capacity_trigger_min_interval_ms),
+        capacity_classified_conns: HashSet::new(),
+        canary_gate: EmissionGate::from_millis(emission.canary_min_warn_interval_ms),
+        canary_warn_bytes: emission.canary_warn_bytes,
     };
 
     while let Some(msg) = rx.recv().await {
@@ -781,29 +977,33 @@ async fn run_hub(
                 hub.handle_upstream_frame(conn_id, data, binary);
             }
             HubMsg::ClientClosed { conn_id } => {
+                // A capacity-classified connection completing its teardown via a
+                // clean close: the pair is complete (no trigger either way), so
+                // the classification mark can go.
+                hub.capacity_classified_conns.remove(&conn_id);
                 hub.close_connection(conn_id);
             }
-            HubMsg::ClientErrored { conn_id } => {
-                hub.emit(RemoteProxyEvent::RepairTrigger(
-                    RemoteProxyRepairTrigger::ProxyError {
-                        message: "Codex remote proxy client connection errored.".to_string(),
-                    },
-                ));
-                hub.close_connection(conn_id);
+            HubMsg::ClientErrored { conn_id, kind } => {
+                hub.handle_stream_error(conn_id, false, kind);
             }
             HubMsg::UpstreamClosed { conn_id } => {
-                hub.emit(RemoteProxyEvent::RepairTrigger(
-                    RemoteProxyRepairTrigger::ProxyClose,
-                ));
+                // §4.3.1c teardown-pair suppression, the close half: a
+                // connection whose teardown follows a Capacity-classified
+                // error must not ALSO log the generic ProxyClose — the
+                // classified line IS the record for that connection's
+                // teardown. An UNMARKED connection (a genuine upstream clean
+                // close, e.g. the pane's app-server exiting) keeps its
+                // ProxyClose diagnostic exactly as before: the suppression
+                // is per-connection and causal, never global.
+                if !hub.capacity_classified_conns.remove(&conn_id) {
+                    hub.emit(RemoteProxyEvent::RepairTrigger(
+                        RemoteProxyRepairTrigger::ProxyClose,
+                    ));
+                }
                 hub.close_connection(conn_id);
             }
-            HubMsg::UpstreamErrored { conn_id } => {
-                hub.emit(RemoteProxyEvent::RepairTrigger(
-                    RemoteProxyRepairTrigger::ProxyError {
-                        message: "Codex remote proxy upstream connection errored.".to_string(),
-                    },
-                ));
-                hub.close_connection(conn_id);
+            HubMsg::UpstreamErrored { conn_id, kind } => {
+                hub.handle_stream_error(conn_id, true, kind);
             }
             HubMsg::MarkCandidatePersisted => {
                 hub.release_identity_gate();
@@ -891,6 +1091,90 @@ impl Hub {
         }
     }
 
+    /// Plan §4.3.1: a transport read-loop error, classified by
+    /// [`classify_stream_error`]. A Capacity error marks the connection and
+    /// emits the classified trigger under the trigger's OWN rate limit; the
+    /// generic teardown pair for a marked connection — the paired generic
+    /// errored trigger here, and the teardown-close `ProxyClose` in the
+    /// `HubMsg::UpstreamClosed` arm — is suppressed (§4.3.1c: the
+    /// classified line IS the record for that teardown). Teardown itself is
+    /// NEVER suppressed: every path still closes the connection (fail
+    /// closed).
+    fn handle_stream_error(&mut self, conn_id: u64, upstream: bool, kind: StreamErrorKind) {
+        let side = if upstream { "upstream" } else { "client" };
+        match kind {
+            StreamErrorKind::Capacity { error_text } => {
+                self.capacity_classified_conns.insert(conn_id);
+                if self.capacity_trigger_gate.due() {
+                    self.emit(RemoteProxyEvent::RepairTrigger(
+                        RemoteProxyRepairTrigger::ProxyError {
+                            message: format!(
+                                "Codex remote proxy {side} connection failed on the WebSocket capacity limit: {error_text}."
+                            ),
+                        },
+                    ));
+                }
+            }
+            StreamErrorKind::Other => {
+                if self.capacity_classified_conns.remove(&conn_id) {
+                    // §4.3.1c teardown-pair suppression: this connection's
+                    // teardown already produced the classified Capacity
+                    // trigger; the generic pair line is suppressed.
+                } else {
+                    self.emit(RemoteProxyEvent::RepairTrigger(
+                        RemoteProxyRepairTrigger::ProxyError {
+                            message: format!("Codex remote proxy {side} connection errored."),
+                        },
+                    ));
+                }
+            }
+        }
+        self.close_connection(conn_id);
+    }
+
+    /// Plan §4.3.1b: the classified Capacity trigger's rate limit lives in
+    /// [`Hub::capacity_trigger_gate`] — at most one classified line per
+    /// interval per proxy, first one always firing (the shared
+    /// [`EmissionGate`] pattern).
+    ///
+    /// Plan §4.3.2: the growth canary — WARN-ONLY ingest guard, called at the
+    /// top of BOTH hub frame-ingest arms, BEFORE the policy check.
+    ///
+    /// Scope (stated exactly): at production equality (transport caps ==
+    /// `max_raw_forward_bytes`, plan §4.1) an over-cap frame is rejected by
+    /// the transport from its header and NEVER reaches hub ingest, so this
+    /// canary covers the growth zone BELOW the cap (`CANARY_BYTES` → the
+    /// policy, 32 MiB → 256 MiB at defaults) — the months of warning as real
+    /// traffic grows toward the cap. The over-cap zone is covered by the
+    /// classified Capacity trigger (§4.3.1). This guard never rejects,
+    /// closes, or alters the frame.
+    ///
+    /// Rate limit: PER PROXY ([`Hub::canary_gate`]; default minimum spacing
+    /// [`CANARY_MIN_WARN_INTERVAL_MS`], injectable via
+    /// [`CodexRemoteProxyOptions::canary_min_warn_interval_ms`]) — NOT per
+    /// connection: per-connection emission would flood during a big-frame
+    /// reconnect loop, while a proxy-wide interval bounds the canary to one
+    /// line per interval regardless of connection churn. The gate is
+    /// deliberately a SEPARATE [`EmissionGate`] from the Capacity trigger's
+    /// (§4.3.1b), so a canary warning can never suppress the first over-cap
+    /// diagnostic and vice versa.
+    fn note_growth_canary(&mut self, len: usize) {
+        if len <= self.canary_warn_bytes {
+            return;
+        }
+        if !self.canary_gate.due() {
+            return;
+        }
+        self.emit(RemoteProxyEvent::RepairTrigger(
+            RemoteProxyRepairTrigger::ProxyError {
+                message: format!(
+                    "Codex remote proxy frame exceeded the growth-canary threshold: {len} bytes (canary threshold {} bytes).",
+                    self.canary_warn_bytes
+                ),
+            },
+        ));
+    }
+
     fn send_to_client(&self, conn_id: u64, data: Vec<u8>, binary: bool) {
         if let Some(conn) = self.connections.get(&conn_id) {
             if let Some(tx) = &conn.client_tx {
@@ -974,6 +1258,7 @@ impl Hub {
     // ── client -> upstream (`handleClientMessage`, `remote-proxy.ts:371-455`) ───────
 
     fn handle_client_frame(&mut self, conn_id: u64, data: Vec<u8>, binary: bool) {
+        self.note_growth_canary(data.len());
         if data.len() > self.max_raw_forward_bytes {
             let id = if data.len() <= MAX_FULL_PARSE_BYTES {
                 scan_json_rpc_envelope(&data).ok().and_then(|e| e.id)
@@ -1216,6 +1501,7 @@ impl Hub {
     // ── upstream -> client (`handleUpstreamMessage`, `remote-proxy.ts:457-511`) ─────
 
     fn handle_upstream_frame(&mut self, conn_id: u64, data: Vec<u8>, binary: bool) {
+        self.note_growth_canary(data.len());
         if data.len() > self.max_raw_forward_bytes {
             self.fail_unsafe_upstream_frame(conn_id, None, "raw_forward_cap_exceeded");
             return;
@@ -1949,5 +2235,295 @@ mod tests {
             extract_thread_fork_parent_thread_id(br#"{"id":1,"method":"thread/fork","params":{}}"#),
             None
         );
+    }
+
+    #[test]
+    fn to_ws_message_text_frames_reuse_the_moved_buffer_allocation() {
+        // §5.9 copy-elimination pin: the returned String must be the exact
+        // allocation the OutFrame owned, with no second (full-copy) allocation.
+        let mut data = Vec::with_capacity(96);
+        data.extend_from_slice(b"{\"id\":1,\"result\":{\"threadId\":\"t1\"}}");
+        let frame = OutFrame {
+            data,
+            binary: false,
+        };
+        let buffer_ptr = frame.data.as_ptr();
+        let Message::Text(text) = to_ws_message(frame) else {
+            panic!("a text OutFrame must convert to Message::Text");
+        };
+        assert_eq!(text, "{\"id\":1,\"result\":{\"threadId\":\"t1\"}}");
+        assert_eq!(
+            text.as_ptr(),
+            buffer_ptr,
+            "the returned String must reuse the moved Vec's allocation (zero-copy)"
+        );
+    }
+
+    #[test]
+    fn to_ws_message_binary_frames_move_the_payload_unchanged() {
+        let data = b"\x00\x01not-utf8\xff".to_vec();
+        let frame = OutFrame { data, binary: true };
+        let buffer_ptr = frame.data.as_ptr();
+        match to_ws_message(frame) {
+            Message::Binary(bytes) => {
+                assert_eq!(bytes, b"\x00\x01not-utf8\xff");
+                assert_eq!(
+                    bytes.as_ptr(),
+                    buffer_ptr,
+                    "the binary branch must move the Vec, not copy it"
+                );
+            }
+            _ => panic!("a binary OutFrame must convert to Message::Binary"),
+        }
+    }
+
+    #[test]
+    fn to_ws_message_falls_back_to_lossy_replacement_text_on_invalid_utf8() {
+        // 0xFF is invalid in every UTF-8 sequence, so this frame violates the
+        // module's UTF-8 invariant; conversion must degrade to lossy
+        // replacement text, not fail.
+        let frame = OutFrame {
+            data: vec![b'a', 0xFF, b'b'],
+            binary: false,
+        };
+        let Message::Text(text) = to_ws_message(frame) else {
+            panic!("even an invalid-UTF-8 text OutFrame must convert to Message::Text");
+        };
+        assert_eq!(text, "a\u{FFFD}b");
+    }
+
+    // ── plan 2026-10-20-codex-proxy-ws-frame-cap.md §4.3.1: hub dispatch mechanics ──
+    // These drive `run_hub` directly (no sockets) so the classified-trigger
+    // mechanics — the exact generic trigger strings, the trigger's own
+    // interval rate limit, and teardown-pair suppression — are pinned
+    // deterministically. The behaviors themselves were RED-driven by the
+    // socket-level integration suite (`tests/remote_proxy_relay.rs` §12);
+    // these pin the hub-level contracts against silent drift.
+
+    use tokio::time::{sleep, timeout as ws_test_timeout};
+
+    /// Spawns the hub with a 1 KiB raw-forward policy and an OPEN identity
+    /// gate, returning its inbox and its event stream.
+    async fn spawn_test_hub(
+        capacity_interval_ms: u64,
+    ) -> (
+        mpsc::UnboundedSender<HubMsg>,
+        mpsc::UnboundedReceiver<RemoteProxyEvent>,
+    ) {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_hub(
+            hub_rx,
+            events_tx,
+            1024,
+            false,
+            60_000,
+            hub_tx.clone(),
+            EmissionConfig {
+                canary_warn_bytes: CANARY_BYTES,
+                canary_min_warn_interval_ms: CANARY_MIN_WARN_INTERVAL_MS,
+                capacity_trigger_min_interval_ms: capacity_interval_ms,
+            },
+        ));
+        (hub_tx, events_rx)
+    }
+
+    /// Registers one connection (client + upstream writer channels) so trigger
+    /// emission AND teardown (`WriterMsg::Close`) are both observable.
+    fn register_test_conn(
+        hub_tx: &mpsc::UnboundedSender<HubMsg>,
+        conn_id: u64,
+    ) -> (
+        mpsc::UnboundedReceiver<WriterMsg>,
+        mpsc::UnboundedReceiver<WriterMsg>,
+    ) {
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+        hub_tx
+            .send(HubMsg::ClientConnected {
+                conn_id,
+                tx: client_tx,
+            })
+            .unwrap();
+        hub_tx
+            .send(HubMsg::UpstreamConnected {
+                conn_id,
+                tx: upstream_tx,
+            })
+            .unwrap();
+        (client_rx, upstream_rx)
+    }
+
+    async fn expect_proxy_error_event(
+        events_rx: &mut mpsc::UnboundedReceiver<RemoteProxyEvent>,
+    ) -> String {
+        match events_rx.recv().await {
+            Some(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
+                message,
+            })) => message,
+            other => panic!("expected a ProxyError repair trigger, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_capacity_stream_errors_keep_the_generic_trigger_strings_and_close() {
+        let (hub_tx, mut events_rx) = spawn_test_hub(CAPACITY_TRIGGER_MIN_INTERVAL_MS).await;
+
+        let (mut client_rx0, mut upstream_rx0) = register_test_conn(&hub_tx, 0);
+        hub_tx
+            .send(HubMsg::ClientErrored {
+                conn_id: 0,
+                kind: StreamErrorKind::Other,
+            })
+            .unwrap();
+        assert_eq!(
+            expect_proxy_error_event(&mut events_rx).await,
+            "Codex remote proxy client connection errored."
+        );
+        assert!(matches!(client_rx0.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx0.recv().await, Some(WriterMsg::Close)));
+
+        let (mut client_rx1, mut upstream_rx1) = register_test_conn(&hub_tx, 1);
+        hub_tx
+            .send(HubMsg::UpstreamErrored {
+                conn_id: 1,
+                kind: StreamErrorKind::Other,
+            })
+            .unwrap();
+        assert_eq!(
+            expect_proxy_error_event(&mut events_rx).await,
+            "Codex remote proxy upstream connection errored."
+        );
+        assert!(matches!(client_rx1.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx1.recv().await, Some(WriterMsg::Close)));
+    }
+
+    #[tokio::test]
+    async fn capacity_stream_errors_classify_rate_limit_and_suppress_the_generic_pair() {
+        // Interval arithmetic: the two 100 ms negative polls below must fit
+        // INSIDE the interval for the suppression assertions, and the final
+        // 120 ms sleep must exceed it for the re-arm assertion.
+        let (hub_tx, mut events_rx) = spawn_test_hub(250).await;
+        let error_text = "Space limit exceeded: Message too long: 2048 > 1024".to_string();
+
+        // 1. The FIRST Capacity error emits the classified trigger (actual
+        //    error text embedded) and tears both legs down.
+        let (mut client_rx0, mut upstream_rx0) = register_test_conn(&hub_tx, 0);
+        hub_tx
+            .send(HubMsg::UpstreamErrored {
+                conn_id: 0,
+                kind: StreamErrorKind::Capacity {
+                    error_text: error_text.clone(),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            expect_proxy_error_event(&mut events_rx).await,
+            format!("Codex remote proxy upstream connection failed on the WebSocket capacity limit: {error_text}.")
+        );
+        assert!(matches!(client_rx0.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx0.recv().await, Some(WriterMsg::Close)));
+
+        // 2. The paired generic error for the SAME connection is suppressed —
+        //    the classified line IS the record for that teardown.
+        hub_tx
+            .send(HubMsg::ClientErrored {
+                conn_id: 0,
+                kind: StreamErrorKind::Other,
+            })
+            .unwrap();
+        assert!(
+            ws_test_timeout(Duration::from_millis(100), events_rx.recv())
+                .await
+                .is_err(),
+            "the paired generic trigger for a capacity-classified connection must be suppressed"
+        );
+
+        // 3. Another connection's Capacity error within the interval emits
+        //    NOTHING (the trigger's own rate limit) — but still tears down.
+        let (mut client_rx1, mut upstream_rx1) = register_test_conn(&hub_tx, 1);
+        hub_tx
+            .send(HubMsg::ClientErrored {
+                conn_id: 1,
+                kind: StreamErrorKind::Capacity {
+                    error_text: error_text.clone(),
+                },
+            })
+            .unwrap();
+        assert!(
+            ws_test_timeout(Duration::from_millis(100), events_rx.recv())
+                .await
+                .is_err(),
+            "a Capacity error within the interval must not re-emit the classified trigger"
+        );
+        assert!(matches!(client_rx1.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx1.recv().await, Some(WriterMsg::Close)));
+
+        // 4. Once the interval elapses, the classified trigger fires again.
+        sleep(Duration::from_millis(120)).await;
+        let (_client_rx2, _upstream_rx2) = register_test_conn(&hub_tx, 2);
+        hub_tx
+            .send(HubMsg::ClientErrored {
+                conn_id: 2,
+                kind: StreamErrorKind::Capacity { error_text },
+            })
+            .unwrap();
+        assert!(
+            expect_proxy_error_event(&mut events_rx)
+                .await
+                .contains("client connection failed on the WebSocket capacity limit"),
+            "the classified trigger must re-arm after the configured interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_close_after_a_capacity_classification_suppresses_the_generic_proxy_close() {
+        // §4.3.1c, the CLOSE half of the generic pair: a teardown whose
+        // upstream leg completes via a clean close handshake (the
+        // `HubMsg::UpstreamClosed` arm — reached whenever the hub's own
+        // `close_connection` closes the upstream writer while the peer is
+        // still healthy, e.g. a client-side Capacity error) must not ALSO
+        // log the generic `ProxyClose` — the classified line IS the record
+        // for that connection. An UNMARKED connection's clean upstream close
+        // (a genuine app-server shutdown) keeps its `ProxyClose` exactly as
+        // before: the suppression is per-connection and causal, never global.
+        let (hub_tx, mut events_rx) = spawn_test_hub(CAPACITY_TRIGGER_MIN_INTERVAL_MS).await;
+
+        // Marked connection: a client-side Capacity error classifies the
+        // teardown; the upstream close handshake's completion must add no
+        // second record for the same connection.
+        let (mut client_rx0, mut upstream_rx0) = register_test_conn(&hub_tx, 0);
+        hub_tx
+            .send(HubMsg::ClientErrored {
+                conn_id: 0,
+                kind: StreamErrorKind::Capacity {
+                    error_text: "Message too long: 2097152 > 1048576".to_string(),
+                },
+            })
+            .unwrap();
+        assert!(expect_proxy_error_event(&mut events_rx)
+            .await
+            .contains("client connection failed on the WebSocket capacity limit"));
+        assert!(matches!(client_rx0.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx0.recv().await, Some(WriterMsg::Close)));
+
+        hub_tx.send(HubMsg::UpstreamClosed { conn_id: 0 }).unwrap();
+        assert!(
+            ws_test_timeout(Duration::from_millis(100), events_rx.recv())
+                .await
+                .is_err(),
+            "the teardown's generic ProxyClose half must be suppressed behind the classified line"
+        );
+
+        // Unmarked connection: a genuine clean upstream close keeps its
+        // ProxyClose diagnostic exactly as before.
+        let (mut client_rx1, mut upstream_rx1) = register_test_conn(&hub_tx, 1);
+        hub_tx.send(HubMsg::UpstreamClosed { conn_id: 1 }).unwrap();
+        match events_rx.recv().await {
+            Some(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyClose)) => {}
+            other => panic!("expected the normal teardown's ProxyClose trigger, got {other:?}"),
+        }
+        assert!(matches!(client_rx1.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx1.recv().await, Some(WriterMsg::Close)));
     }
 }

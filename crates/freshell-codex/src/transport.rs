@@ -14,13 +14,18 @@
 //! compile under the feature and wired live in the next step (T2-over-rust, 3.8b). The CORE
 //! and the completion gating are graded via the fake-injected tests, independent of this.
 
+use std::sync::Mutex;
+
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as TokioMutex;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 use crate::app_server::{BoxFuture, WsTransport};
+use crate::ws_config::lane_ws_config;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
@@ -31,17 +36,50 @@ type WsSource = futures_util::stream::SplitStream<WsStream>;
 pub struct TungsteniteTransport {
     write: TokioMutex<WsSink>,
     read: TokioMutex<WsSource>,
+    /// Diagnostics seam (plan 2026-10-20-codex-proxy-ws-frame-cap.md §5.4): the
+    /// rendered text of the most recent `recv` error. `recv` still collapses
+    /// every error to `None` for callers (the public
+    /// `CodexAppServerError::Closed` mapping is unchanged), but the CAUSE is
+    /// retained here so an over-cap response is assertable in tests and pairs
+    /// with the production `tracing::warn!` in the same arm.
+    last_recv_error: Mutex<Option<String>>,
 }
 
 impl TungsteniteTransport {
     /// Connect to the app-server WS endpoint (`ensureSocket`, `client.ts:521-556`).
+    /// Read caps come from [`lane_ws_config`] — the independent, conservative
+    /// lane constant (plan §4.1); `disable_nagle = false` matches bare
+    /// `connect_async` exactly.
     pub async fn connect(ws_url: &str) -> Result<Self, String> {
-        let (stream, _response) = connect_async(ws_url).await.map_err(|e| e.to_string())?;
+        Self::connect_with_config(ws_url, lane_ws_config()).await
+    }
+
+    /// Connect with an explicit [`WebSocketConfig`] — the seam the over-cap
+    /// lane tests use to inject a tiny cap (plan §5.4). Production callers use
+    /// [`connect`], which installs [`lane_ws_config`] unchanged.
+    pub async fn connect_with_config(
+        ws_url: &str,
+        config: WebSocketConfig,
+    ) -> Result<Self, String> {
+        let (stream, _response) = connect_async_with_config(ws_url, Some(config), false)
+            .await
+            .map_err(|e| e.to_string())?;
         let (write, read) = stream.split();
         Ok(Self {
             write: TokioMutex::new(write),
             read: TokioMutex::new(read),
+            last_recv_error: Mutex::new(None),
         })
+    }
+
+    /// The rendered cause of the most recent `recv` error, if the stream has
+    /// errored (plan §5.4 test seam; pairs with the production warn in the
+    /// `recv` error arm).
+    pub fn last_recv_error(&self) -> Option<String> {
+        self.last_recv_error
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 }
 
@@ -69,8 +107,26 @@ impl WsTransport for TungsteniteTransport {
                     }
                     // Ping/Pong/Frame are transport-level noise — keep reading.
                     Some(Ok(_)) => continue,
-                    // A protocol error or a close frame ends the stream (→ fail pending).
-                    Some(Err(_)) | None => return None,
+                    Some(Err(e)) => {
+                        // Plan §4.3.1 lane observability (Goal 3): the actual
+                        // error text — for a Capacity error it renders
+                        // "Message too long: {size} > {max_size}", carrying the
+                        // configured limit — goes to the production log...
+                        let error_text = e.to_string();
+                        tracing::warn!(
+                            target: "freshell_codex::transport",
+                            error = %error_text,
+                            capacity = matches!(e, TungsteniteError::Capacity(_)),
+                            "codex_lane_ws_recv_failed"
+                        );
+                        // ...and is retained on the seam so tests assert the CAUSE.
+                        if let Ok(mut slot) = self.last_recv_error.lock() {
+                            *slot = Some(error_text);
+                        }
+                        return None;
+                    }
+                    // A close frame ends the stream (→ fail pending).
+                    None => return None,
                 }
             }
         })

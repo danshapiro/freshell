@@ -204,7 +204,11 @@ pub(crate) async fn spawn_own_fake_app_server_with_behavior(
     loop {
         if let Ok(Ok((probe, _response))) = tokio::time::timeout(
             Duration::from_secs(1),
-            tokio_tungstenite::connect_async(&ws_url),
+            tokio_tungstenite::connect_async_with_config(
+                &ws_url,
+                Some(crate::ws_config::lane_ws_config()),
+                false,
+            ),
         )
         .await
         {

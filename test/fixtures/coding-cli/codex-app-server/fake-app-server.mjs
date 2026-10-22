@@ -487,6 +487,24 @@ function successResult(method, params) {
       data: behavior.loadedThreadIds || [],
     }
   }
+  if (method === 'plugin/list') {
+    // Incident-fidelity knob (2026-10-19 codex proxy frame-cap incident): the
+    // real app-server's plugin/list response embeds the whole
+    // openai-curated-remote catalog (~17.8 MB measured) in ONE single-frame
+    // WS text message — the frame class that killed the proxy's 16 MiB
+    // tungstenite read cap. Opt-in via behavior.pluginListResponseBytes: the
+    // result is a deterministic `{"plugins":"<padding>"}` whose JSON
+    // serialization is exactly that many bytes, delivered by the message
+    // handler's single socket.send (one WS frame — the `ws` sender never
+    // fragments a plain send() and permessage-deflate is not negotiated by
+    // the proxy's tungstenite client, so the wire frame is the full size).
+    // Off by default: existing consumers keep the {} fall-through.
+    const responseBytes = Number(behavior.pluginListResponseBytes)
+    if (Number.isFinite(responseBytes) && responseBytes > 0) {
+      const envelopeBytes = '{"plugins":""}'.length
+      return { plugins: 'x'.repeat(Math.max(0, Math.floor(responseBytes) - envelopeBytes)) }
+    }
+  }
   return {}
 }
 
