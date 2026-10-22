@@ -367,3 +367,115 @@ async fn a_batch_item_is_re_planned_on_the_fresh_document() {
     assert_eq!(record.name, "Chosen by a person");
     assert_eq!(record.source, NameSource::Manual);
 }
+
+async fn observe_title(store: &Arc<SessionNames>, id: &str, title: &str) -> SessionNameUpdate {
+    store
+        .observe_native(NativeNameObservation {
+            target: session(id),
+            title: title.to_string(),
+            origin: NativeNameOrigin::Snapshot,
+            location_revision: 0,
+            event_id: None,
+        })
+        .await
+        .expect("observe")
+}
+
+fn persisted_baseline(store: &Arc<SessionNames>, id: &str) -> Option<String> {
+    store
+        .core
+        .current_view()
+        .document
+        .native_write
+        .get(&name_ref_key(&session(id)))
+        .and_then(|state| state.last_native_title.clone())
+}
+
+/// Two current-build processes share one data dir. Process A staged a
+/// baseline it saw over an empty one; process B then persisted a NEWER
+/// baseline, and an automation rename landed after it. Returns both
+/// stores, A's staged baseline still waiting.
+async fn superseded_staging(dir: &Path, id: &str) -> (Arc<SessionNames>, Arc<SessionNames>) {
+    let a = open(dir);
+    a.hydrate_indexed(indexed(id, Some("Billing bug"), None), false)
+        .await
+        .expect("seed");
+    observe_title(&a, id, "Older provider title").await;
+    assert_eq!(
+        a.staged_native_baseline(&session(id)).as_deref(),
+        Some("Older provider title"),
+        "A staged its first observation"
+    );
+    let b = open(dir);
+    observe_title(&b, id, "Newer provider title").await;
+    b.sweep_maintenance(Vec::new())
+        .await
+        .expect("B persists its baseline");
+    assert_eq!(
+        persisted_baseline(&b, id).as_deref(),
+        Some("Newer provider title")
+    );
+    let renamed = b
+        .rename(RenameNameInput {
+            target: session(id),
+            name: "Chosen by automation".into(),
+            intent: NameIntent::Automatic,
+            if_revision: None,
+            cwd: Some("/w/proj".into()),
+        })
+        .await
+        .expect("automation rename");
+    assert_eq!(renamed.record.name, "Chosen by automation");
+    (a, b)
+}
+
+/// A's batch never writes its older staged baseline over B's newer
+/// persisted one: the provider's next re-report of B's title stays an
+/// echo and never undoes the automation rename.
+#[tokio::test]
+async fn a_staged_baseline_never_overwrites_a_newer_persisted_one() {
+    let dir = temp_dir();
+    let id = "s-two-writers-batch";
+    let (a, b) = superseded_staging(dir.path(), id).await;
+
+    let report = a.sweep_maintenance(Vec::new()).await.expect("A's batch");
+    assert_eq!(
+        persisted_baseline(&a, id).as_deref(),
+        Some("Newer provider title"),
+        "the newer persisted baseline survives A's batch"
+    );
+    assert_eq!(report.baselines, 0, "the superseded baseline is dropped");
+    assert!(
+        !a.has_staged_native_baselines(),
+        "A no longer holds the superseded baseline"
+    );
+
+    let echo = observe_title(&b, id, "Newer provider title").await;
+    assert!(!echo.changed, "the provider's re-report is an echo");
+    assert_eq!(
+        name_of(&a, id).await.expect("record").name,
+        "Chosen by automation",
+        "the automation rename stands"
+    );
+}
+
+/// Before any batch runs, A's own decisions never read its superseded
+/// staged baseline either: the provider's re-report, observed through A,
+/// is compared with B's newer persisted baseline and stays an echo.
+#[tokio::test]
+async fn a_superseded_staged_baseline_is_never_read_as_the_baseline() {
+    let dir = temp_dir();
+    let id = "s-two-writers-observe";
+    let (a, _b) = superseded_staging(dir.path(), id).await;
+
+    let echo = observe_title(&a, id, "Newer provider title").await;
+    assert_eq!(
+        echo.record.name, "Chosen by automation",
+        "a re-report of the newer persisted baseline never undoes the rename"
+    );
+    assert!(!echo.changed);
+    assert!(
+        !a.has_staged_native_baselines(),
+        "A dropped the superseded baseline"
+    );
+}

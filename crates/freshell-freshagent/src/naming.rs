@@ -687,8 +687,12 @@ pub(crate) mod test_support {
         /// order (failed ones included).
         pub observe_attempts: Mutex<Vec<NativeNameObservation>>,
         /// Name-reliability Task 4: the observations the sink ACCEPTED (an
-        /// injected failure is not accepted), in arrival order.
-        pub observed: Mutex<Vec<NativeNameObservation>>,
+        /// injected failure is not accepted), in the order their
+        /// transactions finished.
+        pub observed: std::sync::Arc<Mutex<Vec<NativeNameObservation>>>,
+        /// Name-reliability Task 4 review: the next `observe_native` call
+        /// waits on this before it finishes (a slow store transaction).
+        observe_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         /// Name-reliability Task 4: failures answered by the next
         /// `observe_native` calls, front first (a stalled store).
         pub observe_failures: Mutex<std::collections::VecDeque<NameError>>,
@@ -712,6 +716,14 @@ pub(crate) mod test_support {
                     "injected: the document lock stayed busy".into(),
                 ));
             }
+        }
+
+        /// Make the next `observe_native` call wait inside its transaction
+        /// until the returned sender fires (or is dropped).
+        pub fn block_next_observation(&self) -> tokio::sync::oneshot::Sender<()> {
+            let (release, gate) = tokio::sync::oneshot::channel();
+            *self.observe_gate.lock().unwrap() = Some(gate);
+            release
         }
 
         /// The titles of the observations the sink accepted, in order.
@@ -949,10 +961,17 @@ pub(crate) mod test_support {
                     name_ref_debug_key(&input.target)
                 ))),
             };
-            if answer.is_ok() {
-                self.observed.lock().unwrap().push(input);
-            }
-            Box::pin(async move { answer })
+            let gate = self.observe_gate.lock().unwrap().take();
+            let observed = std::sync::Arc::clone(&self.observed);
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                if answer.is_ok() {
+                    observed.lock().unwrap().push(input);
+                }
+                answer
+            })
         }
 
         fn current_location_revision(
@@ -987,7 +1006,8 @@ pub(crate) mod test_support {
                 renames: Mutex::new(Vec::new()),
                 activities: Mutex::new(Vec::new()),
                 observe_attempts: Mutex::new(Vec::new()),
-                observed: Mutex::new(Vec::new()),
+                observed: std::sync::Arc::new(Mutex::new(Vec::new())),
+                observe_gate: Mutex::new(None),
                 observe_failures: Mutex::new(std::collections::VecDeque::new()),
                 location_revision: std::sync::atomic::AtomicU64::new(
                     freshell_protocol::session_names::MAX_NAME_REVISION,
