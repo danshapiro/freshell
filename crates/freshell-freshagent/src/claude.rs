@@ -6284,23 +6284,18 @@ impl FreshClaudeState {
             .or_else(|| recovered.as_ref().and_then(|r| r.cwd.clone()));
         // Tear down the old sidecar (handle_kill discipline): remove the record
         // FIRST so its consumer's exit arm stays silent (evicted=false), then the
-        // graceful shutdown → SIGTERM → kill backstop → ownership sweep, and the
-        // create-dedup eviction so a replayed requestId genuinely re-spawns.
+        // shared kill-family teardown (G31: the shutdown request, escalation only
+        // after the grace period, the ownership sweep, the tree confirmation),
+        // and the create-dedup eviction so a replayed requestId genuinely
+        // re-spawns.
         let old = self.sessions.lock().await.remove(&map_key);
         self.create_dedup
             .clear_for_session(|record| record.session_id == map_key)
             .await;
         if let Some(session) = old {
-            session.consumer.abort();
-            let mut stdin = session.stdin;
-            let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
-            let _ = stdin.flush().await;
-            if let Some(pid) = session.child.id() {
-                terminate_pid(pid as i32);
-            }
-            let mut child = session.child;
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&session.ownership_id);
+            // An unconfirmed tree is logged and keeps escalating detached; the
+            // fork does not wait on it (it never did).
+            let _ = self.teardown_removed_session_logged(session).await;
         }
 
         // Kill + recreate via `spawn_sidecar` with the computed options. The
@@ -9849,16 +9844,6 @@ fn mint_ownership_id() -> String {
     format!("claude-sidecar-{}", uuid::Uuid::new_v4())
 }
 
-/// SIGTERM one pid (best-effort; the target is our own sidecar).
-#[cfg(target_os = "linux")]
-fn terminate_pid(pid: i32) {
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-}
-#[cfg(not(target_os = "linux"))]
-fn terminate_pid(_pid: i32) {}
-
 /// `killOwnedProcesses` analog for claude: SIGTERM any process whose `/proc/<pid>/environ`
 /// carries our `FRESHELL_CLAUDE_SIDECAR_ID=<ownership_id>` tag — the Node sidecar AND the
 /// `claude` CLI grandchild the SDK spawns (which inherits the tag through the SDK clean-env).
@@ -10075,7 +10060,8 @@ async fn confirm_captured_claude_tree_dead(
 // ── helpers ─────────────────────────────────────────────────────────────────────────────
 
 /// The kill-family session teardown, shared by the kill's own removal, the
-/// round-5 post-close sweep, and the claim lanes' late-orphan unwinds:
+/// round-5 post-close sweep, the claim lanes' late-orphan unwinds, the
+/// rollback's replacement of the old sidecar, and server shutdown:
 /// abort + join the consumer, send the graceful sidecar shutdown line and
 /// give node [`crate::claude_spawn::SIDECAR_GRACEFUL_EXIT`] to exit (G31:
 /// escalation only after that), then the `/proc` ownership reap and the
@@ -24071,6 +24057,62 @@ rl.on('line', (line) => {
         assert!(
             st.sessions.lock().await.contains_key("rb-rf"),
             "the session was never torn down"
+        );
+        drop(env);
+    }
+
+    /// G31: an undo replaces the sidecar through the same graceful stop as
+    /// every other teardown. The old sidecar reads its shutdown request
+    /// (nothing kills it first) and the stop is logged as a graceful
+    /// `freshagent.claude.teardown`.
+    #[tokio::test]
+    async fn an_undo_stops_the_old_sidecar_gracefully() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let (events, _capture) = super::teardown_tests::capture::install();
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "dur-graceful", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        st.set_identity_sink(Arc::new(crate::identity_sink::FakeIdentitySink::default()));
+        let old_stdin_log =
+            insert_rollback_fixture_session(&st, "rb-graceful", "dur-graceful").await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-graceful", "rb-graceful-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let adopted = await_adopted_durable(&st, "rb-graceful", "dur-graceful").await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let frames = captured_json(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["event"]["type"], "freshAgent.rolledBack");
+        assert_eq!(frames[0]["event"]["newSessionId"], json!(adopted));
+        let old_stdin = std::fs::read_to_string(&old_stdin_log).unwrap_or_default();
+        assert!(
+            old_stdin
+                .lines()
+                .any(|line| line == r#"{"type":"shutdown"}"#),
+            "the old sidecar read its shutdown request before it stopped: {old_stdin:?}"
+        );
+        let stops: Vec<_> = super::teardown_tests::capture::teardown_events(&events)
+            .into_iter()
+            .filter(|(_, fields)| {
+                fields.get("session_id").map(String::as_str) == Some("rb-graceful")
+            })
+            .collect();
+        assert_eq!(
+            stops.len(),
+            1,
+            "one logged stop of the old sidecar: {stops:?}"
+        );
+        assert_eq!(
+            stops[0].1.get("graceful").map(String::as_str),
+            Some("true"),
+            "{stops:?}"
         );
         drop(env);
     }

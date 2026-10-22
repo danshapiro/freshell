@@ -116,14 +116,15 @@ fn record_of(path: &std::path::Path) -> String {
 
 /// Thread-local capture of `freshagent.claude.teardown` events. The teardown
 /// runs inline on the test's current-thread runtime, so `set_default` sees it.
-mod capture {
+/// Shared with the rollback tests in `claude::tests`.
+pub(super) mod capture {
     use super::*;
     use tracing::field::{Field, Visit};
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
 
-    pub(super) type Fields = BTreeMap<String, String>;
+    pub(in crate::claude) type Fields = BTreeMap<String, String>;
 
     #[derive(Default)]
     struct Visitor(Fields);
@@ -148,7 +149,7 @@ mod capture {
         }
     }
 
-    pub(super) fn teardown_events(
+    pub(in crate::claude) fn teardown_events(
         events: &Arc<StdMutex<Vec<(tracing::Level, Fields)>>>,
     ) -> Vec<(tracing::Level, Fields)> {
         events
@@ -163,7 +164,7 @@ mod capture {
     }
 
     #[allow(clippy::type_complexity)]
-    pub(super) fn install() -> (
+    pub(in crate::claude) fn install() -> (
         Arc<StdMutex<Vec<(tracing::Level, Fields)>>>,
         tracing::subscriber::DefaultGuard,
     ) {
