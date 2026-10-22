@@ -826,9 +826,6 @@ impl FreshAgentTransport for HostedTransport {
                 }
             }
             FreshAgentOperation::Configure { settings } => {
-                if let Some(profile) = self.profile.lock().expect("profile lock").as_mut() {
-                    profile.apply_turn_settings(settings);
-                }
                 // The provider answers on its own event stream, which the
                 // bridge relays to every device: a converged
                 // `freshAgent.session.metadata`, or an error when it refuses
