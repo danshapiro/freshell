@@ -48,10 +48,11 @@
 //! The Node sidecar (and the `claude` CLI grandchild the SDK spawns) inherit the server's
 //! isolated HOME (so they authenticate from + write ALL transcript data under
 //! `<isolatedHOME>/.claude`, never the user's real store) and carry a
-//! `FRESHELL_CLAUDE_SIDECAR_ID` ownership tag. [`FreshClaudeState::shutdown`] SIGTERMs the
-//! sidecar (which cleanly kills its own claude CLI via the SDK), SIGKILLs any straggler,
-//! and runs the `/proc` ownership sweep; the harness sentinel sweep is the backstop — no
-//! orphans.
+//! `FRESHELL_CLAUDE_SIDECAR_ID` ownership tag. Every teardown, and
+//! [`FreshClaudeState::shutdown`] for all sessions concurrently, first asks the sidecar to
+//! shut down (it aborts its SDK query, which stops the claude CLI), escalates to
+//! SIGTERM/SIGKILL only after the grace period ([`crate::claude_spawn`]), and runs the
+//! `/proc` ownership sweep; the harness sentinel sweep is the backstop — no orphans.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1822,28 +1823,25 @@ impl FreshClaudeState {
         }));
     }
 
-    /// Reap every owned claude sidecar: SIGTERM the Node process (so it cleanly kills its
-    /// own `claude` CLI via the SDK abort), SIGKILL any straggler, abort the consumer, and
-    /// run the `/proc` ownership sweep for the grandchild. Called on server shutdown.
+    /// Stop every owned claude sidecar through [`teardown_removed_session`]
+    /// (the shutdown request, then escalation only after the grace period,
+    /// then the tree reap), all sessions CONCURRENTLY so a server stop costs
+    /// about one grace period rather than one per session. Called on server
+    /// shutdown.
     pub async fn shutdown(&self) {
         let drained: Vec<ClaudeSession> = {
             let mut guard = self.sessions.lock().await;
             guard.drain().map(|(_, s)| s).collect()
         };
-        for session in drained {
-            session.consumer.abort();
-            // Graceful: ask the sidecar to shut down (it aborts the SDK query, which kills
-            // the claude CLI), then hard-stop the Node process, then sweep the grandchild.
-            let mut stdin = session.stdin;
-            let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
-            let _ = stdin.flush().await;
-            if let Some(pid) = session.child.id() {
-                terminate_pid(pid as i32);
-            }
-            let mut child = session.child;
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&session.ownership_id);
-        }
+        let confirm_rounds = self
+            .handoff_confirm_rounds
+            .unwrap_or(TREE_DEATH_CONFIRM_ROUNDS);
+        futures_util::future::join_all(
+            drained
+                .into_iter()
+                .map(|session| teardown_removed_session(session, confirm_rounds)),
+        )
+        .await;
         self.cli_index.lock().await.clear();
     }
 
@@ -9973,6 +9971,17 @@ enum TeardownConfirmation {
     PlatformLimited,
 }
 
+impl TeardownConfirmation {
+    /// The log label (`freshagent.claude.teardown`'s `confirmation`).
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::NotConfirmed { .. } => "not_confirmed",
+            Self::PlatformLimited => "platform_limited",
+        }
+    }
+}
+
 /// b8ke focused round-2 review R2-2: the typed outcome of the shared
 /// logged teardown ([`FreshClaudeState::teardown_removed_session_logged`]).
 /// `NotConfirmed` carries the DETACHED escalation handle (the SIGKILL
@@ -10076,8 +10085,10 @@ async fn confirm_captured_claude_tree_dead(
 
 /// The kill-family session teardown, shared by the kill's own removal, the
 /// round-5 post-close sweep, and the claim lanes' late-orphan unwinds:
-/// abort + join the consumer, send the graceful sidecar shutdown line, then
-/// the directed tree kill + the `/proc` ownership reap. Round 5's design
+/// abort + join the consumer, send the graceful sidecar shutdown line and
+/// give node [`crate::claude_spawn::SIDECAR_GRACEFUL_EXIT`] to exit (G31:
+/// escalation only after that), then the `/proc` ownership reap and the
+/// tree-death confirmation. Round 5's design
 /// rule (the durable close precedes every teardown/settlement await) means
 /// callers only run this AFTER the close is durable — a crash anywhere in
 /// here never loses it.
@@ -10102,26 +10113,25 @@ async fn teardown_removed_session(
     session: ClaudeSession,
     confirm_rounds: u8,
 ) -> TeardownConfirmation {
+    let started = std::time::Instant::now();
     let mut tree = capture_owned_claude_tree(&session.ownership_id, session.child.id());
     session.consumer.abort();
     let _ = session.consumer.await;
-    let mut stdin = session.stdin;
-    let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
-    let _ = stdin.flush().await;
-    if let Some(pid) = session.child.id() {
-        terminate_pid(pid as i32);
-    }
-    let mut child = session.child;
-    let _ = child.start_kill();
+    // G31: ask first — the shutdown request lets the sidecar abort its SDK
+    // query (which stops the claude CLI mid-turn) and exit; SIGTERM/SIGKILL
+    // only after the grace period. Node's reaped exit is the portable
+    // confirmation floor, awaited on EVERY platform.
+    let exit = crate::claude_spawn::graceful_then_kill(
+        session.child,
+        session.stdin,
+        crate::claude_spawn::SIDECAR_GRACEFUL_EXIT,
+    )
+    .await;
     reap_owned_claude_sidecars(&session.ownership_id);
-    // The child's ACTUAL exit (SIGKILL was issued; an unreaped zombie has
-    // already exited — it holds no pipes and writes nothing) — the
-    // portable confirmation floor, awaited on EVERY platform.
-    let _ = child.wait().await;
     // The captured ownership-tagged tree's confirmed death (bounded poll,
     // SIGKILL escalation — a TERM-immune grandchild cannot outlive this).
     #[cfg(target_os = "linux")]
-    {
+    let confirmation = {
         if confirm_captured_claude_tree_dead(&mut tree, &session.ownership_id, confirm_rounds).await
         {
             TeardownConfirmation::Confirmed
@@ -10131,9 +10141,9 @@ async fn teardown_removed_session(
                 ownership_id: session.ownership_id,
             }
         }
-    }
+    };
     #[cfg(not(target_os = "linux"))]
-    {
+    let confirmation = {
         // The typed platform limitation: the child's awaited exit is the
         // confirmation floor; the descendant-tree walk needs Linux /proc.
         tracing::warn!(target: "freshell_freshagent::claude",
@@ -10144,8 +10154,39 @@ async fn teardown_removed_session(
         );
         let _ = (&mut tree, confirm_rounds);
         TeardownConfirmation::PlatformLimited
+    };
+    log_claude_teardown(&session.sidecar_session_id, &exit, started, &confirmation);
+    confirmation
+}
+
+/// The one structured record of every sidecar stop (G31): `info` when the
+/// sidecar honored the shutdown request, `warn` when it had to be forced.
+fn log_claude_teardown(
+    session_id: &str,
+    exit: &crate::claude_spawn::SidecarExit,
+    started: std::time::Instant,
+    confirmation: &TeardownConfirmation,
+) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let confirmation = confirmation.label();
+    if exit.graceful {
+        tracing::info!(target: "freshell_freshagent::claude",
+            event = "freshagent.claude.teardown",
+            session_id, graceful = true, elapsed_ms, confirmation,
+            "claude sidecar stopped on its shutdown request"
+        );
+    } else {
+        tracing::warn!(target: "freshell_freshagent::claude",
+            event = "freshagent.claude.teardown",
+            session_id, graceful = false, elapsed_ms, confirmation,
+            node_reaped = exit.status.is_some(),
+            "claude sidecar ignored its shutdown request for the grace period and was killed"
+        );
     }
 }
+
+#[cfg(test)]
+mod teardown_tests;
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
