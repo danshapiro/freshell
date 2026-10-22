@@ -21,7 +21,7 @@ import {
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY, MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '../../../../src/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
-import { listCapturedMigrationEnvelopes } from '@/lib/session-name-migration'
+import { api } from '@/lib/api'
 import { sessionMetadataKey } from '@/lib/session-metadata'
 
 // Delta round 3, finding 1 + e3r1 findings 3/4: layout envelopes are keyed
@@ -3002,7 +3002,8 @@ describe('crossTabSync — unified agent names (Task 7)', () => {
     }
   })
 
-  it('captures an old foreign-window envelope as immutable legacy evidence BEFORE the sanitized hydrate runs', () => {
+  it('a sibling window layout write never captures or submits', async () => {
+    const postSpy = vi.spyOn(api, 'post').mockResolvedValue({ acknowledged: [], names: [] })
     const store = configureStore({
       reducer: { tabs: tabsReducer, panes: panesReducer, machineIdentity: machineIdentityReducer },
     })
@@ -3057,15 +3058,16 @@ describe('crossTabSync — unified agent names (Task 7)', () => {
 
     // The sanitized hydrate dropped the scoped alias…
     expect(store.getState().panes.paneTitles['tab-1']?.['p-agent']).toBeUndefined()
-    // …and the raw bytes were preserved as immutable legacy-name evidence
-    // (captured BEFORE the dispatch — the capture is what keeps the label
-    // recoverable for the consolidation import).
-    const envelopes = listCapturedMigrationEnvelopes(localStorage)
-    const captured = envelopes.find(
-      (envelope) => envelope.storageKey === 'freshell.layout.v3.layout-window-task7-capture',
-    )
-    expect(captured).toBeTruthy()
-    expect(captured?.raw).toBe(foreignRaw)
+    // …and a sibling window's live layout is never legacy-name evidence:
+    // nothing is copied into a migration envelope and nothing is sent.
+    const migrationKeys: string[] = []
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index)
+      if (key?.startsWith('freshell.session-names.migration.v1.')) migrationKeys.push(key)
+    }
+    expect(migrationKeys).toEqual([])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(postSpy).not.toHaveBeenCalled()
   })
 
   it('drops a LOCAL scoped pane alias on the title-only path — an unacknowledged old label never stays an active override', () => {

@@ -93,10 +93,12 @@ const ONECLI_ACCESS_RESTRICTED_BODY = JSON.stringify({
  * (auto-title-rust.spec.ts's pattern): deterministic short names, an
  * optional hold for the late-generation races. With `validKey` it checks
  * the key as Google does: no key → 403 `PERMISSION_DENIED`, any other key →
- * 400 `API_KEY_INVALID`. */
+ * 400 `API_KEY_INVALID`. `status`/`body` make every other generate call
+ * answer that HTTP status and JSON body instead (for example a 403, so AI
+ * naming never succeeds and only first-message/folder names remain). */
 export async function startFakeGemini(
   replyText: string,
-  opts?: { hold?: boolean; validKey?: string },
+  opts?: { hold?: boolean; validKey?: string; status?: number; body?: unknown },
 ): Promise<FakeGemini> {
   const requests: FakeGemini['requests'] = []
   let held = opts?.hold === true
@@ -128,8 +130,11 @@ export async function startFakeGemini(
       }
       if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH) {
         const answer = () => {
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: replyText }] } }] }))
+          const status = opts?.status ?? 200
+          res.writeHead(status, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(opts?.body !== undefined
+            ? opts.body
+            : { candidates: [{ content: { parts: [{ text: replyText }] } }] }))
         }
         if (held) {
           const timer = setInterval(() => {

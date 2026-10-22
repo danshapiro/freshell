@@ -12,10 +12,9 @@ vi.mock('@/lib/recovery/boot-state', () => ({
   bootCapturedAtMs: 1_000,
 }))
 
-import { getRecoveryInventory } from '@/lib/api'
+import { api, getRecoveryInventory } from '@/lib/api'
 import { MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
-import { listCapturedMigrationEnvelopes } from '@/lib/session-name-migration'
 import tabsReducer, { addTab, setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, splitPane } from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
@@ -627,7 +626,8 @@ describe('restoreMachineWorkspace — unified agent names (Task 7)', () => {
     localStorage.clear()
   })
 
-  it('captures raw legacy layout evidence BEFORE the rebuild clears the local cache', async () => {
+  it('machine-workspace restore performs no legacy capture', async () => {
+    const postSpy = vi.spyOn(api, 'post').mockResolvedValue({ acknowledged: [], names: [] })
     const store = createStore()
     addForeignWorkspace(store)
     const legacyRaw = JSON.stringify({
@@ -661,13 +661,18 @@ describe('restoreMachineWorkspace — unified agent names (Task 7)', () => {
 
     await restoreMachineWorkspace(store, MACHINE_ID)
 
-    // The rebuild replaced the local layout, but the raw legacy bytes were
-    // preserved as an immutable per-importId envelope first — the
-    // consolidation import can still recover the old user labels.
-    const envelopes = listCapturedMigrationEnvelopes(localStorage)
-    const captured = envelopes.find((envelope) => envelope.storageKey === 'freshell.layout.v3')
-    expect(captured).toBeTruthy()
-    expect(captured?.raw).toBe(legacyRaw)
+    // The one-time capture runs only at module load; a rebuild copies
+    // nothing into a migration envelope and sends nothing.
+    const migrationKeys: string[] = []
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index)
+      if (key?.startsWith('freshell.session-names.migration.v1.')) migrationKeys.push(key)
+    }
+    expect(migrationKeys).toEqual([])
+    expect(postSpy).not.toHaveBeenCalled()
+    // The genuine legacy key itself is left in place.
+    expect(localStorage.getItem('freshell.layout.v3')).toBe(legacyRaw)
+    postSpy.mockRestore()
   })
 
   it('restores scoped recovery panes with no scoped pane-title aliases and intact identity', async () => {
