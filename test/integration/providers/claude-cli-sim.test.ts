@@ -214,6 +214,22 @@ describe('Claude CLI simulator programs', () => {
     await s.until(() => s.messages.some((m) => m.type === 'command_lifecycle' && m.state === 'cancelled'))
   })
 
+  it('a /compact whose summary request hangs (HANG in its instructions) stays compacting with no result', async () => {
+    // The marker reaches the compaction's summary request the way APIERR does
+    // on the real CLI (T15 scenario `compact`), so the local provider's HANG
+    // mode would leave the real CLI compacting too. Only a CLI death ends it.
+    const s = await open({}, { FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    s.prompt.push('something to compact')
+    await s.until(() => results(s.messages).length === 1)
+    s.prompt.push('/compact HANG', '33333333-3333-4333-8333-333333333333')
+    await s.until(() => s.messages.some((m) => m.type === 'system' && m.subtype === 'status' && m.status === 'compacting'))
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const statuses = s.messages.filter((m) => m.type === 'system' && m.subtype === 'status').map((m) => m.status)
+    expect(statuses.at(-1), 'the compaction is still in progress').toBe('compacting')
+    expect(results(s.messages), 'the hung compaction has no result').toHaveLength(1)
+    expect(s.ended).toBeNull()
+  })
+
   it('a start rule can schedule a CLI-initiated turn: init and a result with no lifecycle, bracketed by running and idle', async () => {
     const s = await open({}, program([{ on: 'start', emit: [{ kind: 'cli_turn', data: { afterMs: 50 } }] }]))
     await s.until(() => results(s.messages).length === 1)
