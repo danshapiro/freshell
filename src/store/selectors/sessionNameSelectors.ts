@@ -233,6 +233,35 @@ export function selectTabDisplayName(state: RootState, tabId: string): string {
   return getTabDisplayTitle(tab, layout, state.panes?.paneTitles?.[tabId], paneExtensions(state))
 }
 
+/**
+ * A session-owned tab's naming binding (name reliability, Task 7): which
+ * naming ref its source pane holds and the saved name cached for it.
+ * - `refKey`: the source pane's naming ref key as the pane holds it (before
+ *   pending→durable redirects, so a redirect is the same binding); null
+ *   while the pane has no naming identity yet.
+ * - `savedName`: the cached record's name; undefined when none is cached.
+ */
+export type SessionTabNameBinding = {
+  refKey: string | null
+  savedName: string | undefined
+}
+
+/** The tab's naming binding; undefined for legacy tabs (and for a source
+ * pane that is not a scoped Claude/Codex/OpenCode pane). */
+function nameBindingOfTab(
+  tab: NamedTab,
+  layout: PaneNode | undefined,
+  cache: SessionNamesCache | undefined,
+): SessionTabNameBinding | undefined {
+  const sourcePaneId = resolveTabNameSourcePaneId(tab, layout)
+  if (!sourcePaneId) return undefined
+  const content = findPaneContent(layout, sourcePaneId)
+  if (!content || !isScopedPaneContent(content)) return undefined
+  const ref = resolvePaneNameRef(content)
+  if (!ref) return { refKey: null, savedName: undefined }
+  return { refKey: sessionNameRefKey(ref), savedName: recordInCache(cache, ref)?.name }
+}
+
 /** A session-owned tab's SAVED name: the record cached for its source
  * pane's naming ref. Undefined for legacy tabs and whenever no record is
  * cached — never a fallback label. */
@@ -241,12 +270,7 @@ function savedNameOfTab(
   layout: PaneNode | undefined,
   cache: SessionNamesCache | undefined,
 ): string | undefined {
-  const sourcePaneId = resolveTabNameSourcePaneId(tab, layout)
-  if (!sourcePaneId) return undefined
-  const content = findPaneContent(layout, sourcePaneId)
-  if (!content || !isScopedPaneContent(content)) return undefined
-  const ref = resolvePaneNameRef(content)
-  return ref ? recordInCache(cache, ref)?.name : undefined
+  return nameBindingOfTab(tab, layout, cache)?.savedName
 }
 
 /** The session display rule for directory/history/sidebar surfaces. */
@@ -330,23 +354,39 @@ export const selectTabDisplayTitles = createSelector(
 )
 
 /**
- * The session-owned tabs' SAVED names only (name reliability, Task 7):
- * `{tabId: name}` for every session-owned tab whose source pane's saved
- * record is cached. A tab with no cached record is absent — this selector
- * never answers a fallback label (the provider label or folder name a
- * display selector shows while names load), so its consumers (the
- * saved-name tab title mirror and the registry overlay) can never store or
- * advertise one. Legacy tabs are always absent.
+ * Every session-owned tab's naming binding (name reliability, Task 7):
+ * `{tabId: binding}`; legacy tabs are absent. Memoized on the tabs, the
+ * layouts and the name cache, so the same reference means none of them
+ * changed. The saved-name tab title mirror reads it.
  */
-export const selectSessionTabSavedNames = createSelector(
+export const selectSessionTabNameBindings = createSelector(
   (state: RootState) => state.tabs?.tabs,
   (state: RootState) => state.panes?.layouts,
   (state: RootState) => state.sessionNames,
   (tabs, layouts, sessionNames) => {
-    const out: Record<string, string> = {}
+    const out: Record<string, SessionTabNameBinding> = {}
     for (const tab of tabs ?? []) {
-      const savedName = savedNameOfTab(tab, layouts?.[tab.id], sessionNames)
-      if (savedName !== undefined) out[tab.id] = savedName
+      const binding = nameBindingOfTab(tab, layouts?.[tab.id], sessionNames)
+      if (binding) out[tab.id] = binding
+    }
+    return out
+  },
+)
+
+/**
+ * The session-owned tabs' SAVED names only (name reliability, Task 7):
+ * `{tabId: name}` for every session-owned tab whose source pane's saved
+ * record is cached. A tab with no cached record is absent — this selector
+ * never answers a fallback label (the provider label or folder name a
+ * display selector shows while names load), so its consumer (the registry
+ * overlay) can never advertise one. Legacy tabs are always absent.
+ */
+export const selectSessionTabSavedNames = createSelector(
+  selectSessionTabNameBindings,
+  (bindings) => {
+    const out: Record<string, string> = {}
+    for (const [tabId, binding] of Object.entries(bindings)) {
+      if (binding.savedName !== undefined) out[tabId] = binding.savedName
     }
     return out
   },

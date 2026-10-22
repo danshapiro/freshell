@@ -40,6 +40,7 @@ import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/s
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
 import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
+import { unnamedTabTitle } from '@/lib/tab-title'
 
 
 const log = createLogger('TabsSlice')
@@ -356,7 +357,7 @@ export const tabsSlice = createSlice({
       const tab: Tab = {
         id,
         createRequestId: payload.createRequestId || id,
-        title: payload.title || `Tab ${state.tabs.length + 1}`,
+        title: payload.title || unnamedTabTitle(state.tabs.length + 1),
         description: payload.description,
         codingCliProvider,
         status: payload.status || 'creating',
@@ -417,9 +418,11 @@ export const tabsSlice = createSlice({
     },
     /**
      * Name reliability (Task 7, D2): the saved-name tab title mirror's only
-     * write — `{tabId: savedName}` for session-owned tabs. It sets the stored
-     * title and nothing else: a display mirror never bumps `updatedAt` (tab
-     * recency) and never sets `titleSetByUser`.
+     * write — `{tabId: title}` for session-owned tabs (the saved name, or the
+     * unnamed placeholder when the tab's naming session changed to one
+     * without a saved name). It sets the stored title and nothing else: a
+     * display mirror never bumps `updatedAt` (tab recency) and never sets
+     * `titleSetByUser`.
      */
     mirrorSessionTabTitles: (state, action: PayloadAction<Record<string, string>>) => {
       for (const tab of state.tabs) {

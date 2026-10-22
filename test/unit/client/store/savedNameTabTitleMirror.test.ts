@@ -1,12 +1,15 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer, { addTab, setActiveTab } from '@/store/tabsSlice'
+import { configureStore, type Middleware } from '@reduxjs/toolkit'
+import tabsReducer, { addTab, mirrorSessionTabTitles, setActiveTab } from '@/store/tabsSlice'
 import panesReducer, {
+  closePane,
   initLayout,
+  reconcileTerminalSessionRefByTerminalId,
   resizePanes,
   setActivePane,
   splitPane,
   toggleZoom,
+  updatePaneContent,
 } from '@/store/panesSlice'
 import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
 import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
@@ -15,11 +18,11 @@ import tabRegistryReducer from '@/store/tabRegistrySlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { sessionNameLifecycleMiddleware } from '@/store/sessionNameLifecycleMiddleware'
 import { savedNameTabTitleMirrorMiddleware } from '@/store/savedNameTabTitleMirror'
-import { selectTabDisplayName } from '@/store/selectors/sessionNameSelectors'
+import { selectPaneDisplayName, selectTabDisplayName } from '@/store/selectors/sessionNameSelectors'
 import { selectLiveLocalTabRecords } from '@/store/selectors/tabsRegistrySelectors'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
-import type { SessionNameRef, SessionNameUpdate } from '@shared/session-names'
+import { sessionNameRefKey, type SessionNameRef, type SessionNameUpdate } from '@shared/session-names'
 import type { RootState } from '@/store/store'
 
 // Name reliability (plan Task 7, D2): a session-owned tab's stored title is a
@@ -28,7 +31,7 @@ import type { RootState } from '@/store/store'
 // user-rename freeze flag, so reloads, the server layout mirror and the tabs
 // registry carry the right name even before names load.
 
-function buildStore() {
+function buildStore(options: { preloadedState?: Record<string, unknown>; spy?: Middleware } = {}) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -42,9 +45,11 @@ function buildStore() {
     // The production order: the mirror sits outside the lifecycle
     // coordinator, so it reads already-reconciled naming-source pointers.
     middleware: (getDefault) => getDefault().concat(
+      ...(options.spy ? [options.spy] : []),
       savedNameTabTitleMirrorMiddleware,
       sessionNameLifecycleMiddleware,
     ),
+    ...(options.preloadedState ? { preloadedState: options.preloadedState as never } : {}),
   })
 }
 
@@ -66,6 +71,7 @@ function shellTerminal(createRequestId = 'crid-shell'): PaneContent {
 }
 
 const SESSION_REF: SessionNameRef = { kind: 'session', provider: 'claude', sessionId: 'sess-1' }
+const NEXT_SESSION_REF: SessionNameRef = { kind: 'session', provider: 'claude', sessionId: 'sess-2' }
 
 function update(
   ref: SessionNameRef,
@@ -226,5 +232,119 @@ describe('savedNameTabTitleMirrorMiddleware', () => {
 
     expect(store.getState().sessionNames.records).toEqual({})
     expect(selectTabDisplayName(store.getState() as unknown as RootState, tabId)).toBe('LotL')
+  })
+  it('a conversation switch to a session without a saved record stops showing the old name', () => {
+    vi.useFakeTimers({ now: 1_000 })
+    const store = buildStore()
+    const { tabId, paneId } = createSessionTab(store, {
+      title: 'freshell',
+      content: claudeTerminal({ terminalId: 'term-1', sessionRef: { provider: 'claude', sessionId: 'sess-1' } }),
+    })
+    store.dispatch(receiveSessionNames([update(SESSION_REF, 'LotL', 1)]))
+    expect(tabOf(store, tabId).title).toBe('LotL')
+    vi.setSystemTime(9_000)
+
+    // The CLI switched conversations (for example /clear): the pane now
+    // holds sess-2, which has no saved name yet.
+    store.dispatch(reconcileTerminalSessionRefByTerminalId({
+      terminalId: 'term-1',
+      sessionRef: { provider: 'claude', sessionId: 'sess-2' },
+    }))
+
+    const state = store.getState() as unknown as RootState
+    // The tab bar shows what the pane header shows: the new conversation's
+    // fallback, never the old conversation's name.
+    expect(selectPaneDisplayName(state, tabId, paneId)).not.toBe('LotL')
+    expect(selectTabDisplayName(state, tabId)).not.toBe('LotL')
+    expect(selectTabDisplayName(state, tabId)).toBe(selectPaneDisplayName(state, tabId, paneId))
+    // The stored title (copied by the persisted layout and the server layout
+    // mirror) and the tabs registry drop it too, without touching recency.
+    expect(tabOf(store, tabId).title).not.toBe('LotL')
+    expect(tabOf(store, tabId).updatedAt).toBe(1_000)
+    const record = selectLiveLocalTabRecords(state).find((candidate) => candidate.tabId === tabId)
+    expect(record?.tabName).not.toBe('LotL')
+
+    // The new conversation's first saved name is mirrored as usual; the old
+    // conversation keeps its own name.
+    store.dispatch(receiveSessionNames([update(NEXT_SESSION_REF, 'Billing bug', 1)]))
+    expect(tabOf(store, tabId).title).toBe('Billing bug')
+    expect(store.getState().sessionNames.records[sessionNameRefKey(SESSION_REF)]?.name).toBe('LotL')
+  })
+
+  it('the naming source moving to a pane without a saved record stops showing the old name', () => {
+    const store = buildStore()
+    const { tabId, paneId } = createSessionTab(store, { title: 'freshell' })
+    store.dispatch(splitPane({
+      tabId,
+      paneId,
+      direction: 'horizontal',
+      newContent: claudeTerminal({ createRequestId: 'crid-claude-2', sessionRef: { provider: 'claude', sessionId: 'sess-2' } }),
+      newPaneId: 'pane-2',
+    }))
+    expect(tabOf(store, tabId).nameSource).toEqual({ kind: 'session', paneId })
+    store.dispatch(receiveSessionNames([update(SESSION_REF, 'LotL', 1)]))
+    expect(tabOf(store, tabId).title).toBe('LotL')
+
+    // Closing the source pane hands the tab's name to the other Claude pane,
+    // whose session has no saved name yet.
+    store.dispatch(closePane({ tabId, paneId }))
+    expect(tabOf(store, tabId).nameSource).toEqual({ kind: 'session', paneId: 'pane-2' })
+
+    const state = store.getState() as unknown as RootState
+    expect(selectTabDisplayName(state, tabId)).not.toBe('LotL')
+    expect(tabOf(store, tabId).title).not.toBe('LotL')
+  })
+
+  it('a new tab keeps its create-time title while its pane gains a naming identity', () => {
+    const store = buildStore()
+    // A tab created with a caller name and a Claude pane that has no naming
+    // identity yet (its terminal is still being created).
+    const { tabId, paneId } = createSessionTab(store, { title: 'Fix login', content: claudeTerminal() })
+    expect(tabOf(store, tabId).nameSource).toEqual({ kind: 'session', paneId })
+
+    store.dispatch(updatePaneContent({ tabId, paneId, content: claudeTerminal({ namingHandle: 'handle-new' }) }))
+    expect(tabOf(store, tabId).title).toBe('Fix login')
+
+    store.dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: claudeTerminal({ namingHandle: 'handle-new', terminalId: 'term-9', sessionRef: { provider: 'claude', sessionId: 'sess-9' } }),
+    }))
+    expect(tabOf(store, tabId).title).toBe('Fix login')
+  })
+
+  it('an empty cached name never dispatches a mirror write', () => {
+    const mirrorWrites: unknown[] = []
+    const spy: Middleware = () => (next) => (action) => {
+      if (mirrorSessionTabTitles.match(action)) mirrorWrites.push(action)
+      return next(action)
+    }
+    // A hand-built cache holding an empty name (the wire schema refuses
+    // one, so only a corrupt or hand-built state can hold it).
+    const store = buildStore({
+      spy,
+      preloadedState: {
+        sessionNames: {
+          records: {
+            [sessionNameRefKey(SESSION_REF)]: { ref: SESSION_REF, name: '', source: 'manual', revision: 1 },
+          },
+          redirects: {},
+          nativeSync: {},
+        },
+      },
+    })
+    const { tabId, paneId } = createSessionTab(store, { title: 'LotL' })
+    store.dispatch(splitPane({
+      tabId,
+      paneId,
+      direction: 'horizontal',
+      newContent: shellTerminal('crid-split'),
+      newPaneId: 'pane-split',
+    }))
+    store.dispatch(setActivePane({ tabId, paneId: 'pane-split' }))
+    store.dispatch(setActivePane({ tabId, paneId }))
+
+    expect(mirrorWrites).toEqual([])
+    expect(tabOf(store, tabId).title).toBe('LotL')
   })
 })
