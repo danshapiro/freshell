@@ -73,6 +73,8 @@ use freshell_protocol::{
     FreshAgentSessionMaterialized, ServerMessage, SessionRuntimeOwner, SessionType,
 };
 
+use crate::claude_handshake::{read_created, BootContext};
+use crate::claude_launch::{ClaudeBoot, SIDECAR_PROTOCOL};
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
@@ -478,13 +480,21 @@ impl AliasTombstones {
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
-/// `requestId` in [`FreshClaudeState::create_dedup`]. Claude's `create()` returns only a
-/// bare nanoid placeholder (no `sessionRef` -- `adapter.ts` returns `{ sessionId }` only),
-/// so only `session_id` need be cached; the replay branch mirrors the live path's own
-/// broadcast (NO `sessionRef`).
+/// `requestId` in [`FreshClaudeState::create_dedup`]: what the original
+/// `freshAgent.created` said, so the replay branch re-answers identically (a resume
+/// create's `sessionRef` included).
 #[derive(Clone)]
 struct ClaudeCreateRecord {
     session_id: String,
+    session_ref: Option<freshell_protocol::SessionLocator>,
+}
+
+/// The `sessionRef` of the claude conversation `session_id`.
+fn claude_session_ref(session_id: &str) -> freshell_protocol::SessionLocator {
+    freshell_protocol::SessionLocator {
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+    }
 }
 
 /// The per-session pending approval/question set folded from the sidecar's stdout
@@ -1979,8 +1989,10 @@ impl FreshClaudeState {
     // ── freshAgent.create (WS) ───────────────────────────────────────────────────────
 
     /// Handle a `freshAgent.create` for claude/kilroy: spawn the Node sidecar, drive the
-    /// SDK `create` to get the BARE nanoid placeholder, register the session + its stdout
-    /// consumer, and broadcast `freshAgent.created` (or `freshAgent.create.failed`).
+    /// SDK `create` to get the BARE nanoid placeholder (the sidecar answers `created` only
+    /// once the CLI booted the conversation; a refused boot is a typed `create.failed`),
+    /// register the session + its stdout consumer, and broadcast `freshAgent.created`
+    /// (with `sessionRef` for a resume) or `freshAgent.create.failed`.
     /// Long-running (cold sidecar spawn), so the WS loop dispatches this as a detached task.
     /// `provenance` (D8): the WS connection's stamped identity for this create
     /// (`None` on conn-less lanes); threaded to the `sdk.session.init` binding write.
@@ -2010,7 +2022,7 @@ impl FreshClaudeState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.session_id,
                     session_type: session_type.to_string(),
-                    session_ref: None,
+                    session_ref: cached.session_ref,
                     name_ref,
                     session_name,
                 }));
@@ -2447,9 +2459,13 @@ impl FreshClaudeState {
         };
 
         // Send the create request (faithful to createClaudeSdkOptions inputs).
+        let boot = ClaudeBoot::resume_or_fresh(resume_sid.as_deref());
         let create_req = json!({
             "type": "create",
+            "protocol": SIDECAR_PROTOCOL,
             "requestId": request_id,
+            "sessionType": session_type,
+            "boot": boot.wire(),
             "cwd": msg.cwd,
             "model": msg.model,
             "permissionMode": msg.permission_mode,
@@ -2457,7 +2473,6 @@ impl FreshClaudeState {
             "plugins": msg.plugins,
             "hostedMcp": self.hosted_mcp,
             "modelSelection": msg.model_selection,
-            "resumeSessionId": resume_sid,
         });
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
@@ -2470,19 +2485,27 @@ impl FreshClaudeState {
             return;
         }
 
-        // Read stdout until `created` / `create.failed` (bounded). Keep the reader to hand
-        // to the consumer so no post-created event line is lost.
+        // Read stdout until `created` / `create.failed` (bounded): the sidecar answers
+        // `created` only once the CLI has booted the conversation, and a refused boot
+        // (a resume of a conversation the CLI does not have, a CLAUDE_CMD that is not
+        // the CLI) is a typed `create.failed`, never a session that is already dead.
+        // Keep the reader to hand to the consumer so no post-created event line is lost.
         let mut reader = BufReader::new(stdout).lines();
-        let created = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(session_id) => session_id,
-            Err(err) => {
+        let boot_context = BootContext {
+            request_id: &request_id,
+            session_type,
+            boot: &boot,
+        };
+        let created = match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
+            Ok(created) => created.session_id,
+            Err(failure) => {
                 let _ = child.start_kill();
                 reap_owned_claude_sidecars(&ownership_id);
                 // Own tree torn down above -- release so the loser can acquire.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                self.fail_create(&request_id, "CLAUDE_CREATE_FAILED", &err);
+                self.fail_create(&request_id, failure.code(), failure.message());
                 return;
             }
         };
@@ -2787,18 +2810,23 @@ impl FreshClaudeState {
         // codex/opencode: a duplicate `create` arriving right after this point must see
         // the cache populated, never race past this guard's release and spawn a second
         // sidecar).
+        // A resume create names the conversation the CLI booted: `created` comes
+        // only after that boot, so the caller learns the native identity here
+        // instead of waiting for a turn's init (design §6, §7.3). A fresh create
+        // has no durable id until its first turn, so it carries none.
+        let session_ref = resume_sid.as_deref().map(claude_session_ref);
         self.create_dedup
             .record_success(
                 &request_id,
                 ClaudeCreateRecord {
                     session_id: created.clone(),
+                    session_ref: session_ref.clone(),
                 },
             )
             .await;
 
-        // Broadcast freshAgent.created (ws-handler.ts:3378). NO sessionRef for claude
-        // (adapter.ts returns { sessionId } only); placeholder == the bare nanoid.
-        // Unified agent names: the created frame carries the pane's naming
+        // Broadcast freshAgent.created (ws-handler.ts:3378); placeholder == the bare
+        // nanoid. Unified agent names: the created frame carries the pane's naming
         // projection (the pending handle's record) when one was admitted.
         let name_ref = naming_projection
             .as_ref()
@@ -2810,7 +2838,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: created,
             session_type: session_type.to_string(),
-            session_ref: None,
+            session_ref,
             name_ref,
             session_name,
         }));
@@ -2888,6 +2916,7 @@ impl FreshClaudeState {
                 request_id,
                 ClaudeCreateRecord {
                     session_id: durable.to_string(),
+                    session_ref: Some(claude_session_ref(durable)),
                 },
             )
             .await;
@@ -2911,10 +2940,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: durable.to_string(),
             session_type: session_type.to_string(),
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: PROVIDER.to_string(),
-                session_id: durable.to_string(),
-            }),
+            session_ref: Some(claude_session_ref(durable)),
             name_ref,
             session_name,
         }));
@@ -6583,20 +6609,21 @@ impl FreshClaudeState {
                     create_req.insert("effort".to_string(), json!(effort));
                 }
             }
-            if let Some(resume_at) = &resume_at_uuid {
-                create_req.insert("resumeSessionId".to_string(), json!(resume_value));
-                create_req.insert("resumeSessionAt".to_string(), json!(resume_at));
-                create_req.insert("forkSession".to_string(), json!(true));
-                if let Some(guard) = &guard_uuid {
+            let boot = match &resume_at_uuid {
+                Some(resume_at) => ClaudeBoot::Fork {
+                    resume: resume_value.clone(),
+                    at: Some(resume_at.clone()),
                     // attempt 1 arms the guard; the retried recovery omits it.
-                    if !guard_retried {
-                        create_req.insert("resumeDropsTurn".to_string(), json!(guard));
-                    }
-                }
-            }
+                    drops_turn: guard_uuid.clone().filter(|_| !guard_retried),
+                },
+                None => ClaudeBoot::Fresh,
+            };
+            create_req.insert("protocol".to_string(), json!(SIDECAR_PROTOCOL));
+            create_req.insert("sessionType".to_string(), json!(session_type));
+            create_req.insert("boot".to_string(), boot.wire());
             let create_req = Value::Object(create_req);
             match self
-                .rollback_spawn_create(&create_req, session_type, lease_guard.as_mut())
+                .rollback_spawn_create(&create_req, &boot, session_type, lease_guard.as_mut())
                 .await
             {
                 Ok(ok) => break Ok(ok),
@@ -7278,7 +7305,7 @@ impl FreshClaudeState {
     }
 
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
-    /// flavored): transcript-present gate -> spawn sidecar with `resumeSessionId` ->
+    /// flavored): transcript-present gate -> spawn sidecar with a resume boot ->
     /// register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
     /// attach-path D8 lease -- the kill handle is armed after the spawn and the lease
     /// completed (bound to the map key) at registration; error paths tear down their
@@ -7369,7 +7396,7 @@ impl FreshClaudeState {
         // keeping the attach cwd for the process itself. The path form is
         // reserved for a transcript WITH records: a zero-turn transcript
         // (touched at create, no records) has no cwd to resolve and NOTHING
-        // to path-resume — and the sidecar protocol's `resumeSessionId` is a
+        // to path-resume — and the create line's resume boot names a
         // SESSION ID (the real sidecar forwards it verbatim to the SDK's
         // `resume` option), so a path there would make the recovered session
         // write under a path-flattened phantom file. An empty transcript
@@ -7380,17 +7407,20 @@ impl FreshClaudeState {
             .map(|meta| meta.len() > 0)
             .unwrap_or(false);
         let (resume_value, resume_cwd) = match original_cwd {
-            Some(cwd) => (json!(durable), json!(cwd)),
+            Some(cwd) => (durable.to_string(), json!(cwd)),
             None if transcript_has_records => (
-                json!(transcript.to_string_lossy()),
+                transcript.to_string_lossy().to_string(),
                 json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
             ),
             // Attach cwd stays primary; the ledger record's cwd is a FINAL
             // fallback only when both existing sources are absent (Task 10).
             None => (
-                json!(durable),
+                durable.to_string(),
                 json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
             ),
+        };
+        let boot = ClaudeBoot::Resume {
+            resume: resume_value,
         };
 
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
@@ -7430,16 +7460,19 @@ impl FreshClaudeState {
             sidecar_pid,
         );
         let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
+        let session_type = session_type_str(msg.session_type);
         let create_req = json!({
             "type": "create",
+            "protocol": SIDECAR_PROTOCOL,
             "requestId": request_id,
+            "sessionType": session_type,
+            "boot": boot.wire(),
             "cwd": resume_cwd,
             // Recovered from the ledger record (Task 10); `json!` serializes `None`
             // as `null`, preserving today's fallback wire shape exactly on a miss.
             "model": rec.model,
             "permissionMode": rec.permission_mode,
             "effort": rec.effort,
-            "resumeSessionId": resume_value,
         });
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
@@ -7447,14 +7480,26 @@ impl FreshClaudeState {
             return Err(ResumeClaudeError::Transient(err));
         }
         let mut reader = BufReader::new(stdout).lines();
-        let sidecar_session_id = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(id) => id,
-            Err(err) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                return Err(ResumeClaudeError::Transient(err));
-            }
+        let boot_context = BootContext {
+            request_id: &request_id,
+            session_type,
+            boot: &boot,
         };
+        // A refusal stays transient here: the transcript was found just above, so a
+        // CLI that cannot resume it is not proof the conversation is gone.
+        let sidecar_session_id =
+            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
+                Ok(created) => created.session_id,
+                Err(failure) => {
+                    let _ = child.start_kill();
+                    reap_owned_claude_sidecars(&ownership_id);
+                    return Err(ResumeClaudeError::Transient(format!(
+                        "{}: {}",
+                        failure.code(),
+                        failure.message()
+                    )));
+                }
+            };
 
         // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
         // 4+5): this attach is a NEW pane GENUINELY CLAIMING `durable` — the
@@ -9834,6 +9879,10 @@ fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMess
 /// twice).
 const RESUME_DROPS_TURN_REFUSAL_PREFIX: &str = "Resume rejected by --resume-drops-turn:";
 
+/// The `create.failed` code of the same refusal when the CLI reports it at boot
+/// (`crates/freshell-claude-sidecar/boot.mjs`).
+const FORK_GUARD_REFUSED_CODE: &str = "FORK_GUARD_REFUSED";
+
 /// Why one rollback-respawn attempt failed.
 enum RollbackSpawnError {
     /// The create's early output carried the `--resume-drops-turn` refusal
@@ -9886,6 +9935,7 @@ impl FreshClaudeState {
     async fn rollback_spawn_create(
         &self,
         create_req: &Value,
+        boot: &ClaudeBoot,
         session_type: &str,
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
     ) -> Result<RollbackSpawned, RollbackSpawnError> {
@@ -9910,14 +9960,30 @@ impl FreshClaudeState {
             return Err(RollbackSpawnError::Other(err));
         }
         let mut reader = BufReader::new(stdout).lines();
-        let sidecar_session_id = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(id) => id,
-            Err(err) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                return Err(RollbackSpawnError::Other(err));
-            }
+        let request_id = create_req
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let boot_context = BootContext {
+            request_id,
+            session_type,
+            boot,
         };
+        let sidecar_session_id =
+            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
+                Ok(created) => created.session_id,
+                Err(failure) => {
+                    let _ = child.start_kill();
+                    reap_owned_claude_sidecars(&ownership_id);
+                    // The CLI refuses a fork whose drops-turn guard does not hold at
+                    // boot (T5): the same refusal the init pre-read below watches for.
+                    return Err(if failure.is_refusal(FORK_GUARD_REFUSED_CODE) {
+                        RollbackSpawnError::GuardRefusal
+                    } else {
+                        RollbackSpawnError::Other(failure.message().to_string())
+                    });
+                }
+            };
         match read_session_init(&mut reader, SIDECAR_CREATE_BUDGET).await {
             Ok(init) => {
                 let cli_id = init
@@ -10157,58 +10223,6 @@ mod provider_exec_tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-    }
-}
-
-/// Read the sidecar's stdout until the `created` (→ the nanoid placeholder) or
-/// `create.failed` control line, bounded by `budget`. EOF before either is a failure.
-async fn read_created(
-    reader: &mut tokio::io::Lines<BufReader<ChildStdout>>,
-    budget: Duration,
-) -> Result<String, String> {
-    let read = async {
-        loop {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                        continue;
-                    };
-                    match value.get("type").and_then(Value::as_str) {
-                        Some("created") => {
-                            let session_id = value
-                                .get("sessionId")
-                                .and_then(Value::as_str)
-                                .ok_or("created carried no sessionId")?;
-                            return Ok(session_id.to_string());
-                        }
-                        Some("create.failed") => {
-                            let message = value
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown sidecar create failure");
-                            return Err(message.to_string());
-                        }
-                        // sdk.* events before `created` are impossible (the sidecar emits
-                        // `created` first), but tolerate + skip any stray line.
-                        _ => continue,
-                    }
-                }
-                // EOF before `created` → the sidecar died at startup (e.g. bad node/SDK).
-                Ok(None) => return Err("sidecar stdout closed before `created`".to_string()),
-                Err(e) => return Err(format!("sidecar stdout read error: {e}")),
-            }
-        }
-    };
-    match tokio::time::timeout(budget, read).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "sidecar did not answer `create` within {}s",
-            budget.as_secs()
-        )),
     }
 }
 
@@ -11012,11 +11026,11 @@ pub(crate) mod tests {
             st.cli_index.lock().await.get(durable),
             Some(&"client-nanoid-1".to_string())
         );
-        // The fake received resumeSessionId (spawn log now records the create request).
+        // The fake received the resume boot (spawn log now records the create request).
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         assert!(
             log.contains(durable),
-            "sidecar create must carry resumeSessionId"
+            "sidecar create must carry the resume boot"
         );
         // Idle snapshot frame, tagged with the client's id + the durable timeline id.
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -11970,7 +11984,7 @@ rl.on('line', (line) => {
   }
   if (msg.type === 'create') {
     // Log the WHOLE create request (one line per create) so tests can both count
-    // spawns AND assert what the sidecar received (e.g. resumeSessionId).
+    // spawns AND assert what the sidecar received (e.g. the resume boot).
     if (spawnLog) {
       fs.appendFileSync(spawnLog, `${JSON.stringify(msg)}\n`)
     }
@@ -11980,14 +11994,14 @@ rl.on('line', (line) => {
       const sessionId = `fake-claude-session-${process.pid}-${counter}`
       liveSessions.add(sessionId)
       configuredSettings.set(sessionId, { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd: msg.cwd })
-      process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
-      // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
-      // id when present (resume continuity), else a fixed fake uuid.
-      // Task 4 (kata 1wxv): a forkSession:true create mints a FRESH durable id,
+      process.stdout.write(JSON.stringify({ type: 'created', sessionId, protocol: 2 }) + '\n')
+      // Mirror the real sidecar's post-create init: echo the resume boot's id as the
+      // durable id when present (resume continuity), else a fixed fake uuid.
+      // Task 4 (kata 1wxv): a fork boot mints a FRESH durable id,
       // never an echo — fork-at-point adoption depends on the id changing.
-      const cliSessionId = msg.forkSession === true
+      const cliSessionId = msg.boot?.kind === 'fork'
         ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
-        : (msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+        : (msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
       console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
       console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
     }
@@ -12202,7 +12216,7 @@ rl.on('line', (line) => {
         }
 
         /// Path of the spawn log (one full JSON create-request line per spawn) so tests
-        /// can assert what the sidecar received (e.g. `resumeSessionId`).
+        /// can assert what the sidecar received (e.g. the resume boot).
         fn spawn_log_path(&self) -> &std::path::Path {
             &self.spawn_log
         }
@@ -13277,8 +13291,8 @@ rl.on('line', (line) => {
     /// ONLY identity is a provider-matched `sessionRef` must resume exactly
     /// like the legacy `resumeSessionId` carrier — the canonical field cannot
     /// be a second-class citizen while the client migrates off the legacy
-    /// duplicate. The fake sidecar echoes the create request's
-    /// `resumeSessionId` back as the durable id, so the created frame's
+    /// duplicate. The fake sidecar echoes the create request's resume
+    /// boot back as the durable id, so the created frame's
     /// sessionId proves the promotion reached the sidecar.
     #[tokio::test]
     async fn handle_create_with_session_ref_only_resumes_like_legacy() {
@@ -13302,7 +13316,7 @@ rl.on('line', (line) => {
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         assert!(
             log.contains(durable),
-            "sidecar create must carry the sessionRef-derived resumeSessionId: {log}"
+            "sidecar create must carry the sessionRef-derived resume boot: {log}"
         );
         drop(env);
     }
@@ -15203,7 +15217,7 @@ rl.on('line', (line) => {
 
     // ── b8ke focused episode-2 round-1: the adoption's atomicity tests ─────
 
-    /// The fake sidecar's durable id for a create with NO resumeSessionId.
+    /// The fake sidecar's durable id for a create with NO resume boot.
     const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     /// A minimal thread-local tracing capture (the session_handoff
@@ -17319,7 +17333,7 @@ rl.on('line', (line) => {
         let created = await_claude_created(&mut rx, "req-alias-exit").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         // The fake sidecar's default durable cliSessionId (its script emits it
-        // on sdk.session.init when no resumeSessionId was supplied).
+        // on sdk.session.init when no resume boot was supplied).
         let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         // The REAL consumer fold adopts the alias (poll, bounded) — the kill
         // must race NOTHING here: the alias exists before the exit.
@@ -17466,7 +17480,7 @@ rl.on('line', (line) => {
     /// Focused-ep5-r1 Finding 2, the tombstone lifecycle's exit: an EXPLICIT
     /// late resume of a killed session still works — the claim clears the
     /// tombstone, and the resumed session's own adoption write (the fake
-    /// sidecar echoes resumeSessionId as the durable cliSessionId) lands
+    /// sidecar echoes the resume boot's id as the durable cliSessionId) lands
     /// instead of being suppressed as a stale orphan.
     #[tokio::test]
     async fn resume_create_after_a_kill_clears_the_tombstone_and_rebinds() {
@@ -17677,7 +17691,7 @@ rl.on('line', (line) => {
         );
 
         // Epoch 2: the genuine claim — resume the SAME durable id (the fake
-        // sidecar echoes resumeSessionId as the cliSessionId).
+        // sidecar echoes the resume boot's id as the cliSessionId).
         let mut resume = dedup_create_msg("req-reopen-2");
         resume.resume_session_id = Some(durable.to_string());
         resume.cwd = Some("/tmp".to_string());
@@ -20290,7 +20304,7 @@ rl.on('line', (line) => {
             json!(["/workspace/.claude/plugins/local"])
         );
         assert_eq!(creates[1]["plugins"], Value::Null);
-        assert_eq!(creates[1]["resumeSessionId"], Value::Null);
+        assert_eq!(creates[1]["boot"], json!({ "kind": "fresh" }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -20704,7 +20718,10 @@ rl.on('line', (line) => {
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         let create_req: serde_json::Value =
             serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(create_req["resumeSessionId"], DURABLE);
+        assert_eq!(
+            create_req["boot"],
+            json!({ "kind": "resume", "resume": DURABLE })
+        );
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -20720,7 +20737,7 @@ rl.on('line', (line) => {
     /// create TOUCHES its transcript (the file exists with zero records).
     /// After a restart, attach's resume lane finds that empty transcript —
     /// its cwd lookup answers nothing — and the path-based resume fallback
-    /// must NOT fire: the sidecar protocol's `resumeSessionId` is a SESSION
+    /// must NOT fire: the create line's resume boot names a SESSION
     /// ID (the real sidecar forwards it verbatim to the SDK's `resume`
     /// option), and a transcript PATH there makes the recovered session
     /// write its conversation under a path-flattened phantom file (observed
@@ -20757,9 +20774,9 @@ rl.on('line', (line) => {
             serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
                 .unwrap();
         assert_eq!(
-            create_req["resumeSessionId"]
+            create_req["boot"]["resume"]
                 .as_str()
-                .expect("resumeSessionId on the wire"),
+                .expect("the resume on the wire"),
             DURABLE,
             "an empty zero-turn transcript must resume by session id, never by transcript path"
         );
@@ -24415,11 +24432,11 @@ rl.on('line', (line) => {
             1,
             "exactly the rollback's fork create: {creates:?}"
         );
-        assert_eq!(creates[0]["resumeSessionId"], json!("s-prime"));
-        assert_eq!(creates[0]["resumeSessionAt"], json!("a1"));
-        assert_eq!(creates[0]["forkSession"], json!(true));
+        assert_eq!(creates[0]["boot"]["resume"], json!("s-prime"));
+        assert_eq!(creates[0]["boot"]["resumeSessionAt"], json!("a1"));
+        assert_eq!(creates[0]["boot"]["kind"], json!("fork"));
         assert_eq!(
-            creates[0]["resumeDropsTurn"],
+            creates[0]["boot"]["dropsTurn"],
             json!("uq"),
             "the guard is the first-to-discard turn's prompt uuid (brief/SDK semantics)"
         );
@@ -24559,14 +24576,14 @@ rl.on('line', (line) => {
             .collect();
         assert_eq!(creates.len(), 2, "{creates:?}");
         assert_eq!(
-            creates[1]["resumeSessionId"],
+            creates[1]["boot"]["resume"],
             json!("s-prime"),
             "redo re-forks the re-rooted chain root"
         );
-        assert_eq!(creates[1]["resumeSessionAt"], json!("aq"));
-        assert_eq!(creates[1]["forkSession"], json!(true));
+        assert_eq!(creates[1]["boot"]["resumeSessionAt"], json!("aq"));
+        assert_eq!(creates[1]["boot"]["kind"], json!("fork"));
         assert!(
-            creates[1].get("resumeDropsTurn").is_none(),
+            creates[1]["boot"].get("dropsTurn").is_none(),
             "the guard is omitted when the discard range is empty (redo to the tip) — never fabricated"
         );
         let record2 = sink_impl

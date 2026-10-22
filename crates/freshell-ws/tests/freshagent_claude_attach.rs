@@ -27,7 +27,7 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 /// A minimal scripted fake claude sidecar (no real SDK, no network, no cost) speaking
 /// the SAME newline-JSON protocol `spawn_sidecar()` drives the vendored package with.
-/// On `create` it replies `created`, then `sdk.session.init` echoing `resumeSessionId`
+/// On `create` it replies `created`, then `sdk.session.init` echoing the resume boot's id
 /// as the durable `cliSessionId` (resume continuity -- exactly what the real sidecar's
 /// SDK init does), then `sdk.status idle`; on `send` it emits `sdk.status busy` (the
 /// Task 10b event-after-rebind knob); on `shutdown` it exits. Every inbound request is
@@ -59,8 +59,8 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
-    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
+    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'send') {
@@ -343,7 +343,7 @@ async fn claude_attach_for_untracked_session_emits_lost_session_frame_over_ws() 
 
 /// Restart parity (Task 6): an attach for an untracked session that DOES carry a
 /// durable claude UUID with a resumable transcript must be resumed in place -- the
-/// server spawns a sidecar with `resumeSessionId` and emits the idle
+/// server spawns a sidecar with a resume boot and emits the idle
 /// `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID (the
 /// frozen client persists it unvalidated -- NEVER a nanoid), all under the CLIENT's
 /// original session id. Before the fix this attach produced the lost frame instead

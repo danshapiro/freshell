@@ -249,7 +249,7 @@ describe('harness-06 fake kilroy runtime', () => {
   it('resume keeps the durable cliSessionId and replays a session snapshot', async () => {
     const durable = randomUUID()
     const { rt } = await make()
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp', resumeSessionId: durable })
+    rt.send({ type: 'create', protocol: 2, requestId: 'r-1', cwd: '/tmp', boot: { kind: 'resume', resume: durable } })
     const init = (await rt.nextEvent('sdk.session.init')) as { cliSessionId: string }
     expect(init.cliSessionId).toBe(durable)
     const snapshot = (await rt.nextEvent('sdk.session.snapshot')) as { messages: unknown[] }

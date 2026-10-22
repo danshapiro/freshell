@@ -8,18 +8,19 @@
 //
 // Wire protocol (mirrors crates/freshell-claude-sidecar/index.mjs and the
 // realism notes in fixtures/fake-claude-sidecar.mjs):
-//   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId,
-//         resumeSessionAt,forkSession,resumeDropsTurn}
-//        (kata 1wxv fork-at-point: forkSession:true + resumeSessionId + resumeSessionAt
+//   in : {"type":"create",protocol:2,requestId,cwd,model,permissionMode,effort,
+//         boot:{kind:'fresh'}|{kind:'resume',resume}|{kind:'fork',resume,resumeSessionAt?,dropsTurn?}}
+//        (protocol v2, crates/freshell-claude-sidecar/boot.mjs; kata 1wxv fork-at-point:
+//        a fork boot of `resume` at resumeSessionAt
 //        mints a NEW durable cliSessionId and writes the parent's transcript PREFIX
-//        through the addressed uuid verbatim; a resumeDropsTurn guard that is NOT the
+//        through the addressed uuid verbatim; a dropsTurn guard that is NOT the
 //        raw-chain successor of the resume point refuses with the SDK-documented
 //        "Resume rejected by --resume-drops-turn:" prefix — NO init, NO durable session;
 //        plain resume keeps the same-id behavior)
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
 //        {"type":"permission.respond",sessionId,requestId,decision}
 //        {"type":"question.respond",sessionId,requestId,answers}
-//        out: {"type":"created",requestId,sessionId} FIRST (claude.rs read_created
+//        out: {"type":"created",requestId,sessionId,protocol:2} FIRST (claude_handshake.rs
 //        discards any earlier line), then sdk.* frames:
 //        sdk.session.init {cliSessionId: CANONICAL UUID}, sdk.status,
 //        sdk.assistant (content MUST be an ARRAY), sdk.result {result} on EVERY
@@ -394,8 +395,12 @@ async function handleInput(line) {
     // the transcript file to CONTINUE — the session's durable id stays the
     // file's stem, and every record lands in THAT file (never a
     // path-flattened `<...>.jsonl.jsonl` phantom).
-    const forking = msg.forkSession === true
-    const resumeRaw = typeof msg.resumeSessionId === 'string' ? msg.resumeSessionId : null
+    // Protocol v2 (crates/freshell-claude-sidecar/boot.mjs): the boot names
+    // the conversation to start.
+    const boot = msg.boot ?? {}
+    const resumeSessionId = typeof boot.resume === 'string' ? boot.resume : undefined
+    const forking = boot.kind === 'fork'
+    const resumeRaw = resumeSessionId ?? null
     const resumeIsPath = resumeRaw !== null
       && (resumeRaw.includes('/') || resumeRaw.endsWith('.jsonl'))
     const resumePath = !forking && resumeIsPath ? resumeRaw : null
@@ -420,28 +425,28 @@ async function handleInput(line) {
     // A path-resumed session's transcript IS the named file.
     const transcript = resumePath ?? transcriptPath(cliSessionId, cwd)
     fs.mkdirSync(path.dirname(transcript), { recursive: true })
-    if (forking && msg.resumeSessionId) {
+    if (forking && resumeSessionId) {
       // created FIRST — a real consumer discards anything earlier. The
       // resumeDropsTurn refusal watch runs BEFORE any durable state moves:
       // the guard must name the RAW-chain successor of the resume point (the
       // SDK-armed discard guard); anything else refuses with the SDK's
       // documented prefix and NO sdk.session.init / durable session is ever
       // minted (freshell retries ONCE with the guard omitted).
-      emit({ type: 'created', requestId: msg.requestId, sessionId })
-      const parentPath = transcriptPath(msg.resumeSessionId, cwd)
+      emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
+      const parentPath = transcriptPath(resumeSessionId, cwd)
       const parentLines = fs.existsSync(parentPath)
         ? fs.readFileSync(parentPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
         : []
-      const cut = typeof msg.resumeSessionAt === 'string'
-        ? parentLines.findIndex((l) => l.uuid === msg.resumeSessionAt)
+      const cut = typeof boot.resumeSessionAt === 'string'
+        ? parentLines.findIndex((l) => l.uuid === boot.resumeSessionAt)
         : parentLines.length - 1
-      if (typeof msg.resumeDropsTurn === 'string') {
+      if (typeof boot.dropsTurn === 'string') {
         const successor = cut >= 0 ? (parentLines[cut + 1]?.uuid ?? null) : null
-        if (msg.resumeDropsTurn !== successor) {
+        if (boot.dropsTurn !== successor) {
           emit({
             type: 'sdk.error',
             sessionId,
-            message: `Resume rejected by --resume-drops-turn: ${msg.resumeDropsTurn} is not the raw-chain successor of the resume point (drop-guard mismatch)`,
+            message: `Resume rejected by --resume-drops-turn: ${boot.dropsTurn} is not the raw-chain successor of the resume point (drop-guard mismatch)`,
           })
           return
         }
@@ -457,10 +462,10 @@ async function handleInput(line) {
     } else {
       fs.closeSync(fs.openSync(transcript, 'a'))
       // created FIRST — a real consumer discards anything earlier.
-      emit({ type: 'created', requestId: msg.requestId, sessionId })
+      emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
       // A plain resume CONTINUES the parent's chain: seed the uuid cursor from
       // the transcript tail so the next appended line's parentUuid is right.
-      if (typeof msg.resumeSessionId === 'string' && fs.existsSync(transcript)) {
+      if (typeof resumeSessionId === 'string' && fs.existsSync(transcript)) {
         const lines = fs.readFileSync(transcript, 'utf8').split('\n').filter(Boolean)
         const last = lines.length > 0 ? JSON.parse(lines[lines.length - 1]) : null
         if (typeof last?.uuid === 'string') lastUuidBySession.set(cliSessionId, last.uuid)
@@ -475,7 +480,7 @@ async function handleInput(line) {
         'msg:create:default',
       )
     }
-    if (msg.resumeSessionId) {
+    if (resumeSessionId) {
       await engine.emitResume(cliSessionId)
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })

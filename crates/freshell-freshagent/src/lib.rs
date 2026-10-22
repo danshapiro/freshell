@@ -38,6 +38,8 @@
 
 pub mod claude;
 pub(crate) mod claude_dead_sessions;
+pub(crate) mod claude_handshake;
+pub(crate) mod claude_launch;
 pub(crate) mod claude_sidecar_exit;
 pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;

@@ -304,27 +304,36 @@ impl RigConnection {
         }
     }
 
-    /// `freshAgent.create` for a freshclaude session in the rig's workspace; returns
-    /// the session id from `freshAgent.created`.
-    pub async fn create(&mut self, request_id: &str) -> String {
+    /// `freshAgent.create` for a freshclaude session in the rig's workspace, with
+    /// `extra` fields merged in (a resume, say); returns the answer:
+    /// `freshAgent.created`, `freshAgent.create.failed` or a request `error`.
+    pub async fn request_create(&mut self, request_id: &str, extra: Value) -> Value {
         let cwd = path_string(&self.workspace);
-        self.send(json!({
+        let mut frame = json!({
             "type": "freshAgent.create",
             "requestId": request_id,
             "provider": "claude",
             "sessionType": "freshclaude",
             "cwd": cwd,
-        }))
-        .await;
-        let answer = self
-            .wait_for(&format!("the answer to create {request_id}"), |v| {
-                v["requestId"] == request_id
-                    && matches!(
-                        v["type"].as_str(),
-                        Some("freshAgent.created" | "freshAgent.create.failed" | "error")
-                    )
-            })
-            .await;
+        });
+        if let (Some(frame), Value::Object(extra)) = (frame.as_object_mut(), extra) {
+            frame.extend(extra);
+        }
+        self.send(frame).await;
+        self.wait_for(&format!("the answer to create {request_id}"), |v| {
+            v["requestId"] == request_id
+                && matches!(
+                    v["type"].as_str(),
+                    Some("freshAgent.created" | "freshAgent.create.failed" | "error")
+                )
+        })
+        .await
+    }
+
+    /// `freshAgent.create` for a freshclaude session in the rig's workspace; returns
+    /// the session id from `freshAgent.created`.
+    pub async fn create(&mut self, request_id: &str) -> String {
+        let answer = self.request_create(request_id, json!({})).await;
         assert_eq!(
             answer["type"], "freshAgent.created",
             "create failed: {answer}"

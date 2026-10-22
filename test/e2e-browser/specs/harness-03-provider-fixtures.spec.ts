@@ -276,7 +276,7 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
       expect(fixture.readEvents().map((event) => event.kind).at(-1)).toBe('crash')
     })
 
-    test('resume: create with resumeSessionId keeps the durable id and snapshots', async () => {
+    test('resume: a resume boot keeps the durable id and snapshots', async () => {
       fixture = await launchProviderFixture({
         fixture: 'fake-claude-sdk-sidecar.mjs',
         program: { rules: [] },
@@ -288,9 +288,10 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
       })
       await sendSidecar(fixture, {
         type: 'create',
+        protocol: 2,
         requestId: 'req-resume',
         cwd: fixture.cwd,
-        resumeSessionId: '77777777-7777-4777-8777-777777777777',
+        boot: { kind: 'resume', resume: '77777777-7777-4777-8777-777777777777' },
       })
       await readSidecarLine(fixture, (o) => o.type === 'sdk.session.init', 'init')
       const initRaw = fixture.stdout

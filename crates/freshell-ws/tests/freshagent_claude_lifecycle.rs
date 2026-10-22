@@ -13,6 +13,11 @@
 //! server keeps a dead-session record so its snapshot says `exited` (from live
 //! state), and a send to it is refused visibly instead of vanishing.
 //!
+//! A session starts only once its CLI booted (C10): the sidecar answers `created`
+//! after the boot, so a boot the CLI refuses is a typed `freshAgent.create.failed`,
+//! never a `freshAgent.created` for a session that is already dead, and a resume's
+//! `created` names the resumed conversation in `sessionRef`.
+//!
 //! Unix only: the tests read the sidecar's pid and signal it (rust-gate runs on Linux).
 #![cfg(unix)]
 
@@ -382,4 +387,136 @@ async fn a_send_to_a_dead_session_gets_the_lost_frame_and_a_request_error() {
         "no send after the death was accepted; frames: {:?}",
         conn.frames
     );
+}
+
+// ── Boot (C10): `created` only after the CLI booted; typed boot failures ──────────
+
+/// The pid of the sidecar process of the `n`th query() the simulator ran in this rig
+/// (1-based; every query() writes a `query` row, booted or not).
+async fn query_pid(rig: &ClaudeRig, n: usize) -> i32 {
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    loop {
+        if let Some(row) = rig.ledger_rows("query").get(n - 1) {
+            return row["pid"].as_i64().expect("the query row carries a pid") as i32;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sidecar never made query() #{n}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The create frame's field that resumes `durable`, as the client sends it.
+fn resume_fields(durable: &str) -> Value {
+    json!({ "sessionRef": { "provider": "claude", "sessionId": durable } })
+}
+
+/// A resume create of a conversation the CLI does not have is refused at create
+/// (T5): one typed `freshAgent.create.failed` with the CLI's own sentence, never a
+/// `freshAgent.created` for a session that is already dead, and no sidecar is left
+/// behind. On both rigs: the simulator, and the pinned CLI itself.
+async fn a_resume_create_of_a_missing_conversation_fails_typed(kind: RigKind) {
+    let rig = ClaudeRig::start(kind).await;
+    let mut conn = rig.connect().await;
+    let missing = uuid::Uuid::new_v4().to_string();
+
+    let answer = conn
+        .request_create("create-missing", resume_fields(&missing))
+        .await;
+    assert_eq!(answer["type"], "freshAgent.create.failed", "{answer}");
+    assert_eq!(answer["code"], "CONVERSATION_NOT_FOUND", "{answer}");
+    assert_eq!(
+        answer["message"],
+        format!("No conversation found with session ID: {missing}"),
+        "{answer}"
+    );
+    if kind == RigKind::Sim {
+        wait_until_gone(query_pid(&rig, 1).await).await;
+    }
+
+    conn.read_for(QUIET).await;
+    assert!(
+        !conn
+            .frames
+            .iter()
+            .any(|v| v["type"] == "freshAgent.created" || v["type"] == "freshAgent.event"),
+        "nothing of the refused boot reaches the client; frames: {:?}",
+        conn.frames
+    );
+    assert!(!rig.fresh_claude.has_live_session(&missing).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_create_of_a_missing_conversation_fails_typed_and_leaves_no_sidecar() {
+    a_resume_create_of_a_missing_conversation_fails_typed(RigKind::Sim).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_create_of_a_missing_conversation_fails_typed_on_the_pinned_cli() {
+    a_resume_create_of_a_missing_conversation_fails_typed(RigKind::Cli).await;
+}
+
+/// A CLAUDE_CMD that is not the CLI fails the create (the pinned SDK cannot spawn
+/// it, so no request is ever made): a typed `freshAgent.create.failed` naming the
+/// path, not a `freshAgent.created` followed by the session's death.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claude_cmd_that_is_not_the_cli_fails_the_create_typed() {
+    let rig =
+        ClaudeRig::start_with_env(RigKind::Cli, &[("CLAUDE_CMD", "/nonexistent/claude")]).await;
+    let mut conn = rig.connect().await;
+
+    let answer = conn.request_create("create-bad-cmd", json!({})).await;
+    assert_eq!(answer["type"], "freshAgent.create.failed", "{answer}");
+    assert_eq!(answer["code"], "BOOT_FAILED", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("/nonexistent/claude")),
+        "the failure names the command: {answer}"
+    );
+    conn.read_for(QUIET).await;
+    assert!(
+        !conn
+            .frames
+            .iter()
+            .any(|v| v["type"] == "freshAgent.created" || v["type"] == "freshAgent.event"),
+        "frames: {:?}",
+        conn.frames
+    );
+}
+
+/// A resume create is answered only once the CLI booted the conversation (no prompt
+/// needed, T2), and `freshAgent.created` names the resumed conversation in
+/// `sessionRef`, so a caller learns the native identity without waiting for a turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_create_answers_created_with_its_session_ref_once_the_cli_booted() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
+    let mut conn = rig.connect().await;
+    let session_id = conn.create("create-1").await;
+    conn.send_text(&session_id, "send-1", "a turn to resume")
+        .await;
+    conn.wait_for_event("freshAgent.turn.complete").await;
+    let durable = durable_id(&conn, &session_id);
+    rig.wait_for_transcripts().await;
+    conn.kill(&session_id).await;
+
+    let answer = conn
+        .request_create("create-resume", resume_fields(&durable))
+        .await;
+    assert_eq!(answer["type"], "freshAgent.created", "{answer}");
+    // The simulated CLI records its boot before initializationResult() resolves.
+    let boots = rig.ledger_rows("boot");
+    assert_eq!(
+        boots.len(),
+        2,
+        "the resumed CLI booted before created: {boots:?}"
+    );
+    assert_eq!(boots[1]["sessionId"], durable.as_str(), "{boots:?}");
+    assert_eq!(
+        answer["sessionRef"],
+        json!({ "provider": "claude", "sessionId": durable }),
+        "{answer}"
+    );
+    assert!(rig.ledger_rows("prompt").len() == 1, "no prompt was needed");
 }

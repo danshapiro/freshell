@@ -384,9 +384,9 @@ describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
     return { home, frames, until, send }
   }
 
-  it('creates a session, runs a turn and reports its result through the unchanged sidecar protocol', async () => {
+  it('creates a session, runs a turn and reports its result through the sidecar protocol', async () => {
     const { home, frames, until, send } = await startSidecar()
-    send({ type: 'create', requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+    send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
     expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
     const sessionId = frames.find((f) => f.type === 'created').sessionId
     send({ type: 'send', sessionId, text: 'hello' })
@@ -399,11 +399,13 @@ describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
   it('FRESHELL_CLAUDE_SIM_STALL_STDIN makes the sidecar stop reading its stdin once the CLI has booted', async () => {
     for (const [stall, readsLaterLines] of [[undefined, true], ['boot', false]] as const) {
       const { home, frames, until, send } = await startSidecar(stall ? { FRESHELL_CLAUDE_SIM_STALL_STDIN: stall } : {})
-      send({ type: 'create', requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+      send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
       expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 300))
-      send({ type: 'create', requestId: 'r2', cwd: home.cwd, permissionMode: 'bypassPermissions' })
-      expect(await until(() => frames.some((f) => f.type === 'created' && f.requestId === 'r2'), 1500), `stall=${stall}`).toBe(readsLaterLines)
+      send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r2', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+      // One sidecar hosts one session, so a reading sidecar refuses the second
+      // create; any answer at all shows it read the line.
+      expect(await until(() => frames.some((f) => (f.type === 'created' || f.type === 'create.failed') && f.requestId === 'r2'), 1500), `stall=${stall}`).toBe(readsLaterLines)
     }
   })
 })

@@ -81,7 +81,7 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
   } else if (msg.type === 'interrupt') {
     const log = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
     if (log) fs.appendFileSync(log, `${msg.sessionId}\n`)

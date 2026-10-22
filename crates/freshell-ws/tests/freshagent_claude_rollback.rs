@@ -105,11 +105,11 @@ rl.on('line', (line) => {
     placeholderCounter += 1
     const sessionId = `fake-sidecar-${process.pid}-${placeholderCounter}`
     fs.mkdirSync(projDir, { recursive: true })
-    if (msg.forkSession === true) {
+    if (msg.boot?.kind === 'fork') {
       // Fork-at-point: NEW durable id, child file = the parent transcript's prefix.
-      const src = msg.resumeSessionId
+      const src = msg.boot?.resume
       let lines = readLines(src)
-      if (msg.resumeSessionAt) lines = prefixThrough(lines, msg.resumeSessionAt)
+      if (msg.boot?.resumeSessionAt) lines = prefixThrough(lines, msg.boot?.resumeSessionAt)
       cliId = mintCliId()
       turnCount = 0
       fs.writeFileSync(transcriptPath(cliId), lines.length ? `${lines.join('\n')}\n` : '')
@@ -118,7 +118,7 @@ rl.on('line', (line) => {
       turnCount = 0
       fs.writeFileSync(transcriptPath(cliId), '')
     }
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId: cliId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'send') {
@@ -921,16 +921,16 @@ async fn setup_and_undo_two_turn_conversation() -> (
     let creates = rig.create_lines();
     let fork_create = creates
         .iter()
-        .find(|l| l["forkSession"] == json!(true))
+        .find(|l| l["boot"]["kind"] == json!("fork"))
         .expect("fork create observed");
-    assert_eq!(fork_create["resumeSessionId"], json!(original));
+    assert_eq!(fork_create["boot"]["resume"], json!(original));
     assert_eq!(
-        fork_create["resumeSessionAt"],
+        fork_create["boot"]["resumeSessionAt"],
         json!("a1"),
         "keep prefix through a1"
     );
     assert_eq!(
-        fork_create["resumeDropsTurn"],
+        fork_create["boot"]["dropsTurn"],
         json!("u2"),
         "the guard is the first-to-discard turn's prompt uuid"
     );
@@ -1030,15 +1030,15 @@ async fn claude_redo_reforks_from_the_original_at_a_later_point() {
     let creates = rig.create_lines();
     let fork_creates: Vec<&Value> = creates
         .iter()
-        .filter(|l| l["forkSession"] == json!(true))
+        .filter(|l| l["boot"]["kind"] == json!("fork"))
         .collect();
     assert_eq!(fork_creates.len(), 2, "{creates:?}");
     let redo_create = fork_creates[1];
-    assert_eq!(redo_create["resumeSessionId"], json!(original));
-    assert_eq!(redo_create["resumeSessionAt"], json!("a2"));
-    assert_eq!(redo_create["forkSession"], json!(true));
+    assert_eq!(redo_create["boot"]["resume"], json!(original));
+    assert_eq!(redo_create["boot"]["resumeSessionAt"], json!("a2"));
+    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
     assert!(
-        redo_create.get("resumeDropsTurn").is_none(),
+        redo_create["boot"].get("dropsTurn").is_none(),
         "the guard is omitted when the discard range is empty (redo to the tip)"
     );
 
@@ -1108,17 +1108,11 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
         "the initial create + the rollback's FRESH create: {creates:?}"
     );
     let fresh_create = &creates[1];
-    for key in [
-        "resumeSessionId",
-        "resumeSessionAt",
-        "forkSession",
-        "resumeDropsTurn",
-    ] {
-        assert!(
-            fresh_create.get(key).is_none(),
-            "the fresh-conversation leg carries NO resume/fork keys ({key} absent): {fresh_create}"
-        );
-    }
+    assert_eq!(
+        fresh_create["boot"],
+        json!({ "kind": "fresh" }),
+        "the fresh-conversation leg boots a new conversation, with NO resume/fork keys: {fresh_create}"
+    );
 
     // The record retained the discarded session as the redo source.
     let rows = rollback_rows(&rig.ledger_dir());
@@ -1160,10 +1154,10 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
     let creates = rig.create_lines();
     assert_eq!(creates.len(), 3, "{creates:?}");
     let redo_create = &creates[2];
-    assert_eq!(redo_create["forkSession"], json!(true));
-    assert_eq!(redo_create["resumeSessionId"], json!(original));
+    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
+    assert_eq!(redo_create["boot"]["resume"], json!(original));
     assert_eq!(
-        redo_create["resumeSessionAt"],
+        redo_create["boot"]["resumeSessionAt"],
         json!("a1"),
         "the r3 boundary rule — resume at a1, NOT u1"
     );

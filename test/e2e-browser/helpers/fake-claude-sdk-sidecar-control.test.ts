@@ -510,7 +510,7 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
     return { sessionId: created.sessionId as string, cliSessionId: init.cliSessionId as string }
   }
 
-  it('forkSession create mints a fresh cliSessionId and seeds the transcript prefix (s2rk correction)', async () => {
+  it('a fork boot mints a fresh cliSessionId and seeds the transcript prefix (s2rk correction)', async () => {
     const fx = launch({ rules: [] })
     try {
       const { cliSessionId: ORIG } = await seedTwoTurns(fx)
@@ -523,16 +523,14 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
       expect(parentLines[1].parentUuid).toBe(parentLines[0].uuid)
       expect(parentLines[2].parentUuid).toBe(parentLines[1].uuid)
 
-      // Fork at a1 (keep through-and-including a1); the resumeDropsTurn guard
+      // Fork at a1 (keep through-and-including a1); the dropsTurn guard
       // is the RAW-chain successor of the resume point (u2).
       fx.send({
         type: 'create',
+        protocol: 2,
         requestId: 'req-fork',
         cwd: tmp,
-        resumeSessionId: ORIG,
-        resumeSessionAt: parentLines[1].uuid,
-        forkSession: true,
-        resumeDropsTurn: parentLines[2].uuid,
+        boot: { kind: 'fork', resume: ORIG, resumeSessionAt: parentLines[1].uuid, dropsTurn: parentLines[2].uuid },
       })
       const forkCreated = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-fork', 'created fork')
       const forkInit = await fx.waitLine(
@@ -551,7 +549,7 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
 
       // A follow-up plain-resume create still keeps ORIG (no same-id divergence
       // regression on the non-fork arm).
-      fx.send({ type: 'create', requestId: 'req-plain', cwd: tmp, resumeSessionId: ORIG })
+      fx.send({ type: 'create', protocol: 2, requestId: 'req-plain', cwd: tmp, boot: { kind: 'resume', resume: ORIG } })
       const plainCreated = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-plain', 'created plain resume')
       const plainInit = await fx.waitLine(
         (o) => o.type === 'sdk.session.init' && o.sessionId === plainCreated.sessionId,
@@ -563,11 +561,11 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
     }
   })
 
-  it('forkSession=false resume keeps the existing same-cliSessionId behavior', async () => {
+  it('a resume boot keeps the existing same-cliSessionId behavior', async () => {
     const fx = launch({ rules: [] })
     try {
       const { cliSessionId: ORIG } = await seedTwoTurns(fx)
-      fx.send({ type: 'create', requestId: 'req-resume', cwd: tmp, resumeSessionId: ORIG })
+      fx.send({ type: 'create', protocol: 2, requestId: 'req-resume', cwd: tmp, boot: { kind: 'resume', resume: ORIG } })
       const created = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-resume', 'created resume')
       const init = await fx.waitLine(
         (o) => o.type === 'sdk.session.init' && o.sessionId === created.sessionId,
@@ -586,7 +584,7 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
     }
   })
 
-  it('a resumeDropsTurn guard that is NOT the raw-chain successor of the resume point refuses with the SDK prefix', async () => {
+  it('a dropsTurn guard that is NOT the raw-chain successor of the resume point refuses with the SDK prefix', async () => {
     const fx = launch({ rules: [] })
     try {
       const { cliSessionId: ORIG } = await seedTwoTurns(fx)
@@ -595,16 +593,17 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
       // SDK's refused-completion contract (freshell retries once guard-less).
       fx.send({
         type: 'create',
+        protocol: 2,
         requestId: 'req-refused',
         cwd: tmp,
-        resumeSessionId: ORIG,
-        resumeSessionAt: parentLines[0].uuid,
-        forkSession: true,
-        resumeDropsTurn: parentLines[3].uuid, // a2 — NOT the successor of u1
+        // dropsTurn a2 — NOT the successor of u1
+        boot: { kind: 'fork', resume: ORIG, resumeSessionAt: parentLines[0].uuid, dropsTurn: parentLines[3].uuid },
       })
-      // The bridge placeholder `created` still lands (the real sidecar emits it
-      // immediately, before the SDK query runs — crates/freshell-claude-sidecar/
-      // index.mjs:278); the refusal surfaces on the wire AFTER it.
+      // This fake still reports the refusal after its placeholder `created`, the
+      // shape from before sidecar protocol v2 (the real sidecar now answers
+      // create.failed{FORK_GUARD_REFUSED} instead: test/unit/claude-sidecar/
+      // boot-handshake.test.ts); the server's rollback treats both as the guard
+      // refusal.
       await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-refused', 'created refused fork')
       const refusal = await fx.waitLine(
         (o) => typeof o?.message === 'string' && o.message.startsWith('Resume rejected by --resume-drops-turn:'),

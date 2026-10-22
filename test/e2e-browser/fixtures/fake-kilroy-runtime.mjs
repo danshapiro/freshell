@@ -5,9 +5,10 @@
 // doc comment lines 9-29) with kilroy flavour, so any harness that can drive a
 // fresh-agent claude/kilroy sidecar can drive this one deterministically:
 //
-//   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId}
+//   in : {"type":"create",protocol:2,requestId,cwd,model,permissionMode,effort,
+//         boot:{kind:'fresh'}|{kind:'resume',resume}}  (protocol v2, crates/freshell-claude-sidecar/boot.mjs)
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
-//   out: {"type":"created","requestId","sessionId"} FIRST (bare nanoid placeholder,
+//   out: {"type":"created","requestId","sessionId",protocol:2} FIRST (bare nanoid placeholder,
 //        read_created discards any earlier sdk.* line), then:
 //        sdk.session.init {sessionId,cliSessionId,model,cwd,tools:[]}
 //        sdk.session.snapshot {sessionId,messages}   (resume only)
@@ -125,11 +126,12 @@ rl.on('line', (line) => {
 async function handle(msg) {
   if (msg.type === 'create') {
     const sessionId = nanoid()
-    const cliSessionId = msg.resumeSessionId ?? CLI_SESSION_ID
+    const resumeSessionId = msg.boot?.resume
+    const cliSessionId = resumeSessionId ?? CLI_SESSION_ID
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, unifiedSessionState(cliSessionId, cwd))
     // `created` MUST be the first line written for this request.
-    emit({ type: 'created', requestId: msg.requestId, sessionId })
+    emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
     emit({
       type: 'sdk.session.init',
       sessionId,
@@ -138,7 +140,7 @@ async function handle(msg) {
       cwd,
       tools: [],
     })
-    if (msg.resumeSessionId) {
+    if (resumeSessionId) {
       emit({ type: 'sdk.session.snapshot', sessionId, messages: [] })
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })

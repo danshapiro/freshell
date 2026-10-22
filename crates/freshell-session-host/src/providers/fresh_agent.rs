@@ -148,6 +148,21 @@ impl HostedTransport {
         Self::new_with_context(provider, None).await
     }
 
+    /// A claude/kilroy transport whose sidecars get exactly `environment` (the
+    /// freshell-freshagent `test-support` seam): the real sidecar over a simulator.
+    #[cfg(test)]
+    async fn with_claude_sidecar_environment(
+        provider: FreshProvider,
+        environment: Vec<(String, String)>,
+    ) -> Arc<Self> {
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(1024);
+        let broadcast_tx = Arc::new(broadcast_tx);
+        let state = ProviderState::Claude(
+            FreshClaudeState::new(Arc::clone(&broadcast_tx)).with_sidecar_environment(environment),
+        );
+        Self::from_parts(provider, state, broadcast_rx)
+    }
+
     async fn new_with_context(
         provider: FreshProvider,
         context: Option<&ProviderLaunchContext>,
@@ -199,6 +214,15 @@ impl HostedTransport {
                 }
             }
         };
+        Self::from_parts(provider, state, broadcast_rx)
+    }
+
+    /// The transport around a provider `state` whose frames arrive on `broadcast_rx`.
+    fn from_parts(
+        provider: FreshProvider,
+        state: ProviderState,
+        broadcast_rx: broadcast::Receiver<String>,
+    ) -> Arc<Self> {
         let (created_tx, created_rx) = watch::channel(None);
         let (native_tx, native_rx) = watch::channel(None);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -1072,6 +1096,13 @@ fn spawn_broadcast_bridge(
         kill_outcomes,
         suppressed_kills,
     } = outputs;
+    // claude/kilroy: the native identity is announced once per distinct id
+    // (design §7.3). `freshAgent.created` names a resumed conversation (the CLI
+    // booted it before the sidecar answered); a fresh one is named by its first
+    // turn's init or by `materialized`. Every later turn's init repeats the same
+    // id and announces nothing.
+    let claude = matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy);
+    let mut announced: Option<String> = None;
     tokio::spawn(async move {
         let mut dropped = 0u64;
         loop {
@@ -1109,6 +1140,13 @@ fn spawn_broadcast_bridge(
             }
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.created") {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
+                    if claude {
+                        if let Some(native_id) = claude_session_ref_id(&value) {
+                            if !announce_native(&mut announced, native_id, &native, &events).await {
+                                break;
+                            }
+                        }
+                    }
                     let _ = created.send(Some(Ok(session_id.to_string())));
                     if matches!(provider, FreshProvider::Codex)
                         || (matches!(provider, FreshProvider::Opencode)
@@ -1121,15 +1159,21 @@ fn spawn_broadcast_bridge(
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.session.materialized")
             {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
-                    let _ = native.send(Some(session_id.to_string()));
-                    if events
-                        .send(AgentEvent::Started {
-                            native_session_id: session_id.to_string(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    if claude {
+                        if !announce_native(&mut announced, session_id, &native, &events).await {
+                            break;
+                        }
+                    } else {
+                        let _ = native.send(Some(session_id.to_string()));
+                        if events
+                            .send(AgentEvent::Started {
+                                native_session_id: session_id.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -1145,15 +1189,22 @@ fn spawn_broadcast_bridge(
                         .or_else(|| event.get("sessionId"))
                         .and_then(Value::as_str)
                     {
-                        let _ = native.send(Some(session_id.to_string()));
-                        if events
-                            .send(AgentEvent::Started {
-                                native_session_id: session_id.to_string(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        if claude {
+                            if !announce_native(&mut announced, session_id, &native, &events).await
+                            {
+                                break;
+                            }
+                        } else {
+                            let _ = native.send(Some(session_id.to_string()));
+                            if events
+                                .send(AgentEvent::Started {
+                                    native_session_id: session_id.to_string(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1199,6 +1250,37 @@ fn spawn_broadcast_bridge(
             }
         }
     });
+}
+
+/// The claude conversation a `freshAgent.created` names in its `sessionRef`.
+fn claude_session_ref_id(created: &Value) -> Option<&str> {
+    let reference = created.get("sessionRef")?;
+    (reference.get("provider").and_then(Value::as_str) == Some("claude"))
+        .then(|| reference.get("sessionId").and_then(Value::as_str))
+        .flatten()
+        .filter(|id| !id.is_empty())
+}
+
+/// Publish `native_id` as the session's native identity and send one
+/// `AgentEvent::Started` for it, unless it is the id last announced. False once
+/// the event receiver is gone.
+async fn announce_native(
+    announced: &mut Option<String>,
+    native_id: &str,
+    native: &watch::Sender<Option<String>>,
+    events: &mpsc::Sender<AgentEvent>,
+) -> bool {
+    if announced.as_deref() == Some(native_id) {
+        return true;
+    }
+    *announced = Some(native_id.to_string());
+    let _ = native.send(Some(native_id.to_string()));
+    events
+        .send(AgentEvent::Started {
+            native_session_id: native_id.to_string(),
+        })
+        .await
+        .is_ok()
 }
 
 fn parse_sandbox(value: &str) -> Option<freshell_protocol::Sandbox> {
@@ -1398,8 +1480,8 @@ lines.on('line', line=>{
   const req=JSON.parse(line);
   if(req.type==='create'){
     writeFileSync(process.env.FRESHELL_TEST_MCP_RECEIPT,JSON.stringify(req));
-    process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture'})+'\n');
-    if(req.model!=='deferred-identity')process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
+    process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture',protocol:2})+'\n');
+    if(req.model!=='deferred-identity')process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:req.boot?.resume??'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
   }
   if(req.type==='shutdown')process.exit(0);
 });
@@ -1457,15 +1539,19 @@ lines.on('line', line=>{
             let observed: Value =
                 serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
             transport.stop().await.unwrap();
-            let started = started.expect("Claude create cannot wait for the first model turn");
-            if expected_identity.is_some() {
-                assert!(
-                    started.is_err(),
-                    "an exact resume must reject a different actual native identity"
+            let started = started
+                .expect("Claude create cannot wait for the first model turn")
+                .unwrap();
+            if let Some(expected) = expected_identity {
+                // A resume is named by `created` (the sidecar answers it once the
+                // CLI booted that conversation), not by a later turn's init.
+                assert_eq!(started.native_session_id.as_deref(), Some(expected));
+                assert_eq!(
+                    observed["boot"],
+                    json!({ "kind": "resume", "resume": expected }),
+                    "the create boots the resumed conversation"
                 );
-                continue;
             }
-            let started = started.unwrap();
             if deferred_identity {
                 assert!(
                     started.native_session_id.is_none(),
@@ -1481,6 +1567,163 @@ lines.on('line', line=>{
                 "arbitrary MCP maps are never sent over private create IPC"
             );
         }
+    }
+
+    /// A hosted claude transport running the REAL sidecar over the CLI simulator
+    /// (`test/fixtures/claude-cli-sim/query.mjs`), with an isolated HOME whose
+    /// CLAUDE_CONFIG_DIR holds a transcript for each id in `conversations`.
+    struct SimulatedClaude {
+        root: tempfile::TempDir,
+        ledger: std::path::PathBuf,
+        transport: Arc<HostedTransport>,
+    }
+
+    impl SimulatedClaude {
+        async fn start(conversations: &[&str]) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let home = root.path().join("home");
+            let workspace = root.path().join("workspace");
+            let config = home.join(".claude");
+            let project = config.join("projects").join("-workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            for id in conversations {
+                let line = json!({ "type": "user", "uuid": format!("u-{id}"), "parentUuid": null,
+                    "sessionId": id, "cwd": workspace, "message": { "role": "user", "content": "hello" } });
+                std::fs::write(project.join(format!("{id}.jsonl")), format!("{line}\n")).unwrap();
+            }
+            let ledger = root.path().join("sim-ledger.jsonl");
+            let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
+            let environment = vec![
+                ("HOME".to_string(), text(&home)),
+                (
+                    "PATH".to_string(),
+                    std::env::var("PATH").unwrap_or_default(),
+                ),
+                ("LANG".to_string(), "C.UTF-8".to_string()),
+                ("CLAUDE_CONFIG_DIR".to_string(), text(&config)),
+                (
+                    "FRESHELL_CLAUDE_SDK_QUERY_MODULE".to_string(),
+                    text(&repo.join("test/fixtures/claude-cli-sim/query.mjs")),
+                ),
+                ("FRESHELL_CLAUDE_SIM_LEDGER".to_string(), text(&ledger)),
+            ];
+            let transport = HostedTransport::with_claude_sidecar_environment(
+                FreshProvider::Claude,
+                environment,
+            )
+            .await;
+            Self {
+                root,
+                ledger,
+                transport,
+            }
+        }
+
+        fn profile(&self, resume: Option<&str>) -> FreshAgentProfile {
+            FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "freshclaude".into(),
+                cwd: self.root.path().join("workspace").to_string_lossy().into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "owned-store".into(),
+                native_session_id: resume.map(str::to_owned),
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: vec![],
+            }
+        }
+
+        /// The simulator's ledger rows of one kind (`query`, `boot`, `prompt`, ...).
+        fn ledger_rows(&self, kind: &str) -> Vec<Value> {
+            std::fs::read_to_string(&self.ledger)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|row| row["kind"] == kind)
+                .collect()
+        }
+    }
+
+    /// The hosted claude resume `start` resolves from `freshAgent.created`'s
+    /// `sessionRef` (design §7.3): the sidecar answers `created` once the CLI booted
+    /// the conversation, so no prompt is needed. The bridge announces the native
+    /// identity once (a turn's init does not announce it again).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claude_resume_start_resolves_from_created_with_no_prompt() {
+        // The sidecar entry is resolved from this process's environment, which
+        // other tests here set: hold their lock.
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let conversation = "4b0e8f6a-1d2c-4e3f-9a5b-6c7d8e9f0a1b";
+        let claude = SimulatedClaude::start(&[conversation]).await;
+        let mut events = claude.transport.take_event_stream().expect("event stream");
+        let profile = claude.profile(Some(conversation));
+
+        let started =
+            tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+                .await
+                .expect("a claude resume start must not wait for a prompt")
+                .expect("the resume start succeeds");
+        assert_eq!(started.native_session_id.as_deref(), Some(conversation));
+        assert_eq!(
+            claude.ledger_rows("boot").len(),
+            1,
+            "the CLI booted the conversation"
+        );
+        assert!(
+            claude.ledger_rows("prompt").is_empty(),
+            "no prompt was needed"
+        );
+
+        // A turn's init names the same conversation: it is not announced again.
+        claude
+            .transport
+            .dispatch(
+                &RequestId::parse("resume-turn").unwrap(),
+                "hello again",
+                &profile,
+            )
+            .await
+            .expect("the send is accepted");
+        let mut announced = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::Started { native_session_id } => announced.push(native_session_id),
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.turn.complete" =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn completes");
+        assert_eq!(announced, vec![conversation.to_string()]);
+        Arc::clone(&claude.transport).stop().await.unwrap();
+    }
+
+    /// A hosted claude resume of a conversation the CLI does not have fails at start:
+    /// the boot is refused (`create.failed`), so no session is reported started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claude_resume_start_of_a_missing_conversation_fails() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let claude = SimulatedClaude::start(&[]).await;
+        let profile = claude.profile(Some("9c8b7a6f-5e4d-4c3b-8a2f-1e0d9c8b7a6f"));
+        let started =
+            tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+                .await
+                .expect("the refused boot answers promptly");
+        assert!(started.is_err(), "a refused resume boot fails the start");
+        Arc::clone(&claude.transport).stop().await.unwrap();
     }
 
     #[tokio::test]
