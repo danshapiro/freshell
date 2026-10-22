@@ -70,63 +70,55 @@ function playFallbackTone(ctxRef: { current: AudioContext | null }, onDone: () =
   }
 }
 
-export function useNotificationSound() {
-  const soundEnabled = useAppSelector((s) => s.settings.settings.notifications?.soundEnabled ?? true)
-  const audioContextRef = useRef<AudioContext | null>(null)
-  const queueLengthRef = useRef(0)
-  const ringingRef = useRef(false)
-  const drainRef = useRef<() => void>(() => {})
-  const activeWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+type RingAttempt = {
+  /** Arm the watchdog and play the chime. Call once. */
+  start: () => void
+  /** Silently stop tracking this ring (unmount): clears the watchdog and
+   * guarantees `onDone` never fires. Idempotent. */
+  dispose: () => void
+}
 
-  useEffect(() => {
-    return () => {
-      queueLengthRef.current = 0
-      ringingRef.current = false
-      if (activeWatchdogRef.current !== null) {
-        clearTimeout(activeWatchdogRef.current)
-        activeWatchdogRef.current = null
-      }
+/**
+ * One ring's lifecycle: play a fresh chime, substitute the fallback tone when
+ * the chime cannot play, and call `onDone` exactly once when the ring is over —
+ * on the chime's `ended`/`pause`, on the fallback tone's completion, when no
+ * completion signal can ever fire, or (backstop only) when RING_WATCHDOG_MS
+ * elapses without any of those.
+ */
+function createRingAttempt(ctxRef: { current: AudioContext | null }, onDone: () => void): RingAttempt {
+  let finished = false
+  // Arm the fallback at most once per ring — the chime can fail via the
+  // play() rejection AND a media `error`/`abort` event for the same dead ring.
+  let fallbackArmed = false
+  let watchdog: ReturnType<typeof setTimeout> | null = null
 
-      const ctx = audioContextRef.current
-      audioContextRef.current = null
-      if (ctx) {
-        void ctx.close().catch(() => {})
-      }
+  const settle = (notify: boolean) => {
+    if (finished) return
+    finished = true
+    if (watchdog !== null) {
+      clearTimeout(watchdog)
+      watchdog = null
     }
-  }, [])
+    if (notify) onDone()
+  }
+  const finish = () => settle(true)
 
-  const startRing = useCallback(() => {
-    let finished = false
-    let watchdog: ReturnType<typeof setTimeout> | null = null
-    const finish = () => {
-      if (finished) return
-      finished = true
-      if (watchdog !== null) {
-        clearTimeout(watchdog)
-        if (activeWatchdogRef.current === watchdog) activeWatchdogRef.current = null
-        watchdog = null
-      }
-      ringingRef.current = false
-      drainRef.current()
-    }
-    // Arm the fallback at most once per ring — the chime can fail via the
-    // play() rejection AND a media `error` event for the same dead ring.
-    let fallbackArmed = false
-    const armFallback = () => {
-      if (fallbackArmed) return
-      fallbackArmed = true
-      // A spurious `error` after a successful `ended` must not play an
-      // audible stray tone for the already-finished ring.
-      if (finished) return
-      if (!playFallbackTone(audioContextRef, finish)) finish()
-    }
+  const armFallback = () => {
+    if (fallbackArmed) return
+    fallbackArmed = true
+    // A spurious `error` after a successful `ended` must not play an
+    // audible stray tone for the already-finished ring.
+    if (finished) return
+    if (!playFallbackTone(ctxRef, finish)) finish()
+  }
 
+  const start = () => {
     watchdog = setTimeout(() => {
+      watchdog = null
       if (finished) return
       log.warn({ event: 'notification_ring_watchdog_fired', stage: fallbackArmed ? 'fallback' : 'chime' })
       finish()
     }, RING_WATCHDOG_MS)
-    activeWatchdogRef.current = watchdog
 
     try {
       // A FRESH Audio instance per ring — restarting one shared element would
@@ -135,8 +127,8 @@ export function useNotificationSound() {
       audio.preload = 'auto'
       audio.volume = 1
       audio.addEventListener('ended', finish, { once: true })
-      // Per the HTML spec a natural end fires `pause` then `ended`; an
-      // external pause (OS audio interruption) fires `pause` alone. Either way
+      // Per the HTML spec a natural end fires `pause` then `ended`; an external
+      // pause (e.g. an OS audio interruption) fires `pause` alone. Either way
       // the ring is over — `finish` is idempotent.
       audio.addEventListener('pause', finish, { once: true })
       audio.addEventListener('error', armFallback, { once: true })
@@ -149,15 +141,46 @@ export function useNotificationSound() {
     } catch {
       armFallback()
     }
+  }
+
+  return { start, dispose: () => settle(false) }
+}
+
+export function useNotificationSound() {
+  const soundEnabled = useAppSelector((s) => s.settings.settings.notifications?.soundEnabled ?? true)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const queueLengthRef = useRef(0)
+  const activeRingRef = useRef<RingAttempt | null>(null)
+  const drainRef = useRef<() => void>(() => {})
+
+  useEffect(() => {
+    return () => {
+      queueLengthRef.current = 0
+      const ring = activeRingRef.current
+      activeRingRef.current = null
+      ring?.dispose()
+
+      const ctx = audioContextRef.current
+      audioContextRef.current = null
+      if (ctx) {
+        void ctx.close().catch(() => {})
+      }
+    }
   }, [])
 
   const drain = useCallback(() => {
-    if (ringingRef.current) return
+    if (activeRingRef.current) return
     if (queueLengthRef.current <= 0) return
     queueLengthRef.current -= 1
-    ringingRef.current = true
-    startRing()
-  }, [startRing])
+    const ring = createRingAttempt(audioContextRef, () => {
+      if (activeRingRef.current === ring) activeRingRef.current = null
+      drainRef.current()
+    })
+    // Occupy the slot BEFORE starting: a ring that settles synchronously (no
+    // audio machinery) re-enters drain from inside start().
+    activeRingRef.current = ring
+    ring.start()
+  }, [])
 
   useEffect(() => {
     drainRef.current = drain
