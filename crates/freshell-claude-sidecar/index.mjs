@@ -87,7 +87,8 @@ import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity 
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
-import { cliStderrLogger, errorText, isHostedSidecar, log } from './log.mjs'
+import { cliStderrLogger, errorText, log } from './log.mjs'
+import { isHostedSidecar } from './hosted.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,

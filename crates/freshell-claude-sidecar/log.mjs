@@ -45,15 +45,6 @@ export function errorText(error) {
 }
 
 /**
- * Whether this sidecar runs inside a hosted session host. The host sets
- * FRESHELL_HOSTED_FRESH_AGENT to the provider it hosts, which for this
- * runtime is `claude` or `kilroy`; a hosted sidecar logs CLI output by size only.
- */
-export function isHostedSidecar(env = process.env) {
-  return Boolean(env.FRESHELL_HOSTED_FRESH_AGENT)
-}
-
-/**
  * The SDK's `stderr` callback: each chunk the CLI writes becomes one
  * `cli.stderr` info record. Its text is cut to CLI_STDERR_MAX_BYTES (a cut
  * record also carries the chunk's full size); a hosted sidecar records the

@@ -10,7 +10,7 @@
 // the real index.mjs running over the CLI simulator (harness.ts).
 
 import { describe, expect, it } from 'vitest'
-import { CLI_STDERR_MAX_BYTES, cliStderrLogger, createLog, errorText, isHostedSidecar } from '../../../crates/freshell-claude-sidecar/log.mjs'
+import { CLI_STDERR_MAX_BYTES, cliStderrLogger, createLog, errorText } from '../../../crates/freshell-claude-sidecar/log.mjs'
 import { startRealSidecar, type RealSidecar } from './harness'
 
 const SEVERITIES = ['debug', 'info', 'warn', 'error']
@@ -80,13 +80,6 @@ describe('log.mjs', () => {
     expect(errorText(new Error('nope'))).toBe('nope')
     expect(errorText('plain')).toBe('plain')
     expect(errorText(undefined)).toBe('undefined')
-  })
-
-  it('treats any FRESHELL_HOSTED_FRESH_AGENT value as a hosted sidecar (claude and kilroy alike)', () => {
-    expect(isHostedSidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })).toBe(true)
-    expect(isHostedSidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'kilroy' })).toBe(true)
-    expect(isHostedSidecar({ FRESHELL_HOSTED_FRESH_AGENT: '' })).toBe(false)
-    expect(isHostedSidecar({})).toBe(false)
   })
 
   it('logs CLI stderr at info, cut to 2 KiB with the full byte count', () => {

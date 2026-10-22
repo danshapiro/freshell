@@ -1,7 +1,8 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { managedSdkSpawn } from './exec-profile.mjs'
-import { cliStderrLogger, createLog, errorText, isHostedSidecar } from './log.mjs'
+import { cliStderrLogger, createLog, errorText } from './log.mjs'
+import { isHostedSidecar } from './hosted.mjs'
 
 const catalogLog = createLog('claude-model-catalog')
 
