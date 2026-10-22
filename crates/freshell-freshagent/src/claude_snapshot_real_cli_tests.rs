@@ -430,3 +430,53 @@ fn real_cli_snapshots_match_their_goldens_for_freshclaude_and_kilroy() {
         );
     }
 }
+
+#[test]
+fn native_history_shows_compaction_command_output_errors_and_image_placeholders() {
+    // The history-only reader streams the transcript through the same
+    // per-line projection (bounded retention, no cross-line folding).
+    let id = "62626262-6262-4262-8262-626262626262";
+    for provider in ["claude", "kilroy"] {
+        let compact = tempfile::tempdir().unwrap();
+        let store = stage_real_cli_store("compact-ok", id);
+        std::fs::rename(store.path(), compact.path().join(".claude")).unwrap();
+        let history = crate::native_history::read(provider, compact.path(), id).unwrap();
+        let turns = history["turns"].as_array().unwrap();
+        assert_eq!(
+            all_items(turns)
+                .iter()
+                .filter(|item| item["kind"] == "context_compaction")
+                .count(),
+            1,
+            "{provider}"
+        );
+        assert!(all_items(turns).iter().any(|item| item["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("Total cost:"))));
+        assert!(all_items(turns)
+            .iter()
+            .any(|item| item["text"] == json!("/compact keep it short")));
+
+        let failed = tempfile::tempdir().unwrap();
+        let store = stage_real_cli_store("compact-fail", id);
+        std::fs::rename(store.path(), failed.path().join(".claude")).unwrap();
+        let history = crate::native_history::read(provider, failed.path(), id).unwrap();
+        assert!(history["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|turn| turn["error"]["name"] == json!("CommandError")));
+
+        let image = tempfile::tempdir().unwrap();
+        let store = stage_real_cli_store("image", id);
+        std::fs::rename(store.path(), image.path().join(".claude")).unwrap();
+        let history = crate::native_history::read(provider, image.path(), id).unwrap();
+        let turns = history["turns"].as_array().unwrap();
+        assert!(all_items(turns)
+            .iter()
+            .any(|item| item["text"] == json!("[image]")));
+        assert!(!serde_json::to_string(turns)
+            .unwrap()
+            .contains("iVBORw0KGgo"));
+    }
+}
