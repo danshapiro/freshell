@@ -182,6 +182,52 @@ fn a_result_that_quotes_notification_tags_leaves_the_header_intact() {
     assert_eq!(item["durationMs"], json!(notified_duration(transcript)));
 }
 
+/// The agent-async notification with its `<tool-use-id>` line replaced.
+fn agent_async_notified_as(tool_use_id_line: &str) -> String {
+    let original = "<tool-use-id>toolu_agent1</tool-use-id>\n";
+    with_notification(real_cli_fixture!("agent-async"), |text| {
+        assert!(text.contains(original), "the fixture names the Agent call");
+        text.replace(original, tool_use_id_line)
+    })
+}
+
+#[test]
+fn a_notification_with_only_a_task_id_settles_the_delegation() {
+    // CLIs after 2.1.237 often send the completion with no <tool-use-id>;
+    // its <task-id> is the agentId the async_launched result reported.
+    let transcript = agent_async_notified_as("");
+    let item = delegation(&project(&transcript));
+    assert_eq!(item["status"], json!("completed"));
+    assert_eq!(item["result"], json!("SUBAGENT-DONE: file has two"));
+    assert_eq!(
+        item["durationMs"],
+        json!(notified_duration(real_cli_fixture!("agent-async")))
+    );
+}
+
+#[test]
+fn a_notification_naming_a_later_tool_call_settles_the_delegation_by_its_task_id() {
+    // Once SendMessage resumes an agent, its next notice names the
+    // SendMessage call rather than the Agent call that started it.
+    let transcript = agent_async_notified_as("<tool-use-id>toolu_sendmessage1</tool-use-id>\n");
+    let item = delegation(&project(&transcript));
+    assert_eq!(item["status"], json!("completed"));
+    assert_eq!(item["result"], json!("SUBAGENT-DONE: file has two"));
+}
+
+#[test]
+fn a_notification_for_another_task_settles_no_delegation() {
+    // A background Bash command notifies too, under its own task id.
+    let transcript = with_notification(&agent_async_notified_as(""), |text| {
+        let agent_task = "<task-id>ad5d9947c890769da</task-id>";
+        assert!(text.contains(agent_task), "the fixture names its agent");
+        text.replace(agent_task, "<task-id>b627srltu</task-id>")
+    });
+    let item = delegation(&project(&transcript));
+    assert_eq!(item["status"], json!("running"));
+    assert!(item.get("result").is_none());
+}
+
 #[test]
 fn a_failed_agent_projects_a_failed_delegation_with_the_error() {
     let transcript = real_cli_fixture!("agent-failed");

@@ -6,7 +6,8 @@
 //! - a subagent delegation (`Agent` on the wire, `Task` in older CLIs) becomes
 //!   one `task_delegation` item that absorbs its tool result (so the client
 //!   never shows an orphan "Result" row) and, for a background agent, the
-//!   later `<task-notification>` line (CLI 2.1.237 F6);
+//!   later `<task-notification>` line (CLI 2.1.237 F6), matched by its
+//!   `<tool-use-id>` or else by its `<task-id>` (the subagent's `agentId`);
 //! - a line the CLI re-appends under an already-projected uuid (during a
 //!   compaction it writes the last message again, just before the
 //!   `system/compact_boundary` line) projects once;
@@ -129,6 +130,11 @@ pub(crate) struct ClaudeTranscriptProjector {
     turns: Vec<Value>,
     /// Delegation items by the tool_use id that started them.
     delegations: HashMap<String, ItemLocation>,
+    /// Delegation items by the subagent's `agentId` (from its tool result).
+    /// A completion notice's `<task-id>` names it: CLIs after 2.1.237 often
+    /// omit `<tool-use-id>`, or name the SendMessage call that resumed the
+    /// agent instead of the Agent call that started it.
+    delegations_by_agent: HashMap<String, ItemLocation>,
     /// Every uuid that already produced (or was folded into) a turn.
     projected_uuids: HashSet<String>,
     /// `system/compact_boundary` uuids, to tell whether a compaction recap
@@ -176,6 +182,7 @@ impl ClaudeTranscriptProjector {
             thread_id: thread_id.to_string(),
             turns: Vec::new(),
             delegations: HashMap::new(),
+            delegations_by_agent: HashMap::new(),
             projected_uuids: HashSet::new(),
             compact_boundaries: HashSet::new(),
             edit_calls: HashMap::new(),
@@ -480,9 +487,17 @@ impl ClaudeTranscriptProjector {
             false
         });
         let changed = items.len() != before;
+        let agent_id = structured
+            .and_then(|s| s.get("agentId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
         for (location, result) in absorbed {
             if let Some(delegation) = self.item_mut(location) {
                 apply_delegation_result(delegation, &result, structured);
+            }
+            if let Some(agent_id) = agent_id {
+                self.delegations_by_agent
+                    .insert(agent_id.to_string(), location);
             }
             self.refresh_turn_summary(location.turn);
         }
@@ -493,10 +508,16 @@ impl ClaudeTranscriptProjector {
     fn fold_task_notification(&mut self, line: &Value) {
         let text = notification_text(line);
         let notice = TaskNotification::parse(&text);
-        let Some(tool_use_id) = notice.tool_use_id() else {
-            return;
-        };
-        let Some(location) = self.delegations.get(tool_use_id).copied() else {
+        let location = notice
+            .tool_use_id()
+            .and_then(|id| self.delegations.get(id))
+            .or_else(|| {
+                notice
+                    .task_id()
+                    .and_then(|id| self.delegations_by_agent.get(id))
+            })
+            .copied();
+        let Some(location) = location else {
             return;
         };
         let Some(delegation) = self.item_mut(location) else {
@@ -768,6 +789,10 @@ impl<'a> TaskNotification<'a> {
 
     fn tool_use_id(&self) -> Option<&'a str> {
         first_tag(self.header, "tool-use-id")
+    }
+
+    fn task_id(&self) -> Option<&'a str> {
+        first_tag(self.header, "task-id")
     }
 
     fn status(&self) -> Option<&'a str> {
