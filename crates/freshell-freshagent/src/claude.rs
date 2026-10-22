@@ -9531,8 +9531,9 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         // provider-originated cancellation).
         "sdk.question.cancelled" => "freshAgent.question.cancelled",
         "sdk.status" => "freshAgent.status",
-        "sdk.turn.complete" => "freshAgent.turn.complete",
-        "sdk.turn.waiting" => "freshAgent.turn.waiting",
+        // `sdk.turn.complete` / `sdk.turn.waiting` are deliberately absent: the
+        // consumer routes them to `emit_attention_edge` (AttentionEdge), the one
+        // logged edge exit, so no other path can broadcast an edge.
         "sdk.error" => "freshAgent.error",
         "sdk.exit" => "freshAgent.exit",
         "sdk.killed" => "freshAgent.killed",
@@ -11172,14 +11173,10 @@ pub(crate) mod tests {
         );
         assert_eq!(normalize_sdk_type("sdk.stream"), Some("freshAgent.stream"));
         assert_eq!(normalize_sdk_type("sdk.result"), Some("freshAgent.result"));
-        assert_eq!(
-            normalize_sdk_type("sdk.turn.complete"),
-            Some("freshAgent.turn.complete")
-        );
-        assert_eq!(
-            normalize_sdk_type("sdk.turn.waiting"),
-            Some("freshAgent.turn.waiting")
-        );
+        // The attention edges are not renamed here: the stdout consumer hands
+        // them to `emit_attention_edge`, the one edge exit (G14, design §9.2 I-1).
+        assert_eq!(normalize_sdk_type("sdk.turn.complete"), None);
+        assert_eq!(normalize_sdk_type("sdk.turn.waiting"), None);
         // Task 2 (g): the pending-state family is forwarded too — including
         // sdk.question.cancelled (fresh-eyes round-3 F3 REPLACED the earlier "keep it
         // dropped" plan: the client folds freshAgent.question.cancelled into
@@ -11232,16 +11229,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn turn_complete_frame_carries_the_success_edge() {
-        // The sidecar's unified turn-complete attention edge (minted for EVERY
-        // result subtype except a user-interrupted turn's own), normalized to
-        // freshAgent.turn.complete.
-        let line = json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 });
-        let frame = sdk_line_to_frame(&line, "s-1", "freshclaude").unwrap();
-        let wire: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(wire["type"], "freshAgent.event");
-        assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
-        assert_eq!(wire["event"]["at"], 42);
+    fn attention_edge_lines_leave_only_through_the_edge_exit() {
+        // The sidecar's attention edges are classified as edges, and the plain
+        // frame mapping refuses them: only `emit_attention_edge` (logged, G14)
+        // can put a freshAgent.turn.complete / turn.waiting on the wire. Its
+        // frame shape is pinned by
+        // `emit_attention_edge_logs_each_edge_and_broadcasts_its_frame`.
+        for (line, edge) in [
+            (
+                json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 }),
+                AttentionEdge::TurnComplete,
+            ),
+            (
+                json!({ "type": "sdk.turn.waiting", "sessionId": "s-1", "at": 43 }),
+                AttentionEdge::Waiting,
+            ),
+        ] {
+            let line_type = line["type"].as_str().unwrap();
+            assert_eq!(AttentionEdge::from_sidecar_type(line_type), Some(edge));
+            assert!(
+                sdk_line_to_frame(&line, "s-1", "freshclaude").is_none(),
+                "{line_type} must not become a plain frame"
+            );
+        }
     }
 
     /// G14 / design §9.2 I-1: every claude attention edge leaves through
@@ -11385,29 +11395,27 @@ pub(crate) mod tests {
             json!({ "type": "sdk.assistant", "sessionId": "s", "content": [{ "type": "text", "text": "part" }] }),
             // …process is SIGKILLed here — stdout ends. NO sdk.result, NO sdk.turn.complete.
         ];
-        let frames: Vec<Value> = death_stream
+        // The consumer's per-line split: an edge line goes to the edge exit,
+        // anything else through the plain frame mapping.
+        let edge_of = |line: &Value| AttentionEdge::from_sidecar_type(line["type"].as_str()?);
+        let edges: Vec<AttentionEdge> = death_stream.iter().filter_map(edge_of).collect();
+        assert!(
+            edges.is_empty(),
+            "a death-truncated stream must never yield an attention edge, got {edges:?}"
+        );
+        let inner_types: Vec<String> = death_stream
             .iter()
             .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude"))
-            .map(|f| serde_json::from_str(&f).unwrap())
-            .collect();
-        let inner_types: Vec<&str> = frames
-            .iter()
-            .map(|f| f["event"]["type"].as_str().unwrap())
+            .map(|f| serde_json::from_str::<Value>(&f).unwrap()["event"]["type"].to_string())
             .collect();
         assert!(
-            !inner_types.contains(&"freshAgent.turn.complete"),
+            !inner_types.iter().any(|t| t.contains("turn.complete")),
             "a death-truncated stream must never yield a completion chime, got {inner_types:?}"
         );
         // And a subsequent success stream DOES complete — the edge is real, not disabled.
-        let ok = sdk_line_to_frame(
-            &json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 }),
-            "s",
-            "freshclaude",
-        )
-        .unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&ok).unwrap()["event"]["type"],
-            "freshAgent.turn.complete"
+            edge_of(&json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 })),
+            Some(AttentionEdge::TurnComplete)
         );
     }
 
