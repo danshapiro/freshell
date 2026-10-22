@@ -220,6 +220,37 @@ pub fn locate_transcript_state(session_id: &str) -> TranscriptLocation {
     locate_transcript_state_in(&claude_home_candidates(), session_id)
 }
 
+/// [`locate_transcript_state`] over explicit roots: the first hit wins;
+/// otherwise the first root error makes the answer Unreadable; only an
+/// all-clean miss is Absent; no roots at all is `Unreadable(NoStoreRoot)`.
+pub(crate) fn locate_transcript_state_in(
+    roots: &[PathBuf],
+    session_id: &str,
+) -> TranscriptLocation {
+    if roots.is_empty() {
+        return TranscriptLocation::Unreadable(LocateError::NoStoreRoot);
+    }
+    let mut first_error: Option<LocateError> = None;
+    for root in roots {
+        match find_transcript_state(root, session_id) {
+            TranscriptLocation::Found(path) => return TranscriptLocation::Found(path),
+            TranscriptLocation::Absent => {}
+            TranscriptLocation::Unreadable(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(TranscriptLocation::Absent, TranscriptLocation::Unreadable)
+}
+
+/// Found-only view of [`locate_transcript_state`] for DISPLAY callers
+/// (`claude_can_redo_now`: an unreadable original reads as "no redo now").
+/// Anything that decides "this session is gone" must match the three-state
+/// [`locate_transcript_state`] instead.
+pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
+    locate_transcript_state(session_id).found()
+}
+
 /// One structured warn per "cannot check" decision (G28): which caller, the
 /// session, the failing store root and the io error kind -- never transcript
 /// contents. Callers then answer transiently instead of "lost".
@@ -259,37 +290,6 @@ pub(crate) fn unreadable_rollback_refusal(
         "INTERNAL_ERROR",
         &format!("claude transcript store unreadable: {}", error.kind_label()),
     )
-}
-
-/// [`locate_transcript_state`] over explicit roots: the first hit wins;
-/// otherwise the first root error makes the answer Unreadable; only an
-/// all-clean miss is Absent; no roots at all is `Unreadable(NoStoreRoot)`.
-pub(crate) fn locate_transcript_state_in(
-    roots: &[PathBuf],
-    session_id: &str,
-) -> TranscriptLocation {
-    if roots.is_empty() {
-        return TranscriptLocation::Unreadable(LocateError::NoStoreRoot);
-    }
-    let mut first_error: Option<LocateError> = None;
-    for root in roots {
-        match find_transcript_state(root, session_id) {
-            TranscriptLocation::Found(path) => return TranscriptLocation::Found(path),
-            TranscriptLocation::Absent => {}
-            TranscriptLocation::Unreadable(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-    first_error.map_or(TranscriptLocation::Absent, TranscriptLocation::Unreadable)
-}
-
-/// Found-only view of [`locate_transcript_state`] for DISPLAY callers
-/// (`claude_can_redo_now`: an unreadable original reads as "no redo now").
-/// Anything that decides "this session is gone" must match the three-state
-/// [`locate_transcript_state`] instead.
-pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
-    locate_transcript_state(session_id).found()
 }
 
 /// Unified agent names (Task 2): a located transcript PLUS the routing
@@ -418,57 +418,62 @@ pub(crate) fn find_transcript_state(claude_home: &Path, session_id: &str) -> Tra
         return TranscriptLocation::Absent;
     }
     let filename = format!("{session_id}.jsonl");
-    let dirs = match read_subdirs_sorted_or_empty(&claude_home.join("projects")) {
-        Ok(dirs) => dirs,
-        Err(e) => return TranscriptLocation::Unreadable(LocateError::io(claude_home, &e)),
-    };
-    let mut first_error: Option<LocateError> = None;
+    let mut first_error: Option<std::io::Error> = None;
     let mut remember = |e: std::io::Error| {
-        first_error.get_or_insert_with(|| LocateError::io(claude_home, &e));
+        first_error.get_or_insert(e);
     };
-    for dir in &dirs {
-        match candidate_is_file(&dir.join(&filename)) {
-            Ok(true) => return TranscriptLocation::Found(dir.join(&filename)),
-            Ok(false) => {}
-            Err(e) => remember(e),
+    for dir in subdirs_sorted(&claude_home.join("projects"), &mut remember) {
+        let direct = dir.join(&filename);
+        if is_file_or_remember(&direct, &mut remember) {
+            return TranscriptLocation::Found(direct);
         }
-        let subdirs = match read_subdirs_sorted_or_empty(dir) {
-            Ok(subdirs) => subdirs,
-            Err(e) => {
-                remember(e);
-                continue;
-            }
-        };
-        for sub in &subdirs {
-            let candidate = sub.join(&filename);
-            match candidate_is_file(&candidate) {
-                Ok(true) => return TranscriptLocation::Found(candidate),
-                Ok(false) => {}
-                Err(e) => remember(e),
+        for sub in subdirs_sorted(&dir, &mut remember) {
+            let nested = sub.join(&filename);
+            if is_file_or_remember(&nested, &mut remember) {
+                return TranscriptLocation::Found(nested);
             }
         }
     }
-    first_error.map_or(TranscriptLocation::Absent, TranscriptLocation::Unreadable)
+    match first_error {
+        Some(e) => TranscriptLocation::Unreadable(LocateError::io(claude_home, &e)),
+        None => TranscriptLocation::Absent,
+    }
 }
 
 /// Sorted child DIRECTORIES of `dir` -- the historic [`find_transcript`]
 /// filter (`DirEntry::file_type`, which does not follow symlinks). Expected
-/// absence reads as an empty listing; any other error propagates.
-fn read_subdirs_sorted_or_empty(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+/// absence reads as an empty listing; any other error -- opening `dir` or
+/// reading one entry -- goes to `remember` and the readable entries are
+/// still returned.
+fn subdirs_sorted(dir: &Path, remember: &mut impl FnMut(std::io::Error)) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if is_expected_absence(&e) => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+        Err(e) => {
+            if !is_expected_absence(&e) {
+                remember(e);
+            }
+            return Vec::new();
+        }
     };
     let mut out: Vec<PathBuf> = Vec::new();
     for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            out.push(entry.path());
+        match entry.and_then(|entry| Ok((entry.file_type()?, entry.path()))) {
+            Ok((file_type, path)) if file_type.is_dir() => out.push(path),
+            Ok(_) => {}
+            Err(e) => remember(e),
         }
     }
     out.sort();
-    Ok(out)
+    out
+}
+
+/// [`candidate_is_file`] with its non-absence error handed to `remember`
+/// (a miss for this candidate; the scan goes on).
+fn is_file_or_remember(path: &Path, remember: &mut impl FnMut(std::io::Error)) -> bool {
+    candidate_is_file(path).unwrap_or_else(|e| {
+        remember(e);
+        false
+    })
 }
 
 /// Error-AWARE variant of [`locate_transcript`] for the resolve endpoint's
