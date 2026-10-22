@@ -3,7 +3,9 @@
 // keepAt, ...), and uuids the CLI minted itself become "cli".
 //
 // The contract suite (claude-cli-contract.test.ts) reads the labelled trace of
-// the real CLI and asserts the T1-T19 facts.
+// the real CLI and asserts the T1-T19 facts; the conformance suite
+// (claude-cli-conformance.test.ts) compares the simulator's normalized trace
+// with the real one (claude-cli-normalize.ts).
 
 import { spawn } from 'node:child_process'
 import path from 'node:path'
@@ -13,7 +15,7 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 export const REPO_ROOT = path.resolve(here, '../../..')
 export const SCENARIO_RUNNER = path.join(here, 'claude-cli-scenarios.mjs')
 
-export type Target = 'real'
+export type Target = 'real' | 'sim'
 
 export interface TraceEvent {
   t: number

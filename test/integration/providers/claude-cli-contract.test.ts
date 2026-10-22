@@ -288,13 +288,13 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(results(r, 'S')).toEqual([])
     const thrown = at(events, (e) => e.k === 'throw')
     expect(events.slice(thrown + 1).filter((e) => e.k === 'msg')).toEqual([])
-    expect(r.observations.afterCrash).toMatchObject({ results: 0, nodeAlive: true })
+    expect(r.observations.afterCrash).toEqual({ messagesAfterThrow: 0, results: 0, nodeAlive: true })
   }, SCENARIO_TIMEOUT)
 
   it('T15: /compact is one command with one result: compacting, then null with compact_result, then compact_boundary, then the result; a failed compaction also ends in one result', async () => {
     const r = await real('compact')
     const events = eventsOf(r, 'S')
-    for (const [uuid, outcome] of [['u3', 'failed'], ['u4', 'success']] as const) {
+    for (const [uuid, outcome] of [['u3', 'success'], ['u5', 'failed']] as const) {
       const started = at(events, isMsg(isLifecycle(uuid, 'started')))
       const completed = at(events, isMsg(isLifecycle(uuid, 'completed')))
       const statuses = between(events, started, completed, (m) => m.type === 'system' && m.subtype === 'status')

@@ -1,0 +1,262 @@
+// @vitest-environment node
+//
+// The CLI simulator's own features that have no real-CLI counterpart to
+// compare against: scenario programs (FRESHELL_CLAUDE_SIM_PROGRAM and its
+// aliases), the options ledger, and the sidecar seam it plugs into. The
+// behavior it shares with the real CLI is covered by
+// claude-cli-conformance.test.ts.
+
+import { spawn, type ChildProcess } from 'node:child_process'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import readline from 'node:readline'
+import { afterEach, describe, expect, it } from 'vitest'
+import { query } from '../../fixtures/claude-cli-sim/query.mjs'
+import { REPO_ROOT } from './claude-cli-trace'
+
+const SIDECAR = path.join(REPO_ROOT, 'crates/freshell-claude-sidecar/index.mjs')
+const SIM = path.join(REPO_ROOT, 'test/fixtures/claude-cli-sim/query.mjs')
+const cleanups: Array<() => Promise<void> | void> = []
+
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+})
+
+async function tempHome() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-claude-sim-'))
+  cleanups.push(() => fs.rm(root, { recursive: true, force: true }))
+  const cwd = path.join(root, 'workspace')
+  await fs.mkdir(cwd, { recursive: true })
+  return { root, cwd, env: { HOME: root, CLAUDE_CONFIG_DIR: path.join(root, '.claude'), PATH: process.env.PATH ?? '/usr/bin:/bin', CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' } }
+}
+
+function input() {
+  const queue: any[] = []
+  let waiting: ((value: IteratorResult<any>) => void) | null = null
+  return {
+    push(text: string, uuid?: string) {
+      const message = { type: 'user', message: { role: 'user', content: [{ type: 'text', text }] }, parent_tool_use_id: null, session_id: 'default', ...(uuid ? { uuid } : {}) }
+      if (waiting) {
+        const resolve = waiting
+        waiting = null
+        resolve({ value: message, done: false })
+      } else {
+        queue.push(message)
+      }
+    },
+    [Symbol.asyncIterator]() {
+      return { next: () => (queue.length ? Promise.resolve({ value: queue.shift(), done: false }) : new Promise<IteratorResult<any>>((resolve) => { waiting = resolve })) }
+    },
+  }
+}
+
+/** Open a simulated session that records every message; `until` resolves on the first match. */
+async function open(options: Record<string, unknown>, env: Record<string, string> = {}) {
+  const home = await tempHome()
+  const prompt = input()
+  const q: any = query({ prompt, options: { cwd: home.cwd, env: { ...home.env, ...env }, includePartialMessages: false, permissionMode: 'bypassPermissions', ...options } })
+  const messages: any[] = []
+  let ended: { error?: string } | null = null
+  const listeners = new Set<() => void>()
+  const done = (async () => {
+    try {
+      for await (const message of q) {
+        messages.push(message)
+        for (const listener of [...listeners]) listener()
+      }
+      ended = {}
+    } catch (error) {
+      ended = { error: String((error as Error).message) }
+    }
+    for (const listener of [...listeners]) listener()
+  })()
+  cleanups.push(async () => {
+    q.close()
+    await done
+  })
+  const until = (predicate: () => boolean, ms = 10_000) => new Promise<void>((resolve, reject) => {
+    if (predicate()) return resolve()
+    const timer = setTimeout(() => reject(new Error(`timed out; messages=${JSON.stringify(messages.map((m) => [m.type, m.subtype, m.state]))}`)), ms)
+    const check = () => {
+      if (!predicate()) return
+      clearTimeout(timer)
+      listeners.delete(check)
+      resolve()
+    }
+    listeners.add(check)
+  })
+  return { q, prompt, messages, until, home, get ended() { return ended } }
+}
+
+const program = (rules: unknown[]) => ({ FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify({ rules }), FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+const results = (messages: any[]) => messages.filter((m) => m.type === 'result')
+
+describe('Claude CLI simulator programs', () => {
+  it('a matching prompt rule replaces the marker behavior: a question goes through canUseTool and the answer ends the turn', async () => {
+    const calls: any[] = []
+    const s = await open({
+      canUseTool: async (toolName: string, toolInput: any, options: any) => {
+        calls.push({ toolName, toolInput, keys: Object.keys(options).sort() })
+        return { behavior: 'allow', updatedInput: { ...toolInput, answers: { 'Pick one': 'A' } } }
+      },
+    }, program([{ on: 'msg:prompt', match: { text: 'please ask' }, emit: [{ kind: 'question', data: { questions: [{ question: 'Pick one', header: 'Choice', options: [{ label: 'A', description: 'a' }], multiSelect: false }] } }] }]))
+    s.prompt.push('please ask', '11111111-1111-4111-8111-111111111111')
+    await s.until(() => s.messages.some((m) => m.subtype === 'session_state_changed' && m.state === 'idle'))
+    expect(calls).toEqual([{ toolName: 'AskUserQuestion', toolInput: { questions: [expect.objectContaining({ question: 'Pick one' })] }, keys: ['displayName', 'requestId', 'signal', 'toolUseID'] }])
+    expect(s.messages.filter((m) => m.subtype === 'session_state_changed').map((m) => m.state)).toEqual(['running', 'requires_action', 'running', 'idle'])
+    const toolResult = s.messages.find((m) => m.type === 'user' && m.message?.content?.[0]?.type === 'tool_result')
+    expect(toolResult.message.content[0].content).toContain('"Pick one":"A"')
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'success', is_error: false, terminal_reason: 'completed' })
+  })
+
+  it('an approval asks canUseTool even in bypass mode, forwarding suggestions, blockedPath and decisionReason; a denial is recorded on the result', async () => {
+    const suggestions = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test' }], behavior: 'allow', destination: 'session' }]
+    const seen: any[] = []
+    const s = await open({
+      canUseTool: async (_toolName: string, _input: any, options: any) => {
+        seen.push(options)
+        return { behavior: 'deny', message: 'no thanks' }
+      },
+    }, program([{ on: 'msg:prompt', emit: [{ kind: 'approval', data: { tool: 'Bash', input: { command: 'npm test' }, suggestions, blockedPath: '/tmp/blocked', decisionReason: 'needs approval' } }] }]))
+    s.prompt.push('run the tests')
+    await s.until(() => results(s.messages).length === 1)
+    expect(seen[0]).toMatchObject({ suggestions, blockedPath: '/tmp/blocked', decisionReason: 'needs approval', displayName: 'Bash' })
+    const toolResult = s.messages.find((m) => m.type === 'user' && m.message?.content?.[0]?.type === 'tool_result')
+    expect(toolResult.message.content[0]).toMatchObject({ is_error: true, content: 'no thanks' })
+    expect(results(s.messages)[0].permission_denials).toEqual([expect.objectContaining({ tool_name: 'Bash', tool_input: { command: 'npm test' } })])
+  })
+
+  it('a completion rule ends the turn with the scripted subtype; a `once` rule then falls back to the prompt markers', async () => {
+    const s = await open({}, program([{ on: 'msg:prompt', once: true, emit: [{ kind: 'text', data: { text: 'partial' } }, { kind: 'completion', data: { subtype: 'error_max_turns', text: 'too many turns' } }] }]))
+    s.prompt.push('first')
+    await s.until(() => results(s.messages).length === 1)
+    s.prompt.push('APIERR:529')
+    await s.until(() => results(s.messages).length === 2)
+    const [first, second] = results(s.messages)
+    expect(first).toMatchObject({ subtype: 'error_max_turns', is_error: true, errors: ['too many turns'] })
+    expect(second).toMatchObject({ subtype: 'success', is_error: true, terminal_reason: 'api_error', api_error_status: 529 })
+  })
+
+  it('a crash rule kills the stand-in CLI: the stream throws the SDK\'s termination error and no result arrives', async () => {
+    const killed = await open({}, program([{ on: 'msg:prompt', emit: [{ kind: 'crash' }] }]))
+    killed.prompt.push('go')
+    await killed.until(() => killed.ended !== null)
+    expect(killed.ended).toEqual({ error: 'Claude Code process terminated by signal SIGKILL' })
+    expect(results(killed.messages)).toEqual([])
+
+    const exited = await open({}, program([{ on: 'msg:prompt', emit: [{ kind: 'crash', data: { code: 3 } }] }]))
+    exited.prompt.push('go')
+    await exited.until(() => exited.ended !== null)
+    expect(exited.ended).toEqual({ error: 'Claude Code process exited with code 3' })
+  })
+
+  it('a hang rule keeps the turn open until an interrupt aborts it', async () => {
+    const s = await open({}, program([{ on: 'msg:prompt', emit: [{ kind: 'hang' }] }]))
+    s.prompt.push('wait forever', '22222222-2222-4222-8222-222222222222')
+    await s.until(() => s.messages.some((m) => m.type === 'user' && m.isReplay))
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(results(s.messages)).toEqual([])
+    await expect(s.q.interrupt()).resolves.toEqual({ still_queued: [] })
+    await s.until(() => results(s.messages).length === 1)
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
+    await s.until(() => s.messages.some((m) => m.type === 'command_lifecycle' && m.state === 'cancelled'))
+  })
+
+  it('a start rule can schedule a CLI-initiated turn: init and a result with no lifecycle, bracketed by running and idle', async () => {
+    const s = await open({}, program([{ on: 'start', emit: [{ kind: 'cli_turn', data: { afterMs: 50 } }] }]))
+    await s.until(() => results(s.messages).length === 1)
+    await s.until(() => s.messages.some((m) => m.subtype === 'session_state_changed' && m.state === 'idle'))
+    expect(s.messages.map((m) => m.subtype ?? m.type)).toEqual(expect.arrayContaining(['task_notification', 'init', 'success']))
+    expect(s.messages.filter((m) => m.type === 'command_lifecycle')).toEqual([])
+    expect(s.messages.filter((m) => m.subtype === 'session_state_changed').map((m) => m.state)).toEqual(['running', 'idle'])
+  })
+
+  it('loads the program from a file or from the FRESHELL_CLAUDE_SDK_SCRIPT alias, and rejects an unknown emission kind', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sim-program-'))
+    cleanups.push(() => fs.rm(dir, { recursive: true, force: true }))
+    const file = path.join(dir, 'program.json')
+    await fs.writeFile(file, JSON.stringify({ rules: [{ on: 'msg:prompt', emit: [{ kind: 'completion', data: { subtype: 'error_during_execution', text: 'from file' } }] }] }))
+    for (const env of [{ FRESHELL_CLAUDE_SIM_PROGRAM_FILE: file }, { FRESHELL_CLAUDE_SDK_SCRIPT: file }]) {
+      const s = await open({}, { ...env, FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+      s.prompt.push('anything')
+      await s.until(() => results(s.messages).length === 1)
+      expect(results(s.messages)[0]).toMatchObject({ subtype: 'error_during_execution', errors: ['from file'] })
+    }
+    const home = await tempHome()
+    expect(() => query({ prompt: input(), options: { cwd: home.cwd, env: { ...home.env, FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify({ rules: [{ on: 'msg:prompt', emit: [{ kind: 'teleport' }] }] }) } } })).toThrow(/Unknown simulator emission kind "teleport"/)
+  })
+
+  it('records each query() call\'s options in FRESHELL_CLAUDE_SIM_LEDGER, with env reduced to its key names', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sim-ledger-'))
+    cleanups.push(() => fs.rm(dir, { recursive: true, force: true }))
+    const ledger = path.join(dir, 'ledger.jsonl')
+    await open({ model: 'claude-test-model', plugins: [{ type: 'local', path: '/plugins/one' }], mcpServers: { freshell: { type: 'stdio', command: 'node' } } }, { FRESHELL_CLAUDE_SIM_LEDGER: ledger, ANTHROPIC_API_KEY: 'secret-value' })
+    const rows = (await fs.readFile(ledger, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    expect(rows[0]).toMatchObject({ kind: 'query', options: { model: 'claude-test-model', plugins: [{ type: 'local', path: '/plugins/one' }], mcpServers: { freshell: { type: 'stdio', command: 'node' } } } })
+    expect(rows[0].options.envKeys).toContain('ANTHROPIC_API_KEY')
+    expect(JSON.stringify(rows)).not.toContain('secret-value')
+  })
+})
+
+describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)', () => {
+  const children: ChildProcess[] = []
+  afterEach(() => {
+    for (const child of children.splice(0)) child.kill('SIGKILL')
+  })
+
+  async function startSidecar(env: Record<string, string> = {}) {
+    const home = await tempHome()
+    const child = spawn(process.execPath, [SIDECAR], {
+      cwd: home.cwd,
+      env: { ...home.env, FRESHELL_CLAUDE_SDK_QUERY_MODULE: SIM, FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1', ...env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    children.push(child)
+    const frames: any[] = []
+    const waiters = new Set<() => void>()
+    readline.createInterface({ input: child.stdout! }).on('line', (line) => {
+      frames.push(JSON.parse(line))
+      for (const waiter of [...waiters]) waiter()
+    })
+    const until = (predicate: () => boolean, ms = 10_000) => new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        waiters.delete(check)
+        resolve(false)
+      }, ms)
+      const check = () => {
+        if (!predicate()) return
+        clearTimeout(timer)
+        waiters.delete(check)
+        resolve(true)
+      }
+      waiters.add(check)
+      check()
+    })
+    const send = (message: unknown) => child.stdin!.write(`${JSON.stringify(message)}\n`)
+    return { home, frames, until, send }
+  }
+
+  it('creates a session, runs a turn and reports its result through the unchanged sidecar protocol', async () => {
+    const { home, frames, until, send } = await startSidecar()
+    send({ type: 'create', requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+    expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
+    const sessionId = frames.find((f) => f.type === 'created').sessionId
+    send({ type: 'send', sessionId, text: 'hello' })
+    expect(await until(() => frames.some((f) => f.type === 'sdk.turn.complete'))).toBe(true)
+    expect(frames.find((f) => f.type === 'sdk.session.init')).toMatchObject({ sessionId, cliSessionId: expect.stringMatching(/^[0-9a-f-]{36}$/) })
+    expect(frames.find((f) => f.type === 'sdk.result')).toMatchObject({ sessionId, result: 'success' })
+    expect(frames.find((f) => f.type === 'sdk.assistant')?.content).toEqual([{ type: 'text', text: 'ok' }])
+  })
+
+  it('FRESHELL_CLAUDE_SIM_STALL_STDIN makes the sidecar stop reading its stdin once the CLI has booted', async () => {
+    for (const [stall, readsLaterLines] of [[undefined, true], ['boot', false]] as const) {
+      const { home, frames, until, send } = await startSidecar(stall ? { FRESHELL_CLAUDE_SIM_STALL_STDIN: stall } : {})
+      send({ type: 'create', requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+      expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      send({ type: 'create', requestId: 'r2', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+      expect(await until(() => frames.some((f) => f.type === 'created' && f.requestId === 'r2'), 1500), `stall=${stall}`).toBe(readsLaterLines)
+    }
+  })
+})

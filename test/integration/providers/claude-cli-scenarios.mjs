@@ -1,13 +1,19 @@
-// Scenario runner for the Claude CLI contract suite (claude-cli-contract.test.ts).
+// Scenario runner for the Claude CLI contract and conformance suites.
 //
-//   node claude-cli-scenarios.mjs real <scenario>
+//   node claude-cli-scenarios.mjs <real|sim> <scenario>
 //
 // Each scenario drives one target through the SDK `query()` surface the
 // sidecar uses and prints ONE JSON line: the recorded trace (every SDK
 // message, push, interrupt receipt and stream end, in arrival order, with
 // relative times) plus scenario observations (files on disk, boot results).
-// The target is the pinned SDK 0.3.237 + bundled CLI 2.1.237 against the
-// loopback provider in claude-local-provider.mjs (never the real API).
+//
+//   real  the pinned SDK 0.3.237 + bundled CLI 2.1.237 against the loopback
+//         provider in claude-local-provider.mjs (never the real API)
+//   sim   the CLI simulator, test/fixtures/claude-cli-sim/query.mjs, loaded
+//         the way the sidecar loads it (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
+//
+// The same scenario code runs on both targets, so their traces can be
+// compared after normalization (claude-cli-normalize.ts).
 
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
@@ -24,6 +30,7 @@ import {
 } from './claude-local-provider.mjs'
 import { HANG_MCP_SERVER_NAME } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
 
+export const SIM_QUERY_MODULE = path.join(DEFAULT_REPO_ROOT, 'test/fixtures/claude-cli-sim/query.mjs')
 const SESSION_STATE_ENV = { CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -107,7 +114,7 @@ function createInput() {
 }
 
 class Session {
-  constructor(ctx, label, { options = {}, env = {} } = {}) {
+  constructor(ctx, label, { options = {}, env = {}, permissions } = {}) {
     this.ctx = ctx
     this.label = label
     this.frames = []
@@ -134,6 +141,7 @@ class Session {
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         stderr: (data) => { self.stderr.push(String(data)) },
+        ...(permissions ? { canUseTool: (toolName, input, opts) => self.canUseTool(permissions, toolName, input, opts) } : {}),
         spawnClaudeCodeProcess(spawnOptions) {
           const child = spawn(spawnOptions.command, spawnOptions.args, {
             cwd: spawnOptions.cwd,
@@ -168,6 +176,15 @@ class Session {
       }
       for (const listener of [...this.listeners]) listener(null)
     })()
+  }
+
+  /** Record a permission request, then answer it with `decide(toolName, input, options)`. */
+  async canUseTool(decide, toolName, input, options) {
+    const { signal, ...rest } = options ?? {}
+    this.ctx.trace.add({ s: this.label, k: 'can-use-tool', toolName, input: trimDeep(input), options: trimDeep(rest), aborted: signal?.aborted === true })
+    const decision = await decide(toolName, input, options)
+    this.ctx.trace.add({ s: this.label, k: 'can-use-tool-answered', toolName, behavior: decision.behavior })
+    return decision
   }
 
   /** Push a user prompt stamped with a fresh uuid registered under `label`. */
@@ -494,25 +511,28 @@ const SCENARIOS = {
     })
     s.push('SLOW kill me', 'u1')
     await Promise.race([s.done, sleep(15_000)])
+    const atThrow = s.frames.length
     s.push('after crash', 'u2')
     await sleep(1500)
-    ctx.observe('afterCrash', { messages: s.frames.length, results: s.results().length, nodeAlive: true })
+    ctx.observe('afterCrash', { messagesAfterThrow: s.frames.length - atThrow, results: s.results().length, nodeAlive: true })
     await s.close()
   },
 
-  /** T15: a failed /compact (the summary request errors) and a successful one, one result each. */
+  /** T15: a successful /compact, then a failed one (the summary request errors), one result each. */
   async compact(ctx) {
     const s = ctx.open('S')
     s.push('seed one', 'u1')
     await s.waitForResults(1)
     s.push('seed two', 'u2')
     await s.waitForResults(2)
-    s.push('/compact APIERR:400', 'u3')
+    s.push('/compact', 'u3')
     await s.waitForResults(3, 30_000)
     await s.waitForCount(isStateIdle, 3, 5000, 'idle')
-    await sleep(800)
-    s.push('/compact', 'u4')
-    await s.waitForResults(4, 30_000)
+    s.push('after compact', 'u4')
+    await s.waitForResults(4)
+    await s.waitForCount(isStateIdle, 4, 5000, 'idle')
+    s.push('/compact APIERR:400', 'u5')
+    await s.waitForResults(5, 30_000)
     await sleep(1500)
     await s.close()
   },
@@ -574,6 +594,27 @@ const SCENARIOS = {
     await s.close()
   },
 
+  /** canUseTool in default mode (allow, then deny), then ExitPlanMode in plan mode. */
+  async permission(ctx) {
+    const s = ctx.open('S', {
+      options: { permissionMode: 'default' },
+      permissions: (toolName, input) => (ctx.denyNext
+        ? { behavior: 'deny', message: 'denied by the scenario' }
+        : { behavior: 'allow', updatedInput: input }),
+    })
+    s.push('TOOL:touch', 'u1')
+    await s.waitForResults(1, 30_000)
+    ctx.denyNext = true
+    s.push('TOOL:touch', 'u2')
+    await s.waitForResults(2, 30_000)
+    ctx.denyNext = false
+    await s.call('setPermissionMode', 'plan')
+    s.push('PLAN:exit', 'u3')
+    await s.waitForResults(3, 30_000)
+    await sleep(500)
+    await s.close()
+  },
+
   /** T19: a background Agent's completion starts a CLI-initiated turn with no uuid and no lifecycle. */
   async 'cli-turn'(ctx) {
     const s = ctx.open('S')
@@ -594,6 +635,10 @@ async function loadTarget(target, repoRoot) {
     const pinned = await resolvePinnedClaude(repoRoot)
     const sdk = await import(pathToFileURL(pinned.sdkEntry).href)
     return { query: sdk.query, nativeCli: pinned.nativeCli, versions: { sdk: pinned.sdkVersion, cli: pinned.cliVersion } }
+  }
+  if (target === 'sim') {
+    const sim = await import(pathToFileURL(SIM_QUERY_MODULE).href)
+    return { query: sim.query, nativeCli: undefined, versions: { sim: sim.SIMULATED_CLI_VERSION } }
   }
   throw new Error(`unknown target ${target}`)
 }
@@ -682,12 +727,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   process.on('unhandledRejection', (error) => {
     process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-cli-scenarios', event: 'unhandled_rejection', message: String(error?.message ?? error).slice(0, 300) })}\n`)
   })
+  // A large result on a pipe is written asynchronously: exit only once it is flushed.
+  const finish = (stream, text, code) => stream.write(text, () => process.exit(code))
   try {
     const result = await runScenario(target, name)
-    process.stdout.write(`${JSON.stringify(result)}\n`)
-    process.exit(0)
+    finish(process.stdout, `${JSON.stringify(result)}\n`, 0)
   } catch (error) {
-    process.stderr.write(`${JSON.stringify({ severity: 'error', component: 'claude-cli-scenarios', event: 'scenario_failed', target, scenario: name, message: String(error?.message ?? error) })}\n`)
-    process.exit(1)
+    finish(process.stderr, `${JSON.stringify({ severity: 'error', component: 'claude-cli-scenarios', event: 'scenario_failed', target, scenario: name, message: String(error?.message ?? error) })}\n`, 1)
   }
 }

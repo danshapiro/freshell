@@ -23,7 +23,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { parsePromptMarkers, SUBAGENT_MARKER, HANG_MCP_QUALIFIED_TOOL } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
+import { parsePromptMarkers, SUBAGENT_MARKER, HANG_MCP_QUALIFIED_TOOL, PLAN_TEXT } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
 
 export const PINNED_SDK_VERSION = '0.3.237'
 export const PINNED_CLI_VERSION = '2.1.237'
@@ -293,9 +293,11 @@ export async function startLocalProvider({ replyText = 'ok' } = {}) {
     }
 
     if (marker.kind === 'tool') {
-      toolUse('Bash', { command: marker.command, description: 'local provider sleep', ...(marker.timeoutMs ? { timeout: marker.timeoutMs } : {}) })
+      toolUse('Bash', { command: marker.command, description: 'local provider command', ...(marker.timeoutMs ? { timeout: marker.timeoutMs } : {}) })
     } else if (marker.kind === 'mcp_hang') {
       toolUse(HANG_MCP_QUALIFIED_TOOL, {})
+    } else if (marker.kind === 'exit_plan') {
+      toolUse('ExitPlanMode', { plan: PLAN_TEXT })
     } else if (marker.kind === 'agent_async') {
       const agentTool = tools.find((name) => name === 'Agent' || name === 'Task') ?? 'Agent'
       toolUse(agentTool, {
