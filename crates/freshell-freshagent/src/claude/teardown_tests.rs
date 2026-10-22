@@ -8,7 +8,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
 
-use crate::claude_spawn::SIDECAR_GRACEFUL_EXIT;
+use crate::claude_spawn::{SERVER_STOP_GRACE, SIDECAR_GRACEFUL_EXIT};
 
 /// Honors the protocol like `index.mjs`: the shutdown line exits 0.
 const FAKE_HONORS_SHUTDOWN: &str = r#"
@@ -262,8 +262,12 @@ async fn teardown_of_a_sidecar_that_crashes_on_its_way_down_is_logged_as_abnorma
     assert_eq!(fields.get("exit_code").map(String::as_str), Some("1"));
 }
 
+/// The server's whole stop (WS drain, terminals, every provider's sidecars,
+/// the codex launch manager, the layout flush) must finish inside a 5 s hard
+/// ceiling (`SHUTDOWN_HARD_TIMEOUT` in freshell-server), so wedged claude
+/// sidecars may not take a whole session grace period of it.
 #[tokio::test]
-async fn server_shutdown_stops_every_session_concurrently_within_one_grace_period() {
+async fn server_shutdown_stops_every_session_concurrently_within_its_share_of_the_stop_budget() {
     let (events, _guard) = capture::install();
     let dir = tempfile::tempdir().unwrap();
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
@@ -280,12 +284,13 @@ async fn server_shutdown_stops_every_session_concurrently_within_one_grace_perio
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed >= SIDECAR_GRACEFUL_EXIT,
-        "each sidecar got its grace period: {elapsed:?}"
+        elapsed >= SERVER_STOP_GRACE,
+        "each sidecar got the server-stop grace period before any signal: {elapsed:?}"
     );
     assert!(
-        elapsed < SIDECAR_GRACEFUL_EXIT * 2,
-        "three wedged sidecars cost about one grace period, not three: {elapsed:?}"
+        elapsed < SIDECAR_GRACEFUL_EXIT,
+        "three wedged sidecars cost one server-stop grace period, not three, and less \
+         than a session's: {elapsed:?}"
     );
     assert!(state.sessions.lock().await.is_empty());
     let logged = capture::teardown_events(&events);

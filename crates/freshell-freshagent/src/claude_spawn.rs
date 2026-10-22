@@ -50,6 +50,14 @@ use tokio::time::Instant;
 /// fifteen times the measured graceful exit).
 pub const SIDECAR_GRACEFUL_EXIT: Duration = Duration::from_secs(2);
 
+/// The grace period when the whole server stops. Its stop (WS drain,
+/// terminals, every provider's sidecars, the codex launch manager, the
+/// layout flush) must finish inside freshell-server's 5 s hard ceiling
+/// (`SHUTDOWN_HARD_TIMEOUT`), so the claude sidecars get half a session's
+/// grace: still about forty times the measured graceful exit, and the real
+/// sidecar's SIGTERM handler is the same graceful stop.
+pub const SERVER_STOP_GRACE: Duration = Duration::from_secs(1);
+
 /// The ownership tag a sidecar and its claude CLI grandchild carry (the codex
 /// analog is `FRESHELL_CODEX_SIDECAR_ID`); the Linux `/proc` reaper keys on
 /// it, and the SDK's clean env passes it through to the CLI.

@@ -3514,9 +3514,10 @@ async fn main() -> ExitCode {
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.
     fresh_codex_state.shutdown().await;
-    // Reap every owned claude Node sidecar (SIGTERM → it kills its own claude CLI via the
-    // SDK abort → SIGKILL straggler + `/proc` ownership sweep) so a freshclaude T2 run
-    // leaves no orphaned sidecar or claude CLI grandchild.
+    // Stop every owned claude Node sidecar, all at once: the shutdown line (its SDK abort
+    // stops the claude CLI), then, after `claude_spawn::SERVER_STOP_GRACE` (1 s, sized to
+    // fit SHUTDOWN_HARD_TIMEOUT), SIGTERM → SIGKILL to its process tree, then the `/proc`
+    // ownership sweep, so a freshclaude T2 run leaves no orphaned sidecar or claude CLI.
     fresh_claude_state.shutdown().await;
     // DEV-0006 S4 + Task 10 retention: stop accepting codex managed-launch plans
     // (mirrors legacy's close-time `codexLaunchPlanner.shutdown()` among the shutdown

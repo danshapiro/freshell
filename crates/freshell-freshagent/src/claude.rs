@@ -1830,10 +1830,12 @@ impl FreshClaudeState {
 
     /// Stop every owned claude sidecar through [`teardown_removed_session`]
     /// (the shutdown request, then escalation only after the grace period,
-    /// then the tree reap), all sessions CONCURRENTLY so a server stop costs
-    /// about one grace period rather than one per session. Called on server
-    /// shutdown.
+    /// then the tree reap), all sessions CONCURRENTLY with the server-stop
+    /// grace ([`crate::claude_spawn::SERVER_STOP_GRACE`]), so wedged
+    /// sidecars cost one short grace period of the server's bounded stop
+    /// rather than one session grace per session. Called on server shutdown.
     pub async fn shutdown(&self) {
+        use tracing::instrument::WithSubscriber;
         let drained: Vec<ClaudeSession> = {
             let mut guard = self.sessions.lock().await;
             guard.drain().map(|(_, s)| s).collect()
@@ -1841,12 +1843,29 @@ impl FreshClaudeState {
         let confirm_rounds = self
             .handoff_confirm_rounds
             .unwrap_or(TREE_DEATH_CONFIRM_ROUNDS);
-        futures_util::future::join_all(
-            drained
-                .into_iter()
-                .map(|session| teardown_removed_session(session, confirm_rounds)),
-        )
-        .await;
+        // One task per session: each teardown's synchronous `/proc` scans run
+        // on the runtime's workers in parallel, so no session's shutdown
+        // line waits behind another session's scan.
+        let teardowns = drained.into_iter().map(|session| {
+            tokio::spawn(
+                teardown_removed_session_within(
+                    session,
+                    confirm_rounds,
+                    crate::claude_spawn::SERVER_STOP_GRACE,
+                )
+                .with_current_subscriber(),
+            )
+        });
+        for outcome in futures_util::future::join_all(teardowns).await {
+            if let Err(error) = outcome {
+                tracing::error!(target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.shutdown_teardown_failed",
+                    cause = %error,
+                    "a claude sidecar teardown failed at server stop; its tree guard's drop \
+                     still kills the process tree"
+                );
+            }
+        }
         self.cli_index.lock().await.clear();
     }
 
@@ -10090,6 +10109,21 @@ async fn teardown_removed_session(
     session: ClaudeSession,
     confirm_rounds: u8,
 ) -> TeardownConfirmation {
+    teardown_removed_session_within(
+        session,
+        confirm_rounds,
+        crate::claude_spawn::SIDECAR_GRACEFUL_EXIT,
+    )
+    .await
+}
+
+/// [`teardown_removed_session`] with an explicit grace period (server stop
+/// passes the shorter [`crate::claude_spawn::SERVER_STOP_GRACE`]).
+async fn teardown_removed_session_within(
+    session: ClaudeSession,
+    confirm_rounds: u8,
+    grace: Duration,
+) -> TeardownConfirmation {
     let started = std::time::Instant::now();
     let mut tree = capture_owned_claude_tree(&session.ownership_id, session.child.id());
     session.consumer.abort();
@@ -10102,7 +10136,7 @@ async fn teardown_removed_session(
         session.child,
         session.stdin,
         session.tree_guard,
-        crate::claude_spawn::SIDECAR_GRACEFUL_EXIT,
+        grace,
     )
     .await;
     reap_owned_claude_sidecars(&session.ownership_id);
