@@ -492,7 +492,8 @@ impl ClaudeTranscriptProjector {
     /// `<task-notification>` (background agent finished): settle the delegation.
     fn fold_task_notification(&mut self, line: &Value) {
         let text = notification_text(line);
-        let Some(tool_use_id) = xml_tag(&text, "tool-use-id") else {
+        let notice = TaskNotification::parse(&text);
+        let Some(tool_use_id) = notice.tool_use_id() else {
             return;
         };
         let Some(location) = self.delegations.get(tool_use_id).copied() else {
@@ -501,15 +502,15 @@ impl ClaudeTranscriptProjector {
         let Some(delegation) = self.item_mut(location) else {
             return;
         };
-        let status = match xml_tag(&text, "status") {
+        let status = match notice.status() {
             Some("completed") | None => "completed",
             Some(_) => "failed",
         };
         delegation["status"] = json!(status);
-        if let Some(result) = xml_tag(&text, "result").filter(|r| !r.is_empty()) {
+        if let Some(result) = notice.result.filter(|r| !r.is_empty()) {
             delegation["result"] = json!(result);
         }
-        if let Some(ms) = xml_tag(&text, "duration_ms").and_then(|ms| ms.parse::<u64>().ok()) {
+        if let Some(ms) = notice.duration_ms() {
             delegation["durationMs"] = json!(ms);
         }
         self.refresh_turn_summary(location.turn);
@@ -733,14 +734,58 @@ fn notification_text(line: &Value) -> String {
     }
 }
 
-/// The trimmed text of the first `<tag>…</tag>` (the closing tag is matched
-/// last-first so a result that itself mentions the tag stays whole).
-fn xml_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+/// A `<task-notification>`, split into its three regions: the header tags
+/// (`task-id`, `tool-use-id`, `status`, …), the agent's free-text `<result>`,
+/// and the `<usage>` trailer. The result may quote any tag (an agent reading
+/// logs or XML), so header tags are read only before `<result>` and trailer
+/// tags only after the last `</result>`.
+struct TaskNotification<'a> {
+    header: &'a str,
+    result: Option<&'a str>,
+    trailer: &'a str,
+}
+
+impl<'a> TaskNotification<'a> {
+    fn parse(text: &'a str) -> Self {
+        const OPEN: &str = "<result>";
+        const CLOSE: &str = "</result>";
+        if let (Some(open), Some(close)) = (text.find(OPEN), text.rfind(CLOSE)) {
+            let start = open + OPEN.len();
+            if close >= start {
+                return Self {
+                    header: &text[..open],
+                    result: Some(text[start..close].trim()),
+                    trailer: &text[close + CLOSE.len()..],
+                };
+            }
+        }
+        Self {
+            header: text,
+            result: None,
+            trailer: text,
+        }
+    }
+
+    fn tool_use_id(&self) -> Option<&'a str> {
+        first_tag(self.header, "tool-use-id")
+    }
+
+    fn status(&self) -> Option<&'a str> {
+        first_tag(self.header, "status")
+    }
+
+    fn duration_ms(&self) -> Option<u64> {
+        first_tag(self.trailer, "duration_ms")?.parse().ok()
+    }
+}
+
+/// The trimmed text of the first `<tag>…</tag>` in `text`.
+fn first_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = text.find(&open)? + open.len();
-    let end = text.rfind(&close)?;
-    (end >= start).then(|| text[start..end].trim())
+    let end = start + text[start..].find(&close)?;
+    Some(text[start..end].trim())
 }
 
 #[cfg(test)]

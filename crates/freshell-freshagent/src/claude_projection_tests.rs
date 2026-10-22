@@ -104,11 +104,6 @@ fn a_delegation_whose_result_has_not_landed_is_running() {
 #[test]
 fn a_background_agent_runs_until_its_task_notification_completes_it() {
     let transcript = real_cli_fixture!("agent-async");
-    let notification = fixture_lines(transcript)
-        .into_iter()
-        .find(|line| line["origin"]["kind"] == "task-notification")
-        .unwrap();
-    let notification_text = message_text(&notification);
 
     // Launched, notification not yet written: background + running.
     let launched = prefix_before(transcript, |line| {
@@ -129,20 +124,62 @@ fn a_background_agent_runs_until_its_task_notification_completes_it() {
     // The notification completes it with the agent's result and duration.
     let turns = project(transcript);
     let item = delegation(&turns);
-    let duration: u64 = notification_text
-        .split("<duration_ms>")
-        .nth(1)
-        .and_then(|rest| rest.split("</duration_ms>").next())
-        .and_then(|ms| ms.parse().ok())
-        .expect("fixture notification carries duration_ms");
     assert_eq!(item["status"], json!("completed"));
     assert_eq!(item["background"], json!(true));
     assert_eq!(item["result"], json!("SUBAGENT-DONE: file has two"));
-    assert_eq!(item["durationMs"], json!(duration));
+    assert_eq!(item["durationMs"], json!(notified_duration(transcript)));
     // The unsolicited follow-up answer still renders.
     assert!(all_items(&turns)
         .iter()
         .any(|item| item["text"] == json!("The background check finished.")));
+}
+
+/// `transcript` with each task-notification line's XML rewritten (every
+/// other line kept byte-for-byte).
+fn with_notification(transcript: &str, rewrite: impl Fn(&str) -> String) -> String {
+    transcript
+        .lines()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(line).unwrap();
+            if value["origin"]["kind"] != "task-notification" {
+                return format!("{line}\n");
+            }
+            let text = value["message"]["content"].as_str().unwrap().to_string();
+            value["message"]["content"] = json!(rewrite(&text));
+            format!("{value}\n")
+        })
+        .collect()
+}
+
+/// The `<duration_ms>` the fixture's own notification reports.
+fn notified_duration(transcript: &str) -> u64 {
+    let notification = fixture_lines(transcript)
+        .into_iter()
+        .find(|line| line["origin"]["kind"] == "task-notification")
+        .unwrap();
+    message_text(&notification)
+        .split("<duration_ms>")
+        .nth(1)
+        .and_then(|rest| rest.split("</duration_ms>").next())
+        .and_then(|ms| ms.parse().ok())
+        .expect("fixture notification carries duration_ms")
+}
+
+#[test]
+fn a_result_that_quotes_notification_tags_leaves_the_header_intact() {
+    // The agent's free-text result sits between the header tags and the
+    // usage trailer, and may quote any of them (an agent reading logs/XML).
+    let transcript = real_cli_fixture!("agent-async");
+    let quoted = "the log shows <status>failed</status> for \
+                  <tool-use-id>toolu_other</tool-use-id> after \
+                  <duration_ms>9</duration_ms>";
+    let rewritten = with_notification(transcript, |text| {
+        text.replace("SUBAGENT-DONE: file has two", quoted)
+    });
+    let item = delegation(&project(&rewritten));
+    assert_eq!(item["status"], json!("completed"));
+    assert_eq!(item["result"], json!(quoted));
+    assert_eq!(item["durationMs"], json!(notified_duration(transcript)));
 }
 
 #[test]
