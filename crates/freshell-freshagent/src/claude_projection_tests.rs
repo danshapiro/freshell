@@ -323,8 +323,11 @@ fn subagent_transcript(scenario: &str) -> String {
 struct MapSubagents(std::collections::HashMap<String, String>);
 
 impl SubagentSource for MapSubagents {
-    fn transcript_for(&self, tool_use_id: &str) -> Option<String> {
-        self.0.get(tool_use_id).cloned()
+    fn summary_for(&self, tool_use_id: &str) -> Option<std::sync::Arc<SubagentSummary>> {
+        let transcript = self.0.get(tool_use_id)?;
+        Some(std::sync::Arc::new(SubagentSummary::from_transcript(
+            transcript,
+        )))
     }
 }
 
@@ -444,6 +447,127 @@ fn delegation_activity_previews_read_claude_tool_inputs() {
         "/w/n.ipynb"
     );
     assert_eq!(preview("Mystery", &json!({ "a": 1 })), r#"{"a":1}"#);
+}
+
+// ── Subagent summaries are cached by file identity ────────────────────────
+
+/// A private copy of a scenario's transcript and its subagent files.
+fn staged_scenario(scenario: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("session.jsonl");
+    std::fs::copy(fixture_path(&format!("{scenario}/session.jsonl")), &session).unwrap();
+    let subagents = dir.path().join("session/subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    for entry in std::fs::read_dir(fixture_path(&format!("{scenario}/session/subagents")))
+        .unwrap()
+        .flatten()
+    {
+        std::fs::copy(entry.path(), subagents.join(entry.file_name())).unwrap();
+    }
+    (dir, session)
+}
+
+/// The staged session's one subagent transcript.
+fn staged_subagent_file(session: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(session.with_extension("").join("subagents"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap()
+}
+
+/// Rewrite `path` in place to same-length text and put its mtime back, so
+/// its identity (inode, length, mtime) is unchanged.
+fn rewrite_keeping_identity(path: &std::path::Path, from: &str, to: &str) {
+    use std::io::Write;
+    assert_eq!(from.len(), to.len());
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains(from));
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all(text.replace(from, to).as_bytes()).unwrap();
+    file.set_modified(modified).unwrap();
+}
+
+fn first_activity(transcript: &str, subagents: &dyn SubagentSource) -> Value {
+    delegation(&project_with(transcript, subagents))["activity"][0].clone()
+}
+
+#[test]
+fn an_unchanged_subagent_file_is_not_parsed_again() {
+    // Every snapshot GET re-projects; a finished subagent's file never
+    // changes, so its summary is reused instead of re-reading the file.
+    let (_dir, session) = staged_scenario("agent-async");
+    let transcript = real_cli_fixture!("agent-async");
+    let read = || first_activity(transcript, &FsSubagents::for_transcript(&session));
+    assert_eq!(read()["preview"], json!("/fixture/ws/a.txt"));
+    rewrite_keeping_identity(
+        &staged_subagent_file(&session),
+        "/fixture/ws/a.txt",
+        "/fixture/ws/z.txt",
+    );
+    assert_eq!(read()["preview"], json!("/fixture/ws/a.txt"));
+}
+
+#[test]
+fn a_subagent_file_that_grew_is_parsed_again() {
+    // A running subagent's file grows line by line (F7).
+    let (_dir, session) = staged_scenario("agent-async");
+    let transcript = real_cli_fixture!("agent-async");
+    let file = staged_subagent_file(&session);
+    let child = std::fs::read_to_string(&file).unwrap();
+    let tool_use_id = fixture_lines(&child)
+        .into_iter()
+        .find_map(|line| {
+            line["message"]["content"]
+                .as_array()?
+                .iter()
+                .find(|b| b["type"] == "tool_use")
+                .and_then(|b| b["id"].as_str().map(str::to_string))
+        })
+        .unwrap();
+    std::fs::write(
+        &file,
+        prefix_before(&child, |line| tool_result_for(line, &tool_use_id)),
+    )
+    .unwrap();
+    let read = || first_activity(transcript, &FsSubagents::for_transcript(&session));
+    assert_eq!(read()["status"], json!("running"));
+    std::fs::write(&file, &child).unwrap();
+    assert_eq!(read()["status"], json!("completed"));
+}
+
+#[test]
+fn the_summary_cache_keeps_only_its_most_recently_used_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = subagent_transcript("agent-async");
+    let [a, b, c] = ["a", "b", "c"].map(|name| {
+        let path = dir.path().join(format!("agent-{name}.jsonl"));
+        std::fs::write(&path, &child).unwrap();
+        path
+    });
+    let cache = SubagentSummaryCache::new(2);
+    let preview =
+        |path: &std::path::Path| cache.summary(path).unwrap().activity[0]["preview"].clone();
+    preview(&a);
+    preview(&b);
+    preview(&a);
+    preview(&c); // over capacity: b, the least recently used, is dropped
+    for path in [&a, &b] {
+        rewrite_keeping_identity(path, "/fixture/ws/a.txt", "/fixture/ws/z.txt");
+    }
+    assert_eq!(preview(&a), json!("/fixture/ws/a.txt"), "a is still cached");
+    assert_eq!(preview(&b), json!("/fixture/ws/z.txt"), "b is read again");
+}
+
+#[test]
+fn a_missing_subagent_file_has_no_summary() {
+    let cache = SubagentSummaryCache::new(2);
+    let dir = tempfile::tempdir().unwrap();
+    assert!(cache
+        .summary(&dir.path().join("agent-gone.jsonl"))
+        .is_none());
 }
 
 // ── A5: changed-files summary (the diff panel) ─────────────────────────────

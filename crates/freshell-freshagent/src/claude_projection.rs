@@ -18,6 +18,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Instant, SystemTime};
 
 use freshell_sessions::{ClaudeUsageAccumulator, ParseSessionOptions};
 use serde_json::{json, Value};
@@ -44,16 +46,16 @@ pub(crate) const TRANSCRIPT_LINE_UUID_WINDOW: usize = 64;
 /// The claude CLI's default subagent type when the model names none.
 const DEFAULT_SUBAGENT: &str = "general-purpose";
 
-/// Where the projector finds a delegation's subagent transcript.
-pub(crate) trait SubagentSource {
-    /// The JSONL of the subagent the `tool_use_id` delegation started.
-    fn transcript_for(&self, tool_use_id: &str) -> Option<String>;
+/// How many subagent files' summaries the process keeps (each holds at most
+/// [`DELEGATION_ACTIVITY_ROW_CAP`] activity rows plus its changed files).
+/// Enough for a couple of open sessions with hundreds of delegations each.
+const SUBAGENT_SUMMARY_CACHE_FILES: usize = 512;
 
-    /// What that transcript contributes to the projection.
-    fn summary_for(&self, tool_use_id: &str) -> Option<SubagentSummary> {
-        self.transcript_for(tool_use_id)
-            .map(|transcript| SubagentSummary::from_transcript(&transcript))
-    }
+/// Where the projector finds what a delegation's subagent did.
+pub(crate) trait SubagentSource {
+    /// The summary of the subagent transcript the `tool_use_id` delegation
+    /// started, if there is one.
+    fn summary_for(&self, tool_use_id: &str) -> Option<Arc<SubagentSummary>>;
 }
 
 /// What one subagent transcript contributes to the projection.
@@ -121,7 +123,7 @@ impl SubagentSummary {
 pub(crate) struct NoSubagents;
 
 impl SubagentSource for NoSubagents {
-    fn transcript_for(&self, _tool_use_id: &str) -> Option<String> {
+    fn summary_for(&self, _tool_use_id: &str) -> Option<Arc<SubagentSummary>> {
         None
     }
 }
@@ -129,10 +131,15 @@ impl SubagentSource for NoSubagents {
 /// The CLI's on-disk subagent layout (F5):
 /// `<transcript without .jsonl>/subagents/agent-<id>.jsonl`, plus
 /// `agent-<id>.meta.json {toolUseId, …}` written at spawn — so a delegation
-/// that is still running already maps to its transcript.
+/// that is still running already maps to its transcript. Summaries come from
+/// the process-wide [`SubagentSummaryCache`].
 pub(crate) struct FsSubagents {
     by_tool_use: HashMap<String, PathBuf>,
 }
+
+/// The process-wide subagent summary cache every snapshot read shares.
+static SUBAGENT_SUMMARIES: LazyLock<SubagentSummaryCache> =
+    LazyLock::new(|| SubagentSummaryCache::new(SUBAGENT_SUMMARY_CACHE_FILES));
 
 impl FsSubagents {
     pub(crate) fn for_transcript(transcript: &Path) -> Self {
@@ -170,8 +177,138 @@ impl FsSubagents {
 }
 
 impl SubagentSource for FsSubagents {
-    fn transcript_for(&self, tool_use_id: &str) -> Option<String> {
-        std::fs::read_to_string(self.by_tool_use.get(tool_use_id)?).ok()
+    fn summary_for(&self, tool_use_id: &str) -> Option<Arc<SubagentSummary>> {
+        SUBAGENT_SUMMARIES.summary(self.by_tool_use.get(tool_use_id)?)
+    }
+}
+
+/// What tells a file version apart: an append changes the length, a rewrite
+/// the mtime (and usually the inode).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// Subagent summaries by file, reused while the file is unchanged. Every
+/// snapshot read re-projects the session, and a session can have hundreds
+/// of subagent files (hundreds of MB); a finished subagent's file never
+/// changes again, so it is parsed once. A running subagent's file grows,
+/// which changes its identity and re-parses it. Least recently used files
+/// are dropped past the capacity.
+pub(crate) struct SubagentSummaryCache {
+    capacity: usize,
+    state: Mutex<SummaryCacheState>,
+}
+
+#[derive(Default)]
+struct SummaryCacheState {
+    entries: HashMap<PathBuf, CachedSummary>,
+    /// Bumped on every use; an entry's `last_used` orders eviction.
+    clock: u64,
+}
+
+struct CachedSummary {
+    identity: FileIdentity,
+    summary: Arc<SubagentSummary>,
+    last_used: u64,
+}
+
+impl SubagentSummaryCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(SummaryCacheState::default()),
+        }
+    }
+
+    /// The summary of the subagent transcript at `path` (`None` when it
+    /// cannot be read).
+    pub(crate) fn summary(&self, path: &Path) -> Option<Arc<SubagentSummary>> {
+        // The identity is taken BEFORE the read: a write racing the read
+        // changes the identity, so the next lookup re-reads instead of
+        // trusting content older than the file.
+        let identity = FileIdentity::of(&std::fs::metadata(path).ok()?);
+        if let Some(summary) = self.cached(path, identity) {
+            return Some(summary);
+        }
+        let started = Instant::now();
+        let transcript = match std::fs::read_to_string(path) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                tracing::debug!(
+                    target: "freshell_freshagent::claude",
+                    event = "claude_subagent_transcript_unreadable",
+                    path = %path.display(),
+                    error = %error,
+                    "claude subagent transcript could not be read; its activity and file changes are not shown"
+                );
+                return None;
+            }
+        };
+        let summary = Arc::new(SubagentSummary::from_transcript(&transcript));
+        tracing::debug!(
+            target: "freshell_freshagent::claude",
+            event = "claude_subagent_summary_parsed",
+            path = %path.display(),
+            bytes = transcript.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "parsed a claude subagent transcript"
+        );
+        self.store(path, identity, Arc::clone(&summary));
+        Some(summary)
+    }
+
+    fn cached(&self, path: &Path, identity: FileIdentity) -> Option<Arc<SubagentSummary>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.clock += 1;
+        let clock = state.clock;
+        let entry = state.entries.get_mut(path)?;
+        if entry.identity != identity {
+            return None;
+        }
+        entry.last_used = clock;
+        Some(Arc::clone(&entry.summary))
+    }
+
+    fn store(&self, path: &Path, identity: FileIdentity, summary: Arc<SubagentSummary>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.clock += 1;
+        let last_used = state.clock;
+        state.entries.insert(
+            path.to_path_buf(),
+            CachedSummary {
+                identity,
+                summary,
+                last_used,
+            },
+        );
+        while state.entries.len() > self.capacity {
+            let Some(oldest) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            state.entries.remove(&oldest);
+        }
     }
 }
 
@@ -477,7 +614,7 @@ impl ClaudeTranscriptProjector {
                 continue;
             }
             if let Some(item) = self.item_mut(location) {
-                item["activity"] = Value::Array(summary.activity);
+                item["activity"] = Value::Array(summary.activity.clone());
             }
         }
         ClaudeProjection {
