@@ -891,9 +891,66 @@ struct GrantExecutionRequest {
     resume_spec: Option<ResumeSpec>,
 }
 
+/// Wall-clock breakdown of one execution grant. The supervisor bounds the
+/// whole grant reply; this names the stage that spent the time, for every
+/// outcome, so a slow dispatch is diagnosable after the container is gone.
+struct GrantStageTimeline {
+    started: std::time::Instant,
+    stage_started: std::time::Instant,
+    stages: Vec<(&'static str, u128)>,
+}
+
+impl GrantStageTimeline {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            stage_started: now,
+            stages: Vec::new(),
+        }
+    }
+
+    fn completed(&mut self, stage: &'static str) {
+        let now = std::time::Instant::now();
+        self.stages
+            .push((stage, now.duration_since(self.stage_started).as_millis()));
+        self.stage_started = now;
+    }
+
+    fn event(&self, grant_id: &GrantId, outcome: Result<(), &RuntimeError>) -> serde_json::Value {
+        serde_json::json!({
+            "severity": if outcome.is_ok() { "info" } else { "warn" },
+            "event": "host.grant_timing",
+            "grantId": grant_id,
+            "outcome": if outcome.is_ok() { "accepted" } else { "refused" },
+            "errorCode": outcome.err().map(|error| error.code),
+            "totalMs": self.started.elapsed().as_millis(),
+            "stages": self
+                .stages
+                .iter()
+                .map(|(stage, ms)| serde_json::json!({"stage": stage, "ms": ms}))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
 async fn grant_execution(
     state: &Arc<HostState>,
     request: GrantExecutionRequest,
+) -> Result<HostResult, RuntimeError> {
+    let grant_id = request.grant_id.clone();
+    let mut timeline = GrantStageTimeline::start();
+    let result = grant_execution_stages(state, request, &mut timeline).await;
+    let event = timeline.event(&grant_id, result.as_ref().map(|_| ()));
+    emit_environment_event(event.clone());
+    append_event_with_secret(&state.state_dir, &state.secret, "host.grant_timing", event).ok();
+    result
+}
+
+async fn grant_execution_stages(
+    state: &Arc<HostState>,
+    request: GrantExecutionRequest,
+    timeline: &mut GrantStageTimeline,
 ) -> Result<HostResult, RuntimeError> {
     let GrantExecutionRequest {
         soul_id,
@@ -959,6 +1016,7 @@ async fn grant_execution(
             "host boot already consumed a different grant",
         ));
     }
+    timeline.completed("admit");
 
     // Resolve every mounted grant once before consuming the execution grant.
     // A changed source selection remains a pre-dispatch preparation failure.
@@ -994,6 +1052,7 @@ async fn grant_execution(
                 format!("resolve managed provider credentials: {error}"),
             )
         })?;
+        timeline.completed("resolve_secrets");
         if matches!(provider, "opencode" | "codex" | "claude" | "amplifier") {
             let generated = provider_input_preparation::prepare_for_identity(
                 context,
@@ -1018,6 +1077,7 @@ async fn grant_execution(
                 )
             })?;
             secrets.environment.extend(generated);
+            timeline.completed("prepare_provider_inputs");
         } else if !provider_path_inputs.is_empty() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1094,6 +1154,7 @@ async fn grant_execution(
                 )
             })?;
             *state.child.lock().await = Some(child);
+            timeline.completed("spawn_worker");
             let evidence = if fixture == FixtureKind::SecurityProbe {
                 security_probe(&state.state_dir)
             } else {
@@ -1152,6 +1213,7 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
+            timeline.completed("prepare_provider_state");
             let prepared = providers::prepare_terminal(
                 terminal,
                 &resolved_secrets.environment,
@@ -1165,6 +1227,7 @@ async fn grant_execution(
                     format!("prepare managed provider: {error}"),
                 )
             })?;
+            timeline.completed("prepare_terminal");
             claude_source_observation::verify_final(
                 prepared.terminal.provider_launch_context.as_ref(),
                 &state
@@ -1178,10 +1241,13 @@ async fn grant_execution(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
             )
             .await?;
+            timeline.completed("verify_claude_sources");
             consume_grant(&mut persisted)?;
+            timeline.completed("consume_grant");
             let prepared = providers::start_terminal_sidecar(prepared)
                 .await
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+            timeline.completed("start_sidecar");
             let terminal = prepared.terminal;
             let hosted = HostedPty::spawn(
                 &state.state_dir,
@@ -1198,6 +1264,7 @@ async fn grant_execution(
                     format!("spawn managed terminal: {e}"),
                 )
             })?;
+            timeline.completed("spawn_worker");
             let pid = hosted.pid();
             let evidence = serde_json::json!({
                 "workload":"terminal",
@@ -1310,6 +1377,7 @@ async fn grant_execution(
             )
             .await
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+            timeline.completed("prepare_provider_state");
             claude_source_observation::verify_final(
                 launch.provider_launch_context.as_ref(),
                 &state
@@ -1323,7 +1391,9 @@ async fn grant_execution(
                 freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
             )
             .await?;
+            timeline.completed("verify_claude_sources");
             consume_grant(&mut persisted)?;
+            timeline.completed("consume_grant");
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
@@ -1334,6 +1404,7 @@ async fn grant_execution(
                         format!("hosted fresh-agent provider failed to start: {error}"),
                     )
                 })?;
+            timeline.completed("start_fresh_agent");
             let profile = actor.profile().await;
             let native_session_id = profile.native_session_id.clone();
             let evidence = serde_json::json!({
@@ -10374,6 +10445,51 @@ mod tests {
         assert!(state.child.lock().await.is_none());
     }
 
+    fn grant_timing_events(state_dir: &Path) -> Vec<serde_json::Value> {
+        journal_events(state_dir)
+            .into_iter()
+            .filter(|event| event["event"] == "host.grant_timing")
+            .map(|event| event["data"].clone())
+            .collect()
+    }
+
+    /// A refused grant still records how long the host held it and why, so a
+    /// supervisor-side timeout can be told apart from a host-side refusal.
+    #[tokio::test]
+    async fn refused_grant_records_its_timing_and_refusal_code() {
+        let state = test_host_state();
+        {
+            let mut persisted = state.persisted.lock().await;
+            persisted.max_control_epoch = 7;
+        }
+        let grant_id = GrantId::new();
+        let envelope = authenticated_host_envelope(
+            &state,
+            HostCommand::GrantExecution {
+                incarnation_id: state.incarnation_id.clone(),
+                soul_id: SoulId::new(),
+                host_boot_id: state.host_boot_id.clone(),
+                control_epoch: 1,
+                execution_generation: 1,
+                grant_id: grant_id.clone(),
+                fixture: Some(FixtureKind::Heartbeat),
+                provider_path_inputs: Default::default(),
+                terminal: None,
+                fresh_agent: None,
+                resume_spec: None,
+            },
+        );
+        let error = dispatch(envelope, &state).await.unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::StaleExecutionGrant);
+        let timing = grant_timing_events(&state.state_dir);
+        assert_eq!(timing.len(), 1, "{timing:?}");
+        assert_eq!(timing[0]["grantId"], serde_json::json!(grant_id));
+        assert_eq!(timing[0]["outcome"], "refused");
+        assert_eq!(timing[0]["severity"], "warn");
+        assert_eq!(timing[0]["errorCode"], "STALE_EXECUTION_GRANT");
+        assert_eq!(timing[0]["stages"], serde_json::json!([]));
+    }
+
     #[tokio::test]
     async fn grant_from_another_host_boot_is_rejected_before_consumption() {
         let state = test_host_state();
@@ -10588,6 +10704,31 @@ mod tests {
         ));
         assert_eq!(state.persisted.lock().await.worker_launch_count, 1);
         assert!(state.pty.lock().await.is_some());
+        let timing = grant_timing_events(&state.state_dir);
+        assert_eq!(timing.len(), 1, "one dispatch records one timing event");
+        assert_eq!(timing[0]["outcome"], "accepted");
+        let stages = timing[0]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stage| stage["stage"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            [
+                "admit",
+                "resolve_secrets",
+                "prepare_provider_inputs",
+                "prepare_provider_state",
+                "prepare_terminal",
+                "verify_claude_sources",
+                "consume_grant",
+                "start_sidecar",
+                "spawn_worker",
+            ],
+            "the accepted terminal dispatch names every stage it spent time in"
+        );
+        assert!(timing[0]["totalMs"].as_u64().is_some());
         let mut observed = None;
         for _ in 0..100 {
             if let Ok(value) = std::fs::read(&child_output) {
