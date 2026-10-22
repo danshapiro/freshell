@@ -1,0 +1,408 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "40c1a3d7-3ee0-40b0-8f23-ac39f4d12fd0",
+  "sessionId": "40c1a3d7-3ee0-40b0-8f23-ac39f4d12fd0",
+  "revision": 1792656000000,
+  "latestTurnId": "ec436c37-cb18-459c-bae7-e4e5b3047a7e",
+  "status": "idle",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "diffs": true,
+    "undo": true,
+    "redo": true,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 100,
+    "outputTokens": 20,
+    "cachedTokens": 10,
+    "totalTokens": 130,
+    "contextTokens": 130,
+    "compactPercent": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [
+    {
+      "id": "/fixture/ws/a.txt",
+      "path": "/fixture/ws/a.txt",
+      "status": "created"
+    },
+    {
+      "id": "/fixture/ws/b.txt",
+      "path": "/fixture/ws/b.txt",
+      "status": "+1 −0"
+    }
+  ],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "0e37ba5e-e169-4f24-9d8e-641a8425a4d6",
+      "turnId": "0e37ba5e-e169-4f24-9d8e-641a8425a4d6",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:40:55.722Z",
+      "summary": "GO write then edit then delegate",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "0e37ba5e-e169-4f24-9d8e-641a8425a4d6-i0",
+          "kind": "text",
+          "text": "GO write then edit then delegate"
+        }
+      ]
+    },
+    {
+      "id": "60f3e2a5-8b6f-4627-b54b-22ea56beb5ed",
+      "turnId": "60f3e2a5-8b6f-4627-b54b-22ea56beb5ed",
+      "messageId": "msg_fixture0001",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.779Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "plan the write",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "60f3e2a5-8b6f-4627-b54b-22ea56beb5ed-i0",
+          "kind": "thinking",
+          "text": "plan the write"
+        }
+      ]
+    },
+    {
+      "id": "7fb79aae-fe9d-429b-be63-59c65b647744",
+      "turnId": "7fb79aae-fe9d-429b-be63-59c65b647744",
+      "messageId": "msg_fixture0001",
+      "ordinal": 2,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.781Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Writing the file now.",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "7fb79aae-fe9d-429b-be63-59c65b647744-i0",
+          "kind": "text",
+          "text": "Writing the file now."
+        }
+      ]
+    },
+    {
+      "id": "50aa6152-2adf-4405-b470-3ea2d3c27f3c",
+      "turnId": "50aa6152-2adf-4405-b470-3ea2d3c27f3c",
+      "messageId": "msg_fixture0001",
+      "ordinal": 3,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.789Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Write",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "50aa6152-2adf-4405-b470-3ea2d3c27f3c-i0",
+          "kind": "tool_use",
+          "toolUseId": "toolu_write1",
+          "name": "Write",
+          "input": {
+            "file_path": "/fixture/ws/a.txt",
+            "content": "one\n"
+          }
+        }
+      ]
+    },
+    {
+      "id": "8adcf6b3-b32e-494b-9318-075b2630ab87",
+      "turnId": "8adcf6b3-b32e-494b-9318-075b2630ab87",
+      "ordinal": 4,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:40:55.805Z",
+      "summary": "Tool result",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "8adcf6b3-b32e-494b-9318-075b2630ab87-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_write1",
+          "content": "File created successfully at: /fixture/ws/a.txt (file state is current in your context — no need to Read it back)",
+          "isError": false
+        }
+      ]
+    },
+    {
+      "id": "95853676-5926-42ee-bcc3-3ad68024c0b0",
+      "turnId": "95853676-5926-42ee-bcc3-3ad68024c0b0",
+      "messageId": "msg_fixture0002",
+      "ordinal": 5,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.821Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Edit",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "95853676-5926-42ee-bcc3-3ad68024c0b0-i0",
+          "kind": "tool_use",
+          "toolUseId": "toolu_edit1",
+          "name": "Edit",
+          "input": {
+            "replace_all": false,
+            "file_path": "/fixture/ws/a.txt",
+            "old_string": "one",
+            "new_string": "two"
+          }
+        }
+      ]
+    },
+    {
+      "id": "49803b54-f814-4ef9-a57d-5e895de08077",
+      "turnId": "49803b54-f814-4ef9-a57d-5e895de08077",
+      "ordinal": 6,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:40:55.830Z",
+      "summary": "Tool result",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "49803b54-f814-4ef9-a57d-5e895de08077-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_edit1",
+          "content": "The file /fixture/ws/a.txt has been updated successfully. (file state is current in your context — no need to Read it back)",
+          "isError": false
+        }
+      ]
+    },
+    {
+      "id": "29a95c4c-991d-40a2-a578-137b7b4c10cb",
+      "turnId": "29a95c4c-991d-40a2-a578-137b7b4c10cb",
+      "messageId": "msg_fixture0003",
+      "ordinal": 7,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.853Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Edit",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "29a95c4c-991d-40a2-a578-137b7b4c10cb-i0",
+          "kind": "tool_use",
+          "toolUseId": "toolu_edit2",
+          "name": "Edit",
+          "input": {
+            "replace_all": false,
+            "file_path": "/fixture/ws/a.txt",
+            "old_string": "not-present",
+            "new_string": "x"
+          }
+        }
+      ]
+    },
+    {
+      "id": "de04ade4-e613-4b15-a503-ef257a909a5a",
+      "turnId": "de04ade4-e613-4b15-a503-ef257a909a5a",
+      "ordinal": 8,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:40:55.856Z",
+      "summary": "Tool error",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "de04ade4-e613-4b15-a503-ef257a909a5a-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_edit2",
+          "content": "<tool_use_error>String to replace not found in file.\nString: not-present</tool_use_error>",
+          "isError": true
+        }
+      ]
+    },
+    {
+      "id": "09b30f17-2de7-423c-999c-6f3305c07ebe",
+      "turnId": "09b30f17-2de7-423c-999c-6f3305c07ebe",
+      "messageId": "msg_fixture0004",
+      "ordinal": 9,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.871Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Read",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "09b30f17-2de7-423c-999c-6f3305c07ebe-i0",
+          "kind": "tool_use",
+          "toolUseId": "toolu_read2",
+          "name": "Read",
+          "input": {
+            "file_path": "/fixture/ws/b.txt"
+          }
+        }
+      ]
+    },
+    {
+      "id": "e71fc7b0-13a5-4300-9799-8d098a12ff43",
+      "turnId": "e71fc7b0-13a5-4300-9799-8d098a12ff43",
+      "ordinal": 10,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:40:55.876Z",
+      "summary": "Tool result",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "e71fc7b0-13a5-4300-9799-8d098a12ff43-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_read2",
+          "content": "1\talpha\n2\tbeta\n3\t",
+          "isError": false
+        }
+      ]
+    },
+    {
+      "id": "6be2c047-670c-4935-98ad-86fef721bc96",
+      "turnId": "6be2c047-670c-4935-98ad-86fef721bc96",
+      "messageId": "msg_fixture0005",
+      "ordinal": 11,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.932Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Edit",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "6be2c047-670c-4935-98ad-86fef721bc96-i0",
+          "kind": "tool_use",
+          "toolUseId": "toolu_edit3",
+          "name": "Edit",
+          "input": {
+            "replace_all": false,
+            "file_path": "/fixture/ws/b.txt",
+            "old_string": "beta",
+            "new_string": "beta\ngamma"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ff9bdeeb-6d8c-4ec2-ac94-9195fcedc455",
+      "turnId": "ff9bdeeb-6d8c-4ec2-ac94-9195fcedc455",
+      "ordinal": 12,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:40:55.939Z",
+      "summary": "Tool result",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "ff9bdeeb-6d8c-4ec2-ac94-9195fcedc455-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_edit3",
+          "content": "The file /fixture/ws/b.txt has been updated successfully. (file state is current in your context — no need to Read it back)",
+          "isError": false
+        }
+      ]
+    },
+    {
+      "id": "550bd29d-5dd6-4163-bc28-41e0b9f54da9",
+      "turnId": "550bd29d-5dd6-4163-bc28-41e0b9f54da9",
+      "messageId": "msg_fixture0006",
+      "ordinal": 13,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:55.951Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "General-purpose Task — check file",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "550bd29d-5dd6-4163-bc28-41e0b9f54da9-i0",
+          "kind": "task_delegation",
+          "status": "completed",
+          "title": "General-purpose Task — check file",
+          "description": "check file",
+          "subagent": "general-purpose",
+          "background": false,
+          "result": "SUBAGENT-DONE: file has two",
+          "durationMs": 39,
+          "activity": [
+            {
+              "tool": "Read",
+              "status": "completed",
+              "preview": "/fixture/ws/a.txt"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ec436c37-cb18-459c-bae7-e4e5b3047a7e",
+      "turnId": "ec436c37-cb18-459c-bae7-e4e5b3047a7e",
+      "messageId": "msg_fixture0009",
+      "ordinal": 14,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:40:56.007Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "All done.",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "ec436c37-cb18-459c-bae7-e4e5b3047a7e-i0",
+          "kind": "text",
+          "text": "All done."
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "transcriptLineUuids": [
+        "0e37ba5e-e169-4f24-9d8e-641a8425a4d6",
+        "64e0606f-e516-4713-b537-75cd6f30ec38",
+        "ec5a79da-67d9-489c-8819-a359fb07c94a",
+        "a16399f2-8ac5-433d-9f80-57e0ee9744ac",
+        "60f3e2a5-8b6f-4627-b54b-22ea56beb5ed",
+        "7fb79aae-fe9d-429b-be63-59c65b647744",
+        "50aa6152-2adf-4405-b470-3ea2d3c27f3c",
+        "8adcf6b3-b32e-494b-9318-075b2630ab87",
+        "7c149a2c-4227-4d5d-9929-6945bcfc6e97",
+        "95853676-5926-42ee-bcc3-3ad68024c0b0",
+        "49803b54-f814-4ef9-a57d-5e895de08077",
+        "b32166f8-0582-4ee7-b527-1c70cf7654c6",
+        "29a95c4c-991d-40a2-a578-137b7b4c10cb",
+        "de04ade4-e613-4b15-a503-ef257a909a5a",
+        "40cf8112-088f-4157-a4e0-642c7c42f547",
+        "09b30f17-2de7-423c-999c-6f3305c07ebe",
+        "e71fc7b0-13a5-4300-9799-8d098a12ff43",
+        "4ca105ee-f34d-4044-816f-5be23b432a2e",
+        "6be2c047-670c-4935-98ad-86fef721bc96",
+        "ff9bdeeb-6d8c-4ec2-ac94-9195fcedc455",
+        "e9375761-7b0a-49b3-b8f7-97bfb31d59cb",
+        "550bd29d-5dd6-4163-bc28-41e0b9f54da9",
+        "097055a3-8d93-46e0-ba4c-27b77e737fc7",
+        "77970664-223e-4919-bd3e-a66efa4ce3df",
+        "ec436c37-cb18-459c-bae7-e4e5b3047a7e"
+      ]
+    }
+  }
+}

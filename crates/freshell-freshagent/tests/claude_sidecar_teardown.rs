@@ -228,11 +228,62 @@ fn grandchild_pid(ready: &str) -> u32 {
         .unwrap_or_else(|| panic!("readiness line carries the grandchild pid: {ready}"))
 }
 
+/// Whether signal 0 reaches `target` (a pid, or `-pgid` for a group).
 #[cfg(unix)]
-fn process_group_exists(pgid: i32) -> bool {
+fn signal_zero_reaches(target: i32) -> bool {
     // SAFETY: signal 0 only probes for existence.
-    let result = unsafe { libc::kill(-pgid, 0) };
+    let result = unsafe { libc::kill(target, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// `(state, process group)` of `pid` from `/proc/<pid>/stat`, or `None` once
+/// the process is gone. `comm` may hold spaces or parentheses, so the fields
+/// resume after the last ')': state, then ppid, then pgrp.
+///
+/// The probes below need it because Linux keeps a killed process in the
+/// table as a zombie until a reaper collects it: an orphaned grandchild waits
+/// for init (asynchronously), or forever in a container without a reaper.
+/// `kill(pid, 0)` still reaches a zombie, but a zombie runs nothing and the
+/// guard's own tree check does not count one, so these probes do not either.
+#[cfg(target_os = "linux")]
+fn linux_proc_state(pid: &str) -> Option<(String, i32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat.rsplit(')').next()?.split_whitespace();
+    let state = fields.next()?.to_string();
+    let group = fields.nth(1)?.parse().ok()?;
+    Some((state, group))
+}
+
+#[cfg(target_os = "linux")]
+fn is_zombie(state: &str) -> bool {
+    matches!(state, "Z" | "X")
+}
+
+/// Whether a live (non-zombie, on Linux) process remains in group `pgid`.
+#[cfg(unix)]
+fn process_group_has_live_member(pgid: i32) -> bool {
+    if !signal_zero_reaches(-pgid) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            // Cannot look: the signal probe above is the answer.
+            return true;
+        };
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(linux_proc_state)
+                .is_some_and(|(state, group)| group == pgid && !is_zombie(&state))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 /// Observes one process's exit. On Windows the handle is opened while the
@@ -256,11 +307,16 @@ impl ProcessProbe {
     }
 
     fn alive(&self) -> bool {
-        #[cfg(unix)]
+        // A zombie is not running (see `linux_proc_state`).
+        #[cfg(target_os = "linux")]
         {
-            // SAFETY: signal 0 only probes for existence.
-            let result = unsafe { libc::kill(self.pid as i32, 0) };
-            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            signal_zero_reaches(self.pid as i32)
+                && linux_proc_state(&self.pid.to_string())
+                    .is_some_and(|(state, _)| !is_zombie(&state))
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            signal_zero_reaches(self.pid as i32)
         }
         #[cfg(windows)]
         {
@@ -324,7 +380,10 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
             "the grandchild got the rest of the grace period to exit by itself: {exit:?}"
         );
         let pgid = pgid.expect("the sidecar ran in its own process group");
-        assert!(!process_group_exists(pgid), "no group member survives");
+        assert!(
+            !process_group_has_live_member(pgid),
+            "no group member survives"
+        );
     }
 }
 
@@ -485,7 +544,7 @@ async fn terminating_the_guard_kills_every_member_of_the_process_group() {
         "the background member of the group was killed"
     );
     assert!(
-        !process_group_exists(leader as i32),
+        !process_group_has_live_member(leader as i32),
         "no group member survives"
     );
 }
@@ -518,7 +577,7 @@ async fn dropping_the_guard_kills_the_process_group() {
         "the drop sent SIGKILL: {status:?}"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while process_group_exists(pgid) {
+    while process_group_has_live_member(pgid) {
         assert!(
             std::time::Instant::now() < deadline,
             "the background member of the group survived the drop"
