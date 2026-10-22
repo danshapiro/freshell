@@ -45,9 +45,10 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// the raw parentUuid chain) as the child's file — the source file is NEVER
 /// touched (Stage-2-proven SDK invariant: the original's JSONL is hash-identical
 /// after a fork). A `<n>`-th `send` appends a uuid-chained u<n>/a<n> pair (the
-/// user line carries the verbatim prompt text) and answers `sdk.status idle`
-/// (the in_turn clear edge) — NEVER a result frame, so no completion chime can
-/// leak into the rollback capture.
+/// user line carries the verbatim prompt text) and answers with the turn's
+/// `sdk.result` (the in_turn clear edge, as the real sidecar ends a turn) — and
+/// NEVER a `sdk.turn.complete`, so no completion chime can leak into the rollback
+/// capture.
 const FAKE_ROLLBACK_SIDECAR_SOURCE: &str = r#"
 import fs from 'node:fs'
 import path from 'node:path'
@@ -131,9 +132,10 @@ rl.on('line', (line) => {
     const user = { type: 'user', uuid: u, parentUuid: parent, timestamp: `t${turnCount}a`, cwd: '/tmp', message: { role: 'user', content: [{ type: 'text', text: msg.text }] } }
     const assistant = { type: 'assistant', uuid: a, parentUuid: u, timestamp: `t${turnCount}b`, message: { role: 'assistant', content: [{ type: 'text', text: `answer ${turnCount}` }] } }
     fs.appendFileSync(transcriptPath(cliId), `${JSON.stringify(user)}\n${JSON.stringify(assistant)}\n`)
-    // The rollback capture surface must NEVER see a completion chime; idle is the
-    // busy-clear edge.
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }) + '\n')
+    // The rollback capture surface must NEVER see a completion chime; the
+    // turn's result is the busy-clear edge (no per-turn idle, like the real
+    // sidecar).
+    process.stdout.write(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: {} }) + '\n')
   } else if (msg.type === 'rollback.quiesce') {
     // ep4-r3 wire parity: rollback's pre-teardown probe — this fake never has
     // an inflight turn at that point (its sends settle their statuses
@@ -812,12 +814,11 @@ async fn drive_conversation(
                 && v["requestId"] == json!(format!("send-{i}"))
         })
         .await;
-        // The fake appends the u<n>/a<n> pair BEFORE answering idle, so this waits
-        // out both the transcript append AND the busy-clear edge.
+        // The fake appends the u<n>/a<n> pair BEFORE answering with the result,
+        // so this waits out both the transcript append AND the busy-clear edge.
         await_frame_into(&mut ws, &mut frames, 15, |v| {
             v["type"] == json!("freshAgent.event")
-                && v["event"]["type"] == json!("freshAgent.status")
-                && v["event"]["status"] == json!("idle")
+                && v["event"]["type"] == json!("freshAgent.result")
         })
         .await;
     }

@@ -161,7 +161,7 @@ describe('Claude sidecar interrupt gate arming (unified attention edge)', () => 
     bridge.sendLines([{ type: 'send', sessionId, text: 'CRASH_SOON' }, { type: 'interrupt', sessionId }])
     expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
     await bridge.waitForPrompt(1)
-    expect(await bridge.waitFor('sdk.error')).toMatchObject({ sessionId })
+    expect(await bridge.waitFor('sdk.stream.ended')).toMatchObject({ sessionId, reason: 'cli_exited' })
     expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
     expect(bridge.frames.filter((frame) => frame.type === 'sdk.result')).toEqual([])
   })

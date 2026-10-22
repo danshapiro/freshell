@@ -645,23 +645,6 @@ struct ClaudeSession {
     ///       is gone).
     /// Carried across the rollback's kill+respawn exactly like `in_turn`.
     turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
-    /// Focused-review ep2-r1 F1: the paired-terminal-frames mark. The
-    /// supported protocol closes EVERY turn with `sdk.result` AND a trailing
-    /// `sdk.status:idle` (both provider fixtures emit exactly that pair; the
-    /// real sidecar's consumeStream finally emits the trailing idle). The
-    /// idle is the SAME turn's closing punctuation, never a new op's edge —
-    /// set by the consumer after folding ANY `sdk.result`, consumed by the
-    /// NEXT `sdk.status:idle` which skips the fold (a second edge's
-    /// attribution would double-count the turn — the reviewer's exact repro:
-    /// A's trailing idle misattributed to a queued garlanded send fired the
-    /// FIFO-drop branch and released the busy gate over still-queued work).
-    /// Arms/sends NEVER reset it (a fresh op submitted between a turn's
-    /// result and its trailing idle must not let that idle fold); an
-    /// in-stream `sdk.error` DOES reset it (the fail-closed `in_turn` needs a
-    /// LIVE terminal edge after the error — the trailing idle must fold
-    /// there), and sidecar EOF zeroes it with the tracker set. Carried across
-    /// the rollback's kill+respawn exactly like `in_turn`.
-    result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Task 5 (unified needs-attention signal): the session's Rust-side
     /// completion clock — an UNREQUESTED sidecar death with a turn in flight
     /// synthesizes the `freshAgent.turn.complete` edge the dead sidecar could
@@ -670,9 +653,11 @@ struct ClaudeSession {
     /// its process (and resets across a rollback fork, same as the sidecar's
     /// own per-session state); wall-clock advancement orders the Rust-minted
     /// `at`s against the sidecar-minted ones — the accepted regime, same as
-    /// Task 3. Minted ONLY by the consumer's unrequested-death arm: requested
-    /// deaths (kill/shutdown/teardown/rollback fork) never reach it, and an
-    /// idle death (no armed turn) mints nothing.
+    /// Task 3. Minted ONLY by the consumer's unrequested-death arm, and only
+    /// for a death that reported no stream end (`sdk.stream.ended`: the
+    /// sidecar already rang that one itself — the interim rule until C18):
+    /// requested deaths (kill/shutdown/teardown/rollback fork) never reach it,
+    /// and an idle death (no armed turn) mints nothing.
     last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
     /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
@@ -2605,7 +2590,6 @@ impl FreshClaudeState {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Task 5: the fresh session's death-mint clock (see the field doc).
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
@@ -2622,7 +2606,6 @@ impl FreshClaudeState {
             Arc::clone(&last_status),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
             Arc::clone(&last_synthesized_complete_at),
             None,
             provenance,
@@ -2678,7 +2661,6 @@ impl FreshClaudeState {
                 pending,
                 in_turn,
                 turn_tracker,
-                result_idle_pair_pending,
                 last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -5551,7 +5533,6 @@ impl FreshClaudeState {
             durable_id,
             in_turn,
             turn_tracker,
-            result_idle_pair_pending,
             turn_lock,
             session_type,
             last_synthesized_complete_at,
@@ -5562,7 +5543,6 @@ impl FreshClaudeState {
                     s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
                     s.in_turn.clone(),
                     s.turn_tracker.clone(),
-                    s.result_idle_pair_pending.clone(),
                     s.turn_lock.clone(),
                     session_type_str(op.session_type),
                     // Task 5: the fork continues the SAME per-session
@@ -6557,7 +6537,6 @@ impl FreshClaudeState {
             Arc::clone(&last_status),
             in_turn.clone(),
             turn_tracker.clone(),
-            result_idle_pair_pending.clone(),
             Arc::clone(&last_synthesized_complete_at),
             Some(RollbackAdoption {
                 supersedes: durable_id.clone(),
@@ -6591,7 +6570,6 @@ impl FreshClaudeState {
                 pending,
                 in_turn: in_turn.clone(),
                 turn_tracker: turn_tracker.clone(),
-                result_idle_pair_pending: result_idle_pair_pending.clone(),
                 last_synthesized_complete_at,
                 turn_lock: turn_lock.clone(),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -7398,7 +7376,6 @@ impl FreshClaudeState {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Task 5: the resumed session's death-mint clock (see the field doc).
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
@@ -7416,7 +7393,6 @@ impl FreshClaudeState {
             Arc::clone(&last_status),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
             Arc::clone(&last_synthesized_complete_at),
             None,
             // Conn-less lane (D8): attach-resume is not a create; the ledger
@@ -7442,7 +7418,6 @@ impl FreshClaudeState {
                 pending,
                 in_turn,
                 turn_tracker,
-                result_idle_pair_pending,
                 last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -8469,11 +8444,11 @@ impl FreshClaudeState {
         // turn lock, the promote/retire/disarm folds live here). `in_turn` is
         // its DERIVED busy cache — this task's folds recompute it from
         // [`TurnTracker::busy`] at every terminal edge:
-        // (a) result/unpaired-idle while a compact was PROMOTED (manual-confirmed
+        // (a) result/idle while a compact was PROMOTED (manual-confirmed
         //     by its completion boundary, ep3-r1 F1) — the
         //     compact's own terminal edge: retire `running`, hold busy while
         //     anything remains outstanding (ep1-r3 F1);
-        // (b) the FIFO-drop peel — result/unpaired-idle with NO running op and
+        // (b) the FIFO-drop peel — result/idle with NO running op and
         //     an UNPROMOTED compact at the queue head: the compact provably
         //     dropped, evidenced by the oldest queued Turn behind it (peel
         //     leading compacts up to that Turn; compacts queued BEHIND the send
@@ -8483,14 +8458,9 @@ impl FreshClaudeState {
         //     own terminal edge or EOF retires it), or EOF (the queue died
         //     with the sidecar) zeroes everything.
         turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
-        // ep2-r1 F1: the paired-terminal-frames mark — see
-        // [`ClaudeSession::result_idle_pair_pending`]. This consumer sets it
-        // after folding ANY `sdk.result`, and the NEXT `sdk.status:idle`
-        // consumes it to skip the fold (pair punctuation, never an edge).
-        result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
         // Task 5 (unified needs-attention signal): the session's Rust-side
         // completion clock — see [`ClaudeSession::last_synthesized_complete_at`].
-        // Held by the consumer (like the latch above) so the unrequested-death
+        // Held by the consumer (like the tracker above) so the unrequested-death
         // arm below can mint AFTER the eviction has already torn the session
         // record out of the map.
         last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
@@ -8553,6 +8523,9 @@ impl FreshClaudeState {
                     let _ = adoption.adopted_tx.send(None);
                 }
             }
+            // The sidecar's report of its SDK stream's end (its last line before it
+            // exits), read by the end-of-output path below.
+            let mut stream_ended: Option<crate::claude_sidecar_exit::StreamEnded> = None;
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -8561,6 +8534,10 @@ impl FreshClaudeState {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
+                if let Some(ended) = crate::claude_sidecar_exit::StreamEnded::from_line(&value) {
+                    stream_ended = Some(ended);
+                    continue;
+                }
                 // kata 1wxv Task 4 busy-truth clear edges — IN-STREAM arms (a) and
                 // (b): `sdk.result` with ANY subtype ends the turn (r2: the earlier
                 // success-only wording is void), and `sdk.status:idle`. NO other
@@ -8578,10 +8555,10 @@ impl FreshClaudeState {
                 // outstanding op's own edge. Any `sdk.error` clears the QUEUE
                 // outright (the queued ops provably never arrive) while leaving
                 // the running op / `in_turn` fail-closed untouched.
-                // ep2-r1 F1 (the paired terminal frames): EVERY turn closes with
-                // `sdk.result` AND a trailing `sdk.status:idle` — the idle is
-                // the SAME turn's punctuation, never a second edge; the fold
-                // below skips the fold for exactly that paired idle.
+                // A turn ends with its `sdk.result` alone: the real sidecar
+                // sends `sdk.status:idle` only when its stream ends, right
+                // before `sdk.stream.ended` and its exit (G23), so an idle is
+                // never a result's trailing punctuation and always folds.
                 // ep4-r2 F2: the fold NEVER serializes behind rollback's
                 // turn_lock (blocking it let rollback absorb compact debt and
                 // then miss a compaction that started in the sidecar behind
@@ -8638,23 +8615,11 @@ impl FreshClaudeState {
                     }
                     Some("sdk.result") => {
                         fold_terminal_edge(&in_turn, &turn_tracker);
-                        // A result's trailing idle is its pair punctuation the
-                        // idle arm below skips (ep2-r1 F1).
-                        result_idle_pair_pending.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("idle") =>
                     {
-                        // ep2-r1 F1: the idle trailing a result is the SAME
-                        // turn's closing punctuation — NEVER a new op's edge
-                        // (folding it would double-attribute the turn: the
-                        // reviewer's exact repro fired the drop branch on
-                        // A's trailing idle while C/S sat queued).
-                        if !result_idle_pair_pending
-                            .swap(false, std::sync::atomic::Ordering::SeqCst)
-                        {
-                            fold_terminal_edge(&in_turn, &turn_tracker);
-                        }
+                        fold_terminal_edge(&in_turn, &turn_tracker);
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("compacting") =>
@@ -8768,21 +8733,18 @@ impl FreshClaudeState {
                         // The queued ops provably never arrive as
                         // their own turns — clear the QUEUE outright (the running
                         // op and `in_turn` stay fail-closed for its own terminal
-                        // edge or EOF to retire). ep2-r1 F1: the pair mark
-                        // resets TOO — the fail-closed `in_turn` needs a LIVE
-                        // terminal edge after the error; a result's trailing
-                        // idle past an error must fold, never be skipped.
+                        // edge or EOF to retire).
                         let session_dead =
                             value.get("sessionNotFound").and_then(Value::as_bool) == Some(true);
                         {
                             let mut tracker = turn_tracker.lock().expect("turn tracker lock");
                             tracker.queued.clear();
                             if session_dead {
-                                // ep3-r2 F2: the provider-side session is DEAD —
-                                // the sidecar (handleSend/handleInterrupt)
-                                // answers `sdk.error` and keeps the long-lived
-                                // stdout OPEN, so NO terminal edge or EOF will
-                                // ever retire what remains. Every tracked op —
+                                // ep3-r2 F2: the sidecar does not host the
+                                // named session (handleSend/handleInterrupt
+                                // answer `sdk.error` with stdout still OPEN),
+                                // so NO terminal edge or EOF will ever retire
+                                // what remains. Every tracked op —
                                 // including `running` — can never complete:
                                 // retire the whole tracker and open the gate
                                 // (else the pane wedges BUSY forever after an
@@ -8792,7 +8754,6 @@ impl FreshClaudeState {
                                 in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
                             }
                         }
-                        result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -8912,23 +8873,23 @@ impl FreshClaudeState {
                 tracker.queued.clear();
                 tracker.compact_candidate = false;
             }
-            result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
-            // Consumer exit == this sidecar's stdout closed == sidecar death
-            // (ledger A9). Evict the dead session and its cli_index entries,
-            // identity-guarded: a newer session re-registered under the same
-            // map key (attach-resume, Task 6) has a DIFFERENT
-            // sidecar_session_id and must not be evicted by this stale consumer.
+            // Consumer exit == this sidecar's stdout closed == the sidecar ended
+            // (ledger A9): it exits after reporting its SDK stream's end
+            // (`sdk.stream.ended`, G02), or the Node process died. Evict the dead
+            // session and its cli_index entries, identity-guarded: a newer session
+            // re-registered under the same map key (attach-resume, Task 6) has a
+            // DIFFERENT sidecar_session_id and must not be evicted by this stale
+            // consumer.
             let evicted = {
                 let mut map = sessions.lock().await;
                 match map.get(&session_id) {
                     Some(s) if s.sidecar_session_id == sidecar_session_id => {
-                        map.remove(&session_id);
-                        true
+                        map.remove(&session_id)
                     }
-                    _ => false,
+                    _ => None,
                 }
             };
-            if evicted {
+            if let Some(mut evicted) = evicted {
                 // Focused-ep5-r1 Finding 1: the aliases are DEMOTED to the
                 // retained alias tombstones, never dropped — the client closes
                 // a crashed pane by its ORIGINAL bare placeholder, and a kill
@@ -8955,46 +8916,49 @@ impl FreshClaudeState {
                         "freshclaude/consumer-exit",
                     );
                 }
+                // Reap the sidecar for its exit status: the cause of a death that
+                // reported no stream end, and no zombie left behind.
+                let status = crate::claude_sidecar_exit::reap(&mut evicted.child).await;
+                let cause =
+                    crate::claude_sidecar_exit::SidecarExitCause::new(stream_ended.take(), status);
                 // Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar
-                // death must never be TOTAL SILENCE. The codex sibling broadcasts its
-                // crash self-heal `exited` status (`codex.rs spawn_exit_watcher`) and
-                // opencode's turn task emits an unconditional `idle`
-                // (`opencode_ws.rs run_turn`); the reference bridge broadcasts an
-                // explicit idle for exactly this edge so the pane doesn't stay stuck
-                // blue (`server/sdk-bridge.ts:344-353`). Claude alone dropped the pane
-                // into a forever-"working" wedge. Broadcast the `freshAgent.error`
+                // end must never be TOTAL SILENCE. Broadcast the `freshAgent.error`
                 // shape the client folds into a visible banner AND a
-                // running/streaming->idle drop (`fresh-agent-ws.ts:333-342`,
-                // `freshAgentSlice.sessionError`). This branch is UNREQUESTED-death
-                // only: `handle_kill`/`shutdown`/attach-teardown all remove the map
-                // entry (and abort this consumer) first, so `evicted` is false there
-                // and stays silent. ADR Decision 2.1's no-FALSE-completion property
-                // now holds through the GATE below: an in-flight death rings the
-                // unified attention edge (a turn end the user did not witness),
-                // an IDLE death still fabricates no chime.
+                // running/streaming->idle drop (`fresh-agent-ws.ts`,
+                // `freshAgentSlice.sessionError`), with the cause. This branch is
+                // UNREQUESTED-end only: `handle_kill`/`shutdown`/attach-teardown all
+                // remove the map entry (and abort this consumer) first, so nothing is
+                // evicted here and it stays silent.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                tracing::warn!(session_id = %stamp, "freshagent.claude.sidecar_death_detected");
-                state.emit_fresh_agent_error(
-                    &stamp,
-                    &session_type,
-                    "SIDECAR_EXITED",
-                    "Claude agent process exited unexpectedly - the in-flight turn was lost. Reopen the pane or create a new agent to continue.",
-                );
-                // Task 5 (unified needs-attention signal): an UNREQUESTED death
-                // ends any in-flight turn — the user must come look. The sidecar
-                // (Task 4) rings its own edge on every turn end its stream can
-                // report; the ONE end it cannot report is a process death
-                // mid-turn (its finally never runs), so synthesize the SAME
-                // `freshAgent.turn.complete` edge here. The armed state was
-                // captured at EOF entry above — the clearing + eviction in
-                // between have already torn down the latch and the session
-                // record, so the mint reads the CAPTURED value and the
-                // consumer-held clock Arc. The sidecar's own monotonic clock
-                // died with its process; wall-clock advancement orders the
-                // Rust-minted `at`s against the sidecar-minted ones — the
-                // accepted regime, same as Task 3. Requested deaths never
-                // reach this arm; an idle death (no armed turn) stays silent.
-                if turn_was_in_flight {
+                let rings = crate::claude_sidecar_exit::death_rings(turn_was_in_flight, &cause);
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    provider = PROVIDER,
+                    session_id = %stamp,
+                    session_type = %session_type,
+                    reason = cause.reason(),
+                    cause = %cause.detail(),
+                    exit_status = %crate::claude_sidecar_exit::describe_status(status),
+                    turn_in_flight = turn_was_in_flight,
+                    rings,
+                    "freshagent.claude.sidecar_exit");
+                state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    event: crate::claude_sidecar_exit::sidecar_exited_event(&stamp, &cause),
+                    provider: PROVIDER.to_string(),
+                    session_id: stamp.clone(),
+                    session_type: session_type.clone(),
+                }));
+                // Task 5 (unified needs-attention signal): an UNREQUESTED end of a
+                // running turn is a turn end the user did not witness. Interim
+                // rule (design §5.7, until C18): a sidecar that reported its
+                // stream's end already rang a result-less turn end itself, so the
+                // server rings only for a death that reported nothing (a Node
+                // death mid-turn) — exactly one edge either way. The armed state
+                // was captured at EOF entry above; the clearing + eviction in
+                // between have torn down the tracker and the session record, so
+                // the mint reads the CAPTURED value and the consumer-held clock
+                // Arc. Wall-clock advancement orders the Rust-minted `at`s against
+                // the sidecar-minted ones — the accepted regime, same as Task 3.
+                if rings {
                     let at = {
                         let mut guard = last_synthesized_complete_at
                             .lock()
@@ -9034,9 +8998,9 @@ impl FreshClaudeState {
 /// Stream invariants the attribution leans on (provider FIFO discipline): the
 /// sidecar processes its input queue strictly in acceptance order; at most one
 /// op runs at a time; EVERY op ends with exactly one logical terminal edge —
-/// a turn emits `sdk.result` (any subtype) followed by its trailing
-/// `sdk.status:idle` PUNCTUATION (paired-skipped by the consumer before this
-/// fold ever sees it, ep2-r1 F1), or a completed interrupt stands in for the
+/// a turn emits `sdk.result` (any subtype) — the sidecar's only idle comes
+/// when its stream ends, right before it exits (G23) — or a completed
+/// interrupt stands in for the
 /// running op's edge at the write site (no result frame exists, Task 4 edge
 /// (d)); and a compact's terminal edge is ALWAYS preceded by its
 /// manual-confirmed completion boundary in-stream (an unpromoted compact can
@@ -9236,8 +9200,8 @@ fn absorb_unstarted_compact_debt(
     }
 }
 
-/// The in-stream TERMINAL-edge fold (`sdk.result` any subtype; `sdk.status:idle`
-/// only when the consumer's pair-skip let it through, ep2-r1 F1). Attribution
+/// The in-stream TERMINAL-edge fold (`sdk.result` any subtype; `sdk.status:idle`,
+/// which the sidecar sends only when its stream ends). Attribution
 /// retires the OLDEST outstanding op:
 ///
 ///   (running) the edge belongs to the op in the `running` slot — the active
@@ -10498,7 +10462,6 @@ pub(crate) mod tests {
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -11940,22 +11903,23 @@ rl.on('line', (line) => {
     // asynchronously, and per the SDK contract (`sdk.d.ts:3760`) the control
     // receipt is written BEFORE the interrupted turn's terminal `sdk.result`
     // — so the fake mirrors: settle frame first, then (accepted case) the
-    // interrupted turn's own result + paired idle, IN THAT ORDER. The
+    // interrupted turn's own result, IN THAT ORDER (no trailing idle: the
+    // real sidecar sends idle only when its stream ends). The
     // rollback gate opens at the RESULTS, never at the receipt. A knocked-out
     // settle (probe on an idle sidecar) still stands alone: with no in-flight
     // op the result folds harmlessly on an empty tracker.
     //
     // Knobs: FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT=1 — the provider REJECTED
-    // the interrupt (ok:false, NO trailing result/idle: the turn still runs
+    // the interrupt (ok:false, NO trailing result: the turn still runs
     // and its own later edge owns it — the gate stays closed);
     // FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS — defer the whole settle→result
-    // →idle chain (the request↔settle window is the provider-work window the
+    // chain (the request↔settle window is the provider-work window the
     // gate must hold);
     // FRESHELL_TEST_CLAUDE_PROBE_COMPACT_BEFORE_SETTLE=1 — BEFORE the settle,
     // emit `sdk.status:compacting` (the absorbed compact debt started in the
     // sidecar before consuming the probe request: rollback's recheck must see
     // the revived candidate via the probe's in-order stream position and
-    // ABORT the teardown) — and NO trailing result/idle for the compact: its
+    // ABORT the teardown) — and NO trailing result for the compact: its
     // own terminal edge has not yet landed (the hazard window).
     const settleMs = parseInt(process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS || '0', 10)
     const reject = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT === '1'
@@ -11967,7 +11931,6 @@ rl.on('line', (line) => {
       console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: !reject }))
       if (!reject && !compactBeforeSettle) {
         console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, subtype: 'error', errors: ['interrupted'] }))
-        console.log(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }))
       }
     }
     if (settleMs > 0) setTimeout(settle, settleMs)
@@ -19478,7 +19441,6 @@ rl.on('line', (line) => {
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -19922,7 +19884,6 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new("idle".to_string())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
             None,
             None, // provenance: test lane is conn-less (D8)
@@ -21093,7 +21054,6 @@ rl.on('line', (line) => {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
@@ -21109,7 +21069,6 @@ rl.on('line', (line) => {
             Arc::clone(&last_status),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
             Arc::clone(&last_synthesized_complete_at),
             None,
             None, // provenance: test lane is conn-less (D8)
@@ -21130,7 +21089,6 @@ rl.on('line', (line) => {
                 pending,
                 in_turn,
                 turn_tracker,
-                result_idle_pair_pending,
                 last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -21181,7 +21139,6 @@ rl.on('line', (line) => {
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -21241,7 +21198,6 @@ rl.on('line', (line) => {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
@@ -21257,7 +21213,6 @@ rl.on('line', (line) => {
             Arc::clone(&last_status),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
             Arc::clone(&last_synthesized_complete_at),
             None,
             None, // provenance: test lane is conn-less (D8)
@@ -21278,7 +21233,6 @@ rl.on('line', (line) => {
                 pending,
                 in_turn,
                 turn_tracker,
-                result_idle_pair_pending,
                 last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -21396,6 +21350,35 @@ rl.on('line', (line) => {
         }
     }
 
+    /// G23: the real sidecar sends `sdk.status:idle` only when its stream ends
+    /// (right before `sdk.stream.ended` and its exit), never as a result's
+    /// trailing punctuation. A stream that ends while a second turn runs, after
+    /// the first turn's result, must release the busy truth: the deleted
+    /// result/idle pair latch skipped exactly this idle and left the session
+    /// busy (`apply_snapshot_metadata` then reported `running`).
+    #[tokio::test]
+    async fn a_stream_end_idle_after_an_earlier_result_releases_the_busy_truth() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-stream-end-idle"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-stream-end-idle").await;
+        let sid = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &sid, "idle").await;
+
+        st.handle_send(send_msg(&sid, "turn one")).await;
+        inject_raw_send(&st, &sid, "__emit_result__").await;
+        await_in_turn(&st, &sid, false).await;
+
+        st.handle_send(send_msg(&sid, "turn two")).await;
+        assert!(in_turn_of(&st, &sid).await, "the second turn is running");
+        // The stream ends mid-turn: the sidecar's stream-end idle.
+        inject_raw_send(&st, &sid, "__emit_idle__").await;
+        await_in_turn(&st, &sid, false).await;
+        drop(env);
+    }
+
     #[tokio::test]
     async fn in_turn_clears_on_exactly_the_four_contract_edges_fail_closed_otherwise() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -21438,15 +21421,15 @@ rl.on('line', (line) => {
         await_in_turn(&st, &sid, false).await;
 
         // (d) a completed handle_interrupt clears — the interrupted turn's OWN
-        // terminal frames (result + idle, per the SDK receipt-before-result
-        // contract) do it; an error-subtype result never chimes:
+        // terminal result (per the SDK receipt-before-result contract) does
+        // it; an error-subtype result never chimes:
         st.handle_send(send_msg(&sid, "turn three")).await;
         assert!(in_turn_of(&st, &sid).await);
         // Baseline: drop every frame the create/emit dance left on the bus.
         while rx.try_recv().is_ok() {}
         st.handle_interrupt(interrupt_msg(&sid)).await;
         // ep4-r2 F1: the gate releases at the interrupted op's OWN result fold
-        // (the fake emits settle → result → idle in SDK order); poll it.
+        // (the fake emits settle → result in SDK order); poll it.
         await_in_turn(&st, &sid, false).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         while let Ok(raw) = rx.try_recv() {
@@ -21780,14 +21763,14 @@ rl.on('line', (line) => {
     /// ahead, B queued as the de-facto active turn], B automatically
     /// compacts mid-turn: status-time promotion attributed the AUTO compaction
     /// to C1 ("promotes the phantom"); B's own result frame then retired the
-    /// PHANTOM compact and stranded B queued — its PAIRED idle deliberately
-    /// skipped (ep2-r1 F1) — `in_turn` held FOREVER (BUSY_TURN for every later
+    /// PHANTOM compact and stranded B queued with no edge left to retire it —
+    /// `in_turn` held FOREVER (BUSY_TURN for every later
     /// undo). Only the SDK's compact COMPLETION boundary
     /// (`sdk.compact_boundary {trigger}`) discriminates the trigger; promotion
     /// now requires the `manual` boundary.
     ///
-    ///   A → C1 → B → A's pair (A retires) → B generating → AUTO compact
-    ///   (status + boundary auto — NO promotion) → B's own result + idle pair
+    ///   A → C1 → B → A's result (A retires) → B generating → AUTO compact
+    ///   (status + boundary auto — NO promotion) → B's own result
     ///   (B retires) → the gate OPENS.
     #[tokio::test]
     async fn an_automatic_compaction_mid_turn_is_never_attributed_to_a_queued_compact() {
@@ -21804,9 +21787,8 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_send(send_msg(&session_id, "turn two")).await; // B
 
-        // A's pair retires A; [C1 dropped, B (de-facto active)] remains.
+        // A's result retires A; [C1 dropped, B (de-facto active)] remains.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "C1(dropped) + B owed");
 
@@ -21828,11 +21810,10 @@ rl.on('line', (line) => {
             "ep3-r1 F1: the queued C1 is NOT promoted by an automatic compaction — B still owes its terminal edge"
         );
 
-        // B's own result + its PAIRED idle retires B — and the gate OPENS:
+        // B's own result retires B — and the gate OPENS:
         // nothing is owed (C1's silent drop is proven by B's activity per the
         // existing drop-absorber), the pane is never permanently busy.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -21857,9 +21838,9 @@ rl.on('line', (line) => {
     /// the sole mid-turn gate admitted a rollback wipe mid-generation. With a
     /// LIVE candidate the interrupt retires EXACTLY the front compact.
     ///
-    ///   A → C1 → C2 → S → A's pair (A retires) → C1 compacting (candidate) →
+    ///   A → C1 → C2 → S → A's result (A retires) → C1 compacting (candidate) →
     ///   INTERRUPT (cancels C1 only — the gate STAYS CLOSED for C2 + S) → C2's
-    ///   manual boundary + pair (C2 retires; S still owed) → S's pair (gate
+    ///   manual boundary + result (C2 retires; S still owed) → S's result (gate
     ///   OPENS exactly here).
     #[tokio::test]
     async fn an_interrupt_inside_the_compact_candidate_window_retires_only_the_interrupted_compact()
@@ -21877,9 +21858,8 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C2
         st.handle_send(send_msg(&session_id, "turn two")).await; // S
 
-        // A's pair retires A: [C1, C2, S] all queued, running empty.
+        // A's result retires A: [C1, C2, S] all queued, running empty.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // C1 starts compacting (candidate pending — the boundary lands later).
@@ -21906,18 +21886,16 @@ rl.on('line', (line) => {
         );
 
         // C2 then runs for real: status marks its candidate, the manual
-        // boundary promotes it, and its own pair retires it; S is still owed
+        // boundary promotes it, and its own result retires it; S is still owed
         // behind it — the gate holds.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "S still owed behind C2");
 
         // S's own pair: the gate OPENS at the last owed edge, exactly.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -21951,10 +21929,9 @@ rl.on('line', (line) => {
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
 
-        // One completed turn (armed then retired by its pair) — the gate is open.
+        // One completed turn (armed then retired by its result) — the gate is open.
         st.handle_send(send_msg(&session_id, "turn one")).await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
 
         // The provider-side session DIES (stream end deletes it) — stdout stays
@@ -22196,7 +22173,7 @@ rl.on('line', (line) => {
     /// compact ahead of a running one — in-band indistinguishable, so the debt
     /// must settle at the gate, not the attribution). A turnaround edge replay
     /// after absorption folds as benign noise (boundary-promotion on an empty
-    /// queue promotes nothing; the pair-skip consumes the trailing idle).
+    /// queue promotes nothing).
     #[tokio::test]
     async fn two_queued_compacts_are_provably_quiescent_and_absorb_at_the_rollback_gate() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -22256,7 +22233,6 @@ rl.on('line', (line) => {
             "a revived absorbed compact RE-ARMS the gate at its proven start"
         );
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -22395,108 +22371,6 @@ rl.on('line', (line) => {
         drop(env);
     }
 
-    /// Focused-review ep2-r1 F1 (the PAIRED terminal frames): the supported
-    /// Claude/Kilroy protocol emits `sdk.result` AND a trailing
-    /// `sdk.status:idle` for ONE turn (both provider fixtures emit exactly that
-    /// pair; the real sidecar's consumeStream finally emits the trailing idle).
-    /// The trailing idle is the SAME turn's closing punctuation, never a new
-    /// op's edge — folding it through attribution double-counts the turn. The
-    /// repair-delta fold missed this: with turn A running and C+S queued
-    /// behind it, A's result consumed the prior debt and then A's TRAILING IDLE
-    /// was attributed to the garlanded send (the FIFO-drop branch), clearing
-    /// the compact/send trackers and `in_turn` while C and S were still
-    /// queued — rollback passed the sole busy gate mid-queue.
-    ///
-    /// Queue: A running → C queued → S queued. EVERY turn ends with its pair
-    /// (result then idle).
-    ///   1. A's pair: the result folds as the owed prior edge; the trailing
-    ///      idle is pair-skipped (NEVER the garlanded drop proof) — the gate
-    ///      HOLDS;
-    ///   2. C's observed compacting + result + trailing idle retires C — the
-    ///      gate HOLDS (S still owed);
-    ///   3. S's result releases the gate (its trailing idle is skipped too).
-    #[tokio::test]
-    async fn a_turns_trailing_idle_is_pair_skipped_never_attributed_to_queued_ops() {
-        let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
-        let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qpair"), None).await;
-        let created = await_claude_created(&mut rx, "req-qpair").await;
-        let session_id = created["sessionId"].as_str().unwrap().to_string();
-        await_status_frame(&mut rx, &session_id, "idle").await;
-
-        st.handle_send(send_msg(&session_id, "turn one")).await; // A
-        st.handle_compact(compact_msg(&session_id, None)).await; // C
-        st.handle_send(send_msg(&session_id, "turn two")).await; // S
-
-        // (1) A's pair — the result consumes the ONE owed prior edge; the
-        // trailing idle is C's/S's edges' queue-mate punctuation, NEVER theirs.
-        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            in_turn_of(&st, &session_id).await,
-            "A's trailing idle is pair-punctuation, not the garlanded drop proof — the compact and send are STILL queued"
-        );
-        let (sink, captured) = capturing_sink();
-        st.handle_rollback(
-            rollback_op(&session_id, "rb-qpair-1", RollbackDirection::Undo),
-            sink,
-        )
-        .await;
-        let frames = captured_json(&captured);
-        assert_eq!(
-            frames[0]["event"]["code"], "BUSY_TURN",
-            "ep2-r1 F1: A's trailing idle must not release the gate over queued C/S: {frames:?}"
-        );
-        assert_eq!(
-            env.spawn_count(),
-            1,
-            "zero teardown from the refused attempt"
-        );
-
-        // (2) C observably runs and its pair lands: retires C — the gate HOLDS
-        // (S is generating behind it).
-        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
-        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
-        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            in_turn_of(&st, &session_id).await,
-            "C's pair retires C only — S's own terminal edge is still owed"
-        );
-        let (sink, captured) = capturing_sink();
-        st.handle_rollback(
-            rollback_op(&session_id, "rb-qpair-2", RollbackDirection::Undo),
-            sink,
-        )
-        .await;
-        assert_eq!(
-            captured_json(&captured)[0]["event"]["code"],
-            "BUSY_TURN",
-            "the garlanded send is still owed after C's pair — the gate holds"
-        );
-
-        // (3) S's pair: the result is the garlanded tail's last owed edge — the
-        // gate releases here; the trailing idle folds nothing further.
-        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
-        await_in_turn(&st, &session_id, false).await;
-        let (sink, captured) = capturing_sink();
-        st.handle_rollback(
-            rollback_op(&session_id, "rb-qpair-3", RollbackDirection::Undo),
-            sink,
-        )
-        .await;
-        let frames = captured_json(&captured);
-        assert_eq!(
-            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
-            "the gate released exactly at S's own terminal edge: {frames:?}"
-        );
-        drop(env);
-    }
-
     /// Focused-review ep2-r1 F2 (the stale prior-edge debt): a SECOND compact
     /// armed while the FIRST compact is mid-compaction owes C₁'s terminal edge
     /// (the one op active at its arm). When C₁'s terminal lands it is C₁'s OWN
@@ -22524,10 +22398,8 @@ rl.on('line', (line) => {
 
         st.handle_send(send_msg(&session_id, "turn one")).await; // A
         st.handle_compact(compact_msg(&session_id, None)).await; // C₁ queued
-                                                                 // A's pair lands first: the result settles the arm's prior debt; A's
-                                                                 // trailing idle is pair-skipped.
+                                                                 // A's result lands first: it settles the arm's prior debt.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // C₁ observably starts; C₂ arms while C₁ is MID-COMPACTION — it owes
@@ -22538,10 +22410,9 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C₂ armed
         st.handle_send(send_msg(&session_id, "turn two")).await; // S garlanded
 
-        // C₁'s pair: retires C₁ AND settles C₂'s owed edge — C₂ remains the
+        // C₁'s result: retires C₁ AND settles C₂'s owed edge — C₂ remains the
         // sole queued compact; S is still owed. The gate HOLDS throughout.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -22556,14 +22427,13 @@ rl.on('line', (line) => {
         assert_eq!(
             captured_json(&captured)[0]["event"]["code"],
             "BUSY_TURN",
-            "C₂ queued + S owed — the gate holds past C₁'s pair"
+            "C₂ queued + S owed — the gate holds past C₁'s result"
         );
 
-        // C₂ is provider-DROPPED (never observed compacting); S's pair lands:
+        // C₂ is provider-DROPPED (never observed compacting); S's result lands:
         // the result is the FIFO-drop proof (C₂ provably never ran), releasing
-        // at the LAST garlanded edge; the trailing idle is pair-skipped.
+        // at the LAST garlanded edge.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -22693,9 +22563,9 @@ rl.on('line', (line) => {
     /// AND closes the gate (in_turn=true); consumption at the boundary either
     /// promotes (gate stays held) or recomputes the owed-debt busy truth.
     ///
-    ///   A → C1 → C2 → A's pair → absorb probe (admitted; C1+C2 survive; gate
+    ///   A → C1 → C2 → A's result → absorb probe (admitted; C1+C2 survive; gate
     ///   open) → C1's STATUS lands (candidate: the gate RE-CLOSES immediately)
-    ///   → manual boundary (C1 promoted; held) → C1's pair (C1 retires; C2
+    ///   → manual boundary (C1 promoted; held) → C1's result (C1 retires; C2
     ///   owed) → absorb probe (admitted again) — the gate never rides the
     ///   proven-running interval.
     #[tokio::test]
@@ -22713,9 +22583,8 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_compact(compact_msg(&session_id, None)).await; // C2
 
-        // A's pair retires A: [C1, C2] queued, nothing running.
+        // A's result retires A: [C1, C2] queued, nothing running.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Provably-quiescent debt: the gate ADMITS (entries survive).
@@ -22753,7 +22622,7 @@ rl.on('line', (line) => {
         );
         assert!(in_turn_of(&st, &session_id).await);
 
-        // C1's boundary promotes it (still held); its own pair retires it; C2
+        // C1's boundary promotes it (still held); its own result retires it; C2
         // is owed; the gate admits at the next absorb probe, quiescent again.
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -22762,7 +22631,6 @@ rl.on('line', (line) => {
             "promotion holds the closed gate through the boundary"
         );
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -22787,7 +22655,7 @@ rl.on('line', (line) => {
     /// promotes the FRONT queued compact, so [C1 silently dropped, C2 runs] is
     /// in-band indistinguishable from [C1 runs, C2 queued]: C2's whole evidence
     /// set is consumed by the phantom C1 entry, and C2's own entry remains as
-    /// debt with NO further evidence — the trailing idle is pair-skipped, so
+    /// debt with NO further evidence, so
     /// `in_turn` holds forever and every later undo/redo is refused BUSY_TURN
     /// ("unavailable until another submission, which would itself destroy
     /// redo"). The gate now admits when the debt is provably quiescent:
@@ -22795,9 +22663,9 @@ rl.on('line', (line) => {
     /// compacts have not started (their runs raise the candidate FIRST), and
     /// the rollback teardown discards their provider-side inputs.
     ///
-    ///   A → C1 → C2 → A's pair (A retires) → C1 dropped (never evidences) →
+    ///   A → C1 → C2 → A's result (A retires) → C1 dropped (never evidences) →
     ///   C2 runs (status + manual boundary promotes the phantom C1) → C2's
-    ///   result + paired idle (the phantom retires; C2's entry remains) →
+    ///   result (the phantom retires; C2's entry remains) →
     ///   the rollback gate OPENS on admission: the provably-quiescent debt
     ///   absorbs (both in a single atomic decision).
     #[tokio::test]
@@ -22816,21 +22684,18 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_compact(compact_msg(&session_id, None)).await; // C2
 
-        // A's pair retires A: [C1, C2] queued, running empty.
+        // A's result retires A: [C1, C2] queued, running empty.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "both compacts owed");
 
         // C1 is provider-DROPPED (never evidences). C2 RUNS: its status marks
         // the candidate and its manual boundary promotes the FRONT — the
-        // phantom C1. C2's pair lands: the result retires running (phantom C1);
-        // the trailing idle is deliberately pair-skipped (ep2-r1 F1). C2's own
-        // entry is the surviving dead debt.
+        // phantom C1. C2's result lands: it retires running (phantom C1).
+        // C2's own entry is the surviving dead debt.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The debt is provably quiescent (nothing running, no candidate, no
@@ -22880,17 +22745,15 @@ rl.on('line', (line) => {
         st.handle_send(send_msg(&session_id, "turn two")).await; // S1
         st.handle_compact(compact_msg(&session_id, None)).await; // C2 (behind S1)
 
-        // A's pair: the result retires A; the trailing idle is pair-skipped.
+        // A's result retires A.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "three ops still queued");
 
-        // C1 is provider-DROPPED (never observed); S1's pair lands: the result
+        // C1 is provider-DROPPED (never observed); S1's result lands: the result
         // evidences C1's drop and retires S1 — but C2 is queued BEHIND S1 and
         // may still run, so the busy gate MUST stay closed past S1's edge.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -22919,7 +22782,6 @@ rl.on('line', (line) => {
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -22946,7 +22808,7 @@ rl.on('line', (line) => {
     /// of it already retired-or-dropped: those ahead compacts' silence at the
     /// live turn's generation IS the drop evidence, absorbed here.
     ///
-    ///   A running → C1 queued → B queued → A's pair → B generating NOW →
+    ///   A running → C1 queued → B queued → A's result → B generating NOW →
     ///   interrupt. Aftermath: NOTHING stands — the gate opens and STAYS sized
     ///   (a follow-up turn cycles fully clean).
     #[tokio::test]
@@ -22964,10 +22826,9 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_send(send_msg(&session_id, "turn two")).await; // B
 
-        // A's pair retires the running op; C1's compacting frame NEVER came —
+        // A's result retires the running op; C1's compacting frame NEVER came —
         // B generates (the drop-evidence window). The gate is closed.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -23002,11 +22863,10 @@ rl.on('line', (line) => {
             "ep2-r4 F1: the gate opened exactly at the interrupt and stays truthful: {frames:?}"
         );
 
-        // No-residue proof: a fresh turn's pair cycles the tracker fully clean.
+        // No-residue proof: a fresh turn's result cycles the tracker fully clean.
         st.handle_send(send_msg(&session_id, "turn three")).await;
         assert!(in_turn_of(&st, &session_id).await);
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         drop(env);
     }
@@ -23021,7 +22881,7 @@ rl.on('line', (line) => {
     /// interrupt retires the running slot OR the queue FRONT (the op actually in
     /// flight) — never the still-queued ops behind it.
     ///
-    /// A running → B queued → A's pair retires A → B starts → interrupt B.
+    /// A running → B queued → A's result retires A → B starts → interrupt B.
     #[tokio::test]
     async fn interrupting_a_queue_advanced_turn_releases_the_gate() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -23035,10 +22895,9 @@ rl.on('line', (line) => {
         st.handle_send(send_msg(&session_id, "turn one")).await; // A
         st.handle_send(send_msg(&session_id, "turn two")).await; // B queued
 
-        // A's pair retires the running op; B (the queue front) is now the
+        // A's result retires the running op; B (the queue front) is now the
         // de-facto active turn — the gate stays closed (B owes its own edge).
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -23101,10 +22960,9 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_send(send_msg(&session_id, "turn two")).await; // B
 
-        // A's pair retires A. [C1 (never promoted — dropped), B (now the
+        // A's result retires A. [C1 (never promoted — dropped), B (now the
         // de-facto active turn)] remains; the gate is closed.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "C1(dropped) + B owed");
         let (sink, captured) = capturing_sink();
@@ -23181,12 +23039,11 @@ rl.on('line', (line) => {
         );
 
         // C runs for real: observed compacting + confirmed-manual boundary +
-        // its pair — retires C, and S is STILL owed: the gate MUST stay closed
+        // its result — retires C, and S is STILL owed: the gate MUST stay closed
         // here.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -23206,9 +23063,8 @@ rl.on('line', (line) => {
         );
         assert_eq!(env.spawn_count(), 1, "zero teardown from refused attempts");
 
-        // S's pair: the gate releases exactly at S's own terminal edge.
+        // S's result: the gate releases exactly at S's own terminal edge.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23228,7 +23084,7 @@ rl.on('line', (line) => {
     /// settle-ack ≠ turn-complete per the SDK receipt-before-result contract
     /// at ep4-r2): with the settle deferred, the gate must stay closed for the
     /// whole provider-work window — and opens only at the interrupted turn's
-    /// OWN terminal frames (result + paired idle, emitted after the receipt
+    /// OWN terminal frame (its result, emitted after the receipt
     /// in that order).
     ///
     ///   A running → interrupt (settle chain deferred by knob) → mid-window
@@ -23266,8 +23122,8 @@ rl.on('line', (line) => {
             "the busy truth holds past the request write"
         );
 
-        // The deferred chain arrives (receipt, then the turn's own result +
-        // paired idle): the gate opens exactly at the op's own terminal edge.
+        // The deferred chain arrives (receipt, then the turn's own result):
+        // the gate opens exactly at the op's own terminal edge.
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23321,10 +23177,9 @@ rl.on('line', (line) => {
             "the rejected interrupt left the running turn owed — gate closed"
         );
 
-        // The turn's OWN terminal edge (its real result + paired idle) retires
+        // The turn's OWN terminal edge (its real result) retires
         // it — the gate opens exactly there.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23353,7 +23208,7 @@ rl.on('line', (line) => {
     /// (BUSY_TURN + compensating ledger rewrite), the sidecar survives.
     ///
     ///   Transcript-eligible durable fixture on a LIVE fake sidecar; [A → C1 →
-    ///   A's pair → C2] owed compacts; the gate absorb admits; the pre-teardown
+    ///   A's result → C2] owed compacts; the gate absorb admits; the pre-teardown
     ///   quiesce probe (an interrupt write) elicits the fake's
     ///   FRESHELL_TEST_CLAUDE_PROBE_COMPACT_BEFORE_SETTLE compacting STATUS
     ///   before its settle → the recheck provably sees the revived candidate
@@ -23372,13 +23227,12 @@ rl.on('line', (line) => {
         st.set_identity_sink(sink_impl.clone());
         insert_rollback_fixture_session_with_live_sidecar(&st, "rb-probe", "dur-probe").await;
 
-        // [A → C1][A's pair][C2] — compact-only owed queue (C1 promoted
+        // [A → C1][A's result][C2] — compact-only owed queue (C1 promoted
         // briefly under A, so retiring A leaves BOTH compacts queued and
         // never-promoted: the absorb family's admittance shape).
         st.handle_send(send_msg("rb-probe", "turn one")).await; // A
         st.handle_compact(compact_msg("rb-probe", None)).await; // C1 queued behind A
         inject_raw_send(&st, "rb-probe", "__emit_result_error__").await;
-        inject_raw_send(&st, "rb-probe", "__emit_idle__").await;
         st.handle_compact(compact_msg("rb-probe", None)).await; // C2 queued
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -23434,7 +23288,7 @@ rl.on('line', (line) => {
         st.handle_send(send_msg(&session_id, "turn one")).await; // A running
         st.handle_send(send_msg(&session_id, "turn two")).await; // B queued
 
-        // Interrupt A: receipt + A's own trailing result/idle (in that order).
+        // Interrupt A: receipt + A's own result (in that order).
         // NOTHING beyond A may retire.
         st.handle_interrupt(interrupt_msg(&session_id)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -23456,7 +23310,6 @@ rl.on('line', (line) => {
 
         // B's own terminal frames retire it — the gate opens exactly there.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23535,11 +23388,10 @@ rl.on('line', (line) => {
         let _ =
             insert_rollback_fixture_session_with_live_sidecar(&st, "rb-qadmit", "dur-qadmit").await;
 
-        // Compact-only owed queue (C1 rides under A; A's pair retires it; C2).
+        // Compact-only owed queue (C1 rides under A; A's result retires it; C2).
         st.handle_send(send_msg("rb-qadmit", "turn one")).await;
         st.handle_compact(compact_msg("rb-qadmit", None)).await;
         inject_raw_send(&st, "rb-qadmit", "__emit_result_error__").await;
-        inject_raw_send(&st, "rb-qadmit", "__emit_idle__").await;
         st.handle_compact(compact_msg("rb-qadmit", None)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -23591,12 +23443,11 @@ rl.on('line', (line) => {
         st.set_identity_sink(sink_impl.clone());
         insert_rollback_fixture_session_with_live_sidecar(&st, "rb-vhanded", "dur-vhanded").await;
 
-        // A send+compact arm the debt realistically (A's pair folds them to
+        // A send+compact arm the debt realistically (A's result folds them to
         // absorb shape: [C] owed, running empty).
         st.handle_send(send_msg("rb-vhanded", "turn one")).await;
         st.handle_compact(compact_msg("rb-vhanded", None)).await;
         inject_raw_send(&st, "rb-vhanded", "__emit_result_error__").await;
-        inject_raw_send(&st, "rb-vhanded", "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let (sink, captured) = capturing_sink();

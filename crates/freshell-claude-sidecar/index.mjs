@@ -34,14 +34,17 @@
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
 //                                  the stopped turn's own aborted result (an accepted user interrupt's mark
 //                                  silences only that — turn-complete-gate.mjs); also minted from consumeStream's finally
-//                                  when a turn ends with NO result frame (stream exception or natural EOF
+//                                  when a turn ends with NO result frame (the CLI died or the stream ended
 //                                  with a send still pending) — the abort/sdk.exit requested-teardown path
 //                                  stays silent
 //     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
 //     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
 //     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
 //                                  (sanitized text, no [ede_diagnostic] lines); never for the user's own Stop
-//     { type:'sdk.exit',                sessionId }
+//     { type:'sdk.stream.ended',        sessionId, reason, message }      // the session's SDK stream ended
+//                                  unrequested (reason cli_exited | stream_error | stream_eof, stream-end.mjs):
+//                                  always the LAST line; the sidecar then exits with code 3 (G02)
+//     { type:'sdk.exit',                sessionId }                       // a requested teardown (abort)
 //     { type:'sdk.permission.request',  sessionId, requestId, subtype:'can_use_tool', tool:{name,input}, toolUseID, suggestions, blockedPath, decisionReason }
 //     { type:'sdk.question.request',    sessionId, requestId, questions }
 //     { type:'sdk.permission.cancelled', sessionId, requestId }
@@ -60,11 +63,15 @@
 // from this process's own stdout: `sdk.turn.complete` rides every SDK
 // `result` (the unified needs-attention edge — only the stopped turn's own
 // aborted result is silenced, by the accepted-interrupt mark) plus the
-// consumeStream finally mint for a result-less turn end (stream exception or
-// natural EOF with a send pending; never the aborted/sdk.exit teardown). If
-// the PROCESS dies mid-turn, stdout simply ends and no completion is ever
-// written — that unrequested death is what the Rust-side death synthesis
-// (ADR Decision 2.1) rings for.
+// consumeStream finally mint for a result-less turn end (the CLI died or the
+// stream ended with a send pending; never the aborted/sdk.exit teardown).
+//
+// Process lifetime: one sidecar hosts one session. When that session's SDK
+// stream ends without a request, the sidecar writes `sdk.stream.ended` last
+// and exits with code 3, so the Rust end-of-output path ends the session. A
+// requested teardown (shutdown, SIGTERM, stdin closing) exits 0 and reports
+// nothing. If the PROCESS itself dies mid-turn, stdout simply ends with no
+// `sdk.stream.ended` — the one end the Rust side rings for itself.
 //
 // Scope discipline (ADR "keep it minimal — only what the claude T2 invariant set
 // needs"): the freshell MCP-server injection (createClaudeSdkMcpServers) is
@@ -89,6 +96,7 @@ import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
 import { cliStderrLogger, errorText, log } from './log.mjs'
 import { isHostedSidecar } from './hosted.mjs'
+import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -106,6 +114,11 @@ const { query } = sdkModule
 function emit(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`)
 }
+
+/** Set once the session's stream has ended unrequested: the sidecar is exiting. */
+let exiting = false
+/** How long an exiting sidecar waits for stdout and stderr to flush. */
+const EXIT_FLUSH_BUDGET_MS = 2000
 
 // ── nanoid()-compatible bare id: 21 url-safe chars ([A-Za-z0-9_-]) ───────────
 // Faithful shape of server/sdk-bridge.ts's `const sessionId = nanoid()` (the
@@ -337,42 +350,62 @@ async function consumeStream(sessionId, sdkQuery) {
   let failure
   try {
     for await (const msg of sdkQuery) handleSdkMessage(sessionId, msg)
-  } catch (err) {
-    failure = err
-    emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
+  } catch (error) {
+    failure = { error }
   } finally {
-    // A requested teardown (abort) is routine; any other error end is the CLI
-    // dying or failing under the session.
-    if (st?.abort.signal.aborted) log('info', 'stream.ended', { sessionId, reason: 'aborted' })
-    else if (failure) log('warn', 'stream.ended', { sessionId, reason: 'stream_error', error: errorText(failure) })
-    else log('info', 'stream.ended', { sessionId, reason: 'stream_eof' })
-    // Stream ended (natural end, error, or abort). The transport is closing:
-    // clear any parked cards WITHOUT resolving their promises (LB-04: a late
-    // resolve lands inside the SDK's floating promise chain → unhandled
-    // rejection → crash under Node 22 throw-mode).
-    if (st) {
-      cancelPending(st, emit, sessionId, { resolveDeny: false })
-    }
-    // A turn that ends with NO result frame — stream exception OR natural
-    // EOF with a result still pending — IS a turn end the user didn't
-    // witness: ring the unified edge (the abort/sdk.exit path is a
-    // REQUESTED teardown and deliberately stays silent). pendingResults
-    // covers the accept→first-message window turnOpen cannot see, and
-    // counts queued sends a boolean would lose. A pending Stop mark does not
-    // silence it: only an aborted result is the stopped turn's own
-    // (turn-complete-gate.mjs), and this end has no result.
-    if (st && st.pendingResults > 0 && !st.abort.signal.aborted) {
-      const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
-      st.lastTurnCompleteAt = at
-      emit({ type: 'sdk.turn.complete', sessionId, at })
-    }
-    // Mirror SdkBridge: an aborted session surfaces sdk.exit; a natural end
-    // surfaces an idle status. NEITHER is a completion chime, so a mid-turn
-    // death cannot fake a turn.complete.
-    if (st?.abort.signal.aborted) emit({ type: 'sdk.exit', sessionId })
-    else emit({ type: 'sdk.status', sessionId, status: 'idle' })
+    // An abort is a requested teardown (shutdown); any other end is the CLI
+    // dying under the session or ending it.
+    const requested = st?.abort.signal.aborted === true
+    const ended = requested ? undefined : streamEnd(failure)
+    if (requested) log('info', 'stream.ended', { sessionId, reason: 'aborted' })
+    else log(failure ? 'warn' : 'info', 'stream.ended', { sessionId, reason: ended.reason, ...(failure ? { error: ended.message } : {}) })
+    // The transport is closing: clear any parked cards WITHOUT resolving their
+    // promises (LB-04: a late resolve lands inside the SDK's floating promise
+    // chain → unhandled rejection → crash under Node 22 throw-mode).
+    if (st) cancelPending(st, emit, sessionId, { resolveDeny: false })
     sessions.delete(sessionId)
+    if (requested) {
+      emit({ type: 'sdk.exit', sessionId })
+    } else {
+      // Interim, until Rust mints every edge (C18): a turn that ends with NO
+      // result frame — the CLI died, or the stream ended, with a result still
+      // pending — is a turn end the user didn't witness, so it rings here.
+      // pendingResults covers the accept→first-message window and counts
+      // queued sends. A pending Stop mark does not silence it: only an aborted
+      // result is the stopped turn's own (turn-complete-gate.mjs). Rust rings
+      // only for a death that reports no stream end, so this edge is the one.
+      if (st && st.pendingResults > 0) {
+        const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+        st.lastTurnCompleteAt = at
+        emit({ type: 'sdk.turn.complete', sessionId, at })
+      }
+      // Interim, until the exited status replaces it (C09): the idle status
+      // takes a compacting pane out of its busy state.
+      emit({ type: 'sdk.status', sessionId, status: 'idle' })
+      // The end of the stream is the end of this sidecar (G02): report how
+      // the stream ended, last, and exit, so the server's end-of-output path
+      // ends the session instead of keeping a sidecar with no session.
+      emit({ type: 'sdk.stream.ended', sessionId, ...ended })
+      exitAfterStreamEnd(st)
+    }
   }
+}
+
+/**
+ * After an unrequested stream end: read no more requests (sdk.stream.ended
+ * stays the last line), make sure the CLI is gone, and exit with
+ * STREAM_ENDED_EXIT_CODE once stdout and stderr have flushed.
+ */
+function exitAfterStreamEnd(st) {
+  if (exiting) return
+  exiting = true
+  try { st?.query?.close?.() } catch (error) { log('warn', 'stream.close_failed', { error: errorText(error) }) }
+  let unflushed = 2
+  const flushed = () => { if (--unflushed === 0) process.exit(STREAM_ENDED_EXIT_CODE) }
+  process.stdout.write('', flushed)
+  process.stderr.write('', flushed)
+  // A pipe that never drains must not keep a sidecar with no session alive.
+  setTimeout(() => process.exit(STREAM_ENDED_EXIT_CODE), EXIT_FLUSH_BUDGET_MS)
 }
 
 // ── request handlers ─────────────────────────────────────────────────────────
@@ -610,6 +643,8 @@ function shutdown() {
 // ── stdin dispatch loop (newline-JSON) ───────────────────────────────────────
 const rl = createInterface({ input: process.stdin })
 rl.on('line', (line) => {
+  // An exiting sidecar has no session left: sdk.stream.ended stays its last line.
+  if (exiting) return
   const trimmed = line.trim()
   if (!trimmed) return
   let req
@@ -659,7 +694,7 @@ rl.on('line', (line) => {
 })
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
 // grandchild is left mid-stream.
-rl.on('close', () => { shutdown(); process.exit(0) })
+rl.on('close', () => { if (!exiting) { shutdown(); process.exit(0) } })
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 process.on('SIGINT', () => { shutdown(); process.exit(0) })
 

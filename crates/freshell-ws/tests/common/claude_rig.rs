@@ -67,6 +67,9 @@ pub struct ClaudeRig {
     pub claude_config_dir: PathBuf,
     /// The simulator's ledger (JSONL; written by [`RigKind::Sim`] only).
     pub ledger: PathBuf,
+    /// The rig server's claude lane, for the server-side truths a test checks
+    /// (for example `has_live_session`).
+    pub fresh_claude: freshell_freshagent::FreshClaudeState,
     /// The local fake Anthropic endpoint ([`RigKind::Cli`] only), killed on drop.
     _provider: Option<tokio::process::Child>,
     _root: tempfile::TempDir,
@@ -159,7 +162,7 @@ impl ClaudeRig {
             environment.push(((*key).into(), (*value).into()));
         }
 
-        let url = spawn_rig_server(environment).await;
+        let (url, fresh_claude) = spawn_rig_server(environment).await;
         eprintln!(
             "{}",
             json!({
@@ -173,6 +176,7 @@ impl ClaudeRig {
             workspace,
             claude_config_dir,
             ledger,
+            fresh_claude,
             _provider: provider,
             _root: root,
         }
@@ -392,6 +396,23 @@ impl RigConnection {
             .collect()
     }
 
+    /// Keep reading frames for `quiet` and keep them in [`Self::frames`]: a bounded
+    /// window for asserting that nothing more arrives (a second edge, say).
+    pub async fn read_for(&mut self, quiet: Duration) {
+        let deadline = tokio::time::Instant::now() + quiet;
+        loop {
+            match tokio::time::timeout_at(deadline, self.ws.next()).await {
+                Ok(Some(Ok(WsMessage::Text(text)))) => {
+                    self.frames
+                        .push(serde_json::from_str(&text).expect("json frame"));
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => panic!("ws error while reading: {error}"),
+                Ok(None) | Err(_) => return,
+            }
+        }
+    }
+
     /// The first `freshAgent.event` whose inner event has this type.
     pub async fn wait_for_event(&mut self, event_type: &str) -> Value {
         self.wait_for(&format!("a {event_type} event"), |v| {
@@ -508,7 +529,9 @@ async fn start_local_provider() -> (tokio::process::Child, String) {
 
 /// A freshell-ws server on an ephemeral loopback port (never 3001/3002) with fresh
 /// agents enabled and a claude state whose sidecars get exactly `environment`.
-async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
+async fn spawn_rig_server(
+    environment: Vec<(String, String)>,
+) -> (String, freshell_freshagent::FreshClaudeState) {
     let mut settings_value = test_settings_value();
     settings_value["freshAgent"]["enabled"] = json!(true);
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
@@ -525,6 +548,7 @@ async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
         .with_sidecar_environment(environment);
     fresh_claude.set_ownership(Arc::clone(&ownership));
+    let lane = fresh_claude.clone();
 
     let state = WsState {
         layout: Default::default(),
@@ -588,5 +612,5 @@ async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    format!("ws://{addr}/ws")
+    (format!("ws://{addr}/ws"), lane)
 }

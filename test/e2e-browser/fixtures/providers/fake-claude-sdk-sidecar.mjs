@@ -36,8 +36,10 @@
 // Turn semantics: `send` ALWAYS opens with sdk.status running (bookkeeping the
 // real bridge performs unconditionally); a matching program rule then owns
 // the turn; when no rule emitted completion/crash — AND no approval/question
-// parked the turn — the canned assistant+turn.complete+idle success turn
-// closes it. A turn that raised an approval/question PARKS: it stays open
+// parked the turn — the canned assistant+result+turn.complete success turn
+// closes it. Like the real sidecar, a turn ends with its result alone: there
+// is no per-turn idle (the real sidecar sends idle only when its stream ends).
+// A turn that raised an approval/question PARKS: it stays open
 // until a matching permission.respond/question.respond (or interrupt) arrives,
 // exactly like the real sidecar's parked canUseTool promise.
 //
@@ -62,9 +64,8 @@
 // (sdk.d.ts:2384-2394; the real sidecar's ok:false 'no in-flight SDK query'
 // shape fires only when the SDK surface lacks the interrupt method entirely)
 // — and NOTHING arms, so no stray mark survives to eat the NEXT unrelated
-// turn's ring. Either way the turn ends with sdk.status idle — NEVER an
-// sdk.exit (the real sidecar keeps the session alive across interrupt;
-// AGENT-03's interrupt/kill separation).
+// turn's ring. Either way it is NEVER an sdk.exit (the real sidecar keeps the
+// session alive across interrupt; AGENT-03's interrupt/kill separation).
 //
 // Raw-stdin audit (AGENT-05/06 e2e): when FRESHELL_FAKE_STDIN=<path> is set,
 // EVERY raw stdin line is appended there as a JSONL row {t, pid, line} —
@@ -78,10 +79,14 @@
 // subtype — success, error, max-turns, denied — EXCEPT the stopped turn's own
 // aborted result under a pending accepted user-interrupt mark (the user's own
 // interrupt never rings).
-// The `stream-error` lane models the real consumeStream catch+finally for a
-// mid-turn stream exception: sdk.error + the finally-minted edge + session
-// teardown WITHOUT exiting the process; the `crash` lane stays as-is (a real
-// crash screams no protocol frame and exits — the Rust unrequested-death
+// The `stream-error` lane models the real sidecar's end of stream (its
+// consumeStream finally): cancel the parked cards, the finally-minted edge for
+// a turn that ends with no result, the stream-end idle, then
+// `sdk.stream.ended {reason, message}` as the LAST line and exit code 3 (each
+// sidecar hosts one session, so its stream's end is the sidecar's end). The
+// Rust server reports the exit (SIDECAR_EXITED) and, because the end was
+// reported, does not ring again. The `crash` lane stays as-is (a real Node
+// death screams no protocol frame and exits — the Rust unrequested-death
 // synthesis rings for it, and an edge from the crash lane would double-ring).
 //
 // Wire audit (D1-F2): every OUTBOUND frame is ALSO recorded into the
@@ -107,7 +112,7 @@
 // Rust server uses; the sidecar inherits the harness's isolated HOME.
 //
 // The process stays alive until `shutdown` (exit 0), a scripted `crash`
-// (exit code), or kill — an early exit would stop the server-side consumer.
+// (exit code), a `stream-error` (exit 3), or kill.
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -118,6 +123,10 @@ import { createTurnCompleteGate } from '../../../../crates/freshell-claude-sidec
 import { nextMonotonic } from '../../../../crates/freshell-claude-sidecar/monotonic-clock.mjs'
 
 const provider = process.env.FRESHELL_FAKE_PROVIDER ?? 'kilroy'
+/** The real sidecar's exit code after its SDK stream ends (stream-end.mjs). */
+const STREAM_ENDED_EXIT_CODE = 3
+/** Set by the stream-error lane: the fake is exiting and reads no more requests. */
+let exiting = false
 /** The SDK result the pinned CLI reports for a turn a Stop landed on (T11). */
 const STOPPED_RESULT = Object.freeze({ type: 'result', subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
 const env = process.env
@@ -298,19 +307,15 @@ async function render(event) {
         emit({ type: 'sdk.turn.complete', sessionId, at })
       }
       st.turnOpen = false
-      emit({ type: 'sdk.status', sessionId, status: 'idle' })
       break
     }
     case 'stream-error': {
-      // The real consumeStream catch+finally for a mid-turn stream exception:
-      // the catch arm's sdk.error, then the finally's teardown — cancel every
-      // parked entry, mint the unified attention edge (a turn ended with NO
-      // result frame: pendingResults > 0, not aborted; a pending Stop mark
-      // never silences a result-less end), idle
-      // status — and the session is deleted WITHOUT exiting the process (a
-      // later create on the same live process works). The separate `crash`
-      // lane deliberately stays different: no protocol frame + process exit.
-      emit({ type: 'sdk.error', sessionId, message: data.message ?? 'SDK error: fixture stream error' })
+      // The real sidecar's end of stream (index.mjs consumeStream finally):
+      // cancel every parked entry, mint the unified attention edge (a turn
+      // ended with NO result frame: pendingResults > 0; a pending Stop mark
+      // never silences a result-less end), the stream-end idle, then
+      // sdk.stream.ended as the LAST line and exit code 3. The separate
+      // `crash` lane deliberately stays different: no protocol frame + exit.
       const st = sessions.get(sessionId)
       if (st) {
         for (const entry of st.pendingEntries.splice(0)) {
@@ -329,6 +334,14 @@ async function render(event) {
       }
       emit({ type: 'sdk.status', sessionId, status: 'idle' })
       if (st) sessions.delete(sessionId)
+      emit({
+        type: 'sdk.stream.ended',
+        sessionId,
+        reason: data.reason ?? 'stream_error',
+        message: data.message ?? 'Fixture stream error',
+      })
+      exiting = true
+      process.stdout.write('', () => process.exit(STREAM_ENDED_EXIT_CODE))
       break
     }
     case 'marker':
@@ -355,6 +368,8 @@ const engine = new FixtureEngine({
 const rl = readline.createInterface({ input: process.stdin })
 rl.on('line', (line) => {
   appendJsonl(STDIN_LOG, { t: Date.now(), pid: process.pid, line })
+  // Like the real sidecar: once its stream ended, sdk.stream.ended stays the last line.
+  if (exiting) return
   void handleInput(line).catch((err) => {
     emit({ type: 'sdk.error', sessionId: activeSessionId, message: String(err?.message ?? err) })
   })
@@ -562,7 +577,7 @@ async function handleInput(line) {
       if (st.sendInFlight) return
       // Parked/plain in-flight turn: nothing else will end it, so synthesize
       // the interrupted turn's own non-success terminal result — the armed
-      // gate consumes its ring — then idle. Still NEVER an sdk.exit. The
+      // gate consumes its ring. Still NEVER an sdk.exit. The
       // counter goes to ZERO, not minus one: the fake models ONE in-flight
       // turn, so the interrupt ends everything pending — a stale-positive
       // counter here would let a later stream-error lane mint a phantom ring
@@ -572,7 +587,6 @@ async function handleInput(line) {
       st.turnCompleteGate.resultEmitsAttention(STOPPED_RESULT)
       st.turnOpen = false
       st.interrupted = false
-      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
       return
     }
     // No turn awaits a terminal frame — real-sidecar parity: the SDK RESOLVES

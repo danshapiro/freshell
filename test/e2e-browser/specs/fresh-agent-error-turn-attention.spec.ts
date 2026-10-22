@@ -23,9 +23,11 @@
 //      still folds the edge and sets the attention flag — the bell rings for
 //      any tab when the window is unfocused (the sound suppression split is
 //      unit-pinned; e2e asserts the fold partition);
-//   5. a mid-turn stream exception (sdk.error + the finally-minted edge, NO
-//      process exit) rings exactly one edge, resolves the pane to idle, and
-//      leaves the sidecar process alive (no unrequested-death double edge).
+//   5. a mid-turn end of the SDK stream (the finally-minted edge, then
+//      sdk.stream.ended and the sidecar's exit) rings exactly one edge,
+//      resolves the pane to idle, reports the exit (SIDECAR_EXITED), and the
+//      sidecar process is gone: a stream end is a session end (G02), and the
+//      server does not ring a second time for the reported end.
 //
 // The user-Stop lane runs on the PRODUCTION sidecar
 // (crates/freshell-claude-sidecar/index.mjs) over the CLI simulator
@@ -87,10 +89,9 @@ const FAKE_PROGRAM = {
       ],
     },
     {
-      // Mid-turn stream-exception lane (NO process exit): sdk.error + the
-      // finally-minted unified edge + session teardown. The sidecar stays
-      // alive — the separate `crash` lane (silent process death) belongs to
-      // the Rust-synthesis lanes.
+      // Mid-turn end-of-stream lane: the finally-minted unified edge, then
+      // sdk.stream.ended and exit code 3, like the real sidecar. The separate
+      // `crash` lane (silent process death) belongs to the Rust-synthesis lanes.
       on: 'msg:send',
       match: { text: 'STREAM_ERROR' },
       emit: [{ kind: 'stream-error', delayMs: 3_000 }],
@@ -355,47 +356,67 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
         .toBeNull()
       await paneStatus().toBe('idle')
 
-      // ── Step 5: mid-turn stream exception — NO process exit ────────────
-      // The fake's stream-error lane models the real consumeStream
-      // catch+finally: sdk.error + the finally-minted unified edge + session
-      // teardown, with the sidecar process still alive.
+      // ── Step 5: the SDK stream ends mid-turn — the sidecar exits ───────
+      // The fake's stream-error lane models the real sidecar's end of stream:
+      // the finally-minted unified edge, then sdk.stream.ended as its last
+      // line and exit code 3. The server reports the exit and, because the end
+      // was reported, does not ring again.
       await composer.fill('STREAM_ERROR')
       await sendButton.click()
       await page.locator(`[data-context="tab"][data-tab-id="${tabB}"]`).click()
 
       await expect
         .poll(async () => (await turnCompletionState()).seq ?? 0,
-          { timeout: 30_000, message: 'the stream-exception turn rings exactly one unified edge (seq 4)' })
+          { timeout: 30_000, message: 'the turn the stream ended in rings exactly one unified edge (seq 4)' })
         .toBe(4)
       await expect
         .poll(async () => (await turnCompletionState()).attentionByTab?.[tabA] ?? null,
-          { timeout: 15_000, message: 'the unwitnessed stream exception sets attention' })
+          { timeout: 15_000, message: 'the unwitnessed end sets attention' })
         .toBe(true)
       await expect
         .poll(async () => {
           const layout = await harness.getPaneLayout(tabA)
           return findFreshAgentLeaf(layout)?.content?.status ?? null
-        }, { timeout: 30_000, message: 'the pane resolves to idle after the stream exception' })
+        }, { timeout: 30_000, message: 'the pane resolves to idle after the stream ends' })
         .toBe('idle')
+      // The server reported the sidecar's exit to the pane.
+      await expect
+        .poll(async () => {
+          const state = await harness.getState()
+          const sessions = Object.values(state?.freshAgent?.sessions ?? {}) as any[]
+          return sessions.find((session) => session.sessionId === bridgeSessionId)?.lastErrorCode ?? null
+        }, { timeout: 30_000, message: 'the pane learns the sidecar exited (SIDECAR_EXITED)' })
+        .toBe('SIDECAR_EXITED')
 
-      // The sidecar process is STILL ALIVE: the wire rows carry its pid and
-      // signal-0 proves the process exists — a process death would have let
-      // the Rust unrequested-death synthesis mint a SECOND edge, which the
-      // exact-one seq pin above already excludes; this is the direct proof.
+      // The sidecar process is GONE: the wire rows carry its pid, the last
+      // one it wrote is the end report, and signal 0 finds no process.
       const streamWires = readJsonl(path.join(sharedRoot, 'sidecar-events.jsonl'))
         .filter((r) => r.kind === 'wire' && r.frame?.sessionId === bridgeSessionId)
       expect(streamWires.length, 'the session produced wire rows to read the sidecar pid from').toBeGreaterThan(0)
       const sidecarPid = streamWires[0].pid as number
-      expect(() => process.kill(sidecarPid, 0), 'the sidecar process survived the stream error (no exit)').not.toThrow()
-      const streamErrIdx = streamWires.findIndex((r) => r.frame?.type === 'sdk.error')
-      expect(streamErrIdx, 'the stream-exception lane surfaced its sdk.error frame').toBeGreaterThanOrEqual(0)
+      expect(streamWires.at(-1)?.frame, 'the sidecar wrote sdk.stream.ended last').toMatchObject({ type: 'sdk.stream.ended', reason: 'stream_error' })
+      await expect
+        .poll(() => {
+          try {
+            process.kill(sidecarPid, 0)
+            return 'alive'
+          } catch {
+            return 'gone'
+          }
+        }, { timeout: 30_000, message: 'the sidecar process exited after its stream ended' })
+        .toBe('gone')
+      // Each send opens with a running status: count the edges after the last one.
+      const lastSendOpen = streamWires
+        .map((r) => r.frame?.type === 'sdk.status' && r.frame?.status === 'running')
+        .lastIndexOf(true)
+      expect(lastSendOpen, 'the ended turn opened with a running status').toBeGreaterThanOrEqual(0)
       expect(
-        streamWires.slice(streamErrIdx).filter((r) => r.frame?.type === 'sdk.turn.complete'),
-        'exactly one unified edge for the stream-exception turn (fenced after its sdk.error; the session\'s earlier turns each rang their own edge)',
+        streamWires.slice(lastSendOpen).filter((r) => r.frame?.type === 'sdk.turn.complete'),
+        'exactly one unified edge for the ended turn (the session\'s earlier turns each rang their own edge)',
       ).toHaveLength(1)
 
-      // One edge total for the lane — stable across a settle window (no
-      // death-synthesis double ring).
+      // One edge total for the lane — stable across a settle window (the
+      // reported end gets no second, server-minted edge).
       await page.waitForTimeout(1_500)
       expect((await turnCompletionState()).seq).toBe(4)
     } finally {

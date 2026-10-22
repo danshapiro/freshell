@@ -154,8 +154,16 @@ describe('the sidecar log', () => {
     const sessionId = await sidecar.create()
     sidecar.send({ type: 'send', sessionId, text: 'hello' })
     const ended = await waitForRecord(sidecar, 'stream.ended', (record) => record.event === 'stream.ended')
-    expect(ended).toMatchObject({ severity: 'warn', component: 'claude-sidecar', sessionId, reason: 'stream_error' })
+    expect(ended).toMatchObject({ severity: 'warn', component: 'claude-sidecar', sessionId, reason: 'cli_exited' })
     expect(ended.error).toContain('terminated by signal SIGKILL')
+  })
+
+  it('logs an SDK stream that ends without an error at info, with no error', async () => {
+    const sidecar = await startRealSidecar({ program: { rules: [{ on: 'msg:prompt', emit: [{ kind: 'crash', data: { code: 0 } }] }] } })
+    const sessionId = await sidecar.create()
+    sidecar.send({ type: 'send', sessionId, text: 'hello' })
+    const ended = await waitForRecord(sidecar, 'stream.ended', (record) => record.event === 'stream.ended')
+    expect(ended).toEqual({ severity: 'info', component: 'claude-sidecar', event: 'stream.ended', sessionId, reason: 'stream_eof' })
   })
 
   it('writes only JSON records with a real severity and an event name', async () => {
