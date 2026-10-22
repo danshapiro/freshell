@@ -1453,7 +1453,7 @@ describe('tabsSlice', () => {
       expect(store.getState().tabs.activeTabId).toBe('local-fallback')
     })
 
-    it('updates title of existing tab for fresh-agent session when reopened with new title', async () => {
+    it('updates title of an existing legacy tab for a fresh-agent session when reopened with new title', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
@@ -1461,6 +1461,9 @@ describe('tabsSlice', () => {
         mode: 'claude',
         title: 'Old Name',
         sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        // A legacy tab: a session-owned tab's title is the saved-name mirror
+        // and openSessionTab never retitles it (covered separately).
+        nameSource: { kind: 'legacy' },
         sessionMetadataByKey: {
           [`claude:${VALID_CLAUDE_SESSION_ID}`]: { sessionType: 'freshclaude' },
         },
@@ -1738,7 +1741,7 @@ describe('tabsSlice', () => {
       expect(tab?.title).toBe('Stale Title')
     })
 
-    it('syncs pane title alongside tab title when hasTitle is true via findTabIdForSession', async () => {
+    it('syncs pane title alongside a legacy tab title when hasTitle is true via findTabIdForSession', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
@@ -1746,6 +1749,9 @@ describe('tabsSlice', () => {
         mode: 'claude',
         title: 'Claude',
         sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        // A legacy tab: a session-owned tab's title is the saved-name mirror
+        // and openSessionTab never retitles it (covered separately).
+        nameSource: { kind: 'legacy' },
       }))
       store.dispatch(initLayout({
         tabId: 'local-fallback',
@@ -1773,7 +1779,7 @@ describe('tabsSlice', () => {
       }
     })
 
-    it('syncs pane title alongside tab title when hasTitle is true via terminalId', async () => {
+    it('syncs pane title alongside a legacy tab title when hasTitle is true via terminalId', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
@@ -1781,6 +1787,9 @@ describe('tabsSlice', () => {
         mode: 'claude',
         title: 'Old',
         sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        // A legacy tab: a session-owned tab's title is the saved-name mirror
+        // and openSessionTab never retitles it (covered separately).
+        nameSource: { kind: 'legacy' },
       }))
       store.dispatch(initLayout({
         tabId: 'term-tab',
@@ -1805,7 +1814,7 @@ describe('tabsSlice', () => {
       }
     })
 
-    it('preserves pane user-set title when syncing hasTitle', async () => {
+    it('preserves pane user-set title when syncing hasTitle into a legacy tab', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
@@ -1813,6 +1822,9 @@ describe('tabsSlice', () => {
         mode: 'claude',
         title: 'Claude',
         sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        // A legacy tab: a session-owned tab's title is the saved-name mirror
+        // and openSessionTab never retitles it (covered separately).
+        nameSource: { kind: 'legacy' },
       }))
       store.dispatch(initLayout({
         tabId: 'local-fallback',
