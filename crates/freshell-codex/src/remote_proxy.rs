@@ -875,7 +875,9 @@ struct Hub {
     /// incident.
     capacity_trigger_gate: EmissionGate,
     /// Plan §4.3.1c: connections whose latest teardown was Capacity-classified.
-    /// The paired generic errored trigger for these is suppressed — the
+    /// BOTH halves of the generic teardown pair are suppressed for these — the
+    /// paired generic errored trigger (`handle_stream_error`'s Other arm) and
+    /// the teardown-close `ProxyClose` (`HubMsg::UpstreamClosed`) — the
     /// classified line IS the record for that connection's teardown.
     capacity_classified_conns: HashSet<u64>,
     /// Plan §4.3.2: the growth canary's OWN emission gate — deliberately a
@@ -985,10 +987,19 @@ async fn run_hub(
                 hub.handle_stream_error(conn_id, false, kind);
             }
             HubMsg::UpstreamClosed { conn_id } => {
-                hub.capacity_classified_conns.remove(&conn_id);
-                hub.emit(RemoteProxyEvent::RepairTrigger(
-                    RemoteProxyRepairTrigger::ProxyClose,
-                ));
+                // §4.3.1c teardown-pair suppression, the close half: a
+                // connection whose teardown follows a Capacity-classified
+                // error must not ALSO log the generic ProxyClose — the
+                // classified line IS the record for that connection's
+                // teardown. An UNMARKED connection (a genuine upstream clean
+                // close, e.g. the pane's app-server exiting) keeps its
+                // ProxyClose diagnostic exactly as before: the suppression
+                // is per-connection and causal, never global.
+                if !hub.capacity_classified_conns.remove(&conn_id) {
+                    hub.emit(RemoteProxyEvent::RepairTrigger(
+                        RemoteProxyRepairTrigger::ProxyClose,
+                    ));
+                }
                 hub.close_connection(conn_id);
             }
             HubMsg::UpstreamErrored { conn_id, kind } => {
@@ -1083,10 +1094,12 @@ impl Hub {
     /// Plan §4.3.1: a transport read-loop error, classified by
     /// [`classify_stream_error`]. A Capacity error marks the connection and
     /// emits the classified trigger under the trigger's OWN rate limit; the
-    /// paired generic errored trigger for a marked connection is suppressed
-    /// (§4.3.1c — the classified line IS the record for that teardown).
-    /// Teardown itself is NEVER suppressed: every path still closes the
-    /// connection (fail closed).
+    /// generic teardown pair for a marked connection — the paired generic
+    /// errored trigger here, and the teardown-close `ProxyClose` in the
+    /// `HubMsg::UpstreamClosed` arm — is suppressed (§4.3.1c: the
+    /// classified line IS the record for that teardown). Teardown itself is
+    /// NEVER suppressed: every path still closes the connection (fail
+    /// closed).
     fn handle_stream_error(&mut self, conn_id: u64, upstream: bool, kind: StreamErrorKind) {
         let side = if upstream { "upstream" } else { "client" };
         match kind {
@@ -2461,5 +2474,56 @@ mod tests {
                 .contains("client connection failed on the WebSocket capacity limit"),
             "the classified trigger must re-arm after the configured interval"
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_close_after_a_capacity_classification_suppresses_the_generic_proxy_close() {
+        // §4.3.1c, the CLOSE half of the generic pair: a teardown whose
+        // upstream leg completes via a clean close handshake (the
+        // `HubMsg::UpstreamClosed` arm — reached whenever the hub's own
+        // `close_connection` closes the upstream writer while the peer is
+        // still healthy, e.g. a client-side Capacity error) must not ALSO
+        // log the generic `ProxyClose` — the classified line IS the record
+        // for that connection. An UNMARKED connection's clean upstream close
+        // (a genuine app-server shutdown) keeps its `ProxyClose` exactly as
+        // before: the suppression is per-connection and causal, never global.
+        let (hub_tx, mut events_rx) = spawn_test_hub(CAPACITY_TRIGGER_MIN_INTERVAL_MS).await;
+
+        // Marked connection: a client-side Capacity error classifies the
+        // teardown; the upstream close handshake's completion must add no
+        // second record for the same connection.
+        let (mut client_rx0, mut upstream_rx0) = register_test_conn(&hub_tx, 0);
+        hub_tx
+            .send(HubMsg::ClientErrored {
+                conn_id: 0,
+                kind: StreamErrorKind::Capacity {
+                    error_text: "Message too long: 2097152 > 1048576".to_string(),
+                },
+            })
+            .unwrap();
+        assert!(expect_proxy_error_event(&mut events_rx)
+            .await
+            .contains("client connection failed on the WebSocket capacity limit"));
+        assert!(matches!(client_rx0.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx0.recv().await, Some(WriterMsg::Close)));
+
+        hub_tx.send(HubMsg::UpstreamClosed { conn_id: 0 }).unwrap();
+        assert!(
+            ws_test_timeout(Duration::from_millis(100), events_rx.recv())
+                .await
+                .is_err(),
+            "the teardown's generic ProxyClose half must be suppressed behind the classified line"
+        );
+
+        // Unmarked connection: a genuine clean upstream close keeps its
+        // ProxyClose diagnostic exactly as before.
+        let (mut client_rx1, mut upstream_rx1) = register_test_conn(&hub_tx, 1);
+        hub_tx.send(HubMsg::UpstreamClosed { conn_id: 1 }).unwrap();
+        match events_rx.recv().await {
+            Some(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyClose)) => {}
+            other => panic!("expected the normal teardown's ProxyClose trigger, got {other:?}"),
+        }
+        assert!(matches!(client_rx1.recv().await, Some(WriterMsg::Close)));
+        assert!(matches!(upstream_rx1.recv().await, Some(WriterMsg::Close)));
     }
 }

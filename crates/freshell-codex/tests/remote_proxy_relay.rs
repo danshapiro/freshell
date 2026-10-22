@@ -1386,7 +1386,7 @@ async fn over_cap_client_frame_at_transport_equality_is_rejected_with_a_classifi
             .await
             .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
-    let _conn = upstream.accept().await;
+    let mut conn = upstream.accept().await;
 
     // The test client's own transport (tungstenite defaults) writes the 2 MiB
     // frame fine; the proxy's accept side rejects it from the header. The
@@ -1410,6 +1410,22 @@ async fn over_cap_client_frame_at_transport_equality_is_rejected_with_a_classifi
 
     // No JSON-RPC error reply reaches the client before its socket ends.
     assert_socket_ends_without_a_text_frame(&mut tui).await;
+
+    // The teardown window after the classified line must stay silent. The
+    // hub's close also closes the UPSTREAM writer; the peer echoes the close
+    // (observed here) and a real app-server then closes its socket — which
+    // is what ends the proxy's upstream read loop and surfaces at the hub
+    // as `UpstreamClosed`. That arm must NOT add the generic ProxyClose
+    // half of the teardown pair (§4.3.1c: the classified line IS the record
+    // for this connection). The harness holds the peer socket open via
+    // `conn`, so complete the peer side the way the §7 disconnect tests do.
+    let closed = timeout(RECV_TIMEOUT, conn.incoming.recv()).await.unwrap();
+    assert!(
+        matches!(closed, None | Some(Message::Close(_))),
+        "the fake upstream must observe the teardown, got {closed:?}"
+    );
+    drop(conn);
+    assert_no_event(&mut events).await;
 
     proxy.close().await;
 }
