@@ -1,9 +1,26 @@
 import { configureStore } from '@reduxjs/toolkit'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+// The session-link step below rides the real association fold, which also
+// asks the server for the newly linked session's record; the test feeds that
+// record itself, so the read answers nothing.
+vi.mock('@/lib/session-names', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/session-names')>()),
+  bootstrapSessionNames: vi.fn(async () => []),
+}))
+
 import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { handleUiCommand } from '@/lib/ui-commands'
 import panesReducer, { startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
+import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
+import sessionActivityReducer from '@/store/sessionActivitySlice'
+import { savedNameTabTitleMirrorMiddleware } from '@/store/savedNameTabTitleMirror'
+import { sessionNameLifecycleMiddleware } from '@/store/sessionNameLifecycleMiddleware'
+import { selectTabDisplayName } from '@/store/selectors/sessionNameSelectors'
+import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
+import { getTabDisplayTitle } from '@/lib/tab-title'
+import { deriveTabName } from '@/lib/deriveTabName'
 import {
   applyManagedRuntimeMergePlan,
   buildManagedRuntimeMergePlan,
@@ -13,6 +30,9 @@ import type {
   ManagedRuntimeSoul,
   ManagedRuntimeViewIntent,
 } from '@shared/managed-runtime'
+import type { PaneNode } from '@/store/paneTypes'
+import type { Tab } from '@/store/types'
+import type { SessionNameRef } from '@shared/session-names'
 
 function soul(overrides: Partial<ManagedRuntimeSoul> = {}): ManagedRuntimeSoul {
   return {
@@ -882,5 +902,267 @@ describe('managed runtime recovery merge', () => {
     )
     expect(oldInventoryPlan.creates).toHaveLength(0)
     expect(oldInventoryPlan.updates).toHaveLength(0)
+  })
+})
+
+// Name reliability (plan Task 8, D6): a managed-runtime refresh merges
+// RUNTIME facts into the layout and never names a tab. Before the fix every
+// existing tab matched to a view took the view's title ("Shell agent",
+// "OpenCode agent") and a fresh `updatedAt`, a split tab took its tab-level
+// fields from whichever pane matched, and a reconstructed tab was titled with
+// the view's provider label and never owned by its session.
+describe('managed runtime merge never writes names', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function shellSoul(overrides: Partial<ManagedRuntimeSoul> = {}): ManagedRuntimeSoul {
+    return soul({
+      terminalId: 'terminal-shell',
+      terminalStreamId: 'stream-shell',
+      terminalMode: 'shell',
+      terminalCreateRequestId: 'user-pane',
+      terminalResumeSessionId: undefined,
+      provider: 'shell',
+      nativeSessionId: undefined,
+      ...overrides,
+    })
+  }
+
+  function tabById(store: { getState: () => unknown }, tabId: string): Tab {
+    const tab = (store.getState() as { tabs: { tabs: Tab[] } }).tabs.tabs.find((candidate) => candidate.id === tabId)
+    if (!tab) throw new Error(`no tab ${tabId}`)
+    return tab
+  }
+
+  /** A store with the name cache, the saved-name tab title mirror and the
+   * naming-source lifecycle coordinator, in their production order. */
+  function namingStore(state = baseState()) {
+    return configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        managedRuntime: managedRuntimeReducer,
+        sessionNames: sessionNamesReducer,
+        sessionActivity: sessionActivityReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(
+        savedNameTabTitleMirrorMiddleware,
+        sessionNameLifecycleMiddleware,
+      ),
+      ...(state ? { preloadedState: state as never } : {}),
+    })
+  }
+
+  it('a stored "Shell agent" title is visible on a single-pane shell tab', () => {
+    // Why the overwrite mattered: a non-default stored title that differs
+    // from the derived name is what a single-pane shell tab displays.
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: { kind: 'terminal', createRequestId: 'create-1', status: 'running', mode: 'shell', shell: 'system' },
+    }
+    const tab = {
+      id: 'tab-1', createRequestId: 'tab-1', title: 'Shell agent', status: 'running',
+      mode: 'shell', shell: 'system', createdAt: 1, updatedAt: 1,
+    } as Tab
+    expect(getTabDisplayTitle(tab, layout)).toBe('Shell agent')
+  })
+
+  it('an existing tab matched to a "Shell agent" view keeps its title and updatedAt', () => {
+    vi.useFakeTimers({ now: 9_000 })
+    const state = baseState()
+    state.tabs.tabs[0].title = 'Tab 1'
+    const store = storeWithState(state)
+
+    const plan = buildManagedRuntimeMergePlan(
+      snapshot([shellSoul()], [view({ title: 'Shell agent' })]),
+      store.getState() as any,
+    )
+    expect(plan.updates.map((update) => update.paneId)).toEqual(['user-pane'])
+    applyManagedRuntimeMergePlan(store as any, plan)
+
+    const tab = tabById(store, 'user-tab')
+    expect(tab.title).toBe('Tab 1')
+    expect(tab.updatedAt).toBe(1)
+    expect(tab.titleSetByUser).toBeUndefined()
+    // The runtime facts still land: the matched pane is the tab's naming pane.
+    expect(tab.soulId).toBe('soul-one')
+    expect((store.getState().panes.layouts['user-tab'] as any).content.soulId).toBe('soul-one')
+  })
+
+  it('an existing OpenCode tab matched to an "OpenCode agent" view keeps its title', () => {
+    vi.useFakeTimers({ now: 9_000 })
+    const state = baseState()
+    Object.assign(state.tabs.tabs[0], {
+      title: 'Billing bug',
+      mode: 'opencode',
+      nameSource: { kind: 'session', paneId: 'user-pane' },
+    })
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      terminalId: 'terminal-one',
+      status: 'running',
+      mode: 'opencode',
+      shell: 'system',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+    }
+    const store = storeWithState(state)
+
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul()], [view({ title: 'OpenCode agent' })]), store.getState() as any)
+    applyManagedRuntimeMergePlan(store as any, plan)
+
+    const tab = tabById(store, 'user-tab')
+    expect(tab.title).toBe('Billing bug')
+    expect(tab.updatedAt).toBe(1)
+    expect(tab.soulId).toBe('soul-one')
+  })
+
+  function splitShellAndAgentState(nameSource: Tab['nameSource']) {
+    const state = baseState()
+    Object.assign(state.tabs.tabs[0], { title: 'Tab 1', nameSource })
+    state.panes.layouts['user-tab'] = {
+      type: 'split',
+      id: 'split-root',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        state.panes.layouts['user-tab'],
+        {
+          type: 'leaf',
+          id: 'agent-pane',
+          content: { kind: 'terminal', createRequestId: 'create-one', status: 'creating', mode: 'opencode', shell: 'system' },
+        },
+      ],
+    }
+    return state
+  }
+
+  it('a split tab takes tab-level fields only from its naming pane', () => {
+    vi.useFakeTimers({ now: 9_000 })
+    const store = storeWithState(splitShellAndAgentState({ kind: 'legacy' }))
+    const before = structuredClone(tabById(store, 'user-tab'))
+
+    const plan = buildManagedRuntimeMergePlan(snapshot(), store.getState() as any)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates.map((update) => update.paneId)).toEqual(['agent-pane'])
+    applyManagedRuntimeMergePlan(store as any, plan)
+
+    // The naming pane is the shell (the first leaf of a legacy tab): the
+    // managed OpenCode pane beside it updates itself, never the tab.
+    expect(tabById(store, 'user-tab')).toEqual(before)
+    const agentPane = (store.getState().panes.layouts['user-tab'] as any).children[1].content
+    expect(agentPane).toMatchObject({ soulId: 'soul-one', terminalId: 'terminal-one', viewIntentId: 'view-one' })
+  })
+
+  it('a split tab whose naming pane is the managed pane takes that pane\'s tab-level fields', () => {
+    vi.useFakeTimers({ now: 9_000 })
+    const store = storeWithState(splitShellAndAgentState({ kind: 'session', paneId: 'agent-pane' }))
+
+    applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(snapshot(), store.getState() as any))
+
+    const tab = tabById(store, 'user-tab')
+    expect(tab).toMatchObject({
+      mode: 'opencode',
+      codingCliProvider: 'opencode',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      soulId: 'soul-one',
+      title: 'Tab 1',
+      updatedAt: 1,
+    })
+  })
+
+  it('a reconstructed agent tab carries a session nameSource and no provider label', () => {
+    const store = storeWithState()
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul()], [view({ title: 'OpenCode agent' })]), store.getState() as any)
+    expect(plan.creates).toHaveLength(1)
+    const [create] = plan.creates
+    expect(create.tab?.nameSource).toEqual({ kind: 'session', paneId: create.paneId })
+    expect(create.tab?.title).toBeUndefined()
+
+    applyManagedRuntimeMergePlan(store as any, plan)
+
+    const tab = tabById(store, create.tabId)
+    expect(tab.title).toBe('Tab 2')
+    expect(tab.nameSource).toEqual({ kind: 'session', paneId: create.paneId })
+    const layout = store.getState().panes.layouts[create.tabId] as PaneNode
+    const label = selectTabDisplayName(store.getState() as any, create.tabId)
+    expect(label).toBe(deriveTabName(layout))
+    expect(label).not.toMatch(/agent/i)
+  })
+
+  it('a reconstructed OpenCode tab without a native id fills its title after the session links', () => {
+    const store = namingStore()
+    const nativeFree = soul({ nativeSessionId: undefined, terminalResumeSessionId: undefined })
+    const plan = buildManagedRuntimeMergePlan(
+      snapshot([nativeFree], [view({ title: 'OpenCode agent' })]),
+      store.getState() as any,
+    )
+    applyManagedRuntimeMergePlan(store as any, plan)
+    const [{ tabId, paneId }] = plan.creates
+
+    // No native id yet: nothing names the tab, and it never shows the
+    // provider label in the meantime.
+    expect(tabById(store, tabId).title).toBe('Tab 2')
+    expect(tabById(store, tabId).nameSource).toEqual({ kind: 'session', paneId })
+    expect((store.getState().panes.layouts[tabId] as any).content.sessionRef).toBeUndefined()
+
+    // terminal.session.associated links the terminal to its OpenCode session.
+    const linked: SessionNameRef = { kind: 'session', provider: 'opencode', sessionId: 'ses_linked' }
+    expect(reconcileTerminalSessionAssociation({
+      dispatch: store.dispatch,
+      getState: () => store.getState() as any,
+      terminalId: 'terminal-one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_linked' },
+    })).toBe('reconciled')
+    store.dispatch(receiveSessionNames([{
+      record: { ref: linked, name: 'Billing bug', source: 'manual', revision: 1 },
+      documentGeneration: 1,
+      redirects: [],
+      changed: true,
+    }]))
+
+    expect(tabById(store, tabId).title).toBe('Billing bug')
+    expect(selectTabDisplayName(store.getState() as any, tabId)).toBe('Billing bug')
+  })
+
+  it('a reconstructed kilroy tab stays a legacy tab', () => {
+    const nativeSessionId = 'd4430000-0000-4444-8444-000000000094'
+    const kilroy = soul({
+      provider: 'kilroy',
+      freshAgentSessionType: 'kilroy',
+      terminalMode: undefined,
+      nativeSessionId,
+    })
+    const plan = buildManagedRuntimeMergePlan(snapshot([kilroy], [view({ title: 'Recovered Kilroy agent' })]), baseState())
+    expect(plan.creates).toHaveLength(1)
+    // It resolves a Claude ref, but kilroy is never a scoped naming mode.
+    expect(plan.creates[0].content.sessionRef).toEqual({ provider: 'claude', sessionId: nativeSessionId })
+    expect(plan.creates[0].tab?.nameSource).toBeUndefined()
+  })
+
+  it.each([
+    ['Build watcher', 'Build watcher'],
+    ['Shell agent', undefined],
+    ['Recovered Shell agent', undefined],
+    ['Shell', undefined],
+    ['Tab 4', undefined],
+    ['workspace', undefined],
+    ['   ', undefined],
+    ['', undefined],
+  ] as const)('a reconstructed shell tab uses a real view title but never a default label (%j)', (viewTitle, expected) => {
+    const store = storeWithState()
+    const plan = buildManagedRuntimeMergePlan(
+      snapshot([shellSoul({ terminalCreateRequestId: 'create-shell', terminalCwd: '/workspace' })], [view({ title: viewTitle })]),
+      store.getState() as any,
+    )
+    expect(plan.creates).toHaveLength(1)
+    const [create] = plan.creates
+    expect(create.tab?.title).toBe(expected)
+    expect(create.tab?.nameSource).toBeUndefined()
+
+    applyManagedRuntimeMergePlan(store as any, plan)
+    expect(tabById(store, create.tabId).title).toBe(expected ?? 'Tab 2')
   })
 })

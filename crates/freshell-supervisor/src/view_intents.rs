@@ -46,12 +46,10 @@ fn automatic_placement_for_owner(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn automatic_primary_intent(
     installation_id: &InstallationId,
     soul_id: SoulId,
     workspace_id: String,
-    provider: &str,
     title_hint: Option<&str>,
     soul_intent_revision: u64,
     now: i64,
@@ -64,19 +62,16 @@ pub fn automatic_primary_intent(
         installation_id,
         soul_id,
         workspace_id,
-        provider,
         Some(&request),
         soul_intent_revision,
         now,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn automatic_primary_intent_from_request(
     installation_id: &InstallationId,
     soul_id: SoulId,
     fallback_workspace_id: String,
-    provider: &str,
     request: Option<&ViewIntentRequest>,
     soul_intent_revision: u64,
     now: i64,
@@ -103,7 +98,7 @@ fn automatic_primary_intent_from_request(
     let title = request
         .and_then(|value| nonempty(value.title.as_deref()))
         .map(str::to_string)
-        .unwrap_or_else(|| format!("Recovered {} agent", provider_label(provider)));
+        .unwrap_or_default();
     let placement_group = request
         .and_then(|value| nonempty(value.placement_group.as_deref()))
         .unwrap_or(RECOVERED_AGENTS_GROUP)
@@ -148,23 +143,11 @@ fn stable_hex(key: &str, domain: &[u8]) -> String {
         .collect()
 }
 
-fn provider_label(provider: &str) -> &str {
-    match provider {
-        "claude" => "Claude",
-        "codex" => "Codex",
-        "opencode" => "OpenCode",
-        "amplifier" => "Amplifier",
-        other => other,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_automatic_primary_in_tx(
     tx: &Transaction<'_>,
     installation_id: &InstallationId,
     soul_id: &SoulId,
     workspace_id: &str,
-    provider: &str,
     soul_intent_revision: u64,
     request: Option<&ViewIntentRequest>,
     now: i64,
@@ -176,7 +159,6 @@ pub(crate) fn ensure_automatic_primary_in_tx(
         installation_id,
         soul_id.clone(),
         workspace_id.to_string(),
-        provider,
         request,
         soul_intent_revision,
         now,
@@ -206,15 +188,14 @@ pub(crate) fn backfill_automatic_view_intents(
 ) -> Result<(), RegistryError> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut statement = tx.prepare(
-        "SELECT s.soul_id,s.project_key,s.provider,s.intent_revision,s.desired_state FROM souls s WHERE EXISTS (SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id AND i.terminal_spec IS NOT NULL) ORDER BY s.created_at,s.soul_id",
+        "SELECT s.soul_id,s.project_key,s.intent_revision,s.desired_state FROM souls s WHERE EXISTS (SELECT 1 FROM incarnations i WHERE i.soul_id=s.soul_id AND i.terminal_spec IS NOT NULL) ORDER BY s.created_at,s.soul_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, u64>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, u64>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let mut values = Vec::new();
@@ -223,7 +204,7 @@ pub(crate) fn backfill_automatic_view_intents(
     }
     drop(statement);
     let now = now_millis();
-    for (soul, workspace, provider, revision, desired) in values {
+    for (soul, workspace, revision, desired) in values {
         let soul =
             SoulId::parse(soul).map_err(|_| RegistryError::Integrity("invalid soul id".into()))?;
         ensure_automatic_primary_in_tx(
@@ -231,7 +212,6 @@ pub(crate) fn backfill_automatic_view_intents(
             installation_id,
             &soul,
             &workspace,
-            &provider,
             revision,
             None,
             now,
@@ -600,11 +580,11 @@ impl Registry {
         let installation_id = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let (provider, workspace, soul_revision): (String, String, u64) = tx
+            let (workspace, soul_revision): (String, u64) = tx
                 .query_row(
-                    "SELECT provider,project_key,intent_revision FROM souls WHERE soul_id=?1",
+                    "SELECT project_key,intent_revision FROM souls WHERE soul_id=?1",
                     params![request.soul_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| RegistryError::UnknownSoul(request.soul_id.clone()))?;
@@ -686,7 +666,7 @@ impl Registry {
                     .as_deref()
                     .and_then(|value| nonempty(Some(value)))
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("Recovered {} agent", provider_label(&provider))),
+                    .unwrap_or_default(),
                 placement_group: request
                     .intent
                     .placement_group
@@ -960,7 +940,6 @@ mod tests {
             &installation,
             SoulId::parse("soul-one").unwrap(),
             "workspace-one".into(),
-            "opencode",
             None,
             4,
             10,
@@ -968,10 +947,15 @@ mod tests {
         assert_eq!(intent.visibility, ViewVisibilityIntent::Visible);
         assert_eq!(intent.kind, ViewIntentKind::AutomaticPrimary);
         assert_eq!(intent.placement_group, RECOVERED_AGENTS_GROUP);
-        assert_eq!(intent.title, "Recovered OpenCode agent");
+        // A view title is a name; the supervisor never invents one.
+        assert_eq!(intent.title, "");
         assert_eq!(
             projection_event_id(&intent.view_id, 1),
             projection_event_id(&intent.view_id, 1)
         );
     }
 }
+
+#[cfg(test)]
+#[path = "view_intent_title_tests.rs"]
+mod title_tests;

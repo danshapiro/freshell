@@ -1223,8 +1223,17 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
   for (const backoff of RENAME_RESUBMIT_BACKOFFS) {
     await page.waitForTimeout(backoff)
     if (!(await input.isVisible().catch(() => false))) break
-    await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
-    await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
+    try {
+      await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
+      await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
+    } catch (error) {
+      // The editor closed between the visibility check and the resubmit:
+      // the earlier submit committed (the editor closing is the product's
+      // success signal; the label assertion below is the commit gate). A
+      // resubmit failing while the editor is still open is a real failure.
+      if (await input.isVisible().catch(() => false)) throw error
+      break
+    }
   }
   await expect(input).toBeHidden({ timeout: 10_000 })
   await expect(tab).toContainText(name, { timeout: 10_000 })
