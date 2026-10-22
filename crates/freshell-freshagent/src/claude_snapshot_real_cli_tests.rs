@@ -324,3 +324,22 @@ async fn the_served_snapshot_reads_delegation_activity_from_the_subagents_direct
         json!([{ "tool": "Read", "status": "completed", "preview": "/fixture/ws/a.txt" }])
     );
 }
+
+#[test]
+fn the_snapshot_lists_changed_files_and_advertises_the_diff_panel() {
+    let edited =
+        build_claude_snapshot_json("freshclaude", "s", real_cli_fixture!("tools-sync"), 0, None);
+    assert_eq!(edited["capabilities"]["diffs"], json!(true));
+    let paths: Vec<&str> = edited["diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["path"].as_str())
+        .collect();
+    assert_eq!(paths, vec!["/fixture/ws/a.txt", "/fixture/ws/b.txt"]);
+
+    let untouched =
+        build_claude_snapshot_json("kilroy", "s", real_cli_fixture!("compact-ok"), 0, None);
+    assert_eq!(untouched["capabilities"]["diffs"], json!(false));
+    assert_eq!(untouched["diffs"], json!([]));
+}

@@ -115,7 +115,10 @@ function makeResponder(scenario, ctx) {
         }
         if (toolResult.tool_use_id === 'toolu_write1') return sse(res, [{ type: 'tool_use', id: 'toolu_edit1', name: 'Edit', input: { file_path: file, old_string: 'one', new_string: 'two' } }])
         if (toolResult.tool_use_id === 'toolu_edit1') return sse(res, [{ type: 'tool_use', id: 'toolu_edit2', name: 'Edit', input: { file_path: file, old_string: 'not-present', new_string: 'x' } }])
-        if (toolResult.tool_use_id === 'toolu_edit2') return sse(res, [{ type: 'tool_use', id: 'toolu_agent1', name: 'Agent', input: { description: 'check file', prompt: 'SUBAGENT-PROMPT read a.txt', subagent_type: 'general-purpose', run_in_background: false } }])
+        // b.txt exists before the session: the CLI requires a Read before an Edit.
+        if (toolResult.tool_use_id === 'toolu_edit2') return sse(res, [{ type: 'tool_use', id: 'toolu_read2', name: 'Read', input: { file_path: path.join(ctx.cwd, 'b.txt') } }])
+        if (toolResult.tool_use_id === 'toolu_read2') return sse(res, [{ type: 'tool_use', id: 'toolu_edit3', name: 'Edit', input: { file_path: path.join(ctx.cwd, 'b.txt'), old_string: 'beta', new_string: 'beta\ngamma' } }])
+        if (toolResult.tool_use_id === 'toolu_edit3') return sse(res, [{ type: 'tool_use', id: 'toolu_agent1', name: 'Agent', input: { description: 'check file', prompt: 'SUBAGENT-PROMPT read a.txt', subagent_type: 'general-purpose', run_in_background: false } }])
         if (toolResult.tool_use_id === 'toolu_agent1') return sse(res, [{ type: 'text', text: 'All done.' }])
         return sse(res, [{ type: 'text', text: 'unexpected' }])
       }
@@ -188,6 +191,7 @@ async function capture(scenario) {
   const cwd = path.join(fixtureRoot, 'ws')
   for (const dir of [home, cwd, path.join(fixtureRoot, 'tmp')]) await fs.mkdir(dir, { recursive: true, mode: 0o700 })
   await fs.writeFile(path.join(cwd, 'pic.png'), Buffer.from(PNG, 'base64'))
+  await fs.writeFile(path.join(cwd, 'b.txt'), 'alpha\nbeta\n')
   const ctx = { cwd, toolSeq: 0, replySeq: 0 }
   const respond = makeResponder(scenario, ctx)
   const server = http.createServer(async (req, res) => {

@@ -353,3 +353,67 @@ fn delegation_activity_previews_read_claude_tool_inputs() {
     );
     assert_eq!(preview("Mystery", &json!({ "a": 1 })), r#"{"a":1}"#);
 }
+
+// ── A5: changed-files summary (the diff panel) ─────────────────────────────
+
+fn diffs_of(transcript: &str) -> Vec<Value> {
+    ClaudeTranscriptProjector::project("s", transcript).diffs
+}
+
+#[test]
+fn writes_and_edits_project_one_changed_file_row_per_path() {
+    // a.txt: created by Write, then edited (a created file stays "created");
+    // b.txt: existed before the session, one Edit adds a line.
+    assert_eq!(
+        diffs_of(real_cli_fixture!("tools-sync")),
+        vec![
+            json!({ "id": "/fixture/ws/a.txt", "path": "/fixture/ws/a.txt", "status": "created" }),
+            json!({ "id": "/fixture/ws/b.txt", "path": "/fixture/ws/b.txt", "status": "+1 \u{2212}0" }),
+        ]
+    );
+}
+
+#[test]
+fn a_failed_edit_changes_no_file() {
+    // Keep only the FAILED Edit's result for a.txt: no row for it.
+    let transcript = real_cli_fixture!("tools-sync");
+    let only_failed: String = transcript
+        .lines()
+        .filter(|line| {
+            let value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+            !(tool_result_for(&value, "toolu_write1") || tool_result_for(&value, "toolu_edit1"))
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let paths: Vec<Value> = diffs_of(&only_failed)
+        .into_iter()
+        .map(|row| row["path"].clone())
+        .collect();
+    assert_eq!(paths, vec![json!("/fixture/ws/b.txt")]);
+}
+
+#[test]
+fn repeated_edits_of_one_file_add_up() {
+    // The b.txt Edit result line applied twice (a second, distinct line).
+    let transcript = real_cli_fixture!("tools-sync");
+    let edit_result = transcript
+        .lines()
+        .find(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|v| tool_result_for(&v, "toolu_edit3"))
+        })
+        .unwrap();
+    let mut second: Value = serde_json::from_str(edit_result).unwrap();
+    second["uuid"] = json!("second-edit-result");
+    let doubled = format!("{transcript}{second}\n");
+    let b = diffs_of(&doubled)
+        .into_iter()
+        .find(|row| row["path"] == json!("/fixture/ws/b.txt"))
+        .unwrap();
+    assert_eq!(b["status"], json!("+2 \u{2212}0"));
+}
+
+#[test]
+fn a_transcript_without_file_edits_has_no_changed_files() {
+    assert!(diffs_of(real_cli_fixture!("compact-ok")).is_empty());
+    assert!(diffs_of(real_cli_fixture!("image")).is_empty());
+}

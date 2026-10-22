@@ -1370,7 +1370,7 @@ pub(crate) fn build_claude_snapshot_from_projection(
     revision: i64,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Value {
-    let turns = projection.turns;
+    let crate::claude_projection::ClaudeProjection { turns, diffs } = projection;
     let latest_turn_id = turns
         .last()
         .and_then(|t| t.get("turnId"))
@@ -1394,6 +1394,8 @@ pub(crate) fn build_claude_snapshot_from_projection(
             "approvals": false,
             "questions": false,
             "fork": false,
+            // The changed-files panel shows when the transcript edited files.
+            "diffs": !diffs.is_empty(),
             // Kata 1wxv Task 5: STATIC stamps (freshclaude AND kilroy — no SDK
             // capability query exists); an old-CLI runtime failure classifies to
             // UNSUPPORTED_CAPABILITY refusal at op time, never at stamp time.
@@ -1412,7 +1414,7 @@ pub(crate) fn build_claude_snapshot_from_projection(
         "pendingApprovals": [],
         "pendingQuestions": [],
         "worktrees": [],
-        "diffs": [],
+        "diffs": diffs,
         "childThreads": [],
         "turns": turns,
         "extensions": {},

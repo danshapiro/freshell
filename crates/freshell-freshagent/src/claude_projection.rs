@@ -12,7 +12,7 @@
 //! - a compaction recap (`isCompactSummary`) with no preceding
 //!   `system/compact_boundary` line still gets a `context_compaction` marker.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -27,6 +27,9 @@ use crate::delegation::{
 /// The subagent tool's names: `Agent` on the wire and in the JSONL, `Task` in
 /// `system/init.tools` and in older CLIs (F5).
 const DELEGATION_TOOL_NAMES: [&str; 2] = ["Agent", "Task"];
+
+/// Tools whose successful result changes a file (the diff panel's rows).
+const FILE_EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 /// The claude CLI's default subagent type when the model names none.
 const DEFAULT_SUBAGENT: &str = "general-purpose";
@@ -98,6 +101,7 @@ impl SubagentSource for FsSubagents {
 /// The projection of a whole transcript.
 pub(crate) struct ClaudeProjection {
     pub turns: Vec<Value>,
+    pub diffs: Vec<Value>,
 }
 
 /// Where a projected item lives: `turns[turn].items[item]`. Turns are only
@@ -121,6 +125,34 @@ pub(crate) struct ClaudeTranscriptProjector {
     /// `system/compact_boundary` uuids, to tell whether a compaction recap
     /// already has its marker.
     compact_boundaries: HashSet<String>,
+    /// Every tool call seen so far: tool_use id -> (name, input).
+    tool_calls: HashMap<String, (String, Value)>,
+    /// Files changed by successful edit tools, by path (one row per path).
+    changed_files: BTreeMap<String, ChangedFile>,
+}
+
+/// What the session did to one file.
+#[derive(Clone, Default)]
+struct ChangedFile {
+    created: bool,
+    added: usize,
+    removed: usize,
+    /// Whether any result carried a line-level patch.
+    patched: bool,
+}
+
+impl ChangedFile {
+    /// `created` for a file this session created; else `+A −D` summed over
+    /// every successful edit's patch lines.
+    fn status(&self) -> String {
+        if self.created {
+            "created".to_string()
+        } else if self.patched {
+            format!("+{} \u{2212}{}", self.added, self.removed)
+        } else {
+            "modified".to_string()
+        }
+    }
 }
 
 impl ClaudeTranscriptProjector {
@@ -131,6 +163,8 @@ impl ClaudeTranscriptProjector {
             delegations: HashMap::new(),
             projected_uuids: HashSet::new(),
             compact_boundaries: HashSet::new(),
+            tool_calls: HashMap::new(),
+            changed_files: BTreeMap::new(),
         }
     }
 
@@ -192,6 +226,8 @@ impl ClaudeTranscriptProjector {
             self.remember(uuid);
             return;
         }
+        self.record_tool_calls(obj);
+        self.record_changed_files(obj);
         let Some(mut turn) = parse_transcript_turn(obj, &self.thread_id, self.turns.len()) else {
             return;
         };
@@ -231,7 +267,102 @@ impl ClaudeTranscriptProjector {
                 item["activity"] = Value::Array(rows);
             }
         }
-        ClaudeProjection { turns: self.turns }
+        let diffs = self
+            .changed_files
+            .iter()
+            .map(|(path, file)| json!({ "id": path, "path": path, "status": file.status() }))
+            .collect();
+        ClaudeProjection {
+            turns: self.turns,
+            diffs,
+        }
+    }
+
+    /// Remember every tool call's name and input (the result line names only
+    /// the tool_use id).
+    fn record_tool_calls(&mut self, obj: &Value) {
+        if obj.get("type").and_then(Value::as_str) != Some("assistant") {
+            return;
+        }
+        for block in message_blocks(obj) {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let (Some(id), Some(name)) = (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let input = block.get("input").cloned().unwrap_or(Value::Null);
+            self.tool_calls
+                .insert(id.to_string(), (name.to_string(), input));
+        }
+    }
+
+    /// A successful Edit/Write/MultiEdit/NotebookEdit result changes its file;
+    /// the CLI's structured `toolUseResult` carries the patch (F4).
+    fn record_changed_files(&mut self, obj: &Value) {
+        if obj.get("type").and_then(Value::as_str) != Some("user") {
+            return;
+        }
+        let results: Vec<&Value> = message_blocks(obj)
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .collect();
+        // One structured result per line; a multi-result line is ambiguous.
+        let [result] = results.as_slice() else {
+            return;
+        };
+        if result.get("is_error").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        let Some(structured) = obj.get("toolUseResult").filter(|value| value.is_object()) else {
+            return;
+        };
+        let Some((name, input)) = result
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .and_then(|id| self.tool_calls.get(id))
+        else {
+            return;
+        };
+        if !FILE_EDIT_TOOLS.contains(&name.as_str()) {
+            return;
+        }
+        let path_keys = ["filePath", "file_path", "notebook_path"];
+        let Some(path) = path_keys
+            .iter()
+            .find_map(|key| structured.get(*key).and_then(Value::as_str))
+            .or_else(|| {
+                path_keys
+                    .iter()
+                    .find_map(|key| input.get(*key).and_then(Value::as_str))
+            })
+            .filter(|path| !path.is_empty())
+        else {
+            return;
+        };
+        let file = self.changed_files.entry(path.to_string()).or_default();
+        if structured.get("type").and_then(Value::as_str) == Some("create") {
+            file.created = true;
+        }
+        if let Some(hunks) = structured.get("structuredPatch").and_then(Value::as_array) {
+            for line in hunks
+                .iter()
+                .filter_map(|hunk| hunk.get("lines").and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if line.starts_with('+') {
+                    file.added += 1;
+                    file.patched = true;
+                } else if line.starts_with('-') {
+                    file.removed += 1;
+                    file.patched = true;
+                }
+            }
+        }
     }
 
     fn remember(&mut self, uuid: Option<&str>) {
@@ -518,6 +649,14 @@ fn subagent_activity_rows(transcript: &str) -> Vec<Value> {
         }
     }
     rows
+}
+
+/// A line's message content blocks (empty for string content).
+fn message_blocks(obj: &Value) -> &[Value] {
+    obj.pointer("/message/content")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 /// The notification XML (string content or joined text blocks).
