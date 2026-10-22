@@ -154,6 +154,17 @@ async function saveDefaultModel(
     .toBe(modelId)
 }
 
+/** Record the conversation's flavour through the real session-metadata route
+ * (the write `setSessionMetadata` makes for a resumed fresh-agent session). */
+async function tagSessionFlavour(info: E2eServerInfo, sessionId: string, flavour: Flavour): Promise<void> {
+  const res = await fetch(`${info.baseUrl}/api/session-metadata`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-auth-token': info.token },
+    body: JSON.stringify({ provider: 'claude', sessionId, sessionType: flavour, sessionTypeSource: 'explicit' }),
+  })
+  expect(res.ok, `POST /api/session-metadata failed: ${res.status}`).toBe(true)
+}
+
 async function bootLane(page: Page, flavour: Flavour): Promise<{
   server: RustServer
   info: E2eServerInfo
@@ -179,15 +190,14 @@ async function bootLane(page: Page, flavour: Flavour): Promise<{
     setupHome: async (homeDir) => {
       const freshellDir = path.join(homeDir, '.freshell')
       await fs.mkdir(freshellDir, { recursive: true })
+      // An existing Claude projects root (as on any machine that has run
+      // Claude), so the session directory watches it from boot.
+      await fs.mkdir(path.join(homeDir, '.claude', 'projects'), { recursive: true })
       await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
         version: 1,
         settings: {
           codingCli: { enabledProviders: ['claude'] },
           freshAgent: { enabled: true },
-          // The fixture conversation never gets a title, and the default
-          // hideEmptySessions drops an untitled row once its pane closes;
-          // keep it listed so the sidebar can resume it.
-          sidebar: { hideEmptySessions: false },
         },
       }, null, 2))
     },
@@ -281,11 +291,22 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
       .toMatch(CANONICAL_UUID_RE)
     await waitForPaneStatus(harness, tabId, 'idle')
 
-    // A past exchange in the conversation's on-disk transcript (the shape the
-    // CLI writes), so the session directory keeps listing the conversation
-    // after its pane closes. This step deliberately does not depend on the
-    // fake sidecar's turn lanes: the resume path is what is under test.
+    // Two past exchanges in the conversation's on-disk transcript (the shape
+    // the CLI writes), so the session directory keeps listing the
+    // conversation after its pane closes: the first user message titles the
+    // row, and a transcript with fewer than two user messages is classified
+    // non-interactive, which the default sidebar filter hides once no pane
+    // holds the session. This step deliberately does not depend on the fake
+    // sidecar's turn lanes: the resume path is what is under test.
     await appendTranscriptExchange(info.homeDir, lane.projectDir, durableId, 'hello default model')
+    await appendTranscriptExchange(info.homeDir, lane.projectDir, durableId, 'and a follow-up')
+
+    // The sidebar resumes a row as the flavour recorded for it in the session
+    // metadata store. A brand-new Claude-runtime pane's session gets no such
+    // record (only the resume, reopen and materialize paths write one), so the row
+    // would otherwise reopen in a Claude CLI terminal. Record it through the
+    // same route the client's resume path writes.
+    await tagSessionFlavour(info, durableId, flavour)
 
     const sidebarRow = page.locator(`[data-context="sidebar-session"][data-session-id="${durableId}"]`)
     await expect(sidebarRow, 'the session has a sidebar row').toBeVisible({ timeout: 30_000 })
@@ -307,6 +328,11 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
       .poll(async () => (await paneLeaf(harness, tabId))?.id ?? null, { timeout: 15_000 })
       .toBeNull()
 
+    await expect(sidebarRow, 'the closed conversation stays listed as its flavour').toHaveAttribute(
+      'data-session-type',
+      flavour,
+      { timeout: 30_000 },
+    )
     await sidebarRow.click()
     const resumeCreate = await waitForStdinFrame(
       stdinLog,
