@@ -63,14 +63,17 @@ pub mod terminal_tabs;
 mod test_environment;
 
 pub use claude::FreshClaudeState;
-// Kata 09v1 + SYNC-06: the TWO claude_snapshot items visible outside this
-// crate — the raw-file existence check freshell-server's IndexExistenceProbe
-// shares with the attach arm, and the original-cwd reader the resume-resolve
-// claude fallback pairs with it (`claude-transcript-locator.ts` parity).
-// Keep the rest of claude_snapshot crate-private.
+// Kata 09v1 + SYNC-06 + G28: the claude_snapshot items visible outside this
+// crate — the ONE shared claude store-root rule (`claude_home_candidates`,
+// also read by freshell-ws's PTY truth probe), the three-state transcript
+// locator freshell-server's IndexExistenceProbe shares with the attach arm,
+// and the original-cwd readers the resume-resolve claude fallback pairs with
+// it (`claude-transcript-locator.ts` parity). Keep the rest of
+// claude_snapshot crate-private.
 pub use claude_snapshot::{
-    locate_transcript, locate_transcript_checked, locate_transcript_selected, transcript_cwd,
-    transcript_cwd_bounded, transcript_cwd_checked, SelectedTranscript,
+    claude_home_candidates, locate_transcript, locate_transcript_checked,
+    locate_transcript_selected, locate_transcript_state, transcript_cwd, transcript_cwd_bounded,
+    transcript_cwd_checked, LocateError, SelectedTranscript, TranscriptLocation,
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{

@@ -48,6 +48,19 @@ export function applyIsolatedHomeEnvironment(env: Record<string, string>, homeDi
   return nextEnv
 }
 
+/**
+ * The caller env keys that `applyIsolatedHomeEnvironment` would replace or
+ * delete for this owned home (HOME, the provider homes under it,
+ * CLAUDE_CONFIG_DIR, ...), sorted. Such a caller value can never reach the
+ * spawned process: provider state always lives under `<homeDir>`.
+ */
+export function homeIsolationConflicts(callerEnv: Record<string, string>, homeDir: string): string[] {
+  const isolated = applyIsolatedHomeEnvironment({ ...callerEnv }, homeDir)
+  return Object.keys(callerEnv)
+    .filter((key) => isolated[key] !== callerEnv[key])
+    .sort()
+}
+
 export function applyServerHomeEnvironment(
   env: Record<string, string>,
   homeDir: string,

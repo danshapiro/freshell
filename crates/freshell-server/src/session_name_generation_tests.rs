@@ -2497,17 +2497,16 @@ async fn the_worker_alternates_native_and_generation_under_sustained_native_requ
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let named = match store.get(vec![pending("g4")]).await {
-            Ok(updates) => updates
-                .into_iter()
-                .next()
-                .and_then(|u| (u.record.source == NameSource::FreshellAi).then_some(u)),
-            // The worker is intentionally writing the same document. A
-            // bounded lock miss is a valid read result; keep polling until
-            // the overall completion deadline instead of failing this race.
-            Err(NameError::LockUnavailable(_)) => None,
-            Err(error) => panic!("get: {error:?}"),
-        };
+        // The worker writes the same document from THIS process: its
+        // transactions queue ahead of this read on the store's local turn,
+        // so the read waits instead of missing the lock.
+        let named = store
+            .get(vec![pending("g4")])
+            .await
+            .expect("a same-process read waits its turn behind the worker")
+            .into_iter()
+            .next()
+            .and_then(|u| (u.record.source == NameSource::FreshellAi).then_some(u));
         if named.is_some() {
             break;
         }
