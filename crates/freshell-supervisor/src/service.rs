@@ -1723,9 +1723,10 @@ impl Supervisor {
     }
 
     /// Persists the settings as the soul's recovery profile, then asks the
-    /// owning host to persist and apply them live. This is the same order a
-    /// settings-carrying send uses, so a recovered incarnation launches with
-    /// exactly the profile the host actor holds.
+    /// owning host to persist and apply them live, so a recovered incarnation
+    /// launches with exactly the profile the host actor holds. The host is
+    /// authenticated first: a host that is already gone never saves the
+    /// configure, so the recovery profile must not save it either.
     async fn fresh_agent_configure(
         &self,
         request_id: RequestId,
@@ -1745,6 +1746,9 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
         self.registry
             .configure_fresh_agent_settings(
                 soul_id,
@@ -1753,9 +1757,6 @@ impl Supervisor {
             )
             .await
             .map_err(map_registry)?;
-        let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await?;
         match self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),

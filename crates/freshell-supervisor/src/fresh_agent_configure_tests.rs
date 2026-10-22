@@ -342,6 +342,51 @@ async fn admin_configure_to_the_default_effort_clears_the_recovery_effort() {
     );
 }
 
+/// A session host that died after the registry last saw it running: its
+/// socket still accepts, but the connection closes before any answer.
+fn crashed_host(runtime_dir: &std::path::Path) -> tokio::task::JoinHandle<()> {
+    std::fs::write(runtime_dir.join("secret"), b"synthetic-host-secret").unwrap();
+    let listener = UnixListener::bind(runtime_dir.join("host.sock")).unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    })
+}
+
+/// A host that cannot be reached never sees the configure, so it never
+/// saves it. The recovery record must not save it either: recovery
+/// relaunches the soul from that record and refuses a host actor whose
+/// saved profile differs from it.
+#[tokio::test]
+async fn admin_configure_for_an_unreachable_host_leaves_the_recovery_profile_alone() {
+    let fixture = running_fresh_claude().await;
+    let host = crashed_host(&fixture.runtime_dir);
+    let epoch = fixture.supervisor.registry.control_epoch();
+
+    let reply = fixture
+        .supervisor
+        .dispatch(configure_envelope(
+            &fixture.soul,
+            &RequestId::parse("configure-crashed-host").unwrap(),
+            Some(epoch),
+        ))
+        .await;
+    host.abort();
+
+    assert!(reply.result.is_err(), "{:?}", reply.result);
+    let recovered = fixture
+        .supervisor
+        .registry
+        .recovery_context(fixture.soul.clone())
+        .await
+        .unwrap()
+        .fresh_agent
+        .unwrap();
+    assert_eq!(recovered.model.as_deref(), Some("sonnet"));
+    assert_eq!(recovered.effort.as_deref(), Some("low"));
+}
+
 #[tokio::test]
 async fn admin_configure_with_a_stale_epoch_is_refused_before_any_host_or_registry_change() {
     let fixture = running_fresh_claude().await;
