@@ -40,6 +40,7 @@ pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
+pub(crate) mod delegation;
 pub mod hosted_rest;
 pub mod identity_sink;
 pub mod layout_store;
@@ -3883,23 +3884,6 @@ fn opencode_task_result_text(output: &str) -> String {
     }
 }
 
-/// The opencode TUI header: `titlecase(subagent_type ?? "General") + " Task"` (+ " (background)")
-/// + " — " + description.
-fn opencode_task_delegation_title(subagent: &str, background: bool, description: &str) -> String {
-    let mut chars = subagent.chars();
-    let titlecased = match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    };
-    let name = if titlecased.trim().is_empty() {
-        "General".to_string()
-    } else {
-        titlecased
-    };
-    let marker = if background { " (background)" } else { "" };
-    format!("{name} Task{marker} — {description}")
-}
-
 /// Wire `state.status` triple shared by every opencode tool-shaped part: the
 /// contract's `running | completed | failed` enum.
 fn opencode_tool_status(state: &Value) -> &'static str {
@@ -3910,32 +3894,8 @@ fn opencode_tool_status(state: &Value) -> &'static str {
     }
 }
 
-/// One-line child-activity preview (the client's `getToolPreview` core cases).
-/// Unknown tools (or known tools with no preview key) fall back to compact JSON
-/// verbatim, braces included.
-pub(crate) fn opencode_child_activity_preview(tool: &str, input: &Value) -> String {
-    let get = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
-    let preview = match tool {
-        "bash" | "shell" => get("command"),
-        "read" | "write" | "edit" => get("filePath"),
-        "grep" => get("pattern"),
-        "glob" => get("pattern"),
-        "task" => get("description"),
-        "webfetch" => get("url"),
-        _ => "",
-    };
-    let text = if preview.is_empty() {
-        serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        preview.to_string()
-    };
-    text.chars().take(120).collect()
-}
-
-/// Task-3 join: the most child-activity rows embedded per delegation. Full
-/// detail lives in the child session pane (sidebar + "Open session"); this is a
-/// summary strip (recorded residual).
-const OPENCODE_CHILD_ACTIVITY_ROW_CAP: usize = 200;
+pub(crate) use delegation::delegation_activity_preview as opencode_child_activity_preview;
+use delegation::{task_delegation_title, DELEGATION_ACTIVITY_ROW_CAP};
 
 /// Idle retire bound for orphaned watchers (plan review round 1, Finding 5):
 /// 2 hours covers realistic long-running delegations and post-"Open session"
@@ -3946,7 +3906,7 @@ const OPENCODE_CHILD_WATCHER_IDLE_SECS: u64 = 7200;
 /// nested `↳ <tool> <summary>` lines, joined server-side from the child
 /// session's message page): tool parts only, in wire order, each with the
 /// contract's `running | completed | failed` status and a one-line preview,
-/// capped at [`OPENCODE_CHILD_ACTIVITY_ROW_CAP`].
+/// capped at [`DELEGATION_ACTIVITY_ROW_CAP`].
 pub(crate) fn opencode_child_activity_rows(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
@@ -3968,7 +3928,7 @@ pub(crate) fn opencode_child_activity_rows(messages: &[Value]) -> Vec<Value> {
                 "preview": opencode_child_activity_preview(tool, &input),
             })
         })
-        .take(OPENCODE_CHILD_ACTIVITY_ROW_CAP)
+        .take(DELEGATION_ACTIVITY_ROW_CAP)
         .collect()
 }
 
@@ -4222,7 +4182,7 @@ fn opencode_item_from_part(
                 let status = opencode_tool_status(&state);
                 let mut item = json!({
                     "id": id, "kind": "task_delegation", "status": status,
-                    "title": opencode_task_delegation_title(subagent, background, description),
+                    "title": task_delegation_title(subagent, background, description),
                     "subagent": subagent, "background": background,
                 });
                 if !description.is_empty() {
