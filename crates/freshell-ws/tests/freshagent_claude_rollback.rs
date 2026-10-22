@@ -1199,12 +1199,14 @@ impl Drop for UnreadableDir {
 }
 
 /// The rig's fake transcript store (`CLAUDE_CONFIG_DIR`) projects dir.
+#[cfg(unix)]
 fn rig_projects_dir(rig: &RollbackRig) -> PathBuf {
     rig.home.path().join("claude-store").join("projects")
 }
 
 /// The rollback refusal answered for `request_id` (the requesting sink's
 /// `freshAgent.error{rollback:true}`).
+#[cfg(unix)]
 async fn await_rollback_error(ws: &mut TestWs, frames: &mut FrameBag, request_id: &str) -> Value {
     let request_id = request_id.to_string();
     await_frame_into(ws, frames, 20, move |v| {
