@@ -720,7 +720,7 @@ impl HostedFreshAgentProxy {
                 kind: ViewIntentKind::AutomaticPrimary,
                 preferred_tab_id: message.tab_id.clone(),
                 preferred_pane_id: None,
-                title: None,
+                title: Some(format!("{} agent", provider.as_str())),
                 placement_group: None,
                 visibility: ViewVisibilityIntent::Visible,
             }),
