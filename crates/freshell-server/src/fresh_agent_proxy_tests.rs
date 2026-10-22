@@ -136,6 +136,50 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
     );
 }
 
+#[tokio::test]
+async fn hosted_configure_is_consumed_by_the_gateway_without_a_lost_session_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("managed-claude-soul").unwrap();
+    let (broadcast, mut receiver) = broadcast::channel(16);
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::from([(
+            ("claude".into(), "public-1".into()),
+            soul,
+        )])),
+        presentation_ids: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
+    });
+
+    proxy
+        .handle(HostedFreshAgentCommand::Configure(
+            serde_json::from_value(serde_json::json!({
+                "provider":"claude","sessionId":"public-1","sessionType":"freshclaude",
+                "requestId":"configure-1","settings":{"model":"opus","effort":"high"}
+            }))
+            .unwrap(),
+        ))
+        .await;
+
+    assert!(
+        receiver.try_recv().is_err(),
+        "a hosted configure must not answer with an error or lost-session frame"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "the staged configure is applied by the next send, not by a host call"
+    );
+}
+
 #[test]
 fn presentation_rewrite_keeps_materialized_native_identity() {
     let mut created = serde_json::json!({

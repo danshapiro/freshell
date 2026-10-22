@@ -270,6 +270,19 @@ impl HostedFreshAgentProxy {
                     );
                 }
             }
+            HostedFreshAgentCommand::Configure(message) => {
+                // Every hosted send already carries the pane's settings, so a
+                // configure is staged until that send (the protocol's
+                // accept-and-strip degradation). It must not reach the
+                // in-process provider states, which do not own this soul.
+                tracing::info!(
+                    event = "fresh_agent.configure.staged_until_next_send",
+                    provider = %provider_wire(&message.provider),
+                    session_id = %message.session_id,
+                    request_id = message.request_id.as_deref().unwrap_or(""),
+                    "managed fresh-agent configure staged until the next send"
+                );
+            }
             HostedFreshAgentCommand::Kill(message) => {
                 let success = if let Some(soul) = self
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
