@@ -1908,6 +1908,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// One listed entry failing must not hide the others: an entry that
+    /// vanished before its type check (`NotFound`) is a clean miss, an entry
+    /// that could not be read is remembered, and every readable directory
+    /// after either is still returned for the scan to probe.
+    #[test]
+    fn subdir_listing_keeps_going_past_a_bad_entry_and_skips_a_vanished_one() {
+        use std::io::{Error, ErrorKind};
+        let mut errors = ScanErrors::default();
+        let dirs = collect_subdirs(
+            [
+                Ok((true, PathBuf::from("projects/-b"))),
+                Err(Error::from(ErrorKind::NotFound)),
+                Ok((false, PathBuf::from("projects/stray.txt"))),
+                Err(Error::from(ErrorKind::PermissionDenied)),
+                Ok((true, PathBuf::from("projects/-a"))),
+            ],
+            &mut errors,
+        );
+        assert_eq!(
+            dirs,
+            [PathBuf::from("projects/-a"), PathBuf::from("projects/-b")],
+            "every readable directory survives a bad entry, sorted"
+        );
+        assert_eq!(
+            errors.first().map(Error::kind),
+            Some(ErrorKind::PermissionDenied),
+            "the vanished entry is not an error; the unreadable one is"
+        );
+
+        let mut errors = ScanErrors::default();
+        collect_subdirs(
+            [
+                Ok((true, PathBuf::from("projects/-a"))),
+                Err(Error::from(ErrorKind::NotFound)),
+            ],
+            &mut errors,
+        );
+        assert!(
+            errors.first().is_none(),
+            "a listing whose only failure is a vanished entry is clean"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn locate_state_reports_an_unreadable_projects_dir_as_unreadable() {
