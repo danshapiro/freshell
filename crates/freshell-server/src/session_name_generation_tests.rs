@@ -2213,14 +2213,19 @@ async fn the_targeted_opencode_lookup_serves_eligibility_and_is_bounded() {
         Duration::from_millis(1_000),
         None,
     );
-    let first = index.opencode_first_user_message("ses_named");
+    let first = index
+        .opencode_first_user_message("ses_named")
+        .expect("the targeted read succeeds");
     assert_eq!(
         first.as_deref(),
         Some("The hidden first message"),
         "an already-named opencode session's first message is served on demand"
     );
     assert!(
-        index.opencode_first_user_message("ses_missing").is_none(),
+        index
+            .opencode_first_user_message("ses_missing")
+            .expect("a missing session is an answer, not a failed read")
+            .is_none(),
         "a missing session answers None"
     );
 

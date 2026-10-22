@@ -41,6 +41,22 @@ pub(crate) fn cached_first_message_is_stale(
         && first_user_message.is_some_and(starts_with_context_tag)
 }
 
+/// Log one load's re-parse (INFO `session_index.first_message_rules_reparse`
+/// with how many entries were dropped and the rules version), so the
+/// one-time cost after a rules bump shows up in the JSONL log. A load that
+/// dropped nothing logs nothing.
+pub(crate) fn log_reparse(dropped: usize) {
+    if dropped == 0 {
+        return;
+    }
+    tracing::info!(
+        event = "session_index.first_message_rules_reparse",
+        dropped,
+        rules_version = FIRST_MESSAGE_RULES_VERSION,
+        "session_index.first_message_rules_reparse: cached first messages derived under older rules are re-parsed once"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

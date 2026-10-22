@@ -90,7 +90,13 @@ where
             target == "freshell_server::session_directory" && level == tracing::Level::ERROR;
         let is_session_names_info =
             target == "freshell_server::session_names" && level == tracing::Level::INFO;
-        if !is_extension_warning && !is_session_directory_error && !is_session_names_info {
+        let is_first_message_lookup_warning =
+            target == "freshell_server::auto_title_sweep" && level == tracing::Level::WARN;
+        if !is_extension_warning
+            && !is_session_directory_error
+            && !is_session_names_info
+            && !is_first_message_lookup_warning
+        {
             return;
         }
 
@@ -103,12 +109,20 @@ where
         {
             return;
         }
+        // The event name is the message up to its first colon.
+        let event_name = visitor.message.split(':').next().unwrap_or_default();
         if is_session_names_info
             && !matches!(
-                visitor.message.as_str(),
+                event_name,
                 "session_names.import_ignored_after_completion"
                     | "session_names.bind_collision_import_label_lost"
+                    | "session_names.generation_input_refused"
             )
+        {
+            return;
+        }
+        if is_first_message_lookup_warning
+            && event_name != "session_names.first_message_lookup_failed"
         {
             return;
         }

@@ -8,29 +8,92 @@
 //! still use the message — as AI-naming input, or as a name for a record
 //! below `first_message` or stuck on a junk default label such as its
 //! folder name. A session that has no user message would then be read on
-//! every 5-second pass forever, so every answer is remembered ACROSS passes,
-//! keyed by session id and the index row's last activity: a new message
-//! moves the row's activity, which reads again. Entries for sessions that
-//! left the index are forgotten at the end of each pass, so the memo never
-//! outgrows the index.
+//! every 5-second pass forever, so every ANSWER (the message, or "no user
+//! message") is remembered ACROSS passes, keyed by session id and the index
+//! row's last activity: a new message moves the row's activity, which reads
+//! again. A FAILED read (the database stayed busy past its timeout, the
+//! query failed, the task died) is not an answer: it is logged as a warning
+//! and retried on the first pass after [`FAILED_LOOKUP_RETRY`] — or at once
+//! when the row's activity moves — so one transient failure never puts off
+//! a session's first-message name, and a lasting one costs one read and one
+//! warning per session per window. Entries for sessions that left the index
+//! are forgotten at the end of each pass, so the memo never outgrows the
+//! index.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-/// One remembered lookup answer.
-struct Remembered {
-    last_activity_at: i64,
-    message: Option<String>,
+use freshell_sessions::directory_index::FirstUserMessageRead;
+use freshell_sessions::parse::OpencodeByIdError;
+
+/// How long a FAILED read waits before a later pass retries it.
+pub(crate) const FAILED_LOOKUP_RETRY: Duration = Duration::from_secs(60);
+
+/// What the memo holds for one session, at one index activity stamp.
+enum Remembered {
+    /// A known answer: the first user message, or `None` (no user message).
+    Answer {
+        last_activity_at: i64,
+        message: Option<String>,
+    },
+    /// The read failed; no read again before `retry_at` at this stamp.
+    Failed {
+        last_activity_at: i64,
+        retry_at: Instant,
+    },
+}
+
+/// What a lookup at one activity stamp should do.
+enum Recall {
+    /// Serve this remembered answer.
+    Answer(Option<String>),
+    /// A recent read failed: no message this pass, no read.
+    Waiting,
+    /// Read now.
+    Read,
+}
+
+impl Remembered {
+    fn recall(&self, last_activity_at: i64, now: Instant) -> Recall {
+        match self {
+            Self::Answer {
+                last_activity_at: at,
+                message,
+            } if *at == last_activity_at => Recall::Answer(message.clone()),
+            Self::Failed {
+                last_activity_at: at,
+                retry_at,
+            } if *at == last_activity_at && now < *retry_at => Recall::Waiting,
+            _ => Recall::Read,
+        }
+    }
 }
 
 /// The cross-pass memo of targeted first-message lookups. Cheap to clone
 /// (shared state).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FirstMessageLookupMemo {
     inner: Arc<Mutex<HashMap<String, Remembered>>>,
+    failure_retry: Duration,
+}
+
+impl Default for FirstMessageLookupMemo {
+    fn default() -> Self {
+        Self::with_failure_retry(FAILED_LOOKUP_RETRY)
+    }
 }
 
 impl FirstMessageLookupMemo {
+    /// A memo whose failed reads are retried after `failure_retry` (the
+    /// sweep uses [`FAILED_LOOKUP_RETRY`]).
+    pub(crate) fn with_failure_retry(failure_retry: Duration) -> Self {
+        Self {
+            inner: Arc::default(),
+            failure_retry,
+        }
+    }
+
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Remembered>> {
         self.inner
             .lock()
@@ -38,8 +101,10 @@ impl FirstMessageLookupMemo {
     }
 
     /// The session's first user message at `last_activity_at`: the
-    /// remembered answer when this activity was already read, else
-    /// `read()`'s (remembered for later passes).
+    /// remembered answer when this activity was already read, `None` while
+    /// a failed read waits out its retry window, else `read()`'s — an
+    /// answer is remembered for later passes, a failure only delays the
+    /// next read.
     pub(crate) async fn first_message<F, Fut>(
         &self,
         session_id: &str,
@@ -48,28 +113,56 @@ impl FirstMessageLookupMemo {
     ) -> Option<String>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Option<String>>,
+        Fut: std::future::Future<Output = FirstUserMessageRead>,
     {
-        if let Some(remembered) = self.map().get(session_id) {
-            if remembered.last_activity_at == last_activity_at {
-                return remembered.message.clone();
-            }
+        let recall = self
+            .map()
+            .get(session_id)
+            .map_or(Recall::Read, |remembered| {
+                remembered.recall(last_activity_at, Instant::now())
+            });
+        match recall {
+            Recall::Answer(message) => return message,
+            Recall::Waiting => return None,
+            Recall::Read => {}
         }
-        let message = read().await;
-        tracing::debug!(
-            target: "freshell_server::auto_title_sweep",
-            op = "first_message_lookup",
-            session_id = %session_id,
-            found = message.is_some(),
-            "session_names.first_message_lookup"
-        );
-        self.map().insert(
-            session_id.to_string(),
-            Remembered {
-                last_activity_at,
-                message: message.clone(),
-            },
-        );
+        let (remembered, message) = match read().await {
+            Ok(message) => {
+                tracing::debug!(
+                    target: "freshell_server::auto_title_sweep",
+                    op = "first_message_lookup",
+                    session_id = %session_id,
+                    found = message.is_some(),
+                    "session_names.first_message_lookup"
+                );
+                (
+                    Remembered::Answer {
+                        last_activity_at,
+                        message: message.clone(),
+                    },
+                    message,
+                )
+            }
+            Err(failure) => {
+                tracing::warn!(
+                    target: "freshell_server::auto_title_sweep",
+                    op = "first_message_lookup",
+                    session_id = %session_id,
+                    code = failure.code.as_deref().unwrap_or("unknown"),
+                    error = %failure.message,
+                    retry_in_ms = u64::try_from(self.failure_retry.as_millis()).unwrap_or(u64::MAX),
+                    "session_names.first_message_lookup_failed: the targeted first-message read failed; a later pass retries it"
+                );
+                (
+                    Remembered::Failed {
+                        last_activity_at,
+                        retry_at: Instant::now() + self.failure_retry,
+                    },
+                    None,
+                )
+            }
+        };
+        self.map().insert(session_id.to_string(), remembered);
         message
     }
 
@@ -86,8 +179,9 @@ impl FirstMessageLookupMemo {
 }
 
 /// The targeted lookup for one OpenCode row through the shared index (a
-/// blocking read-only query, off the async executor), remembered in the
-/// sweep state's memo.
+/// blocking read-only query, off the async executor), through the sweep
+/// state's memo. A failed query and a failed blocking task are both failed
+/// reads (retried later), never "no user message".
 pub(crate) async fn opencode_first_message(
     state: &super::AutoTitleSweepState,
     row: &super::SweepSession,
@@ -99,8 +193,12 @@ pub(crate) async fn opencode_first_message(
         .first_message(&row.session_id, row.last_activity_at, || async move {
             tokio::task::spawn_blocking(move || index.opencode_first_user_message(&session_id))
                 .await
-                .ok()
-                .flatten()
+                .unwrap_or_else(|join| {
+                    Err(OpencodeByIdError {
+                        code: None,
+                        message: format!("the lookup task failed: {join}"),
+                    })
+                })
         })
         .await
 }
@@ -117,11 +215,28 @@ mod tests {
         at: i64,
         answer: Option<&str>,
     ) -> Option<String> {
+        read_with(memo, reads, session_id, at, Ok(answer.map(str::to_string))).await
+    }
+
+    async fn read_with(
+        memo: &FirstMessageLookupMemo,
+        reads: &AtomicUsize,
+        session_id: &str,
+        at: i64,
+        read: FirstUserMessageRead,
+    ) -> Option<String> {
         memo.first_message(session_id, at, || async {
             reads.fetch_add(1, Ordering::SeqCst);
-            answer.map(str::to_string)
+            read
         })
         .await
+    }
+
+    fn busy() -> FirstUserMessageRead {
+        Err(OpencodeByIdError {
+            code: Some("SQLITE_BUSY".to_string()),
+            message: "database is locked".to_string(),
+        })
     }
 
     #[tokio::test]
@@ -149,6 +264,85 @@ mod tests {
             "a found message is remembered too"
         );
         assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// A failed read (busy past the timeout, a query error, a failed task)
+    /// is never remembered as "no user message": the pass after the retry
+    /// window reads again, and the found message is then remembered.
+    #[tokio::test]
+    async fn a_failed_read_is_retried_after_the_retry_window() {
+        let memo = FirstMessageLookupMemo::with_failure_retry(Duration::ZERO);
+        let reads = AtomicUsize::new(0);
+        assert_eq!(
+            read_with(&memo, &reads, "ses_flaky", 10, busy()).await,
+            None
+        );
+        assert_eq!(
+            look(
+                &memo,
+                &reads,
+                "ses_flaky",
+                10,
+                Some("Fix the sardine importer")
+            )
+            .await
+            .as_deref(),
+            Some("Fix the sardine importer"),
+            "the same activity is read again once the window passed"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            look(&memo, &reads, "ses_flaky", 10, None).await.as_deref(),
+            Some("Fix the sardine importer"),
+            "the answer that followed is remembered"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// Inside the retry window a failed session is not re-read every pass
+    /// (a lasting failure costs one read, and one warning, per window); a
+    /// move of its activity reads at once.
+    #[tokio::test]
+    async fn a_failed_read_waits_out_the_window_unless_the_activity_moves() {
+        let events = crate::test_trace_capture::captured_trace_events();
+        let session_id = format!("ses_window_{}", uuid::Uuid::new_v4());
+        let memo = FirstMessageLookupMemo::with_failure_retry(Duration::from_secs(3_600));
+        let reads = AtomicUsize::new(0);
+        assert_eq!(
+            read_with(&memo, &reads, &session_id, 10, busy()).await,
+            None
+        );
+        assert_eq!(
+            look(&memo, &reads, &session_id, 10, Some("unread")).await,
+            None,
+            "inside the window: no read"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            look(&memo, &reads, &session_id, 20, Some("Now it has one"))
+                .await
+                .as_deref(),
+            Some("Now it has one"),
+            "newer activity reads at once"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        let warnings: Vec<_> = events
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.level == tracing::Level::WARN
+                    && event
+                        .message
+                        .starts_with("session_names.first_message_lookup_failed")
+                    && event.fields.get("session_id") == Some(&session_id)
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "one warning for the one failed read");
+        assert_eq!(
+            warnings[0].fields.get("code").map(String::as_str),
+            Some("SQLITE_BUSY")
+        );
     }
 
     #[tokio::test]

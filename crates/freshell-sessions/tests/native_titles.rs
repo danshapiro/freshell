@@ -165,6 +165,52 @@ fn opencode_named_first_message_lookup_is_targeted() {
         .is_none());
 }
 
+/// Name-reliability Task 5 review: a read that FAILED is an error, never
+/// the "no user message" answer — the naming sweep remembers answers across
+/// passes, so a failure reported as `None` would put off the session's
+/// first-message name for the rest of the process's life. A database that
+/// cannot be opened and a query that cannot run (here: no `message` table)
+/// are both errors; a session with no user message stays `Ok(None)`.
+#[test]
+fn opencode_first_message_lookup_reports_a_failed_read_as_an_error() {
+    let missing = TmpDir::new("no-db");
+    assert!(
+        opencode_first_user_message_by_id(missing.path(), "ses_named").is_err(),
+        "no database: the read failed"
+    );
+
+    let broken = TmpDir::new("no-message-table");
+    rusqlite::Connection::open(broken.path().join("opencode.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                project_id TEXT, parent_id TEXT
+             );",
+        )
+        .unwrap();
+    let failure = opencode_first_user_message_by_id(broken.path(), "ses_named")
+        .expect_err("a query that cannot run is a failed read, not 'no user message'");
+    assert!(
+        failure.message.contains("no such table"),
+        "the failure names what went wrong: {}",
+        failure.message
+    );
+
+    let silent = TmpDir::new("no-user-message");
+    named_session_db(silent.path());
+    rusqlite::Connection::open(silent.path().join("opencode.db"))
+        .unwrap()
+        .execute_batch("DELETE FROM part; DELETE FROM message;")
+        .unwrap();
+    assert_eq!(
+        opencode_first_user_message_by_id(silent.path(), "ses_named")
+            .expect("a readable session with no user message is an answer"),
+        None
+    );
+}
+
 /// The retained exact-ID database on the by-id hit travels through the
 /// resolve core WITHOUT leaking into any match output (it is internal
 /// routing evidence, never user-facing).

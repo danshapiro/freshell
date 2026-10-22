@@ -334,33 +334,36 @@ const FIRST_USER_MESSAGE_SQL: &str = "\
       AND json_extract(p.data, '$.text') IS NOT NULL \
     ORDER BY p.id LIMIT 1";
 
+/// The listing path's read: a failed prepare or query degrades to `None`
+/// (an older schema must not break listing).
 fn first_user_message_for_session(conn: &Connection, session_id: &str) -> Option<String> {
-    let mut stmt = match conn.prepare_cached(FIRST_USER_MESSAGE_SQL) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            tracing::debug!(
-                session_id,
-                error = %e,
-                "opencode first-user-message prepare failed; degrading to None"
-            );
-            return None;
-        }
-    };
+    try_first_user_message_for_session(conn, session_id).unwrap_or_else(|e| {
+        tracing::debug!(
+            session_id,
+            error = %e,
+            "opencode first-user-message read failed; degrading to None"
+        );
+        None
+    })
+}
+
+/// The read itself: `Ok(None)` when the session has no (non-empty) user
+/// message, `Err` when the statement cannot be prepared or the query fails
+/// (busy past the timeout, schema mismatch).
+fn try_first_user_message_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare_cached(FIRST_USER_MESSAGE_SQL)?;
     let text: Option<String> = match stmt.query_row(rusqlite::params![session_id], |row| row.get(0))
     {
         Ok(text) => text,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return None,
-        Err(e) => {
-            tracing::debug!(
-                session_id,
-                error = %e,
-                "opencode first-user-message query failed; degrading to None"
-            );
-            return None;
-        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e),
     };
-    text.as_deref()
-        .and_then(crate::text::normalize_first_user_message)
+    Ok(text
+        .as_deref()
+        .and_then(crate::text::normalize_first_user_message))
 }
 
 /// Unified agent names (Task 3): the TARGETED first-user-message lookup for
@@ -369,6 +372,12 @@ fn first_user_message_for_session(conn: &Connection, session_id: &str) -> Option
 /// messages for placeholder-titled rows. This reads the single named
 /// session's first real user message on demand (read-only, the same
 /// SQL/normalization the listing path uses), never a full-history scan.
+///
+/// `Ok(None)` means the session has no user message; ANY failed read — the
+/// database cannot be opened, the statement cannot be prepared, the query
+/// fails or stays busy past the timeout — is an `Err` (name-reliability
+/// Task 5 review: the naming sweep remembers answers, so a failure must
+/// never read as "no user message").
 pub fn opencode_first_user_message_by_id(
     data_home: &Path,
     session_id: &str,
@@ -383,7 +392,7 @@ pub fn opencode_first_user_message_by_id(
         OPENCODE_BYID_BUSY_TIMEOUT_MS,
     ))
     .map_err(by_id_err)?;
-    Ok(first_user_message_for_session(&conn, session_id))
+    try_first_user_message_for_session(&conn, session_id).map_err(by_id_err)
 }
 
 /// Assistant messages of a session, newest-first — the usage walk's cursor.
