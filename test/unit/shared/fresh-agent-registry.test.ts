@@ -2,9 +2,17 @@ import { describe, expect, it } from 'vitest'
 
 import {
   getEffectiveFreshAgentEffort,
+  resolveFreshAgentPaneModelDefaults,
   resolveFreshAgentType,
   resolveFreshAgentPaneCreateEffort,
+  type FreshAgentRegistryEntry,
 } from '@/lib/fresh-agent-registry'
+
+function registryEntry(sessionType: string): FreshAgentRegistryEntry {
+  const entry = resolveFreshAgentType(sessionType)
+  if (!entry) throw new Error(`no registry entry for ${sessionType}`)
+  return entry
+}
 
 describe('fresh-agent registry', () => {
   it('keeps kilroy as a hidden claude-backed fresh-agent type', () => {
@@ -140,5 +148,35 @@ describe('getEffectiveFreshAgentEffort', () => {
       effort: 'high',
       modelEffortLevels: ['alpha'],
     })).toBe('high')
+  })
+})
+
+describe('resolveFreshAgentPaneModelDefaults', () => {
+  const saved = (modelId: string) => ({ modelSelection: { kind: 'exact' as const, modelId } })
+
+  it.each([
+    // [label, sessionType, providerSettings, runtimeProviderModel, expected model, expected persistModel]
+    ['claude: saved default wins', 'freshclaude', saved('sonnet'), undefined, 'sonnet', true],
+    ['claude: registry default when nothing is saved', 'freshclaude', undefined, undefined, 'opus[1m]', true],
+    ['claude: a blank saved id falls back to the registry default', 'freshclaude', saved('   '), undefined, 'opus[1m]', true],
+    ['claude: never falls back to the terminal CLI model (D1)', 'freshclaude', undefined, 'haiku', 'opus[1m]', true],
+    ['claude: saved default beats the terminal CLI model', 'freshclaude', saved('sonnet'), 'haiku', 'sonnet', true],
+    ['kilroy: saved default wins', 'kilroy', saved('sonnet'), undefined, 'sonnet', true],
+    ['kilroy: registry default when nothing is saved', 'kilroy', undefined, undefined, 'opus[1m]', true],
+    ['codex: saved default wins', 'freshcodex', saved('gpt-5.6-luna'), 'gpt-5.6-terra', 'gpt-5.6-luna', true],
+    ['codex: runtime CLI model when nothing is saved', 'freshcodex', undefined, 'gpt-5.6-terra', 'gpt-5.6-terra', true],
+    ['codex: unknown saved model normalizes to the codex default', 'freshcodex', saved('gpt-unknown'), undefined, 'gpt-6-astra', true],
+    ['codex: registry default when nothing is configured', 'freshcodex', undefined, undefined, 'gpt-6-astra', true],
+    ['opencode: saved default persists', 'freshopencode', saved('umans/kimi'), undefined, 'umans/kimi', true],
+    ['opencode: runtime CLI model persists', 'freshopencode', undefined, 'umans/kimi', 'umans/kimi', true],
+    ['opencode: nothing configured persists no model', 'freshopencode', undefined, undefined, undefined, false],
+  ] as const)('%s', (_label, sessionType, providerSettings, runtimeProviderModel, model, persistModel) => {
+    const result = resolveFreshAgentPaneModelDefaults({
+      entry: registryEntry(sessionType),
+      providerSettings,
+      runtimeProviderModel,
+    })
+    expect(result.model).toBe(model)
+    expect(result.persistModel).toBe(persistModel)
   })
 })

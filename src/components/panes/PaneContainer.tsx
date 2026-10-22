@@ -14,7 +14,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
-import { normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentPaneCreateEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { normalizeFreshAgentEffort, resolveFreshAgentPaneCreateEffort, resolveFreshAgentPaneModelDefaults, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { renamePaneAfterMirrorReady } from '@/lib/pane-rename'
@@ -709,23 +709,11 @@ function PickerWrapper({
         ? getFreshAgentProviderConfig(type)
         : undefined
       const providerSettings = freshAgentSettings?.providers?.[type]
-      const providerDefaultModel = typeof providerSettings?.modelSelection?.modelId === 'string'
-        ? providerSettings.modelSelection.modelId
-        : undefined
-      const runtimeProviderConfiguredModel = settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model
-      const runtimeProviderModel = typeof runtimeProviderConfiguredModel === 'string'
-        && runtimeProviderConfiguredModel.trim().length > 0
-        ? runtimeProviderConfiguredModel
-        : undefined
-      const configuredModel = freshAgentType.runtimeProvider === 'codex' || freshAgentType.runtimeProvider === 'opencode'
-        ? providerDefaultModel
-          ?? runtimeProviderModel
-          ?? freshAgentType.defaultModel
-        : freshAgentType.defaultModel
-      const model = normalizeFreshAgentModel(freshAgentType.sessionType, freshAgentType.runtimeProvider, configuredModel) ?? configuredModel
-      const shouldPersistPaneModel = freshAgentType.runtimeProvider !== 'opencode'
-        || providerDefaultModel !== undefined
-        || runtimeProviderModel !== undefined
+      const { model, persistModel: shouldPersistPaneModel } = resolveFreshAgentPaneModelDefaults({
+        entry: freshAgentType,
+        providerSettings,
+        runtimeProviderModel: settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model,
+      })
       const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
         ? undefined
         : providerSettings?.defaultPermissionMode

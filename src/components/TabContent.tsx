@@ -15,6 +15,7 @@ interface TabContentProps {
 export default function TabContent({ tabId, hidden }: TabContentProps) {
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const defaultNewPane = useAppSelector((s) => s.settings.settings.panes?.defaultNewPane || 'ask')
+  const freshAgentProviders = useAppSelector((s) => s.settings.settings.freshAgent?.providers)
   const previousHiddenRef = useRef(hidden)
 
   useEffect(() => {
@@ -38,6 +39,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       sessionId: tabSessionId,
       cwd: tab.initialCwd,
       checkpointWorkspace: tab.checkpointWorkspace,
+      freshAgentProviderSettings: freshAgentProviders?.[resumeSessionType],
     })
   } else if (tab.mode !== 'shell') {
     defaultContent = {

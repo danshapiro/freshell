@@ -235,6 +235,55 @@ describe('buildResumeContent', () => {
     expect(content.effort).toBe('turbo')
   })
 
+  describe('resumed panes start on the saved fresh-pane default model (G11, decision D2)', () => {
+    it('resumes a Freshclaude session on the saved default model', () => {
+      const content = buildResumeContent({
+        sessionType: 'freshclaude',
+        sessionId: 'abc-123',
+        freshAgentProviderSettings: {
+          modelSelection: { kind: 'exact', modelId: 'sonnet' },
+        },
+      })
+      if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+      expect(content.model).toBe('sonnet')
+      expect(content.modelSelection).toEqual({ kind: 'exact', modelId: 'sonnet' })
+    })
+
+    it('resumes a Freshclaude session on the registry default when nothing is saved', () => {
+      const content = buildResumeContent({ sessionType: 'freshclaude', sessionId: 'abc-123' })
+      if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+      expect(content.model).toBe('opus[1m]')
+    })
+
+    it('resumes a Kilroy session on the saved Kilroy default model', () => {
+      const saved = buildResumeContent({
+        sessionType: 'kilroy',
+        sessionId: 'xyz-789',
+        freshAgentProviderSettings: {
+          modelSelection: { kind: 'exact', modelId: 'sonnet' },
+        },
+      })
+      if (saved.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+      expect(saved.model).toBe('sonnet')
+
+      const unsaved = buildResumeContent({ sessionType: 'kilroy', sessionId: 'xyz-789' })
+      if (unsaved.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+      expect(unsaved.model).toBe('opus[1m]')
+    })
+
+    it('resumes a Freshcodex session on the saved Freshcodex default model', () => {
+      const content = buildResumeContent({
+        sessionType: 'freshcodex',
+        sessionId: 'codex-session-1',
+        freshAgentProviderSettings: {
+          modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
+        },
+      })
+      if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+      expect(content.model).toBe('gpt-5.6-luna')
+    })
+  })
+
   it('does not stamp visual style onto fresh-agent resume content', () => {
     const content = buildResumeContent({
       sessionType: 'freshcodex',

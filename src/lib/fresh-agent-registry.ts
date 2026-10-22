@@ -167,6 +167,54 @@ export type FreshAgentProviderDefaultsForModel = {
   effort?: string
 }
 
+/** The saved per-type fresh-pane defaults the model resolver reads. */
+export type FreshAgentPaneModelDefaultsSettings = {
+  modelSelection?: { modelId?: string }
+}
+
+export type FreshAgentPaneModelDefaults = {
+  /** The model a new or resumed pane starts on (undefined: provider default). */
+  model: string | undefined
+  /** Whether to stamp `model` into the pane content. An opencode pane with
+   * nothing configured persists no model, so its provider default applies. */
+  persistModel: boolean
+}
+
+function nonBlank(value: string | undefined): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+/**
+ * The one rule for the model a NEW or RESUMED fresh-agent pane starts on.
+ * An existing pane keeps its own model; this only seeds pane content.
+ *
+ * - claude (freshclaude, kilroy): the saved fresh-pane default for the type,
+ *   then the registry default. The terminal Claude CLI model is deliberately
+ *   NOT consulted (decision D1): fresh panes have their own saved default.
+ * - codex, opencode: the saved fresh-pane default, then the runtime CLI model
+ *   (`codingCli.providers[runtime].model`), then the registry default.
+ *
+ * `runtimeProviderModel` is only supplied where the CLI model applies (the
+ * picker); resume content omits it.
+ */
+export function resolveFreshAgentPaneModelDefaults(args: {
+  entry: FreshAgentRegistryEntry
+  providerSettings?: FreshAgentPaneModelDefaultsSettings
+  runtimeProviderModel?: string
+}): FreshAgentPaneModelDefaults {
+  const { entry } = args
+  const saved = nonBlank(args.providerSettings?.modelSelection?.modelId)
+  const runtimeProviderModel = entry.runtimeProvider === 'claude'
+    ? undefined
+    : nonBlank(args.runtimeProviderModel)
+  const configured = saved ?? runtimeProviderModel ?? entry.defaultModel
+  const model = normalizeFreshAgentModel(entry.sessionType, entry.runtimeProvider, configured) ?? configured
+  const persistModel = entry.runtimeProvider !== 'opencode'
+    || saved !== undefined
+    || runtimeProviderModel !== undefined
+  return { model, persistModel }
+}
+
 /**
  * The pane's effective model: the staged pane value first, then the explicit
  * pane selection, then the persisted provider default, normalized for the
