@@ -1180,8 +1180,16 @@ struct UnreadableDir(PathBuf);
 #[cfg(unix)]
 impl UnreadableDir {
     fn make(dir: &Path) -> Option<Self> {
+        Self::with_mode(dir, 0o000)
+    }
+    /// Mode 111: listing `dir` fails with EACCES, but a path THROUGH it still
+    /// opens -- a store a scan cannot check while a known file stays readable.
+    fn list_denied(dir: &Path) -> Option<Self> {
+        Self::with_mode(dir, 0o111)
+    }
+    fn with_mode(dir: &Path, mode: u32) -> Option<Self> {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
         let guard = Self(dir.to_path_buf());
         if std::fs::read_dir(dir).is_ok() {
             eprintln!("skipping: euid bypasses permission checks");
@@ -1293,6 +1301,96 @@ async fn claude_redo_with_an_unreadable_original_is_internal_error_not_redo_unav
         json!(true),
         "the refused redo leaves the record redoable for a retry"
     );
+    assert_never_completes(&frames);
+}
+
+/// Sets an env var for one test and removes it on drop (also on panic, while
+/// the caller still holds `CLAUDE_ENV_LOCK`).
+#[cfg(unix)]
+struct EnvVarGuard(&'static str);
+#[cfg(unix)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        std::env::set_var(key, value);
+        Self(key)
+    }
+}
+#[cfg(unix)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
+/// Polls `check` every 10 ms until it holds (bounded).
+#[cfg(unix)]
+async fn wait_until(budget_secs: u64, what: &str, check: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+    while !check() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// G28: the fork resumes from the transcript the undo ALREADY located. If the
+/// store stops listing between that lookup and the fork (here: the projects
+/// dir turns list-denied while the handler is parked before teardown), a
+/// second scan would miss, and the fork would resume by bare id with no cwd
+/// after the old sidecar is gone. Using the located path keeps the
+/// transcript's own cwd (the CLI's resume lookup is scoped to it).
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_undo_forks_from_the_transcript_it_located_even_if_the_store_stops_listing() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let rig = RollbackRig::install();
+    let _park = EnvVarGuard::set("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS", "1500");
+    let (mut ws, _addr, _ledger, mut frames, original) =
+        drive_conversation(&rig, &["first prompt", "second prompt"]).await;
+
+    send_json(
+        &mut ws,
+        &rollback_frame("rb-undo-relocate", "undo", &original, "step"),
+    )
+    .await;
+    // The durable pre-write lands AFTER the undo located the transcript and
+    // BEFORE the parked pre-teardown window.
+    let ledger_dir = rig.ledger_dir();
+    wait_until(15, "the rollback pre-write", || {
+        !rollback_rows(&ledger_dir).is_empty()
+    })
+    .await;
+    let Some(locked) = UnreadableDir::list_denied(&rig_projects_dir(&rig)) else {
+        return;
+    };
+    wait_until(15, "the fork create", || {
+        rig.create_lines()
+            .iter()
+            .any(|l| l["forkSession"] == json!(true))
+    })
+    .await;
+    drop(locked);
+
+    let creates = rig.create_lines();
+    let fork_create = creates
+        .iter()
+        .find(|l| l["forkSession"] == json!(true))
+        .expect("fork create observed");
+    assert_eq!(fork_create["resumeSessionId"], json!(original));
+    assert_eq!(fork_create["resumeSessionAt"], json!("a1"));
+    assert_eq!(
+        fork_create["cwd"],
+        json!("/tmp"),
+        "the fork runs in the located transcript's own cwd: {fork_create}"
+    );
+    let ack = await_frame_into(&mut ws, &mut frames, 20, |v| {
+        v["type"] == json!("freshAgent.event")
+            && v["event"]["type"] == json!("freshAgent.rolledBack")
+    })
+    .await;
+    assert_eq!(ack["event"]["requestId"], json!("rb-undo-relocate"));
     assert_never_completes(&frames);
 }
 

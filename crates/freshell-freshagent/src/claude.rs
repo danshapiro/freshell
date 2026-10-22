@@ -5771,6 +5771,7 @@ impl FreshClaudeState {
 
         let (
             resume_from,
+            source_path,
             resume_at_uuid,
             removed_turns,
             prompt_text,
@@ -5867,6 +5868,7 @@ impl FreshClaudeState {
                 // whenever a tip exists).
                 (
                     durable_id.clone(),
+                    path,
                     point.resume_at_uuid,
                     point.removed_turns,
                     point.prompt_text,
@@ -6000,6 +6002,7 @@ impl FreshClaudeState {
                 let guard = snap::raw_chain_successor(&original_text, &resume_at);
                 (
                     original,
+                    original_path,
                     Some(resume_at),
                     restored.turns,
                     restored.prompt_text,
@@ -6269,24 +6272,21 @@ impl FreshClaudeState {
         // Pre-compute the create-drive inputs: recovered settings + the resume
         // value/cwd (ledger A15 slug scoping; the transcript-PATH escape hatch
         // when the original cwd is gone). The fork READS: undo ⇒ the CURRENT
-        // session's file; redo ⇒ the chain-root ORIGINAL's file (`resume_from`).
+        // session's file; redo ⇒ the chain-root ORIGINAL's file (`resume_from`)
+        // -- `source_path`, the file the arm above already located and read
+        // (G28: never a second scan that a store turning unreadable could miss
+        // AFTER the pre-write, with teardown next).
         let recovered = self
             .identity_sink()
             .and_then(|s| s.load_settings(PROVIDER, &durable_id));
-        let source_path = snap::locate_transcript(&resume_from);
-        let original_cwd = source_path
-            .as_deref()
-            .and_then(snap::transcript_cwd)
-            .filter(|c| std::path::Path::new(c).is_dir());
+        let original_cwd =
+            snap::transcript_cwd(&source_path).filter(|c| std::path::Path::new(c).is_dir());
         // resume value (the fork leg): the durable id under its ORIGINAL cwd's
         // slug scope when that cwd survives; else the transcript PATH (the
         // verified cli.js escape hatch bypassing slug scoping).
         let resume_value = match &original_cwd {
             Some(_) => resume_from.clone(),
-            None => source_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| resume_from.clone()),
+            None => source_path.to_string_lossy().to_string(),
         };
         let spawn_cwd = original_cwd
             .clone()
