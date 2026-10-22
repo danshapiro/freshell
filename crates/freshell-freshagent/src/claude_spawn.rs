@@ -31,8 +31,15 @@
 //!
 //! On Linux the stronger, start-time-checked `/proc` ownership-tag
 //! confirmation in `claude.rs` still runs on top of this.
+//!
+//! [`ClaudeNodeCommand`] is the one recipe for launching a Claude Node child
+//! (the session sidecar and the model-catalog probe), so the two can never
+//! drift apart in node binary, run-as wrapper, managed secrets, the OneCLI
+//! key flag, or the provider exec check (audit G30).
 
-use std::process::ExitStatus;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -42,6 +49,15 @@ use tokio::time::Instant;
 /// How long a sidecar gets to exit on its own after the shutdown line (about
 /// fifteen times the measured graceful exit).
 pub const SIDECAR_GRACEFUL_EXIT: Duration = Duration::from_secs(2);
+
+/// The ownership tag a sidecar and its claude CLI grandchild carry (the codex
+/// analog is `FRESHELL_CODEX_SIDECAR_ID`); the Linux `/proc` reaper keys on
+/// it, and the SDK's clean env passes it through to the CLI.
+pub const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = "FRESHELL_CLAUDE_SIDECAR_ID";
+
+/// Tells the sidecar's clean env (`sdk-env.mjs`) to keep the managed
+/// `ANTHROPIC_API_KEY` for the SDK instead of stripping it.
+const ONECLI_API_KEY_FLAG: &str = "FRESHELL_CLAUDE_ONECLI_API_KEY";
 
 /// The sidecar protocol's shutdown request (`index.mjs`: `case 'shutdown'`).
 pub const SHUTDOWN_REQUEST: &[u8] = b"{\"type\":\"shutdown\"}\n";
@@ -88,6 +104,176 @@ pub struct SidecarExit {
     pub status: Option<ExitStatus>,
     /// Whether the rest of the tree (the CLI) is confirmed gone too.
     pub tree: TreeConfirmation,
+}
+
+/// How a Claude Node child (`node <entry>`) is launched. Built from the
+/// process environment and the managed child secrets ([`Self::new`]), or
+/// from injected parts in tests ([`Self::from_parts`]).
+pub struct ClaudeNodeCommand {
+    entry: PathBuf,
+    node: String,
+    run_as_ids: Option<(String, String)>,
+    secrets: Option<BTreeMap<String, String>>,
+    run_as: bool,
+    managed_environment: bool,
+    ownership_tag: Option<String>,
+    closed_stdin: bool,
+}
+
+impl ClaudeNodeCommand {
+    /// `node <entry>` from the live process: `FRESHELL_CLAUDE_NODE` (default
+    /// `node`), `FRESHELL_PROVIDER_RUN_AS_UID`/`_GID`, and the managed child
+    /// secrets installed by the session host (none in the default server).
+    pub fn new(entry: impl Into<PathBuf>) -> Self {
+        Self::from_parts(
+            entry,
+            &|name| std::env::var(name).ok(),
+            freshell_platform::managed_child_secrets::snapshot().cloned(),
+        )
+    }
+
+    /// The same recipe with the environment and secrets injected.
+    pub fn from_parts(
+        entry: impl Into<PathBuf>,
+        env: &dyn Fn(&str) -> Option<String>,
+        secrets: Option<BTreeMap<String, String>>,
+    ) -> Self {
+        Self {
+            entry: entry.into(),
+            node: env("FRESHELL_CLAUDE_NODE").unwrap_or_else(|| "node".to_string()),
+            run_as_ids: env("FRESHELL_PROVIDER_RUN_AS_UID")
+                .zip(env("FRESHELL_PROVIDER_RUN_AS_GID")),
+            secrets,
+            run_as: false,
+            managed_environment: false,
+            ownership_tag: None,
+            closed_stdin: false,
+        }
+    }
+
+    /// Give the child the managed secrets, plus the OneCLI key flag when
+    /// they carry `ANTHROPIC_API_KEY`, and run the provider exec check on
+    /// the final command before spawning (Linux, managed mode).
+    pub fn with_managed_environment(mut self) -> Self {
+        self.managed_environment = true;
+        self
+    }
+
+    /// Wrap node in `setpriv` when the provider run-as ids are configured.
+    pub fn with_run_as(mut self) -> Self {
+        self.run_as = true;
+        self
+    }
+
+    /// Tag the child (and, through the SDK's clean env, its CLI) for the
+    /// Linux `/proc` ownership reaper.
+    pub fn with_ownership_tag(mut self, ownership_id: &str) -> Self {
+        self.ownership_tag = Some(ownership_id.to_string());
+        self
+    }
+
+    /// The child reads no stdin (the catalog probe); the default is a pipe.
+    pub fn with_closed_stdin(mut self) -> Self {
+        self.closed_stdin = true;
+        self
+    }
+
+    /// The node binary this command runs (for error messages).
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// The entry script this command runs (for error messages).
+    pub fn entry(&self) -> &std::path::Path {
+        &self.entry
+    }
+
+    fn run_as_ids(&self) -> Option<&(String, String)> {
+        self.run_as_ids.as_ref().filter(|_| self.run_as)
+    }
+
+    fn managed_secrets(&self) -> Option<&BTreeMap<String, String>> {
+        self.secrets.as_ref().filter(|_| self.managed_environment)
+    }
+
+    /// The fully configured, not yet spawned command: program and wrapper,
+    /// environment overlay, piped stdout/stderr, `kill_on_drop`.
+    pub fn command(&self) -> Command {
+        let mut command = match self.run_as_ids() {
+            Some((uid, gid)) => {
+                let mut command = Command::new("/usr/bin/setpriv");
+                command.args([
+                    "--reuid",
+                    uid,
+                    "--regid",
+                    gid,
+                    "--clear-groups",
+                    "--no-new-privs",
+                    "--",
+                    &self.node,
+                ]);
+                command
+            }
+            None => Command::new(&self.node),
+        };
+        command.arg(&self.entry);
+        if let Some(ownership_id) = &self.ownership_tag {
+            command.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, ownership_id);
+        }
+        if let Some(secrets) = self.managed_secrets() {
+            if secrets.contains_key("ANTHROPIC_API_KEY") {
+                command.env(ONECLI_API_KEY_FLAG, "1");
+            }
+            command.envs(secrets);
+        }
+        command
+            .stdin(if self.closed_stdin {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+
+    /// Check (managed mode, Linux) and spawn the command inside its
+    /// process-tree guard.
+    pub fn spawn_guarded(self) -> Result<(Child, SidecarTreeGuard), ClaudeSpawnError> {
+        let mut command = self.command();
+        #[cfg(target_os = "linux")]
+        if self.managed_secrets().is_some() {
+            let wrapper_targets = [self.node.as_str()];
+            let additional: &[&str] = if self.run_as_ids().is_some() {
+                &wrapper_targets
+            } else {
+                &[]
+            };
+            freshell_platform::provider_exec::check_command(command.as_std(), true, additional)
+                .map_err(|error| ClaudeSpawnError::ExecProfile(error.to_string()))?;
+        }
+        spawn_guarded(&mut command).map_err(ClaudeSpawnError::Spawn)
+    }
+}
+
+/// Why [`ClaudeNodeCommand::spawn_guarded`] did not start the child.
+#[derive(Debug)]
+pub enum ClaudeSpawnError {
+    /// The managed provider exec check refused the final command (its
+    /// classification; never the command's contents).
+    ExecProfile(String),
+    /// The operating system could not start the process.
+    Spawn(std::io::Error),
+}
+
+impl std::fmt::Display for ClaudeSpawnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecProfile(classification) => formatter.write_str(classification),
+            Self::Spawn(error) => write!(formatter, "{error}"),
+        }
+    }
 }
 
 /// Stop a sidecar: write the shutdown request and close its stdin, wait up
@@ -486,4 +672,173 @@ fn linux_group_has_live_member(pgid: i32) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const RUN_AS_ENV: [(&str, &str); 3] = [
+        ("FRESHELL_PROVIDER_RUN_AS_UID", "1234"),
+        ("FRESHELL_PROVIDER_RUN_AS_GID", "5678"),
+        ("FRESHELL_CLAUDE_NODE", "/opt/node/bin/node"),
+    ];
+
+    fn env_from(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    fn managed_secrets() -> Option<BTreeMap<String, String>> {
+        Some(BTreeMap::from([
+            ("ANTHROPIC_API_KEY".to_string(), "sk-managed".to_string()),
+            (
+                "ONECLI_URL".to_string(),
+                "http://127.0.0.1:10254".to_string(),
+            ),
+        ]))
+    }
+
+    fn program(command: &Command) -> String {
+        command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn envs(command: &Command) -> BTreeMap<String, Option<String>> {
+        command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// G30: the catalog probe launches node exactly as the session sidecar
+    /// does (same program, run-as wrapper, OneCLI flag and managed secrets);
+    /// only the entry file and the sidecar's ownership tag differ.
+    #[test]
+    fn the_sidecar_and_the_catalog_probe_launch_node_the_same_way() {
+        let env = env_from(&RUN_AS_ENV);
+        let sidecar = crate::claude::sidecar_node_command(
+            ClaudeNodeCommand::from_parts("/srv/sidecar/index.mjs", &env, managed_secrets()),
+            "claude-sidecar-parity",
+        )
+        .command();
+        let probe = crate::model_capabilities::catalog_node_command(ClaudeNodeCommand::from_parts(
+            "/srv/sidecar/model-catalog.mjs",
+            &env,
+            managed_secrets(),
+        ))
+        .command();
+
+        assert_eq!(program(&sidecar), "/usr/bin/setpriv");
+        assert_eq!(program(&probe), "/usr/bin/setpriv");
+        let wrapper = [
+            "--reuid",
+            "1234",
+            "--regid",
+            "5678",
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+            "/opt/node/bin/node",
+        ];
+        assert_eq!(
+            args(&sidecar),
+            [&wrapper[..], &["/srv/sidecar/index.mjs"]].concat()
+        );
+        assert_eq!(
+            args(&probe),
+            [&wrapper[..], &["/srv/sidecar/model-catalog.mjs"]].concat()
+        );
+        let mut sidecar_env = envs(&sidecar);
+        assert_eq!(
+            sidecar_env.remove(CLAUDE_SIDECAR_OWNERSHIP_ENV),
+            Some(Some("claude-sidecar-parity".to_string()))
+        );
+        let probe_env = envs(&probe);
+        assert_eq!(sidecar_env, probe_env, "same flag and secrets for both");
+        assert_eq!(
+            probe_env.get("FRESHELL_CLAUDE_ONECLI_API_KEY"),
+            Some(&Some("1".to_string()))
+        );
+        assert_eq!(
+            probe_env.get("ANTHROPIC_API_KEY"),
+            Some(&Some("sk-managed".to_string()))
+        );
+        assert_eq!(
+            probe_env.get("ONECLI_URL"),
+            Some(&Some("http://127.0.0.1:10254".to_string()))
+        );
+    }
+
+    #[test]
+    fn without_managed_mode_node_runs_directly_with_no_key() {
+        let env = env_from(&[]);
+        let probe = crate::model_capabilities::catalog_node_command(ClaudeNodeCommand::from_parts(
+            "/srv/sidecar/model-catalog.mjs",
+            &env,
+            None,
+        ))
+        .command();
+
+        assert_eq!(program(&probe), "node");
+        assert_eq!(args(&probe), ["/srv/sidecar/model-catalog.mjs"]);
+        assert!(envs(&probe).is_empty(), "{:?}", envs(&probe));
+    }
+
+    #[test]
+    fn managed_secrets_without_the_api_key_do_not_select_it() {
+        let env = env_from(&[]);
+        let command = ClaudeNodeCommand::from_parts(
+            "/srv/sidecar/index.mjs",
+            &env,
+            Some(BTreeMap::from([(
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "managed-oauth".to_string(),
+            )])),
+        )
+        .with_managed_environment()
+        .command();
+
+        let env = envs(&command);
+        assert_eq!(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(&Some("managed-oauth".to_string()))
+        );
+        assert!(
+            !env.contains_key("FRESHELL_CLAUDE_ONECLI_API_KEY"),
+            "{env:?}"
+        );
+    }
+
+    #[test]
+    fn the_run_as_wrapper_needs_both_ids() {
+        let env = env_from(&[("FRESHELL_PROVIDER_RUN_AS_UID", "1234")]);
+        let command = ClaudeNodeCommand::from_parts("/srv/sidecar/index.mjs", &env, None)
+            .with_run_as()
+            .command();
+
+        assert_eq!(program(&command), "node");
+    }
 }

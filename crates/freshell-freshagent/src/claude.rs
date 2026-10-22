@@ -56,6 +56,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -102,7 +103,7 @@ fn checkpoint_attempt_for_send(msg: &FreshAgentSend) -> Option<Value> {
 const PENDING_CLAUDE_CREATE_PREFIX: &str = "pending-create-";
 /// The ownership tag env the sidecar + its claude CLI grandchild carry (the codex analog
 /// is `FRESHELL_CODEX_SIDECAR_ID`); the `/proc` reaper keys on it.
-const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = "FRESHELL_CLAUDE_SIDECAR_ID";
+const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = crate::claude_spawn::CLAUDE_SIDECAR_OWNERSHIP_ENV;
 /// Cold-boot budget for the sidecar to answer the `create` request (`created`).
 const SIDECAR_CREATE_BUDGET: Duration = Duration::from_secs(45);
 /// kata 1wxv task 4 review (C1): `handle_send`'s re-resolve cadence while a
@@ -9641,6 +9642,19 @@ async fn read_session_init(
 
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
 
+/// The session sidecar's launch recipe (G30: the model-catalog probe uses the same
+/// builder, see `model_capabilities::catalog_node_command`): run-as wrapper, managed
+/// secrets plus the OneCLI key flag, and the `/proc` ownership tag.
+pub(crate) fn sidecar_node_command(
+    command: crate::claude_spawn::ClaudeNodeCommand,
+    ownership_id: &str,
+) -> crate::claude_spawn::ClaudeNodeCommand {
+    command
+        .with_run_as()
+        .with_managed_environment()
+        .with_ownership_tag(ownership_id)
+}
+
 /// Spawn `node <sidecar>/index.mjs`, ownership-tagged, inheriting the server's isolated HOME
 /// (so the SDK's `claude` CLI authenticates from + writes under `<isolatedHOME>/.claude`).
 /// Returns the owned child, its stdin, its stdout, the ownership tag, and the guard that
@@ -9662,65 +9676,22 @@ async fn spawn_sidecar() -> Result<
             entry.display()
         ));
     }
-    let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string());
     let ownership_id = mint_ownership_id();
-
-    let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
-        .ok()
-        .zip(std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok());
-    #[cfg(target_os = "linux")]
-    let run_as_wrapped = run_as.is_some();
-    let mut cmd = if let Some((uid, gid)) = run_as {
-        let mut command = tokio::process::Command::new("/usr/bin/setpriv");
-        command.args([
-            "--reuid",
-            &uid,
-            "--regid",
-            &gid,
-            "--clear-groups",
-            "--no-new-privs",
-            "--",
-            &node,
-        ]);
-        command.arg(&entry);
-        command
-    } else {
-        let mut command = tokio::process::Command::new(&node);
-        command.arg(&entry);
-        command
-    };
     // Inherit the parent env (HOME=<isolated>, CLAUDE_HOME=<isolated>/.claude) and layer the
     // ownership tag so the /proc reaper can find our sidecar AND the claude CLI grandchild
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
     // CLAUDECODE + ANTHROPIC_API_KEY).
-    cmd.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id);
-    if let Some(environment) = freshell_platform::managed_child_secrets::snapshot() {
-        if environment.contains_key("ANTHROPIC_API_KEY") {
-            cmd.env("FRESHELL_CLAUDE_ONECLI_API_KEY", "1");
-        }
-        cmd.envs(environment);
-    }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    #[cfg(target_os = "linux")]
-    if freshell_platform::managed_child_secrets::snapshot().is_some() {
-        let wrapper_targets = [node.as_str()];
-        let additional = if run_as_wrapped {
-            &wrapper_targets[..]
-        } else {
-            &[]
-        };
-        freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
-            .map_err(|error| error.to_string())?;
-    }
-    let (mut child, tree_guard) = crate::claude_spawn::spawn_guarded(&mut cmd).map_err(|e| {
-        format!(
-            "claude sidecar spawn failed ({node} {}): {e}",
+    let command = sidecar_node_command(
+        crate::claude_spawn::ClaudeNodeCommand::new(&entry),
+        &ownership_id,
+    );
+    let node = command.node().to_string();
+    let (mut child, tree_guard) = command.spawn_guarded().map_err(|error| match error {
+        crate::claude_spawn::ClaudeSpawnError::ExecProfile(classification) => classification,
+        crate::claude_spawn::ClaudeSpawnError::Spawn(error) => format!(
+            "claude sidecar spawn failed ({node} {}): {error}",
             entry.display()
-        )
+        ),
     })?;
     let stdin = child.stdin.take().ok_or("sidecar stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("sidecar stdout unavailable")?;
