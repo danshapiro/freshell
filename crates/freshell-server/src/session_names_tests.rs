@@ -1144,29 +1144,299 @@ async fn cancelled_wait_retains_executing_lock() {
         .await
         .expect("ensure pending");
 
+    let mut published = store.subscribe();
+
     set_test_hooks(dir.path(), vec![TestHook::HoldLock(2000)]);
     let rename_fut = rename_user(&store, target.clone(), "First writer");
 
     // The outer wait is cancelled while the transaction still executes.
     let cancelled = tokio::time::timeout(Duration::from_millis(150), rename_fut).await;
     assert!(cancelled.is_err(), "the outer wait elapses");
+    wait_for_lock_held_sentinel(dir.path()).await;
 
-    // The still-executing transaction retains its guard: a second mutation
-    // hits LockUnavailable, proving the lock was NOT released by the drop.
-    let second = rename_user(&store, target.clone(), "Second writer").await;
+    // The still-executing transaction retains its guard: the sidecar lock
+    // stays held against a fresh handle (exactly what another process
+    // opens), proving the lock was NOT released by the drop.
+    let lock_path = dir.path().join(LOCK_FILE_NAME);
+    let probe = open_lock_file(&lock_path).expect("open sidecar probe");
     assert!(
-        matches!(second, Err(NameError::LockUnavailable(_))),
+        matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         "the dropped wait must not release the executing transaction's lock"
+    );
+    drop(probe);
+
+    // A same-process writer queues behind it and commits only after the
+    // abandoned-by-its-caller first writer has committed and published.
+    let second = rename_user(&store, target.clone(), "Second writer")
+        .await
+        .expect("the second writer commits after its turn");
+    assert_eq!(second.record.name, "Second writer");
+    let mut order = Vec::new();
+    while let Ok(update) = published.try_recv() {
+        if update.record.name_ref == target {
+            order.push(update.record.name);
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["First writer".to_string(), "Second writer".to_string()],
+        "the executing first writer completed before the queued second writer"
     );
 
     // Once the executing transaction completes, the lock is free again.
-    tokio::time::sleep(Duration::from_millis(2200)).await;
-    let third = rename_user(&store, target.clone(), "Third writer").await;
+    let probe = open_lock_file(&lock_path).expect("reopen sidecar probe");
     assert!(
-        third.is_ok(),
+        probe.try_lock().is_ok(),
         "lock releases when the transaction completes"
     );
+    drop(probe);
+    let third = rename_user(&store, target.clone(), "Third writer").await;
     assert_eq!(third.expect("third").record.name, "Third writer");
+}
+
+/// Local serialization (plan Task 1, item 5): the bounded one-second retry
+/// budget is for contention with ANOTHER process. A transaction of this same
+/// process that holds the document lock longer than that (a durable write
+/// stalled by a busy disk) makes the next same-process caller wait its turn,
+/// never fail with `LockUnavailable`. A wait that long is still diagnosable:
+/// it logs one structured `session_names.local_turn_slow` warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_local_transaction_queues_same_process_callers_instead_of_failing_them() {
+    let events = crate::test_trace_capture::captured_trace_events();
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-slow-local");
+    ensure(
+        &store,
+        "h-slow-local",
+        NamedProvider::Claude,
+        Some("/w/slow"),
+    )
+    .await
+    .expect("ensure pending");
+
+    set_test_hooks(dir.path(), vec![TestHook::HoldLock(2_000)]);
+    let slow_writer = tokio::spawn({
+        let store = Arc::clone(&store);
+        let target = target.clone();
+        async move { rename_user(&store, target, "Slow writer").await }
+    });
+    wait_for_lock_held_sentinel(dir.path()).await;
+
+    let read = store
+        .get(vec![target.clone()])
+        .await
+        .expect("a same-process read waits for the local holder instead of failing");
+    assert_eq!(
+        read[0].record.name, "Slow writer",
+        "the queued read runs after the slow writer commits"
+    );
+    let committed = slow_writer
+        .await
+        .expect("slow writer task joins")
+        .expect("slow writer commits");
+    assert_eq!(committed.record.name, "Slow writer");
+
+    let data_dir = std::fs::canonicalize(dir.path())
+        .expect("canonical data dir")
+        .display()
+        .to_string();
+    let slow_turns: Vec<_> = events
+        .snapshot()
+        .into_iter()
+        .filter(|event| {
+            event.level == tracing::Level::WARN && event.fields.get("data_dir") == Some(&data_dir)
+        })
+        .collect();
+    assert_eq!(
+        slow_turns.len(),
+        1,
+        "exactly the queued read logs a slow local turn: {slow_turns:?}"
+    );
+    assert!(
+        slow_turns[0]
+            .message
+            .starts_with("session_names.local_turn_slow:"),
+        "dotted event name leads the message: {:?}",
+        slow_turns[0].message
+    );
+    assert_eq!(
+        slow_turns[0].fields.get("class").map(String::as_str),
+        Some("slow_local_turn")
+    );
+    let queued_ms: u64 = slow_turns[0].fields["queued_ms"]
+        .parse()
+        .expect("numeric queued_ms");
+    assert!(
+        queued_ms >= LOCK_RETRY_BUDGET.as_millis() as u64,
+        "the warning reports the wait that crossed the threshold ({queued_ms} ms)"
+    );
+}
+
+/// A same-process caller queued behind a local transaction that does not
+/// finish (a durable write wedged on a stalled disk) has no budget that fails
+/// it, so the stall must be visible WHILE it lasts: once the wait crosses the
+/// one-second budget, `session_names.local_turn_slow` is logged with the
+/// caller still queued, and when the turn finally arrives
+/// `session_names.local_turn_resumed` records the whole wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_local_turn_is_reported_while_the_caller_is_still_queued() {
+    let events = crate::test_trace_capture::captured_trace_events();
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-stalled-local");
+    ensure(
+        &store,
+        "h-stalled-local",
+        NamedProvider::Claude,
+        Some("/w/stalled"),
+    )
+    .await
+    .expect("ensure pending");
+    let data_dir = std::fs::canonicalize(dir.path())
+        .expect("canonical data dir")
+        .display()
+        .to_string();
+    let local_turn_events = |prefix: &str| -> Vec<crate::test_trace_capture::CapturedTraceEvent> {
+        events
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("data_dir") == Some(&data_dir) && event.message.starts_with(prefix)
+            })
+            .collect()
+    };
+
+    set_test_hooks(dir.path(), vec![TestHook::HoldLockUntilReleased]);
+    let stalled_writer = tokio::spawn({
+        let store = Arc::clone(&store);
+        let target = target.clone();
+        async move { rename_user(&store, target, "Stalled writer").await }
+    });
+    wait_for_lock_held_sentinel(dir.path()).await;
+    let queued_read = tokio::spawn({
+        let store = Arc::clone(&store);
+        let target = target.clone();
+        async move { store.get(vec![target]).await }
+    });
+
+    // The holder never finishes on its own: the warning must arrive while
+    // the read is still waiting for its turn.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let warning = loop {
+        if let Some(warning) = local_turn_events("session_names.local_turn_slow:")
+            .into_iter()
+            .next()
+        {
+            break warning;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a stalled local turn must be reported while the caller is still queued"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        !queued_read.is_finished() && !stalled_writer.is_finished(),
+        "the warning fired while the holder still held the turn and the read still waited"
+    );
+    assert_eq!(warning.level, tracing::Level::WARN);
+    assert_eq!(
+        warning.fields.get("class").map(String::as_str),
+        Some("slow_local_turn")
+    );
+    let warned_ms: u64 = warning.fields["queued_ms"]
+        .parse()
+        .expect("numeric queued_ms");
+    assert!(
+        warned_ms >= LOCK_RETRY_BUDGET.as_millis() as u64,
+        "the warning reports the wait that crossed the budget ({warned_ms} ms)"
+    );
+
+    release_held_lock(dir.path());
+    let read = queued_read
+        .await
+        .expect("queued read joins")
+        .expect("the queued read is served once the stalled turn ends");
+    assert_eq!(read[0].record.name, "Stalled writer");
+    stalled_writer
+        .await
+        .expect("stalled writer joins")
+        .expect("stalled writer commits");
+
+    assert_eq!(
+        local_turn_events("session_names.local_turn_slow:").len(),
+        1,
+        "one warning per stalled wait"
+    );
+    let resumed = local_turn_events("session_names.local_turn_resumed:");
+    assert_eq!(
+        resumed.len(),
+        1,
+        "the stalled wait reports its end: {resumed:?}"
+    );
+    assert_eq!(resumed[0].level, tracing::Level::INFO);
+    assert_eq!(
+        resumed[0].fields.get("class").map(String::as_str),
+        Some("slow_local_turn_resumed")
+    );
+    let resumed_ms: u64 = resumed[0].fields["queued_ms"]
+        .parse()
+        .expect("numeric queued_ms");
+    assert!(
+        resumed_ms >= warned_ms,
+        "the resumed event reports the whole wait ({resumed_ms} ms >= {warned_ms} ms)"
+    );
+}
+
+/// Local serialization is FIFO: a same-process caller that arrives while a
+/// background loop is committing back-to-back transactions (the native
+/// worker's claim / charge / fold sequence) is served right after the
+/// transaction that was running when it arrived — it never loses every
+/// lock handoff to the loop's later transactions until a budget expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_process_callers_are_served_in_arrival_order_between_back_to_back_transactions() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-fifo");
+    ensure(&store, "h-fifo", NamedProvider::Claude, Some("/w/fifo"))
+        .await
+        .expect("ensure pending");
+
+    // Three consecutive transactions each hold the lock for 800 ms: 2.4 s
+    // in all, well past the one-second cross-process budget.
+    set_test_hooks(
+        dir.path(),
+        vec![
+            TestHook::HoldLock(800),
+            TestHook::HoldLock(800),
+            TestHook::HoldLock(800),
+        ],
+    );
+    let back_to_back = tokio::spawn({
+        let store = Arc::clone(&store);
+        let target = target.clone();
+        async move {
+            for name in ["First", "Second", "Third"] {
+                rename_user(&store, target.clone(), name)
+                    .await
+                    .expect("background rename commits");
+            }
+        }
+    });
+    wait_for_lock_held_sentinel(dir.path()).await;
+
+    let read = store
+        .get(vec![target.clone()])
+        .await
+        .expect("a caller arriving between back-to-back local transactions is served in turn");
+    assert_eq!(
+        read[0].record.name, "First",
+        "served right after the transaction running when it arrived, ahead of later ones"
+    );
+    back_to_back.await.expect("background loop joins");
+    let settled = get_one(&store, target).await.expect("record exists");
+    assert_eq!(settled.record.name, "Third");
 }
 
 // ---------------------------------------------------------------------------

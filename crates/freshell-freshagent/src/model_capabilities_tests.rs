@@ -421,30 +421,10 @@ fn claude_catalog_keeps_live_effort_choices_and_deduplicates_models() {
 async fn claude_catalog_probe_uses_the_configured_sidecar_directory() {
     let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let directory = tempfile::tempdir().expect("temporary sidecar directory");
-    let sidecar_entry = directory.path().join("index.mjs");
-    let catalog_entry = directory.path().join("model-catalog.mjs");
     let sdk_name = "task-b-relocated-sdk.mjs";
-    let sdk_entry = directory.path().join(sdk_name);
-
-    std::fs::write(&sidecar_entry, "export {}\n").expect("write sidecar entry");
-    std::fs::copy(
-        PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../freshell-claude-sidecar/model-catalog.mjs"
-        )),
-        &catalog_entry,
-    )
-    .expect("copy model catalog helper");
-    std::fs::copy(
-        PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../freshell-claude-sidecar/exec-profile.mjs"
-        )),
-        directory.path().join("exec-profile.mjs"),
-    )
-    .expect("copy model catalog exec dependency");
-    std::fs::write(
-        &sdk_entry,
+    let sidecar_entry = stage_catalog_sidecar(
+        directory.path(),
+        sdk_name,
         r#"
 export function query() {
   return {
@@ -458,13 +438,12 @@ export function query() {
   }
 }
 "#,
-    )
-    .expect("write fake SDK module");
+    );
 
     std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &sidecar_entry);
     std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
     std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", format!("./{sdk_name}"));
-    let result = ClaudeCatalogProbe.probe(None).await;
+    let result = ClaudeCatalogProbe::default().probe(None).await;
     std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
     std::env::remove_var("FRESHELL_CLAUDE_NODE");
     std::env::remove_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE");
@@ -475,6 +454,128 @@ export function query() {
     assert_eq!(models[0].display_name, "Task B Relocated Model");
     assert_eq!(models[0].supported_effort_levels, vec!["medium"]);
     assert!(models[0].supports_adaptive_thinking);
+}
+
+/// Stage a relocated sidecar directory holding the real catalog helper (and
+/// the modules it imports) plus a fake SDK module; returns the index path.
+fn stage_catalog_sidecar(directory: &std::path::Path, sdk_name: &str, sdk_source: &str) -> PathBuf {
+    for module in ["model-catalog.mjs", "exec-profile.mjs", "sdk-env.mjs"] {
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../freshell-claude-sidecar")
+                .join(module),
+            directory.join(module),
+        )
+        .unwrap_or_else(|error| panic!("copy {module}: {error}"));
+    }
+    std::fs::write(directory.join(sdk_name), sdk_source).expect("write fake SDK module");
+    let sidecar_entry = directory.join("index.mjs");
+    std::fs::write(&sidecar_entry, "export {}\n").expect("write sidecar entry");
+    sidecar_entry
+}
+
+/// G30: in managed mode the session sidecar authenticates with the managed
+/// OneCLI key (`FRESHELL_CLAUDE_ONECLI_API_KEY`), so the catalog probe must
+/// hand its SDK query the same key, or the model dialog falls back to the
+/// static list for a OneCLI-only user. The managed secrets are process-global
+/// and install once, so the scenario runs in a re-executed child test process.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn claude_catalog_probe_gets_the_managed_onecli_key_like_the_sidecar() {
+    const CASE: &str = "FRESHELL_CATALOG_ONECLI_FIXTURE_CHILD";
+    const KEY: &str = "sk-managed-catalog-probe";
+    if std::env::var_os(CASE).is_some() {
+        let directory = tempfile::tempdir().expect("temporary sidecar directory");
+        let sidecar_entry = stage_catalog_sidecar(
+            directory.path(),
+            "onecli-sdk.mjs",
+            &format!(
+                r#"
+export function query({{ options }}) {{
+  return {{
+    supportedModels: async () => [{{
+      value: 'onecli-model',
+      displayName: options.env.ANTHROPIC_API_KEY === '{KEY}' ? 'managed key visible' : 'managed key missing',
+    }}],
+    close: async () => {{}},
+  }}
+}}
+"#
+            ),
+        );
+        freshell_platform::managed_child_secrets::install(
+            [("ANTHROPIC_API_KEY".to_string(), KEY.to_string())].into(),
+        )
+        .unwrap();
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &sidecar_entry);
+        std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", "./onecli-sdk.mjs");
+        let models = ClaudeCatalogProbe::default()
+            .probe(None)
+            .await
+            .expect("the catalog probe runs");
+        assert_eq!(models[0].display_name, "managed key visible");
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env(CASE, "1")
+        .args([
+            "--exact",
+            "model_capabilities::tests::claude_catalog_probe_gets_the_managed_onecli_key_like_the_sidecar",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the managed-key catalog scenario failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// G30/G31: a hung probe is killed with its whole tree, so the SDK-spawned
+/// CLI (here a grandchild node) cannot outlive the timeout on any platform.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_catalog_probe_timeout_leaves_no_process_behind() {
+    let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("temporary sidecar directory");
+    let pid_file = directory.path().join("grandchild.pid");
+    let sidecar_entry = stage_catalog_sidecar(
+        directory.path(),
+        "hung-sdk.mjs",
+        r#"
+import { spawn } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
+export function query() {
+  const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+  grandchild.on('spawn', () => writeFileSync(process.env.FRESHELL_TEST_GRANDCHILD_PID_FILE, String(grandchild.pid)))
+  return { supportedModels: () => new Promise(() => {}), close: () => new Promise(() => {}) }
+}
+"#,
+    );
+    std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &sidecar_entry);
+    std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", "./hung-sdk.mjs");
+    std::env::set_var("FRESHELL_TEST_GRANDCHILD_PID_FILE", &pid_file);
+    let result = ClaudeCatalogProbe::with_timeout(Duration::from_secs(2))
+        .probe(None)
+        .await;
+    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+    std::env::remove_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE");
+    std::env::remove_var("FRESHELL_TEST_GRANDCHILD_PID_FILE");
+
+    let error = result.expect_err("a hung catalog probe times out");
+    assert!(error.message.contains("timed out"), "{error:?}");
+    let grandchild: i32 = std::fs::read_to_string(&pid_file)
+        .expect("the fake SDK started its grandchild")
+        .trim()
+        .parse()
+        .expect("a pid");
+    // SAFETY: signal 0 only probes for existence.
+    let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+    assert!(!alive, "the probe's grandchild did not outlive the timeout");
 }
 
 // ── route level (model-capabilities-router.ts ports) ─────────────────────────

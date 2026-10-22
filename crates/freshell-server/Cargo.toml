@@ -154,17 +154,16 @@ unicode-normalization = "=0.1.25"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Checkpoint Git children are started suspended, assigned to a kill-on-close
-# Job Object, and only then resumed. This owns filters/hooks and other child
-# processes through timeout settlement on native Windows.
+# Checkpoint Git children are started suspended (`CREATE_SUSPENDED`),
+# assigned to freshell-platform's kill-on-close Job Object, and only then
+# resumed. This owns filters/hooks and other child processes through timeout
+# settlement on native Windows.
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_System_Environment",
   "Win32_System_Registry",
-  "Win32_System_Diagnostics_ToolHelp",
-  "Win32_System_JobObjects",
   "Win32_System_Threading",
   "Win32_Storage_FileSystem",
 ] }

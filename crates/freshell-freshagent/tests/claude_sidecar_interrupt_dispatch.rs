@@ -89,6 +89,7 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
         "hosted-mcp.mjs",
         "monotonic-clock.mjs",
         "permission-channel.mjs",
+        "sdk-env.mjs",
         "session-settings.mjs",
         "turn-complete-gate.mjs",
     ] {

@@ -6,6 +6,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { userTurnText } from '../helpers/fresh-agent-transcript.js'
 
 /**
  * RESTORE-DOUBLE-RESTART -- permanent e2e pin for a real production incident:
@@ -228,7 +229,7 @@ test.describe('Restore Double-Restart Regression', () => {
         const turnText = `dbl-restart-turn-${Math.random().toString(36).slice(2, 8)}`
         await composer.fill(turnText)
         await sendButton.click()
-        await expect(paneRoot.getByText(turnText)).toBeVisible({ timeout: 10_000 })
+        await expect(userTurnText(paneRoot, turnText)).toBeVisible({ timeout: 10_000 })
         await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 20_000 })
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(tabId!)
@@ -382,7 +383,7 @@ test.describe('Restore Double-Restart Regression', () => {
         const turnText = `resume-failure-turn-${Math.random().toString(36).slice(2, 8)}`
         await composer.fill(turnText)
         await sendButton.click()
-        await expect(paneRoot.getByText(turnText)).toBeVisible({ timeout: 10_000 })
+        await expect(userTurnText(paneRoot, turnText)).toBeVisible({ timeout: 10_000 })
         await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 20_000 })
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(tabId!)
