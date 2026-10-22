@@ -84,6 +84,12 @@ use crate::session_name_generation::{
     GenerationClaim, GenerationOutcome, GenerationWorkItem, IndexedNameInput,
 };
 
+// Name-reliability Task 3: the post-migration import policy and the
+// import-owned bind-collision rule. A child module so it reads the document
+// internals without widening their visibility.
+#[path = "session_name_import_policy.rs"]
+mod session_name_import_policy;
+
 #[cfg(test)]
 #[path = "session_names_tests.rs"]
 mod tests;
@@ -301,9 +307,14 @@ struct SchedulingCursor {
 /// interrupted between chunks leaves the receipt open so the next boot
 /// resumes. `winning_evidence` retains, per record key, the winning
 /// migration candidate — while a record is migration-owned, a later
-/// previously-offline import compares against this retained evidence with
-/// the same deterministic total order, so import arrival order can never
-/// pick a different winner.
+/// pre-completion import (a browser import that arrived before the boot
+/// finished, or a resumed boot chunk) compares against this retained
+/// evidence and replaces it only on a strict win, and a bind
+/// collision consults it to let an import-owned default label give way.
+/// Once `completed` is committed, browser imports are acknowledged without
+/// any effect (`session_name_import_policy`), so no later import compares
+/// against it. The bookkeeping (`acknowledged_candidate_ids`, the evidence)
+/// is never pruned: an older binary sharing the document still relies on it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MigrationReceipts {
@@ -771,8 +782,19 @@ impl SessionNames {
     /// accepted-Freshell-AI classifications; the HTTP route rejects the
     /// whole family, so an arbitrary caller can never assert them. The
     /// import itself never completes the migration — the runner's final
-    /// [`SessionNames::complete_legacy_migration`] does.
+    /// [`SessionNames::complete_legacy_migration`] does. Once that receipt
+    /// has committed, a non-boot import is acknowledged in full and writes
+    /// nothing at all (no backup, record or stored id; name-reliability
+    /// Task 3).
     pub(crate) fn import_legacy(&self, input: LegacyNameImport) -> NameFuture<LegacyImportResult> {
+        // `completed` never reverts, so once this store's view shows it a
+        // browser import is answered without the document lock or a
+        // re-read; a stale view falls through to the transaction, whose
+        // decision applies the same rule.
+        if !is_boot_import_id(&input.import_id) && self.migration_completed() {
+            let result = session_name_import_policy::post_completion_acknowledge(&input);
+            return Box::pin(async move { result });
+        }
         let core = Arc::clone(&self.core);
         let backup_dir = core
             .data_dir
@@ -2707,8 +2729,9 @@ fn bind_pending_decision(
 
     // Rank decides the collision: manual/manual compares actual manual
     // revisions; equal automatic ranks favor the durable record; migration
-    // protection rides the rank order. Losing evidence is retained in
-    // recovery, never active.
+    // protection rides the rank order — except that an import-owned default
+    // label ("Tab 4") always gives way to the live pending record (Task 3).
+    // Losing evidence is retained in recovery, never active.
     let (winner, loser) = match &existing {
         None => (pending_record.clone(), None),
         Some(current) => {
@@ -2718,6 +2741,11 @@ fn bind_pending_decision(
                 pending_record.manual_revision.unwrap_or(0) > current.manual_revision.unwrap_or(0)
             } else {
                 source_rank(pending_record.source) > source_rank(current.source)
+                    || session_name_import_policy::pending_beats_import_owned_label(
+                        document,
+                        &target_key,
+                        pending_record.source,
+                    )
             };
             if pending_wins {
                 (pending_record.clone(), Some(current.clone()))
@@ -3840,13 +3868,16 @@ fn classify_legacy_candidate(
     }
 }
 
-/// The core the deterministic total order compares. `Less` means `a` wins.
+/// The core the candidate order compares. `Less` means `a` wins.
 ///
 /// Order: source rank (manual > legacy_protected > freshell_ai >
 /// provider_ai > first_message > directory), then — within proven manual —
 /// trustworthy explicit-rename recency (later first, dated ahead of
 /// undated), then scope (session > pane > source_tab > terminal >
-/// derived), then ascending evidence key and candidate id. Generic
+/// derived). Nothing else orders: candidates equal on all three compare
+/// `Equal`, and the apply path replaces only on a strict win, so the
+/// incumbent stays (Task 3 — the evidence key carries browser window and
+/// device ids, which must never decide a name). Generic
 /// updatedAt/mtime/layout timestamps never reach `explicit_rename_at`, so
 /// they can never order here.
 fn compare_classified_candidates(
@@ -3870,15 +3901,7 @@ fn compare_classified_candidates(
             (None, None) => {}
         }
     }
-    let scope = legacy_scope_rank(b.scope).cmp(&legacy_scope_rank(a.scope));
-    if scope != std::cmp::Ordering::Equal {
-        return scope;
-    }
-    let evidence = a.evidence_key.cmp(&b.evidence_key);
-    if evidence != std::cmp::Ordering::Equal {
-        return evidence;
-    }
-    a.candidate_id.cmp(&b.candidate_id)
+    legacy_scope_rank(b.scope).cmp(&legacy_scope_rank(a.scope))
 }
 
 /// Scope tie-break: session > pane > source_tab > terminal > derived.
@@ -3977,7 +4000,7 @@ fn resolve_legacy_target(
 
 /// Apply one classified candidate against the current document state:
 /// install a missing record, or compare against the existing record /
-/// retained winning migration evidence with the deterministic total order.
+/// retained winning migration evidence, replacing only on a strict win.
 /// Post-migration protection: a record whose accepted source is manual,
 /// legacy-protected or accepted Freshell AI (or which moved after the
 /// migration installed it through a protected decision) can never be
@@ -4001,8 +4024,10 @@ fn apply_legacy_candidate(
     let candidate_wins = match document.migration.winning_evidence.get(&key) {
         Some(evidence) if current.revision == evidence.installed_revision => {
             // Still migration-owned: compare against the retained winning
-            // evidence with the same total order — import arrival order
-            // can never pick a different winner.
+            // evidence. Only a strict win (higher rank, a later proven
+            // rename, or a wider scope) replaces it; an equal candidate —
+            // e.g. the same label kind from another window — leaves the
+            // incumbent.
             let retained = ClassifiedLegacyCandidate {
                 name: evidence.name.clone(),
                 source: evidence.source,
@@ -4134,15 +4159,14 @@ pub(crate) fn is_boot_import_id(import_id: &str) -> bool {
 }
 
 /// Order the trusted boot lane's gathered candidates best-first by the
-/// deterministic total order (`compare_classified_candidates`), so the
-/// consolidation's ≤100-candidate import chunks keep a stable membership
-/// across boots (the create-once per-import backups and the per-candidate
-/// acknowledgment replay both key off the chunk ids). Sequential
-/// application against the retained winning evidence is already
-/// permutation-invariant — the ordering is the belt that guarantees no
-/// cross-chunk comparison is ever decided by arrival order. Comparator-
-/// equal candidates are interchangeable in every compared field (the final
-/// tiebreak is the candidate id), so the stable sort needs no extra key.
+/// candidate order (`compare_classified_candidates`), then by candidate id,
+/// so the consolidation's ≤100-candidate import chunks keep a stable
+/// membership across boots (the create-once per-import backups and the
+/// per-candidate acknowledgment replay both key off the chunk ids). Higher
+/// rank or scope wins whatever the arrival order; among comparator-equal
+/// candidates the first one applied stays (strict-win apply), and the
+/// candidate-id key only makes that order — and so the batching — the same
+/// on every boot.
 pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate]) {
     let mut classified: Vec<(ClassifiedLegacyCandidate, LegacyNameCandidate)> = candidates
         .iter()
@@ -4153,7 +4177,10 @@ pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate
             )
         })
         .collect();
-    classified.sort_by(|a, b| compare_classified_candidates(&a.0, &b.0));
+    classified.sort_by(|a, b| {
+        compare_classified_candidates(&a.0, &b.0)
+            .then_with(|| a.0.candidate_id.cmp(&b.0.candidate_id))
+    });
     for (slot, (_, candidate)) in candidates.iter_mut().zip(classified) {
         *slot = candidate;
     }
@@ -4169,35 +4196,28 @@ pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate
 /// chunk acknowledged ([`SessionNames::complete_legacy_migration`]), so
 /// canonical readers stop consulting migrated legacy fields exactly when
 /// the whole consolidation finished (the physical cleanup that follows is
-/// idempotently retried at boot).
+/// idempotently retried at boot). After completion a non-boot import never
+/// reaches the backup or the candidates: it is a `Read` that acknowledges
+/// every candidate id (`session_name_import_policy::post_completion_acknowledge`).
 fn import_legacy_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
     backup_dir: &Path,
     input: LegacyNameImport,
 ) -> Result<Decision<LegacyImportResult>, NameError> {
-    if input.version != 1 {
-        return Err(NameError::InvalidName(
-            "unsupported legacy-name import version".into(),
-        ));
-    }
-    if input.import_id.trim().is_empty() {
-        return Err(NameError::InvalidName(
-            "a legacy-name import must carry its retry-stable importId".into(),
-        ));
-    }
-    if input.candidates.len() > NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT {
-        return Err(NameError::InvalidName(format!(
-            "a legacy-name import batches at most {} candidates",
-            NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT
-        )));
+    session_name_import_policy::validate_import_envelope(&input)?;
+
+    let trusted_boot = is_boot_import_id(&input.import_id);
+    // Name-reliability Task 3: after the consolidation completed, a browser
+    // import is acknowledged and writes nothing (no backup, no stored ids).
+    if document.migration.completed && !trusted_boot {
+        return session_name_import_policy::post_completion_acknowledge(&input).map(Decision::Read);
     }
 
     // Immutable create-once backup BEFORE any acknowledgment: a failure
     // here retains every original and acknowledges nothing.
     write_import_backup_once(backup_dir, &input, meta.now_ms)?;
 
-    let trusted_boot = is_boot_import_id(&input.import_id);
     let mut acknowledged: Vec<String> = Vec::with_capacity(input.candidates.len());
     let mut newly_acknowledged = false;
     let mut publish: Vec<PublishSpec> = Vec::new();

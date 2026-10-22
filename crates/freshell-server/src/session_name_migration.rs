@@ -35,12 +35,14 @@
 //! step, before any request is served); if the physical cleanup cannot
 //! flush, the next boot retries it idempotently.
 //!
-//! Late previously-offline browser imports keep arriving through
-//! `POST /api/session-names/import` with per-candidate acknowledgment and
-//! their own immutable per-import backups; they compare against the
-//! retained winning evidence with the same deterministic total order and
-//! can never replace a post-migration manual or accepted-Freshell-AI
-//! name. The Amplifier-only `run_ai_title_shadow_cleanup` stays separate.
+//! Browser imports through `POST /api/session-names/import` apply only
+//! while the receipt is still open (with per-candidate acknowledgment and
+//! their own immutable per-import backups), and can never replace a
+//! post-migration manual or accepted-Freshell-AI name. Once the receipt
+//! has committed, every browser import is acknowledged without any effect
+//! — no record, stored candidate id or backup (name-reliability Task 3,
+//! `session_name_import_policy`). The Amplifier-only
+//! `run_ai_title_shadow_cleanup` stays separate.
 //!
 //! Recovery policy: the immutable `server.json` / `imports/*.json`
 //! backups plus their evidence indexes ARE the retained recovery copies.
@@ -141,13 +143,12 @@ pub(crate) async fn run_session_name_consolidation(inputs: SessionNameConsolidat
     let receipt_was_complete = names.migration_completed();
     if !receipt_was_complete {
         // The plan's batching rule: at most 100 candidates per
-        // envelope/importId. Order the gathered candidates best-first by
-        // the deterministic total order first, THEN chunk: the
-        // retained-evidence comparison already makes application
-        // permutation-invariant, and the ordering additionally keeps every
-        // chunk's membership stable across boots (the create-once
-        // per-import backups and the per-candidate acknowledgment replay
-        // both key off the chunk ids).
+        // envelope/importId. Order the gathered candidates best-first
+        // (rank, rename recency, scope; then candidate id) first, THEN
+        // chunk: the ordering keeps every chunk's membership — and which of
+        // several equal candidates installs first and stays — stable across
+        // boots (the create-once per-import backups and the per-candidate
+        // acknowledgment replay both key off the chunk ids).
         let mut candidates = std::mem::take(&mut evidence.candidates);
         order_boot_legacy_candidates(&mut candidates);
         let envelopes = boot_evidence_envelopes(&evidence);

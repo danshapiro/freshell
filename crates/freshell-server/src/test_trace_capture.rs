@@ -55,7 +55,10 @@ unsafe fn install_process_trace_capture() {
 /// inspect tracing events read it and filter by values unique to their own
 /// fixture, because every test in the binary feeds the same buffer.
 pub(crate) fn captured_trace_events() -> CapturedTraceEvents {
-    process_capture().clone()
+    let events = process_capture().clone();
+    // Recompute interest after the process-wide subscriber is installed.
+    tracing::callsite::rebuild_interest_cache();
+    events
 }
 
 fn process_capture() -> &'static CapturedTraceEvents {

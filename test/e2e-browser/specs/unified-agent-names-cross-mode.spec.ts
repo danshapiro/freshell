@@ -148,12 +148,12 @@ test.describe('cross-mode unified agent names', () => {
   })
 
   test('legacy imports converge in both orders', async () => {
-    // Two servers, identical evidence, opposite import orders: the winner
-    // is the SAME (the retained-evidence comparison is permutation-
-    // invariant; the deterministic total order's final tiebreak is the
-    // candidate id, so the lexicographically-first device's candidate is
-    // the best-first winner regardless of import arrival order).
-    const results: string[] = []
+    // Two servers, identical evidence, opposite import orders: the outcome
+    // is the SAME. Each server's boot consolidation has already completed
+    // (a clean home), so every browser import is acknowledged and changes
+    // nothing (name-reliability Task 3): no record is created in either
+    // order, and arrival order can never pick a name.
+    const results: number[] = []
     for (const order of [['deviceA', 'deviceB'], ['deviceB', 'deviceA']] as const) {
       const journey = await bootJourney('claude')
       try {
@@ -173,16 +173,26 @@ test.describe('cross-mode unified agent names', () => {
                 protectionEvidence: 'none',
               }],
             }, journey.server.info.token)
-          expect(response.ok, await response.text()).toBe(true)
+          const text = await response.text()
+          expect(response.ok, text).toBe(true)
+          const result = JSON.parse(text) as { acknowledged: string[]; names: unknown[] }
+          expect(result.acknowledged).toHaveLength(1)
+          expect(result.names).toEqual([])
         }
-        const record = await readRecord(journey, { kind: 'session', provider: 'claude', sessionId })
-        results.push(record.name)
+        const read = await postJsonRetry429(
+          `${journey.server.info.baseUrl}/api/session-names/read`,
+          { refs: [{ kind: 'session', provider: 'claude', sessionId }] },
+          journey.server.info.token,
+        )
+        const readText = await read.text()
+        expect(read.ok, readText).toBe(true)
+        const payload = JSON.parse(readText) as { names: unknown[] }
+        results.push(payload.names.length)
       } finally {
         await journey.cleanup()
       }
     }
-    expect(results[0]).toBe(results[1])
-    expect(results[0]).toBe('deviceA label')
+    expect(results).toEqual([0, 0])
   })
 
   test('late legacy device cannot replace a new user name', async ({ browser }) => {
