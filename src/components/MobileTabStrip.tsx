@@ -114,7 +114,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
           <TabAttentionIndicator
             variant="dot"
             label="An earlier tab needs attention"
-            style={tabAttentionStyle}
+            attentionStyle={tabAttentionStyle}
             className="absolute right-1.5 top-2"
           />
         )}
@@ -157,7 +157,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
       <TabAttentionIndicator
         count={otherAttentionCount}
         label={otherTabsNeedAttentionLabel(otherAttentionCount)}
-        style={tabAttentionStyle}
+        attentionStyle={tabAttentionStyle}
         className="px-1"
       />
 
@@ -172,7 +172,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
           <TabAttentionIndicator
             variant="dot"
             label="A later tab needs attention"
-            style={tabAttentionStyle}
+            attentionStyle={tabAttentionStyle}
             className="absolute right-1.5 top-2"
           />
         )}

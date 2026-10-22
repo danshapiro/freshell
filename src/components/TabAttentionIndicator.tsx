@@ -10,7 +10,8 @@ interface TabAttentionIndicatorProps {
   /** `dot`: a decorative mark inside a control whose own name/title carries
    * the meaning (aria-hidden). `count` (default): a polite live status. */
   variant?: 'count' | 'dot'
-  style?: TabAttentionStyle
+  /** The user's tabAttentionStyle (named apart from React's `style` prop). */
+  attentionStyle?: TabAttentionStyle
   className?: string
 }
 
@@ -23,12 +24,12 @@ export function TabAttentionIndicator({
   count,
   label,
   variant = 'count',
-  style = 'highlight',
+  attentionStyle = 'highlight',
   className,
 }: TabAttentionIndicatorProps) {
   const dotClassName = cn(
     'inline-block h-2 w-2 shrink-0 rounded-full',
-    tabAttentionClassName({ needsAttention: true, style, surface: 'indicator' }),
+    tabAttentionClassName({ needsAttention: true, style: attentionStyle, surface: 'indicator' }),
   )
 
   if (variant === 'dot') {

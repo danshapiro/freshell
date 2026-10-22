@@ -4,7 +4,7 @@ import { cn } from '@/lib/utils'
 import { tabAttentionClassName } from '@/lib/tab-attention'
 import { getTerminalStatusDotClassName, getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import { useAppSelector } from '@/store/hooks'
-import { selectTabStripAttention } from '@/store/turnCompletionAttention'
+import { selectTabNeedsAttention } from '@/store/selectors/tabAttentionSelectors'
 import PaneIcon from '@/components/icons/PaneIcon'
 import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -40,7 +40,6 @@ const MAX_REPO_ICONS = 3
 export interface TabItemProps {
   tab: Tab
   isActive: boolean
-  needsAttention: boolean
   busy?: boolean
   busyPaneIds?: string[]
   isDragging: boolean
@@ -62,7 +61,6 @@ export interface TabItemProps {
 export default function TabItem({
   tab,
   isActive,
-  needsAttention,
   busy,
   busyPaneIds = [],
   isDragging,
@@ -88,13 +86,11 @@ export default function TabItem({
     }
   }, [isRenaming])
 
-  // The tab strip renders the UNION of unwitnessed attention (the
-  // needsAttention prop, fed from attentionByTab) and watched fresh-agent
-  // completions (watchedCompletionByTab — a tab-strip-ONLY mark).
-  const stripAttention = useAppSelector((s) => selectTabStripAttention(s, tab.id))
-  const effectiveNeedsAttention = needsAttention || stripAttention
+  // The same needs-attention derivation every tab surface reads (the union
+  // of unwitnessed attention and watched fresh-agent completions).
+  const needsAttention = useAppSelector((s) => selectTabNeedsAttention(s, tab.id))
   const attentionClassName = tabAttentionClassName({
-    needsAttention: effectiveNeedsAttention,
+    needsAttention,
     style: tabAttentionStyle,
     active: isActive,
     surface: 'tab',

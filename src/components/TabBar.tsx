@@ -82,7 +82,6 @@ interface SortableTabProps {
   tab: Tab
   displayTitle: string
   isActive: boolean
-  needsAttention: boolean
   busy: boolean
   busyPaneIds: string[]
   isDragging: boolean
@@ -109,7 +108,6 @@ function SortableTab({
   tab,
   displayTitle,
   isActive,
-  needsAttention,
   busy,
   busyPaneIds,
   isDragging,
@@ -175,7 +173,6 @@ function SortableTab({
       <TabItem
         tab={tabWithDisplayTitle}
         isActive={isActive}
-        needsAttention={needsAttention}
         busy={busy}
         busyPaneIds={busyPaneIds}
         isDragging={isDragging}
@@ -209,7 +206,6 @@ function SortableTab({
 // Stable empty object to avoid creating new references
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
-const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
@@ -241,7 +237,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   // Unified agent names (Task 5): canonical session names for session-owned
   // tabs (memoized; recomputes only when its slice references change).
   const tabDisplayTitles = useAppSelector(selectTabDisplayTitles)
-  const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
   const amplifierActivityByTerminalId = useAppSelector((s) => s.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID)
@@ -507,7 +502,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         tab={tab}
         displayTitle={getDisplayTitle(tab)}
         isActive={tab.id === activeTabId}
-        needsAttention={!!attentionByTab[tab.id]}
         busy={busyPaneIds.length > 0}
         busyPaneIds={busyPaneIds}
         isDragging={activeId === tab.id}
@@ -593,7 +587,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   }, [
     activeId,
     activeTabId,
-    attentionByTab,
     commitTabRename,
     dispatch,
     getDisplayTitle,
@@ -860,7 +853,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
               <TabItem
                 tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
                 isActive={activeTab.id === activeTabId}
-                needsAttention={!!attentionByTab[activeTab.id]}
                 busy={getBusyPaneIds(activeTab).length > 0}
                 busyPaneIds={getBusyPaneIds(activeTab)}
                 isDragging={false}

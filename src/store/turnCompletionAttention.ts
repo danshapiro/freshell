@@ -14,17 +14,6 @@ import { clearPaneAttention, clearTabAttention } from './turnCompletionSlice'
 import { setActiveTab } from './tabsSlice'
 import type { AppDispatch, RootState } from './store'
 
-/**
- * The tab strip's attention flag: the UNION of unwitnessed attention
- * (attentionByTab) and watched fresh-agent completions (watchedCompletionByTab
- * — a tab-strip-ONLY mark that must never reach the sidebar or pane-header
- * derivations, which keep reading the attention maps directly).
- */
-export function selectTabStripAttention(state: RootState, tabId: string): boolean {
-  const tc = state.turnCompletion
-  return Boolean(tc?.attentionByTab?.[tabId] || tc?.watchedCompletionByTab?.[tabId])
-}
-
 export function selectPaneBySessionKey(
   state: RootState,
   sessionKey: string,
