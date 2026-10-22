@@ -1283,3 +1283,266 @@ async fn close_tears_down_active_connections_and_stops_accepting_new_ones() {
         panic!("expected connecting after close() to fail (listener stopped)");
     }
 }
+
+// ── 12. over-cap rejection at the transport boundary: classified Capacity
+//         triggers with their own rate limit + generic-pair suppression
+//         (plan 2026-10-20-codex-proxy-ws-frame-cap.md §4.3.1, tests §5.3/§5.8) ───────
+
+/// Options with transport caps == hub policy at exact equality (plan §4.1):
+/// the over-cap boundary tests inject one small cap for all three so frames
+/// die at the transport, from the frame header, without allocating MiBs.
+/// Mirrors candidate_gate.rs's `gate_options` injection pattern.
+fn equality_options(upstream: &str, cap: usize) -> CodexRemoteProxyOptions {
+    let mut options = CodexRemoteProxyOptions::new(upstream, true);
+    options.max_raw_forward_bytes = cap;
+    options.max_ws_frame_bytes = cap;
+    options.max_ws_message_bytes = cap;
+    options
+}
+
+/// Reads until the socket ends and asserts NO text frame (no JSON-RPC error
+/// reply) arrives first. The STYLE of the close is deliberately NOT asserted
+/// (plan §5.3: the teardown's `WriterMsg::Close` behavior is expressly
+/// unchanged) — a close frame, a raw transport error, or a silent stream end
+/// are all accepted as the end.
+async fn assert_socket_ends_without_a_text_frame<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for _ in 0..8 {
+        match timeout(RECV_TIMEOUT, ws.next())
+            .await
+            .expect("timed out waiting for the socket to end")
+        {
+            Some(Ok(Message::Text(text))) => panic!(
+                "the proxy must not answer an over-cap frame with a JSON-RPC reply, got: {text:.512}"
+            ),
+            Some(Ok(_)) => continue, // close/control frames: keep draining to the end
+            Some(Err(_)) | None => return, // the socket ended; style deliberately unpinned
+        }
+    }
+}
+
+#[tokio::test]
+async fn over_cap_upstream_frame_at_transport_equality_is_rejected_with_a_classified_capacity_trigger(
+) {
+    // Plan §5.3(i), upstream direction (the incident direction) at production
+    // equality — transport caps == hub policy, all 1 MiB: a 2 MiB upstream
+    // response frame is rejected by the TRANSPORT from its frame header (never
+    // buffered, never relayed), producing the DISTINCT classified Capacity
+    // trigger, a connection close, and NO JSON-RPC error reply to the client
+    // (at equality the hub's JSON-RPC rejection is unreachable).
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(equality_options(&upstream.ws_url, 1024 * 1024))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    let request = json!({"id": 1, "method": "foo/bar", "params": {}}).to_string();
+    tui.send(Message::Text(request)).await.unwrap();
+    let _ = conn.recv_text().await;
+
+    // A 2 MiB single frame: rejected at the header against the 1 MiB caps. The
+    // exact size makes the classified trigger's error text assertable verbatim.
+    conn.send_text("x".repeat(2 * 1024 * 1024));
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert!(
+                message.contains("upstream connection failed on the WebSocket capacity limit"),
+                "the classified Capacity trigger must distinctly identify the capacity failure, got: {message}"
+            );
+            assert!(
+                message.contains("Message too long: 2097152 > 1048576"),
+                "the trigger must embed the ACTUAL error text (real sizes + configured limit), got: {message}"
+            );
+        }
+        other => panic!("expected a classified Capacity ProxyError trigger, got {other:?}"),
+    }
+
+    // The connection closes with NO JSON-RPC error reply to the client.
+    assert_socket_ends_without_a_text_frame(&mut tui).await;
+    // Nothing else fires for this teardown — the generic errored pair is
+    // suppressed behind the classified line; the client leg ends silently.
+    assert_no_event(&mut events).await;
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn over_cap_client_frame_at_transport_equality_is_rejected_with_a_classified_capacity_trigger(
+) {
+    // Plan §5.3 client-direction mirror at production equality: an oversized
+    // CLIENT frame dies at the TUI-facing ACCEPT transport (from its header)
+    // with the classified trigger and NO JSON-RPC error reply. The existing
+    // 256-byte test pins the hub's client-direction rejection under injected
+    // ASYMMETRY; at equality the transport fires first — do not conflate.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(equality_options(&upstream.ws_url, 1024 * 1024))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let _conn = upstream.accept().await;
+
+    // The test client's own transport (tungstenite defaults) writes the 2 MiB
+    // frame fine; the proxy's accept side rejects it from the header. The
+    // send may fail once the teardown lands — the rejection is the point.
+    let _ = tui.send(Message::Text("x".repeat(2 * 1024 * 1024))).await;
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert!(
+                message.contains("client connection failed on the WebSocket capacity limit"),
+                "the client-direction classified trigger must identify the capacity failure, got: {message}"
+            );
+            assert!(
+                message.contains("Message too long: 2097152 > 1048576"),
+                "the trigger must embed the ACTUAL error text, got: {message}"
+            );
+        }
+        other => panic!("expected a classified Capacity ProxyError trigger, got {other:?}"),
+    }
+
+    // No JSON-RPC error reply reaches the client before its socket ends.
+    assert_socket_ends_without_a_text_frame(&mut tui).await;
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn over_cap_upstream_frame_with_transport_over_hub_asymmetry_hits_the_raw_forward_cap_guard()
+{
+    // Plan §5.3(ii) — hub belt-and-suspenders pinned independently of the
+    // transport: transport caps 4 MiB > hub policy 1 MiB, so the 2 MiB frame
+    // reaches the hub and takes the upstream-path rejection
+    // (`raw_forward_cap_exceeded`): trigger + close, and still NO JSON-RPC
+    // error reply (the upstream rejection path never writes to the client).
+    let mut upstream = start_fake_upstream().await;
+    let mut options = CodexRemoteProxyOptions::new(&upstream.ws_url, true);
+    options.max_raw_forward_bytes = 1024 * 1024;
+    options.max_ws_frame_bytes = 4 * 1024 * 1024;
+    options.max_ws_message_bytes = 4 * 1024 * 1024;
+    let (proxy, mut events) = CodexRemoteProxy::start(options).await.unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    let request = json!({"id": 1, "method": "foo/bar", "params": {}}).to_string();
+    tui.send(Message::Text(request)).await.unwrap();
+    let _ = conn.recv_text().await;
+
+    conn.send_text("x".repeat(2 * 1024 * 1024));
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert_eq!(
+                *message,
+                "Codex remote proxy rejected an unsafe upstream frame: raw_forward_cap_exceeded.",
+                "the hub's belt-and-suspenders guard must own the rejection when the transport cap is higher"
+            );
+        }
+        other => panic!("expected the hub raw_forward_cap_exceeded trigger, got {other:?}"),
+    }
+
+    assert_socket_ends_without_a_text_frame(&mut tui).await;
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn over_cap_reconnect_cycles_emit_at_most_one_classified_trigger_per_interval() {
+    // Plan §4.3.1b/c boundedness, scoped to this task's triggers: a >cap
+    // reconnect cycle emits ONE classified line per interval per proxy — the
+    // generic teardown pair is suppressed behind it — and the limiter re-arms
+    // once the injected interval (700 ms — comfortably above this test's own
+    // two 300 ms negative polls) elapses. Each cycle drops its TUI abruptly
+    // so the client leg ERRORS during teardown (the incident's exact pair
+    // shape), not clean-closes.
+    let mut upstream = start_fake_upstream().await;
+    let mut options = equality_options(&upstream.ws_url, 1024 * 1024);
+    options.capacity_trigger_min_interval_ms = 700;
+    let (proxy, mut events) = CodexRemoteProxy::start(options).await.unwrap();
+
+    // Cycle 1: the classified trigger fires.
+    let tui1 = connect_tui(proxy.ws_url()).await;
+    let conn1 = upstream.accept().await;
+    conn1.send_text("x".repeat(2 * 1024 * 1024));
+    let received_events = recv_events(&mut events, 1).await;
+    assert!(matches!(
+        &received_events[0],
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message })
+            if message.contains("upstream connection failed on the WebSocket capacity limit")
+    ));
+    drop(tui1); // abrupt: the client leg errors (Other) during teardown — suppressed
+    assert_no_event(&mut events).await;
+
+    // Cycle 2 (within the interval): the classified trigger is rate-limited and
+    // the generic pair suppressed — but the connection still tears down.
+    let tui2 = connect_tui(proxy.ws_url()).await;
+    let mut conn2 = upstream.accept().await;
+    conn2.send_text("x".repeat(2 * 1024 * 1024));
+    // Wait for the hub to process the (rate-limited, silent) Capacity error
+    // BEFORE dropping the TUI: the teardown it causes is what makes the client
+    // leg error, so causality guarantees the classified mark is set first —
+    // the same order the real incident's pair always has.
+    let closed = timeout(RECV_TIMEOUT, conn2.incoming.recv()).await.unwrap();
+    assert!(
+        matches!(closed, None | Some(Message::Close(_))),
+        "the fake upstream must observe the teardown of the suppressed cycle, got {closed:?}"
+    );
+    drop(tui2);
+    assert_no_event(&mut events).await;
+
+    // Once the interval elapses, the next cycle's classified trigger fires again.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let tui3 = connect_tui(proxy.ws_url()).await;
+    let conn3 = upstream.accept().await;
+    conn3.send_text("x".repeat(2 * 1024 * 1024));
+    let received_events = recv_events(&mut events, 1).await;
+    assert!(matches!(
+        &received_events[0],
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message })
+            if message.contains("failed on the WebSocket capacity limit")
+    ));
+
+    drop(tui3);
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn classified_capacity_trigger_text_embeds_the_actual_error_and_configured_limit() {
+    // Plan §5.8: an injected tiny transport cap (1024) forces a Capacity error
+    // on a 2048-byte frame; the distinct trigger text embeds the ACTUAL
+    // tungstenite error ("Message too long: ..." with the real size numbers —
+    // which itself carries the configured limit) and invents no size claim.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) = CodexRemoteProxy::start(equality_options(&upstream.ws_url, 1024))
+        .await
+        .unwrap();
+    let _tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    conn.send_text("x".repeat(2048));
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }) => {
+            assert!(
+                message.contains("failed on the WebSocket capacity limit"),
+                "the trigger must be the distinct classified line, got: {message}"
+            );
+            assert!(
+                message.contains("Message too long: 2048 > 1024"),
+                "the trigger must embed the actual error text with the real size numbers and the configured limit, got: {message}"
+            );
+        }
+        other => panic!("expected the classified Capacity trigger, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
