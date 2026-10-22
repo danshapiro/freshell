@@ -6366,8 +6366,12 @@ mod tests {
         );
         let control = Arc::new(CheckpointCaptureControl::default());
         let mut command = Command::new("cmd.exe");
+        // cmd.exe does not follow CommandLineToArgvW quoting: an escaped
+        // `\"` would reach `start` literally and no descendant would ever
+        // launch. Pass the command line verbatim.
         command
-            .args(["/C", &script])
+            .raw_arg("/C")
+            .raw_arg(&script)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

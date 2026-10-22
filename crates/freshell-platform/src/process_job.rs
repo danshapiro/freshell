@@ -249,11 +249,11 @@ mod tests {
     /// its own long `ping`, spawned suspended into `job`. Returns the child.
     fn spawn_tree_in(job: &KillOnCloseJob) -> std::process::Child {
         use std::os::windows::process::CommandExt;
+        // cmd.exe does not follow CommandLineToArgvW quoting, so the command
+        // line is passed verbatim (an escaped `\"` would break `start`).
         let mut child = Command::new("cmd.exe")
-            .args([
-                "/C",
-                "start \"\" /B ping -n 120 127.0.0.1 > nul & ping -n 120 127.0.0.1 > nul",
-            ])
+            .raw_arg("/C")
+            .raw_arg("start \"\" /B ping -n 120 127.0.0.1 > nul & ping -n 120 127.0.0.1 > nul")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
