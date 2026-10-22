@@ -99,10 +99,7 @@ mod session_name_apply;
 mod session_name_policy;
 #[path = "session_name_sweep_batch.rs"]
 mod session_name_sweep_batch;
-use session_name_apply::{
-    effective_native_baseline, indexed_key, replace_automatic, replace_heal, wire_source,
-    with_outcome,
-};
+use session_name_apply::{indexed_key, replace_automatic, replace_heal, wire_source, with_outcome};
 use session_name_sweep_batch::StagedNativeBaselines;
 pub(crate) use session_name_sweep_batch::{
     SweepMaintenanceItem, SweepMaintenanceQueue, SweepMaintenanceReport, SweepWork,
@@ -1320,7 +1317,7 @@ impl SessionNames {
     #[cfg(test)]
     pub(crate) fn staged_native_baseline(&self, target: &SessionNameRef) -> Option<String> {
         let (resolved, _) = self.core.current_view().document.resolve_ref(target);
-        self.core.staged_baselines.get(&name_ref_key(&resolved))
+        self.core.staged_baselines.title(&name_ref_key(&resolved))
     }
 
     /// Name-reliability Task 4: whether any native baseline waits for the
@@ -3238,7 +3235,7 @@ fn observe_native_decision(
                     // of the baseline never changes the name, the first
                     // observation only records the baseline, and a changed
                     // title replaces an unprotected provider-level name.
-                    let baseline = effective_native_baseline(document, meta, &key);
+                    let baseline = meta.staged_baselines.effective(document, &key);
                     let plan = session_name_policy::native_offer_decision(
                         &record,
                         baseline.as_deref(),
@@ -3357,7 +3354,7 @@ fn observe_native_decision(
                 name_ref = %key,
                 "session_names.native_baseline_staged"
             );
-            meta.staged_baselines.stage(&key, baseline);
+            meta.staged_baselines.stage(document, &key, baseline);
         }
         return Ok(Decision::Read(read_update(document, &key)));
     }

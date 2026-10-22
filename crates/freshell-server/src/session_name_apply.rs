@@ -2,13 +2,14 @@
 //! small document mutations the store's decisions use once
 //! `session_name_policy` has decided an offer applies — install the name
 //! exactly as planned (never re-offered through the strict raise), log a
-//! self-heal, read a record's native baseline, and attach a rename outcome.
+//! self-heal, and attach a rename outcome. (A record's native baseline is
+//! read through `session_name_sweep_batch::StagedNativeBaselines`.)
 
 use freshell_protocol::session_names::{
     NameSource, RenameOutcome, SessionNameRecord, SessionNameRef, SessionNameUpdate,
 };
 
-use super::{name_ref_key, Decision, NameError, StoredDocument, TxnMeta};
+use super::{name_ref_key, Decision, NameError, StoredDocument};
 use crate::session_name_generation::IndexedNameInput;
 
 /// Name-reliability Task 4: install an automatic name the policy already
@@ -87,21 +88,6 @@ pub(super) fn indexed_key(input: &IndexedNameInput) -> String {
     name_ref_key(&SessionNameRef::Session {
         provider: input.provider,
         session_id: input.session_id.clone(),
-    })
-}
-
-/// Name-reliability Task 4: a record's native baseline — the staged value
-/// when one waits for the maintenance batch, else the persisted one.
-pub(super) fn effective_native_baseline(
-    document: &StoredDocument,
-    meta: &TxnMeta,
-    key: &str,
-) -> Option<String> {
-    meta.staged_baselines.get(key).or_else(|| {
-        document
-            .native_write
-            .get(key)
-            .and_then(|state| state.last_native_title.clone())
     })
 }
 

@@ -20,6 +20,13 @@
 //! target, one submission per target at a time. An older title can therefore
 //! never land after a newer one.
 //!
+//! The inline attempt never waits for its target's turn: when another
+//! submission of the same target is still inside the store (a background
+//! retry, or a concurrent lane's inline attempt), the new observation goes
+//! straight to the background, where it takes the turn as soon as it is
+//! free (then the same 200 ms / 1 s ladder). The relay's worst case stays
+//! one store attempt, never two back to back.
+//!
 //! The bookkeeping is process-wide, keyed by (sink, target): one sink is one
 //! naming store, so this is a per-sink retrier. A target's entry lives only
 //! while one of its observations is in flight.
@@ -134,8 +141,20 @@ enum Attempt {
     Failed(NameError),
 }
 
-async fn attempt(ticket: &ObservationTicket, observation: NativeNameObservation) -> Attempt {
-    let _turn = ticket.submit.lock().await;
+/// How an observation reaches the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handoff {
+    /// The inline attempt failed on a busy or failing store: the backoff
+    /// ladder follows.
+    AfterFailure,
+    /// Another submission of the target held its turn: the observation has
+    /// made no attempt yet, so it takes the turn as soon as it is free, then
+    /// the ladder.
+    TargetBusy,
+}
+
+/// One submission. The caller holds the target's turn for the whole call.
+async fn fold(ticket: &ObservationTicket, observation: NativeNameObservation) -> Attempt {
     if !ticket.is_latest() {
         return Attempt::Superseded;
     }
@@ -148,11 +167,19 @@ async fn attempt(ticket: &ObservationTicket, observation: NativeNameObservation)
     }
 }
 
+/// One submission that waits for the target's turn (background only).
+async fn attempt(ticket: &ObservationTicket, observation: NativeNameObservation) -> Attempt {
+    let _turn = ticket.submit.lock().await;
+    fold(ticket, observation).await
+}
+
 /// Fold one reserved observation: stamp it with the store's current
 /// location revision NOW, make one attempt, and on a busy or failing store
-/// hand the same observation to the background retry. Returns the
-/// accepted update when the inline attempt applied; `None` otherwise (the
-/// caller never waits for a retry).
+/// hand the same observation to the background retry. When another
+/// submission of the target is still inside the store, the observation goes
+/// to the background without an inline attempt. Returns the accepted update
+/// when the inline attempt applied; `None` otherwise (the caller never waits
+/// for a retry or for another submission).
 pub async fn submit(
     ticket: ObservationTicket,
     title: String,
@@ -173,7 +200,21 @@ pub async fn submit(
         location_revision,
         event_id,
     };
-    match attempt(&ticket, observation.clone()).await {
+    let turn = Arc::clone(&ticket.submit);
+    let outcome = match turn.try_lock() {
+        Ok(_turn) => fold(&ticket, observation.clone()).await,
+        Err(_) => {
+            tracing::debug!(
+                target: "freshell_freshagent::naming",
+                op = "observe_native",
+                name_ref = %name_ref_debug_key(&ticket.target),
+                "session_names.native_observation_queued_behind_in_flight"
+            );
+            tokio::spawn(retry(ticket, observation, Handoff::TargetBusy));
+            return None;
+        }
+    };
+    match outcome {
         Attempt::Applied(update) => Some(update),
         Attempt::Superseded => None,
         Attempt::Failed(error) => {
@@ -188,24 +229,49 @@ pub async fn submit(
                 class = %error.code(),
                 "session_names.native_observation_retry_scheduled"
             );
-            tokio::spawn(retry(ticket, observation));
+            tokio::spawn(retry(ticket, observation, Handoff::AfterFailure));
             None
         }
     }
 }
 
-async fn retry(ticket: ObservationTicket, observation: NativeNameObservation) {
-    for (index, delay) in RETRY_DELAYS.iter().enumerate() {
-        tokio::time::sleep(*delay).await;
+/// The background attempts: a busy-target handoff first takes the turn as
+/// soon as it is free; then the backoff ladder. Every observation makes at
+/// most `RETRY_DELAYS.len() + 1` attempts in all.
+async fn retry(ticket: ObservationTicket, observation: NativeNameObservation, handoff: Handoff) {
+    // `None`: the queued attempt (no delay, not a retry).
+    let queued = (handoff == Handoff::TargetBusy).then_some(None);
+    let schedule: Vec<Option<Duration>> = queued
+        .into_iter()
+        .chain(RETRY_DELAYS.into_iter().map(Some))
+        .collect();
+    let last = schedule.len() - 1;
+    let mut retries = 0usize;
+    for (index, delay) in schedule.into_iter().enumerate() {
+        if let Some(delay) = delay {
+            retries += 1;
+            tokio::time::sleep(delay).await;
+        }
         match attempt(&ticket, observation.clone()).await {
             Attempt::Applied(_) => {
-                tracing::info!(
-                    target: "freshell_freshagent::naming",
-                    op = "observe_native",
-                    name_ref = %name_ref_debug_key(&ticket.target),
-                    retry = index + 1,
-                    "session_names.native_observation_retry_applied"
-                );
+                // A busy-target handoff that lands at once was queued, not
+                // retried: only a real retry is worth an INFO line.
+                if delay.is_none() {
+                    tracing::debug!(
+                        target: "freshell_freshagent::naming",
+                        op = "observe_native",
+                        name_ref = %name_ref_debug_key(&ticket.target),
+                        "session_names.native_observation_queued_applied"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "freshell_freshagent::naming",
+                        op = "observe_native",
+                        name_ref = %name_ref_debug_key(&ticket.target),
+                        retry = retries,
+                        "session_names.native_observation_retry_applied"
+                    );
+                }
                 return;
             }
             Attempt::Superseded => {
@@ -222,7 +288,7 @@ async fn retry(ticket: ObservationTicket, observation: NativeNameObservation) {
                 return;
             }
             Attempt::Retryable(error) => {
-                if index + 1 == RETRY_DELAYS.len() {
+                if index == last {
                     tracing::warn!(
                         target: "freshell_freshagent::naming",
                         op = "observe_native",
@@ -414,6 +480,59 @@ mod tests {
             sink.attempted_titles()
         );
         assert!(sink.observed_titles().is_empty());
+    }
+
+    /// A new observation never waits behind its target's in-flight
+    /// background retry: while that retry sits inside a slow store
+    /// transaction, the next inline call returns at once, and its title
+    /// lands once the retry finishes — after it, so the newest title is the
+    /// last word.
+    #[tokio::test]
+    async fn an_inline_observation_never_waits_behind_an_in_flight_retry() {
+        let sink = sink_for("ses_busy");
+        sink.fail_next_observations(1);
+        observe_native_live(
+            &dyn_sink(&sink),
+            target("ses_busy"),
+            "A",
+            NativeNameOrigin::Snapshot,
+            None,
+        )
+        .await;
+        // The background retry of "A" blocks inside the store until released.
+        let release = sink.block_next_observation();
+        assert!(
+            wait_until(Duration::from_secs(2), || sink.attempted_titles().len()
+                == 2)
+            .await,
+            "the retry of A is in flight: {:?}",
+            sink.attempted_titles()
+        );
+
+        let inline = tokio::time::timeout(
+            Duration::from_millis(200),
+            observe_native_live(
+                &dyn_sink(&sink),
+                target("ses_busy"),
+                "B",
+                NativeNameOrigin::Snapshot,
+                None,
+            ),
+        )
+        .await;
+        let inline = inline.expect("the inline call returned while the retry was in flight");
+        assert!(inline.is_none(), "B is not answered inline");
+
+        release.send(()).expect("the retry of A still waits");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                sink.observed_titles() == vec!["A".to_string(), "B".to_string()]
+            })
+            .await,
+            "B lands after the retry of A finished: observed {:?}, attempted {:?}",
+            sink.observed_titles(),
+            sink.attempted_titles()
+        );
     }
 
     /// OpenCode's placeholder title never even reaches the store.

@@ -61,26 +61,71 @@ pub(crate) struct SweepMaintenanceReport {
     pub deferred: usize,
 }
 
+/// One staged baseline: the title, and the persisted baseline the
+/// observation saw when it staged it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedBaseline {
+    title: String,
+    over: Option<String>,
+}
+
 /// The native baselines observed but not yet persisted: an observation
 /// whose only effect is a new baseline never makes its own commit. Keyed by
 /// record key; decisions read a staged value as if it were persisted. Lost
 /// on restart, which only means the next observation records it again.
+///
+/// A staged value is this process's newest observation, but only relative
+/// to the persisted baseline it was staged over: once another process
+/// persists a different baseline, that one is newer, and the staged value
+/// is dropped — never read, never written back over it (writing it back
+/// would make the provider's next re-report of the newer title look
+/// changed and undo a rename made since).
 #[derive(Debug, Default)]
-pub(super) struct StagedNativeBaselines(Mutex<BTreeMap<String, String>>);
+pub(super) struct StagedNativeBaselines(Mutex<BTreeMap<String, StagedBaseline>>);
+
+/// The persisted baseline of `key` in `document`.
+fn persisted<'a>(document: &'a StoredDocument, key: &str) -> Option<&'a str> {
+    document
+        .native_write
+        .get(key)
+        .and_then(|state| state.last_native_title.as_deref())
+}
 
 impl StagedNativeBaselines {
-    fn map(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
+    fn map(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, StagedBaseline>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(super) fn get(&self, key: &str) -> Option<String> {
-        self.map().get(key).cloned()
+    /// The staged title, whatever the document holds (a test seam).
+    #[cfg(test)]
+    pub(super) fn title(&self, key: &str) -> Option<String> {
+        self.map().get(key).map(|staged| staged.title.clone())
     }
 
-    pub(super) fn stage(&self, key: &str, title: String) {
-        self.map().insert(key.to_string(), title);
+    /// The baseline decisions use for `key`: the staged title while the
+    /// document still holds the baseline it was staged over, else the
+    /// persisted one.
+    pub(super) fn effective(&self, document: &StoredDocument, key: &str) -> Option<String> {
+        let persisted = persisted(document, key);
+        self.map()
+            .get(key)
+            .filter(|staged| staged.over.as_deref() == persisted)
+            .map(|staged| staged.title.clone())
+            .or_else(|| persisted.map(str::to_string))
+    }
+
+    /// Stage `title` over the document's persisted baseline for `key`.
+    pub(super) fn stage(&self, document: &StoredDocument, key: &str, title: String) {
+        let over = persisted(document, key).map(str::to_string);
+        let mut map = self.map();
+        if over.as_deref() == Some(title.as_str()) {
+            // The persisted baseline already is this title.
+            map.remove(key);
+        } else {
+            map.insert(key.to_string(), StagedBaseline { title, over });
+        }
     }
 
     pub(super) fn remove(&self, key: &str) {
@@ -91,29 +136,29 @@ impl StagedNativeBaselines {
         self.map().is_empty()
     }
 
-    fn first(&self, count: usize) -> Vec<(String, String)> {
+    fn first(&self, count: usize) -> Vec<(String, StagedBaseline)> {
         self.map()
             .iter()
             .take(count)
-            .map(|(key, title)| (key.clone(), title.clone()))
+            .map(|(key, staged)| (key.clone(), staged.clone()))
             .collect()
     }
 
-    /// Drop every staged baseline the document already carries, and every
-    /// one whose record no longer exists (a bound pending handle). Called
-    /// with each freshly committed or adopted document.
+    /// Drop every staged baseline the document already carries, every one
+    /// another participant superseded (the persisted baseline is no longer
+    /// the one it was staged over), and every one whose record no longer
+    /// exists (a bound pending handle). Called with each freshly committed
+    /// or adopted document.
     pub(super) fn prune_persisted(&self, document: &StoredDocument) {
         let mut map = self.map();
         if map.is_empty() {
             return;
         }
-        map.retain(|key, title| {
+        map.retain(|key, staged| {
+            let persisted = persisted(document, key);
             document.records.contains_key(key)
-                && document
-                    .native_write
-                    .get(key)
-                    .and_then(|state| state.last_native_title.as_deref())
-                    != Some(title.as_str())
+                && persisted == staged.over.as_deref()
+                && persisted != Some(staged.title.as_str())
         });
     }
 }
@@ -167,14 +212,26 @@ pub(super) fn sweep_maintenance_decision(
         }
     }
     let room = SWEEP_MAINTENANCE_BATCH.saturating_sub(used);
-    for (key, title) in meta.staged_baselines.first(room) {
+    for (key, staged) in meta.staged_baselines.first(room) {
         if !document.records.contains_key(&key) {
             meta.staged_baselines.remove(&key);
             continue;
         }
+        // Another participant persisted a different baseline since this
+        // one was staged: theirs is newer, so the staged one is dropped.
+        if persisted(document, &key) != staged.over.as_deref() {
+            tracing::debug!(
+                target: "freshell_server::session_names",
+                op = "sweep_maintenance",
+                name_ref = %key,
+                "session_names.native_baseline_superseded"
+            );
+            meta.staged_baselines.remove(&key);
+            continue;
+        }
         let entry = document.native_write.entry(key).or_default();
-        if entry.last_native_title.as_deref() != Some(title.as_str()) {
-            entry.last_native_title = Some(title);
+        if entry.last_native_title.as_deref() != Some(staged.title.as_str()) {
+            entry.last_native_title = Some(staged.title);
             wrote = true;
         }
         report.baselines += 1;
