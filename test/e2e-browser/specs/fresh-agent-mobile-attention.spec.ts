@@ -138,7 +138,10 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
         })
       }
 
-      const otherTabsStatus = page.getByRole('status', { name: '1 other tab needs attention' })
+      // The strip's "other tabs" count is a polite live region that stays
+      // mounted (empty while nothing else is marked); its label is its text.
+      const otherTabsStatus = page.getByRole('status').filter({ hasText: '1 other tab needs attention' })
+      const anyOtherTabsStatus = page.getByRole('status').filter({ hasText: /other tabs? needs? attention/ })
       const previousTab = page.getByRole('button', { name: 'Previous tab' })
 
       // ── 1. A turn ends in a BACKGROUND tab ─────────────────────────────────
@@ -176,7 +179,7 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
           message: 'tapping the card clears the tab attention (click mode)',
         })
         .toEqual([])
-      await expect(page.getByRole('status', { name: /other tabs? needs? attention/ })).toHaveCount(0)
+      await expect(anyOtherTabsStatus).toHaveCount(0)
       await expect(previousTab).toHaveAccessibleDescription('')
 
       // ── 3. An approval wait raised while the user is in another tab ───────
