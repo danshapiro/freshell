@@ -66,6 +66,8 @@ pub mod opencode_config;
 pub mod opencode_plugin;
 pub mod opencode_recipe;
 pub mod path;
+#[cfg(windows)]
+pub mod process_job;
 pub mod provider_environment;
 pub mod provider_environment_grants;
 pub mod provider_exec;

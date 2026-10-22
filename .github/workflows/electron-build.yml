@@ -106,6 +106,12 @@ jobs:
         if: matrix.os == 'windows-2022'
         run: cargo test --locked -p freshell-server --bin freshell-server checkpoints::tests::windows_system_profile_is_rejected_as_checkpoint_scope
 
+      # Checkpoint Git children run inside freshell-platform's shared
+      # kill-on-close Job Object; a timed-out capture must leave no descendant.
+      - name: Test Windows checkpoint Job Object settlement
+        if: matrix.os == 'windows-2022'
+        run: cargo test --locked -p freshell-server --bin freshell-server checkpoints::tests::checkpoint_timeout_settles_windows_job_descendant_before_returning
+
       - name: Run Electron unit tests
         run: pnpm run test:electron
 
