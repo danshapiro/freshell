@@ -99,8 +99,8 @@ const WORKER_LOCK_FILE_NAME: &str = ".session-names-worker.lock";
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// The bounded monotonic retry budget before `LockUnavailable` — spent only
 /// on contention with another participant (this store's own transactions
-/// queue on its local turn first). A local-turn wait at least this long logs
-/// `session_names.local_turn_slow`.
+/// queue on its local turn first). A local-turn wait that reaches this long
+/// logs `session_names.local_turn_slow` while the caller is still queued.
 const LOCK_RETRY_BUDGET: Duration = Duration::from_secs(1);
 /// Hard accepted-name cap: 200 Unicode scalar values.
 const MAX_NAME_SCALARS: usize = 200;
@@ -1401,28 +1401,12 @@ where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError> + Send + 'static,
 {
     // Local serialization: wait (FIFO) for this store's turn before touching
-    // the cross-process lock. Every turn holder runs bounded document IO (no
-    // provider call happens under a transaction), so the wait is bounded by
-    // the local queue ahead of us; the one-second retry budget below is left
-    // for contention with another process. A caller that stops waiting here
-    // simply leaves the queue — nothing has started.
-    let queued_at = Instant::now();
-    let turn = Arc::clone(&core.local_turn).lock_owned().await;
-    let queued = queued_at.elapsed();
-    if queued >= LOCK_RETRY_BUDGET {
-        tracing::warn!(
-            target: "freshell_server::session_names",
-            op = "local_turn",
-            name_ref = "-",
-            revision = 0,
-            class = "slow_local_turn",
-            queued_ms = queued.as_millis() as u64,
-            data_dir = %core.data_dir.display(),
-            "session_names.local_turn_slow: a naming transaction waited {} ms \
-             behind this process's own naming transactions (slow durable writes)",
-            queued.as_millis()
-        );
-    }
+    // the cross-process lock. Turn holders run document IO only (no provider
+    // call happens under a transaction), so the wait normally ends when the
+    // local queue ahead of us drains; the one-second retry budget below is
+    // left for contention with another process. A caller that stops waiting
+    // here simply leaves the queue — nothing has started.
+    let turn = await_local_turn(&core).await;
     // The blocking-IO owner retains its turn and lock guard until completion
     // even if the caller stops waiting: dropping this handle detaches the
     // spawn_blocking task, which runs to completion on its own.
@@ -1433,6 +1417,53 @@ where
             "naming transaction task failed: {join_err}"
         ))),
     }
+}
+
+/// Take this store's local turn (FIFO). Nothing bounds this wait — a queued
+/// caller must not fail just because this process's own durable writes are
+/// slow — so a wait that crosses [`LOCK_RETRY_BUDGET`] is reported WHILE it
+/// lasts (`session_names.local_turn_slow`, the caller still queued), and its
+/// end is reported once the turn arrives (`session_names.local_turn_resumed`).
+/// A turn holder that never finishes (a durable write wedged on a stalled
+/// disk) therefore shows up in the log within a second instead of silently
+/// hanging every naming caller.
+async fn await_local_turn(core: &NamesCore) -> LocalTurn {
+    let queued_at = Instant::now();
+    // One pinned acquisition future for the whole wait: re-creating it after
+    // the timeout would give up this caller's place in the FIFO queue.
+    let mut acquire = std::pin::pin!(Arc::clone(&core.local_turn).lock_owned());
+    if let Ok(turn) = tokio::time::timeout(LOCK_RETRY_BUDGET, acquire.as_mut()).await {
+        return turn;
+    }
+    let waited = queued_at.elapsed();
+    tracing::warn!(
+        target: "freshell_server::session_names",
+        op = "local_turn",
+        name_ref = "-",
+        revision = 0,
+        class = "slow_local_turn",
+        queued_ms = waited.as_millis() as u64,
+        data_dir = %core.data_dir.display(),
+        "session_names.local_turn_slow: a naming transaction has waited {} ms behind \
+         this process's own naming transactions and is still queued (a slow or \
+         stalled durable write holds the turn)",
+        waited.as_millis()
+    );
+    let turn = acquire.await;
+    let queued = queued_at.elapsed();
+    tracing::info!(
+        target: "freshell_server::session_names",
+        op = "local_turn",
+        name_ref = "-",
+        revision = 0,
+        class = "slow_local_turn_resumed",
+        queued_ms = queued.as_millis() as u64,
+        data_dir = %core.data_dir.display(),
+        "session_names.local_turn_resumed: a naming transaction got its turn after \
+         waiting {} ms behind this process's own naming transactions",
+        queued.as_millis()
+    );
+    turn
 }
 
 fn run_txn_sync<T, F>(core: &NamesCore, _turn: &LocalTurn, f: F) -> Result<T, NameError>
@@ -1825,6 +1856,12 @@ pub(crate) enum TestHook {
     PostReplace,
     FailReconcile,
     HoldLock(u64),
+    /// Hold the document lock (and with it this store's local turn) from
+    /// inside a transaction until the test calls [`release_held_lock`]: a
+    /// stalled durable write whose end the test controls. Fires once, like
+    /// `HoldLock`, and gives up after [`HELD_LOCK_RELEASE_BOUND`] so a test
+    /// that never releases cannot wedge the lane.
+    HoldLockUntilReleased,
     /// Task 3: override the native cycle retry floors (both delays) for the
     /// data dir — the bounded-allowance tests pin exhaustion without
     /// wall-clock waits. Persists until cleared (like the failure injections).
@@ -1843,6 +1880,22 @@ pub(crate) enum TestHook {
 /// ownership instead of a fixed post-spawn delay.
 #[cfg(test)]
 const LOCK_HELD_SENTINEL_NAME: &str = ".session-names-lock-held";
+
+/// Release sentinel for a `HoldLockUntilReleased` hold: the holder polls for
+/// it and returns once it exists.
+#[cfg(test)]
+const LOCK_RELEASE_SENTINEL_NAME: &str = ".session-names-lock-release";
+
+/// The longest a `HoldLockUntilReleased` hold waits for its release.
+#[cfg(test)]
+const HELD_LOCK_RELEASE_BOUND: Duration = Duration::from_secs(30);
+
+/// End a `HoldLockUntilReleased` hold for `data_dir`.
+#[cfg(test)]
+pub(crate) fn release_held_lock(data_dir: &Path) {
+    std::fs::write(data_dir.join(LOCK_RELEASE_SENTINEL_NAME), b"release")
+        .expect("write the session-names lock release sentinel");
+}
 
 #[cfg(test)]
 pub(crate) fn set_test_hooks(data_dir: &Path, hooks: Vec<TestHook>) {
@@ -1879,7 +1932,10 @@ fn take_matching_hook(data_dir: &Path, predicate: impl Fn(&TestHook) -> bool) ->
     let index = hooks.iter().position(predicate)?;
     // HoldLock fires once; failure injections persist until cleared so a
     // whole write window stays broken deterministically.
-    if matches!(hooks[index], TestHook::HoldLock(_)) {
+    if matches!(
+        hooks[index],
+        TestHook::HoldLock(_) | TestHook::HoldLockUntilReleased
+    ) {
         Some(hooks.remove(index))
     } else {
         Some(hooks[index].clone())
@@ -1889,11 +1945,29 @@ fn take_matching_hook(data_dir: &Path, predicate: impl Fn(&TestHook) -> bool) ->
 fn test_hold_once(_data_dir: &Path) {
     #[cfg(test)]
     {
-        if let Some(TestHook::HoldLock(ms)) =
-            take_matching_hook(_data_dir, |h| matches!(h, TestHook::HoldLock(_)))
-        {
-            write_lock_held_sentinel(_data_dir);
-            std::thread::sleep(Duration::from_millis(ms));
+        match take_matching_hook(_data_dir, |h| {
+            matches!(h, TestHook::HoldLock(_) | TestHook::HoldLockUntilReleased)
+        }) {
+            Some(TestHook::HoldLock(ms)) => {
+                write_lock_held_sentinel(_data_dir);
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            Some(TestHook::HoldLockUntilReleased) => {
+                write_lock_held_sentinel(_data_dir);
+                let release = _data_dir.join(LOCK_RELEASE_SENTINEL_NAME);
+                let deadline = Instant::now() + HELD_LOCK_RELEASE_BOUND;
+                while !release.exists() {
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "session-names held lock was never released for {}",
+                            _data_dir.display()
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            _ => {}
         }
     }
 }
