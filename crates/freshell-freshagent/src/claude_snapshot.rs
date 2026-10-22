@@ -452,12 +452,13 @@ pub(crate) fn parse_transcript_turn_indexed(
     ordinal: usize,
     index_key: Option<&str>,
 ) -> Option<Value> {
-    let role = match obj.get("type").and_then(Value::as_str) {
-        Some("user") => "user",
-        Some("assistant") => "assistant",
-        _ => return None,
-    };
+    let line_type = obj.get("type").and_then(Value::as_str)?;
+    if !matches!(line_type, "user" | "assistant" | "system") {
+        return None;
+    }
     // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
+    // The compact summary (`isCompactSummary`) is the model-facing recap of the
+    // compacted history; the visible marker comes from `system/compact_boundary`.
     if [
         "isMeta",
         "isSidechain",
@@ -467,6 +468,25 @@ pub(crate) fn parse_transcript_turn_indexed(
     .iter()
     .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
     {
+        return None;
+    }
+    let line_uuid = obj
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    // kata 1wxv: real message uuids are the rollback-addressable turn identity;
+    // the synthetic {thread}:{ordinal} stays as the fallback for uuid-less lines.
+    let turn_id = line_uuid
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{thread_id}:{ordinal}"));
+    if line_type == "system" {
+        return system_line_turn(obj, &turn_id, ordinal);
+    }
+    // A background agent's completion arrives as an unsolicited USER line
+    // carrying `<task-notification>` XML (CLI 2.1.237, F6). It is provider
+    // bookkeeping, not something the user typed: the transcript projector folds
+    // it into the owning delegation instead.
+    if is_task_notification_line(obj) {
         return None;
     }
     let msg = obj.get("message");
@@ -479,16 +499,35 @@ pub(crate) fn parse_transcript_turn_indexed(
         },
         _ => return None,
     };
-
-    let line_uuid = obj
-        .get("uuid")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    // kata 1wxv: real message uuids are the rollback-addressable turn identity;
-    // the synthetic {thread}:{ordinal} stays as the fallback for uuid-less lines.
-    let turn_id = line_uuid
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{thread_id}:{ordinal}"));
+    if line_type == "user" {
+        if let Some(turn) = local_command_user_turn(&blocks, &turn_id, ordinal, obj) {
+            return turn;
+        }
+    }
+    let role = if line_type == "user" {
+        "user"
+    } else {
+        "assistant"
+    };
+    // An API failure is persisted as a synthetic assistant line whose text is
+    // the error (`isApiErrorMessage`, F14): the durable error module renders it.
+    if role == "assistant" && obj.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
+        let message = blocks_text(&blocks);
+        let message = if message.trim().is_empty() {
+            "API error".to_string()
+        } else {
+            message
+        };
+        let error = json!({ "name": "ApiError", "message": message });
+        return Some(turn_json(
+            &turn_id,
+            ordinal,
+            role,
+            Vec::new(),
+            Some(error),
+            obj,
+        ));
+    }
     let mut items: Vec<Value> = Vec::new();
     for (j, block) in blocks.iter().enumerate() {
         let j = index_key
@@ -500,8 +539,20 @@ pub(crate) fn parse_transcript_turn_indexed(
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    // A slash command the user ran is persisted as
+                    // `<command-name>/x</command-name>…<command-args>…` (F8/F10):
+                    // show what the user typed.
+                    let text = match role {
+                        "user" => slash_command_text(text).unwrap_or_else(|| text.to_string()),
+                        _ => text.to_string(),
+                    };
                     items.push(json!({ "id": item_id, "kind": "text", "text": text }));
                 }
+            }
+            // Attachments are placeholders only (codex parity, `codex.rs`
+            // userMessage parts): base64 payloads never reach the snapshot.
+            Some("image") => {
+                items.push(json!({ "id": item_id, "kind": "text", "text": IMAGE_PLACEHOLDER }));
             }
             Some("thinking") => {
                 let text = block
@@ -552,8 +603,34 @@ pub(crate) fn parse_transcript_turn_indexed(
     if items.is_empty() {
         return None;
     }
+    Some(turn_json(&turn_id, ordinal, role, items, None, obj))
+}
 
-    let summary = summarize(&items);
+/// Display text for an image attachment or an image tool result.
+const IMAGE_PLACEHOLDER: &str = "[image]";
+
+/// Summary of a compaction-marker turn (the session-host text capture falls
+/// back to the summary for item kinds without text).
+const CONTEXT_COMPACTED_LABEL: &str = "Context compacted";
+
+/// The one turn-JSON builder every projection arm shares. `error` is the
+/// durable error module's `{name, message}`; an error-only turn (no items)
+/// keeps a BLANK summary (LB-4: the client renders a zero-item turn's summary
+/// as its body, which would duplicate the error module).
+fn turn_json(
+    turn_id: &str,
+    ordinal: usize,
+    role: &str,
+    items: Vec<Value>,
+    error: Option<Value>,
+    obj: &Value,
+) -> Value {
+    let msg = obj.get("message");
+    let summary = if items.is_empty() {
+        String::new()
+    } else {
+        summarize(&items)
+    };
     let mut turn = Map::new();
     turn.insert("id".into(), json!(turn_id));
     turn.insert("turnId".into(), json!(turn_id));
@@ -573,23 +650,181 @@ pub(crate) fn parse_transcript_turn_indexed(
     if let Some(model) = msg
         .and_then(|m| m.get("model"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && *s != SYNTHETIC_MODEL)
     {
         turn.insert("model".into(), json!(model));
+    }
+    if let Some(error) = error {
+        turn.insert("error".into(), error);
     }
     turn.insert("summary".into(), json!(summary));
     turn.insert("summaryKind".into(), json!(SUMMARY_KIND_ECHO));
     turn.insert("items".into(), json!(items));
-    Some(Value::Object(turn))
+    Value::Object(turn)
 }
 
-/// Flatten a tool_result block's content (string, or array of text blocks) to a string.
+/// The model stamp the CLI writes on lines it synthesizes itself (API errors).
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// `system` lines worth showing: the compaction marker and local slash-command
+/// output (`/cost`, `/context`, a failed `/compact`, F8-F10). Every other
+/// system subtype (status, informational noise) stays hidden.
+fn system_line_turn(obj: &Value, turn_id: &str, ordinal: usize) -> Option<Value> {
+    match obj.get("subtype").and_then(Value::as_str) {
+        Some("compact_boundary") => Some(turn_json(
+            turn_id,
+            ordinal,
+            "system",
+            vec![json!({ "id": format!("{turn_id}-i0"), "kind": "context_compaction" })],
+            None,
+            obj,
+        )),
+        Some("local_command") => {
+            let content = obj.get("content").and_then(Value::as_str)?;
+            let output = LocalCommandOutput::parse(content).unwrap_or_else(|| LocalCommandOutput {
+                stdout: content.trim().to_string(),
+                stderr: String::new(),
+            });
+            output.into_turn(turn_id, ordinal, obj)
+        }
+        _ => None,
+    }
+}
+
+/// A USER line whose whole text is local-command output (`<local-command-
+/// stdout>Compacted </local-command-stdout>` after `/compact`) is the CLI
+/// talking, not the user: project it as a system row. `None` = not such a
+/// line; `Some(None)` = such a line with nothing to show.
+fn local_command_user_turn(
+    blocks: &[Value],
+    turn_id: &str,
+    ordinal: usize,
+    obj: &Value,
+) -> Option<Option<Value>> {
+    let [block] = blocks else {
+        return None;
+    };
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    let output = LocalCommandOutput::parse(block.get("text").and_then(Value::as_str)?)?;
+    Some(output.into_turn(turn_id, ordinal, obj))
+}
+
+/// The stdout/stderr a local slash command wrote, unwrapped from the CLI's
+/// `<local-command-stdout>` / `<local-command-stderr>` envelopes.
+struct LocalCommandOutput {
+    stdout: String,
+    stderr: String,
+}
+
+impl LocalCommandOutput {
+    const STDOUT: (&'static str, &'static str) =
+        ("<local-command-stdout>", "</local-command-stdout>");
+    const STDERR: (&'static str, &'static str) =
+        ("<local-command-stderr>", "</local-command-stderr>");
+
+    /// `Some` only when the text consists of nothing but output envelopes.
+    fn parse(text: &str) -> Option<Self> {
+        let mut rest = text.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        while !rest.is_empty() {
+            let (sink, (open, close)) = if rest.starts_with(Self::STDOUT.0) {
+                (&mut stdout, Self::STDOUT)
+            } else if rest.starts_with(Self::STDERR.0) {
+                (&mut stderr, Self::STDERR)
+            } else {
+                return None;
+            };
+            let end = rest.find(close)?;
+            sink.push(rest[open.len()..end].trim());
+            rest = rest[end + close.len()..].trim_start();
+        }
+        let join = |parts: Vec<&str>| {
+            parts
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Some(Self {
+            stdout: join(stdout),
+            stderr: join(stderr),
+        })
+    }
+
+    /// stdout renders as a markdown system row; stderr as the durable
+    /// `CommandError` module (stdout, when both exist, stays as the row text).
+    fn into_turn(self, turn_id: &str, ordinal: usize, obj: &Value) -> Option<Value> {
+        let items: Vec<Value> = if self.stdout.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "id": format!("{turn_id}-i0"), "kind": "text", "text": self.stdout })]
+        };
+        let error = (!self.stderr.is_empty())
+            .then(|| json!({ "name": "CommandError", "message": self.stderr }));
+        if items.is_empty() && error.is_none() {
+            return None;
+        }
+        Some(turn_json(turn_id, ordinal, "system", items, error, obj))
+    }
+}
+
+/// `/name args` for a persisted slash-command invocation, `None` for any
+/// other text.
+fn slash_command_text(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if !text.starts_with("<command-name>") {
+        return None;
+    }
+    let tag = |name: &str| -> Option<&str> {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let start = text.find(&open)? + open.len();
+        let end = start + text[start..].find(&close)?;
+        Some(text[start..end].trim())
+    };
+    let name = tag("command-name").filter(|name| !name.is_empty())?;
+    let name = if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{name}")
+    };
+    Some(match tag("command-args").filter(|args| !args.is_empty()) {
+        Some(args) => format!("{name} {args}"),
+        None => name,
+    })
+}
+
+/// A background agent's completion notice (`origin.kind: task-notification`).
+pub(crate) fn is_task_notification_line(obj: &Value) -> bool {
+    obj.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+}
+
+/// The text blocks of a message, joined.
+fn blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Flatten a tool_result block's content (string, or array of text/image
+/// parts) to a string; image parts become the `[image]` placeholder.
 fn tool_result_text(block: &Value) -> String {
     match block.get("content") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(parts)) => parts
             .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .filter_map(|p| match p.get("type").and_then(Value::as_str) {
+                Some("image") => Some(IMAGE_PLACEHOLDER),
+                _ => p.get("text").and_then(Value::as_str),
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
@@ -643,6 +878,12 @@ fn summarize(items: &[Value]) -> String {
                 }
                 .to_string();
             }
+            Some("task_delegation") => {
+                if let Some(title) = item.get("title").and_then(Value::as_str) {
+                    return truncate_summary(title);
+                }
+            }
+            Some("context_compaction") => return CONTEXT_COMPACTED_LABEL.to_string(),
             _ => {}
         }
     }
@@ -2452,3 +2693,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "claude_snapshot_real_cli_tests.rs"]
+mod real_cli_tests;
