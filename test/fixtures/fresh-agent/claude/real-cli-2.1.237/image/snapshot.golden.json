@@ -1,0 +1,137 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "c495433c-b843-4161-b1b9-e06a9a76acdc",
+  "sessionId": "c495433c-b843-4161-b1b9-e06a9a76acdc",
+  "revision": 1792656000000,
+  "latestTurnId": "2ab3253a-2b48-4451-80e5-b8e2018d4e99",
+  "status": "idle",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "diffs": false,
+    "undo": true,
+    "redo": true,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 100,
+    "outputTokens": 20,
+    "cachedTokens": 10,
+    "totalTokens": 130,
+    "contextTokens": 130,
+    "compactPercent": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "659a5013-ea3d-405e-94e0-a88f7264a613",
+      "turnId": "659a5013-ea3d-405e-94e0-a88f7264a613",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:45.115Z",
+      "summary": "what is this",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "659a5013-ea3d-405e-94e0-a88f7264a613-i0",
+          "kind": "text",
+          "text": "what is this"
+        },
+        {
+          "id": "659a5013-ea3d-405e-94e0-a88f7264a613-i1",
+          "kind": "text",
+          "text": "[image]"
+        }
+      ]
+    },
+    {
+      "id": "d8c18209-77e2-4047-a061-3735040ffe95",
+      "turnId": "d8c18209-77e2-4047-a061-3735040ffe95",
+      "messageId": "msg_fixture0001",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:45.176Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Read",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "d8c18209-77e2-4047-a061-3735040ffe95-i0",
+          "kind": "tool_use",
+          "toolUseId": "toolu_read1",
+          "name": "Read",
+          "input": {
+            "file_path": "/fixture/ws/pic.png"
+          }
+        }
+      ]
+    },
+    {
+      "id": "a31e8735-8b9f-42b8-a4e8-3cb2ce9c6f55",
+      "turnId": "a31e8735-8b9f-42b8-a4e8-3cb2ce9c6f55",
+      "ordinal": 2,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:45.192Z",
+      "summary": "Tool result",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "a31e8735-8b9f-42b8-a4e8-3cb2ce9c6f55-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_read1",
+          "content": "[image]",
+          "isError": false
+        }
+      ]
+    },
+    {
+      "id": "2ab3253a-2b48-4451-80e5-b8e2018d4e99",
+      "turnId": "2ab3253a-2b48-4451-80e5-b8e2018d4e99",
+      "messageId": "msg_fixture0002",
+      "ordinal": 3,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:45.210Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "a red pixel",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "2ab3253a-2b48-4451-80e5-b8e2018d4e99-i0",
+          "kind": "text",
+          "text": "a red pixel"
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "transcriptLineUuids": [
+        "659a5013-ea3d-405e-94e0-a88f7264a613",
+        "218b9b33-8212-4892-b4d5-d8d7896a896e",
+        "b30552fb-3770-47cc-958d-edbfca8a39dc",
+        "dacd0790-9319-43de-b2c5-0976dd16574a",
+        "d8c18209-77e2-4047-a061-3735040ffe95",
+        "a31e8735-8b9f-42b8-a4e8-3cb2ce9c6f55",
+        "491c0b5e-49fe-4836-b533-7a19cfd4b876",
+        "2ab3253a-2b48-4451-80e5-b8e2018d4e99"
+      ]
+    }
+  }
+}

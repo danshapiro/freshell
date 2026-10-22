@@ -364,3 +364,69 @@ fn the_snapshot_exposes_recent_transcript_line_uuids() {
     );
     assert!(!projection.transcript_line_uuids.is_empty());
 }
+
+/// Every captured scenario (each has a `snapshot.golden.json`).
+pub(crate) const REAL_CLI_SCENARIOS: [&str; 8] = [
+    "tools-sync",
+    "agent-async",
+    "agent-failed",
+    "compact-ok",
+    "compact-fail",
+    "compact-preserved-duplicate",
+    "api-error",
+    "image",
+];
+
+/// Compare against a checked-in golden. `FRESHELL_UPDATE_GOLDENS=1` rewrites
+/// the golden from the builder first (review the diff before committing).
+/// The goldens are the cross-language contract: the TS contract test parses
+/// them with the strict zod schema and the client renders them.
+fn assert_matches_golden(built: &Value, golden: &std::path::Path) {
+    if std::env::var_os("FRESHELL_UPDATE_GOLDENS").is_some() {
+        let text = serde_json::to_string_pretty(built).expect("serializes") + "\n";
+        std::fs::write(golden, text).expect("golden writes");
+    }
+    let text = std::fs::read_to_string(golden)
+        .unwrap_or_else(|e| panic!("missing golden {}: {e}", golden.display()));
+    let expected: Value = serde_json::from_str(&text).expect("golden parses");
+    assert_eq!(built, &expected, "golden mismatch: {}", golden.display());
+}
+
+#[test]
+fn real_cli_snapshots_match_their_goldens_for_freshclaude_and_kilroy() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/fresh-agent/claude/real-cli-2.1.237");
+    for scenario in REAL_CLI_SCENARIOS {
+        let dir = root.join(scenario);
+        let path = dir.join("session.jsonl");
+        let transcript = std::fs::read_to_string(&path).unwrap();
+        let thread = fixture_lines(&transcript)
+            .into_iter()
+            .find_map(|line| line["sessionId"].as_str().map(str::to_string))
+            .expect("the transcript names its session");
+        let build = |session_type: &str| {
+            let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
+            let projection = crate::claude_projection::ClaudeTranscriptProjector::project_with(
+                &thread,
+                &transcript,
+                &subagents,
+            );
+            build_claude_snapshot_from_projection(
+                session_type,
+                &thread,
+                projection,
+                1_792_656_000_000,
+                None,
+            )
+        };
+        let freshclaude = build("freshclaude");
+        assert_matches_golden(&freshclaude, &dir.join("snapshot.golden.json"));
+        let mut expected_kilroy = freshclaude.clone();
+        expected_kilroy["sessionType"] = json!("kilroy");
+        assert_eq!(
+            build("kilroy"),
+            expected_kilroy,
+            "{scenario}: kilroy projects identically"
+        );
+    }
+}

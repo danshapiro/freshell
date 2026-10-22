@@ -1,0 +1,334 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "262cbd4e-bd55-4b6a-8baf-14ca400336de",
+  "sessionId": "262cbd4e-bd55-4b6a-8baf-14ca400336de",
+  "revision": 1792656000000,
+  "latestTurnId": "61729e39-0d48-4552-99ee-2879e4cc1e76",
+  "status": "idle",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "diffs": false,
+    "undo": true,
+    "redo": true,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 5000,
+    "outputTokens": 30,
+    "cachedTokens": 10,
+    "totalTokens": 5040,
+    "contextTokens": 5040,
+    "compactPercent": 3
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "e8c1f5a9-a789-4e49-8cba-438bb6c1737b",
+      "turnId": "e8c1f5a9-a789-4e49-8cba-438bb6c1737b",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:08:35.478Z",
+      "summary": "hi there",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "e8c1f5a9-a789-4e49-8cba-438bb6c1737b-i0",
+          "kind": "text",
+          "text": "hi there"
+        }
+      ]
+    },
+    {
+      "id": "bb204d94-d334-45db-aca8-3d71a695359b",
+      "turnId": "bb204d94-d334-45db-aca8-3d71a695359b",
+      "messageId": "msg_fixture0009",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:08:35.528Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "reply 1",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "bb204d94-d334-45db-aca8-3d71a695359b-i0",
+          "kind": "text",
+          "text": "reply 1"
+        }
+      ]
+    },
+    {
+      "id": "88649262-8497-43dc-a526-8fc13e844587",
+      "turnId": "88649262-8497-43dc-a526-8fc13e844587",
+      "ordinal": 2,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:08:35.544Z",
+      "summary": "second msg",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "88649262-8497-43dc-a526-8fc13e844587-i0",
+          "kind": "text",
+          "text": "second msg"
+        }
+      ]
+    },
+    {
+      "id": "90373176-12f5-497c-ab31-01f9ea2ba674",
+      "turnId": "90373176-12f5-497c-ab31-01f9ea2ba674",
+      "messageId": "msg_fixture0010",
+      "ordinal": 3,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:08:35.559Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "reply 2",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "90373176-12f5-497c-ab31-01f9ea2ba674-i0",
+          "kind": "text",
+          "text": "reply 2"
+        }
+      ]
+    },
+    {
+      "id": "e201b5e9-8e9a-4d14-b7f6-0f72ace1d186",
+      "turnId": "e201b5e9-8e9a-4d14-b7f6-0f72ace1d186",
+      "ordinal": 4,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:08:35.572Z",
+      "summary": "third msg",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "e201b5e9-8e9a-4d14-b7f6-0f72ace1d186-i0",
+          "kind": "text",
+          "text": "third msg"
+        }
+      ]
+    },
+    {
+      "id": "d6669c29-95ec-4ebd-aa48-572a603fe587",
+      "turnId": "d6669c29-95ec-4ebd-aa48-572a603fe587",
+      "messageId": "msg_fixture0011",
+      "ordinal": 5,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:08:35.589Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "reply 3",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "d6669c29-95ec-4ebd-aa48-572a603fe587-i0",
+          "kind": "text",
+          "text": "reply 3"
+        }
+      ]
+    },
+    {
+      "id": "92b1ab0b-0e62-432c-81db-1682be652d79",
+      "turnId": "92b1ab0b-0e62-432c-81db-1682be652d79",
+      "ordinal": 6,
+      "source": "durable",
+      "role": "system",
+      "timestamp": "2026-10-22T09:08:35.656Z",
+      "summary": "Context compacted",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "92b1ab0b-0e62-432c-81db-1682be652d79-i0",
+          "kind": "context_compaction"
+        }
+      ]
+    },
+    {
+      "id": "07cae023-a138-42f8-8d9e-64ff7d42e2b4",
+      "turnId": "07cae023-a138-42f8-8d9e-64ff7d42e2b4",
+      "ordinal": 7,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:08:35.637Z",
+      "summary": "/compact",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "07cae023-a138-42f8-8d9e-64ff7d42e2b4-i0",
+          "kind": "text",
+          "text": "/compact"
+        }
+      ]
+    },
+    {
+      "id": "26f7e6ef-4bf2-4a1e-b640-39d66a24b171",
+      "turnId": "26f7e6ef-4bf2-4a1e-b640-39d66a24b171",
+      "ordinal": 8,
+      "source": "durable",
+      "role": "system",
+      "timestamp": "2026-10-22T09:08:35.759Z",
+      "summary": "Compacted",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "26f7e6ef-4bf2-4a1e-b640-39d66a24b171-i0",
+          "kind": "text",
+          "text": "Compacted"
+        }
+      ]
+    },
+    {
+      "id": "972c3ea3-b1bd-4263-a0b8-259b23860ac7",
+      "turnId": "972c3ea3-b1bd-4263-a0b8-259b23860ac7",
+      "ordinal": 9,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:08:35.669Z",
+      "summary": "after compact",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "972c3ea3-b1bd-4263-a0b8-259b23860ac7-i0",
+          "kind": "text",
+          "text": "after compact"
+        }
+      ]
+    },
+    {
+      "id": "aba1afcb-44a9-43c4-a69a-abd4286fad59",
+      "turnId": "aba1afcb-44a9-43c4-a69a-abd4286fad59",
+      "messageId": "msg_fixture0013",
+      "ordinal": 10,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:08:35.680Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "reply 5",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "aba1afcb-44a9-43c4-a69a-abd4286fad59-i0",
+          "kind": "text",
+          "text": "reply 5"
+        }
+      ]
+    },
+    {
+      "id": "a072372f-4f55-4e0e-90c0-66db12ba92c7",
+      "turnId": "a072372f-4f55-4e0e-90c0-66db12ba92c7",
+      "ordinal": 11,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:08:35.683Z",
+      "summary": "/usage",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "a072372f-4f55-4e0e-90c0-66db12ba92c7-i0",
+          "kind": "text",
+          "text": "/usage"
+        }
+      ]
+    },
+    {
+      "id": "fab1fa46-0343-4743-a581-97c5f02388dc",
+      "turnId": "fab1fa46-0343-4743-a581-97c5f02388dc",
+      "ordinal": 12,
+      "source": "durable",
+      "role": "system",
+      "timestamp": "2026-10-22T09:08:35.684Z",
+      "summary": "Total cost:            $0.0773\nTotal duration (API):  0s\nTotal duration (wall): 0s\nTotal code changes:    0 lines added, 0 lines removed\nUsa",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "fab1fa46-0343-4743-a581-97c5f02388dc-i0",
+          "kind": "text",
+          "text": "Total cost:            $0.0773\nTotal duration (API):  0s\nTotal duration (wall): 0s\nTotal code changes:    0 lines added, 0 lines removed\nUsage by model:\n   claude-sonnet-4-5:  25.0k input, 150 output, 35 cache read, 15 cache write ($0.0773)"
+        }
+      ]
+    },
+    {
+      "id": "7123e7ca-a891-4ab1-9ae5-7fb192ec1c33",
+      "turnId": "7123e7ca-a891-4ab1-9ae5-7fb192ec1c33",
+      "ordinal": 13,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:08:35.687Z",
+      "summary": "/context",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "7123e7ca-a891-4ab1-9ae5-7fb192ec1c33-i0",
+          "kind": "text",
+          "text": "/context"
+        }
+      ]
+    },
+    {
+      "id": "61729e39-0d48-4552-99ee-2879e4cc1e76",
+      "turnId": "61729e39-0d48-4552-99ee-2879e4cc1e76",
+      "ordinal": 14,
+      "source": "durable",
+      "role": "system",
+      "timestamp": "2026-10-22T09:08:35.705Z",
+      "summary": "## Context Usage\n\n**Model:** claude-sonnet-4-5-20250929  \n**Tokens:** 5k / 200k (3%)\n\n### Estimated usage by category\n\n| Category | Tokens |",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "61729e39-0d48-4552-99ee-2879e4cc1e76-i0",
+          "kind": "text",
+          "text": "## Context Usage\n\n**Model:** claude-sonnet-4-5-20250929  \n**Tokens:** 5k / 200k (3%)\n\n### Estimated usage by category\n\n| Category | Tokens | Percentage |\n|----------|--------|------------|\n| Skills | 1.1k | 0.6% |\n| Messages | 4.1k | 2.0% |\n| Free space | 194.8k | 97.4% |\n\n### Skills\n\n| Skill | Source | Tokens |\n|-------|--------|--------|\n| dataviz | Built-in | ~290 |\n| update-config | Built-in | ~180 |\n| keybindings-help | Built-in | ~60 |\n| simplify | Built-in | ~50 |\n| fewer-permission-prompts | Built-in | ~50 |\n| loop | Built-in | ~80 |\n| claude-api | Built-in | ~270 |\n| run | Built-in | ~90 |\n| init | Built-in | < 20 |\n| security-review | Built-in | ~20 |"
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "transcriptLineUuids": [
+        "e8c1f5a9-a789-4e49-8cba-438bb6c1737b",
+        "758e4a09-6377-4615-a8a4-edbc2c7b500b",
+        "c8899cfb-4333-4bea-8da3-f0672f91bf96",
+        "aa498c23-cc90-4b96-80c8-a32758acadb8",
+        "bb204d94-d334-45db-aca8-3d71a695359b",
+        "88649262-8497-43dc-a526-8fc13e844587",
+        "c8dbc3c1-96c9-481f-b04e-dad7efd2c11a",
+        "90373176-12f5-497c-ab31-01f9ea2ba674",
+        "e201b5e9-8e9a-4d14-b7f6-0f72ace1d186",
+        "911ea2f6-00f7-4835-81a0-04c8cf3da4ee",
+        "d6669c29-95ec-4ebd-aa48-572a603fe587",
+        "92b1ab0b-0e62-432c-81db-1682be652d79",
+        "cf3d5262-2b96-4711-9463-a7047cef48ec",
+        "ae4c044e-5972-40ca-ac04-0c8b83bc222c",
+        "07cae023-a138-42f8-8d9e-64ff7d42e2b4",
+        "26f7e6ef-4bf2-4a1e-b640-39d66a24b171",
+        "42733a24-7419-4980-ae65-104ad0cf8902",
+        "972c3ea3-b1bd-4263-a0b8-259b23860ac7",
+        "4740e2fd-ab50-47ef-bb11-883f1fe78785",
+        "aba1afcb-44a9-43c4-a69a-abd4286fad59",
+        "9749ef6c-0bbc-497f-a758-e6c598d06f5d",
+        "a072372f-4f55-4e0e-90c0-66db12ba92c7",
+        "fab1fa46-0343-4743-a581-97c5f02388dc",
+        "3888a801-1df6-4035-98da-46bf6d1caeb0",
+        "7123e7ca-a891-4ab1-9ae5-7fb192ec1c33",
+        "61729e39-0d48-4552-99ee-2879e4cc1e76"
+      ]
+    }
+  }
+}
