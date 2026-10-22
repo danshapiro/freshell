@@ -4416,8 +4416,10 @@ impl FreshClaudeState {
         // the fence when the coordinator is wired; ordinary legacy sends keep
         // their existing unfenced behavior, while any supplied fence is honored.
         // The fence keys on the record that owns the session (its durable id
-        // once reported), never on a new pane's placeholder wire id.
-        let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
+        // once reported), never on a new pane's placeholder wire id. A lane
+        // without a coordinator (the session host's) has nothing to fence.
+        let fenced = msg.checkpoint_intent.is_some() || send_fence.is_some();
+        let ownership_guard = if fenced && self.ownership.is_some() {
             match self.fence_owner_key(&map_key, &session_id).await {
                 Some(owner_key) => match crate::ownership_lane::arm_reclaimless_op_guard(
                     &self.ownership,
@@ -11800,6 +11802,83 @@ rl.on('line', (line) => {
                 .busy(),
             "a refused stale prompt leaves the turn tracker idle"
         );
+    }
+
+    /// The checkpointed send a new pane makes before the CLI reported its
+    /// session: the browser's send shape (a checkpoint intent, no owner pair),
+    /// addressed by the lane's placeholder id.
+    fn checkpointed_send_before_session_report(session_id: &str) -> FreshAgentSend {
+        let mut send = send_msg(session_id, "first prompt of a new pane");
+        send.request_id = Some(format!("send-{session_id}"));
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: format!("attempt-{session_id}"),
+            workspace: None,
+        });
+        send
+    }
+
+    /// The events named `freshagent.claude.send_before_session_report` that
+    /// the capture recorded.
+    fn send_before_session_report_events(
+        events: &std::sync::Mutex<Vec<(String, std::collections::BTreeMap<String, String>)>>,
+    ) -> usize {
+        events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(_message, fields)| {
+                fields.get("event").is_some_and(|event| {
+                    event.contains("freshagent.claude.send_before_session_report")
+                })
+            })
+            .count()
+    }
+
+    /// With an ownership coordinator wired, a checkpointed send to a session the
+    /// CLI has not reported yet (and the coordinator holds no record for) runs
+    /// unfenced, and says so in `freshagent.claude.send_before_session_report`.
+    #[tokio::test]
+    async fn a_send_before_the_session_report_logs_that_it_ran_unfenced() {
+        let (events, _capture_guard) = info_capture_for_test::capture();
+        let (mut st, mut rx) = state_with_bus();
+        st.set_ownership(Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new()));
+        let session_id = "claude-placeholder-wired";
+        insert_fake_claude_session(&st, session_id).await;
+
+        st.handle_send(checkpointed_send_before_session_report(session_id))
+            .await;
+
+        let frames = drain(&mut rx).await;
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.send.accepted"),
+            "the send runs: {frames:?}"
+        );
+        assert_eq!(send_before_session_report_events(&events), 1);
+    }
+
+    /// Without an ownership coordinator (the session host's lane) there is no
+    /// fence to skip: the send runs as before and the before-report event,
+    /// which says the coordinator holds no record, is not logged.
+    #[tokio::test]
+    async fn a_send_on_a_lane_without_a_coordinator_does_not_log_a_skipped_fence() {
+        let (events, _capture_guard) = info_capture_for_test::capture();
+        let (st, mut rx) = state_with_bus();
+        let session_id = "claude-placeholder-unwired";
+        insert_fake_claude_session(&st, session_id).await;
+
+        st.handle_send(checkpointed_send_before_session_report(session_id))
+            .await;
+
+        let frames = drain(&mut rx).await;
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["type"] == "freshAgent.send.accepted"),
+            "the send runs: {frames:?}"
+        );
+        assert_eq!(send_before_session_report_events(&events), 0);
     }
 
     /// kata z7j7 (claude scope honesty): a settings-bearing send whose payload
