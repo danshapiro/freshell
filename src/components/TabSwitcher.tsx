@@ -1,6 +1,10 @@
 import { Plus, X } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, setActiveTab } from '@/store/tabsSlice'
+import { addTab } from '@/store/tabsSlice'
+import { activateTabFromSurface } from '@/store/turnCompletionAttention'
+import { selectAttentionTabIds, selectTabAttentionStyle } from '@/store/selectors/tabAttentionSelectors'
+import { NEEDS_ATTENTION_LABEL, tabAttentionClassName } from '@/lib/tab-attention'
+import { cn } from '@/lib/utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { useCallback, useMemo } from 'react'
@@ -56,6 +60,8 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
     (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
   )
   const extensions = useAppSelector((s) => s.extensions?.entries)
+  const attentionTabIds = useAppSelector(selectAttentionTabIds)
+  const tabAttentionStyle = useAppSelector(selectTabAttentionStyle)
 
   const getDisplayTitle = useCallback(
     (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], paneTitles?.[tab.id], extensions),
@@ -65,7 +71,9 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
   const handleCardClick = useCallback(
     (tabId: string) => {
       triggerHapticFeedback()
-      dispatch(setActiveTab(tabId))
+      // Same visit rule as the desktop tab strip: in click mode the tap
+      // dismisses the card's attention, even on the already-active card.
+      dispatch(activateTabFromSurface(tabId))
       onClose()
     },
     [dispatch, onClose]
@@ -114,21 +122,41 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
               paneRuntimeActivityByPaneId,
               freshAgentSessions,
             }).length > 0
+            const needsAttention = attentionTabIds.includes(tab.id)
+            const attentionClassName = tabAttentionClassName({
+              needsAttention,
+              style: tabAttentionStyle,
+              active: isActive,
+              surface: 'card',
+            })
+            const baseLabel = tabStatusLabel ? `Switch to ${title} (${tabStatusLabel})` : `Switch to ${title}`
             return (
               <button
                 key={tab.id}
-                className={`flex flex-col items-start gap-1 rounded-lg border p-3 text-left transition-colors ${
-                  isActive
-                    ? 'ring-2 ring-primary border-primary bg-primary/5'
-                    : 'border-border bg-card hover:bg-accent/50'
-                }`}
+                className={cn(
+                  'flex flex-col items-start gap-1 rounded-lg border p-3 text-left transition-colors',
+                  isActive && 'ring-2 ring-primary',
+                  attentionClassName
+                    || (isActive ? 'border-primary bg-primary/5' : 'border-border bg-card hover:bg-accent/50'),
+                )}
                 onClick={() => handleCardClick(tab.id)}
-                aria-label={tabStatusLabel ? `Switch to ${title} (${tabStatusLabel})` : `Switch to ${title}`}
+                aria-label={needsAttention ? `${baseLabel}, needs attention` : baseLabel}
               >
                 <div className="flex w-full items-start justify-between gap-2">
                   <span className="text-sm font-medium truncate flex-1">
                     {title}
                   </span>
+                  {needsAttention && (
+                    <span
+                      className={cn(
+                        'inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+                        tabAttentionClassName({ needsAttention, style: tabAttentionStyle, surface: 'badge' }),
+                      )}
+                      data-testid={`tab-switcher-attention-badge-${tab.id}`}
+                    >
+                      {NEEDS_ATTENTION_LABEL}
+                    </span>
+                  )}
                   {isBusy && (
                     <span
                       className="inline-flex shrink-0 items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-600 dark:text-blue-400"

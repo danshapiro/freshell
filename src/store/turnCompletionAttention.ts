@@ -11,6 +11,7 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveFreshAgentSessionKey } from '@/lib/pane-activity'
 import { clearPaneAttention, clearTabAttention } from './turnCompletionSlice'
+import { setActiveTab } from './tabsSlice'
 import type { AppDispatch, RootState } from './store'
 
 /**
@@ -71,6 +72,22 @@ export function dismissTabGreen(tabId: string) {
         dispatch(clearPaneAttention({ paneId: entry.paneId }))
       }
     }
+  }
+}
+
+/**
+ * Activate a tab from any tab surface (desktop tab strip, mobile tab
+ * switcher, Stream Deck): in 'click' dismiss mode the visit dismisses the
+ * tab's green and all its panes' green FIRST — including a tap on the tab
+ * that is already active — then the tab is activated. The single owner of
+ * this "dismiss then activate" rule for every surface.
+ */
+export function activateTabFromSurface(tabId: string) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    if (getState().settings?.settings?.panes?.attentionDismiss === 'click') {
+      dispatch(dismissTabGreen(tabId))
+    }
+    dispatch(setActiveTab(tabId))
   }
 }
 
