@@ -20,9 +20,14 @@
  * (`freshAgent.event{event:{type:'freshAgent.turn.complete'|'freshAgent.turn.waiting', at}}`)
  * through the harness's WS receive path, which runs the production fold
  * (fresh-agent-ws → applyFreshAgentCompletion/applyFreshAgentWaiting →
- * receipt-time watched classification). The server's edge emission itself is
- * pinned by fresh-agent-error-turn-attention.spec.ts; injecting here keeps
- * this spec independent of the fake sidecar's turn lanes.
+ * receipt-time watched classification). Injecting keeps this spec independent
+ * of the fake sidecar's turn lanes, so it does NOT cover the server emitting
+ * those edges. That is fresh-agent-error-turn-attention.spec.ts's job, but
+ * that spec (like every fake-sidecar spec that drives a composer send) was
+ * red on origin/main when this one was written: the send never reached the
+ * fake sidecar. Until that send lane is fixed, nothing green covers
+ * "server edge → mobile mark" end to end; once it is, switch this spec to a
+ * real delayed turn as the plan (C6) describes.
  *
  * CLOUD-LEGALITY: no timing dependencies; every wait is a poll on observed
  * state. This spec must NOT be added to CLOUD_SKIP_SPECS.

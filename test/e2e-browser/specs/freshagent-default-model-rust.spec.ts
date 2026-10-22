@@ -306,6 +306,13 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
     // record (only the resume, reopen and materialize paths write one), so the row
     // would otherwise reopen in a Claude CLI terminal. Record it through the
     // same route the client's resume path writes.
+    // KNOWN PRODUCT GAP, not a test convenience: a user who starts a
+    // Freshclaude/Kilroy conversation in a new pane, closes it and clicks its
+    // sidebar row gets a Claude CLI terminal today. This step writes the tag
+    // the product should have written, so the spec covers the resume path
+    // from the row onward, not that first hop. When new claude panes record
+    // their flavour on adopting their durable id, delete this step so the
+    // spec covers the whole journey.
     await tagSessionFlavour(info, durableId, flavour)
 
     const sidebarRow = page.locator(`[data-context="sidebar-session"][data-session-id="${durableId}"]`)
