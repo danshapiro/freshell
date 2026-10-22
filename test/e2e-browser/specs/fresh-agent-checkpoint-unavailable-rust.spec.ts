@@ -290,10 +290,14 @@ test.describe('fresh-agent checkpoint availability', () => {
       await expect(reloadedUserTurn.getByRole('button', { name: 'Rewind unavailable for this message' }))
         .toBeDisabled()
 
-      // Provider ground truth: the turn the unavailable checkpoint belongs to
-      // really ran. The fake app-server records every turn/start under the
+      // Provider ground truth: the send behind the unavailable checkpoint
+      // really reached the provider as that checkpoint's turn. The fake
+      // app-server records each turn/start (with its user text) under the
       // spawned server's isolated CODEX_HOME (RustServer pins it to
-      // <homeDir>/.codex), so read it there.
+      // <homeDir>/.codex), so read it there. The record is written at
+      // turn/start and never updated, so it proves delivery, not completion;
+      // completion is proven above by the 'Fixture turn' reply and the pane
+      // settling back to idle.
       const threadId = content.sessionRef?.sessionId ?? content.sessionId
       expect(threadId).toBeTruthy()
       const unavailableOutcome = content.checkpointOutcomes.find((entry: any) => entry.status === 'unavailable'
@@ -304,16 +308,12 @@ test.describe('fresh-agent checkpoint availability', () => {
         const raw = await fs.readFile(recordedTurnsPath, 'utf8').catch(() => '[]')
         const turns = JSON.parse(raw) as Array<{
           id?: string
-          status?: string
           items?: Array<{ type?: string; content?: Array<{ text?: string }> }>
         }>
         const turn = turns.find((candidate) => candidate.id === unavailableOutcome.nativeTurnId)
-        return {
-          status: turn?.status,
-          carriesMarker: turn?.items?.some((item) => item.type === 'userMessage'
-            && item.content?.some((part) => part.text === marker)) ?? false,
-        }
-      }, { timeout: 20_000 }).toEqual({ status: 'completed', carriesMarker: true })
+        return turn?.items?.some((item) => item.type === 'userMessage'
+          && item.content?.some((part) => part.text === marker)) ?? false
+      }, { timeout: 20_000 }).toBe(true)
     } finally {
       await context?.close().catch(() => {})
       await server?.stop().catch(() => {})
