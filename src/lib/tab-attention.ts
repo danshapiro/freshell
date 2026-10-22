@@ -2,7 +2,8 @@
  * The needs-attention look of every tab surface, in one place: the single
  * owner of the emerald (highlight/pulse), darken and pulse class tokens used
  * by the desktop tab (TabItem), the mobile title pill (MobileTabStrip), the
- * tab-switcher card (TabSwitcher) and the attention indicator dot.
+ * tab-switcher card and its "Needs attention" badge (TabSwitcher), and the
+ * attention indicator dot.
  *
  * Returns '' when the surface shows no mark (no attention, or the user's
  * `tabAttentionStyle` is 'none'); the caller then keeps its normal styling.
@@ -10,7 +11,7 @@
 import { cn } from '@/lib/utils'
 import type { TabAttentionStyle } from '@/store/types'
 
-export type TabAttentionSurface = 'tab' | 'card' | 'pill' | 'indicator'
+export type TabAttentionSurface = 'tab' | 'card' | 'pill' | 'badge' | 'indicator'
 
 export function tabAttentionClassName({
   needsAttention,
@@ -58,6 +59,10 @@ export function tabAttentionClassName({
           : 'bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-100',
         pulse,
       )
+    case 'badge':
+      return darken
+        ? 'bg-foreground/15 text-foreground'
+        : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
     case 'indicator':
       return cn(darken ? 'bg-foreground/60' : 'bg-emerald-500', pulse)
   }

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import turnCompletionReducer, { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
-import { dismissTabGreen, revokeFreshAgentAttention, selectPaneBySessionKey } from '@/store/turnCompletionAttention'
+import { activateTabFromSurface, dismissTabGreen, revokeFreshAgentAttention, selectPaneBySessionKey } from '@/store/turnCompletionAttention'
 import type { RootState } from '@/store/store'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -45,6 +45,62 @@ describe('dismissTabGreen', () => {
     store.dispatch(dismissTabGreen('T') as never)
     // unrelated pane attention untouched (tab had no flag -> early return)
     expect(store.getState().turnCompletion.attentionByPane['pane-9']).toBe(true)
+  })
+})
+
+describe('activateTabFromSurface', () => {
+  const layoutFor = (tabId: string): PaneNode => ({
+    type: 'leaf',
+    id: `pane-${tabId}`,
+    content: { kind: 'terminal', createRequestId: `c-${tabId}`, status: 'running', mode: 'shell' },
+  })
+
+  function makeStore(attentionDismiss: 'click' | 'type') {
+    const tabsState = { tabs: [{ id: 'A' }, { id: 'B' }], activeTabId: 'A' }
+    return configureStore({
+      reducer: {
+        panes: () => ({ layouts: { A: layoutFor('A'), B: layoutFor('B') }, activePane: {} } as never),
+        settings: () => ({ settings: { panes: { attentionDismiss } } } as never),
+        tabs: (state = tabsState, action: { type: string; payload?: unknown }) => (
+          action.type === 'tabs/setActiveTab' ? { ...state, activeTabId: action.payload as string } : state
+        ),
+        turnCompletion: turnCompletionReducer,
+      },
+    })
+  }
+
+  it('in click mode dismisses the tab and its panes, then activates it', () => {
+    const store = makeStore('click')
+    store.dispatch(markTabAttention({ tabId: 'B' }))
+    store.dispatch(markPaneAttention({ paneId: 'pane-B' }))
+
+    store.dispatch(activateTabFromSurface('B') as never)
+
+    expect(store.getState().tabs.activeTabId).toBe('B')
+    expect(store.getState().turnCompletion.attentionByTab['B']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByPane['pane-B']).toBeUndefined()
+  })
+
+  it('in click mode dismisses an already-active tab', () => {
+    const store = makeStore('click')
+    store.dispatch(markTabAttention({ tabId: 'A' }))
+
+    store.dispatch(activateTabFromSurface('A') as never)
+
+    expect(store.getState().tabs.activeTabId).toBe('A')
+    expect(store.getState().turnCompletion.attentionByTab['A']).toBeUndefined()
+  })
+
+  it('in type mode only activates the tab', () => {
+    const store = makeStore('type')
+    store.dispatch(markTabAttention({ tabId: 'B' }))
+    store.dispatch(markPaneAttention({ paneId: 'pane-B' }))
+
+    store.dispatch(activateTabFromSurface('B') as never)
+
+    expect(store.getState().tabs.activeTabId).toBe('B')
+    expect(store.getState().turnCompletion.attentionByTab['B']).toBe(true)
+    expect(store.getState().turnCompletion.attentionByPane['pane-B']).toBe(true)
   })
 })
 

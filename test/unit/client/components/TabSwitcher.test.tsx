@@ -62,6 +62,11 @@ function createStore(
     opencodeActivity?: Partial<OpencodeActivityState>
     includeCodexActivity?: boolean
     includeOpencodeActivity?: boolean
+    attentionByTab?: Record<string, boolean>
+    attentionByPane?: Record<string, boolean>
+    watchedCompletionByTab?: Record<string, boolean>
+    tabAttentionStyle?: 'highlight' | 'pulse' | 'darken' | 'none'
+    attentionDismiss?: 'click' | 'type'
   },
 ) {
   const layouts: Record<string, PaneNode> = {}
@@ -117,8 +122,24 @@ function createStore(
       availableClis: {},
     },
     settings: {
-      settings: defaultSettings,
+      settings: {
+        ...defaultSettings,
+        panes: {
+          ...defaultSettings.panes,
+          ...(opts?.tabAttentionStyle ? { tabAttentionStyle: opts.tabAttentionStyle } : {}),
+          ...(opts?.attentionDismiss ? { attentionDismiss: opts.attentionDismiss } : {}),
+        },
+      },
       loaded: true,
+    },
+    turnCompletion: {
+      seq: 0,
+      lastAtByTerminalId: {},
+      lastIdleAtByTerminalId: {},
+      pendingEvents: [],
+      attentionByTab: opts?.attentionByTab ?? {},
+      attentionByPane: opts?.attentionByPane ?? {},
+      watchedCompletionByTab: opts?.watchedCompletionByTab ?? {},
     },
   }
   if (includeCodexActivity) {
@@ -513,5 +534,99 @@ describe('TabSwitcher', () => {
     } finally {
       warnSpy.mockRestore()
     }
+  })
+
+  describe('needs-attention marks (G17)', () => {
+    function threeTabs() {
+      return [
+        createTab('tab-1', 'Shell'),
+        createTab('tab-2', 'Claude'),
+        createTab('tab-3', 'Codex'),
+      ]
+    }
+
+    async function renderSwitcher(store: ReturnType<typeof createStore>, onClose = vi.fn()) {
+      const { TabSwitcher } = await import('@/components/TabSwitcher')
+      render(
+        <Provider store={store}>
+          <TabSwitcher onClose={onClose} />
+        </Provider>
+      )
+      return onClose
+    }
+
+    it('badges a card that needs attention and names it in the card label', async () => {
+      await renderSwitcher(createStore(threeTabs(), 'tab-1', { attentionByTab: { 'tab-2': true } }))
+
+      const card = screen.getByRole('button', { name: /^Switch to Claude.*, needs attention$/ })
+      expect(card).toHaveTextContent('Needs attention')
+      expect(card).toHaveClass('bg-emerald-100')
+      const plainCard = screen.getByRole('button', { name: /^Switch to Codex/ })
+      expect(plainCard).not.toHaveTextContent('Needs attention')
+      expect(plainCard.getAttribute('aria-label')).not.toMatch(/needs attention/)
+    })
+
+    it('marks a card with only a watched-completion mark', async () => {
+      await renderSwitcher(createStore(threeTabs(), 'tab-1', { watchedCompletionByTab: { 'tab-1': true } }))
+
+      expect(screen.getByRole('button', { name: /^Switch to Shell.*, needs attention$/ })).toBeInTheDocument()
+    })
+
+    it('in click mode, tapping the active card dismisses its attention and its panes\' marks', async () => {
+      const store = createStore(threeTabs(), 'tab-1', {
+        attentionDismiss: 'click',
+        attentionByTab: { 'tab-1': true },
+        attentionByPane: { 'pane-tab-1': true },
+      })
+      const onClose = await renderSwitcher(store)
+
+      fireEvent.click(screen.getByRole('button', { name: /^Switch to Shell.*, needs attention$/ }))
+
+      expect(onClose).toHaveBeenCalled()
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-tab-1']).toBeUndefined()
+    })
+
+    it('in type mode, tapping the active card keeps its attention', async () => {
+      const store = createStore(threeTabs(), 'tab-1', {
+        attentionDismiss: 'type',
+        attentionByTab: { 'tab-1': true },
+        attentionByPane: { 'pane-tab-1': true },
+      })
+      await renderSwitcher(store)
+
+      fireEvent.click(screen.getByRole('button', { name: /^Switch to Shell.*, needs attention$/ }))
+
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-tab-1']).toBe(true)
+    })
+
+    it('in click mode, tapping an inactive card with attention activates it and clears it', async () => {
+      const store = createStore(threeTabs(), 'tab-1', {
+        attentionDismiss: 'click',
+        attentionByTab: { 'tab-3': true },
+        attentionByPane: { 'pane-tab-3': true },
+      })
+      await renderSwitcher(store)
+
+      fireEvent.click(screen.getByRole('button', { name: /^Switch to Codex.*, needs attention$/ }))
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-3')
+      expect(store.getState().turnCompletion.attentionByTab['tab-3']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-tab-3']).toBeUndefined()
+    })
+
+    it('shows no mark when the attention style is none', async () => {
+      await renderSwitcher(createStore(threeTabs(), 'tab-1', {
+        tabAttentionStyle: 'none',
+        attentionByTab: { 'tab-2': true },
+      }))
+
+      const card = screen.getByRole('button', { name: /^Switch to Claude/ })
+      expect(card.getAttribute('aria-label')).not.toMatch(/needs attention/)
+      expect(card).not.toHaveTextContent('Needs attention')
+      expect(card).not.toHaveClass('bg-emerald-100')
+    })
   })
 })
