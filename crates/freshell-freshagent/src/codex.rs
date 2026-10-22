@@ -110,7 +110,8 @@ fn codex_home_from_env() -> Option<String> {
 /// alone is unsafe: rollouts embed foreign uuids as fork/resume lineage).
 /// Bounded recursive walk (`sessions/YYYY/MM/DD/rollout-*.jsonl`, flat in
 /// tests). `None` when no rollout is verified — the pending name stays
-/// pending (InitialRecovery semantics) and the tick retries.
+/// pending (InitialRecovery semantics) until the next turn-completed edge
+/// retries (no periodic tick retries a freshcodex bind).
 fn locate_thread_rollout(
     sessions_root: &std::path::Path,
     thread_id: &str,
@@ -433,8 +434,9 @@ pub struct FreshCodexState {
     /// admitted at create. A `thread/start` id/path is PROSPECTIVE (the
     /// rollout hasn't materialized), so the handle stays pending and the
     /// record only retains the acquired location; the durability-driven bind
-    /// (turn-completed edge / the main.rs naming tick) transfers it exactly
-    /// once the rollout exists.
+    /// (a turn-completed edge, or a resume create whose rollout already
+    /// exists) transfers it exactly once the rollout exists. The main.rs
+    /// naming tick binds Claude terminal rows only, never these handles.
     naming_handles: Arc<TokioMutex<HashMap<String, String>>>,
     /// kata b8ke Task 5: the deterministic-race pause seam for the snapshot
     /// GET (Task 7's race tests inject here). An AWAITED barrier —
@@ -1503,8 +1505,10 @@ impl FreshCodexState {
     /// freshcodex thread is verified ONLY once its rollout exists under the
     /// initialized `codexHome` sessions tree (the first line a
     /// `session_meta` naming the thread — the same proof
-    /// `freshell-codex`'s rollout locator applies). Called at the
-    /// turn-completed edge and by the main.rs naming tick; idempotent (the
+    /// `freshell-codex`'s rollout locator applies). Called at every
+    /// turn-completed edge and at a resume create (claim); never by the
+    /// main.rs naming tick, which binds Claude terminal rows only. So a
+    /// miss is retried only by a LATER turn completing. Idempotent (the
     /// store answers the already-bound handle with a Read, and the stash is
     /// consumed on success). `codex_home` comes from the app-server's own
     /// initialize result when known.
@@ -1519,7 +1523,7 @@ impl FreshCodexState {
             .or_else(codex_home_from_env)?;
         let sessions_root = std::path::Path::new(&home).join("sessions");
         let Some(rollout) = locate_thread_rollout(&sessions_root, thread_id) else {
-            return None; // still prospective: the tick retries the transition visibly
+            return None; // still prospective: the next turn-completed edge retries
         };
         let target = freshell_protocol::session_names::SessionNameRef::Session {
             provider: freshell_protocol::session_names::NamedProvider::Codex,
@@ -3126,8 +3130,8 @@ impl FreshCodexState {
         };
         // A resumed thread's rollout already exists — bind the just-admitted
         // handle immediately (verified persistence); a fresh thread's rollout
-        // has not materialized, so this is a no-op until the turn-completed
-        // edge / the main.rs naming tick observes it. The declared
+        // has not materialized, so this is a no-op and the turn-completed
+        // edge binds it (the main.rs naming tick never does). The declared
         // transition is consumed as provenance (T2-M5 truthful trim: the
         // identity-event upsert below deliberately carries `None` — the
         // durable-before-answer ledger write precedes the rollout-driven
