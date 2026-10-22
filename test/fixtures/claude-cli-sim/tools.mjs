@@ -79,6 +79,13 @@ function applyPermissionUpdates(cli, updates) {
 /** A tool call: its streamed tool_use block, permission, execution and result. */
 export async function toolCall(cli, turn, step) {
   const data = step.data ?? {}
+  // An `approval` is a tool call the CLI asks canUseTool for. Under
+  // bypassPermissions the pinned CLI asks for none (needsPermission), so a
+  // program that scripts one there would pin a behavior the real CLI does not
+  // have: fail the stream loudly instead.
+  if (step.kind === 'approval' && cli.permissionMode === 'bypassPermissions') {
+    throw new Error('a program `approval` step ran under bypassPermissions, where the pinned CLI never asks canUseTool for a tool call; run the session in another permission mode, or script a `question` step (AskUserQuestion asks in every mode)')
+  }
   // The model names its tool calls; a program may choose the id.
   const toolUseId = data.id ?? `toolu_sim_${++cli.toolSeq}`
   let name

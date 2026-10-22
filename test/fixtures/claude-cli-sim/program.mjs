@@ -17,7 +17,9 @@
 //   text / activity  { text?, chunks?, delayMs? }   one streamed assistant text block
 //   tool             { name, input, id?, seconds?, output?, isError? }   a tool call and its result
 //   approval         { tool, input, id?, suggestions?, blockedPath?, decisionReason? }
-//                    a tool call that always asks canUseTool, with these fields
+//                    a tool call that asks canUseTool, with these fields; under
+//                    bypassPermissions (where the pinned CLI asks for no tool
+//                    call) it fails the stream as a simulator failure
 //   question         { questions | input, id? }     AskUserQuestion through canUseTool
 //                                                   (`input`: the whole tool input)
 //   exit_plan        { plan? }                      ExitPlanMode through canUseTool

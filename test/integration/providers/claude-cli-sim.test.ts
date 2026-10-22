@@ -128,10 +128,11 @@ describe('Claude CLI simulator programs', () => {
     expect(results(s.messages)[0]).toMatchObject({ subtype: 'success', is_error: false, terminal_reason: 'completed' })
   })
 
-  it('an approval asks canUseTool even in bypass mode, forwarding suggestions, blockedPath and decisionReason; a denial is recorded on the result', async () => {
+  it('an approval asks canUseTool, forwarding suggestions, blockedPath and decisionReason; a denial is recorded on the result', async () => {
     const suggestions = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test' }], behavior: 'allow', destination: 'session' }]
     const seen: any[] = []
     const s = await open({
+      permissionMode: 'default',
       canUseTool: async (_toolName: string, _input: any, options: any) => {
         seen.push(options)
         return { behavior: 'deny', message: 'no thanks' }
@@ -143,6 +144,26 @@ describe('Claude CLI simulator programs', () => {
     const toolResult = s.messages.find((m) => m.type === 'user' && m.message?.content?.[0]?.type === 'tool_result')
     expect(toolResult.message.content[0]).toMatchObject({ is_error: true, content: 'no thanks' })
     expect(results(s.messages)[0].permission_denials).toEqual([expect.objectContaining({ tool_name: 'Bash', tool_input: { command: 'npm test' } })])
+  })
+
+  // The pinned CLI never asks canUseTool for a tool call under
+  // bypassPermissions (only AskUserQuestion asks in every mode), so an
+  // `approval` step there would pin a behavior the real CLI does not have.
+  // It fails the stream loudly instead of asking.
+  it('an approval step under bypassPermissions fails loudly instead of asking', async () => {
+    const asked: string[] = []
+    const s = await open({
+      permissionMode: 'bypassPermissions',
+      canUseTool: async (toolName: string) => {
+        asked.push(toolName)
+        return { behavior: 'allow' }
+      },
+    }, program([{ on: 'msg:prompt', emit: [{ kind: 'approval', data: { tool: 'Bash', input: { command: 'npm test' } } }] }]))
+    s.prompt.push('run the tests')
+    await s.until(() => s.ended !== null)
+    expect(s.ended?.error).toMatch(/^Claude CLI simulator failure: .*bypassPermissions/)
+    expect(asked).toEqual([])
+    expect(results(s.messages)).toEqual([])
   })
 
   it('a completion rule ends the turn with the scripted subtype; a `once` rule then falls back to the prompt markers', async () => {
@@ -272,6 +293,7 @@ describe('Claude CLI simulator programs', () => {
   it('a program chooses the tool_use id the model gives a tool call and the whole input of an AskUserQuestion call', async () => {
     const seen: any[] = []
     const s = await open({
+      permissionMode: 'default',
       canUseTool: async (toolName: string, toolInput: any, options: any) => {
         seen.push({ toolName, toolInput, toolUseID: options.toolUseID })
         return toolName === 'AskUserQuestion'
