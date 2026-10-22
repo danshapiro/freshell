@@ -190,6 +190,18 @@ describe('Claude CLI simulator programs', () => {
     expect(exited.ended).toEqual({ error: 'Claude Code process exited with code 3' })
   })
 
+  it('a CLI that exits with code 0 mid-turn ends the stream cleanly, with no error and no result', async () => {
+    // The SDK reports no error for exit code 0 (sdk.mjs getProcessExitError),
+    // so its message iterator simply ends: the natural end of stream that the
+    // sidecar must treat as a session end (G23).
+    const s = await open({}, program([{ on: 'msg:prompt', emit: [{ kind: 'text', data: { text: 'partial' } }, { kind: 'crash', data: { code: 0 } }] }]))
+    s.prompt.push('go')
+    await s.until(() => s.ended !== null)
+    expect(s.ended).toEqual({})
+    expect(s.messages.some((m) => m.type === 'assistant')).toBe(true)
+    expect(results(s.messages)).toEqual([])
+  })
+
   it('a hang rule keeps the turn open until an interrupt aborts it', async () => {
     const s = await open({}, program([{ on: 'msg:prompt', emit: [{ kind: 'hang' }] }]))
     s.prompt.push('wait forever', '22222222-2222-4222-8222-222222222222')

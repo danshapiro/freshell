@@ -324,6 +324,13 @@ class SimulatedCli {
   onCliExit(code, signal) {
     this.cliExited = true
     if (this.closing || this.dead) return
+    // Like the SDK's process transport (getProcessExitError): a CLI that exits
+    // with code 0 is no error, so the message stream just ends. A real CLI
+    // does that, for one, after SIGINT (an aborted result, then exit 0).
+    if (code === 0 && !signal && !this.bootError) {
+      this.terminate(undefined)
+      return
+    }
     const message = this.bootError
       ?? (signal ? `Claude Code process terminated by signal ${signal}` : `Claude Code process exited with code ${code}`)
     this.terminate(new Error(message))
