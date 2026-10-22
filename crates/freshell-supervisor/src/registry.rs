@@ -305,6 +305,15 @@ pub struct ReplacementPreparation {
     pub attempt_id: RecoveryAttemptId,
 }
 
+/// How turn settings fold into a recovery launch spec: a send's settings
+/// replace only the fields they state, while a configure's absent effort
+/// follows the provider's live configure rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsFold {
+    Turn,
+    Configure,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputJournalDisposition {
     Dispatch,
@@ -998,11 +1007,35 @@ impl Registry {
         .await
     }
 
+    /// Folds a send's turn settings into the soul's recovery launch spec.
     pub async fn update_fresh_agent_settings(
         &self,
         soul_id: SoulId,
         incarnation_id: IncarnationId,
         settings: FreshAgentTurnSettings,
+    ) -> Result<(), RegistryError> {
+        self.fold_fresh_agent_settings(soul_id, incarnation_id, settings, SettingsFold::Turn)
+            .await
+    }
+
+    /// Folds a `freshAgent.configure` into the soul's recovery launch spec,
+    /// with the same rule the host actor applies to its own copy.
+    pub async fn configure_fresh_agent_settings(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        settings: FreshAgentTurnSettings,
+    ) -> Result<(), RegistryError> {
+        self.fold_fresh_agent_settings(soul_id, incarnation_id, settings, SettingsFold::Configure)
+            .await
+    }
+
+    async fn fold_fresh_agent_settings(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        settings: FreshAgentTurnSettings,
+        fold: SettingsFold,
     ) -> Result<(), RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1016,6 +1049,14 @@ impl Registry {
                 .ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
             let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
                 .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+            let effort = match fold {
+                SettingsFold::Turn => settings.effort.clone().or_else(|| spec.effort.clone()),
+                SettingsFold::Configure => settings.effort_after_configure(
+                    &spec.provider,
+                    spec.model.as_deref(),
+                    spec.effort.as_deref(),
+                ),
+            };
             if let Some(value) = settings.cwd {
                 let cwd = std::fs::canonicalize(&value).map_err(|_| {
                     RegistryError::InvalidState("fresh-agent cwd is unavailable".into())
@@ -1033,9 +1074,7 @@ impl Registry {
             if let Some(value) = settings.model {
                 spec.model = Some(value);
             }
-            if let Some(value) = settings.effort {
-                spec.effort = Some(value);
-            }
+            spec.effort = effort;
             if let Some(value) = settings.permission_mode {
                 spec.permission_mode = Some(value);
             }

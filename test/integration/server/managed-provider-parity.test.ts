@@ -1,8 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createHash, randomUUID } from 'node:crypto'
-import http from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
@@ -12,7 +11,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../helpers/provider-parity-environment.js'
-import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../helpers/provider-parity-broker.js'
+import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes, readProviderParitySource, type ProviderParitySource } from '../../helpers/provider-parity-broker.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -297,7 +296,7 @@ describe('managed provider parity argv comparison', () => {
 
 describe('ordinary and managed terminal provider parity', () => {
   let rig: ManagedRuntimeBrowserRig
-  let initialProviderSource: Omit<InitialProviderVolumeAuthorization, 'soulId' | 'providerVolumeName'>
+  let initialProviderSource: ProviderParitySource
   let workspace: string
   let webHome: string
   let xdgConfigHome: string
@@ -467,32 +466,7 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     }
     const health = await rig.runtime.adminOk(rig.supervisor, { method: 'health' })
     expect(health.kind).toBe('health')
-    const daemon = await new Promise<{ ID: string }>((resolve, reject) => {
-      const request = http.get({ socketPath: rig.runtime.broker.proxySocketPath, path: '/v1.47/info' }, response => {
-        const chunks: Buffer[] = []
-        let size = 0
-        response.on('data', chunk => {
-          size += chunk.length
-          if (size > 64 * 1024) request.destroy(new Error('owned daemon metadata exceeds fixture bound'))
-          else chunks.push(Buffer.from(chunk))
-        })
-        response.once('error', reject)
-        response.once('end', () => {
-          try {
-            if (response.statusCode !== 200) throw new Error('owned daemon metadata unavailable')
-            resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-          } catch (error) { reject(error) }
-        })
-      })
-      request.once('error', reject)
-    })
-    initialProviderSource = {
-      installationId: health.data.installation_id,
-      imageRef: rig.runtime.imageRef,
-      hostBinaryPath: rig.runtime.testHostBinary,
-      binarySha256: createHash('sha256').update(fs.readFileSync(rig.runtime.testHostBinary)).digest('hex'),
-      daemonId: daemon.ID,
-    }
+    initialProviderSource = await readProviderParitySource(rig.runtime, health.data.installation_id)
     for (const [directory, filename, content] of [
       ['.claude', 'settings.json', JSON.stringify({ paritySetting: true })],
       ['.codex', 'config.toml', 'parity_setting = true\n'],
@@ -525,6 +499,8 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     // Vitest shuffles cases. Each case sees the same user-owned inputs even
     // when a prior recovery case edited them to exercise refresh semantics.
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), homeTuiConfig())
+    // The refreshed-config recovery case deletes the whole project directory.
+    fs.mkdirSync(path.join(workspace, '.opencode'), { recursive: true })
     fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), projectOpencodeConfig())
     // Every provider observes this shared project file. Prepare the selected
     // owned subtree for the provider user independently of shuffled case order.
