@@ -311,9 +311,15 @@ async fn spawn_sidecar_runs_the_sidecar_inside_its_own_process_group() {
         spawned.expect("spawn the sidecar");
     let pid = child.id().expect("a live sidecar") as i32;
     assert_eq!(
+        // SAFETY: getpgid only reads the process table.
+        unsafe { libc::getpgid(pid) },
+        pid,
+        "the kernel has the sidecar leading its own process group"
+    );
+    assert_eq!(
         tree_guard.process_group(),
         Some(pid),
-        "the sidecar leads its own process group"
+        "the guard owns that group"
     );
     drop(stdin);
     assert_eq!(

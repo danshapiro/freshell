@@ -363,25 +363,76 @@ async fn dropping_the_guard_kills_the_job_tree() {
     drop(child);
 }
 
+/// The process group the kernel has `pid` in (not the guard's own record).
+#[cfg(unix)]
+fn kernel_process_group(pid: u32) -> i32 {
+    // SAFETY: getpgid only reads the process table.
+    unsafe { libc::getpgid(pid as i32) }
+}
+
+/// Whether `pid` is gone, waiting up to five seconds for whoever adopted it to
+/// reap it (a killed orphan is briefly a zombie, which `kill(pid, 0)` still
+/// finds).
+#[cfg(unix)]
+async fn process_gone_within_five_seconds(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: signal 0 only probes for existence.
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn terminating_the_guard_kills_every_member_of_the_process_group() {
     let mut command = tokio::process::Command::new("sh");
     command
-        .args(["-c", "sleep 300 & sleep 300"])
+        .args(["-c", "sleep 300 & echo $!; wait"])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .kill_on_drop(true);
     let (mut child, mut guard) = spawn_guarded(&mut command).expect("spawn sh");
-    let pgid = guard
-        .process_group()
-        .expect("the child runs in its own process group");
-    assert_eq!(Some(pgid as u32), child.id(), "the child leads its group");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let member: u32 = tokio::time::timeout(
+        Duration::from_secs(10),
+        BufReader::new(stdout).lines().next_line(),
+    )
+    .await
+    .expect("sh reports its background member")
+    .expect("read sh's stdout")
+    .and_then(|line| line.trim().parse().ok())
+    .expect("the background member's pid");
+    let leader = child.id().expect("sh is running");
+    assert_eq!(
+        kernel_process_group(leader),
+        leader as i32,
+        "the kernel has the child leading its own process group"
+    );
+    assert_eq!(
+        kernel_process_group(member),
+        leader as i32,
+        "the background member is in the child's group"
+    );
+    assert_eq!(guard.process_group(), Some(leader as i32));
 
     let confirmation = guard.terminate(&mut child).await;
 
     assert_eq!(confirmation, TreeConfirmation::Confirmed);
-    assert!(!process_group_exists(pgid), "no group member survives");
+    assert!(
+        process_gone_within_five_seconds(member).await,
+        "the background member of the group was killed"
+    );
+    assert!(
+        !process_group_exists(leader as i32),
+        "no group member survives"
+    );
 }
 
 #[cfg(unix)]
