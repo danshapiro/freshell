@@ -703,57 +703,53 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       // sidecar's gate — the denied turn's ERRORED result rings the SAME
       // sdk.turn.complete edge a success would. A deny is an error turn
       // end; only a user-initiated interrupt stays silent. Race-free: poll
-      // the outbound ledger until the errored result AND the edge AND the
-      // following idle marker exist, THEN assert the edge's exact-once shape
-      // — fenced BEFORE the follow-up send below (a LATER, legitimately-
-      // completing turn on the same session).
+      // the outbound ledger until the errored result AND the edge that
+      // follows it exist, THEN assert the edge's exact-once shape — fenced
+      // BEFORE the follow-up send below (a LATER, legitimately-completing
+      // turn on the same session). Like the real sidecar, the turn ends with
+      // its result alone: no per-turn idle follows it.
       const deniedBridgeId = respond.sessionId as string
-      await expect
-        .poll(
-          () => {
-            const wires = readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
-            const resultIdx = wires.findIndex(
-              (r) => r.frame?.type === 'sdk.result' && r.frame?.sessionId === deniedBridgeId
-                && r.frame?.result === 'error',
-            )
-            if (resultIdx === -1) return false
-            const idleIdx = wires.findIndex(
-              (r, i) => i > resultIdx && r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
-                && r.frame?.status === 'idle',
-            )
-            if (idleIdx === -1) return false
-            return wires
-              .slice(resultIdx, idleIdx + 1)
-              .some((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId)
-          },
-          { timeout: 15_000, message: 'the errored sdk.result + unified edge + trailing idle marker for the denied turn' },
-        )
-        .toBe(true)
-      const wires = readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
-      const denyResultIdx = wires.findIndex(
+      const denyWires = () => readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
+      const denyResultIndex = (wires: any[]) => wires.findIndex(
         (r) => r.frame?.type === 'sdk.result' && r.frame?.sessionId === deniedBridgeId
           && r.frame?.result === 'error',
       )
+      await expect
+        .poll(
+          () => {
+            const wires = denyWires()
+            const resultIdx = denyResultIndex(wires)
+            if (resultIdx === -1) return false
+            return wires
+              .slice(resultIdx)
+              .some((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId)
+          },
+          { timeout: 15_000, message: 'the errored sdk.result + the unified edge after it for the denied turn' },
+        )
+        .toBe(true)
+      const wires = denyWires()
+      const denyResultIdx = denyResultIndex(wires)
       expect(denyResultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
       const denyEdgeIdx = wires.findIndex(
         (r, i) => i > denyResultIdx && r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId,
       )
       expect(denyEdgeIdx, 'the unified attention edge follows the errored result in stream order').toBeGreaterThan(denyResultIdx)
-      const denyIdleIdx = wires.findIndex(
-        (r, i) => i > denyEdgeIdx && r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
-          && r.frame?.status === 'idle',
-      )
-      expect(denyIdleIdx, 'the idle close follows the edge in stream order').toBeGreaterThan(denyEdgeIdx)
       expect(
         Number.isFinite(wires[denyEdgeIdx]?.frame?.at),
         'the edge carries a finite numeric monotonic at',
       ).toBe(true)
       expect(
         wires
-          .slice(denyResultIdx, denyIdleIdx + 1)
+          .slice(denyResultIdx)
           .filter((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId),
         'exactly one unified edge for the denied turn',
       ).toHaveLength(1)
+      expect(
+        wires
+          .slice(denyResultIdx)
+          .filter((r) => r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId && r.frame?.status === 'idle'),
+        'no per-turn idle follows the result (the real sidecar sends idle only when its stream ends)',
+      ).toEqual([])
       expect(
         wires.some((r) => r.frame?.type === 'sdk.assistant' && r.frame?.sessionId === deniedBridgeId
           && r.frame?.content?.[0]?.text?.includes('denied')),
