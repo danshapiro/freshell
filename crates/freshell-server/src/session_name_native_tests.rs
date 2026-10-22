@@ -155,6 +155,46 @@ fn document_json(dir: &std::path::Path) -> Value {
     serde_json::from_slice(&bytes).expect("document parses")
 }
 
+/// Wait for the store to PUBLISH `target`'s native projection at `status` —
+/// the worker's own fold event — on a receiver subscribed BEFORE the work
+/// that produces it could run, then confirm the durable read agrees. A worker
+/// cycle is several durable transactions (plus any capability re-probe
+/// window before it), so it takes as long as the disk does; the bound only
+/// turns a series that never converges into a failure instead of a hang.
+async fn await_published_native_status(
+    store: &Arc<SessionNames>,
+    published: &mut tokio::sync::broadcast::Receiver<SessionNameUpdate>,
+    target: &SessionNameRef,
+    status: NativeSyncStatus,
+    failure: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let update = published
+                .recv()
+                .await
+                .expect("the store keeps publishing name updates");
+            if &update.record.name_ref == target
+                && update
+                    .native_sync
+                    .as_ref()
+                    .is_some_and(|sync| sync.status == status)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{failure}"));
+    let sync = native_sync_of(store, target.clone())
+        .await
+        .expect("series projected");
+    assert_eq!(
+        sync.status, status,
+        "the durable projection agrees with the published one"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The deterministic scripted backend
 // ---------------------------------------------------------------------------
@@ -1136,24 +1176,20 @@ async fn the_worker_loop_converges_an_armed_series() {
     let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
     backend.set_title(Some("Divergent"));
 
+    let mut published = store.subscribe();
     let worker = SessionNameWorker::start(
         Arc::clone(&store),
         backend.clone(),
         inert_generation(dir.path()),
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(sync) = native_sync_of(&store, target.clone()).await {
-            if sync.status == NativeSyncStatus::Synced {
-                break;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the worker must converge the armed series"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    await_published_native_status(
+        &store,
+        &mut published,
+        &target,
+        NativeSyncStatus::Synced,
+        "the worker must converge the armed series",
+    )
+    .await;
     worker.abort();
     assert_eq!(backend.writes(), 1);
     assert_eq!(backend.reads(), 2);
@@ -2296,23 +2332,20 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
         "no cycle is consumed while the capability is absent"
     );
 
-    // The capability arrives: the SAME series proceeds and converges.
+    // The capability arrives: the SAME series proceeds and converges (after
+    // the refused probe's re-probe window, through its own cycle).
+    let mut published = store.subscribe();
     let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
     backend.set_title(Some("Divergent"));
     dispatch.wire(backend.clone());
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(sync) = native_sync_of(&store, target.clone()).await {
-            if sync.status == NativeSyncStatus::Synced {
-                break;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the paused series must converge once the capability arrives"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    await_published_native_status(
+        &store,
+        &mut published,
+        &target,
+        NativeSyncStatus::Synced,
+        "the paused series must converge once the capability arrives",
+    )
+    .await;
     worker.abort();
     assert_eq!(backend.writes(), 1);
     assert_eq!(backend.reads(), 2);
@@ -2391,6 +2424,7 @@ async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
     scripted.set_title(Some("Divergent"));
     let dispatch = SelectiveCapabilityBackend::refusing(scripted.clone(), &["/paused/.claude"]);
 
+    let mut published = store.subscribe();
     let worker = SessionNameWorker::start(
         Arc::clone(&store),
         dispatch.clone(),
@@ -2399,19 +2433,14 @@ async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
 
     // THE fairness assertion: the ready series converges DESPITE the paused
     // head holding the front of the selector.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(sync) = native_sync_of(&store, ready.clone()).await {
-            if sync.status == NativeSyncStatus::Synced {
-                break;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the ready series must converge despite the paused head"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    await_published_native_status(
+        &store,
+        &mut published,
+        &ready,
+        NativeSyncStatus::Synced,
+        "the ready series must converge despite the paused head",
+    )
+    .await;
 
     // The paused head consumed nothing while refused: still pending, still
     // discoverable work, its whole allowance intact.
@@ -2439,19 +2468,14 @@ async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
 
     // The capability arrives: the paused head converges too.
     dispatch.wire("/paused/.claude");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(sync) = native_sync_of(&store, paused.clone()).await {
-            if sync.status == NativeSyncStatus::Synced {
-                break;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the paused head must converge once its capability arrives"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    await_published_native_status(
+        &store,
+        &mut published,
+        &paused,
+        NativeSyncStatus::Synced,
+        "the paused head must converge once its capability arrives",
+    )
+    .await;
     worker.abort();
     // Both series converged through their own full cycles — one write and
     // two reads each — and nothing was double-dispatched while paused.
