@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { userTurnText } from '../helpers/fresh-agent-transcript.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { RustServer } from '../helpers/rust-server.js'
 
@@ -275,7 +276,7 @@ test.describe('Freshopencode TUI inline parity', () => {
       const delegatedCaption = page.getByTestId('fresh-agent-delegated-task')
       await expect(delegatedCaption).toHaveCount(1)
       await expect(delegatedCaption).toHaveText(DELEGATED_CAPTION)
-      await expect(page.getByText(CHILD_PROMPT_TEXT)).toBeVisible({ timeout: 30_000 })
+      await expect(userTurnText(page, CHILD_PROMPT_TEXT)).toBeVisible({ timeout: 30_000 })
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
