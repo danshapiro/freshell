@@ -72,8 +72,14 @@ export interface FakeOneCliGeminiProxy {
 
 /** A local fake Gemini answering the Rust-only FRESHELL_GEMINI_BASE_URL seam
  * (auto-title-rust.spec.ts's pattern): deterministic short names, an
- * optional hold for the late-generation races. */
-export async function startFakeGemini(replyText: string, opts?: { hold?: boolean }): Promise<FakeGemini> {
+ * optional hold for the late-generation races. `status`/`body` make every
+ * generate call answer that HTTP status and JSON body instead (for example
+ * a 403, so AI naming never succeeds and only first-message/folder names
+ * remain). */
+export async function startFakeGemini(
+  replyText: string,
+  opts?: { hold?: boolean; status?: number; body?: unknown },
+): Promise<FakeGemini> {
   const requests: FakeGemini['requests'] = []
   let held = opts?.hold === true
   const server = http.createServer((req, res) => {
@@ -86,8 +92,11 @@ export async function startFakeGemini(replyText: string, opts?: { hold?: boolean
       })
       if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH) {
         const answer = () => {
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: replyText }] } }] }))
+          const status = opts?.status ?? 200
+          res.writeHead(status, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(opts?.body !== undefined
+            ? opts.body
+            : { candidates: [{ content: { parts: [{ text: replyText }] } }] }))
         }
         if (held) {
           const timer = setInterval(() => {
