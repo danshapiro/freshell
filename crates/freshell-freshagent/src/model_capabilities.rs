@@ -175,33 +175,63 @@ impl ModelCatalogProbe for ClaudeCatalogProbe {
             // A hung SDK close cannot leave that grandchild behind on timeout.
             #[cfg(target_os = "linux")]
             command.process_group(0);
-            let child = command.spawn().map_err(|error| {
+            let mut child = command.spawn().map_err(|error| {
                 claude_probe_error(format!("Cannot start Claude model catalog: {error}"))
             })?;
-            #[cfg(target_os = "linux")]
-            let process_group = child.id();
+            let pid = child.id();
+            // The helper's stderr is the sidecar's JSONL log (log.mjs): the same
+            // logger as a session sidecar re-emits each record at its severity,
+            // bounded and rate-limited (G14, design §5.9).
+            let stderr_logger = child.stderr.take().map(|stderr| {
+                crate::claude_sidecar_io::spawn_stderr_logger(
+                    stderr,
+                    crate::claude_sidecar_io::SidecarLogLabels::model_catalog(pid),
+                    crate::claude_sidecar_io::hosted_sidecar(None),
+                )
+            });
             let output =
                 match tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await
                 {
-                    Ok(result) => result.map_err(|error| claude_probe_error(error.to_string()))?,
+                    Ok(result) => result.map_err(|error| claude_probe_error(error.to_string())),
                     Err(_) => {
                         #[cfg(target_os = "linux")]
-                        if let Some(id) = process_group {
+                        if let Some(id) = pid {
                             // SAFETY: this is the group created for this probe only.
                             unsafe {
                                 libc::kill(-(id as i32), libc::SIGKILL);
                             }
                         }
-                        tracing::warn!(
-                            component = "claude_model_catalog",
-                            "Claude model catalog process timed out"
-                        );
-                        return Err(claude_probe_error("Claude model catalog process timed out"));
+                        Err(claude_probe_error("Claude model catalog process timed out"))
                     }
                 };
+            // The process is gone, so its stderr ends: let its last records
+            // land before the outcome is logged.
+            if let Some(logger) = stderr_logger {
+                let _ = tokio::time::timeout(Duration::from_secs(1), logger).await;
+            }
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = "claude",
+                        component = crate::claude_sidecar_io::MODEL_CATALOG_LABEL,
+                        pid,
+                        error = %error.message,
+                        "freshagent.claude.model_catalog_unavailable"
+                    );
+                    return Err(error);
+                }
+            };
             if !output.status.success() {
-                let details = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(component = "claude_model_catalog", status = ?output.status, stderr = %details, "Claude model catalog unavailable");
+                tracing::warn!(
+                    provider = "claude",
+                    component = crate::claude_sidecar_io::MODEL_CATALOG_LABEL,
+                    pid,
+                    status = %output.status,
+                    see = "the helper's own freshagent.claude.sidecar_log records \
+                           (ownership_id claude-model-catalog) say why",
+                    "freshagent.claude.model_catalog_unavailable"
+                );
                 return Err(claude_probe_error("Claude model catalog is unavailable. Check Claude authentication and the server logs."));
             }
             let raw: Value = serde_json::from_slice(&output.stdout).map_err(|error| {

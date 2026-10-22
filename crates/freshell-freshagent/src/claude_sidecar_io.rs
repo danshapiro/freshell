@@ -32,6 +32,9 @@ const PROVIDER: &str = "claude";
 /// provider it hosts: `claude` or `kilroy`).
 const HOSTED_ENV: &str = "FRESHELL_HOSTED_FRESH_AGENT";
 
+/// The process label (`ownership_id`) the model catalog probe's log events carry.
+pub(crate) const MODEL_CATALOG_LABEL: &str = "claude-model-catalog";
+
 /// The longest stderr line kept whole. Records are far shorter (log.mjs cuts
 /// CLI output to 2 KiB); a longer line is cut here and counted.
 const STDERR_LINE_MAX_BYTES: usize = 16 * 1024;
@@ -108,7 +111,8 @@ pub(crate) struct SidecarLogLabels {
 
 struct LabelsInner {
     ownership_id: String,
-    session_type: String,
+    /// `None` for a sidecar process that serves no session (the model catalog probe).
+    session_type: Option<String>,
     pid: Option<u32>,
     /// The session's envelope id handle (the id clients address it by; an
     /// attach by durable id may change it), once the sidecar has named it.
@@ -117,10 +121,20 @@ struct LabelsInner {
 
 impl SidecarLogLabels {
     pub(crate) fn new(ownership_id: &str, session_type: &str, pid: Option<u32>) -> Self {
+        Self::with(ownership_id, Some(session_type), pid)
+    }
+
+    /// Labels for the model catalog probe (`model-catalog.mjs`): a short-lived
+    /// sidecar process that serves no session, named by [`MODEL_CATALOG_LABEL`].
+    pub(crate) fn model_catalog(pid: Option<u32>) -> Self {
+        Self::with(MODEL_CATALOG_LABEL, None, pid)
+    }
+
+    fn with(ownership_id: &str, session_type: Option<&str>, pid: Option<u32>) -> Self {
         Self {
             inner: Arc::new(LabelsInner {
                 ownership_id: ownership_id.to_string(),
-                session_type: session_type.to_string(),
+                session_type: session_type.map(str::to_string),
                 pid,
                 session: OnceLock::new(),
             }),
@@ -131,8 +145,8 @@ impl SidecarLogLabels {
         &self.inner.ownership_id
     }
 
-    fn session_type(&self) -> &str {
-        &self.inner.session_type
+    fn session_type(&self) -> Option<&str> {
+        self.inner.session_type.as_deref()
     }
 
     fn pid(&self) -> Option<u32> {
@@ -148,7 +162,7 @@ impl SidecarLogLabels {
             tracing::info!(
                 provider = PROVIDER,
                 session_id = session_id.as_deref(),
-                session_type = %self.inner.session_type,
+                session_type = self.session_type(),
                 ownership_id = %self.inner.ownership_id,
                 pid = self.inner.pid,
                 "freshagent.claude.sidecar_bound"
@@ -376,8 +390,13 @@ impl LineRateLimiter {
 }
 
 /// Re-emit a sidecar's stderr through `tracing` (see the module docs) on a task
-/// that ends with the stream, when the sidecar exits.
-pub(crate) fn spawn_stderr_logger<R>(stderr: R, labels: SidecarLogLabels, hosted: bool)
+/// that ends with the stream, when the sidecar exits. The handle lets a caller
+/// that waits for the process also wait for its last records.
+pub(crate) fn spawn_stderr_logger<R>(
+    stderr: R,
+    labels: SidecarLogLabels,
+    hosted: bool,
+) -> tokio::task::JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -386,7 +405,7 @@ where
         labels,
         hosted,
         StderrLogLimits::default(),
-    ));
+    ))
 }
 
 async fn run_stderr_logger<R>(
@@ -479,7 +498,7 @@ fn emit_record(labels: &SidecarLogLabels, record: StderrRecord) {
             severity,
             provider = PROVIDER,
             session_id = session_id.as_deref(),
-            session_type = %labels.session_type(),
+            session_type = labels.session_type(),
             ownership_id = %labels.ownership_id(),
             pid = labels.pid(),
             component = component.as_deref(),
@@ -495,7 +514,7 @@ fn emit_record(labels: &SidecarLogLabels, record: StderrRecord) {
         } => tracing::warn!(
             provider = PROVIDER,
             session_id = session_id.as_deref(),
-            session_type = %labels.session_type(),
+            session_type = labels.session_type(),
             ownership_id = %labels.ownership_id(),
             pid = labels.pid(),
             raw = true,
@@ -512,7 +531,7 @@ fn emit_dropped(labels: &SidecarLogLabels, dropped: u64, window: Duration) {
     tracing::warn!(
         provider = PROVIDER,
         session_id = session_id.as_deref(),
-        session_type = %labels.session_type(),
+        session_type = labels.session_type(),
         ownership_id = %labels.ownership_id(),
         pid = labels.pid(),
         dropped,
