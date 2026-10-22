@@ -681,6 +681,7 @@ async fn automation_rename_to_the_folder_name_is_refused_and_stays_refused() {
             first_user_message: Some(SARDINE.into()),
             title_source: None,
             git_branch: None,
+            last_activity_at: 0,
         }],
     )
     .await;
@@ -921,18 +922,23 @@ async fn planned_fallback_is_applied_without_the_strict_raise() {
     let dir = temp_dir();
     let store = open(dir.path());
     let target = session(NamedProvider::Claude, "s-c1");
-    let seeded = seed(
+    seed(
         &store,
-        indexed(
-            NamedProvider::Claude,
-            "s-c1",
-            Some("/w/proj"),
-            None,
-            Some("Claude CLI"),
-        ),
+        indexed(NamedProvider::Claude, "s-c1", Some("/w/proj"), None, None),
         false,
     )
     .await;
+    // The junk first-message record an old build saved (Task 5 keeps the
+    // hydration ladder itself from installing a default label as a first
+    // message, so it is planted through the store's raw offer seam).
+    let seeded = store
+        .offer(
+            target.clone(),
+            "Claude CLI".to_string(),
+            NameSource::FirstMessage,
+        )
+        .await
+        .expect("plant the junk first-message record");
     assert_eq!(seeded.record.source, NameSource::FirstMessage);
     assert_eq!(seeded.record.name, "Claude CLI");
     let input = activity_input(
@@ -1232,6 +1238,7 @@ fn sweep_state(
         metadata: crate::session_metadata::SessionMetadataStore::new(home),
         index: None,
         index_hydrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        first_message_lookups: Default::default(),
     };
     (state, rx)
 }

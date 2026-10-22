@@ -1747,7 +1747,8 @@ async fn a_rearmed_series_rejects_answers_from_older_input() {
 /// Hydration installs the free fallbacks (provider title > first message >
 /// directory basename) and NEVER schedules paid titles across history: the
 /// absorbed series rests Idle, out of the selector, and stays that way
-/// across repeated hydration; a genuinely new message arms it.
+/// across repeated hydration and a re-derived message; a genuinely newly
+/// observed message on a session without an absorbed series arms.
 #[tokio::test]
 async fn hydration_installs_free_fallbacks_and_never_schedules_paid_titles() {
     let dir = temp_data_dir();
@@ -1827,14 +1828,39 @@ async fn hydration_installs_free_fallbacks_and_never_schedules_paid_titles() {
         "an existing record is returned unchanged"
     );
 
-    // A genuinely newly observed message (a later pass) arms generation.
+    // Name-reliability Task 5 (V2 decision B, re-absorb at rest): a changed
+    // message the index feeds to the absorbed series is only ever a
+    // RE-DERIVED first message (a real first message never changes; the
+    // extraction rules did), so it refreshes the input at rest and is still
+    // never scheduled in the background — an explicit open arms it.
     activity(
         &store,
         titled.clone(),
         "opencode",
+        "e-rederived-message",
+        NameActivityReason::IndexUserMessage,
+        Some("The re-derived first message"),
+    )
+    .await
+    .expect("the re-derived message rests");
+    assert!(
+        store.generation_work_snapshot().is_empty(),
+        "a re-derived message never arms an absorbed series in the background"
+    );
+    assert_eq!(
+        generation_status(&document_json(dir.path()), &titled).as_deref(),
+        Some("idle")
+    );
+
+    // A genuinely newly observed message (a later pass) on a session with
+    // no absorbed series arms generation.
+    activity(
+        &store,
+        plain.clone(),
+        "claude",
         "e-new-message",
         NameActivityReason::IndexUserMessage,
-        Some("A brand new second turn message"),
+        Some("A brand new first message"),
     )
     .await
     .expect("the new message arms");
@@ -1842,7 +1868,7 @@ async fn hydration_installs_free_fallbacks_and_never_schedules_paid_titles() {
         store
             .generation_work_snapshot()
             .iter()
-            .any(|item| item.target == titled),
+            .any(|item| item.target == plain),
         "a newly observed message makes the session eligible"
     );
 }

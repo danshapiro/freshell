@@ -2654,6 +2654,8 @@ async fn main() -> ExitCode {
                 // first-message lookup for already-named sessions.
                 index: Some(Arc::clone(index)),
                 index_hydrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                // Name-reliability Task 5 (C5): remembered across passes.
+                first_message_lookups: Default::default(),
             },
             Arc::clone(index),
             SESSIONS_SWEEP_INTERVAL,

@@ -97,6 +97,7 @@ fn sweep_rows(count: usize) -> Vec<crate::auto_title_sweep::SweepSession> {
             first_user_message: Some(heal_message(i)),
             title_source: None,
             git_branch: None,
+            last_activity_at: 0,
         })
         .collect()
 }
@@ -124,6 +125,7 @@ fn sweep_state(
         index: None,
         // A later (non-boot) pass: every indexed session feeds activity.
         index_hydrated: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        first_message_lookups: Default::default(),
     }
 }
 
@@ -207,6 +209,7 @@ async fn sweep_maintenance_is_batched_and_leaves_room_for_renames() {
         first_user_message: Some("A brand new session".into()),
         title_source: None,
         git_branch: None,
+        last_activity_at: 0,
     });
     let before = test_store_transaction_count(&data_dir);
     crate::auto_title_sweep::run_auto_title_pass(&sweep, &with_new).await;

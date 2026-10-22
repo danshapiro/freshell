@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -26,6 +27,26 @@ export interface SeedNameRecord {
   sessionId: string
   name: string
   source: SeedNameSource
+  /** Name-reliability Task 5: the AI-naming input an old build absorbed
+   * for this session at rest (an Idle, never-attempted generation series
+   * holding this first message) — e.g. the wrapper text the old extraction
+   * took as the first message. */
+  restingGenerationInput?: string
+}
+
+/** The store's bounded generation excerpt (`PROMPT_MESSAGE_CHAR_CAP`
+ * chars) and its input fingerprint (sha-256 hex of the excerpt). */
+const PROMPT_MESSAGE_CHAR_CAP = 2000
+
+function restingSeries(input: string): Record<string, unknown> {
+  const excerpt = Array.from(input).slice(0, PROMPT_MESSAGE_CHAR_CAP).join('')
+  return {
+    status: 'idle',
+    seriesId: `seeded-${createHash('sha256').update(input).digest('hex').slice(0, 12)}`,
+    inputFingerprint: createHash('sha256').update(excerpt).digest('hex'),
+    excerpt,
+    consumed: 0,
+  }
 }
 
 /** The store's record key for a durable session ref (`name_ref_key`). */
@@ -42,14 +63,19 @@ export async function writeSessionNamesDocument(homeDir: string, records: SeedNa
   const now = Date.now()
   let revision = 0
   const out: Record<string, unknown> = {}
+  const generation: Record<string, unknown> = {}
   for (const record of records) {
     revision += 1
-    out[sessionNameKey(record.provider, record.sessionId)] = {
+    const key = sessionNameKey(record.provider, record.sessionId)
+    out[key] = {
       ref: { kind: 'session', provider: record.provider, sessionId: record.sessionId },
       name: record.name,
       source: record.source,
       revision,
       ...(record.source === 'manual' ? { manualRevision: revision, renamedAt: now } : {}),
+    }
+    if (record.restingGenerationInput !== undefined) {
+      generation[key] = restingSeries(record.restingGenerationInput)
     }
   }
   const document = {
@@ -58,6 +84,7 @@ export async function writeSessionNamesDocument(homeDir: string, records: SeedNa
     nextRevision: revision + 1,
     records: out,
     redirects: {},
+    generation,
     migration: { completed: true },
   }
   await fs.writeFile(path.join(freshellDir, 'session-names.json'), JSON.stringify(document, null, 2))
