@@ -8,6 +8,7 @@
 // claude-cli-conformance.test.ts.
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -222,7 +223,7 @@ describe('Claude CLI simulator programs', () => {
     expect(await snapshotTree(s.home.env.CLAUDE_CONFIG_DIR)).toEqual(atClose)
   })
 
-  it('records each query() call\'s options in FRESHELL_CLAUDE_SIM_LEDGER, with env reduced to its key names', async () => {
+  it('records each query() call\'s options in FRESHELL_CLAUDE_SIM_LEDGER, with env reduced to its key names and credential digests', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sim-ledger-'))
     cleanups.push(() => fs.rm(dir, { recursive: true, force: true }))
     const ledger = path.join(dir, 'ledger.jsonl')
@@ -230,6 +231,9 @@ describe('Claude CLI simulator programs', () => {
     const rows = (await fs.readFile(ledger, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
     expect(rows[0]).toMatchObject({ kind: 'query', options: { model: 'claude-test-model', plugins: [{ type: 'local', path: '/plugins/one' }], mcpServers: { freshell: { type: 'stdio', command: 'node' } } } })
     expect(rows[0].options.envKeys).toContain('ANTHROPIC_API_KEY')
+    // A credential is recorded as a short sha256 digest, so a test can tell
+    // which value the child got without the ledger ever holding it.
+    expect(rows[0].options.envDigests).toEqual({ ANTHROPIC_API_KEY: createHash('sha256').update('secret-value').digest('hex').slice(0, 12) })
     expect(JSON.stringify(rows)).not.toContain('secret-value')
   })
 

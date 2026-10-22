@@ -42,7 +42,8 @@
 //                                       the SDK side received. Every row carries
 //                                       `query`, the ordinal of its query() call in
 //                                       this process. Rows: `query` (the options, env
-//                                       reduced to key names), `boot` (the session id
+//                                       reduced to key names plus short sha256
+//                                       digests of credential values), `boot` (the session id
 //                                       and the stand-in CLI's pid), `prompt` (each
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
@@ -52,7 +53,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { HANG_MCP_QUALIFIED_TOOL, parsePromptMarkers, PLAN_TEXT, SLOW_DELAY_MS } from './prompt-markers.mjs'
 import { loadProgram, ProgramEngine } from './program.mjs'
@@ -918,12 +919,24 @@ class SimulatedCli {
   }
 }
 
-/** The options as a ledger row: functions and controllers by kind, env by key names only. */
+/** The credentials whose value a test may need to tell apart (as a digest, never the value). */
+const DIGESTED_CREDENTIALS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN']
+
+/** A short sha256 digest of a credential value: enough to compare, useless to read. */
+const credentialDigest = (value) => createHash('sha256').update(String(value)).digest('hex').slice(0, 12)
+
+/**
+ * The options as a ledger row: functions and controllers by kind, env by key
+ * names only, plus a short digest of each credential the child got.
+ */
 function describeOptions(options) {
   const out = {}
   for (const [key, value] of Object.entries(options)) {
-    if (key === 'env') out.envKeys = Object.keys(value ?? {}).sort()
-    else if (key === 'abortController') out.abortController = Boolean(value)
+    if (key === 'env') {
+      const env = value ?? {}
+      out.envKeys = Object.keys(env).sort()
+      out.envDigests = Object.fromEntries(DIGESTED_CREDENTIALS.filter((name) => env[name] !== undefined).map((name) => [name, credentialDigest(env[name])]))
+    } else if (key === 'abortController') out.abortController = Boolean(value)
     else if (typeof value === 'function') out[key] = '[function]'
     else out[key] = value
   }

@@ -1,5 +1,6 @@
 // @vitest-environment node
 
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 // The sidecar runs directly in Node, so its shared settings logic is plain ESM.
 // @ts-expect-error JavaScript sidecar module has no declaration file.
@@ -107,10 +108,20 @@ async function hostedMcpProbe(bridge: Pick<RealSidecar, 'waitForLedger'>) {
   return { selected: !!mcp, fixedRecipe: mcp?.command === 'node' && JSON.stringify(mcp?.args) === JSON.stringify(['/opt/freshell-mcp/server.js']) && mcp?.env === undefined }
 }
 
-/** Which credentials the SDK child environment carries (the ledger records key names, never values). */
+/** The short digest the simulator's ledger records for a credential value (never the value itself). */
+const credentialDigest = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 12)
+
+/** Which credentials the SDK child environment carries, and digests of their values. */
 async function authEnvProbe(bridge: Pick<RealSidecar, 'waitForLedger'>) {
-  const envKeys: string[] = (await queryOptions(bridge)).envKeys ?? []
-  return { apiKeyVisible: envKeys.includes('ANTHROPIC_API_KEY'), oauthVisible: envKeys.includes('CLAUDE_CODE_OAUTH_TOKEN') }
+  const options = await queryOptions(bridge)
+  const envKeys: string[] = options.envKeys ?? []
+  const digests: Record<string, string> = options.envDigests ?? {}
+  return {
+    apiKeyVisible: envKeys.includes('ANTHROPIC_API_KEY'),
+    oauthVisible: envKeys.includes('CLAUDE_CODE_OAUTH_TOKEN'),
+    apiKeyDigest: digests.ANTHROPIC_API_KEY,
+    oauthDigest: digests.CLAUDE_CODE_OAUTH_TOKEN,
+  }
 }
 
 describe('Claude sidecar OneCLI child environment', () => {
@@ -136,7 +147,13 @@ describe('Claude sidecar OneCLI child environment', () => {
 
     const managed = await sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key', CLAUDE_CODE_OAUTH_TOKEN: 'onecli-test-oauth', FRESHELL_CLAUDE_ONECLI_API_KEY: '1' })
     managed.send({ type: 'create', requestId: 'managed', cwd: managed.cwd })
-    expect(await authEnvProbe(managed)).toMatchObject({ apiKeyVisible: true, oauthVisible: true })
+    // The child gets the managed values themselves, not some other or empty key.
+    expect(await authEnvProbe(managed)).toMatchObject({
+      apiKeyVisible: true,
+      oauthVisible: true,
+      apiKeyDigest: credentialDigest('onecli-test-key'),
+      oauthDigest: credentialDigest('onecli-test-oauth'),
+    })
   })
 })
 
@@ -158,12 +175,13 @@ describe('Claude sidecar configuration protocol', () => {
 
   it('correlates rejected settings and leaves the existing query available', async () => {
     const bridge = await sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', cwd: bridge.cwd })
+    bridge.send({ type: 'create', requestId: 'create', model: 'opus', permissionMode: 'acceptEdits', cwd: bridge.cwd })
     const { sessionId } = await bridge.waitFor('created')
     bridge.send({ type: 'configure', sessionId, requestId: 'bad-mode', settings: { permissionMode: 'no-such-mode' } })
-    expect(await bridge.waitFor('sdk.configured', 'bad-mode')).toMatchObject({ ok: false, message: UNKNOWN_MODE_REFUSAL })
+    // The refused mode is neither reported nor kept: the previous one stands.
+    expect(await bridge.waitFor('sdk.configured', 'bad-mode')).toMatchObject({ ok: false, message: UNKNOWN_MODE_REFUSAL, settings: { permissionMode: 'acceptEdits' } })
     bridge.send({ type: 'send', sessionId, text: 'Still works' })
-    expect(await bridge.waitForPrompt()).toMatchObject({ generation: 1, model: 'opus' })
+    expect(await bridge.waitForPrompt()).toMatchObject({ generation: 1, model: 'opus', permissionMode: 'acceptEdits' })
   })
 
   it('publishes usable provider commands and removes terminal-only commands', async () => {
@@ -184,17 +202,18 @@ describe('Claude sidecar configuration protocol', () => {
 
   it('keeps the conversation usable after a settings change fails part way', async () => {
     const bridge = await sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high', cwd: bridge.cwd })
+    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan', cwd: bridge.cwd })
     const { sessionId } = await bridge.waitFor('created')
     // The model change applies, then the permission mode is refused: the
-    // answer reports the settings as they now stand.
+    // answer reports the settings as they now stand, with the refused mode
+    // left at its previous value.
     bridge.send({ type: 'configure', sessionId, requestId: 'failed-settings', settings: { model: 'sonnet', effort: 'high', permissionMode: 'no-such-mode' } })
-    expect(await bridge.waitFor('sdk.configured', 'failed-settings')).toMatchObject({ ok: false, settings: { model: 'sonnet', effort: 'high' } })
+    expect(await bridge.waitFor('sdk.configured', 'failed-settings')).toMatchObject({ ok: false, settings: { model: 'sonnet', effort: 'high', permissionMode: 'plan' } })
     bridge.send({ type: 'configure', sessionId, requestId: 'recover', settings: { model: 'opus', effort: 'high' } })
-    expect(await bridge.waitFor('sdk.configured', 'recover')).toMatchObject({ ok: true })
+    expect(await bridge.waitFor('sdk.configured', 'recover')).toMatchObject({ ok: true, settings: { permissionMode: 'plan' } })
     bridge.send({ type: 'send', sessionId, text: 'Continue' })
     const { cliSessionId } = await bridge.waitFor('sdk.session.init')
-    expect(await bridge.waitForPrompt()).toMatchObject({ generation: 1, durable: cliSessionId, model: 'opus', effort: 'high' })
+    expect(await bridge.waitForPrompt()).toMatchObject({ generation: 1, durable: cliSessionId, model: 'opus', effort: 'high', permissionMode: 'plan' })
     expect(bridge.frames.some((frame) => frame.type === 'sdk.exit')).toBe(false)
   })
 
