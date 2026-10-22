@@ -858,6 +858,19 @@ async fn cli_db_association_transfers_pending_and_switch_surfaces_own_record() {
         switch_record[0].record.name, "Switch Own Name",
         "the new session's OWN record must surface through the pane's binding"
     );
+    // Name reliability (Task 10, G45): the REGISTRY row — what
+    // `/api/terminals`, the overview, and the publisher's refresh set read —
+    // follows the switch too, and presents the new session's own name.
+    assert_eq!(
+        registry.name_ref_of(&tid),
+        Some(opencode_session_ref(SWITCH)),
+        "the terminal row's naming binding must follow the conversation switch"
+    );
+    assert_eq!(
+        registry.session_name_of(&tid).map(|record| record.name),
+        Some("Switch Own Name".to_string()),
+        "the terminal row must show the new session's own name"
+    );
     let kept = sink
         .get(vec![opencode_session_ref(ASSOC)])
         .await

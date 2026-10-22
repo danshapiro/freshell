@@ -14,6 +14,14 @@
 // `<CLAUDE_CONFIG_DIR>/projects/<mangled-cwd>/<sessionId>.jsonl`. Opt out
 // with FRESHELL_FAKE_CLAUDE_NO_TRANSCRIPT=1 (legacy specs that only pin the
 // TUI surface).
+//
+// Name reliability (Task 10): the stdin line `/clear` is a CONVERSATION
+// SWITCH, as in the real CLI: the fake starts a new session id (later lines
+// append to the NEW session's transcript) and emits what the real CLI's
+// injected SessionStart hook emits — the hook's stdin JSON written
+// atomically to
+// `$HOME/.freshell/session-signals/claude/<FRESHELL_TERMINAL_ID>__<nonce>.json`
+// with `source: "clear"`, the signal the server's claude rebind lane drains.
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -63,6 +71,30 @@ const launchSessionId = resumeIdx !== -1
     ? argv[sessionIdx + 1]
     : randomUUID()
 const cwd = process.cwd()
+let currentSessionId = launchSessionId
+
+/** Width-stable, timestamp-first nonce (the hook's filename sort order). */
+function signalNonce() {
+  const nanos = process.hrtime.bigint() % 1_000_000n
+  return `${Date.now()}${String(nanos).padStart(6, '0')}-${process.pid}`
+}
+
+function writeSessionStartSignal(sessionId, source) {
+  const terminalId = process.env.FRESHELL_TERMINAL_ID
+  if (!terminalId) return
+  const dir = path.join(os.homedir(), '.freshell', 'session-signals', 'claude')
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, `${terminalId}__${signalNonce()}.json`)
+  const body = {
+    session_id: sessionId,
+    transcript_path: transcriptPath(sessionId, cwd),
+    cwd,
+    hook_event_name: 'SessionStart',
+    source,
+  }
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(body))
+  fs.renameSync(`${file}.tmp`, file)
+}
 
 await runTerminalCli({
   provider: 'claude',
@@ -78,6 +110,11 @@ await runTerminalCli({
     // records, so a real multi-turn exchange is what makes the session a
     // realistic directory entry).
     const text = String(line).trim()
-    if (text.length > 0) appendUserRecord(launchSessionId, cwd, text)
+    if (text === '/clear') {
+      currentSessionId = randomUUID()
+      writeSessionStartSignal(currentSessionId, 'clear')
+      return
+    }
+    if (text.length > 0) appendUserRecord(currentSessionId, cwd, text)
   },
 })

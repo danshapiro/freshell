@@ -75,6 +75,7 @@ pub(crate) mod tabs_store_migrate;
 pub mod tabs_store_model;
 pub mod terminal;
 pub mod terminal_meta;
+pub mod terminal_naming;
 
 pub use codex_identity::codex_sessions_root;
 pub use codex_reconcile::locate_codex_rollout;

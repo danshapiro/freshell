@@ -352,6 +352,16 @@ fn name_key(target: &freshell_protocol::session_names::SessionNameRef) -> String
 }
 
 impl NamingProbeSink {
+    /// Serve a pre-existing record (name reliability Task 10): the record a
+    /// RESTARTED server's store already holds for a session it never saw
+    /// create — e.g. a managed soul the supervisor kept alive.
+    pub fn seed_record(&self, record: freshell_protocol::session_names::SessionNameRecord) {
+        self.records
+            .lock()
+            .unwrap()
+            .insert(name_key(&record.name_ref), record);
+    }
+
     fn resolve(
         &self,
         target: &freshell_protocol::session_names::SessionNameRef,
@@ -1574,7 +1584,10 @@ pub async fn connect_and_capture_inventory_with_identity(
     .await
 }
 
-async fn connect_with_hello(url: &str, hello: serde_json::Value) -> (TestWs, serde_json::Value) {
+pub async fn connect_with_hello(
+    url: &str,
+    hello: serde_json::Value,
+) -> (TestWs, serde_json::Value) {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");

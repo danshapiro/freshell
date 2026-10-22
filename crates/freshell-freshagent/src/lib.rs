@@ -91,6 +91,7 @@ pub mod snapshot;
 pub mod spawn_gate;
 pub(crate) mod summary;
 pub mod target_resolver;
+pub mod terminal_name_binding;
 pub mod terminal_tabs;
 #[cfg(test)]
 mod test_environment;
@@ -2243,6 +2244,12 @@ pub struct FreshAgentState {
     /// wired (the Option-until-wired convention): creates proceed, only the
     /// meta seeding is skipped.
     pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
+    /// Name reliability (Task 10): the shared identity table the REST door's
+    /// terminal naming bind writes through (`freshell-server`'s `main.rs`
+    /// injects the WebSocket door's identity binder, so both doors bind the
+    /// SAME table). `None` until wired: REST binds still write the registry
+    /// row and this state's handle stash.
+    pub(crate) terminal_name_binder: Option<Arc<dyn terminal_name_binding::TerminalNameBinder>>,
     /// The `GET`/`POST /api/fresh-agent/model-capabilities/*` registry
     /// ([`model_capabilities`]): cwd-keyed TTL cache + single-flight coalescing
     /// over the transient opencode catalog probe, plus the static codex/claude
@@ -2454,6 +2461,7 @@ impl FreshAgentState {
             sidecar_liveness: None,
             layout: layout_store::LayoutStore::default(),
             terminal_created_hook: None,
+            terminal_name_binder: None,
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
             )),
@@ -2818,6 +2826,16 @@ impl FreshAgentState {
     /// (e.g. [`Self::with_shared_sessions_revision`]).
     pub fn with_terminal_created_hook(mut self, hook: TerminalCreatedHook) -> Self {
         self.terminal_created_hook = Some(hook);
+        self
+    }
+
+    /// Name reliability (Task 10): wire the shared identity table the REST
+    /// door's terminal naming bind writes (see the field doc).
+    pub fn with_terminal_name_binder(
+        mut self,
+        binder: Arc<dyn terminal_name_binding::TerminalNameBinder>,
+    ) -> Self {
+        self.terminal_name_binder = Some(binder);
         self
     }
 

@@ -244,7 +244,13 @@ export function reconcileTerminalSessionAssociation({
 
   if (!matchedAnyPane) return 'ignored'
 
-  dispatch(reconcileTerminalSessionRefByTerminalId({ terminalId, sessionRef }))
+  // Name reliability (Task 10, G45): the rebind token rides along so the
+  // reducer releases the superseded conversation's naming identity.
+  dispatch(reconcileTerminalSessionRefByTerminalId({
+    terminalId,
+    sessionRef,
+    ...(typeof previousSessionId === 'string' && previousSessionId.length > 0 ? { previousSessionId } : {}),
+  }))
 
   // Unified agent names (Task 5): the accepted rebind also moves the pane's
   // NAMING binding — the display selector resolves through the pane content's

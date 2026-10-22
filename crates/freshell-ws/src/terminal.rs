@@ -3469,6 +3469,7 @@ fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
 
 async fn adopt_existing_managed_for_compat(
     registry: &freshell_terminal::TerminalRegistry,
+    cli_commands: &[freshell_platform::CliCommandSpec],
     mode: &str,
     create_request_id: &str,
     negotiated_managed_runtime: bool,
@@ -3483,7 +3484,9 @@ async fn adopt_existing_managed_for_compat(
         .simple()
         .to_string();
     if !registry
-        .adopt_managed_for_reconcile(&terminal_id, Some(create_request_id.to_string()))
+        .adopt_managed_for_reconcile(&terminal_id, Some(create_request_id.to_string()), |mode| {
+            crate::terminal_naming::mode_title(cli_commands, mode)
+        })
         .await?
     {
         return Ok(None);
@@ -3813,19 +3816,23 @@ mod managed_runtime_id_tests {
         })));
 
         let adopted =
-            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, false)
+            adopt_existing_managed_for_compat(&registry, &[], "opencode", create_request_id, false)
                 .await
                 .unwrap()
                 .expect("old-capability replay adopts the managed row");
         assert_eq!(adopted, descriptor);
         assert!(registry.is_managed(&terminal_id));
 
-        assert!(
-            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, true,)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(adopt_existing_managed_for_compat(
+            &registry,
+            &[],
+            "opencode",
+            create_request_id,
+            true,
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     async fn assert_compat_create_retains_ownership(wire_ref: bool, already_registered: bool) {
@@ -3861,7 +3868,9 @@ mod managed_runtime_id_tests {
                 final_tail: false,
             })));
         if already_registered {
-            state.registry.register_managed(descriptor);
+            state
+                .registry
+                .register_managed(descriptor, "OpenCode".to_string());
         }
 
         let frames = Arc::new(std::sync::Mutex::new(Vec::<ServerMessage>::new()));
@@ -3967,7 +3976,7 @@ mod managed_runtime_id_tests {
             resume_session_id: Some("ses_match".into()),
             create_request_id: Some("create-match".into()),
         };
-        registry.register_managed(descriptor.clone());
+        registry.register_managed(descriptor.clone(), "OpenCode".to_string());
         let check = |descriptor: &ManagedTerminalDescriptor| {
             super::settle_managed_compat_adoption(
                 &registry, &None, &create, 17, descriptor, &mut None, &mut None, None,
@@ -4018,7 +4027,9 @@ mod managed_runtime_id_tests {
             resume_session_id: Some("ses_retained_ended".into()),
             create_request_id: Some(request.into()),
         };
-        state.registry.register_managed(descriptor.clone());
+        state
+            .registry
+            .register_managed(descriptor.clone(), "OpenCode".to_string());
         state
             .registry
             .ingest_managed_output(&terminal, 1, 1, "final retained tail\n".into());
@@ -4100,7 +4111,7 @@ mod managed_runtime_id_tests {
             resume_session_id: Some("ses_ended_input".into()),
             create_request_id: Some("ended-input-create".into()),
         };
-        registry.register_managed(descriptor.clone());
+        registry.register_managed(descriptor.clone(), "OpenCode".to_string());
         registry.finish_managed_exit(&descriptor.terminal_id, 17);
         registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
             descriptor: descriptor.clone(),
@@ -4773,8 +4784,13 @@ pub(crate) async fn prepare_launch(
 /// Unified agent names (Task 2): the scoped-create naming admission. See
 /// [`handle_create`]'s call site for the ordering contract. Answers the
 /// frame projection (`nameRef` + last-known `sessionName`) when the create
-/// is in scope and a naming authority is wired.
-#[allow(clippy::too_many_arguments)]
+/// is in scope, a naming authority is wired, and a record is known.
+///
+/// Name reliability (Task 10): the admission runs through the shared
+/// terminal naming bind, so a transient store error is retried and then
+/// deferred to the reconcile tick with the binding kept — a read failure on
+/// a resume never falls into the fresh pending path, and a failed
+/// `ensure_pending` still leaves the row bound to its pending handle.
 async fn admit_create_naming(
     state: &WsState,
     create: &TerminalCreate,
@@ -4782,117 +4798,41 @@ async fn admit_create_naming(
     mode: &str,
     cwd: Option<&str>,
     session_locator: Option<&SessionLocator>,
+    fallback_title: String,
 ) -> Option<(
     freshell_protocol::session_names::SessionNameRef,
     freshell_protocol::session_names::SessionNameRecord,
 )> {
-    let provider = freshell_freshagent::naming::named_provider_for(Some(mode), None)?;
-    let sink = state.identity.naming()?;
     // A resume/restore create (a client-sent sessionRef) targets the DURABLE
-    // session's own record — established identities are never re-pended.
-    // The server-side PREALLOCATED identity is deliberately NOT durable
-    // input: a fresh `--session-id` spawn is prospective (the transcript
-    // does not exist yet), so a fresh create always admits its pre-durable
-    // handle and the verified-bind lanes transfer it at materialization.
+    // session's own record — established identities are never re-pended. So
+    // does a managed create the supervisor answered with an existing soul's
+    // native session (a retried create after a web restart). The server-side
+    // PREALLOCATED identity is deliberately NOT durable input: a fresh
+    // `--session-id` spawn is prospective (the transcript does not exist
+    // yet), so a fresh create always admits its pre-durable handle and the
+    // verified-bind lanes transfer it at materialization.
     let durable_session = session_locator
-        .filter(|locator| locator.provider == provider.as_str())
-        .map(|locator| locator.session_id.clone());
-    if let Some(session_id) = durable_session {
-        let target = freshell_protocol::session_names::SessionNameRef::Session {
-            provider,
-            session_id: session_id.clone(),
-        };
-        state
-            .identity
-            .set_name_binding(terminal_id, Some(target.clone()), None);
-        state
-            .registry
-            .set_naming(terminal_id, Some(target.clone()), None);
-        let updates = sink
-            .get(vec![target.clone()])
-            .await
-            .map_err(|error| {
-                // Structured failure log under THIS crate's target.
-                tracing::warn!(
-                    target: "freshell_ws::naming",
-                    op = "get",
-                    name_ref = %freshell_freshagent::naming::name_ref_debug_key(&target),
-                    revision = error.log_revision(),
-                    class = %error.code(),
-                    "session_names.operation_failed: {error}"
-                );
-            })
-            .ok();
-        match updates.and_then(|found| found.into_iter().next()) {
-            Some(update) => {
-                state
-                    .registry
-                    .update_session_name(terminal_id, &update.record);
-                return Some((update.record.name_ref.clone(), update.record));
-            }
-            None => {
-                // A recovery create against a PROSPECTIVE (record-less)
-                // sessionRef — a zero-turn pane whose server restarted —
-                // must re-stamp the PERSISTED pre-durable handle (the pane
-                // content's own namingHandle) instead of leaving the
-                // restored row bound to a dead durable ref: only a pending
-                // binding puts the row on the sweep's reconcile list, so
-                // the verified bind can transfer the record once the
-                // transcript materializes. Without this fallthrough the
-                // pre-durable rename is orphaned behind a spent handle
-                // forever. A record-less durable create WITHOUT a handle
-                // keeps the previous behavior (durable binding, unnamed).
-                let has_persisted_handle = create
-                    .naming_handle
-                    .as_deref()
-                    .map(|handle| !handle.trim().is_empty())
-                    .unwrap_or(false);
-                if !has_persisted_handle {
-                    return None;
-                }
-            }
-        }
-    }
-    // Fresh scoped create: admit the pre-durable handle (client-sent, else
-    // server-minted — the nanoid-style uuid facility).
-    let handle = create
-        .naming_handle
-        .clone()
-        .filter(|h| !h.trim().is_empty())
-        .unwrap_or_else(|| format!("nh-{}", uuid::Uuid::new_v4()));
-    let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle.clone() };
-    let update = sink
-        .ensure_pending(freshell_freshagent::naming::PendingNameInput {
-            handle: handle.clone(),
-            provider,
+        .filter(|locator| locator.provider == mode)
+        .map(|locator| locator.session_id.clone())
+        .or_else(|| {
+            state
+                .registry
+                .managed_descriptor(terminal_id)
+                .and_then(|descriptor| descriptor.resume_session_id)
+        });
+    let outcome = crate::terminal_naming::bind_ws_terminal_naming(
+        state,
+        terminal_id,
+        freshell_freshagent::terminal_name_binding::NamingBindHint {
+            mode: mode.to_string(),
             cwd: cwd.map(str::to_string),
-        })
-        .await
-        .map_err(|error| {
-            // Structured failure log under THIS crate's target.
-            tracing::warn!(
-                target: "freshell_ws::naming",
-                op = "ensure_pending",
-                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&pending),
-                revision = error.log_revision(),
-                class = %error.code(),
-                "session_names.operation_failed: {error}"
-            );
-        })
-        .ok()?;
-    let target = update.record.name_ref.clone();
-    // Retain the binding BEFORE the frame acknowledges creation (the
-    // registry row + identity entry are the rename routes' resolvers).
-    state
-        .identity
-        .set_name_binding(terminal_id, Some(target.clone()), Some(handle.clone()));
-    state
-        .registry
-        .set_naming(terminal_id, Some(target.clone()), Some(handle));
-    state
-        .registry
-        .update_session_name(terminal_id, &update.record);
-    Some((update.record.name_ref.clone(), update.record))
+            resume_session_id: durable_session,
+            naming_handle: create.naming_handle.clone(),
+            fallback_title,
+        },
+    )
+    .await;
+    outcome.projection()
 }
 
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
@@ -5704,6 +5644,7 @@ pub(crate) async fn handle_create(
     // terminal protocol without requiring the old client to understand souls.
     match adopt_existing_managed_for_compat(
         &state.registry,
+        &state.cli_commands,
         &mode,
         &create.request_id,
         use_managed_runtime,
@@ -5733,6 +5674,14 @@ pub(crate) async fn handle_create(
                     .await;
                 }
             };
+            // Name reliability (Task 10): the reconstructed facade binds the
+            // soul's saved name before the frame acknowledges it.
+            crate::terminal_naming::bind_adopted_managed_row(
+                state,
+                &descriptor,
+                create.naming_handle.clone(),
+            )
+            .await;
             tracing::info!(
                 terminal_id = %managed_terminal_id,
                 create_request_id = %create.request_id,
@@ -6901,7 +6850,9 @@ pub(crate) async fn handle_create(
         };
         match state.registry.launch_managed(managed).await {
             Ok(descriptor) => {
-                state.registry.register_managed(descriptor);
+                state
+                    .registry
+                    .register_managed(descriptor, mode_label(&mode, cli.as_ref()));
                 tracing::info!(
                     terminal_id = %terminal_id,
                     mode = %mode,
@@ -7578,6 +7529,7 @@ pub(crate) async fn handle_create(
         &mode,
         spec.cwd.as_deref(),
         create_session_locator(&create).as_ref(),
+        mode_label(&mode, cli.as_ref()),
     )
     .await;
     let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
@@ -8248,6 +8200,26 @@ pub async fn respawn_agent_terminal(
         }
     }
 
+    // Name reliability (Task 10): the replacement row resumes the SAME
+    // durable session, so it binds that session's saved name (its title was
+    // "<Mode> (auto-resumed)" with no binding at all). With no record yet the
+    // auto-resumed label stays. A gate-fired fresh respawn (the cached session
+    // is gone) is prospective, so it admits a pending handle instead.
+    crate::terminal_naming::bind_ws_terminal_naming(
+        state,
+        &terminal_id,
+        freshell_freshagent::terminal_name_binding::NamingBindHint {
+            mode: mode.clone(),
+            cwd: spec.cwd.clone(),
+            resume_session_id: resume_session_id
+                .clone()
+                .filter(|_| launch_intent == LaunchIntent::Resume),
+            naming_handle: None,
+            fallback_title: format!("{} (auto-resumed)", mode_label(&mode, cli.as_ref())),
+        },
+    )
+    .await;
+
     // "Notify all clients that list changed" so sidebars refresh, then the
     // meta slice — the same closing pair as `handle_create`.
     broadcast_terminals_changed(state);
@@ -8504,10 +8476,12 @@ async fn handle_pane_reconcile(
             if state.registry.exists(terminal_id) {
                 continue;
             }
-            match state
-                .registry
-                .adopt_managed_for_reconcile(terminal_id, pane.create_request_id.clone())
-                .await
+            match crate::terminal_naming::adopt_managed_row_for_reconcile(
+                state,
+                terminal_id,
+                pane.create_request_id.clone(),
+            )
+            .await
             {
                 Ok(true) => tracing::info!(
                     terminal_id,
@@ -12867,6 +12841,10 @@ mod connection_span_filter_tests {
 /// shape). Pre-reconcile ("frozen") clients never send the request, so the
 /// error code can never reach them (frozen-client wire parity).
 #[cfg(test)]
+#[path = "terminal_naming_tests.rs"]
+mod terminal_naming_tests;
+
+#[cfg(test)]
 mod pane_reconcile_gate_tests {
     use super::*;
 
@@ -13420,16 +13398,19 @@ mod managed_output_order_tests {
         read_error: Option<&str>,
     ) -> String {
         let terminal_id = format!("T-managed-{suffix}");
-        state.registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: format!("soul-{suffix}"),
-            incarnation_id: format!("incarnation-{suffix}"),
-            terminal_id: terminal_id.clone(),
-            stream_id: format!("S-managed-{suffix}"),
-            mode: "opencode".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: Some(format!("ses-{suffix}")),
-            create_request_id: Some(format!("req-{suffix}")),
-        });
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: format!("soul-{suffix}"),
+                incarnation_id: format!("incarnation-{suffix}"),
+                terminal_id: terminal_id.clone(),
+                stream_id: format!("S-managed-{suffix}"),
+                mode: "opencode".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: Some(format!("ses-{suffix}")),
+                create_request_id: Some(format!("req-{suffix}")),
+            },
+            "OpenCode".to_string(),
+        );
         let blocked_lifecycle = ManagedLifecycle {
             state: ManagedLifecycleState::Blocked,
             recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
@@ -13460,16 +13441,19 @@ mod managed_output_order_tests {
     async fn native_identity_and_exit_in_one_read_bind_before_exit() {
         let state = super::pane_reconcile_gate_tests::state();
         let terminal_id = "T-managed-short-lived";
-        state.registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-short-lived".into(),
-            incarnation_id: "incarnation-short-lived".into(),
-            terminal_id: terminal_id.into(),
-            stream_id: "S-managed-short-lived".into(),
-            mode: "opencode".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: None,
-            create_request_id: Some("req-short-lived".into()),
-        });
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-short-lived".into(),
+                incarnation_id: "incarnation-short-lived".into(),
+                terminal_id: terminal_id.into(),
+                stream_id: "S-managed-short-lived".into(),
+                mode: "opencode".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: Some("req-short-lived".into()),
+            },
+            "OpenCode".to_string(),
+        );
         state
             .registry
             .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
@@ -13509,16 +13493,19 @@ mod managed_output_order_tests {
     async fn managed_final_exit_waits_for_all_retained_pages() {
         let state = super::pane_reconcile_gate_tests::state();
         let terminal = "T-managed-short-lived";
-        state.registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-short-lived".into(),
-            incarnation_id: "incarnation-short-lived".into(),
-            terminal_id: terminal.into(),
-            stream_id: "S-managed-short-lived".into(),
-            mode: "opencode".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: None,
-            create_request_id: Some("req-short-lived".into()),
-        });
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-short-lived".into(),
+                incarnation_id: "incarnation-short-lived".into(),
+                terminal_id: terminal.into(),
+                stream_id: "S-managed-short-lived".into(),
+                mode: "opencode".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: Some("req-short-lived".into()),
+            },
+            "OpenCode".to_string(),
+        );
         state
             .registry
             .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
@@ -13556,16 +13543,19 @@ mod managed_output_order_tests {
         let state = super::pane_reconcile_gate_tests::state();
         let terminal_id = "T-managed-blocked";
         let mut events = state.broadcast_tx.subscribe();
-        state.registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-blocked".into(),
-            incarnation_id: "incarnation-blocked".into(),
-            terminal_id: terminal_id.into(),
-            stream_id: "S-managed-blocked".into(),
-            mode: "opencode".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: Some("ses-blocked".into()),
-            create_request_id: Some("req-blocked".into()),
-        });
+        state.registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-blocked".into(),
+                incarnation_id: "incarnation-blocked".into(),
+                terminal_id: terminal_id.into(),
+                stream_id: "S-managed-blocked".into(),
+                mode: "opencode".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: Some("ses-blocked".into()),
+                create_request_id: Some("req-blocked".into()),
+            },
+            "OpenCode".to_string(),
+        );
         state
             .registry
             .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
@@ -13791,16 +13781,19 @@ mod managed_output_order_tests {
         async {
             let state = super::pane_reconcile_gate_tests::state();
             let terminal = "T-managed-failures";
-            state.registry.register_managed(ManagedTerminalDescriptor {
-                soul_id: "soul-failure".into(),
-                incarnation_id: "incarnation-failure".into(),
-                terminal_id: terminal.into(),
-                stream_id: "epoch-failure".into(),
-                mode: "shell".into(),
-                cwd: "/workspace".into(),
-                resume_session_id: None,
-                create_request_id: None,
-            });
+            state.registry.register_managed(
+                ManagedTerminalDescriptor {
+                    soul_id: "soul-failure".into(),
+                    incarnation_id: "incarnation-failure".into(),
+                    terminal_id: terminal.into(),
+                    stream_id: "epoch-failure".into(),
+                    mode: "shell".into(),
+                    cwd: "/workspace".into(),
+                    resume_session_id: None,
+                    create_request_id: None,
+                },
+                "Shell".to_string(),
+            );
             let controller = Arc::new(FailedRead(StdMutex::new(Some(
                 "transport unavailable secret=synthetic-sensitive".into(),
             ))));

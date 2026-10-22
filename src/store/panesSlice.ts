@@ -41,6 +41,7 @@ import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, pr
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
+import { releaseSupersededConversationNaming } from '@/lib/terminal-naming-rebind'
 import { ManagedRuntimeProjectionFieldsSchema, type ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
 
@@ -2366,7 +2367,7 @@ export const panesSlice = createSlice({
 
     reconcileTerminalSessionRefByTerminalId: (
       state,
-      action: PayloadAction<{ terminalId: string; sessionRef: unknown }>
+      action: PayloadAction<{ terminalId: string; sessionRef: unknown; previousSessionId?: string }>
     ) => {
       const terminalId = action.payload.terminalId
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
@@ -2384,6 +2385,7 @@ export const panesSlice = createSlice({
           }
 
           if (!sessionRefsEqual(content.sessionRef, canonicalSessionRef)) {
+            releaseSupersededConversationNaming(content, canonicalSessionRef, action.payload.previousSessionId)
             content.sessionRef = canonicalSessionRef
           }
           content.resumeSessionId = undefined

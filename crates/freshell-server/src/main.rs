@@ -1784,8 +1784,6 @@ async fn main() -> ExitCode {
         .with_terminal_created_hook({
             let terminal_meta = terminal_meta.clone();
             let broadcast_tx = Arc::clone(&broadcast_tx);
-            let terminal_identity = terminal_identity.clone();
-            let registry = registry.clone();
             Arc::new(move |event: freshell_freshagent::TerminalCreatedEvent| {
                 freshell_ws::terminal_meta::seed_from_terminal(
                     &terminal_meta,
@@ -1795,27 +1793,16 @@ async fn main() -> ExitCode {
                     event.resume_session_id.as_deref(),
                     event.cwd.as_deref(),
                 );
-                // Unified agent names (Task 2): write the REST create-lane
-                // naming binding onto the SHARED identity registry (the CLI
-                // locator bind lanes and every rename resolver read it) and
-                // the terminal registry row (the display cache the
-                // `/api/terminals` projection carries). The WS create path
-                // performs its own admission — this hook only fires for
-                // REST-pipeline creates, so no row is double-bound.
-                if event.naming_handle.is_some() || event.name_ref.is_some() {
-                    terminal_identity.set_name_binding(
-                        &event.terminal_id,
-                        event.name_ref.clone(),
-                        event.naming_handle.clone(),
-                    );
-                    registry.set_naming(
-                        &event.terminal_id,
-                        event.name_ref.clone(),
-                        event.naming_handle.clone(),
-                    );
-                }
             })
-        });
+        })
+        // Name reliability (Task 10): the REST door's terminal naming bind
+        // writes the SAME shared identity registry the WS door binds (the
+        // CLI locator bind lanes and every rename resolver read it), through
+        // the one shared helper — replacing this hook's former binding
+        // write, so the registry row's cache and title are filled too.
+        .with_terminal_name_binder(Arc::new(
+            freshell_ws::terminal_naming::IdentityNameBinder::new(terminal_identity.clone()),
+        ));
     // Batch B: `session_directory` no longer re-walks + re-parses every
     // transcript on every request -- it reads a cached, TTL-refreshed
     // `SessionIndex`. Batch C adds `CodexSource` (file-based, same shape as
@@ -2742,6 +2729,12 @@ async fn main() -> ExitCode {
         ws_state.clone(),
         codex_proxy_events_rx,
     );
+    // Name reliability (Task 10): the 2s terminal-naming reconcile — rows
+    // whose identity ref moved (a conversation switch no caller reported),
+    // scoped rows with no naming binding, and bound rows with an empty name
+    // cache. Runs beside the naming tick above (which owns store adoption and
+    // the pending binds); one batched read per pass.
+    freshell_ws::terminal_naming::spawn_terminal_naming_reconcile(ws_state.clone());
     // P4 (stale-resume-identity): claude SessionStart signal sweep — drains
     // the signal files Task 11's launch hook writes
     // (`$HOME/.freshell/session-signals/claude/<terminal_id>__<nonce>.json`)

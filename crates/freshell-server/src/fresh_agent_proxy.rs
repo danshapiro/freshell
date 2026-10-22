@@ -81,6 +81,17 @@ impl HostedFreshAgentProxy {
             format!("{OPT_IN_ENV}=1 requires an available managed runtime controller")
         })?;
         let fixture_modes = configured_fixture_modes()?;
+        // Name reliability (Task 10, Residual 4): hosted fresh agents admit a
+        // pending name at create and read a resumed session's name, but no
+        // lane reports their first message or transfers the pending name onto
+        // the native session, so they never get a first-message or AI name.
+        // Said once at boot so enabling the flag cannot hide the gap.
+        tracing::warn!(
+            target: "freshell_server::session_names",
+            flag = OPT_IN_ENV,
+            "session_names.hosted_fresh_agent_naming_incomplete: hosted fresh-agent \
+             sessions keep their create-time name only (no first-message or AI naming)"
+        );
         Ok(Some(Arc::new(Self {
             client,
             broadcast,

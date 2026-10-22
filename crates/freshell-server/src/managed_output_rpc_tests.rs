@@ -233,7 +233,7 @@ async fn managed_runtime_failed_retained_read_publishes_blocked_without_fabricat
         resume_session_id: Some("native-retained-failure".into()),
         create_request_id: Some("failed-read-create".into()),
     };
-    registry.register_managed(descriptor.clone());
+    registry.register_managed(descriptor.clone(), "Shell".to_string());
     registry.set_managed_controller(Some(controller.clone()));
     let result = registry
         .refresh_managed_output(&descriptor.terminal_id, 65536)

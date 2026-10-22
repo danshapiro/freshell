@@ -118,6 +118,32 @@ function sessionIdsOf(entries: Array<{ argv: string[] }>): string[] {
   })
 }
 
+/** The server's `/api/terminals` rows. */
+async function terminalRows(info: E2eServerInfo): Promise<Array<Record<string, any>>> {
+  const response = await fetch(`${info.baseUrl}/api/terminals`, {
+    headers: { 'x-auth-token': info.token },
+  })
+  expect(response.ok, `GET /api/terminals: ${response.status}`).toBe(true)
+  return await response.json() as Array<Record<string, any>>
+}
+
+/** Rename a terminal's saved name through its route (bounded 429 retry: the
+ *  API rate limiter is shared). */
+async function renameTerminal(info: E2eServerInfo, terminalId: string, name: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch(`${info.baseUrl}/api/terminals/${encodeURIComponent(terminalId)}`, {
+      method: 'PATCH',
+      headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ titleOverride: name, nameIntent: 'user' }),
+    })
+    if (response.ok) return
+    if (response.status !== 429 || attempt >= 5) {
+      throw new Error(`rename failed: ${response.status} ${await response.text()}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 600))
+  }
+}
+
 /** Boot a page against the server (donor: recover-my-panes-rust.spec.ts:125). */
 async function connect(page: Page, info: { baseUrl: string; token: string }): Promise<TestHarness> {
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -268,6 +294,84 @@ test.describe('agent crash auto-resume (rust only)', () => {
         expect(claude.content.status).toBe('running')
         expect(claude.content.terminalId).toBeTruthy()
       }).toPass({ timeout: 30_000 })
+    } finally {
+      await teardownRigPage(rigPage)
+    }
+  })
+
+  // Name reliability (Task 10): the auto-resume respawn's replacement row is
+  // bound to the SAME durable session, so it carries the saved name (it was
+  // titled "Claude CLI (auto-resumed)" with no naming binding at all).
+  test('the auto-resumed terminal keeps its saved name', async ({ browser }) => {
+    test.setTimeout(240_000)
+    let rigPage: RigPage | undefined
+    try {
+      // Invocation 1 stays alive until the test sends `crash-now`; every
+      // invocation writes the transcript the claude naming lane verifies the
+      // pane's pending name against.
+      rigPage = await bootRigPage(browser, 'named', {
+        FAKE_CRASH_ON_LINE: 'crash-now',
+        FAKE_CLAUDE_TRANSCRIPT: '1',
+      })
+      const { rig, page } = rigPage
+      await createClaudePane(page, rig.info)
+
+      let sessionId = ''
+      await expect(async () => {
+        const sid = sessionIdsOf(await readArgvLog(rig!.argvLog))[0]
+        expect(sid, 'fake claude received a pre-allocated --session-id').toBeTruthy()
+        sessionId = sid!
+      }).toPass({ timeout: 30_000 })
+
+      // The pane's pending name is bound onto the durable session.
+      let originalTerminalId = ''
+      await expect(async () => {
+        const row = (await terminalRows(rig!.info)).find((candidate) =>
+          candidate.mode === 'claude' && candidate.status === 'running')
+        expect(row?.nameRef, 'the claude row is bound to its durable session').toEqual({
+          kind: 'session', provider: 'claude', sessionId,
+        })
+        originalTerminalId = row!.terminalId
+      }).toPass({ timeout: 30_000 })
+
+      // Rename it, then crash the CLI.
+      await renameTerminal(rig.info, originalTerminalId, 'Survivor')
+      await expect(async () => {
+        const row = (await terminalRows(rig!.info)).find((candidate) =>
+          candidate.terminalId === originalTerminalId)
+        expect(row?.sessionName?.name).toBe('Survivor')
+      }).toPass({ timeout: 30_000 })
+      await page.evaluate((terminalId: string) => {
+        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+          type: 'terminal.input', terminalId, data: 'crash-now\r',
+        })
+      }, originalTerminalId)
+
+      // Auto-resume: invocation 2 is `--resume <same id>`.
+      await expect(async () => {
+        const entries = await readArgvLog(rig!.argvLog)
+        expect(entries.length, 'one crash + one auto-resume').toBe(2)
+        expect(hasClaudeResumePair(entries[1].argv, sessionId)).toBe(true)
+      }).toPass({ timeout: 30_000 })
+
+      // The replacement row carries the saved name...
+      let resumedTerminalId = ''
+      await expect(async () => {
+        const row = (await terminalRows(rig!.info)).find((candidate) =>
+          candidate.mode === 'claude'
+          && candidate.status === 'running'
+          && candidate.terminalId !== originalTerminalId)
+        expect(row, 'the auto-resumed row is listed').toBeTruthy()
+        expect(row!.sessionName?.name).toBe('Survivor')
+        expect(row!.title).toBe('Survivor')
+        resumedTerminalId = row!.terminalId
+      }).toPass({ timeout: 30_000 })
+
+      // ...and the Overview card shows it.
+      await page.getByTitle('Panes (Ctrl+B O)').click()
+      const card = page.locator(`[data-terminal-id="${resumedTerminalId}"]`)
+      await expect(card).toBeVisible({ timeout: 15_000 })
+      await expect(card).toContainText('Survivor', { timeout: 15_000 })
     } finally {
       await teardownRigPage(rigPage)
     }
