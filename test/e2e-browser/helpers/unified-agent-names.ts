@@ -1310,6 +1310,10 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
       await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
       await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
     } catch (error) {
+      // The editor closed between the error check and the resubmit: the
+      // earlier submit committed (the editor closing is the product's
+      // success signal; the label assertion below is the commit gate).
+      if (!(await input.isVisible().catch(() => false))) break
       console.error(`[unified-agent-names] tab rename resubmit failed: ${String(error).slice(0, 200)}`)
     }
   }

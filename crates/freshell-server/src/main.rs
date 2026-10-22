@@ -55,6 +55,8 @@ mod managed_provider_sdk_tests;
 mod managed_runtime;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime_api;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_view_intent;
 mod migrations;
 mod net_bind;
 mod network;

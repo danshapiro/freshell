@@ -18,8 +18,7 @@ use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
     FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest, RequestId,
-    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome, ViewIntentKind,
-    ViewIntentRequest, ViewVisibilityIntent,
+    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -765,16 +764,11 @@ impl HostedFreshAgentProxy {
             fixture: None,
             terminal: None,
             fresh_agent: Some(launch),
-            view_intent: Some(ViewIntentRequest {
-                owner_id: String::new(),
-                workspace_id: project_key,
-                kind: ViewIntentKind::AutomaticPrimary,
-                preferred_tab_id: message.tab_id.clone(),
-                preferred_pane_id: None,
-                title: Some(format!("{} agent", provider.as_str())),
-                placement_group: None,
-                visibility: ViewVisibilityIntent::Visible,
-            }),
+            view_intent: Some(crate::managed_view_intent::automatic_primary_view_request(
+                project_key,
+                message.tab_id.clone(),
+                None,
+            )),
             expected_control_epoch: None,
         };
         let launched = if provider == FreshProvider::Opencode {

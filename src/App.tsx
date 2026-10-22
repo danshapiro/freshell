@@ -1693,7 +1693,8 @@ export default function App() {
             const status = aggregateTerminalTabStatus(collectPaneEntries(layout).flatMap(({ content }) => (
               content.kind === 'terminal' ? [content.status] : []
             )))
-            if (status) dispatch(updateTab({ id: tabId, updates: { status } }))
+            // A runtime fact, not a user action: never the tab's recency.
+            if (status) dispatch(updateTab({ id: tabId, updates: { status }, touchUpdatedAt: false }))
           }
           dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: terminalMetaRequestedAt }))
           dispatch(patchSessionRunningStateFromTerminalMeta({

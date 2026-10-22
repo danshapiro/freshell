@@ -544,7 +544,6 @@ impl Registry {
                     &installation_id,
                     &input.soul_id,
                     &input.project_key,
-                    &input.provider,
                     soul_intent_revision,
                     input.view_intent.as_ref(),
                     now,
