@@ -504,6 +504,77 @@ fn repeated_edits_of_one_file_add_up() {
     assert_eq!(b["status"], json!("+2 \u{2212}0"));
 }
 
+/// tools-sync's real lines for these tool calls and their results.
+fn tools_sync_lines_for(tool_use_ids: &[&str]) -> String {
+    real_cli_fixture!("tools-sync")
+        .lines()
+        .filter(|line| {
+            let value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+            value["message"]["content"]
+                .as_array()
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        tool_use_ids
+                            .iter()
+                            .any(|id| block["id"] == json!(id) || block["tool_use_id"] == json!(id))
+                    })
+                })
+        })
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+fn diffs_with(transcript: &str, subagents: &dyn SubagentSource) -> Vec<Value> {
+    ClaudeTranscriptProjector::project_with("s", transcript, subagents).diffs
+}
+
+#[test]
+fn files_a_subagent_changed_join_the_changed_files() {
+    // The background agent's own transcript (a Read), plus a successful Edit
+    // of b.txt and a failed Edit of a.txt in the subagent's thread. The
+    // main thread itself only created a.txt.
+    let main = real_cli_fixture!("agent-async");
+    let child = format!(
+        "{}{}",
+        subagent_transcript("agent-async"),
+        tools_sync_lines_for(&["toolu_edit2", "toolu_edit3"])
+    );
+    let subagents = MapSubagents([("toolu_agent1".to_string(), child)].into());
+    assert_eq!(
+        diffs_with(main, &subagents),
+        vec![
+            json!({ "id": "/fixture/ws/a.txt", "path": "/fixture/ws/a.txt", "status": "created" }),
+            json!({ "id": "/fixture/ws/b.txt", "path": "/fixture/ws/b.txt", "status": "+1 \u{2212}0" }),
+        ]
+    );
+}
+
+#[test]
+fn a_file_both_threads_edited_sums_their_changes() {
+    // tools-sync's main thread adds one line to b.txt; its subagent adds
+    // another (the same real Edit, run in the subagent's thread).
+    let child = format!(
+        "{}{}",
+        subagent_transcript("tools-sync"),
+        tools_sync_lines_for(&["toolu_edit3"])
+    );
+    let subagents = MapSubagents([("toolu_agent1".to_string(), child)].into());
+    let b = diffs_with(real_cli_fixture!("tools-sync"), &subagents)
+        .into_iter()
+        .find(|row| row["path"] == json!("/fixture/ws/b.txt"))
+        .unwrap();
+    assert_eq!(b["status"], json!("+2 \u{2212}0"));
+}
+
+#[test]
+fn a_subagent_that_changed_nothing_adds_no_changed_files() {
+    let subagents = FsSubagents::for_transcript(&fixture_path("agent-async/session.jsonl"));
+    assert_eq!(
+        diffs_with(real_cli_fixture!("agent-async"), &subagents),
+        diffs_of(real_cli_fixture!("agent-async"))
+    );
+}
+
 #[test]
 fn a_transcript_without_file_edits_has_no_changed_files() {
     assert!(diffs_of(real_cli_fixture!("compact-ok")).is_empty());

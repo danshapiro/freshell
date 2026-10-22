@@ -12,7 +12,9 @@
 //!   compaction it writes the last message again, just before the
 //!   `system/compact_boundary` line) projects once;
 //! - a compaction recap (`isCompactSummary`) with no preceding
-//!   `system/compact_boundary` line still gets a `context_compaction` marker.
+//!   `system/compact_boundary` line still gets a `context_compaction` marker;
+//! - the diff panel's changed files, from the main thread's edit tools and
+//!   each delegation's subagent transcript.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -46,6 +48,73 @@ const DEFAULT_SUBAGENT: &str = "general-purpose";
 pub(crate) trait SubagentSource {
     /// The JSONL of the subagent the `tool_use_id` delegation started.
     fn transcript_for(&self, tool_use_id: &str) -> Option<String>;
+
+    /// What that transcript contributes to the projection.
+    fn summary_for(&self, tool_use_id: &str) -> Option<SubagentSummary> {
+        self.transcript_for(tool_use_id)
+            .map(|transcript| SubagentSummary::from_transcript(&transcript))
+    }
+}
+
+/// What one subagent transcript contributes to the projection.
+#[derive(Clone, Default)]
+pub(crate) struct SubagentSummary {
+    /// `{tool, status, preview}` for each tool call, in order: completed or
+    /// failed once its result line exists, running before (the delegation's
+    /// `↳ Tool preview` rows), capped at [`DELEGATION_ACTIVITY_ROW_CAP`].
+    activity: Vec<Value>,
+    /// Files the subagent's own edit-tool calls changed.
+    changed_files: BTreeMap<String, ChangedFile>,
+}
+
+impl SubagentSummary {
+    pub(crate) fn from_transcript(transcript: &str) -> Self {
+        let mut activity: Vec<Value> = Vec::new();
+        let mut row_by_tool_use: HashMap<String, usize> = HashMap::new();
+        let mut changed_files = ChangedFiles::default();
+        for line in transcript.lines() {
+            let Ok(obj) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            changed_files.observe(&obj);
+            for block in message_blocks(&obj) {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        if activity.len() >= DELEGATION_ACTIVITY_ROW_CAP {
+                            continue;
+                        }
+                        let tool = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                        if let Some(id) = block.get("id").and_then(Value::as_str) {
+                            row_by_tool_use.insert(id.to_string(), activity.len());
+                        }
+                        activity.push(json!({
+                            "tool": tool,
+                            "status": "running",
+                            "preview": delegation_activity_preview(tool, &input),
+                        }));
+                    }
+                    Some("tool_result") => {
+                        let Some(index) = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| row_by_tool_use.get(id))
+                        else {
+                            continue;
+                        };
+                        let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                        activity[*index]["status"] =
+                            json!(if failed { "failed" } else { "completed" });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            activity,
+            changed_files: changed_files.files,
+        }
+    }
 }
 
 /// No subagent transcripts (pure projections: rollback slices, goldens).
@@ -92,7 +161,7 @@ impl FsSubagents {
                     target: "freshell_freshagent::claude",
                     event = "claude_subagent_meta_unreadable",
                     path = %path.display(),
-                    "claude subagent meta.json has no toolUseId; its activity is not shown"
+                    "claude subagent meta.json has no toolUseId; its activity and file changes are not shown"
                 ),
             }
         }
@@ -140,11 +209,9 @@ pub(crate) struct ClaudeTranscriptProjector {
     /// `system/compact_boundary` uuids, to tell whether a compaction recap
     /// already has its marker.
     compact_boundaries: HashSet<String>,
-    /// File-editing tool calls seen so far: tool_use id -> the path their
-    /// input names (the result line names only the tool_use id).
-    edit_calls: HashMap<String, Option<String>>,
-    /// Files changed by successful edit tools, by path (one row per path).
-    changed_files: BTreeMap<String, ChangedFile>,
+    /// Files the main thread's edit tools changed (the diff panel's rows;
+    /// each delegation's subagent edits join them at finish).
+    changed_files: ChangedFiles,
     /// The session indexer's own token-usage definition (one context meter).
     usage: ClaudeUsageAccumulator,
     /// The newest uuid-bearing lines in file order, whether or not they
@@ -162,7 +229,123 @@ struct ChangedFile {
     patched: bool,
 }
 
+/// The files one transcript's edit-tool calls changed, fed every line in
+/// order: a `tool_use` names the file, its result line says whether (and
+/// how) it changed.
+#[derive(Clone, Default)]
+struct ChangedFiles {
+    /// File-editing tool calls seen so far: tool_use id -> the path their
+    /// input names (the result line names only the tool_use id).
+    edit_calls: HashMap<String, Option<String>>,
+    /// Files changed by successful edit tools, by path (one row per path).
+    files: BTreeMap<String, ChangedFile>,
+}
+
+impl ChangedFiles {
+    fn observe(&mut self, obj: &Value) {
+        self.record_edit_calls(obj);
+        self.record_results(obj);
+    }
+
+    /// Remember each file-editing tool call and the path its input names.
+    fn record_edit_calls(&mut self, obj: &Value) {
+        if obj.get("type").and_then(Value::as_str) != Some("assistant") {
+            return;
+        }
+        for block in message_blocks(obj) {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let (Some(id), Some(name)) = (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if !FILE_EDIT_TOOLS.contains(&name) {
+                continue;
+            }
+            let path = block.get("input").and_then(edited_path).map(str::to_string);
+            self.edit_calls.insert(id.to_string(), path);
+        }
+    }
+
+    /// A successful Edit/Write/MultiEdit/NotebookEdit result changes its file;
+    /// the CLI's structured `toolUseResult` carries the patch (F4).
+    fn record_results(&mut self, obj: &Value) {
+        if obj.get("type").and_then(Value::as_str) != Some("user") {
+            return;
+        }
+        let results: Vec<&Value> = message_blocks(obj)
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .collect();
+        // One structured result per line; a multi-result line is ambiguous.
+        let [result] = results.as_slice() else {
+            return;
+        };
+        if result.get("is_error").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        let Some(structured) = obj.get("toolUseResult").filter(|value| value.is_object()) else {
+            return;
+        };
+        let Some(input_path) = result
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .and_then(|id| self.edit_calls.get(id))
+        else {
+            return;
+        };
+        let Some(path) = edited_path(structured).or(input_path.as_deref()) else {
+            return;
+        };
+        let file = self.files.entry(path.to_string()).or_default();
+        if structured.get("type").and_then(Value::as_str) == Some("create") {
+            file.created = true;
+        }
+        if let Some(hunks) = structured.get("structuredPatch").and_then(Value::as_array) {
+            for line in hunks
+                .iter()
+                .filter_map(|hunk| hunk.get("lines").and_then(Value::as_array))
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if line.starts_with('+') {
+                    file.added += 1;
+                    file.patched = true;
+                } else if line.starts_with('-') {
+                    file.removed += 1;
+                    file.patched = true;
+                }
+            }
+        }
+    }
+
+    /// Add another thread's changes (a subagent's) to these.
+    fn absorb(&mut self, files: &BTreeMap<String, ChangedFile>) {
+        for (path, file) in files {
+            self.files.entry(path.clone()).or_default().absorb(file);
+        }
+    }
+
+    /// The diff panel's rows, one per path.
+    fn rows(&self) -> Vec<Value> {
+        self.files
+            .iter()
+            .map(|(path, file)| json!({ "id": path, "path": path, "status": file.status() }))
+            .collect()
+    }
+}
+
 impl ChangedFile {
+    fn absorb(&mut self, other: &ChangedFile) {
+        self.created |= other.created;
+        self.added += other.added;
+        self.removed += other.removed;
+        self.patched |= other.patched;
+    }
+
     /// `created` for a file this session created; else `+A −D` summed over
     /// every successful edit's patch lines.
     fn status(&self) -> String {
@@ -185,8 +368,7 @@ impl ClaudeTranscriptProjector {
             delegations_by_agent: HashMap::new(),
             projected_uuids: HashSet::new(),
             compact_boundaries: HashSet::new(),
-            edit_calls: HashMap::new(),
-            changed_files: BTreeMap::new(),
+            changed_files: ChangedFiles::default(),
             usage: ClaudeUsageAccumulator::new(),
             recent_line_uuids: VecDeque::with_capacity(TRANSCRIPT_LINE_UUID_WINDOW),
         }
@@ -255,8 +437,7 @@ impl ClaudeTranscriptProjector {
             self.remember(uuid);
             return;
         }
-        self.record_edit_calls(obj);
-        self.record_changed_files(obj);
+        self.changed_files.observe(obj);
         let Some(mut turn) = parse_transcript_turn(obj, &self.thread_id, self.turns.len()) else {
             return;
         };
@@ -277,7 +458,10 @@ impl ClaudeTranscriptProjector {
     }
 
     /// The projection, with each delegation's subagent tool calls attached as
-    /// `activity` rows (`↳ Tool preview` in the client).
+    /// `activity` rows (`↳ Tool preview` in the client) and the files its
+    /// subagent changed joining the session's changed files. Only the
+    /// delegations this transcript started count (a nested subagent's own
+    /// delegations are not followed).
     pub(crate) fn finish_with(mut self, subagents: &dyn SubagentSource) -> ClaudeProjection {
         let delegations: Vec<(String, ItemLocation)> = self
             .delegations
@@ -285,25 +469,20 @@ impl ClaudeTranscriptProjector {
             .map(|(id, location)| (id.clone(), *location))
             .collect();
         for (tool_use_id, location) in delegations {
-            let Some(transcript) = subagents.transcript_for(&tool_use_id) else {
+            let Some(summary) = subagents.summary_for(&tool_use_id) else {
                 continue;
             };
-            let rows = subagent_activity_rows(&transcript);
-            if rows.is_empty() {
+            self.changed_files.absorb(&summary.changed_files);
+            if summary.activity.is_empty() {
                 continue;
             }
             if let Some(item) = self.item_mut(location) {
-                item["activity"] = Value::Array(rows);
+                item["activity"] = Value::Array(summary.activity);
             }
         }
-        let diffs = self
-            .changed_files
-            .iter()
-            .map(|(path, file)| json!({ "id": path, "path": path, "status": file.status() }))
-            .collect();
         ClaudeProjection {
             turns: self.turns,
-            diffs,
+            diffs: self.changed_files.rows(),
             token_usage: token_usage_json(&self.usage),
             transcript_line_uuids: self.recent_line_uuids.into(),
         }
@@ -324,81 +503,6 @@ impl ClaudeTranscriptProjector {
             self.recent_line_uuids.pop_front();
         }
         self.recent_line_uuids.push_back(uuid.to_string());
-    }
-
-    /// Remember each file-editing tool call and the path its input names.
-    fn record_edit_calls(&mut self, obj: &Value) {
-        if obj.get("type").and_then(Value::as_str) != Some("assistant") {
-            return;
-        }
-        for block in message_blocks(obj) {
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
-            }
-            let (Some(id), Some(name)) = (
-                block.get("id").and_then(Value::as_str),
-                block.get("name").and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            if !FILE_EDIT_TOOLS.contains(&name) {
-                continue;
-            }
-            let path = block.get("input").and_then(edited_path).map(str::to_string);
-            self.edit_calls.insert(id.to_string(), path);
-        }
-    }
-
-    /// A successful Edit/Write/MultiEdit/NotebookEdit result changes its file;
-    /// the CLI's structured `toolUseResult` carries the patch (F4).
-    fn record_changed_files(&mut self, obj: &Value) {
-        if obj.get("type").and_then(Value::as_str) != Some("user") {
-            return;
-        }
-        let results: Vec<&Value> = message_blocks(obj)
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-            .collect();
-        // One structured result per line; a multi-result line is ambiguous.
-        let [result] = results.as_slice() else {
-            return;
-        };
-        if result.get("is_error").and_then(Value::as_bool) == Some(true) {
-            return;
-        }
-        let Some(structured) = obj.get("toolUseResult").filter(|value| value.is_object()) else {
-            return;
-        };
-        let Some(input_path) = result
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .and_then(|id| self.edit_calls.get(id))
-        else {
-            return;
-        };
-        let Some(path) = edited_path(structured).or(input_path.as_deref()) else {
-            return;
-        };
-        let file = self.changed_files.entry(path.to_string()).or_default();
-        if structured.get("type").and_then(Value::as_str) == Some("create") {
-            file.created = true;
-        }
-        if let Some(hunks) = structured.get("structuredPatch").and_then(Value::as_array) {
-            for line in hunks
-                .iter()
-                .filter_map(|hunk| hunk.get("lines").and_then(Value::as_array))
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                if line.starts_with('+') {
-                    file.added += 1;
-                    file.patched = true;
-                } else if line.starts_with('-') {
-                    file.removed += 1;
-                    file.patched = true;
-                }
-            }
-        }
     }
 
     fn remember(&mut self, uuid: Option<&str>) {
@@ -653,53 +757,6 @@ fn set_background(delegation: &mut Value) {
         .to_string();
     let description = delegation["description"].as_str().unwrap_or("").to_string();
     delegation["title"] = json!(task_delegation_title(&subagent, true, &description));
-}
-
-/// `{tool, status, preview}` for each tool call in a subagent transcript, in
-/// order: completed or failed once its result line exists, running before.
-fn subagent_activity_rows(transcript: &str) -> Vec<Value> {
-    let mut rows: Vec<Value> = Vec::new();
-    let mut row_by_tool_use: HashMap<String, usize> = HashMap::new();
-    for line in transcript.lines() {
-        let Ok(obj) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        let Some(blocks) = obj.pointer("/message/content").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks {
-            match block.get("type").and_then(Value::as_str) {
-                Some("tool_use") => {
-                    if rows.len() >= DELEGATION_ACTIVITY_ROW_CAP {
-                        continue;
-                    }
-                    let tool = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                    if let Some(id) = block.get("id").and_then(Value::as_str) {
-                        row_by_tool_use.insert(id.to_string(), rows.len());
-                    }
-                    rows.push(json!({
-                        "tool": tool,
-                        "status": "running",
-                        "preview": delegation_activity_preview(tool, &input),
-                    }));
-                }
-                Some("tool_result") => {
-                    let Some(index) = block
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .and_then(|id| row_by_tool_use.get(id))
-                    else {
-                        continue;
-                    };
-                    let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                    rows[*index]["status"] = json!(if failed { "failed" } else { "completed" });
-                }
-                _ => {}
-            }
-        }
-    }
-    rows
 }
 
 /// The snapshot's `tokenUsage`: the indexer's summary in the contract's
