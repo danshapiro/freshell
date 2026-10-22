@@ -3250,12 +3250,33 @@ fn sync_provider_projection_directory(path: &Path) -> Result<(), String> {
 }
 
 fn sync_provider_projection_tree(root: &Path) -> Result<(), String> {
-    sync_provider_projection_tree_with(root, &mut |path| std::fs::File::open(path)?.sync_all())
+    sync_provider_projection_tree_with(root, &|path| std::fs::File::open(path)?.sync_all())
 }
 
+/// Concurrent flushes per projection durability barrier. Every flush is one
+/// journal commit when issued alone; overlapping flushes of independent nodes
+/// let the filesystem commit them together, so a selected environment with
+/// thousands of files (an installed plugin's node_modules) costs a handful of
+/// commits instead of one per file. Measured on the qualification host's
+/// ext4 volume, 4,200 files took 13.4 s one at a time and 1.4 s at 16.
+const PROVIDER_PROJECTION_SYNC_WORKERS: usize = 16;
+
+/// Make every node of a staged projection durable before the transaction
+/// advances. Symlinks are never followed. Each node is still flushed exactly
+/// once with a full `fsync`; only their order is relaxed, which the
+/// transaction does not depend on because it waits for the whole barrier.
 fn sync_provider_projection_tree_with(
     root: &Path,
-    sync_node: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    sync_node: &(impl Fn(&Path) -> std::io::Result<()> + Sync),
+) -> Result<(), String> {
+    let mut nodes = Vec::new();
+    collect_provider_projection_sync_nodes(root, &mut nodes)?;
+    flush_provider_projection_nodes(&nodes, sync_node)
+}
+
+fn collect_provider_projection_sync_nodes(
+    root: &Path,
+    nodes: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(root).map_err(|error| {
         format!(
@@ -3273,15 +3294,63 @@ fn sync_provider_projection_tree_with(
             let entry = entry.map_err(|error| {
                 format!("provider projection sync read {}: {error}", root.display())
             })?;
-            sync_provider_projection_tree_with(&entry.path(), sync_node)?;
+            collect_provider_projection_sync_nodes(&entry.path(), nodes)?;
         }
     }
-    sync_node(root).map_err(|error| {
-        format!(
-            "provider projection flush failed for {}: {error}",
-            root.display()
-        )
-    })
+    nodes.push(root.to_path_buf());
+    Ok(())
+}
+
+fn flush_provider_projection_nodes(
+    nodes: &[PathBuf],
+    sync_node: &(impl Fn(&Path) -> std::io::Result<()> + Sync),
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let failure = std::sync::Mutex::new(None::<String>);
+    let flush = || {
+        while !failed.load(Ordering::Acquire) {
+            let Some(path) = nodes.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                return;
+            };
+            if let Err(error) = sync_node(path) {
+                failed.store(true, Ordering::Release);
+                failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(|| {
+                        format!(
+                            "provider projection flush failed for {}: {error}",
+                            path.display()
+                        )
+                    });
+                return;
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        // The calling thread always takes part, so the barrier completes even
+        // when the container's pid budget refuses additional threads.
+        for _ in 1..PROVIDER_PROJECTION_SYNC_WORKERS.min(nodes.len()) {
+            if std::thread::Builder::new()
+                .name("projection-sync".into())
+                .spawn_scoped(scope, flush)
+                .is_err()
+            {
+                break;
+            }
+        }
+        flush();
+    });
+    match failure
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn sync_provider_projection_file(path: &Path) -> Result<(), String> {
@@ -6588,12 +6657,13 @@ mod tests {
         std::fs::write(&outside_file, "outside state").unwrap();
         symlink(&outside_file, nested.join("outside-link.json")).unwrap();
 
-        let mut synced = Vec::new();
-        super::sync_provider_projection_tree_with(tree.path(), &mut |path| {
-            synced.push(path.to_path_buf());
+        let synced = std::sync::Mutex::new(Vec::new());
+        super::sync_provider_projection_tree_with(tree.path(), &|path| {
+            synced.lock().unwrap().push(path.to_path_buf());
             Ok(())
         })
         .unwrap();
+        let synced = synced.into_inner().unwrap();
 
         assert!(synced.contains(&file));
         assert!(synced.contains(&nested));
@@ -6601,6 +6671,77 @@ mod tests {
         assert!(
             !synced.contains(&outside_file),
             "sync traversal must not follow provider-controlled symlinks"
+        );
+    }
+
+    /// A selected provider environment can hold thousands of files (an
+    /// installed plugin's node_modules). Each flush is one journal commit, so
+    /// flushing them one at a time inside the execution grant made a healthy
+    /// 4,200-file projection take 8-13 s and miss the grant reply. Flushes of
+    /// independent nodes must overlap, and every node is still flushed once.
+    #[cfg(unix)]
+    #[test]
+    fn provider_projection_sync_walk_overlaps_flushes_of_independent_nodes() {
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tree = tempfile::tempdir().unwrap();
+        let entries = tree.path().join("node_modules/parity-installed/entries");
+        std::fs::create_dir_all(&entries).unwrap();
+        for index in 0..32 {
+            std::fs::write(
+                entries.join(format!("entry-{index}.cjs")),
+                "module.exports=1\n",
+            )
+            .unwrap();
+        }
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let synced = std::sync::Mutex::new(Vec::new());
+        super::sync_provider_projection_tree_with(tree.path(), &|path| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            synced.lock().unwrap().push(path.to_path_buf());
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+
+        let synced = synced.into_inner().unwrap();
+        let unique = synced.iter().collect::<BTreeSet<_>>();
+        assert_eq!(synced.len(), 32 + 4, "32 files, 3 directories and the root");
+        assert_eq!(
+            unique.len(),
+            synced.len(),
+            "each node is flushed exactly once"
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) > 1,
+            "independent flushes must overlap instead of running one at a time"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_projection_sync_walk_reports_the_node_whose_flush_failed() {
+        let tree = tempfile::tempdir().unwrap();
+        for index in 0..16 {
+            std::fs::write(tree.path().join(format!("file-{index}")), "state").unwrap();
+        }
+        let failing = tree.path().join("file-7");
+        let error = super::sync_provider_projection_tree_with(tree.path(), &|path| {
+            if path == failing {
+                Err(std::io::Error::other("synthetic flush failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(
+            error.contains(&failing.display().to_string())
+                && error.contains("synthetic flush failure"),
+            "{error}"
         );
     }
 
