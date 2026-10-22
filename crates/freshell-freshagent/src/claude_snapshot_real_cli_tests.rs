@@ -208,6 +208,9 @@ fn api_error_assistant_line_projects_an_error_only_turn() {
         json!({ "name": "ApiError", "message": "API Error: 400 fixture bad request" })
     );
     assert_eq!(turn["summary"], json!(""));
+    // The CLI stamps its synthesized line `model: "<synthetic>"`; that is not
+    // a model the turn ran on.
+    assert!(turn.get("model").is_none(), "{turn}");
 }
 
 #[test]
