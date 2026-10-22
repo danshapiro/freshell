@@ -3876,10 +3876,13 @@ fn classify_legacy_candidate(
 /// undated), then scope (session > pane > source_tab > terminal >
 /// derived). Nothing else orders: candidates equal on all three compare
 /// `Equal`, and the apply path replaces only on a strict win, so the
-/// incumbent stays (Task 3 — the evidence key carries browser window and
-/// device ids, which must never decide a name). Generic
-/// updatedAt/mtime/layout timestamps never reach `explicit_rename_at`, so
-/// they can never order here.
+/// incumbent stays — a browser window or device id (the evidence key and
+/// candidate id carry them) never displaces an installed name (Task 3).
+/// Within one boot an id can still pick among exact equals:
+/// [`order_boot_legacy_candidates`] breaks comparator ties by candidate id,
+/// so the lowest id for a target installs first and stays (the same one on
+/// every boot). Generic updatedAt/mtime/layout timestamps never reach
+/// `explicit_rename_at`, so they can never order here.
 fn compare_classified_candidates(
     a: &ClassifiedLegacyCandidate,
     b: &ClassifiedLegacyCandidate,
@@ -4164,9 +4167,13 @@ pub(crate) fn is_boot_import_id(import_id: &str) -> bool {
 /// membership across boots (the create-once per-import backups and the
 /// per-candidate acknowledgment replay both key off the chunk ids). Higher
 /// rank or scope wins whatever the arrival order; among comparator-equal
-/// candidates the first one applied stays (strict-win apply), and the
-/// candidate-id key only makes that order — and so the batching — the same
-/// on every boot.
+/// candidates the first one applied stays (strict-win apply). The
+/// candidate-id key makes that order, and so the batching, the same on
+/// every boot, and it also decides which of several comparator-equal
+/// candidates for one target is applied first: the lowest candidate id
+/// installs and stays. Candidate ids embed storage keys and device ids, so
+/// among exact equals this one choice is made by an id; it never displaces
+/// a name that is already installed.
 pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate]) {
     let mut classified: Vec<(ClassifiedLegacyCandidate, LegacyNameCandidate)> = candidates
         .iter()

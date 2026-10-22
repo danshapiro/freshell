@@ -159,11 +159,21 @@ pub(super) fn pending_beats_import_owned_label(
         target: "freshell_server::session_names",
         op = "bind_pending",
         name_ref = %key,
-        loser_source = ?current.source,
-        winner_source = ?pending_source,
+        loser_source = %wire_source(current.source),
+        winner_source = %wire_source(pending_source),
         "session_names.bind_collision_import_label_lost"
     );
     true
+}
+
+/// A source as the stored document and the wire spell it (`provider_ai`,
+/// `directory`), taken from its serde form so a log line matches a search
+/// for that spelling.
+fn wire_source(source: NameSource) -> String {
+    serde_json::to_value(source)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{source:?}"))
 }
 
 /// True the first time this process sees `import_id` (until the bounded set
