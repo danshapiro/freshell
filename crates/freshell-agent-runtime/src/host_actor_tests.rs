@@ -1574,3 +1574,255 @@ async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replay
         Some("native-parent")
     );
 }
+
+/// Records what the provider saw for each live configure and each send: the
+/// settings it was asked to apply, the model already durable in the actor's
+/// state file at that moment, and the profile a later send carried.
+struct ConfigureTransport {
+    state_dir: PathBuf,
+    supported: bool,
+    failure: Option<OperationFailureKind>,
+    applied: std::sync::Mutex<Vec<(FreshAgentTurnSettings, Option<String>)>>,
+    sent_profiles: std::sync::Mutex<Vec<FreshAgentProfile>>,
+}
+
+impl ConfigureTransport {
+    fn new(state_dir: &Path, supported: bool, failure: Option<OperationFailureKind>) -> Arc<Self> {
+        Arc::new(Self {
+            state_dir: state_dir.to_path_buf(),
+            supported,
+            failure,
+            applied: std::sync::Mutex::new(Vec::new()),
+            sent_profiles: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn durable_model(&self) -> Option<String> {
+        let persisted: Value = serde_json::from_slice(
+            &fs::read(self.state_dir.join("fresh-agent-state.json")).unwrap(),
+        )
+        .unwrap();
+        persisted["profile"]["model"].as_str().map(str::to_string)
+    }
+}
+
+#[async_trait]
+impl FreshAgentTransport for ConfigureTransport {
+    async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: Some("native-configure".into()),
+        })
+    }
+    async fn dispatch(
+        &self,
+        request_id: &RequestId,
+        _text: &str,
+        profile: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.sent_profiles.lock().unwrap().push(profile.clone());
+        Ok(DispatchAck {
+            provider_ack_id: Some(request_id.as_str().into()),
+        })
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        unreachable!()
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn supports_operation(&self, _: &FreshAgentOperation) -> Result<bool, String> {
+        Ok(self.supported)
+    }
+    async fn dispatch_operation(
+        &self,
+        request_id: &RequestId,
+        operation: &FreshAgentOperation,
+    ) -> Result<OperationAck, OperationFailure> {
+        let FreshAgentOperation::Configure { settings } = operation else {
+            panic!("only configure is exercised here: {operation:?}");
+        };
+        self.applied
+            .lock()
+            .unwrap()
+            .push((settings.clone(), self.durable_model()));
+        if let Some(kind) = self.failure {
+            return Err(OperationFailure {
+                kind,
+                message: "Wait for the current turn to finish before changing agent settings."
+                    .into(),
+                acceptance_ambiguous: false,
+            });
+        }
+        Ok(OperationAck {
+            provider_ack_id: Some(request_id.as_str().into()),
+            native_session_id: None,
+        })
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+fn opus_high() -> FreshAgentTurnSettings {
+    FreshAgentTurnSettings {
+        cwd: None,
+        model: Some("opus".into()),
+        effort: Some("high".into()),
+        permission_mode: None,
+        sandbox: None,
+    }
+}
+
+#[tokio::test]
+async fn configure_persists_settings_before_the_live_apply_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = ConfigureTransport::new(dir.path(), true, None);
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "configure-store", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request_id = RequestId::parse("configure-1").unwrap();
+
+    assert_eq!(
+        actor
+            .configure(request_id.clone(), opus_high())
+            .await
+            .unwrap(),
+        CommandState::ProviderAcked
+    );
+    assert_eq!(
+        *transport.applied.lock().unwrap(),
+        vec![(opus_high(), Some("opus".to_string()))],
+        "the provider applies settings that are already durable"
+    );
+    let configured = actor.profile().await;
+    assert_eq!(configured.model.as_deref(), Some("opus"));
+    assert_eq!(configured.effort.as_deref(), Some("high"));
+    assert_eq!(configured.permission_mode.as_deref(), Some("ask"));
+
+    // The same request is idempotent; a different payload under it conflicts
+    // and changes nothing.
+    assert_eq!(
+        actor
+            .configure(request_id.clone(), opus_high())
+            .await
+            .unwrap(),
+        CommandState::ProviderAcked
+    );
+    let mut other = opus_high();
+    other.model = Some("haiku".into());
+    assert_eq!(
+        actor.configure(request_id, other).await.unwrap_err(),
+        ActorError::RequestConflict
+    );
+    assert_eq!(transport.applied.lock().unwrap().len(), 1);
+    assert_eq!(actor.profile().await, configured);
+
+    drop(actor);
+    let reopened = FreshAgentHostActor::open(
+        dir.path(),
+        configured.clone(),
+        ConfigureTransport::new(dir.path(), true, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.profile().await, configured);
+}
+
+#[tokio::test]
+async fn refused_live_configure_keeps_the_intent_for_the_next_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = ConfigureTransport::new(dir.path(), true, Some(OperationFailureKind::Rejected));
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "configure-refused", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    let refused = actor
+        .configure(RequestId::parse("configure-mid-turn").unwrap(), opus_high())
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, ActorError::Transport(_)), "{refused:?}");
+    assert_eq!(actor.profile().await.model.as_deref(), Some("opus"));
+    assert_eq!(transport.durable_model().as_deref(), Some("opus"));
+
+    actor
+        .dispatch(
+            RequestId::parse("next-turn").unwrap(),
+            "continue".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let sent = transport.sent_profiles.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].model.as_deref(), Some("opus"));
+    assert_eq!(sent[0].effort.as_deref(), Some("high"));
+}
+
+#[tokio::test]
+async fn configure_without_live_support_is_staged_for_the_next_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = ConfigureTransport::new(dir.path(), false, None);
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "configure-staged", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        actor
+            .configure(RequestId::parse("configure-staged").unwrap(), opus_high())
+            .await
+            .unwrap(),
+        CommandState::Completed
+    );
+    assert!(transport.applied.lock().unwrap().is_empty());
+    assert_eq!(transport.durable_model().as_deref(), Some("opus"));
+    actor
+        .dispatch(RequestId::parse("staged-send").unwrap(), "go".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        transport.sent_profiles.lock().unwrap()[0].model.as_deref(),
+        Some("opus")
+    );
+}
+
+#[tokio::test]
+async fn invalid_configure_changes_neither_the_profile_nor_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = ConfigureTransport::new(dir.path(), true, None);
+    let initial = profile(FreshProvider::Claude, "configure-invalid", None);
+    let actor = FreshAgentHostActor::open(dir.path(), initial, transport.clone())
+        .await
+        .unwrap();
+    let before = actor.profile().await;
+    let mut invalid = opus_high();
+    invalid.model = Some("bad\nmodel".into());
+
+    assert_eq!(
+        actor
+            .configure(RequestId::parse("configure-invalid").unwrap(), invalid)
+            .await
+            .unwrap_err(),
+        ActorError::InvalidProfile
+    );
+    assert_eq!(actor.profile().await, before);
+    assert!(transport.applied.lock().unwrap().is_empty());
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["commands"].as_object().unwrap().len(), 0);
+}

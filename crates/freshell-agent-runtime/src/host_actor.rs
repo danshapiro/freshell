@@ -76,6 +76,26 @@ pub struct FreshAgentProfile {
 }
 
 impl FreshAgentProfile {
+    /// Folds per-turn settings into the durable launch profile: every
+    /// provided field replaces the stored one, absent fields keep it.
+    pub fn apply_turn_settings(&mut self, settings: &FreshAgentTurnSettings) {
+        if let Some(value) = &settings.cwd {
+            self.cwd = value.clone();
+        }
+        if let Some(value) = &settings.model {
+            self.model = Some(value.clone());
+        }
+        if let Some(value) = &settings.effort {
+            self.effort = Some(value.clone());
+        }
+        if let Some(value) = &settings.permission_mode {
+            self.permission_mode = Some(value.clone());
+        }
+        if let Some(value) = &settings.sandbox {
+            self.sandbox = Some(value.clone());
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ActorError> {
         if self.runtime_variant.is_empty()
             || self.cwd.is_empty()
@@ -190,6 +210,8 @@ pub enum FreshAgentOperation {
         turn_id: Option<String>,
         cwd: Option<String>,
     },
+    /// Apply settings to the live provider session without a turn.
+    Configure { settings: FreshAgentTurnSettings },
 }
 
 #[async_trait]
@@ -626,7 +648,7 @@ impl FreshAgentHostActor {
                 };
             }
             if let Some(settings) = settings {
-                apply_turn_settings(&mut state.profile, settings);
+                state.profile.apply_turn_settings(&settings);
                 state.profile.validate()?;
             }
             dispatch_profile = state.profile.clone();
@@ -832,6 +854,15 @@ impl FreshAgentHostActor {
         }
     }
 
+    pub async fn configure(
+        &self,
+        request_id: RequestId,
+        settings: FreshAgentTurnSettings,
+    ) -> Result<CommandState, ActorError> {
+        self.semantic_operation(request_id, FreshAgentOperation::Configure { settings })
+            .await
+    }
+
     pub async fn semantic_operation(
         &self,
         request_id: RequestId,
@@ -861,26 +892,56 @@ impl FreshAgentHostActor {
                 };
             }
         }
-        if !self
+        let live_supported = self
             .transport
             .supports_operation(&operation)
             .await
-            .map_err(|_| ActorError::Transport("provider capability check failed".into()))?
-        {
+            .map_err(|_| ActorError::Transport("provider capability check failed".into()))?;
+        // A configure is first the durable settings intent that every later
+        // send carries; the live apply only converges the provider sooner.
+        // Without live support the intent is still staged for the next send.
+        let staged_settings = match &operation {
+            FreshAgentOperation::Configure { settings } => Some(settings),
+            _ => None,
+        };
+        if !live_supported && staged_settings.is_none() {
             return Err(ActorError::UnsupportedOperation);
         }
         {
             let mut state = self.state.lock().await;
+            if let Some(settings) = staged_settings {
+                let mut configured = state.profile.clone();
+                configured.apply_turn_settings(settings);
+                configured.validate()?;
+                state.profile = configured;
+            }
             state.commands.insert(
                 request_id.as_str().to_string(),
                 PersistedCommand {
                     payload_digest,
-                    state: CommandState::Queued,
+                    state: if live_supported {
+                        CommandState::Queued
+                    } else {
+                        CommandState::Completed
+                    },
                     provider_ack_id: None,
                     operation_failure: None,
                 },
             );
             write_protected_payload(&self.state_dir, &request_id, &material)?;
+            if !live_supported {
+                push_event_bounded(
+                    &mut state,
+                    AgentEvent::CommandOutcome {
+                        request_id,
+                        state: CommandState::Completed,
+                    },
+                    self.event_byte_cap,
+                    self.event_count_cap,
+                )?;
+                write_state(&self.state_dir, &state)?;
+                return Ok(CommandState::Completed);
+            }
             write_state(&self.state_dir, &state)?;
             state
                 .commands
@@ -1201,24 +1262,6 @@ impl FreshAgentHostActor {
             .stop()
             .await
             .map_err(ActorError::Transport)
-    }
-}
-
-fn apply_turn_settings(profile: &mut FreshAgentProfile, settings: FreshAgentTurnSettings) {
-    if let Some(value) = settings.cwd {
-        profile.cwd = value;
-    }
-    if let Some(value) = settings.model {
-        profile.model = Some(value);
-    }
-    if let Some(value) = settings.effort {
-        profile.effort = Some(value);
-    }
-    if let Some(value) = settings.permission_mode {
-        profile.permission_mode = Some(value);
-    }
-    if let Some(value) = settings.sandbox {
-        profile.sandbox = Some(value);
     }
 }
 

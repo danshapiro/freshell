@@ -15,7 +15,7 @@ use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, R
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
     AgentProvider, FreshAgentApprovalRespond, FreshAgentCheckpointIntent, FreshAgentCompact,
-    FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
+    FreshAgentConfigure, FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
     FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendSettings, ServerMessage,
     SessionLocator, SessionType, StringOrNumber,
 };
@@ -769,7 +769,7 @@ impl FreshAgentTransport for HostedTransport {
             return delegate.supports_operation(operation).await;
         }
         match operation {
-            FreshAgentOperation::Compact { .. } => Ok(true),
+            FreshAgentOperation::Compact { .. } | FreshAgentOperation::Configure { .. } => Ok(true),
             FreshAgentOperation::Rollback {
                 direction: FreshAgentRollbackDirection::Redo,
                 ..
@@ -818,6 +818,36 @@ impl FreshAgentTransport for HostedTransport {
                     ProviderState::Codex(state) => state.handle_compact(message).await,
                     ProviderState::Opencode { runtime, .. } => {
                         runtime.handle_compact(message).await
+                    }
+                }
+            }
+            FreshAgentOperation::Configure { settings } => {
+                if let Some(profile) = self.profile.lock().expect("profile lock").as_mut() {
+                    profile.apply_turn_settings(settings);
+                }
+                // The provider answers on its own event stream: a converged
+                // `freshAgent.session.metadata`, or a session-scoped error
+                // when it refuses the live apply (the actor has already
+                // persisted the intent for the next send).
+                let message = FreshAgentConfigure {
+                    provider: self.provider_wire(),
+                    session_id,
+                    session_type: self.session_type(),
+                    cwd: settings.cwd.clone(),
+                    request_id: Some(request_id.as_str().to_string()),
+                    settings: FreshAgentSendSettings {
+                        cwd: settings.cwd.clone(),
+                        effort: settings.effort.clone(),
+                        model: settings.model.clone(),
+                        permission_mode: settings.permission_mode.clone(),
+                        sandbox: settings.sandbox.as_deref().and_then(parse_sandbox),
+                    },
+                };
+                match &self.state {
+                    ProviderState::Claude(state) => state.handle_configure(message).await,
+                    ProviderState::Codex(state) => state.handle_configure(message).await,
+                    ProviderState::Opencode { runtime, .. } => {
+                        runtime.handle_configure(message).await
                     }
                 }
             }
@@ -1225,7 +1255,7 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 
 fn operation_supported_by_snapshot(operation: &FreshAgentOperation, snapshot: &Value) -> bool {
     let capability = match operation {
-        FreshAgentOperation::Compact { .. } => return true,
+        FreshAgentOperation::Compact { .. } | FreshAgentOperation::Configure { .. } => return true,
         FreshAgentOperation::Rollback {
             direction: FreshAgentRollbackDirection::Undo,
             ..
@@ -1481,6 +1511,112 @@ lines.on('line', line=>{
                 "arbitrary MCP maps are never sent over private create IPC"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hosted_claude_configure_applies_live_and_relays_the_session_metadata_frame() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("sidecar.mjs");
+        let receipt = dir.path().join("configure.jsonl");
+        std::fs::write(&script, r#"
+import {createInterface} from 'node:readline';
+import {appendFileSync} from 'node:fs';
+const lines=createInterface({input:process.stdin});
+const emit=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
+lines.on('line', line=>{
+  const req=JSON.parse(line);
+  if(req.type==='create')emit({type:'created',requestId:req.requestId,sessionId:'owned-configure'});
+  if(req.type==='configure'){
+    appendFileSync(process.env.FRESHELL_TEST_CONFIGURE_RECEIPT,JSON.stringify(req)+'\n');
+    emit({type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:true,settings:req.settings});
+  }
+  if(req.type==='shutdown')process.exit(0);
+});
+"#).unwrap();
+        let keys = [
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_NODE",
+            "FRESHELL_TEST_CONFIGURE_RECEIPT",
+        ];
+        let _env = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("FRESHELL_TEST_CONFIGURE_RECEIPT", &receipt);
+        let transport = HostedTransport::new(FreshProvider::Claude).await;
+        let profile = FreshAgentProfile {
+            provider: FreshProvider::Claude,
+            runtime_variant: "freshclaude".into(),
+            cwd: dir.path().to_string_lossy().into(),
+            model: Some("sonnet".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("default".into()),
+            sandbox: None,
+            provider_store_id: "owned-store".into(),
+            native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: vec![],
+        };
+        let actor = FreshAgentHostActor::open(dir.path().join("actor"), profile, transport.clone())
+            .await
+            .unwrap();
+
+        let outcome = actor
+            .configure(
+                RequestId::parse("hosted-configure-1").unwrap(),
+                freshell_runtime_protocol::FreshAgentTurnSettings {
+                    cwd: None,
+                    model: Some("opus".into()),
+                    effort: Some("high".into()),
+                    permission_mode: None,
+                    sandbox: None,
+                },
+            )
+            .await;
+        let metadata = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = actor.read_events(0, 256).await.events;
+                if let Some(event) = events.iter().find_map(|entry| match &entry.event {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.session.metadata" =>
+                    {
+                        Some(payload["event"].clone())
+                    }
+                    _ => None,
+                }) {
+                    break event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let configured_model = actor.profile().await.model;
+        let applied = std::fs::read_to_string(&receipt).unwrap_or_default();
+        Arc::clone(&transport).stop().await.unwrap();
+
+        assert_eq!(
+            outcome.unwrap(),
+            freshell_runtime_protocol::CommandState::ProviderAcked
+        );
+        assert_eq!(configured_model.as_deref(), Some("opus"));
+        let applied: Vec<Value> = applied
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(applied.len(), 1, "one live configure reaches the sidecar");
+        assert_eq!(applied[0]["settings"]["model"], "opus");
+        assert_eq!(applied[0]["settings"]["effort"], "high");
+        let metadata = metadata.expect("the provider's metadata frame reaches the host journal");
+        assert_eq!(metadata["sessionId"], "owned-configure");
+        assert_eq!(metadata["model"], "opus");
+        assert_eq!(metadata["effort"], "high");
     }
 
     #[tokio::test]
@@ -1987,6 +2123,7 @@ lines.on('line', line=>{
             );
             let name = match operation {
                 FreshAgentOperation::Compact { .. } => "compact",
+                FreshAgentOperation::Configure { .. } => "configure",
                 FreshAgentOperation::Rollback {
                     direction: FreshAgentRollbackDirection::Undo,
                     ..
@@ -2186,6 +2323,7 @@ lines.on('line', line=>{
             self.trace.record(
                 match operation {
                     FreshAgentOperation::Compact { .. } => "compact",
+                    FreshAgentOperation::Configure { .. } => "configure",
                     FreshAgentOperation::Rollback {
                         direction: FreshAgentRollbackDirection::Undo,
                         ..
@@ -2340,6 +2478,15 @@ lines.on('line', line=>{
                 mode: FreshAgentRollbackMode::Step,
                 turn_id: Some("turn-1".into()),
                 cwd: Some("/workspace".into()),
+            },
+            FreshAgentOperation::Configure {
+                settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                    cwd: None,
+                    model: Some("fixture-configured-model".into()),
+                    effort: Some("high".into()),
+                    permission_mode: Some("acceptEdits".into()),
+                    sandbox: None,
+                },
             },
         ]
     }
@@ -2496,6 +2643,11 @@ lines.on('line', line=>{
                     )
                     .await
                     .unwrap();
+            }
+            // The direct route stores configured settings on the live
+            // session, so its later resume launches with them.
+            if let FreshAgentOperation::Configure { settings } = operation {
+                profile.apply_turn_settings(settings);
             }
         }
         transport.capture(4096).await.unwrap();
@@ -2697,6 +2849,7 @@ lines.on('line', line=>{
                 "compact",
                 "rollback_undo",
                 "rollback_redo",
+                "configure",
                 "capture",
                 "fork",
                 "restart",
