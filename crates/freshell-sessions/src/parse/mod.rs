@@ -8,7 +8,7 @@ pub mod claude;
 pub mod codex;
 pub mod opencode;
 
-pub use claude::{parse_session_content, ParseSessionOptions};
+pub use claude::{parse_session_content, ClaudeUsageAccumulator, ParseSessionOptions};
 pub use codex::parse_codex_session_content;
 pub use opencode::{
     default_opencode_data_home, is_opencode_placeholder_title, opencode_compact_percent,
