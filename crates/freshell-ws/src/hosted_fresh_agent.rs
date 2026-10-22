@@ -35,8 +35,8 @@ pub enum HostedFreshAgentCommand {
 pub(crate) enum HostedRoute {
     /// A fresh-agent operation: the gateway consumes it. It must never fall
     /// through to the in-process provider states, which do not own hosted
-    /// sessions.
-    Gateway(HostedFreshAgentCommand),
+    /// sessions. Boxed: commands carry whole client frames.
+    Gateway(Box<HostedFreshAgentCommand>),
     /// Not a fresh-agent operation: the web process handles it as usual.
     NotFreshAgent,
 }
@@ -93,7 +93,7 @@ pub(crate) fn hosted_route(message: &ClientMessage) -> HostedRoute {
         | ClientMessage::HostStatsUnsubscribe
         | ClientMessage::HostStatsRefresh(_) => return HostedRoute::NotFreshAgent,
     };
-    HostedRoute::Gateway(command)
+    HostedRoute::Gateway(Box::new(command))
 }
 
 pub trait HostedFreshAgentGateway: Send + Sync {
@@ -118,7 +118,7 @@ pub(crate) fn dispatch_if_installed(message: &ClientMessage) -> bool {
     let HostedRoute::Gateway(command) = hosted_route(message) else {
         return false;
     };
-    let task = Arc::clone(gateway).dispatch(command);
+    let task = Arc::clone(gateway).dispatch(*command);
     tokio::spawn(task);
     true
 }
