@@ -32,8 +32,8 @@
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
-//                                  the interrupted turn's own (an accepted user interrupt's mark consumes
-//                                  it — turn-complete-gate.mjs); also minted from consumeStream's finally
+//                                  the stopped turn's own aborted result (an accepted user interrupt's mark
+//                                  silences only that — turn-complete-gate.mjs); also minted from consumeStream's finally
 //                                  when a turn ends with NO result frame (stream exception or natural EOF
 //                                  with a send still pending) — the abort/sdk.exit requested-teardown path
 //                                  stays silent
@@ -54,8 +54,8 @@
 //
 // A sidecar death mid-turn can therefore NEVER produce a false completion
 // from this process's own stdout: `sdk.turn.complete` rides every SDK
-// `result` (the unified needs-attention edge — the interrupted turn's own
-// result is consumed silently by the accepted-interrupt mark) plus the
+// `result` (the unified needs-attention edge — only the stopped turn's own
+// aborted result is silenced, by the accepted-interrupt mark) plus the
 // consumeStream finally mint for a result-less turn end (stream exception or
 // natural EOF with a send pending; never the aborted/sdk.exit teardown). If
 // the PROCESS dies mid-turn, stdout simply ends and no completion is ever
@@ -305,11 +305,12 @@ function handleSdkMessage(sessionId, msg) {
       // The awaited turn's terminal frame arrived: drop one pending send
       // (clamped at 0 — an unsolicited result must not underflow the counter).
       st.pendingResults = Math.max(0, st.pendingResults - 1)
-      // The gate's verdict comes first: the interrupted turn's own result is
-      // the user's Stop, so it carries neither a bell nor a failure banner
-      // (G03). Any other turn end rings; a failed one also reports why. No
-      // outcome rides the edge — the client treats all ends identically.
-      const rings = st.turnCompleteGate.resultEmitsAttention()
+      // The gate's verdict comes first: the stopped turn's own (aborted)
+      // result is the user's Stop, so it carries neither a bell nor a failure
+      // banner (G03). Any other turn end rings, including one a Stop missed
+      // (G06); a failed one also reports why. No outcome rides the edge — the
+      // client treats all ends identically.
+      const rings = st.turnCompleteGate.resultEmitsAttention(msg)
       for (const frame of resultFrames(sessionId, msg, { userStopped: !rings })) emit(frame)
       if (rings) {
         const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
@@ -347,9 +348,10 @@ async function consumeStream(sessionId, sdkQuery) {
     // witness: ring the unified edge (the abort/sdk.exit path is a
     // REQUESTED teardown and deliberately stays silent). pendingResults
     // covers the accept→first-message window turnOpen cannot see, and
-    // counts queued sends a boolean would lose. The gate consult is LAST in
-    // the guard so a no-mint path never consumes an interrupt mark.
-    if (st && st.pendingResults > 0 && !st.abort.signal.aborted && st.turnCompleteGate.resultEmitsAttention()) {
+    // counts queued sends a boolean would lose. A pending Stop mark does not
+    // silence it: only an aborted result is the stopped turn's own
+    // (turn-complete-gate.mjs), and this end has no result.
+    if (st && st.pendingResults > 0 && !st.abort.signal.aborted) {
       const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
       st.lastTurnCompleteAt = at
       emit({ type: 'sdk.turn.complete', sessionId, at })
@@ -567,11 +569,12 @@ function handleInterrupt(req) {
   // the NEXT unrelated turn's result, silently suppressing exactly the ring
   // this feature exists to produce. While a turn IS pending, the settle
   // receipt (sdk.d.ts:3765) lands BEFORE the interrupted turn's own result,
-  // so the mark deterministically consumes exactly that result (including the
-  // crash-order case where the result wins the race to the wire — the mark
-  // was armed at request time and is still there to consume it). A REJECTED
-  // interrupt (the turn kept running) clears the mark; noteInterruptSettled
-  // stays in both promise arms — settle(true) without a mark is a no-op.
+  // so the mark is consumed by exactly that result, and silences it only if
+  // the Stop landed (the result was aborted). A Stop that missed — the CLI was
+  // still starting (T13), or the turn finished first — leaves a result that
+  // rings. A REJECTED interrupt (the turn kept running) clears the mark;
+  // noteInterruptSettled stays in both promise arms — settle(true) without a
+  // mark is a no-op.
   if (st.pendingResults > 0) st.turnCompleteGate.noteInterruptRequest()
   st.query.interrupt()
     .then(() => {
