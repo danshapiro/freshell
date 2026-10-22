@@ -369,13 +369,12 @@ fn the_snapshot_exposes_recent_transcript_line_uuids() {
 }
 
 /// Every captured scenario (each has a `snapshot.golden.json`).
-pub(crate) const REAL_CLI_SCENARIOS: [&str; 8] = [
+pub(crate) const REAL_CLI_SCENARIOS: [&str; 7] = [
     "tools-sync",
     "agent-async",
     "agent-failed",
     "compact-ok",
     "compact-fail",
-    "compact-preserved-duplicate",
     "api-error",
     "image",
 ];

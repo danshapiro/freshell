@@ -42,7 +42,6 @@ describe('rust claude snapshot contract', () => {
       'api-error',
       'compact-fail',
       'compact-ok',
-      'compact-preserved-duplicate',
       'image',
       'tools-sync',
     ])

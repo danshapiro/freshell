@@ -162,8 +162,17 @@ fn a_failed_agent_projects_a_failed_delegation_with_the_error() {
 }
 
 #[test]
-fn a_line_the_cli_re_appended_after_a_compaction_projects_once() {
-    let transcript = real_cli_fixture!("compact-preserved-duplicate");
+fn a_line_the_cli_re_appends_during_a_compaction_projects_once() {
+    // The real /compact capture writes the last assistant line ("reply 3")
+    // twice under one uuid, the second copy just before the boundary line.
+    let transcript = real_cli_fixture!("compact-ok");
+    let reply_uuids: Vec<Value> = fixture_lines(transcript)
+        .into_iter()
+        .filter(|line| line["type"] == "assistant" && message_text(line) == "reply 3")
+        .map(|line| line["uuid"].clone())
+        .collect();
+    assert_eq!(reply_uuids.len(), 2, "the capture re-appends the line");
+    assert_eq!(reply_uuids[0], reply_uuids[1], "under the same uuid");
     let turns = project(transcript);
     let mut ids: Vec<&str> = turns
         .iter()
@@ -467,8 +476,8 @@ fn a_transcript_without_usage_reports_zero_tokens() {
 
 // ── A7: recent transcript line uuids (the live tail's landing check) ──────
 
-/// Distinct line uuids in file order (the CLI re-appends a compaction's
-/// preserved tail under its original uuid; it is one line identity).
+/// Distinct line uuids in file order (during a compaction the CLI re-appends
+/// the last message under its original uuid; it is one line identity).
 fn uuid_lines(transcript: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for uuid in fixture_lines(transcript)

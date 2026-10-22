@@ -7,8 +7,9 @@
 //!   one `task_delegation` item that absorbs its tool result (so the client
 //!   never shows an orphan "Result" row) and, for a background agent, the
 //!   later `<task-notification>` line (CLI 2.1.237 F6);
-//! - a line the CLI re-appends under an already-projected uuid (the preserved
-//!   tail after a compaction) projects once;
+//! - a line the CLI re-appends under an already-projected uuid (during a
+//!   compaction it writes the last message again, just before the
+//!   `system/compact_boundary` line) projects once;
 //! - a compaction recap (`isCompactSummary`) with no preceding
 //!   `system/compact_boundary` line still gets a `context_compaction` marker.
 

@@ -115,8 +115,8 @@ describe('claude real-CLI snapshots render through the existing transcript', () 
     expect(screen.getByText('[image]')).toBeInTheDocument()
   })
 
-  it('a compaction that re-appended the preserved tail renders that message once', () => {
-    renderTranscript('compact-preserved-duplicate')
+  it('a message the CLI re-appended during a compaction renders once', () => {
+    renderTranscript('compact-ok')
     expect(screen.getAllByText('reply 3')).toHaveLength(1)
   })
 })
