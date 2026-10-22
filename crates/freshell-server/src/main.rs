@@ -2104,13 +2104,13 @@ async fn main() -> ExitCode {
             )
             // Kata 09v1 zero-turn claude fallback: the SAME raw-file check
             // the attach arm trusts (claude_snapshot ordered candidate
-            // roots, CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), so
-            // reconcile and attach can never disagree about whether a
-            // claude transcript exists. Degenerate no-roots case (HOME
-            // unset etc.): locate_transcript answers None and the probe
-            // keeps the pure index answer — identical to pre-fix behavior.
+            // roots, CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home
+            // `.claude`), so reconcile and attach can never disagree about
+            // whether a claude transcript exists. An unreadable store (or
+            // no store root at all) answers Unreadable and the probe defers
+            // with Unknown — never a dead_session (G28).
             .with_claude_transcript_locator(std::sync::Arc::new(|session_id: &str| {
-                freshell_freshagent::locate_transcript(session_id)
+                freshell_freshagent::locate_transcript_state(session_id)
             }))
             // Opencode rebind fix: the SAME by-id DB truth the attach arm
             // trusts (`opencode --session <id>` resolves children and
