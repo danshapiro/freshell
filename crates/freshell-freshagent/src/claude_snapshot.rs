@@ -22,32 +22,39 @@ use serde_json::{json, Map, Value};
 
 use crate::summary::{truncate_summary, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL};
 
-/// Ordered candidate store roots. The real CLI resolves its store as
-/// `CLAUDE_CONFIG_DIR ?? $HOME/.claude` and IGNORES `CLAUDE_HOME` (verified against
-/// cli.js 2.1.220 -- ledger A3); `CLAUDE_HOME` is freshell's legacy knob
-/// (`server/claude-home.ts`, `session_directory.rs` -- `pub(crate)` to that crate).
-/// We read ALL candidates so a reader/writer root mismatch can never turn a live
-/// session into a false positive denial.
+/// Ordered candidate store roots -- the ONE store-root rule every claude
+/// transcript caller shares (snapshot, resume-on-attach, rollback, naming,
+/// reconcile existence). The real CLI resolves its store as
+/// `CLAUDE_CONFIG_DIR ?? os.homedir()/.claude` and IGNORES `CLAUDE_HOME`
+/// (verified against cli.js 2.1.220 -- ledger A3); `CLAUDE_HOME` is freshell's
+/// legacy knob (`server/claude-home.ts`, `session_directory.rs`). The platform
+/// home is [`std::env::home_dir`] -- USERPROFILE on Windows (HOME is never read
+/// there), HOME-else-passwd-entry on POSIX -- exactly Node's `os.homedir()`, so
+/// the Windows desktop app (no HOME) and a POSIX service with HOME unset still
+/// find the store the CLI writes. We read ALL candidates so a reader/writer
+/// root mismatch can never turn a live session into a false positive denial.
 pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
+    claude_home_candidates_from(|key| std::env::var(key).ok(), std::env::home_dir())
+}
+
+/// Pure form of [`claude_home_candidates`]: `var` is the environment lookup and
+/// `home` the platform home, both injected so the rule is testable without
+/// mutating process-global env. Empty values never produce a (bogus,
+/// cwd-relative) root; duplicates are scanned once, first position wins.
+pub(crate) fn claude_home_candidates_from(
+    var: impl Fn(&str) -> Option<String>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let explicit = ["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"]
+        .into_iter()
+        .filter_map(|key| var(key).filter(|v| !v.is_empty()).map(PathBuf::from));
+    let platform_default = home
+        .filter(|h| !h.as_os_str().is_empty())
+        .map(|h| h.join(".claude"));
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf| {
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    };
-    if let Ok(v) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !v.is_empty() {
-            push(PathBuf::from(v));
-        }
-    }
-    if let Ok(v) = std::env::var("CLAUDE_HOME") {
-        if !v.is_empty() {
-            push(PathBuf::from(v));
-        }
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            push(PathBuf::from(h).join(".claude"));
+    for root in explicit.chain(platform_default) {
+        if !out.contains(&root) {
+            out.push(root);
         }
     }
     out
@@ -89,27 +96,12 @@ pub struct SelectedTranscript {
 /// SELECTED root + original cwd — the exact evidence a verified claude
 /// naming acquisition carries. Uses the same ordered candidates and
 /// traversal as [`locate_transcript`] (one definition of "the transcript
-/// exists"), plus the PLATFORM home fallback: on native Windows a missing
-/// `HOME` still resolves through `%USERPROFILE%\.claude` (the real CLI's
-/// home), so a session created by the Windows CLI is verifiable from the
-/// service host. `None` when the transcript cannot be located anywhere.
+/// exists"); the shared candidates already resolve the platform home the
+/// real CLI uses (`%USERPROFILE%\.claude` on native Windows), so a session
+/// created by the Windows CLI is verifiable from the service host. `None`
+/// when the transcript cannot be located anywhere.
 pub fn locate_transcript_selected(session_id: &str) -> Option<SelectedTranscript> {
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut candidates = claude_home_candidates();
-    // Platform home fallback (native Windows): `HOME` is frequently absent
-    // for a service host; the CLI resolves `~` through USERPROFILE there.
-    #[cfg(windows)]
-    if !candidates.iter().any(|root| root.ends_with(".claude")) {
-        if let Ok(profile) = std::env::var("USERPROFILE") {
-            if !profile.is_empty() {
-                let root = PathBuf::from(profile).join(".claude");
-                if !candidates.contains(&root) {
-                    candidates.push(root);
-                }
-            }
-        }
-    }
-    for root in candidates {
+    for root in claude_home_candidates() {
         if let Some(path) = find_transcript(&root, session_id) {
             let transcript_cwd = transcript_cwd_bounded(&path);
             return Some(SelectedTranscript {
@@ -1192,16 +1184,31 @@ pub(crate) async fn get_claude_snapshot(
     thread_id: &str,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, ClaudeSnapshotError> {
+    get_claude_snapshot_in(&claude_home_candidates(), session_type, thread_id, rollback).await
+}
+
+/// [`get_claude_snapshot`] over explicit store roots (the production caller
+/// passes [`claude_home_candidates`]; tests pass temp roots, no env mutation).
+async fn get_claude_snapshot_in(
+    roots: &[PathBuf],
+    session_type: &str,
+    thread_id: &str,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+) -> Result<Value, ClaudeSnapshotError> {
     // Cannot check => must not deny (the attach arm in claude.rs treats this exact
     // state as Transient): with NO resolvable store root we cannot assert the
     // session is gone, so this is Io (-> 500), never NotFound (-> 404 lost).
-    if claude_home_candidates().is_empty() {
+    if roots.is_empty() {
         return Err(ClaudeSnapshotError::Io(
-            "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/HOME all unset)".into(),
+            "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/platform home all unset)"
+                .into(),
         ));
     }
     // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
-    let path = locate_transcript(thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
+    let path = roots
+        .iter()
+        .find_map(|root| find_transcript(root, thread_id))
+        .ok_or(ClaudeSnapshotError::NotFound)?;
     let mtime_ms = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -1366,6 +1373,89 @@ mod tests {
         assert_eq!(
             transcript_cwd_bounded(&home.path().join("absent.jsonl")),
             None
+        );
+    }
+
+    // -- G28: ONE shared claude store-root rule (pure seam) ------------------
+    //
+    // `claude_home_candidates_from` takes the env lookup AND the platform home
+    // as parameters, so these tests never mutate process-global env. The
+    // platform home is `std::env::home_dir()` in production — USERPROFILE on
+    // Windows, HOME-else-passwd on POSIX — exactly the real CLI's
+    // `os.homedir()`; the raw HOME variable is never consulted here.
+
+    fn env_of(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(&'static str, &'static str)> = pairs.to_vec();
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn store_roots_use_the_platform_home_when_home_is_unset() {
+        // POSIX passwd fallback shape: HOME unset, the platform home still
+        // resolves (here injected as `/h`).
+        assert_eq!(
+            claude_home_candidates_from(env_of(&[]), Some(PathBuf::from("/h"))),
+            vec![PathBuf::from("/h").join(".claude")]
+        );
+    }
+
+    #[test]
+    fn store_roots_follow_the_injected_platform_home_never_the_raw_home_var() {
+        // Windows shape: the CLI resolves `~` through USERPROFILE and never
+        // reads HOME. A stray HOME value must not add (or replace) a root.
+        let profile = PathBuf::from(r"C:\Users\u");
+        assert_eq!(
+            claude_home_candidates_from(env_of(&[]), Some(profile.clone())),
+            vec![profile.join(".claude")]
+        );
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("HOME", "/never-consulted")]),
+                Some(profile.clone())
+            ),
+            vec![profile.join(".claude")],
+            "the raw HOME variable is not a store-root input"
+        );
+    }
+
+    #[test]
+    fn store_roots_are_ordered_config_dir_then_claude_home_then_platform_home_deduped() {
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("CLAUDE_CONFIG_DIR", "/cfg"), ("CLAUDE_HOME", "/ch")]),
+                Some(PathBuf::from("/h")),
+            ),
+            vec![
+                PathBuf::from("/cfg"),
+                PathBuf::from("/ch"),
+                PathBuf::from("/h").join(".claude"),
+            ]
+        );
+        // A CLAUDE_CONFIG_DIR naming the default root is scanned ONCE.
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("CLAUDE_CONFIG_DIR", "/h/.claude"), ("CLAUDE_HOME", "/ch")]),
+                Some(PathBuf::from("/h")),
+            ),
+            vec![PathBuf::from("/h/.claude"), PathBuf::from("/ch")]
+        );
+        // Empty values never produce a bogus relative root.
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("CLAUDE_CONFIG_DIR", ""), ("CLAUDE_HOME", "")]),
+                Some(PathBuf::new()),
+            ),
+            Vec::<PathBuf>::new()
+        );
+        // Nothing resolvable at all: no roots (the "cannot check" state).
+        assert_eq!(
+            claude_home_candidates_from(env_of(&[]), None),
+            Vec::<PathBuf>::new()
         );
     }
 
@@ -1731,21 +1821,22 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_with_no_resolvable_store_root_is_io_not_notfound() {
-        // Cannot check => must not deny: with every store-root env var unset the
-        // server cannot assert the session is gone, so the error must be Io (-> 500),
-        // never NotFound (-> 404 FRESH_AGENT_LOST_SESSION). Env vars are
-        // process-global -- serialize under the shared claude env lock.
-        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-        let _restore = EnvVarsRestore::remove_all(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "HOME"]);
-        assert!(claude_home_candidates().is_empty());
-        let result =
-            get_claude_snapshot("freshclaude", "55555555-5555-4555-8555-555555555555", None).await;
-        match result {
-            Err(ClaudeSnapshotError::Io(msg)) => {
-                assert!(msg.contains("no claude store root resolvable"), "{msg}");
-            }
-            other => panic!("expected Io (cannot-check must not deny), got {other:?}"),
-        }
+        // Cannot check => must not deny: with no store root at all the server
+        // cannot assert the session is gone, so the error must be Io (-> 500),
+        // never NotFound (-> 404 FRESH_AGENT_LOST_SESSION). Driven through the
+        // roots seam: on POSIX the platform home can no longer be emptied via
+        // env (passwd-entry fallback), so "no roots" is an injected input.
+        let result = get_claude_snapshot_in(
+            &[],
+            "freshclaude",
+            "55555555-5555-4555-8555-555555555555",
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ClaudeSnapshotError::Io(_))),
+            "expected Io (cannot-check must not deny), got {result:?}"
+        );
     }
 
     /// Unified agent names (Task 2 review, M3): `locate_transcript_selected`
