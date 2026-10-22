@@ -14,7 +14,7 @@ async fn managed_socket_windows(
         cwd: "/workspace".into(),
         resume_session_id: None,
         create_request_id: None,
-    });
+    }, "OpenCode".to_string());
     state
         .registry
         .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {

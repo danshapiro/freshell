@@ -1,0 +1,771 @@
+//! Name reliability (Task 10): one naming bind for every terminal row path.
+//!
+//! Every terminal row the server creates or adopts — the WebSocket and REST
+//! creates, resume, auto-resume, managed register/reattach, compatibility
+//! adoption — binds its saved name through [`bind_terminal_naming_from_identity`].
+//! It resolves the naming target (the durable scoped session when the caller
+//! knows one, else a pre-durable pending handle), writes the door's identity
+//! binding and the registry binding together, then reads the record into the
+//! row's display cache and title. A transient store failure is retried
+//! (50 ms, 250 ms, 1 s) and then deferred to the 2 s tick with the binding
+//! kept — a row is never left unbound, and "read failed" never falls into the
+//! fresh pending path the way "no record" may.
+//!
+//! The core lives in this crate so both doors can call it: `freshell-ws`
+//! depends on `freshell-freshagent`, never the reverse, so each door bridges
+//! its own identity table in through [`TerminalNameBinder`] (the
+//! `identity_sink.rs` trait precedent).
+//!
+//! [`follow_identity_name_ref`] is the conversation-switch arm: when a door's
+//! identity table moves a terminal onto a new durable session (Claude's
+//! `/clear`, an OpenCode switch, a new Codex thread), the registry binding
+//! follows and the row adopts the NEW session's record — or, with none yet,
+//! drops the old session's cached name for the mode label. The switch never
+//! creates or changes a record. [`reconcile_terminal_names`] is the tick:
+//! it backstops moves no caller reported, binds scoped rows that have no
+//! binding, and fills bound rows whose cache is empty.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use freshell_protocol::session_names::{
+    NamedProvider, SessionNameRecord, SessionNameRef, SessionNameUpdate,
+};
+use freshell_terminal::TerminalRegistry;
+
+use crate::naming::{
+    log_name_error, name_ref_debug_key, named_provider_for, NameError, PendingNameInput,
+    SessionNaming,
+};
+
+/// The bounded retry schedule for a transient store failure: each delay
+/// precedes one more attempt, so a persistently busy store costs at most
+/// ~1.3 s before the bind defers to the tick.
+const BIND_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(250),
+    Duration::from_millis(1000),
+];
+
+/// How long a scoped row with no binding is left to its own create path
+/// before the tick binds it. A row is visible in the registry from its spawn,
+/// a beat before the create's naming admission (ledger writes and the
+/// ownership settle run in between); binding it from the tick inside that
+/// window would mint a handle that pre-empts the client's own `namingHandle`.
+const UNBOUND_ROW_GRACE_MS: i64 = 30_000;
+
+/// A door's identity table, as the naming bind needs it. The WebSocket door
+/// implements it over `freshell-ws`'s identity registry; the REST door over
+/// the same registry through its injected binder plus its own handle stash.
+pub trait TerminalNameBinder: Send + Sync {
+    /// Record the terminal's naming binding. Option-write for the handle:
+    /// `None` keeps the handle already retained.
+    fn set_name_binding(
+        &self,
+        terminal_id: &str,
+        name_ref: &SessionNameRef,
+        naming_handle: Option<&str>,
+    );
+    /// The naming ref the identity table holds for this terminal.
+    fn name_ref_of(&self, terminal_id: &str) -> Option<SessionNameRef>;
+    /// The pre-durable handle the identity table retains for this terminal.
+    fn naming_handle_of(&self, terminal_id: &str) -> Option<String>;
+    /// The durable `(provider, session id)` the door knows for this terminal.
+    fn durable_session_of(&self, terminal_id: &str) -> Option<(String, String)>;
+}
+
+/// What the caller knows about the row it is binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamingBindHint {
+    /// The terminal mode (`claude`, `codex`, `opencode`, …); out-of-scope
+    /// modes bind nothing.
+    pub mode: String,
+    /// The row's folder (the pending record's directory-name fallback).
+    pub cwd: Option<String>,
+    /// An ESTABLISHED durable session id (a resume's sessionRef, a managed
+    /// soul's native id, an auto-resume target). Never a prospective id.
+    pub resume_session_id: Option<String>,
+    /// A persisted or client-sent pre-durable handle. Only a persisted handle
+    /// lets a record-less durable session fall back to the pending path.
+    pub naming_handle: Option<String>,
+    /// The row title when no saved name is known (the mode label).
+    pub fallback_title: String,
+}
+
+/// The binding a row ended up with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameBinding {
+    pub name_ref: SessionNameRef,
+    /// The pending handle the row retains (the pending path only).
+    pub naming_handle: Option<String>,
+}
+
+/// How a bind ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NamingBindOutcome {
+    /// Bound, and the saved record is cached on the row.
+    Bound {
+        binding: NameBinding,
+        record: SessionNameRecord,
+    },
+    /// Bound to a durable session that has no record yet; the row shows the
+    /// fallback title until the normal naming paths create one.
+    BoundNoRecord { binding: NameBinding },
+    /// Out of naming scope, or no naming authority is wired.
+    NotScoped,
+    /// Bound, but the store stayed unavailable through the bounded retry;
+    /// the tick fills the cache (or admits the pending record) later.
+    Deferred {
+        binding: NameBinding,
+        reason: String,
+    },
+}
+
+impl NamingBindOutcome {
+    /// The row's binding, when it has one.
+    pub fn binding(&self) -> Option<&NameBinding> {
+        match self {
+            Self::Bound { binding, .. }
+            | Self::BoundNoRecord { binding }
+            | Self::Deferred { binding, .. } => Some(binding),
+            Self::NotScoped => None,
+        }
+    }
+
+    /// The `nameRef` + `sessionName` frame projection, when a record is known.
+    pub fn projection(&self) -> Option<(SessionNameRef, SessionNameRecord)> {
+        match self {
+            Self::Bound { record, .. } => Some((record.name_ref.clone(), record.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// Bind a terminal row's saved name (see the module doc). A row the registry
+/// already holds a binding for keeps it — re-adopting an existing facade
+/// never re-targets its name — and only has its cache refreshed.
+pub async fn bind_terminal_naming_from_identity(
+    sink: Option<&Arc<dyn SessionNaming>>,
+    registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
+    terminal_id: &str,
+    hint: NamingBindHint,
+) -> NamingBindOutcome {
+    let Some(provider) = named_provider_for(Some(hint.mode.as_str()), None) else {
+        return NamingBindOutcome::NotScoped;
+    };
+    let Some(sink) = sink else {
+        return NamingBindOutcome::NotScoped;
+    };
+    if let Some(existing) = registry.name_ref_of(terminal_id) {
+        return refresh_existing_binding(
+            sink.as_ref(),
+            registry,
+            binder,
+            terminal_id,
+            existing,
+            &hint,
+        )
+        .await;
+    }
+    let durable = hint
+        .resume_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|session_id| SessionNameRef::Session {
+            provider,
+            session_id: session_id.to_string(),
+        });
+    if let Some(target) = durable {
+        let binding = NameBinding {
+            name_ref: target.clone(),
+            naming_handle: None,
+        };
+        apply_binding(registry, binder, terminal_id, &binding);
+        match read_record(sink.as_ref(), &target).await {
+            Ok(Some(record)) => {
+                registry.update_session_name(terminal_id, &record);
+                log_bound(terminal_id, &binding, "durable");
+                return NamingBindOutcome::Bound { binding, record };
+            }
+            Ok(None) => {
+                // A recovery create against a PROSPECTIVE (record-less)
+                // session — a zero-turn pane whose server restarted — must
+                // re-stamp the PERSISTED pre-durable handle: only a pending
+                // binding lets the verified bind transfer the record once the
+                // transcript materializes. Without a persisted handle the
+                // durable binding stands, unnamed until the normal paths name
+                // the session.
+                if persisted_handle(&hint).is_none() {
+                    registry.set_meta(
+                        terminal_id,
+                        Some(hint.fallback_title.clone()),
+                        None,
+                        None,
+                        None,
+                    );
+                    log_bound(terminal_id, &binding, "durable_no_record");
+                    return NamingBindOutcome::BoundNoRecord { binding };
+                }
+            }
+            Err(error) => {
+                // "Read failed" is not "no record": the durable binding is
+                // kept and NEVER replaced by the fresh pending path (that
+                // would orphan the session's saved name behind a new handle).
+                registry.set_meta(
+                    terminal_id,
+                    Some(hint.fallback_title.clone()),
+                    None,
+                    None,
+                    None,
+                );
+                return deferred(terminal_id, binding, &error);
+            }
+        }
+    }
+    let handle = persisted_handle(&hint)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("nh-{}", uuid::Uuid::new_v4()));
+    bind_pending_path(
+        sink.as_ref(),
+        registry,
+        binder,
+        terminal_id,
+        provider,
+        handle,
+        &hint,
+    )
+    .await
+}
+
+/// The conversation-switch arm: the door's identity table moved this
+/// terminal onto a new naming ref, so the registry binding follows it and
+/// the row adopts THAT ref's record. With no record, the row drops the old
+/// session's cached name and shows `fallback_title`; the normal naming paths
+/// name the new session later (the publisher refreshes every row bound to
+/// it). `None` when nothing moved. Creates and changes no record.
+pub async fn follow_identity_name_ref(
+    sink: Option<&Arc<dyn SessionNaming>>,
+    registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
+    terminal_id: &str,
+    fallback_title: &str,
+) -> Option<NamingBindOutcome> {
+    let sink = sink?;
+    let moved_to = binder.name_ref_of(terminal_id)?;
+    let moved_from = registry.name_ref_of(terminal_id);
+    if moved_from.as_ref() == Some(&moved_to) || !registry.exists(terminal_id) {
+        return None;
+    }
+    registry.set_naming(terminal_id, Some(moved_to.clone()), None);
+    let binding = NameBinding {
+        name_ref: moved_to.clone(),
+        naming_handle: binder.naming_handle_of(terminal_id),
+    };
+    let outcome = match read_record(sink.as_ref(), &moved_to).await {
+        Ok(Some(record)) => {
+            registry.update_session_name(terminal_id, &record);
+            NamingBindOutcome::Bound { binding, record }
+        }
+        Ok(None) => {
+            registry.clear_session_name(terminal_id, fallback_title);
+            NamingBindOutcome::BoundNoRecord { binding }
+        }
+        Err(error) => {
+            // The old session's name must not keep showing on the moved row.
+            registry.clear_session_name(terminal_id, fallback_title);
+            deferred(terminal_id, binding, &error)
+        }
+    };
+    tracing::info!(
+        target: "freshell_freshagent::naming",
+        terminal_id = %terminal_id,
+        from = %moved_from
+            .as_ref()
+            .map(name_ref_debug_key)
+            .unwrap_or_else(|| "-".to_string()),
+        to = %name_ref_debug_key(&moved_to),
+        has_record = matches!(outcome, NamingBindOutcome::Bound { .. }),
+        "session_names.terminal_binding_moved"
+    );
+    Some(outcome)
+}
+
+/// The REST door's identity table: its own create-lane handle stash (the
+/// pane rename resolver's last fallback) plus the shared identity table
+/// `freshell-server` injects (the same one the WebSocket door binds).
+pub(crate) struct RestDoorBinder<'a> {
+    state: &'a crate::FreshAgentState,
+}
+
+impl TerminalNameBinder for RestDoorBinder<'_> {
+    fn set_name_binding(
+        &self,
+        terminal_id: &str,
+        name_ref: &SessionNameRef,
+        naming_handle: Option<&str>,
+    ) {
+        if let Some(handle) = naming_handle {
+            self.state.stash_naming_handle(terminal_id, handle);
+        }
+        if let Some(door) = self.state.terminal_name_binder.as_ref() {
+            door.set_name_binding(terminal_id, name_ref, naming_handle);
+        }
+    }
+
+    fn name_ref_of(&self, terminal_id: &str) -> Option<SessionNameRef> {
+        self.state
+            .terminal_name_binder
+            .as_ref()
+            .and_then(|door| door.name_ref_of(terminal_id))
+    }
+
+    fn naming_handle_of(&self, terminal_id: &str) -> Option<String> {
+        self.state
+            .terminal_name_binder
+            .as_ref()
+            .and_then(|door| door.naming_handle_of(terminal_id))
+            .or_else(|| self.state.peek_naming_handle(terminal_id))
+    }
+
+    fn durable_session_of(&self, terminal_id: &str) -> Option<(String, String)> {
+        self.state
+            .terminal_name_binder
+            .as_ref()
+            .and_then(|door| door.durable_session_of(terminal_id))
+    }
+}
+
+/// Bind one REST-created terminal row through the shared helper.
+pub(crate) async fn bind_rest_terminal_naming(
+    state: &crate::FreshAgentState,
+    registry: &TerminalRegistry,
+    terminal_id: &str,
+    hint: NamingBindHint,
+) -> NamingBindOutcome {
+    let sink = state.naming();
+    let binder = RestDoorBinder { state };
+    bind_terminal_naming_from_identity(sink.as_ref(), registry, &binder, terminal_id, hint).await
+}
+
+/// What one tick pass did (for the tick's own structured log).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalNamesReconcile {
+    /// Rows whose registry binding followed a moved identity ref.
+    pub moved: usize,
+    /// Scoped rows that had no binding and got one.
+    pub bound: usize,
+    /// Bound rows whose empty cache was filled.
+    pub filled: usize,
+}
+
+/// The 2 s tick's terminal-naming reconcile (see the module doc). Bounded:
+/// one batched read for every uncached row, plus at most one bind per row
+/// that has no binding at all. `label_for` maps a mode to its row title.
+pub async fn reconcile_terminal_names(
+    sink: Option<&Arc<dyn SessionNaming>>,
+    registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
+    label_for: &(dyn Fn(&str) -> String + Sync),
+) -> TerminalNamesReconcile {
+    let mut report = TerminalNamesReconcile::default();
+    let Some(sink) = sink else {
+        return report;
+    };
+    let mut uncached: Vec<UncachedRow> = Vec::new();
+    for row in registry.identity_probe_rows() {
+        let Some(provider) = named_provider_for(Some(row.mode.as_str()), None) else {
+            continue;
+        };
+        let terminal_id = row.terminal_id.as_str();
+        let identity_ref = binder.name_ref_of(terminal_id);
+        let registry_ref = registry.name_ref_of(terminal_id);
+        let bound = match (identity_ref, registry_ref) {
+            (Some(identity_ref), Some(registry_ref)) if identity_ref == registry_ref => {
+                identity_ref
+            }
+            (Some(_), _) => {
+                if follow_identity_name_ref(
+                    Some(sink),
+                    registry,
+                    binder,
+                    terminal_id,
+                    &label_for(&row.mode),
+                )
+                .await
+                .is_some()
+                {
+                    report.moved += 1;
+                }
+                continue;
+            }
+            (None, Some(registry_ref)) => {
+                // Keep both homes consistent: the rename resolvers read the
+                // identity table.
+                binder.set_name_binding(terminal_id, &registry_ref, None);
+                registry_ref
+            }
+            (None, None) => {
+                if row.status != freshell_protocol::TerminalRunStatus::Running {
+                    continue; // an exited row is never minted a new record
+                }
+                if now_ms().saturating_sub(row.created_at) < UNBOUND_ROW_GRACE_MS {
+                    continue; // still inside its create path's admission window
+                }
+                let durable = binder
+                    .durable_session_of(terminal_id)
+                    .filter(|(door_provider, _)| door_provider.as_str() == provider.as_str())
+                    .map(|(_, session_id)| session_id);
+                let hint = NamingBindHint {
+                    mode: row.mode.clone(),
+                    cwd: row.cwd.clone(),
+                    resume_session_id: durable,
+                    naming_handle: binder.naming_handle_of(terminal_id),
+                    fallback_title: label_for(&row.mode),
+                };
+                let outcome = bind_terminal_naming_from_identity(
+                    Some(sink),
+                    registry,
+                    binder,
+                    terminal_id,
+                    hint,
+                )
+                .await;
+                tracing::info!(
+                    target: "freshell_freshagent::naming",
+                    terminal_id = %terminal_id,
+                    name_ref = %outcome
+                        .binding()
+                        .map(|binding| name_ref_debug_key(&binding.name_ref))
+                        .unwrap_or_else(|| "-".to_string()),
+                    "session_names.terminal_binding_reconciled: bound a scoped row that had no binding"
+                );
+                report.bound += 1;
+                continue;
+            }
+        };
+        if registry.session_name_of(terminal_id).is_none() {
+            uncached.push(UncachedRow {
+                terminal_id: row.terminal_id.clone(),
+                provider,
+                cwd: row.cwd.clone(),
+                name_ref: bound,
+            });
+        }
+    }
+    report.filled = fill_uncached_rows(sink.as_ref(), registry, &uncached).await;
+    report
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A bound row whose display cache is empty.
+struct UncachedRow {
+    terminal_id: String,
+    provider: NamedProvider,
+    cwd: Option<String>,
+    name_ref: SessionNameRef,
+}
+
+/// Fill every uncached bound row from ONE batched read; a pending binding
+/// whose record was never admitted (its create's `ensure_pending` failed)
+/// is admitted here, once per tick.
+async fn fill_uncached_rows(
+    sink: &dyn SessionNaming,
+    registry: &TerminalRegistry,
+    uncached: &[UncachedRow],
+) -> usize {
+    if uncached.is_empty() {
+        return 0;
+    }
+    let mut refs: Vec<SessionNameRef> = Vec::new();
+    for row in uncached {
+        if !refs.contains(&row.name_ref) {
+            refs.push(row.name_ref.clone());
+        }
+    }
+    let updates = match sink.get(refs).await {
+        Ok(updates) => updates,
+        Err(error) => {
+            tracing::warn!(
+                target: "freshell_freshagent::naming",
+                op = "get",
+                rows = uncached.len(),
+                class = %error.code(),
+                "session_names.terminal_cache_fill_deferred: {error}"
+            );
+            return 0;
+        }
+    };
+    let mut filled = 0;
+    for row in uncached {
+        if let Some(update) = updates.iter().find(|update| answers(update, &row.name_ref)) {
+            registry.update_session_name(&row.terminal_id, &update.record);
+            filled += 1;
+            continue;
+        }
+        let SessionNameRef::Pending { id } = &row.name_ref else {
+            continue; // a durable session with no record yet: nothing to fill
+        };
+        match sink
+            .ensure_pending(PendingNameInput {
+                handle: id.clone(),
+                provider: row.provider,
+                cwd: row.cwd.clone(),
+            })
+            .await
+        {
+            Ok(update) => {
+                registry.update_session_name(&row.terminal_id, &update.record);
+                filled += 1;
+            }
+            Err(error) => log_name_error("ensure_pending", &row.name_ref, &error),
+        }
+    }
+    filled
+}
+
+/// Whether `update` answers a read of `name_ref` (directly, or through the
+/// pending→durable redirect the store traversed).
+fn answers(update: &SessionNameUpdate, name_ref: &SessionNameRef) -> bool {
+    &update.record.name_ref == name_ref
+        || update
+            .redirects
+            .iter()
+            .any(|redirect| &redirect.from == name_ref)
+}
+
+/// A row already bound keeps its binding; its identity home is re-stamped
+/// and its cache refreshed (a compatibility re-adoption of a live facade).
+async fn refresh_existing_binding(
+    sink: &dyn SessionNaming,
+    registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
+    terminal_id: &str,
+    existing: SessionNameRef,
+    hint: &NamingBindHint,
+) -> NamingBindOutcome {
+    let binding = NameBinding {
+        name_ref: existing.clone(),
+        naming_handle: binder.naming_handle_of(terminal_id),
+    };
+    binder.set_name_binding(terminal_id, &existing, None);
+    match read_record(sink, &existing).await {
+        Ok(Some(record)) => {
+            registry.update_session_name(terminal_id, &record);
+            NamingBindOutcome::Bound { binding, record }
+        }
+        Ok(None) => {
+            if registry.session_name_of(terminal_id).is_none() {
+                registry.set_meta(
+                    terminal_id,
+                    Some(hint.fallback_title.clone()),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            NamingBindOutcome::BoundNoRecord { binding }
+        }
+        Err(error) => deferred(terminal_id, binding, &error),
+    }
+}
+
+/// Admit (or re-resolve) the pending record for `handle` and bind the row
+/// to it. On a persistent store failure the row is STILL bound to the
+/// pending ref, so the tick can admit the record later.
+async fn bind_pending_path(
+    sink: &dyn SessionNaming,
+    registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
+    terminal_id: &str,
+    provider: NamedProvider,
+    handle: String,
+    hint: &NamingBindHint,
+) -> NamingBindOutcome {
+    let input = PendingNameInput {
+        handle: handle.clone(),
+        provider,
+        cwd: hint.cwd.clone(),
+    };
+    let pending = SessionNameRef::Pending { id: handle.clone() };
+    let mut attempt = 0;
+    let admitted = loop {
+        match sink.ensure_pending(input.clone()).await {
+            Ok(update) => break Ok(update),
+            Err(error) if is_transient(&error) && attempt < BIND_RETRY_DELAYS.len() => {
+                log_retry("ensure_pending", &pending, &error, attempt);
+                tokio::time::sleep(BIND_RETRY_DELAYS[attempt]).await;
+                attempt += 1;
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    match admitted {
+        Ok(update) => {
+            // `ensure_pending` resolves a handle already bound to a durable
+            // session onto that session's record; the row follows it.
+            let binding = NameBinding {
+                name_ref: update.record.name_ref.clone(),
+                naming_handle: Some(handle),
+            };
+            apply_binding(registry, binder, terminal_id, &binding);
+            registry.update_session_name(terminal_id, &update.record);
+            log_bound(terminal_id, &binding, "pending");
+            NamingBindOutcome::Bound {
+                binding,
+                record: update.record,
+            }
+        }
+        Err(error) => {
+            log_name_error("ensure_pending", &pending, &error);
+            let binding = NameBinding {
+                name_ref: pending,
+                naming_handle: Some(handle),
+            };
+            apply_binding(registry, binder, terminal_id, &binding);
+            registry.set_meta(
+                terminal_id,
+                Some(hint.fallback_title.clone()),
+                None,
+                None,
+                None,
+            );
+            deferred(terminal_id, binding, &error)
+        }
+    }
+}
+
+/// Read one ref's record with the bounded retry; `Ok(None)` = no record.
+async fn read_record(
+    sink: &dyn SessionNaming,
+    target: &SessionNameRef,
+) -> Result<Option<SessionNameRecord>, NameError> {
+    let mut attempt = 0;
+    loop {
+        match sink.get(vec![target.clone()]).await {
+            Ok(updates) => {
+                return Ok(updates
+                    .into_iter()
+                    .find(|update| answers(update, target))
+                    .map(|update| update.record))
+            }
+            Err(error) if is_transient(&error) && attempt < BIND_RETRY_DELAYS.len() => {
+                log_retry("get", target, &error, attempt);
+                tokio::time::sleep(BIND_RETRY_DELAYS[attempt]).await;
+                attempt += 1;
+            }
+            Err(error) => {
+                log_name_error("get", target, &error);
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// A verified bind lane's accepted answer (the pending→durable transfer at
+/// materialization): when the store answered the requested durable target,
+/// the row's binding advances onto it in BOTH homes; either way the row
+/// caches the accepted record (an already-bound handle answers its own).
+pub fn apply_transferred_record(
+    registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
+    terminal_id: &str,
+    target: &SessionNameRef,
+    record: &SessionNameRecord,
+) {
+    if &record.name_ref == target {
+        apply_binding(
+            registry,
+            binder,
+            terminal_id,
+            &NameBinding {
+                name_ref: target.clone(),
+                naming_handle: None,
+            },
+        );
+    }
+    registry.update_session_name(terminal_id, record);
+}
+
+/// Write the binding into BOTH homes together: the door's identity table
+/// (the rename resolvers) and the registry row (the projections).
+fn apply_binding(
+    registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
+    terminal_id: &str,
+    binding: &NameBinding,
+) {
+    binder.set_name_binding(
+        terminal_id,
+        &binding.name_ref,
+        binding.naming_handle.as_deref(),
+    );
+    registry.set_naming(
+        terminal_id,
+        Some(binding.name_ref.clone()),
+        binding.naming_handle.clone(),
+    );
+}
+
+fn persisted_handle(hint: &NamingBindHint) -> Option<&str> {
+    hint.naming_handle
+        .as_deref()
+        .map(str::trim)
+        .filter(|handle| !handle.is_empty())
+}
+
+/// Store failures worth a bounded retry: lock contention, a document
+/// read/write failure with the old state intact, and an uncertain commit
+/// (every bind operation here is idempotent).
+fn is_transient(error: &NameError) -> bool {
+    matches!(
+        error,
+        NameError::LockUnavailable(_) | NameError::Persistence(_) | NameError::CommitUncertain(_)
+    )
+}
+
+fn deferred(terminal_id: &str, binding: NameBinding, error: &NameError) -> NamingBindOutcome {
+    tracing::warn!(
+        target: "freshell_freshagent::naming",
+        terminal_id = %terminal_id,
+        name_ref = %name_ref_debug_key(&binding.name_ref),
+        class = %error.code(),
+        "session_names.terminal_binding_deferred: the binding is kept and the 2s tick fills the name"
+    );
+    NamingBindOutcome::Deferred {
+        binding,
+        reason: error.code().to_string(),
+    }
+}
+
+fn log_retry(op: &str, target: &SessionNameRef, error: &NameError, attempt: usize) {
+    tracing::debug!(
+        target: "freshell_freshagent::naming",
+        op = %op,
+        name_ref = %name_ref_debug_key(target),
+        class = %error.code(),
+        attempt = attempt + 1,
+        "session_names.terminal_binding_retry"
+    );
+}
+
+fn log_bound(terminal_id: &str, binding: &NameBinding, path: &str) {
+    tracing::debug!(
+        target: "freshell_freshagent::naming",
+        terminal_id = %terminal_id,
+        name_ref = %name_ref_debug_key(&binding.name_ref),
+        path = %path,
+        "session_names.terminal_binding_bound"
+    );
+}
+
+#[cfg(test)]
+#[path = "terminal_name_binding_tests.rs"]
+mod tests;

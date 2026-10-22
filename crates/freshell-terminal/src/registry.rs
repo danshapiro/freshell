@@ -4494,6 +4494,24 @@ impl TerminalRegistry {
         }
     }
 
+    /// Name reliability (Task 10): drop the display cache when the row's
+    /// binding moved to a session with no record yet (a conversation switch),
+    /// presenting `fallback_title` instead of the previous session's name.
+    pub fn clear_session_name(&self, terminal_id: &str, fallback_title: &str) {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        if let Some(shared) = shared {
+            let mut s = shared.lock().expect("terminal lock");
+            s.session_name = None;
+            s.title = fallback_title.to_string();
+        }
+    }
+
     /// Unified agent names: the terminal's last-known canonical name record
     /// (display cache), if any.
     pub fn session_name_of(
@@ -4643,10 +4661,15 @@ impl TerminalRegistry {
     /// Reconstruct a browser-facing facade from protected supervisor inventory
     /// before legacy pane reconciliation consults host-local provider stores.
     /// This is read/adopt only: it never launches or resumes a provider.
+    ///
+    /// `title_for_mode` labels the reconstructed row from its mode (the
+    /// caller owns the CLI labels); the naming bind then overwrites it with
+    /// the saved name.
     pub async fn adopt_managed_for_reconcile(
         &self,
         terminal_id: &str,
         create_request_id: Option<String>,
+        title_for_mode: impl FnOnce(&str) -> String,
     ) -> Result<bool, String> {
         if self.exists(terminal_id) {
             return Ok(self.is_managed(terminal_id));
@@ -4671,7 +4694,8 @@ impl TerminalRegistry {
                 descriptor.terminal_id
             ));
         }
-        self.register_managed(descriptor);
+        let title = title_for_mode(&descriptor.mode);
+        self.register_managed(descriptor, title);
         Ok(true)
     }
 
@@ -4715,8 +4739,10 @@ impl TerminalRegistry {
 
     /// Register the browser-facing facade for a supervisor-owned PTY. This row
     /// deliberately has no `PtyTerminal`: server shutdown therefore has no OS
-    /// process handle it could accidentally reap.
-    pub fn register_managed(&self, descriptor: ManagedTerminalDescriptor) {
+    /// process handle it could accidentally reap. `title` is the caller's mode
+    /// label (never a hard-coded "Shell" for an agent soul); the naming bind
+    /// replaces it with the saved name.
+    pub fn register_managed(&self, descriptor: ManagedTerminalDescriptor, title: String) {
         let created_at = now_ms();
         let shared = Arc::new(Mutex::new(TerminalShared {
             managed_identity: Some((
@@ -4749,7 +4775,7 @@ impl TerminalRegistry {
             geometry_epoch: 1,
             has_client_geometry: false,
             cwd: Some(descriptor.cwd.clone()),
-            title: "Shell".to_string(),
+            title,
             description: None,
             mode: descriptor.mode.clone(),
             resume_session_id: descriptor.resume_session_id.clone(),
@@ -15513,16 +15539,19 @@ mod tests {
     fn managed_facade_is_never_reaped_by_legacy_idle_or_shutdown_paths() {
         let registry = TerminalRegistry::new();
         registry.set_auto_kill_idle_minutes(1);
-        registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-managed".into(),
-            incarnation_id: "incarnation-managed".into(),
-            terminal_id: "T-managed".into(),
-            stream_id: "S-managed".into(),
-            mode: "shell".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: None,
-            create_request_id: Some("req-managed".into()),
-        });
+        registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-managed".into(),
+                incarnation_id: "incarnation-managed".into(),
+                terminal_id: "T-managed".into(),
+                stream_id: "S-managed".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: Some("req-managed".into()),
+            },
+            "Shell".to_string(),
+        );
         registry.backdate_last_activity("T-managed", now_ms() - 48 * 60 * 60_000);
 
         assert!(registry.enforce_idle_kills().is_empty());
@@ -15534,16 +15563,19 @@ mod tests {
     #[test]
     fn managed_exit_marks_facade_exited_but_retains_replay_row() {
         let registry = TerminalRegistry::new();
-        registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-exit".into(),
-            incarnation_id: "incarnation-exit".into(),
-            terminal_id: "T-exit".into(),
-            stream_id: "S-exit".into(),
-            mode: "shell".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: None,
-            create_request_id: None,
-        });
+        registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-exit".into(),
+                incarnation_id: "incarnation-exit".into(),
+                terminal_id: "T-exit".into(),
+                stream_id: "S-exit".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            },
+            "Shell".to_string(),
+        );
         assert!(registry.ingest_managed_output("T-exit", 1, 1, "tail\n".into()));
         assert!(registry.finish_managed_exit("T-exit", 17));
         assert!(!registry.is_live("T-exit"));
@@ -15560,16 +15592,19 @@ mod tests {
     fn managed_exit_waits_for_paced_replay_before_notifying_the_client() {
         let registry = TerminalRegistry::new();
         registry.set_paced_page_max_bytes(0);
-        registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-paced-exit".into(),
-            incarnation_id: "incarnation-paced-exit".into(),
-            terminal_id: "T-paced-exit".into(),
-            stream_id: "S-paced-exit".into(),
-            mode: "opencode".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: None,
-            create_request_id: None,
-        });
+        registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-paced-exit".into(),
+                incarnation_id: "incarnation-paced-exit".into(),
+                terminal_id: "T-paced-exit".into(),
+                stream_id: "S-paced-exit".into(),
+                mode: "opencode".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            },
+            "OpenCode".to_string(),
+        );
         for seq in 1..=3 {
             assert!(registry.ingest_managed_output(
                 "T-paced-exit",
@@ -15649,16 +15684,19 @@ mod tests {
     #[test]
     fn managed_output_replay_dedupes_repeated_host_cursor_reads() {
         let registry = TerminalRegistry::new();
-        registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-output".into(),
-            incarnation_id: "incarnation-output".into(),
-            terminal_id: "T-output".into(),
-            stream_id: "S-output".into(),
-            mode: "shell".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: None,
-            create_request_id: None,
-        });
+        registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "soul-output".into(),
+                incarnation_id: "incarnation-output".into(),
+                terminal_id: "T-output".into(),
+                stream_id: "S-output".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            },
+            "Shell".to_string(),
+        );
 
         assert!(registry.ingest_managed_output("T-output", 1, 1, "one\n".into()));
         assert!(registry.ingest_managed_output("T-output", 1, 1, "duplicate\n".into()));
@@ -15676,6 +15714,10 @@ mod tests {
 #[cfg(test)]
 #[path = "managed_output_tests.rs"]
 mod managed_output_tests;
+
+#[cfg(test)]
+#[path = "registry_naming_tests.rs"]
+mod registry_naming_tests;
 
 #[cfg(test)]
 mod fixture_denies_host_pty {
@@ -15733,16 +15775,19 @@ mod fixture_denies_host_pty {
     #[test]
     fn managed_facade_remains_available_without_a_host_pid() {
         let registry = TerminalRegistry::new().with_managed_environment_fixture_only(true);
-        registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "fixture-soul".into(),
-            incarnation_id: "fixture-incarnation".into(),
-            terminal_id: "fixture-managed".into(),
-            stream_id: "fixture-stream".into(),
-            mode: "opencode".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: None,
-            create_request_id: Some("fixture-create".into()),
-        });
+        registry.register_managed(
+            ManagedTerminalDescriptor {
+                soul_id: "fixture-soul".into(),
+                incarnation_id: "fixture-incarnation".into(),
+                terminal_id: "fixture-managed".into(),
+                stream_id: "fixture-stream".into(),
+                mode: "opencode".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: Some("fixture-create".into()),
+            },
+            "OpenCode".to_string(),
+        );
         assert!(registry.is_managed("fixture-managed"));
         assert_eq!(registry.pid_of("fixture-managed"), None);
         assert!(registry.ingest_managed_output("fixture-managed", 1, 1, "fixture output".into()));

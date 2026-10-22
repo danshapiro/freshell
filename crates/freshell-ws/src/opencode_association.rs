@@ -304,6 +304,10 @@ async fn associate_session_identity(
         acquisition,
     )
     .await;
+    // Name reliability (Task 10, G45): a conversation switch moved the
+    // identity's durable ref; the terminal row's binding follows it and the
+    // row adopts the new session's own name.
+    crate::terminal_naming::follow_identity_switch(state, terminal_id).await;
     state.registry.set_meta(
         terminal_id,
         None,
