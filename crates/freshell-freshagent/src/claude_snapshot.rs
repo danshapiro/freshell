@@ -8,13 +8,15 @@
 //! snapshot GET, and the legacy Node server already proved direct-read viable
 //! (`server/session-history-loader.ts` -- with real-store parsing fixes, ledger A5).
 //! Store-root resolution is ORDERED CANDIDATES (`CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` >
-//! `$HOME/.claude`) because the real CLI honors CLAUDE_CONFIG_DIR and IGNORES
-//! CLAUDE_HOME (ledger A3) -- reading a single root risks false positive denial.
-//! The transcript store is also the AUTHORITY for lost-vs-alive on attach
-//! ([`crate::FreshClaudeState::handle_attach`]): file present => resumable, file
-//! absent in EVERY candidate root => positively gone (mirrors opencode's 404 rule;
+//! platform home `.claude`, the platform home being `std::env::home_dir()` exactly
+//! like the CLI's `os.homedir()`) because the real CLI honors CLAUDE_CONFIG_DIR and
+//! IGNORES CLAUDE_HOME (ledger A3) -- reading a single root risks false positive
+//! denial. The transcript store is also the AUTHORITY for lost-vs-alive on attach
+//! ([`crate::FreshClaudeState::handle_attach`]): file present => resumable, a CLEAN
+//! miss in EVERY candidate root => positively gone (mirrors opencode's 404 rule;
 //! honest even under claude's 30-day `cleanupPeriodDays` GC -- an expired transcript
-//! is unresumable by the CLI too, ledger A4).
+//! is unresumable by the CLI too, ledger A4), and a store that cannot be read is
+//! "cannot check", never gone ([`TranscriptLocation`], G28).
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +35,7 @@ use crate::summary::{truncate_summary, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL
 /// the Windows desktop app (no HOME) and a POSIX service with HOME unset still
 /// find the store the CLI writes. We read ALL candidates so a reader/writer
 /// root mismatch can never turn a live session into a false positive denial.
-pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
+pub fn claude_home_candidates() -> Vec<PathBuf> {
     claude_home_candidates_from(|key| std::env::var(key).ok(), std::env::home_dir())
 }
 
@@ -53,11 +55,76 @@ pub(crate) fn claude_home_candidates_from(
         .map(|h| h.join(".claude"));
     let mut out: Vec<PathBuf> = Vec::new();
     for root in explicit.chain(platform_default) {
-        if !out.contains(&root) {
+        if !out.iter().any(|seen| same_store_root(seen, &root)) {
             out.push(root);
         }
     }
     out
+}
+
+/// Two spellings of the same store root are scanned once. Path equality
+/// compares components (separators and a trailing slash never matter); on
+/// Windows each component also compares case-insensitively, the filesystem's
+/// own rule, so `C:/USERS/u/.claude/` and `C:\Users\u\.claude` are one root.
+#[cfg(not(windows))]
+fn same_store_root(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn same_store_root(left: &Path, right: &Path) -> bool {
+    same_windows_path(left, right)
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Component;
+
+    const CSTR_EQUAL: i32 = 2;
+    const TRUE: i32 = 1;
+
+    let components_match = |left: Component<'_>, right: Component<'_>| {
+        let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+        let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+        else {
+            return false;
+        };
+        if left_len == 0 || right_len == 0 {
+            return false;
+        }
+
+        // SAFETY: both buffers remain alive for the call, and each explicit
+        // length is the number of valid UTF-16 code units in that buffer.
+        unsafe {
+            compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, TRUE)
+                == CSTR_EQUAL
+        }
+    };
+
+    let mut left = left.components();
+    let mut right = right.components();
+    loop {
+        match (left.next(), right.next()) {
+            (Some(left), Some(right)) if components_match(left, right) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CompareStringOrdinal"]
+    fn compare_string_ordinal(
+        string1: *const u16,
+        count1: i32,
+        string2: *const u16,
+        count2: i32,
+        ignore_case: i32,
+    ) -> i32;
 }
 
 /// Where a claude transcript stands across the store roots (G28). Only a CLEAN
