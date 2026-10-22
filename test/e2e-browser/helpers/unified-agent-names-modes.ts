@@ -134,10 +134,7 @@ export async function resolveSessionId(journey: Journey, handle: NamedAgentHandl
   return resolved
 }
 
-export async function readRecord(
-  journey: Journey,
-  ref: SessionNameRef,
-): Promise<{ name: string; source: string; ref: SessionNameRef; revision: number }> {
+export async function readRecord(journey: Journey, ref: SessionNameRef): Promise<{ name: string; source: string; ref: SessionNameRef }> {
   // A rate-limited read (shared API bucket) is transient: retry a bounded
   // few times instead of failing the journey on the limiter.
   for (let attempt = 0; ; attempt += 1) {
@@ -147,9 +144,7 @@ export async function readRecord(
       body: JSON.stringify({ refs: [ref] }),
     })
     if (response.ok) {
-      const payload = await response.json() as {
-        names: Array<{ record: { name: string; source: string; ref: SessionNameRef; revision: number } }>
-      }
+      const payload = await response.json() as { names: Array<{ record: { name: string; source: string; ref: SessionNameRef } }> }
       expect(payload.names[0]).toBeTruthy()
       return payload.names[0].record
     }

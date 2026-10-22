@@ -11,7 +11,6 @@ import {
 } from '../helpers/unified-agent-names.js'
 import {
   bootJourney,
-  readRecord,
   resolveSessionId,
   type Journey,
 } from '../helpers/unified-agent-names-modes.js'
@@ -71,25 +70,48 @@ async function createClaudeSession(
   return { handle, sessionId, ref: { kind: 'session', provider: 'claude', sessionId } }
 }
 
-/** Wait until the server's record stops moving (same name and revision
- * across several sweep passes), then return it. */
-async function settledRecord(
-  journey: Journey,
-  ref: SessionNameRef,
-): Promise<{ name: string; revision: number }> {
+type NameRecord = { name: string; source: string; revision: number }
+
+/** The server's saved record for `ref`, or null while none exists (a pane
+ * can learn its session id before the server binds the name to it). A
+ * rate-limited read (shared API bucket) is retried a bounded few times. */
+async function readNameRecord(journey: Journey, ref: SessionNameRef): Promise<NameRecord | null> {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch(`${journey.server.info.baseUrl}/api/session-names/read`, {
+      method: 'POST',
+      headers: { 'x-auth-token': journey.server.info.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ refs: [ref] }),
+    })
+    if (response.ok) {
+      const payload = await response.json() as { names: Array<{ record: NameRecord }> }
+      const record = payload.names[0]?.record
+      return record ? { name: record.name, source: record.source, revision: record.revision } : null
+    }
+    if (response.status !== 429 || attempt >= 5) {
+      throw new Error(`session-names read failed (${response.status})`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 600))
+  }
+}
+
+/** Wait until the server holds a record for `ref` and it stops moving
+ * (same name and revision across several sweep passes), then return it. */
+async function settledRecord(journey: Journey, ref: SessionNameRef): Promise<NameRecord> {
   const stableForMs = 15_000
-  const deadline = Date.now() + 120_000
-  let last = await readRecord(journey, ref)
+  // The pending-to-session bind can take a minute or two on a cold cloud
+  // filesystem.
+  const deadline = Date.now() + 240_000
+  let last: NameRecord | null = null
   let stableSince = Date.now()
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 1_500))
-    const next = await readRecord(journey, ref)
-    if (next.name !== last.name || next.revision !== last.revision) {
+    const next = await readNameRecord(journey, ref)
+    if (!next || !last || next.name !== last.name || next.revision !== last.revision) {
       last = next
       stableSince = Date.now()
-      continue
+    } else if (Date.now() - stableSince >= stableForMs) {
+      return last
     }
-    if (Date.now() - stableSince >= stableForMs) return { name: last.name, revision: last.revision }
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
   }
   throw new Error(`the record for ${JSON.stringify(ref)} never settled (last: ${JSON.stringify(last)})`)
 }
@@ -170,7 +192,7 @@ test.describe('name import shutdown', () => {
       await quietPeriod(page)
 
       expect(imports.count).toBe(0)
-      expect(await readRecord(journey, ref)).toMatchObject(before)
+      expect(await readNameRecord(journey, ref)).toMatchObject(before)
       await expectTabLabel(page, handle.tabId, before.name)
       await context.close()
     } finally {
@@ -195,7 +217,7 @@ test.describe('name import shutdown', () => {
 
       expect(firstImports.count).toBe(0)
       expect(secondImports.count).toBe(0)
-      expect(await readRecord(journey, ref)).toMatchObject(before)
+      expect(await readNameRecord(journey, ref)).toMatchObject(before)
       await expectTabLabel(page, handle.tabId, before.name)
       await expectTabLabel(second.page, await tabIdOfSession(second.harness, handle, sessionId), before.name)
       await context.close()
@@ -252,14 +274,14 @@ test.describe('name import shutdown', () => {
       for (const win of windows) counters.push(countImportPosts(win.page))
       for (const win of windows) await quietPeriod(win.page)
       expect(counters.map((counter) => counter.count)).toEqual([0, 0, 0])
-      expect(await readRecord(journey, ref)).toMatchObject(before)
+      expect(await readNameRecord(journey, ref)).toMatchObject(before)
 
       for (let round = 1; round <= 3; round += 1) {
         for (const win of windows) {
           await reloadAndConnect(win.page)
           await quietPeriod(win.page)
           expect(counters.map((counter) => counter.count), `reload round ${round}`).toEqual([0, 0, 0])
-          expect(await readRecord(journey, ref), `reload round ${round}`).toMatchObject(before)
+          expect(await readNameRecord(journey, ref), `reload round ${round}`).toMatchObject(before)
         }
       }
       await context.close()
