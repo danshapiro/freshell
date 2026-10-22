@@ -77,6 +77,7 @@ import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
+import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
@@ -243,22 +244,9 @@ function handleSdkMessage(sessionId, msg) {
     case 'user': {
       // The SDK replays actual persisted user messages when this query opts in.
       // Only the unique UUID that this sidecar supplied for a checkpointed send
-      // can resolve its attempt; assistant/tool/result frames and unrelated
-      // user rows are never identity evidence.
-      if (msg.isReplay === true && msg.message?.role === 'user' && isUuid(msg.uuid)) {
-        const attempt = st.pendingCheckpointAttempts.get(msg.uuid)
-        if (attempt) {
-          st.pendingCheckpointAttempts.delete(msg.uuid)
-          emit({
-            type: 'sdk.checkpointTurnIdentity',
-            sessionId,
-            logicalAttemptId: attempt.logicalAttemptId,
-            requestId: attempt.requestId,
-            nativeTurnId: msg.uuid,
-            displayTurnId: msg.uuid,
-          })
-        }
-      }
+      // can resolve its attempt (checkpoint-identity.mjs).
+      const identity = takeCheckpointIdentity(st.pendingCheckpointAttempts, sessionId, msg)
+      if (identity) emit(identity)
       break
     }
     case 'system': {
@@ -495,12 +483,7 @@ function handleSend(req) {
   // the quiesce handler can drain never-handed compacts from the input queue
   // and so a same-tick handoff arms the BUSY-forcing handed flag.
   const isCompact = /^\s*\/compact(\s|$)/.test(String(req.text ?? ''))
-  const attempt = req.checkpointAttempt
-  const checkpointAttempt = attempt && isUuid(attempt.uuid)
-    && typeof attempt.logicalAttemptId === 'string' && attempt.logicalAttemptId.length > 0
-    && typeof attempt.requestId === 'string' && attempt.requestId.length > 0
-    ? { uuid: attempt.uuid, logicalAttemptId: attempt.logicalAttemptId, requestId: attempt.requestId }
-    : undefined
+  const checkpointAttempt = checkpointAttemptOf(req.checkpointAttempt)
   const userMessage = {
       type: 'user',
       message: { role: 'user', content: userMessageContent(req.text, req.images) },
@@ -508,15 +491,7 @@ function handleSend(req) {
       session_id: st.cliSessionId || 'default',
       ...(checkpointAttempt ? { uuid: checkpointAttempt.uuid } : {}),
     }
-  if (checkpointAttempt) {
-    // Bound stale/missing-replay entries. Eviction means unavailable identity,
-    // never an approximate join by request order or prompt text.
-    st.pendingCheckpointAttempts.delete(checkpointAttempt.uuid)
-    st.pendingCheckpointAttempts.set(checkpointAttempt.uuid, checkpointAttempt)
-    while (st.pendingCheckpointAttempts.size > 128) {
-      st.pendingCheckpointAttempts.delete(st.pendingCheckpointAttempts.keys().next().value)
-    }
-  }
+  if (checkpointAttempt) rememberCheckpointAttempt(st.pendingCheckpointAttempts, checkpointAttempt)
   st.inputStream.push(userMessage, isCompact)
   // Unified attention bookkeeping: this send is now ACCEPTED (the input-stream
   // push succeeded) and awaits exactly one terminal frame — a COUNTER, not a
@@ -526,11 +501,6 @@ function handleSend(req) {
   // the first assistant/system frame and cannot see the accept→first-message
   // window. The gate is NOT reset here — see turn-complete-gate.mjs.
   st.pendingResults += 1
-}
-
-function isUuid(value) {
-  return typeof value === 'string'
-    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 }
 
 async function handleConfigure(req) {
