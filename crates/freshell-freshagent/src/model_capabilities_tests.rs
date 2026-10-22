@@ -426,23 +426,24 @@ async fn claude_catalog_probe_uses_the_configured_sidecar_directory() {
     let sdk_name = "task-b-relocated-sdk.mjs";
     let sdk_entry = directory.path().join(sdk_name);
 
+    // The relocated package carries every sidecar module (the catalog helper
+    // imports its siblings), with a stub in place of the session entry.
+    let package = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../freshell-claude-sidecar"
+    ));
+    for module in std::fs::read_dir(&package).expect("read the sidecar package") {
+        let module = module.expect("sidecar package entry").path();
+        if module
+            .extension()
+            .is_some_and(|extension| extension == "mjs")
+        {
+            let name = module.file_name().expect("module file name");
+            std::fs::copy(&module, directory.path().join(name)).expect("copy a sidecar module");
+        }
+    }
+    assert!(catalog_entry.is_file(), "the catalog helper was copied");
     std::fs::write(&sidecar_entry, "export {}\n").expect("write sidecar entry");
-    std::fs::copy(
-        PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../freshell-claude-sidecar/model-catalog.mjs"
-        )),
-        &catalog_entry,
-    )
-    .expect("copy model catalog helper");
-    std::fs::copy(
-        PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../freshell-claude-sidecar/exec-profile.mjs"
-        )),
-        directory.path().join("exec-profile.mjs"),
-    )
-    .expect("copy model catalog exec dependency");
     std::fs::write(
         &sdk_entry,
         r#"

@@ -842,11 +842,9 @@ impl FreshClaudeState {
     }
 
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
-    /// come through here).
-    async fn spawn_sidecar_process(
-        &self,
-    ) -> Result<(Child, ChildStdin, ChildStdout, String), String> {
-        spawn_sidecar(self.sidecar_environment.as_deref()).await
+    /// come through here) for a session of `session_type`.
+    async fn spawn_sidecar_process(&self, session_type: &str) -> Result<SpawnedSidecar, String> {
+        spawn_sidecar(self.sidecar_environment.as_deref(), session_type).await
     }
 
     pub fn set_checkpoint_event_persister(
@@ -1906,6 +1904,45 @@ impl FreshClaudeState {
         }
     }
 
+    /// The one way a claude attention edge leaves the server: every site that
+    /// forwards or mints a `freshAgent.turn.complete` / `freshAgent.turn.waiting`
+    /// calls this (design §9.2 I-1; C18's `ClaudeEdgeHub::emit` replaces it).
+    /// It logs the edge at info (G14, design §5.5: ids, type, source and `at`;
+    /// never content), then broadcasts its client frame. `stamp` is the
+    /// envelope id clients address the session by; `sidecar_session_id` is the
+    /// id inside the event, as the sidecar names the session.
+    pub(crate) fn emit_attention_edge(
+        &self,
+        edge: AttentionEdge,
+        stamp: &str,
+        sidecar_session_id: &str,
+        session_type: &str,
+        at: i64,
+        source: AttentionEdgeSource,
+    ) {
+        let source = source.as_str();
+        match edge {
+            AttentionEdge::TurnComplete => tracing::info!(
+                provider = PROVIDER, session_id = %stamp, session_type = %session_type,
+                source, at, "freshagent.turn.complete"
+            ),
+            AttentionEdge::Waiting => tracing::info!(
+                provider = PROVIDER, session_id = %stamp, session_type = %session_type,
+                source, at, "freshagent.turn.waiting"
+            ),
+        }
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({
+                "type": edge.wire_type(),
+                "sessionId": sidecar_session_id,
+                "at": at,
+            }),
+            provider: PROVIDER.to_string(),
+            session_id: stamp.to_string(),
+            session_type: session_type.to_string(),
+        }));
+    }
+
     async fn broadcast_checkpoint_frame(
         &self,
         frame: String,
@@ -2321,9 +2358,14 @@ impl FreshClaudeState {
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
 
-        let (mut child, mut stdin, stdout, ownership_id) = match self.spawn_sidecar_process().await
-        {
-            Ok(parts) => parts,
+        let SpawnedSidecar {
+            mut child,
+            mut stdin,
+            stdout,
+            ownership_id,
+            log_labels,
+        } = match self.spawn_sidecar_process(session_type).await {
+            Ok(spawned) => spawned,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -2528,6 +2570,7 @@ impl FreshClaudeState {
         // pending-set fold live here). `Some(settings)` => the consumer records a
         // binding row at `sdk.session.init`.
         let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
+        log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
@@ -6409,7 +6452,7 @@ impl FreshClaudeState {
             }
             let create_req = Value::Object(create_req);
             match self
-                .rollback_spawn_create(&create_req, lease_guard.as_mut())
+                .rollback_spawn_create(&create_req, session_type, lease_guard.as_mut())
                 .await
             {
                 Ok(ok) => break Ok(ok),
@@ -6442,6 +6485,7 @@ impl FreshClaudeState {
             stdin,
             reader,
             ownership_id,
+            log_labels,
             sidecar_session_id,
             preseeded_init,
             cli_id,
@@ -6466,6 +6510,7 @@ impl FreshClaudeState {
         // the SAME lock regardless of when it resolved its handle).
         let (adopted_tx, adopted_rx) = tokio::sync::oneshot::channel();
         let broadcast_id = Arc::new(std::sync::Mutex::new(op.session_id.clone()));
+        log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         // The respawn is fresh: nothing announced yet; the consumer's status
         // fold owns the tracked status from here.
@@ -7212,8 +7257,14 @@ impl FreshClaudeState {
         // advances the durable tombstone past it and the commit below
         // REFUSES instead of undoing the newer close.
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
-        let (mut child, mut stdin, stdout, ownership_id) = self
-            .spawn_sidecar_process()
+        let SpawnedSidecar {
+            mut child,
+            mut stdin,
+            stdout,
+            ownership_id,
+            log_labels,
+        } = self
+            .spawn_sidecar_process(session_type_str(msg.session_type))
             .await
             .map_err(ResumeClaudeError::Transient)?;
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
@@ -7316,6 +7367,7 @@ impl FreshClaudeState {
         // attaches with the old id still resolve — no repeat-fire, V7 §4); `None`
         // records nothing (no laundered blank row under the new id, V7/A10).
         let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
+        log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
@@ -8776,7 +8828,26 @@ impl FreshClaudeState {
                 // Task 10b: stamp the envelope from the SHARED handle (not the captured
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
+                let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+                if let Some(edge) = AttentionEdge::from_sidecar_type(line_type) {
+                    // The sidecar's attention edges leave through the one edge
+                    // exit (logged there, G14).
+                    match value.get("at").and_then(Value::as_i64) {
+                        Some(at) => state.emit_attention_edge(
+                            edge,
+                            &stamp,
+                            &sidecar_session_id,
+                            &session_type,
+                            at,
+                            AttentionEdgeSource::Sidecar,
+                        ),
+                        // The client drops an edge without a numeric `at`; say so here.
+                        None => tracing::warn!(target: "freshell_freshagent::claude",
+                            provider = PROVIDER, session_id = %stamp,
+                            session_type = %session_type, edge = edge.wire_type(),
+                            "freshagent.claude.attention_edge_dropped_malformed_at"),
+                    }
+                } else if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
                     if value.get("type").and_then(Value::as_str)
                         == Some("sdk.checkpointTurnIdentity")
                     {
@@ -8908,21 +8979,14 @@ impl FreshClaudeState {
                         *guard = Some(at);
                         at
                     };
-                    // DIAG-01: the attention edge only — session id + source,
-                    // never the turn's text/response content.
-                    tracing::info!(provider = PROVIDER, session_id = %stamp,
-                        source = "freshclaude/consumer-exit", "freshagent.turn.complete");
-                    let frame = ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                        event: json!({
-                            "type": "freshAgent.turn.complete",
-                            "sessionId": sidecar_session_id,
-                            "at": at,
-                        }),
-                        provider: PROVIDER.to_string(),
-                        session_id: stamp.clone(),
-                        session_type: session_type.clone(),
-                    });
-                    state.broadcast(&frame);
+                    state.emit_attention_edge(
+                        AttentionEdge::TurnComplete,
+                        &stamp,
+                        &sidecar_session_id,
+                        &session_type,
+                        at,
+                        AttentionEdgeSource::ConsumerExit,
+                    );
                 }
             }
         })
@@ -9377,6 +9441,53 @@ fn frame_request_id(value: &Value) -> Option<String> {
 
 // ── sdk.* → freshAgent.event frame (port of sdk-events.ts normalizeFreshAgentProviderEvent) ─
 
+/// The two attention edges a claude session raises (AGENTS.md "Agent Status
+/// Indicators"): a turn ended that the user did not witness, or the agent waits
+/// on the user (a pending approval or question).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionEdge {
+    TurnComplete,
+    Waiting,
+}
+
+impl AttentionEdge {
+    /// The edge a sidecar stdout line carries, if it carries one.
+    fn from_sidecar_type(sdk_type: &str) -> Option<Self> {
+        match sdk_type {
+            "sdk.turn.complete" => Some(Self::TurnComplete),
+            "sdk.turn.waiting" => Some(Self::Waiting),
+            _ => None,
+        }
+    }
+
+    /// The client event type.
+    pub(crate) fn wire_type(self) -> &'static str {
+        match self {
+            Self::TurnComplete => "freshAgent.turn.complete",
+            Self::Waiting => "freshAgent.turn.waiting",
+        }
+    }
+}
+
+/// Where an attention edge was minted (logged as `source`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionEdgeSource {
+    /// The sidecar minted it (a result, a result-less stream end, a pending
+    /// card) and the stdout consumer forwarded it.
+    Sidecar,
+    /// The stdout consumer minted it for an unrequested sidecar death mid-turn.
+    ConsumerExit,
+}
+
+impl AttentionEdgeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sidecar => "freshclaude/sidecar",
+            Self::ConsumerExit => "freshclaude/consumer-exit",
+        }
+    }
+}
+
 /// Map an `sdk.*` event line from the sidecar to a `freshAgent.event` wire frame. Renames
 /// the inner `type` `sdk.X → freshAgent.X` (only the known set — matching sdk-events.ts,
 /// which passes unknown types through unchanged and thus never surfaces them as fresh-agent
@@ -9564,6 +9675,8 @@ struct RollbackSpawned {
     /// The stdout line reader, positioned AFTER the preread `sdk.session.init`.
     reader: tokio::io::Lines<BufReader<ChildStdout>>,
     ownership_id: String,
+    /// The labels the respawn's stderr log carries (bound at registration).
+    log_labels: crate::claude_sidecar_io::SidecarLogLabels,
     /// The sidecar-keyed id (`created.sessionId`).
     sidecar_session_id: String,
     /// The preread `sdk.session.init` line (the consumer adopts it preseeded).
@@ -9598,10 +9711,17 @@ impl FreshClaudeState {
     async fn rollback_spawn_create(
         &self,
         create_req: &Value,
+        session_type: &str,
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
     ) -> Result<RollbackSpawned, RollbackSpawnError> {
-        let (mut child, mut stdin, stdout, ownership_id) = self
-            .spawn_sidecar_process()
+        let SpawnedSidecar {
+            mut child,
+            mut stdin,
+            stdout,
+            ownership_id,
+            log_labels,
+        } = self
+            .spawn_sidecar_process(session_type)
             .await
             .map_err(RollbackSpawnError::Other)?;
         if let Some(g) = lease_guard {
@@ -9635,6 +9755,7 @@ impl FreshClaudeState {
                     stdin,
                     reader,
                     ownership_id,
+                    log_labels,
                     sidecar_session_id,
                     preseeded_init: init,
                     cli_id,
@@ -9702,14 +9823,27 @@ async fn read_session_init(
 
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
 
-/// Spawn `node <sidecar>/index.mjs`, ownership-tagged, inheriting the server's isolated HOME
-/// (so the SDK's `claude` CLI authenticates from + writes under `<isolatedHOME>/.claude`).
-/// Returns the owned child, its stdin, its stdout, and the ownership tag.
+/// A just-spawned claude sidecar: the owned child with its stdin and stdout, the
+/// ownership tag the reaper finds its tree by, and the labels its stderr log
+/// carries (bound to the session once the sidecar names it).
+struct SpawnedSidecar {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    ownership_id: String,
+    log_labels: crate::claude_sidecar_io::SidecarLogLabels,
+}
+
+/// Spawn `node <sidecar>/index.mjs` for a session of `session_type`, ownership-tagged,
+/// inheriting the server's isolated HOME (so the SDK's `claude` CLI authenticates from +
+/// writes under `<isolatedHOME>/.claude`). Its stderr is re-emitted through `tracing`
+/// (`claude_sidecar_io::spawn_stderr_logger`, G14).
 /// `environment`: when set, the sidecar's complete environment (the
 /// `test-support` seam); otherwise it inherits this process's.
 async fn spawn_sidecar(
     environment: Option<&[(String, String)]>,
-) -> Result<(Child, ChildStdin, ChildStdout, String), String> {
+    session_type: &str,
+) -> Result<SpawnedSidecar, String> {
     let entry = sidecar_entry_path();
     if !entry.exists() {
         return Err(format!(
@@ -9784,11 +9918,24 @@ async fn spawn_sidecar(
     })?;
     let stdin = child.stdin.take().ok_or("sidecar stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("sidecar stdout unavailable")?;
-    // Drain stderr so verbose SDK/CLI logs can never fill the pipe and stall the sidecar.
-    if let Some(err) = child.stderr.take() {
-        drain_reader(err);
+    let log_labels =
+        crate::claude_sidecar_io::SidecarLogLabels::new(&ownership_id, session_type, child.id());
+    // Read stderr continuously (so verbose SDK/CLI output can never fill the pipe and
+    // stall the sidecar) and log it; the task ends when the sidecar does.
+    if let Some(stderr) = child.stderr.take() {
+        crate::claude_sidecar_io::spawn_stderr_logger(
+            stderr,
+            log_labels.clone(),
+            crate::claude_sidecar_io::hosted_sidecar(environment),
+        );
     }
-    Ok((child, stdin, stdout, ownership_id))
+    Ok(SpawnedSidecar {
+        child,
+        stdin,
+        stdout,
+        ownership_id,
+        log_labels,
+    })
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -9810,8 +9957,8 @@ mod provider_exec_tests {
                     .collect(),
             )
             .unwrap();
-            let mut result = spawn_sidecar(None).await;
-            if let Ok((child, _, _, _)) = &mut result {
+            let mut result = spawn_sidecar(None, "freshclaude").await;
+            if let Ok(SpawnedSidecar { child, .. }) = &mut result {
                 let pid = child.id().unwrap();
                 child.kill().await.unwrap();
                 child.wait().await.unwrap();
@@ -9914,20 +10061,6 @@ async fn write_line(stdin: &mut ChildStdin, value: &Value) -> Result<(), String>
         .await
         .map_err(|e| e.to_string())?;
     stdin.flush().await.map_err(|e| e.to_string())
-}
-
-/// Drain an async child pipe to `/dev/null` so it never back-pressures the sidecar.
-fn drain_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(mut reader: R) {
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
 }
 
 // ── ownership / reaping (Linux /proc, mirrors freshell-codex) ───────────────────────────
@@ -11111,6 +11244,85 @@ pub(crate) mod tests {
         assert_eq!(wire["event"]["at"], 42);
     }
 
+    /// G14 / design §9.2 I-1: every claude attention edge leaves through
+    /// `emit_attention_edge`, which logs it at info (provider, session, type,
+    /// source and `at`, never content) and broadcasts the client frame.
+    #[tokio::test]
+    async fn emit_attention_edge_logs_each_edge_and_broadcasts_its_frame() {
+        use crate::claude_sidecar_io::test_capture::{capture, with_message};
+        let (events, _guard) = capture();
+        let (st, mut rx) = state_with_bus();
+        st.emit_attention_edge(
+            AttentionEdge::TurnComplete,
+            "envelope-1",
+            "sidecar-1",
+            "kilroy",
+            41,
+            AttentionEdgeSource::Sidecar,
+        );
+        st.emit_attention_edge(
+            AttentionEdge::Waiting,
+            "envelope-1",
+            "sidecar-1",
+            "kilroy",
+            42,
+            AttentionEdgeSource::Sidecar,
+        );
+        st.emit_attention_edge(
+            AttentionEdge::TurnComplete,
+            "envelope-1",
+            "sidecar-1",
+            "kilroy",
+            43,
+            AttentionEdgeSource::ConsumerExit,
+        );
+
+        let frames: Vec<Value> = (0..3)
+            .map(|_| serde_json::from_str(&rx.try_recv().expect("an edge frame")).unwrap())
+            .collect();
+        for frame in &frames {
+            assert_eq!(frame["type"], "freshAgent.event");
+            assert_eq!(frame["provider"], "claude");
+            assert_eq!(frame["sessionId"], "envelope-1");
+            assert_eq!(frame["sessionType"], "kilroy");
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame["event"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({ "type": "freshAgent.turn.complete", "sessionId": "sidecar-1", "at": 41 }),
+                json!({ "type": "freshAgent.turn.waiting", "sessionId": "sidecar-1", "at": 42 }),
+                json!({ "type": "freshAgent.turn.complete", "sessionId": "sidecar-1", "at": 43 }),
+            ]
+        );
+
+        let completes = with_message(&events, "freshagent.turn.complete");
+        let waits = with_message(&events, "freshagent.turn.waiting");
+        assert_eq!(completes.len(), 2, "{completes:?}");
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        let logged: Vec<(Option<&str>, Option<&str>)> = completes
+            .iter()
+            .chain(&waits)
+            .map(|event| (event.field("source"), event.field("at")))
+            .collect();
+        assert_eq!(
+            logged,
+            vec![
+                (Some("freshclaude/sidecar"), Some("41")),
+                (Some("freshclaude/consumer-exit"), Some("43")),
+                (Some("freshclaude/sidecar"), Some("42")),
+            ]
+        );
+        for event in completes.iter().chain(&waits) {
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(event.field("provider"), Some("claude"));
+            assert_eq!(event.field("session_id"), Some("envelope-1"));
+            assert_eq!(event.field("session_type"), Some("kilroy"));
+        }
+    }
+
     /// Delta-review round 5 (AGENT-06): the `sdk.question.request` →
     /// `freshAgent.question.request` WS broadcast stays VERBATIM even though the
     /// snapshot-bound copy is normalized (see
@@ -11210,6 +11422,7 @@ pub(crate) mod tests {
     /// same as Task 3).
     #[tokio::test]
     async fn sidecar_death_with_turn_in_flight_rings_the_unified_edge() {
+        let (log_events, _log_guard) = crate::claude_sidecar_io::test_capture::capture();
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
@@ -11282,6 +11495,29 @@ pub(crate) mod tests {
             second > first,
             "the second death cycle's at ({second}) must strictly exceed the first ({first})"
         );
+        // G14: each death edge is logged as it leaves, with its source and `at`.
+        let logged: Vec<(Option<String>, Option<String>, Option<String>)> =
+            crate::claude_sidecar_io::test_capture::with_message(
+                &log_events,
+                "freshagent.turn.complete",
+            )
+            .iter()
+            .map(|event| {
+                (
+                    event.field("source").map(str::to_string),
+                    event.field("session_type").map(str::to_string),
+                    event.field("at").map(str::to_string),
+                )
+            })
+            .collect();
+        let expected = |at: i64| {
+            (
+                Some("freshclaude/consumer-exit".to_string()),
+                Some("freshclaude".to_string()),
+                Some(at.to_string()),
+            )
+        };
+        assert_eq!(logged, vec![expected(first), expected(second)]);
         drop(env);
     }
 
@@ -11337,8 +11573,15 @@ pub(crate) mod tests {
         std::env::set_var("FRESHELL_TEST_INHERITED_MARKER", "inherited");
 
         async fn child_env(state: &FreshClaudeState) -> (HashMap<String, String>, String) {
-            let (mut child, _stdin, stdout, ownership_id) =
-                state.spawn_sidecar_process().await.expect("spawn sidecar");
+            let SpawnedSidecar {
+                mut child,
+                stdout,
+                ownership_id,
+                ..
+            } = state
+                .spawn_sidecar_process("freshclaude")
+                .await
+                .expect("spawn sidecar");
             let line = BufReader::new(stdout)
                 .lines()
                 .next_line()
@@ -11382,6 +11625,96 @@ pub(crate) mod tests {
             Some("inherited"),
             "without a configured environment the sidecar inherits this process's"
         );
+    }
+
+    /// G14: every spawned sidecar's stderr is logged, labelled with its
+    /// ownership id, pid and session type. A sidecar whose environment marks
+    /// it hosted (the session host sets FRESHELL_HOSTED_FRESH_AGENT, to
+    /// `claude` or `kilroy`) has its raw lines logged by size only.
+    #[tokio::test]
+    async fn a_spawned_sidecar_stderr_is_logged_and_redacted_when_hosted() {
+        use crate::claude_sidecar_io::test_capture::{capture, with_message};
+        let (events, _log_guard) = capture();
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("stderr-sidecar.mjs");
+        std::fs::write(
+            &script,
+            "process.stderr.write('secret raw output\\n')\n\
+             process.stderr.write(JSON.stringify({ severity: 'info', component: 'claude-sidecar', event: 'sidecar.ready' }) + '\\n')\n",
+        )
+        .unwrap();
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+
+        async fn spawn_and_log(
+            state: &FreshClaudeState,
+            events: &Arc<std::sync::Mutex<Vec<crate::claude_sidecar_io::test_capture::Captured>>>,
+        ) -> (String, Option<u32>) {
+            let before = with_message(events, "freshagent.claude.sidecar_log").len();
+            let SpawnedSidecar {
+                mut child,
+                ownership_id,
+                ..
+            } = state
+                .spawn_sidecar_process("kilroy")
+                .await
+                .expect("spawn sidecar");
+            let pid = child.id();
+            let _ = child.wait().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while with_message(events, "freshagent.claude.sidecar_log").len() < before + 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the sidecar's two stderr lines were never logged"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            (ownership_id, pid)
+        }
+        let path = (
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        );
+        let ordinary = state().with_sidecar_environment([path.clone()]);
+        let hosted = state().with_sidecar_environment([
+            path,
+            (
+                "FRESHELL_HOSTED_FRESH_AGENT".to_string(),
+                "kilroy".to_string(),
+            ),
+        ]);
+        let (ordinary_owner, ordinary_pid) = spawn_and_log(&ordinary, &events).await;
+        let (hosted_owner, _) = spawn_and_log(&hosted, &events).await;
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+
+        let logs = with_message(&events, "freshagent.claude.sidecar_log");
+        let of = |owner: &str| -> Vec<_> {
+            logs.iter()
+                .filter(|event| event.field("ownership_id") == Some(owner))
+                .cloned()
+                .collect()
+        };
+        let ordinary_logs = of(&ordinary_owner);
+        assert_eq!(ordinary_logs.len(), 2, "{logs:?}");
+        assert_eq!(ordinary_logs[0].level, tracing::Level::WARN);
+        assert_eq!(ordinary_logs[0].field("raw"), Some("true"));
+        assert_eq!(ordinary_logs[0].field("text"), Some("secret raw output"));
+        assert_eq!(ordinary_logs[1].level, tracing::Level::INFO);
+        assert_eq!(
+            ordinary_logs[1].field("sidecar_event"),
+            Some("sidecar.ready")
+        );
+        let ordinary_pid = ordinary_pid.map(|pid| pid.to_string());
+        for event in &ordinary_logs {
+            assert_eq!(event.field("session_type"), Some("kilroy"));
+            assert_eq!(event.field("pid"), ordinary_pid.as_deref());
+        }
+        let hosted_logs = of(&hosted_owner);
+        assert_eq!(hosted_logs.len(), 2, "{logs:?}");
+        assert_eq!(hosted_logs[0].field("raw"), Some("true"));
+        assert_eq!(hosted_logs[0].field("bytes"), Some("17"));
+        assert_eq!(hosted_logs[0].field("text"), None, "hosted: size only");
+        assert_eq!(hosted_logs[1].field("sidecar_event"), Some("sidecar.ready"));
     }
 
     // ── freshAgent.create requestId dedup (parity gap fix) ──────────────────
@@ -20042,6 +20375,41 @@ rl.on('line', (line) => {
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         assert_eq!(create_req["effort"], "high");
+        drop(env);
+    }
+
+    /// G14: a sidecar spawned to resume a session on attach logs under the
+    /// attached session (its stderr log is bound to the envelope id the
+    /// client addresses), joined to the sidecar's ownership id.
+    #[tokio::test]
+    async fn an_attach_resumed_sidecar_logs_under_the_attached_session() {
+        use crate::claude_sidecar_io::test_capture::{capture, with_message};
+        let (events, _log_guard) = capture();
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "d1d1d1d1-dddd-4ddd-8ddd-d1d1d1d1d1d1";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, _rx) = state_with_bus();
+        let mut msg = attach_msg_with_resume("client-nanoid-logs", DURABLE);
+        msg.session_type = SessionType::Kilroy;
+        state.handle_attach(msg).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let ownership_id = state
+            .sessions
+            .lock()
+            .await
+            .get("client-nanoid-logs")
+            .map(|session| session.ownership_id.clone())
+            .expect("the attach resumed a session under the client's id");
+        let bound = with_message(&events, "freshagent.claude.sidecar_bound");
+        assert_eq!(bound.len(), 1, "{bound:?}");
+        assert_eq!(bound[0].field("session_id"), Some("client-nanoid-logs"));
+        assert_eq!(bound[0].field("session_type"), Some("kilroy"));
+        assert_eq!(bound[0].field("ownership_id"), Some(ownership_id.as_str()));
         drop(env);
     }
 

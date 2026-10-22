@@ -598,10 +598,11 @@ describe('production wiring: permission.respond with a null/absent decision is a
     // Hand-crafted malformed frame: NO decision key at all.
     harness.send({ type: 'permission.respond', sessionId, requestId: permReq.requestId })
 
-    // Log-only no-op: stderr carries the guard line, and the parked promise must
-    // NOT settle (no canUseTool answer) within a generous window.
+    // Log-only no-op: stderr carries the guard's warning record, and the parked
+    // promise must NOT settle (no canUseTool answer) within a generous window.
     await new Promise((r) => setTimeout(r, 300))
-    expect(harness.stderr()).toContain('permission.respond: missing decision')
+    const records = harness.stderr().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    expect(records).toContainEqual(expect.objectContaining({ severity: 'warn', event: 'respond.invalid', kind: 'permission', sessionId, requestId: permReq.requestId }))
     expect(canUseToolAnswers(harness.ledger(), 'Bash')).toEqual([])
 
     // The entry is still parked: a later well-formed respond resolves verbatim.

@@ -47,6 +47,10 @@
 //     { type:'sdk.permission.cancelled', sessionId, requestId }
 //     { type:'sdk.question.cancelled',  sessionId, requestId }
 //
+//   sidecar → Rust (stderr): log records only, one JSON object per line
+//     ({ severity, component, event, ...ids }, log.mjs). Rust re-emits each
+//     through `tracing` at its severity (claude_sidecar_io.rs).
+//
 // The Rust side normalizes `sdk.* -> freshAgent.*` (a port of
 // server/fresh-agent/sdk-events.ts) and wraps each in a `freshAgent.event`
 // envelope — so this sidecar is the faithful analog of server/sdk-bridge.ts's
@@ -83,6 +87,7 @@ import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity 
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
+import { cliStderrLogger, errorText, isHostedSidecar, log } from './log.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -96,12 +101,9 @@ import {
 const sdkModule = await import(process.env.FRESHELL_CLAUDE_SDK_QUERY_MODULE || '@anthropic-ai/claude-agent-sdk')
 const { query } = sdkModule
 
-// ── stdout writer (newline-JSON; stderr is the only log sink) ────────────────
+// ── stdout writer (newline-JSON; stderr is the only log sink: log.mjs) ───────
 function emit(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`)
-}
-function logerr(msg) {
-  process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', message: msg })}\n`)
 }
 
 // ── nanoid()-compatible bare id: 21 url-safe chars ([A-Za-z0-9_-]) ───────────
@@ -331,11 +333,18 @@ function handleSdkMessage(sessionId, msg) {
 
 async function consumeStream(sessionId, sdkQuery) {
   const st = sessions.get(sessionId)
+  let failure
   try {
     for await (const msg of sdkQuery) handleSdkMessage(sessionId, msg)
   } catch (err) {
+    failure = err
     emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
   } finally {
+    // A requested teardown (abort) is routine; any other error end is the CLI
+    // dying or failing under the session.
+    if (st?.abort.signal.aborted) log('info', 'stream.ended', { sessionId, reason: 'aborted' })
+    else if (failure) log('warn', 'stream.ended', { sessionId, reason: 'stream_error', error: errorText(failure) })
+    else log('info', 'stream.ended', { sessionId, reason: 'stream_eof' })
     // Stream ended (natural end, error, or abort). The transport is closing:
     // clear any parked cards WITHOUT resolving their promises (LB-04: a late
     // resolve lands inside the SDK's floating promise chain → unhandled
@@ -402,9 +411,7 @@ function handleCreate(req) {
     // events (macrotasks) cannot interleave inside that finally.
     sessions.set(sessionId, state)
 
-    const sdkStderr = process.env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
-      ? data => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', event: 'provider.stderr', bytes: Buffer.byteLength(String(data)) })}\n`)
-      : data => logerr(`sdk stderr: ${String(data).trimEnd()}`)
+    const sdkStderr = cliStderrLogger(log, { hosted: isHostedSidecar(), fields: { sessionId } })
     const sdkQuery = query({
       prompt: iterable,
       options: {
@@ -456,14 +463,15 @@ function handleCreate(req) {
         if (commands === undefined) return
         state.commandCatalog = commands
         publishCommands(sessionId, state)
-      }).catch((error) => logerr(`session commands unavailable: ${error?.message || error}`))
+      }).catch((error) => log('warn', 'commands.unavailable', { sessionId, error: errorText(error) }))
     }
 
     // Return the placeholder before the native system/init identity arrives.
     emit({ type: 'created', requestId, sessionId })
-    consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
+    consumeStream(sessionId, sdkQuery).catch((err) => log('error', 'stream.consume_failed', { sessionId, error: errorText(err) }))
   } catch (err) {
     if (sessionId) sessions.delete(sessionId)
+    log('warn', 'create.failed', { requestId, error: errorText(err) })
     emit({ type: 'create.failed', requestId, message: err?.message || String(err) })
   }
 }
@@ -510,7 +518,7 @@ async function handleConfigure(req) {
     })
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings })
   } catch (err) {
-    logerr(`session settings failed: ${err?.message || err}`)
+    log('warn', 'configure.failed', { sessionId: req.sessionId, requestId: req.requestId, error: errorText(err) })
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, settings: { ...st.settings }, message: String(err?.message || err) })
   }
 }
@@ -583,7 +591,7 @@ function handleInterrupt(req) {
     })
     .catch((err) => {
       st.turnCompleteGate.noteInterruptSettled(false)
-      logerr(`interrupt failed: ${err?.message || err}`)
+      log('warn', 'interrupt.failed', { sessionId: req.sessionId, error: errorText(err) })
       emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: String(err?.message || err) })
     })
 }
@@ -604,7 +612,8 @@ rl.on('line', (line) => {
   const trimmed = line.trim()
   if (!trimmed) return
   let req
-  try { req = JSON.parse(trimmed) } catch { logerr(`unparseable request: ${trimmed.slice(0, 200)}`); return }
+  // A request line may carry prompt text: log its size, never its content.
+  try { req = JSON.parse(trimmed) } catch { log('warn', 'request.unparseable', { bytes: Buffer.byteLength(trimmed) }); return }
   switch (req?.type) {
     case 'create': handleCreate(req); break
     case 'send': handleSend(req); break
@@ -624,13 +633,13 @@ rl.on('line', (line) => {
       // no-op; the entry stays parked for a later valid respond (mirrors the
       // coerced-answers asymmetry one arm below).
       if (req.decision == null) {
-        logerr(`permission.respond: missing decision for request ${req.requestId} (session ${req.sessionId})`)
+        log('warn', 'respond.invalid', { kind: 'permission', sessionId: req.sessionId, requestId: req.requestId })
         break
       }
       // Unknown requestId: lose-safely (Rust validates its pending set first) —
       // stderr log only, no frame.
       if (!respondPermission(st, String(req.requestId), req.decision)) {
-        logerr(`permission.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+        log('warn', 'respond.unknown', { kind: 'permission', sessionId: req.sessionId, requestId: req.requestId })
       }
       break
     }
@@ -639,12 +648,12 @@ rl.on('line', (line) => {
       if (!st) break
       const answers = req.answers && typeof req.answers === 'object' ? req.answers : {}
       if (!respondQuestion(st, String(req.requestId), answers)) {
-        logerr(`question.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+        log('warn', 'respond.unknown', { kind: 'question', sessionId: req.sessionId, requestId: req.requestId })
       }
       break
     }
     case 'shutdown': shutdown(); process.exit(0); break
-    default: logerr(`unknown request type: ${req?.type}`)
+    default: log('warn', 'request.unknown_type', { requestType: String(req?.type) })
   }
 })
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
@@ -653,4 +662,4 @@ rl.on('close', () => { shutdown(); process.exit(0) })
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 process.on('SIGINT', () => { shutdown(); process.exit(0) })
 
-logerr('ready')
+log('info', 'sidecar.ready', { pid: process.pid })

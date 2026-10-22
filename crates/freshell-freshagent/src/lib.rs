@@ -37,6 +37,7 @@
 //! backstop, by the harness sentinel sweep — no orphans.
 
 pub mod claude;
+pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
