@@ -19,8 +19,15 @@
 //!   shares that group. Escalation signals the group, and "the tree is gone"
 //!   means no live process is left in it (on Linux zombies are not counted;
 //!   they hold no pipes and write nothing).
+//! - **Windows**: the child is created suspended, assigned to a
+//!   kill-on-close Job Object (`freshell_platform::process_job`), and only
+//!   then resumed, so every process it starts is born in the job.
+//!   Escalation terminates the job, and "the tree is gone" means the job has
+//!   no active process. If the job cannot be created or assigned, the child
+//!   runs unguarded and `freshagent.claude.tree_guard_unavailable` is logged.
 //! - Dropping the guard (an early-return path, a panic, a dropped session)
-//!   SIGKILLs whatever is left of the tree, so no path leaks the CLI.
+//!   kills whatever is left of the tree (Windows: closing the job handle does
+//!   it too), so no path leaks the CLI.
 //!
 //! On Linux the stronger, start-time-checked `/proc` ownership-tag
 //! confirmation in `claude.rs` still runs on top of this.
@@ -173,14 +180,59 @@ pub fn spawn_guarded(command: &mut Command) -> std::io::Result<(Child, SidecarTr
         };
         Ok((child, guard))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        spawn_in_job(command)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let child = command.spawn()?;
         Ok((child, SidecarTreeGuard::unguarded()))
     }
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
+/// Windows: create the child suspended, assign it to a fresh kill-on-close
+/// job, then resume it. A guard failure leaves the child running unguarded
+/// (logged); only a failure to resume it fails the spawn, because a child
+/// that stays suspended can never run.
+#[cfg(windows)]
+fn spawn_in_job(command: &mut Command) -> std::io::Result<(Child, SidecarTreeGuard)> {
+    use freshell_platform::process_job::{
+        resume_suspended_process, KillOnCloseJob, CREATE_SUSPENDED,
+    };
+
+    let job = match KillOnCloseJob::new() {
+        Ok(job) => job,
+        Err(error) => {
+            tree_guard_unavailable(&format!("job object creation failed: {error}"));
+            let child = command.spawn()?;
+            return Ok((child, SidecarTreeGuard::unguarded()));
+        }
+    };
+    command.creation_flags(CREATE_SUSPENDED);
+    let mut child = command.spawn()?;
+    let Some(process_id) = child.id() else {
+        let _ = child.start_kill();
+        return Err(std::io::Error::other(
+            "the suspended child exited before it could be assigned",
+        ));
+    };
+    let guard = match job.assign_process(process_id) {
+        Ok(()) => SidecarTreeGuard {
+            tree: Tree::Job { job, gone: false },
+        },
+        Err(error) => {
+            tree_guard_unavailable(&format!("job assignment failed: {error}"));
+            SidecarTreeGuard::unguarded()
+        }
+    };
+    if let Err(error) = resume_suspended_process(process_id) {
+        let _ = child.start_kill();
+        return Err(error);
+    }
+    Ok((child, guard))
+}
+
 fn tree_guard_unavailable(cause: &str) {
     tracing::error!(target: "freshell_freshagent::claude",
         event = "freshagent.claude.tree_guard_unavailable",
@@ -204,6 +256,13 @@ enum Tree {
         pgid: i32,
         gone: bool,
     },
+    /// Closing the job's last handle (dropping it) kills every process
+    /// still in it.
+    #[cfg(windows)]
+    Job {
+        job: freshell_platform::process_job::KillOnCloseJob,
+        gone: bool,
+    },
 }
 
 impl std::fmt::Debug for SidecarTreeGuard {
@@ -214,6 +273,8 @@ impl std::fmt::Debug for SidecarTreeGuard {
             Tree::ProcessGroup { pgid, gone } => {
                 write!(formatter, "SidecarTreeGuard(pgid {pgid}, gone {gone})")
             }
+            #[cfg(windows)]
+            Tree::Job { gone, .. } => write!(formatter, "SidecarTreeGuard(job, gone {gone})"),
         }
     }
 }
@@ -234,6 +295,16 @@ impl SidecarTreeGuard {
     pub fn process_group(&self) -> Option<i32> {
         match self.tree {
             Tree::ProcessGroup { pgid, .. } => Some(pgid),
+            Tree::None => None,
+        }
+    }
+
+    /// How many processes of the tree are alive in its job (`None` when
+    /// unguarded or when the job cannot be queried).
+    #[cfg(windows)]
+    pub fn active_processes(&self) -> Option<u32> {
+        match &self.tree {
+            Tree::Job { job, .. } => job.active_processes().ok(),
             Tree::None => None,
         }
     }
@@ -304,19 +375,28 @@ impl SidecarTreeGuard {
     }
 
     fn tree_alive(&self) -> bool {
-        match self.tree {
+        match &self.tree {
             Tree::None => false,
             #[cfg(unix)]
             Tree::ProcessGroup { gone: true, .. } => false,
             #[cfg(unix)]
-            Tree::ProcessGroup { pgid, gone: false } => process_group_alive(pgid),
+            Tree::ProcessGroup { pgid, gone: false } => process_group_alive(*pgid),
+            #[cfg(windows)]
+            Tree::Job { gone: true, .. } => false,
+            // A failed query counts as alive: the bounded wait then ends
+            // as Lingering rather than claiming a confirmation.
+            #[cfg(windows)]
+            Tree::Job { job, gone: false } => job.active_processes().map_or(true, |n| n > 0),
         }
     }
 
     fn mark_gone(&mut self) {
-        #[cfg(unix)]
-        if let Tree::ProcessGroup { gone, .. } = &mut self.tree {
-            *gone = true;
+        match &mut self.tree {
+            Tree::None => {}
+            #[cfg(unix)]
+            Tree::ProcessGroup { gone, .. } => *gone = true,
+            #[cfg(windows)]
+            Tree::Job { gone, .. } => *gone = true,
         }
     }
 
@@ -324,6 +404,16 @@ impl SidecarTreeGuard {
     fn kill_now(&self) {
         #[cfg(unix)]
         self.signal_tree(libc::SIGKILL);
+        #[cfg(windows)]
+        if let Tree::Job { job, gone: false } = &self.tree {
+            if let Err(error) = job.terminate() {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.tree_terminate_failed",
+                    cause = %error,
+                    "the Claude child's job could not be terminated; closing it still kills the tree"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -16,6 +16,10 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::HANDLE;
 
+/// The process-creation flag a job-owned child is spawned with: it starts
+/// suspended, is assigned to the job, and only then resumed.
+pub const CREATE_SUSPENDED: u32 = windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
 /// An owned Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 pub struct KillOnCloseJob {
     handle: HANDLE,
@@ -188,4 +192,115 @@ fn find_process_thread(process_id: u32) -> io::Result<u32> {
     }
     unsafe { CloseHandle(snapshot) };
     found.ok_or_else(|| io::Error::other("suspended process thread was not found"))
+}
+
+/// A synchronization handle on a process, opened while it is known to be
+/// running, so a later wait observes THAT process's exit even if its id is
+/// reused afterwards.
+pub struct ProcessExitWatch {
+    handle: HANDLE,
+}
+
+// SAFETY: a process handle is a kernel object handle; waiting on it is
+// thread-safe, and it is closed exactly once (in `Drop`).
+unsafe impl Send for ProcessExitWatch {}
+unsafe impl Sync for ProcessExitWatch {}
+
+impl ProcessExitWatch {
+    pub fn open(process_id: u32) -> io::Result<Self> {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle })
+    }
+
+    /// Whether the process has exited, waiting at most `timeout` for it.
+    pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        match unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(self.handle, millis)
+        } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            status => Err(io::Error::other(format!(
+                "process wait returned unexpected status {status}"
+            ))),
+        }
+    }
+}
+
+impl Drop for ProcessExitWatch {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    /// A `cmd` that starts a long-lived `ping` grandchild and then waits on
+    /// its own long `ping`, spawned suspended into `job`. Returns the child.
+    fn spawn_tree_in(job: &KillOnCloseJob) -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+        let mut child = Command::new("cmd.exe")
+            .args([
+                "/C",
+                "start \"\" /B ping -n 120 127.0.0.1 > nul & ping -n 120 127.0.0.1 > nul",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .expect("spawn cmd suspended");
+        job.assign_suspended_process(child.id())
+            .expect("assign the suspended child and resume it");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while job.active_processes().unwrap() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never started its descendants inside the job"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.try_wait();
+        child
+    }
+
+    #[test]
+    fn terminate_empties_the_job_including_descendants() {
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut child = spawn_tree_in(&job);
+
+        job.terminate().expect("terminate the job");
+        job.wait_signaled(Duration::from_secs(5))
+            .expect("the job signals once terminated");
+
+        assert_eq!(job.active_processes().unwrap(), 0);
+        child.wait().expect("reap the child");
+    }
+
+    #[test]
+    fn closing_the_job_kills_every_process_in_it() {
+        let job = KillOnCloseJob::new().expect("create the job");
+        let mut child = spawn_tree_in(&job);
+        let watch = ProcessExitWatch::open(child.id()).expect("watch the child");
+
+        drop(job);
+
+        assert!(
+            watch
+                .wait(Duration::from_secs(5))
+                .expect("wait on the child"),
+            "closing the last job handle killed the child"
+        );
+        child.wait().expect("reap the child");
+    }
 }

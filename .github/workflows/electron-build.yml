@@ -112,6 +112,24 @@ jobs:
         if: matrix.os == 'windows-2022'
         run: cargo test --locked -p freshell-server --bin freshell-server checkpoints::tests::checkpoint_timeout_settles_windows_job_descendant_before_returning
 
+      # The shared kill-on-close Job Object on its own: terminating it, and
+      # closing its last handle, end every process in it.
+      - name: Test Windows kill-on-close Job Object
+        if: matrix.os == 'windows-2022'
+        run: cargo test --locked -p freshell-platform --lib process_job::tests
+
+      # The Claude sidecar's process-tree guard (a Job Object on Windows, a
+      # process group on macOS) and the graceful sidecar stop, against Node
+      # fake sidecars. The crate's unit tests do not build on Windows, so
+      # this behavior lives in an integration target that runs everywhere.
+      - name: Test Claude sidecar tree guard (Windows)
+        if: matrix.os == 'windows-2022'
+        run: cargo test --locked -p freshell-freshagent --test claude_sidecar_teardown
+
+      - name: Test Claude sidecar tree guard (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: cargo test --locked -p freshell-freshagent --test claude_sidecar_teardown
+
       - name: Run Electron unit tests
         run: pnpm run test:electron
 

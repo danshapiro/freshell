@@ -69,7 +69,6 @@ struct Fake {
     stdin: ChildStdin,
     _stdout: ChildStdout,
     guard: SidecarTreeGuard,
-    #[cfg_attr(not(unix), allow(dead_code))]
     ready: String,
 }
 
@@ -204,7 +203,6 @@ fn libc_sigkill() -> i32 {
 /// Exits 0 on the shutdown line WITHOUT stopping the grandchild it started
 /// (the CLI in production): the shape a hard-killed or buggy sidecar leaves
 /// behind. The readiness line carries the grandchild's pid.
-#[cfg(unix)]
 const FAKE_ORPHANS_GRANDCHILD: &str = r#"
 const { spawn } = require('child_process')
 const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
@@ -215,7 +213,6 @@ setInterval(() => {}, 1000)
 grandchild.on('spawn', () => process.stdout.write(`ready ${grandchild.pid}\n`))
 "#;
 
-#[cfg(unix)]
 fn grandchild_pid(ready: &str) -> u32 {
     ready
         .strip_prefix("ready ")
@@ -230,26 +227,56 @@ fn process_group_exists(pgid: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Observes one process's exit.
-#[cfg(unix)]
+/// Observes one process's exit. On Windows the handle is opened while the
+/// process is known to run, so a reused id can never be mistaken for it.
 struct ProcessProbe {
+    #[cfg(unix)]
     pid: u32,
+    #[cfg(windows)]
+    watch: freshell_platform::process_job::ProcessExitWatch,
 }
 
-#[cfg(unix)]
 impl ProcessProbe {
     fn open(pid: u32) -> Self {
-        Self { pid }
+        Self {
+            #[cfg(unix)]
+            pid,
+            #[cfg(windows)]
+            watch: freshell_platform::process_job::ProcessExitWatch::open(pid)
+                .expect("open the grandchild while it runs"),
+        }
     }
 
     fn alive(&self) -> bool {
-        // SAFETY: signal 0 only probes for existence.
-        let result = unsafe { libc::kill(self.pid as i32, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 only probes for existence.
+            let result = unsafe { libc::kill(self.pid as i32, 0) };
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+        #[cfg(windows)]
+        {
+            !self
+                .watch
+                .wait(Duration::ZERO)
+                .expect("wait on the grandchild")
+        }
+    }
+
+    /// Whether the process exits within `budget`.
+    #[cfg(windows)]
+    async fn exits_within(&self, budget: Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while self.alive() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
     let dir = tempfile::tempdir().unwrap();
@@ -258,6 +285,12 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
     let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
     #[cfg(unix)]
     let pgid = fake.guard.process_group();
+    #[cfg(windows)]
+    assert!(
+        fake.guard.active_processes().is_some_and(|n| n >= 2),
+        "node and its grandchild both run inside the guard's job: {:?}",
+        fake.guard.active_processes()
+    );
     assert!(grandchild.alive());
     let grace = Duration::from_millis(500);
 
@@ -285,6 +318,49 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
         let pgid = pgid.expect("the sidecar ran in its own process group");
         assert!(!process_group_exists(pgid), "no group member survives");
     }
+}
+
+/// Windows: the guard's job holds node and every descendant; terminating it
+/// empties the job.
+#[cfg(windows)]
+#[tokio::test]
+async fn terminating_the_guard_empties_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let mut fake = spawn_fake(FAKE_ORPHANS_GRANDCHILD, &record).await;
+    let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
+    assert!(fake.guard.active_processes().is_some_and(|n| n >= 2));
+
+    let confirmation = fake.guard.terminate(&mut fake.child).await;
+
+    assert_eq!(confirmation, TreeConfirmation::Confirmed);
+    assert_eq!(fake.guard.active_processes(), Some(0), "the job is empty");
+    assert!(
+        !grandchild.alive(),
+        "the grandchild was in the job and died"
+    );
+}
+
+/// Windows: dropping the guard (kill-on-close) ends node and its grandchild
+/// within five seconds, with nothing else signaling them.
+#[cfg(windows)]
+#[tokio::test]
+async fn dropping_the_guard_kills_the_job_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let fake = spawn_fake(FAKE_ORPHANS_GRANDCHILD, &record).await;
+    let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
+    let node = ProcessProbe::open(fake.child.id().expect("node is running"));
+    let Fake { child, guard, .. } = fake;
+
+    drop(guard);
+
+    assert!(node.exits_within(Duration::from_secs(5)).await, "node died");
+    assert!(
+        grandchild.exits_within(Duration::from_secs(5)).await,
+        "the grandchild died with the job"
+    );
+    drop(child);
 }
 
 #[cfg(unix)]
