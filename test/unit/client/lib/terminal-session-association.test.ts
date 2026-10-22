@@ -141,10 +141,13 @@ describe('server-authoritative rebind (previousSessionId)', () => {
       previousSessionId: 'old-id',
     })
     expect(result).toBe('reconciled')
+    // The rebind token rides on the fold so the reducer releases the
+    // superseded conversation's naming identity (name reliability Task 10).
     expect(dispatch).toHaveBeenCalledWith(
       reconcileTerminalSessionRefByTerminalId({
         terminalId: 't1',
         sessionRef: { provider: 'codex', sessionId: 'new-id' },
+        previousSessionId: 'old-id',
       }),
     )
     expect(dispatch).toHaveBeenCalledWith(flushPersistedLayoutNow())
