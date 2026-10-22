@@ -6605,8 +6605,9 @@ impl FreshClaudeState {
     /// | untracked, durable id already in `cli_index`, aliased session LIVE | REBIND + ACK (Task 10b): flip the live session's envelope stamp to the durable id and answer with the `freshAgent.session.snapshot` stamped with the durable and the session's TRACKED status (the consumer's turn-lifecycle + sdk.status fold, never a hardcoded idle) -- the attaching client must observe success, never silence. The map is never re-keyed (alias, don't move) |
     /// | untracked, durable id in `cli_index` but aliased session GONE (stale row, eviction in flight) | fall through to the resume path below (the session is dead; resuming converges the client) |
     /// | untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit a `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID -- NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) -- carrying the session's tracked status ("idle" for a fresh resume, by construction) |
-    /// | untracked, transcript ABSENT in EVERY candidate root | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
-    /// | untracked, spawn/pipe/created failure (incl. no store root resolvable) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
+    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable) | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
+    /// | untracked, store UNREADABLE (no store root, or an IO error other than NotFound/NotADirectory while scanning) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- cannot check, so NEVER the lost frame (G28) |
+    /// | untracked, spawn/pipe/created failure | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — before any
@@ -7073,17 +7074,18 @@ impl FreshClaudeState {
             own_ticket,
             crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
         );
-        if crate::claude_snapshot::claude_home_candidates().is_empty() {
-            // No store root resolvable at all: we cannot CHECK, so we must not DENY.
-            return Err(ResumeClaudeError::Transient(
-                "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/HOME unset)"
-                    .to_string(),
-            ));
-        }
-        // Positive denial only when the transcript is absent in EVERY candidate
-        // root (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude -- ledger A3).
-        let Some(transcript) = crate::claude_snapshot::locate_transcript(durable) else {
-            return Err(ResumeClaudeError::NotFound);
+        // Positive denial only on a CLEAN miss in EVERY candidate root
+        // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home -- ledger A3). An
+        // unreadable store (or no root at all) cannot CHECK, so it must not DENY.
+        let transcript = match crate::claude_snapshot::locate_transcript_state(durable) {
+            crate::claude_snapshot::TranscriptLocation::Found(path) => path,
+            crate::claude_snapshot::TranscriptLocation::Absent => {
+                return Err(ResumeClaudeError::NotFound);
+            }
+            crate::claude_snapshot::TranscriptLocation::Unreadable(error) => {
+                crate::claude_snapshot::log_transcript_unreadable("attach_resume", durable, &error);
+                return Err(ResumeClaudeError::Transient(error.to_string()));
+            }
         };
         // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
         // resume-in-place does not silently revert model/permissionMode/effort. V7/A10
