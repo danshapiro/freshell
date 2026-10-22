@@ -38,10 +38,11 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 // ── fake claude sidecar ─────────────────────────────────────────────────────
 
 /// The production newline-JSON sidecar protocol, reduced to create / send /
-/// interrupt / shutdown. `FRESHELL_TEST_CLAUDE_INIT_AT` picks when the session
-/// is reported (`sdk.session.init`, the CLI's `system/init`):
-///   - `first-prompt`: as the first prompt starts running, like the real CLI;
-///   - `create`: right after `created`, like the e2e fake sidecar.
+/// interrupt / shutdown. The session is reported (`sdk.session.init`, the CLI's
+/// `system/init`) at the start of every turn, as the real CLI does, and
+/// `FRESHELL_TEST_CLAUDE_INIT_AT` picks whether it is also reported earlier:
+///   - `first-prompt`: never before the first prompt runs, like the real CLI;
+///   - `create`: also right after `created`, like the e2e fake sidecar.
 ///
 /// Every prompt is one turn: assistant text, a `success` result, one
 /// `sdk.turn.complete` with a strictly increasing `at`, then idle. Each prompt's
@@ -59,8 +60,6 @@ let lastAt = 0
 const emit = (frame) => process.stdout.write(JSON.stringify(frame) + '\n')
 
 function reportSession(sessionId, st) {
-  if (st.reported) return
-  st.reported = true
   emit({ type: 'sdk.session.init', sessionId, cliSessionId: st.cliSessionId, model: 'fake-model', cwd: process.cwd(), tools: [] })
 }
 
@@ -74,7 +73,7 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-${process.pid}-${counter}`
-    const st = { cliSessionId: randomUUID(), reported: false }
+    const st = { cliSessionId: randomUUID() }
     sessions.set(sessionId, st)
     emit({ type: 'created', requestId: msg.requestId, sessionId })
     if (initAt === 'create') reportSession(sessionId, st)
@@ -453,8 +452,10 @@ fn turn_completes(frames: &[Value], session_id: &str) -> Vec<u64> {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
-/// Two messages sent the way the browser sends them each run once: each reaches
-/// the sidecar, is accepted, and rings exactly one turn-complete edge.
+/// Three messages sent the way the browser sends them each run once: each
+/// reaches the sidecar, is accepted, and rings exactly one turn-complete edge.
+/// The CLI reports the session again at the start of every turn, so the later
+/// messages are sent after a repeated report of the session they belong to.
 async fn a_new_panes_messages_each_run_once(init_at: InitAt) {
     let _env = CLAUDE_ENV_LOCK.lock().await;
     let sidecar = FakeSidecar::install(init_at);
@@ -472,34 +473,42 @@ async fn a_new_panes_messages_each_run_once(init_at: InitAt) {
         })
         .await;
     }
-    conn.send_like_the_browser(&session_id, "send-1", "first message")
-        .await;
-    conn.expect_send_runs(&session_id, "send-1", 1).await;
-
-    // The first prompt made the CLI report the session (in either order), so the
-    // browser now holds the durable id's owner pair and sends it.
-    assert!(
-        conn.observed_owner(&session_id).is_some(),
-        "the coordinator announced the reported session's owner: {:#?}",
-        conn.frames
-    );
-    conn.send_like_the_browser(&session_id, "send-2", "second message")
-        .await;
-    conn.expect_send_runs(&session_id, "send-2", 2).await;
+    let messages = ["first message", "second message", "third message"];
+    for (index, text) in messages.iter().enumerate() {
+        let turn = index + 1;
+        let request_id = format!("send-{turn}");
+        conn.send_like_the_browser(&session_id, &request_id, text)
+            .await;
+        conn.expect_send_runs(&session_id, &request_id, turn).await;
+        // The first prompt made the CLI report the session (in either order), so
+        // the browser now holds the durable id's owner pair and sends it.
+        assert!(
+            conn.observed_owner(&session_id).is_some(),
+            "the coordinator announced the reported session's owner: {:#?}",
+            conn.frames
+        );
+    }
 
     conn.kill(&session_id).await;
     assert_eq!(
         sidecar.prompts(),
-        vec!["first message".to_string(), "second message".to_string()],
+        messages.map(str::to_string).to_vec(),
         "each message reached the sidecar exactly once"
     );
     let edges = turn_completes(&conn.frames, &session_id);
-    assert_eq!(edges.len(), 2, "one turn-complete edge per send: {edges:?}");
+    assert_eq!(
+        edges.len(),
+        messages.len(),
+        "one turn-complete edge per send: {edges:?}"
+    );
     assert!(
-        edges[0] < edges[1],
+        edges.windows(2).all(|pair| pair[0] < pair[1]),
         "edges are strictly increasing: {edges:?}"
     );
-    assert_eq!(conn.events_of(&session_id, "freshAgent.result"), 2);
+    assert_eq!(
+        conn.events_of(&session_id, "freshAgent.result"),
+        messages.len()
+    );
 }
 
 mod checkpointed_sends {
