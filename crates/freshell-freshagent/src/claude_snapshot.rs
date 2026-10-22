@@ -1356,7 +1356,21 @@ pub(crate) fn build_claude_snapshot_json(
     // rolled back through this server's ledger).
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Value {
-    let turns = parse_transcript_turns(thread_id, transcript);
+    let projection =
+        crate::claude_projection::ClaudeTranscriptProjector::project(thread_id, transcript);
+    build_claude_snapshot_from_projection(session_type, thread_id, projection, revision, rollback)
+}
+
+/// [`build_claude_snapshot_json`] over an already-built projection (the served
+/// snapshot projects off the async runtime, with subagent activity).
+pub(crate) fn build_claude_snapshot_from_projection(
+    session_type: &str,
+    thread_id: &str,
+    projection: crate::claude_projection::ClaudeProjection,
+    revision: i64,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+) -> Value {
+    let turns = projection.turns;
     let latest_turn_id = turns
         .last()
         .and_then(|t| t.get("turnId"))
@@ -1440,15 +1454,27 @@ pub(crate) async fn get_claude_snapshot(
     }
     // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
     let path = locate_transcript(thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
-    let mtime_ms = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64);
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
-    let mut snapshot = build_claude_snapshot_json(session_type, thread_id, &content, 0, rollback);
+    // Reading the transcript and its subagent files, and projecting them, is
+    // blocking work: keep it off the async runtime.
+    let thread = thread_id.to_string();
+    let (mtime_ms, projection) = tokio::task::spawn_blocking(move || {
+        let mtime_ms = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        let content = std::fs::read_to_string(&path)?;
+        let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
+        let projection = crate::claude_projection::ClaudeTranscriptProjector::project_with(
+            &thread, &content, &subagents,
+        );
+        Ok::<_, std::io::Error>((mtime_ms, projection))
+    })
+    .await
+    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?
+    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
+    let mut snapshot =
+        build_claude_snapshot_from_projection(session_type, thread_id, projection, 0, rollback);
     let turn_count = snapshot["turns"]
         .as_array()
         .map(|a| a.len() as i64)

@@ -207,3 +207,149 @@ fn a_compact_summary_without_a_boundary_line_still_marks_the_compaction() {
         .count();
     assert_eq!(markers, 1);
 }
+
+// ── A4: subagent activity rows ─────────────────────────────────────────────
+
+fn fixture_path(relative: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/fresh-agent/claude/real-cli-2.1.237")
+        .join(relative)
+}
+
+/// The single subagent transcript captured next to a scenario's session.
+fn subagent_transcript(scenario: &str) -> String {
+    let dir = fixture_path(&format!("{scenario}/session/subagents"));
+    let file = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("the scenario captured a subagent transcript");
+    std::fs::read_to_string(file).unwrap()
+}
+
+struct MapSubagents(std::collections::HashMap<String, String>);
+
+impl SubagentSource for MapSubagents {
+    fn transcript_for(&self, tool_use_id: &str) -> Option<String> {
+        self.0.get(tool_use_id).cloned()
+    }
+}
+
+fn project_with(transcript: &str, subagents: &dyn SubagentSource) -> Vec<Value> {
+    ClaudeTranscriptProjector::project_with("s", transcript, subagents).turns
+}
+
+#[test]
+fn a_delegation_lists_its_subagent_tool_calls_from_the_subagent_transcript() {
+    let transcript = real_cli_fixture!("tools-sync");
+    let subagents = FsSubagents::for_transcript(&fixture_path("tools-sync/session.jsonl"));
+    let item = delegation(&project_with(transcript, &subagents));
+    assert_eq!(
+        item["activity"],
+        json!([{ "tool": "Read", "status": "completed", "preview": "/fixture/ws/a.txt" }])
+    );
+}
+
+#[test]
+fn a_running_delegation_shows_the_subagent_call_in_flight() {
+    // Mid-run read (F7: both files grow progressively): the subagent has
+    // called Read but its result has not been written yet.
+    let transcript = real_cli_fixture!("tools-sync");
+    let parent = prefix_before(transcript, |line| tool_result_for(line, "toolu_agent1"));
+    let child = subagent_transcript("tools-sync");
+    let child_tool_use = fixture_lines(&child)
+        .into_iter()
+        .find_map(|line| {
+            line["message"]["content"]
+                .as_array()?
+                .iter()
+                .find(|b| b["type"] == "tool_use")
+                .and_then(|b| b["id"].as_str().map(str::to_string))
+        })
+        .unwrap();
+    let child_partial = prefix_before(&child, |line| tool_result_for(line, &child_tool_use));
+    let subagents = MapSubagents([("toolu_agent1".to_string(), child_partial)].into());
+    let item = delegation(&project_with(&parent, &subagents));
+    assert_eq!(item["status"], json!("running"));
+    assert_eq!(
+        item["activity"],
+        json!([{ "tool": "Read", "status": "running", "preview": "/fixture/ws/a.txt" }])
+    );
+}
+
+#[test]
+fn a_background_delegation_lists_its_subagent_activity() {
+    let transcript = real_cli_fixture!("agent-async");
+    let subagents = FsSubagents::for_transcript(&fixture_path("agent-async/session.jsonl"));
+    let item = delegation(&project_with(transcript, &subagents));
+    assert_eq!(
+        item["activity"],
+        json!([{ "tool": "Read", "status": "completed", "preview": "/fixture/ws/a.txt" }])
+    );
+}
+
+#[test]
+fn a_delegation_without_a_subagent_transcript_carries_no_activity() {
+    let transcript = real_cli_fixture!("agent-failed");
+    let subagents = FsSubagents::for_transcript(&fixture_path("agent-failed/session.jsonl"));
+    let item = delegation(&project_with(transcript, &subagents));
+    assert!(item.get("activity").is_none());
+}
+
+#[test]
+fn subagent_activity_is_capped() {
+    // Real subagent tool_use line shape, repeated past the cap.
+    let child = subagent_transcript("tools-sync");
+    let tool_line = fixture_lines(&child)
+        .into_iter()
+        .find(|line| line["message"]["content"][0]["type"] == "tool_use")
+        .unwrap();
+    let many: String = (0..250)
+        .map(|i| {
+            let mut line = tool_line.clone();
+            line["uuid"] = json!(format!("u{i}"));
+            line["message"]["content"][0]["id"] = json!(format!("toolu_many{i}"));
+            format!("{line}\n")
+        })
+        .collect();
+    let subagents = MapSubagents([("toolu_agent1".to_string(), many)].into());
+    let item = delegation(&project_with(real_cli_fixture!("tools-sync"), &subagents));
+    assert_eq!(
+        item["activity"].as_array().unwrap().len(),
+        crate::delegation::DELEGATION_ACTIVITY_ROW_CAP
+    );
+}
+
+#[test]
+fn delegation_activity_previews_read_claude_tool_inputs() {
+    use crate::delegation::delegation_activity_preview as preview;
+    assert_eq!(
+        preview("Read", &json!({ "file_path": "/w/a.txt" })),
+        "/w/a.txt"
+    );
+    assert_eq!(
+        preview("Edit", &json!({ "file_path": "/w/b.rs" })),
+        "/w/b.rs"
+    );
+    assert_eq!(
+        preview("Write", &json!({ "file_path": "/w/c.md" })),
+        "/w/c.md"
+    );
+    assert_eq!(preview("Bash", &json!({ "command": "ls -la" })), "ls -la");
+    assert_eq!(preview("Grep", &json!({ "pattern": "fn main" })), "fn main");
+    assert_eq!(preview("Glob", &json!({ "pattern": "**/*.ts" })), "**/*.ts");
+    assert_eq!(
+        preview("Agent", &json!({ "description": "inner" })),
+        "inner"
+    );
+    assert_eq!(
+        preview("WebFetch", &json!({ "url": "https://x.test" })),
+        "https://x.test"
+    );
+    assert_eq!(
+        preview("NotebookEdit", &json!({ "notebook_path": "/w/n.ipynb" })),
+        "/w/n.ipynb"
+    );
+    assert_eq!(preview("Mystery", &json!({ "a": 1 })), r#"{"a":1}"#);
+}

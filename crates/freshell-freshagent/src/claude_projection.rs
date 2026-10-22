@@ -13,13 +13,16 @@
 //!   `system/compact_boundary` line still gets a `context_compaction` marker.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
 use crate::claude_snapshot::{
     compaction_marker_turn, is_task_notification_line, parse_transcript_turn, summarize,
 };
-use crate::delegation::task_delegation_title;
+use crate::delegation::{
+    delegation_activity_preview, task_delegation_title, DELEGATION_ACTIVITY_ROW_CAP,
+};
 
 /// The subagent tool's names: `Agent` on the wire and in the JSONL, `Task` in
 /// `system/init.tools` and in older CLIs (F5).
@@ -27,6 +30,70 @@ const DELEGATION_TOOL_NAMES: [&str; 2] = ["Agent", "Task"];
 
 /// The claude CLI's default subagent type when the model names none.
 const DEFAULT_SUBAGENT: &str = "general-purpose";
+
+/// Where the projector finds a delegation's subagent transcript.
+pub(crate) trait SubagentSource {
+    /// The JSONL of the subagent the `tool_use_id` delegation started.
+    fn transcript_for(&self, tool_use_id: &str) -> Option<String>;
+}
+
+/// No subagent transcripts (pure projections: rollback slices, goldens).
+pub(crate) struct NoSubagents;
+
+impl SubagentSource for NoSubagents {
+    fn transcript_for(&self, _tool_use_id: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The CLI's on-disk subagent layout (F5):
+/// `<transcript without .jsonl>/subagents/agent-<id>.jsonl`, plus
+/// `agent-<id>.meta.json {toolUseId, …}` written at spawn — so a delegation
+/// that is still running already maps to its transcript.
+pub(crate) struct FsSubagents {
+    by_tool_use: HashMap<String, PathBuf>,
+}
+
+impl FsSubagents {
+    pub(crate) fn for_transcript(transcript: &Path) -> Self {
+        let dir = transcript.with_extension("").join("subagents");
+        let mut by_tool_use = HashMap::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Self { by_tool_use };
+        };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            let Some(stem) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".meta.json"))
+            else {
+                continue;
+            };
+            let tool_use_id = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|meta| meta.get("toolUseId")?.as_str().map(str::to_string));
+            match tool_use_id {
+                Some(id) => {
+                    by_tool_use.insert(id, dir.join(format!("{stem}.jsonl")));
+                }
+                None => tracing::debug!(
+                    target: "freshell_freshagent::claude",
+                    event = "claude_subagent_meta_unreadable",
+                    path = %path.display(),
+                    "claude subagent meta.json has no toolUseId; its activity is not shown"
+                ),
+            }
+        }
+        Self { by_tool_use }
+    }
+}
+
+impl SubagentSource for FsSubagents {
+    fn transcript_for(&self, tool_use_id: &str) -> Option<String> {
+        std::fs::read_to_string(self.by_tool_use.get(tool_use_id)?).ok()
+    }
+}
 
 /// The projection of a whole transcript.
 pub(crate) struct ClaudeProjection {
@@ -67,13 +134,22 @@ impl ClaudeTranscriptProjector {
         }
     }
 
-    /// Project every line of `transcript`.
+    /// Project every line of `transcript` (no subagent activity).
     pub(crate) fn project(thread_id: &str, transcript: &str) -> ClaudeProjection {
+        Self::project_with(thread_id, transcript, &NoSubagents)
+    }
+
+    /// Project every line of `transcript`, attaching subagent activity.
+    pub(crate) fn project_with(
+        thread_id: &str,
+        transcript: &str,
+        subagents: &dyn SubagentSource,
+    ) -> ClaudeProjection {
         let mut projector = Self::new(thread_id);
         for line in transcript.lines() {
             projector.push_line(line);
         }
-        projector.finish()
+        projector.finish_with(subagents)
     }
 
     /// Project one raw JSONL line; malformed and blank lines are skipped.
@@ -135,7 +211,26 @@ impl ClaudeTranscriptProjector {
         self.turns.push(turn);
     }
 
-    pub(crate) fn finish(self) -> ClaudeProjection {
+    /// The projection, with each delegation's subagent tool calls attached as
+    /// `activity` rows (`↳ Tool preview` in the client).
+    pub(crate) fn finish_with(mut self, subagents: &dyn SubagentSource) -> ClaudeProjection {
+        let delegations: Vec<(String, ItemLocation)> = self
+            .delegations
+            .iter()
+            .map(|(id, location)| (id.clone(), *location))
+            .collect();
+        for (tool_use_id, location) in delegations {
+            let Some(transcript) = subagents.transcript_for(&tool_use_id) else {
+                continue;
+            };
+            let rows = subagent_activity_rows(&transcript);
+            if rows.is_empty() {
+                continue;
+            }
+            if let Some(item) = self.item_mut(location) {
+                item["activity"] = Value::Array(rows);
+            }
+        }
         ClaudeProjection { turns: self.turns }
     }
 
@@ -376,6 +471,53 @@ fn set_background(delegation: &mut Value) {
         .to_string();
     let description = delegation["description"].as_str().unwrap_or("").to_string();
     delegation["title"] = json!(task_delegation_title(&subagent, true, &description));
+}
+
+/// `{tool, status, preview}` for each tool call in a subagent transcript, in
+/// order: completed or failed once its result line exists, running before.
+fn subagent_activity_rows(transcript: &str) -> Vec<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    let mut row_by_tool_use: HashMap<String, usize> = HashMap::new();
+    for line in transcript.lines() {
+        let Ok(obj) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let Some(blocks) = obj.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if rows.len() >= DELEGATION_ACTIVITY_ROW_CAP {
+                        continue;
+                    }
+                    let tool = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        row_by_tool_use.insert(id.to_string(), rows.len());
+                    }
+                    rows.push(json!({
+                        "tool": tool,
+                        "status": "running",
+                        "preview": delegation_activity_preview(tool, &input),
+                    }));
+                }
+                Some("tool_result") => {
+                    let Some(index) = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| row_by_tool_use.get(id))
+                    else {
+                        continue;
+                    };
+                    let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                    rows[*index]["status"] = json!(if failed { "failed" } else { "completed" });
+                }
+                _ => {}
+            }
+        }
+    }
+    rows
 }
 
 /// The notification XML (string content or joined text blocks).

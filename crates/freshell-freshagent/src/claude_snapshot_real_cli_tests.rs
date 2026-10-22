@@ -275,3 +275,52 @@ fn the_snapshot_and_rollback_slices_carry_the_delegation_projection() {
         .iter()
         .any(|item| item["kind"] == "task_delegation"));
 }
+
+/// Copy a real-CLI scenario into a temp store as `<id>.jsonl` plus its
+/// `<id>/subagents/` directory (the CLI's own layout).
+pub(crate) fn stage_real_cli_store(scenario: &str, id: &str) -> tempfile::TempDir {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/fresh-agent/claude/real-cli-2.1.237")
+        .join(scenario);
+    let home = tempfile::tempdir().expect("tempdir");
+    let project = home.path().join("projects").join("-fixture-ws");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::copy(
+        fixture.join("session.jsonl"),
+        project.join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    let subagents = fixture.join("session").join("subagents");
+    if subagents.is_dir() {
+        let target = project.join(id).join("subagents");
+        std::fs::create_dir_all(&target).unwrap();
+        for entry in std::fs::read_dir(&subagents).unwrap().flatten() {
+            std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+        }
+    }
+    home
+}
+
+#[tokio::test]
+async fn the_served_snapshot_reads_delegation_activity_from_the_subagents_directory() {
+    let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let id = "61616161-6161-4161-8161-616161616161";
+    let home = stage_real_cli_store("tools-sync", id);
+    let previous = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+    let snapshot = get_claude_snapshot("freshclaude", id, None).await;
+    match previous {
+        Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+        None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+    }
+    let snapshot = snapshot.expect("snapshot builds");
+    let turns = snapshot["turns"].as_array().unwrap();
+    let delegation = all_items(turns)
+        .into_iter()
+        .find(|item| item["kind"] == "task_delegation")
+        .expect("delegation projected");
+    assert_eq!(
+        delegation["activity"],
+        json!([{ "tool": "Read", "status": "completed", "preview": "/fixture/ws/a.txt" }])
+    );
+}

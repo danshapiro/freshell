@@ -28,17 +28,23 @@ pub(crate) fn task_delegation_title(subagent: &str, background: bool, descriptio
 }
 
 /// One-line child-activity preview (the client's `getToolPreview` core cases).
-/// Unknown tools (or known tools with no preview key) fall back to compact JSON
-/// verbatim, braces included.
+/// Tool names match case-insensitively (opencode `read`, claude `Read`) and
+/// path inputs accept both spellings (opencode `filePath`, claude
+/// `file_path`). Unknown tools (or known tools with no preview key) fall back
+/// to compact JSON verbatim, braces included.
 pub(crate) fn delegation_activity_preview(tool: &str, input: &Value) -> String {
-    let get = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
-    let preview = match tool {
-        "bash" | "shell" => get("command"),
-        "read" | "write" | "edit" => get("filePath"),
-        "grep" => get("pattern"),
-        "glob" => get("pattern"),
-        "task" => get("description"),
-        "webfetch" => get("url"),
+    let get = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str))
+            .unwrap_or("")
+    };
+    let preview = match tool.to_ascii_lowercase().as_str() {
+        "bash" | "shell" => get(&["command"]),
+        "read" | "write" | "edit" | "multiedit" => get(&["filePath", "file_path"]),
+        "notebookedit" => get(&["notebook_path", "notebookPath"]),
+        "grep" | "glob" => get(&["pattern"]),
+        "task" | "agent" => get(&["description"]),
+        "webfetch" => get(&["url"]),
         _ => "",
     };
     let text = if preview.is_empty() {
