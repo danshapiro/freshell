@@ -94,10 +94,16 @@ async function openSavedSession(
   return paneRoot
 }
 
+/** Expand every collapsed activity strip. An expanded strip keeps a toggle
+ * with the same name (to collapse it again), so only COLLAPSED toggles are
+ * clicked, one at a time, until none remain. */
 async function expandActivity(paneRoot: ReturnType<Page['locator']>) {
-  const toggles = paneRoot.getByRole('button', { name: 'Toggle activity details' })
-  const count = await toggles.count()
-  for (let i = 0; i < count; i += 1) await toggles.first().click()
+  const collapsed = paneRoot.getByRole('button', { name: 'Toggle activity details', expanded: false })
+  await expect(collapsed.first()).toBeVisible({ timeout: 15_000 })
+  for (let remaining = await collapsed.count(); remaining > 0; remaining = await collapsed.count()) {
+    await collapsed.first().click()
+    await expect(collapsed).toHaveCount(remaining - 1)
+  }
 }
 
 test.describe('freshclaude durable transcript (real CLI transcripts, Rust server)', () => {
