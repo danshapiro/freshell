@@ -180,6 +180,15 @@ export const TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.rolledBack',
   'freshAgent.redone',
 ])
+// Approval and question lifecycle events change only the pane surface (the
+// cards rendered from the snapshot's pendingApprovals/pendingQuestions). A
+// hidden pane owes a non-blocking refresh for them on reveal.
+export const SURFACE_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
+  'freshAgent.permission.request',
+  'freshAgent.permission.cancelled',
+  'freshAgent.question.request',
+  'freshAgent.question.cancelled',
+])
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const log = createLogger('FreshAgentView')
 let nextSnapshotAuditView = 0
@@ -1609,6 +1618,12 @@ export function FreshAgentView({
   }, [hidden])
   // Snapshot refresh owed at next reveal (set when a reconnect happens hidden).
   const pendingRevealRefreshRef = useRef(false)
+  // G26: a NON-blocking surface refresh owed at next reveal, set when an
+  // approval/question (or its cancellation) arrives while hidden. These do not
+  // change the transcript, so they must not take the blocking reveal path:
+  // its overlay clears only on a newer transcript revision, which an approval
+  // never produces (it would spin for REVEAL_REFRESH_MAX_WAIT_MS, then error).
+  const surfaceRefreshOwedRef = useRef(false)
   // Release callback for an in-flight queued CREATE rebind; released by the
   // freshAgent.created / create-failed ack (or the queue's 10s backstop).
   const pendingRebindReleaseRef = useRef<(() => void) | null>(null)
@@ -1643,6 +1658,7 @@ export function FreshAgentView({
     if (previousSnapshotHydrationIdentityRef.current === snapshotHydrationIdentity) return
     previousSnapshotHydrationIdentityRef.current = snapshotHydrationIdentity
     snapshotDirtyRef.current = false
+    surfaceRefreshOwedRef.current = false
     snapshotDirtyVersionRef.current += 1
     snapshotDirtyBaseRevisionRef.current = null
     revealRefreshVersionRef.current = null
@@ -2832,8 +2848,14 @@ export function FreshAgentView({
   useEffect(() => {
     if (hidden) return
     if (pendingRevealRefreshRef.current) pendingRevealRefreshRef.current = false
+    if (surfaceRefreshOwedRef.current) {
+      surfaceRefreshOwedRef.current = false
+      // A transcript-dirty pane's blocking reveal refresh fetches the same
+      // snapshot, so it covers the owed surface refresh.
+      if (!snapshotDirtyRef.current) requestSnapshotRefresh('reveal-surface')
+    }
     requestRevealRefresh()
-  }, [hidden, requestRevealRefresh, snapshotDirty])
+  }, [hidden, requestRevealRefresh, requestSnapshotRefresh, snapshotDirty])
 
   // reconcileNotice is a one-shot: visible for 5s, then consumed from the
   // pane content (a chat pane has no xterm write-notice channel; a timed
@@ -3152,6 +3174,9 @@ export function FreshAgentView({
         requestRevealRefresh(true)
       } else if (messageBelongsToPane && isSnapshotInvalidatingFreshAgentEvent(message)) {
         if (!hiddenRef.current) requestSnapshotRefresh('event')
+        else if (eventType && SURFACE_INVALIDATING_FRESH_AGENT_EVENTS.has(eventType)) {
+          surfaceRefreshOwedRef.current = true
+        }
       }
       // kata 1wxv: the requesting-sink ack drives the composer refill; rollback
       // refusals render their server-pinned message verbatim. Both match on the
