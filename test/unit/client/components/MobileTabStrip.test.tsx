@@ -444,6 +444,10 @@ describe('MobileTabStrip', () => {
     // The "other tabs" status is a polite live region that stays mounted
     // (empty while no other tab is marked); its label is the region's text.
     const otherTabsStatus = () => screen.getByRole('status')
+    // The visible chevron mark is decorative (aria-hidden; the chevron's
+    // accessible description carries the meaning), so it has no role to query.
+    const chevronDot = (name: string) =>
+      screen.getByRole('button', { name }).querySelector('span[aria-hidden="true"]')
 
     async function renderStrip(store: ReturnType<typeof createStore>) {
       const { MobileTabStrip } = await import('@/components/MobileTabStrip')
@@ -478,6 +482,8 @@ describe('MobileTabStrip', () => {
         .toHaveAccessibleDescription('A later tab needs attention')
       expect(screen.getByRole('button', { name: 'Previous tab' })).toHaveAccessibleDescription('')
       expect(within(otherTabsStatus()).getByText('1 other tab needs attention')).toBeInTheDocument()
+      expect(chevronDot('Next tab')).toHaveClass('rounded-full', 'bg-emerald-500')
+      expect(chevronDot('Previous tab')).toBeNull()
     })
 
     it('dots the previous chevron for an earlier tab that needs attention', async () => {
@@ -486,6 +492,20 @@ describe('MobileTabStrip', () => {
       expect(screen.getByRole('button', { name: 'Previous tab' }))
         .toHaveAccessibleDescription('An earlier tab needs attention')
       expect(screen.getByRole('button', { name: 'Next tab' })).toHaveAccessibleDescription('')
+      expect(chevronDot('Previous tab')).toHaveClass('rounded-full', 'bg-emerald-500')
+      expect(chevronDot('Next tab')).toBeNull()
+    })
+
+    it('draws the chevron dot in the user\'s attention style', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', {
+        tabAttentionStyle: 'darken',
+        attentionByTab: { 'tab-1': true, 'tab-4': true },
+      }))
+
+      for (const name of ['Previous tab', 'Next tab']) {
+        expect(chevronDot(name)).toHaveClass('rounded-full', 'bg-foreground/60')
+        expect(chevronDot(name)).not.toHaveClass('bg-emerald-500')
+      }
     })
 
     it('counts watched-completion marks like attention marks', async () => {
@@ -507,6 +527,8 @@ describe('MobileTabStrip', () => {
       expect(screen.getByRole('button', { name: 'Open tab switcher' })).toHaveAccessibleDescription('')
       expect(screen.getByRole('button', { name: 'Next tab' })).toHaveAccessibleDescription('')
       expect(screen.getByRole('button', { name: 'Previous tab' })).toHaveAccessibleDescription('')
+      expect(chevronDot('Next tab')).toBeNull()
+      expect(chevronDot('Previous tab')).toBeNull()
     })
 
     it('shows no mark when no tab needs attention', async () => {
