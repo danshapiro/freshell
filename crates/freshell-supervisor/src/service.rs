@@ -3625,12 +3625,12 @@ mod host_ipc_timeout_tests {
 mod host_command_budget_tests {
     use super::{
         default_backend, AuthenticatedHost, HostCommandBudgets, Supervisor, SupervisorConfig,
-        HOST_COMMAND_TIMEOUT_ENV,
+        FRESH_AGENT_COMMAND_TIMEOUT_ENV, HOST_COMMAND_TIMEOUT_ENV, TERMINAL_DISPATCH_TIMEOUT_ENV,
     };
     use crate::registry::Registry;
     use freshell_runtime_protocol::{
         read_frame, write_frame, Envelope, GrantId, HostBootId, HostCommand, HostReply, HostResult,
-        IncarnationId, RuntimeErrorCode, RuntimeLimits, SoulId, TerminalLaunchSpec,
+        IncarnationId, RequestId, RuntimeErrorCode, RuntimeLimits, SoulId, TerminalLaunchSpec,
     };
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -3645,17 +3645,21 @@ mod host_command_budget_tests {
         }
     }
 
-    /// Every non-control budget is generous; a control round trip is short.
-    fn budgets(control_ms: &'static str, dispatch_ms: &'static str) -> HostCommandBudgets {
+    /// Distinct budgets per command class, so a test can tell which one a
+    /// command was held to.
+    fn budgets(
+        control_ms: &'static str,
+        terminal_ms: &'static str,
+        fresh_ms: &'static str,
+    ) -> HostCommandBudgets {
         HostCommandBudgets::from_lookup(move |name| {
-            Some(
-                if name == HOST_COMMAND_TIMEOUT_ENV {
-                    control_ms
-                } else {
-                    dispatch_ms
-                }
-                .to_string(),
-            )
+            match name {
+                HOST_COMMAND_TIMEOUT_ENV => Some(control_ms),
+                TERMINAL_DISPATCH_TIMEOUT_ENV => Some(terminal_ms),
+                FRESH_AGENT_COMMAND_TIMEOUT_ENV => Some(fresh_ms),
+                _ => None,
+            }
+            .map(str::to_string)
         })
     }
 
@@ -3761,7 +3765,7 @@ mod host_command_budget_tests {
         let root = tempfile::tempdir().unwrap();
         let runtime_dir = root.path().join("incarnation");
         std::fs::create_dir_all(&runtime_dir).unwrap();
-        let supervisor = supervisor(root.path(), budgets("200", "5000"));
+        let supervisor = supervisor(root.path(), budgets("200", "5000", "9000"));
         let host = slow_host(&runtime_dir, Some(Duration::from_millis(700)));
         let incarnation_id = IncarnationId::new();
 
@@ -3805,7 +3809,7 @@ mod host_command_budget_tests {
         let root = tempfile::tempdir().unwrap();
         let runtime_dir = root.path().join("incarnation");
         std::fs::create_dir_all(&runtime_dir).unwrap();
-        let supervisor = supervisor(root.path(), budgets("100", "400"));
+        let supervisor = supervisor(root.path(), budgets("100", "400", "9000"));
         let host = slow_host(&runtime_dir, None);
         let incarnation_id = IncarnationId::new();
         let started = Instant::now();
@@ -3825,6 +3829,57 @@ mod host_command_budget_tests {
             error.message
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+        host.abort();
+    }
+
+    /// Terminal grants, fresh-agent operations, and control round trips are
+    /// each held to their own configured budget: none borrows another's.
+    #[tokio::test]
+    async fn each_command_class_is_held_to_its_own_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("incarnation");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let supervisor = supervisor(root.path(), budgets("100", "300", "700"));
+        let host = slow_host(&runtime_dir, None);
+        let incarnation_id = IncarnationId::new();
+        let host_auth = authenticated();
+        let send = |command| {
+            supervisor.send_authenticated_host_command(
+                incarnation_id.clone(),
+                &runtime_dir,
+                &host_auth,
+                command,
+            )
+        };
+
+        let terminal = send(terminal_grant(&incarnation_id, root.path()))
+            .await
+            .expect_err("a silent host times out");
+        let fresh_agent = send(HostCommand::FreshAgentSend {
+            incarnation_id: incarnation_id.clone(),
+            request_id: RequestId::new(),
+            text: "synthetic turn".into(),
+            settings: None,
+            checkpoint_logical_attempt_id: None,
+        })
+        .await
+        .expect_err("a silent host times out");
+        let control = send(HostCommand::Status {
+            incarnation_id: incarnation_id.clone(),
+        })
+        .await
+        .expect_err("a silent host times out");
+
+        for (error, budget) in [(&terminal, 300), (&fresh_agent, 700), (&control, 100)] {
+            assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+            assert!(
+                error
+                    .message
+                    .contains(&format!("timed out after {budget}ms")),
+                "{}",
+                error.message
+            );
+        }
         host.abort();
     }
 }
