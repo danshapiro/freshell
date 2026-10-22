@@ -417,31 +417,23 @@ pub(crate) enum ClaudeSnapshotError {
     Io(String),
 }
 
+/// The display turns of a whole transcript: the per-line projection below
+/// ([`parse_transcript_turn_indexed`]) folded by the stateful
+/// [`crate::claude_projection::ClaudeTranscriptProjector`] (delegations absorb
+/// their results and task notifications; re-appended lines project once).
+fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
+    crate::claude_projection::ClaudeTranscriptProjector::project(thread_id, transcript).turns
+}
+
 /// One transcript JSONL line -> zero-or-one snapshot turn. Parsing rules are the
 /// legacy `extractChatMessagesFromJsonl` contract (`server/session-history-loader.ts:36-131`)
 /// PLUS the real-store fixes from the ledger A5 census (23,615 real lines): keep only
-/// type user|assistant; message may be a plain string, `{content: [...]}`, or
+/// type user|assistant (and the visible system lines: compaction markers and local
+/// command output); message may be a plain string, `{content: [...]}`, or
 /// `{content: "<string>"}` (the DOMINANT real prompt shape, which legacy-as-coded
 /// drops); lines flagged isMeta/isSidechain/isCompactSummary/isVisibleInTranscriptOnly
 /// are synthetic/subagent noise and are SKIPPED; malformed lines and unknown block
 /// kinds are skipped, never fatal.
-fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
-    let mut turns: Vec<Value> = Vec::new();
-    for line in transcript.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if let Some(turn) = parse_transcript_turn(&obj, thread_id, turns.len()) {
-            turns.push(turn);
-        }
-    }
-    turns
-}
-
 pub(crate) fn parse_transcript_turn(obj: &Value, thread_id: &str, ordinal: usize) -> Option<Value> {
     parse_transcript_turn_indexed(obj, thread_id, ordinal, None)
 }
@@ -671,14 +663,7 @@ const SYNTHETIC_MODEL: &str = "<synthetic>";
 /// system subtype (status, informational noise) stays hidden.
 fn system_line_turn(obj: &Value, turn_id: &str, ordinal: usize) -> Option<Value> {
     match obj.get("subtype").and_then(Value::as_str) {
-        Some("compact_boundary") => Some(turn_json(
-            turn_id,
-            ordinal,
-            "system",
-            vec![json!({ "id": format!("{turn_id}-i0"), "kind": "context_compaction" })],
-            None,
-            obj,
-        )),
+        Some("compact_boundary") => Some(compaction_marker_turn(turn_id, ordinal, obj)),
         Some("local_command") => {
             let content = obj.get("content").and_then(Value::as_str)?;
             let output = LocalCommandOutput::parse(content).unwrap_or_else(|| LocalCommandOutput {
@@ -689,6 +674,18 @@ fn system_line_turn(obj: &Value, turn_id: &str, ordinal: usize) -> Option<Value>
         }
         _ => None,
     }
+}
+
+/// The system turn marking a context compaction at `obj`'s position.
+pub(crate) fn compaction_marker_turn(turn_id: &str, ordinal: usize, obj: &Value) -> Value {
+    turn_json(
+        turn_id,
+        ordinal,
+        "system",
+        vec![json!({ "id": format!("{turn_id}-i0"), "kind": "context_compaction" })],
+        None,
+        obj,
+    )
 }
 
 /// A USER line whose whole text is local-command output (`<local-command-
@@ -839,7 +836,7 @@ fn tool_result_text(block: &Value) -> String {
 /// items `[thinking "pondering", text "first answer"]` must summarize to
 /// `"first answer"`). Every claude summary is a mechanical projection of the
 /// turn's own items, so every claude turn tags `summaryKind: "echo"`.
-fn summarize(items: &[Value]) -> String {
+pub(crate) fn summarize(items: &[Value]) -> String {
     let first_text_of = |kind: &str| -> Option<String> {
         items.iter().find_map(|item| {
             if item.get("kind").and_then(Value::as_str) != Some(kind) {
@@ -2696,4 +2693,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "claude_snapshot_real_cli_tests.rs"]
-mod real_cli_tests;
+pub(crate) mod real_cli_tests;

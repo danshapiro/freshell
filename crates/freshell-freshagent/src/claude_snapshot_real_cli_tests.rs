@@ -17,9 +17,9 @@ macro_rules! real_cli_fixture {
     };
 }
 #[allow(unused_imports)]
-pub(super) use real_cli_fixture;
+pub(crate) use real_cli_fixture;
 
-pub(super) fn fixture_lines(transcript: &str) -> Vec<Value> {
+pub(crate) fn fixture_lines(transcript: &str) -> Vec<Value> {
     transcript
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -28,7 +28,7 @@ pub(super) fn fixture_lines(transcript: &str) -> Vec<Value> {
 
 /// The uuid of the ONE fixture line matching `pred` (panics on zero or many,
 /// so a re-capture that changes the shape fails loudly).
-pub(super) fn uuid_of(transcript: &str, pred: impl Fn(&Value) -> bool) -> String {
+pub(crate) fn uuid_of(transcript: &str, pred: impl Fn(&Value) -> bool) -> String {
     let matches: Vec<String> = fixture_lines(transcript)
         .into_iter()
         .filter(|line| pred(line))
@@ -43,7 +43,7 @@ pub(super) fn uuid_of(transcript: &str, pred: impl Fn(&Value) -> bool) -> String
 }
 
 /// The raw text of a line's message content (string content or joined text blocks).
-pub(super) fn message_text(line: &Value) -> String {
+pub(crate) fn message_text(line: &Value) -> String {
     match &line["message"]["content"] {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
@@ -55,14 +55,14 @@ pub(super) fn message_text(line: &Value) -> String {
     }
 }
 
-pub(super) fn turn_by_id<'a>(turns: &'a [Value], id: &str) -> &'a Value {
+pub(crate) fn turn_by_id<'a>(turns: &'a [Value], id: &str) -> &'a Value {
     turns
         .iter()
         .find(|turn| turn["turnId"] == json!(id))
         .unwrap_or_else(|| panic!("no projected turn {id}"))
 }
 
-pub(super) fn all_items(turns: &[Value]) -> Vec<&Value> {
+pub(crate) fn all_items(turns: &[Value]) -> Vec<&Value> {
     turns
         .iter()
         .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
@@ -249,4 +249,29 @@ fn task_notification_lines_never_render_as_user_turns() {
         .as_str()
         .unwrap_or("")
         .contains("<task-notification>")));
+}
+
+#[test]
+fn the_snapshot_and_rollback_slices_carry_the_delegation_projection() {
+    let transcript = real_cli_fixture!("tools-sync");
+    for session_type in ["freshclaude", "kilroy"] {
+        let snapshot = build_claude_snapshot_json(session_type, "s", transcript, 0, None);
+        let turns = snapshot["turns"].as_array().unwrap();
+        let kinds: Vec<&str> = all_items(turns)
+            .iter()
+            .filter_map(|item| item["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"task_delegation"),
+            "{session_type}: {kinds:?}"
+        );
+        assert!(all_items(turns)
+            .iter()
+            .all(|item| item["toolUseId"] != json!("toolu_agent1")));
+    }
+    // The rollback marker slice is the same projection (one display truth).
+    let point = resolve_resume_point(transcript, "s", ResumeTarget::Step).expect("resolves");
+    assert!(all_items(&point.removed_turns)
+        .iter()
+        .any(|item| item["kind"] == "task_delegation"));
 }
