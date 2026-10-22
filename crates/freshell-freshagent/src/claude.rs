@@ -1139,28 +1139,59 @@ impl FreshClaudeState {
         &self.leases
     }
 
-    /// The coordinator key that fences a send to the session behind `map_key`.
-    /// The coordinator keys a claude session by its durable id (the map key and
-    /// the pane's wire id are the lane's own placeholder), so once the CLI has
-    /// reported the session that id is the key, as in `handle_attach`. Before the
-    /// report (`system/init`, which the CLI emits only once a prompt runs, T1),
-    /// the wire id is the key if the coordinator holds a record for it, and
-    /// otherwise there is no owner to fence: `None`. Such a session has no durable
-    /// id to hand off, reattach or roll back, and a close removes it from the map.
-    async fn send_owner_key(&self, map_key: &str, wire_id: &str) -> Option<String> {
-        let durable = self
-            .sessions
-            .lock()
-            .await
-            .get(map_key)
-            .and_then(|session| session.cli_session_id.clone());
-        if let Some(durable) = durable {
-            return Some(self.resolve_ownership_key(&durable));
+    /// The coordinator key a claude session is owned under. The coordinator
+    /// keys a claude session by its durable id (the map key and the pane's wire
+    /// id are the lane's own placeholder), so once the CLI has reported the
+    /// session (`system/init`, which it emits only once a prompt runs, T1) that
+    /// id is the key, as in `handle_attach`. Before the report, or when
+    /// `map_key` names no live session, the wire id is. Either resolves through
+    /// the coordinator's alias walk. Kill and send both address the owner
+    /// through this one rule. C23 (durable id minted at create) makes the
+    /// durable id known from the start and removes the wire-id fallback.
+    async fn claude_owner_key(&self, map_key: Option<&str>, wire_id: &str) -> ClaudeOwnerKey {
+        let durable = match map_key {
+            Some(map_key) => self
+                .sessions
+                .lock()
+                .await
+                .get(map_key)
+                .and_then(|session| session.cli_session_id.clone()),
+            None => None,
+        };
+        match durable {
+            Some(durable) => ClaudeOwnerKey {
+                key: self.resolve_ownership_key(&durable),
+                reported: true,
+            },
+            None => ClaudeOwnerKey {
+                key: self.resolve_ownership_key(wire_id),
+                reported: false,
+            },
         }
-        let key = self.resolve_ownership_key(wire_id);
-        match self.ownership_snapshot(PROVIDER, &key).state {
+    }
+
+    /// The coordinator key that fences a send to the session behind `map_key`,
+    /// or `None` when the send runs unfenced. A reported session is always
+    /// fenced on its durable id, and a supplied observed pair is always checked
+    /// (against a record the coordinator does not hold, it is stale and the
+    /// guard refuses it typed). The one unfenced case is a session the CLI has
+    /// not reported, with no record in the coordinator and no pair on the
+    /// send: a new pane's first message, which is what makes the CLI report
+    /// it. Such a session has no durable id to hand off, reattach or roll back,
+    /// and a close removes it from the map.
+    async fn send_owner_key(
+        &self,
+        map_key: &str,
+        wire_id: &str,
+        fence: Option<freshell_ownership::ObservedFence>,
+    ) -> Option<String> {
+        let owner = self.claude_owner_key(Some(map_key), wire_id).await;
+        if owner.reported || fence.is_some() {
+            return Some(owner.key);
+        }
+        match self.ownership_snapshot(PROVIDER, &owner.key).state {
             freshell_ownership::OwnershipState::Vacant => None,
-            _ => Some(key),
+            _ => Some(owner.key),
         }
     }
 
@@ -3201,18 +3232,11 @@ impl FreshClaudeState {
                 // lane resolution the stamp path uses (placeholder wire
                 // ids resolve through the live session's recorded cli id;
                 // a durable wire id is itself).
-                let canonical = match self.resolve_session_key(&session_id).await {
-                    Some(mk) => {
-                        let durable = self
-                            .sessions
-                            .lock()
-                            .await
-                            .get(&mk)
-                            .and_then(|sess| sess.cli_session_id.clone());
-                        durable.unwrap_or_else(|| self.resolve_ownership_key(&session_id))
-                    }
-                    None => self.resolve_ownership_key(&session_id),
-                };
+                let live_key = self.resolve_session_key(&session_id).await;
+                let canonical = self
+                    .claude_owner_key(live_key.as_deref(), &session_id)
+                    .await
+                    .key;
                 let snap = registry.observe(PROVIDER, &canonical);
                 match snap.state.clone() {
                     freshell_ownership::OwnershipState::Live {
@@ -4481,11 +4505,14 @@ impl FreshClaudeState {
         // Arm the coordinator guard only after the send has waited behind any
         // earlier turn. A lifecycle transition during that wait advances the
         // generation, so the captured fence is checked against the owner that
-        // will actually receive this prompt. Checkpointed sends always require
-        // the fence when the coordinator is wired; ordinary legacy sends keep
-        // their existing unfenced behavior, while any supplied fence is honored.
+        // will actually receive this prompt. Checkpointed sends go through the
+        // guard when the coordinator is wired, and any supplied fence is
+        // honored; ordinary legacy sends keep their existing unfenced
+        // behavior. The one exception is `send_owner_key`'s: an unfenced send
+        // to a session the CLI has not reported and the coordinator holds no
+        // record for (a new pane's first message) runs unguarded.
         let ownership_guard = if msg.checkpoint_intent.is_some() || send_fence.is_some() {
-            if let Some(owner_key) = self.send_owner_key(&map_key, &session_id).await {
+            if let Some(owner_key) = self.send_owner_key(&map_key, &session_id, send_fence).await {
                 match crate::ownership_lane::arm_reclaimless_op_guard(
                     &self.ownership,
                     PROVIDER,
@@ -4505,10 +4532,10 @@ impl FreshClaudeState {
                     }
                 }
             } else {
-                // Nothing owns the session in the coordinator yet: the CLI
-                // reports the session only once a prompt runs (T1), and this
-                // send is what makes it run. Refusing it would refuse every
-                // new pane's first message.
+                // Nothing owns the session in the coordinator yet and the send
+                // names no owner: the CLI reports the session only once a
+                // prompt runs (T1), and this send is what makes it run.
+                // Refusing it would refuse every new pane's first message.
                 tracing::debug!(target: "freshell_freshagent::claude",
                     session_id = %session_id, request_id = ?request_id,
                     event = "freshagent.claude.send_before_session_report",
@@ -9439,6 +9466,14 @@ fn frame_request_id(value: &Value) -> Option<String> {
         .or_else(|| value.as_i64().map(|n| n.to_string()))
 }
 
+/// The coordinator key a claude session is owned under
+/// ([`FreshClaudeState::claude_owner_key`]).
+struct ClaudeOwnerKey {
+    key: String,
+    /// The key is the durable id the CLI reported (else the pane's wire id).
+    reported: bool,
+}
+
 // ── sdk.* → freshAgent.event frame (port of sdk-events.ts normalizeFreshAgentProviderEvent) ─
 
 /// The two attention edges a claude session raises (AGENTS.md "Agent Status
@@ -12239,6 +12274,78 @@ rl.on('line', (line) => {
                 .expect("turn tracker mutex")
                 .busy(),
             "a refused stale prompt leaves the turn tracker idle"
+        );
+    }
+
+    /// F4 (PR-A review): before the CLI reports a new pane's session the
+    /// coordinator holds no record for it, and an unfenced (checkpointed)
+    /// send runs: refusing it would lose every new pane's first message
+    /// (827d9395d). A send that DOES carry an observed owner pair is still
+    /// checked: the pair names an owner the coordinator does not hold, so it
+    /// is stale and refused typed, never run unguarded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenced_send_before_the_session_report_is_checked_not_skipped() {
+        let (mut st, mut rx) = state_with_bus();
+        let session_id = "claude-send-before-report";
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fake_claude_session(&st, session_id).await;
+        let vacant = registry.observe(PROVIDER, session_id);
+        assert!(
+            matches!(vacant.state, freshell_ownership::OwnershipState::Vacant),
+            "fixture: nothing owns an unreported session"
+        );
+        let checkpointed = |request_id: &str| {
+            let mut send = send_msg(session_id, "first message");
+            send.request_id = Some(request_id.to_string());
+            send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: format!("{request_id}-attempt"),
+                workspace: None,
+            });
+            send
+        };
+        let drain = |rx: &mut tokio::sync::broadcast::Receiver<String>| {
+            let mut frames: Vec<Value> = Vec::new();
+            while let Ok(raw) = rx.try_recv() {
+                if let Ok(frame) = serde_json::from_str(&raw) {
+                    frames.push(frame);
+                }
+            }
+            frames
+        };
+
+        let mut fenced = checkpointed("fenced-before-report");
+        fenced.observed_epoch = Some(vacant.epoch);
+        fenced.observed_generation = Some(vacant.generation);
+        st.handle_send(fenced).await;
+        let frames = drain(&mut rx);
+        assert!(
+            frames.iter().any(|frame| {
+                frame["requestId"] == json!("fenced-before-report")
+                    && frame.to_string().contains("SESSION_RESERVED")
+            }),
+            "the supplied fence is honored and refuses typed: {frames:?}"
+        );
+        assert!(
+            !st.sessions.lock().await[session_id]
+                .in_turn
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the refused send never reaches the sidecar"
+        );
+
+        st.handle_send(checkpointed("unfenced-before-report")).await;
+        let frames = drain(&mut rx);
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.to_string().contains("SESSION_RESERVED")),
+            "an unfenced first send of a new pane runs: {frames:?}"
+        );
+        assert!(
+            st.sessions.lock().await[session_id]
+                .in_turn
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the unfenced first send reaches the sidecar"
         );
     }
 
