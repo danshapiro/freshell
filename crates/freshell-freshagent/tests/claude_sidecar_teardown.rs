@@ -1,11 +1,15 @@
-//! How a Claude Node sidecar is stopped (`freshell_freshagent::claude_spawn`).
+//! How a Claude Node sidecar is stopped (`freshell_freshagent::claude_spawn`,
+//! and a session's stop through `FreshClaudeState`).
 //!
 //! These tests drive small fake sidecars written in Node, so they run on every
 //! platform the desktop app ships on: Linux in the Rust gate, and Windows and
 //! macOS in the `electron-build` workflow (the crate's unit tests do not
 //! compile on Windows, so the cross-platform behavior lives in this
 //! integration target). They need `node` on PATH (or `FRESHELL_CLAUDE_NODE`),
-//! like the crate's other sidecar tests.
+//! like the crate's other sidecar tests. Only
+//! `a_session_stop_confirms_the_whole_sidecar_tree_gone` sets process
+//! environment (`FRESHELL_CLAUDE_SIDECAR`, `CLAUDE_CONFIG_DIR`), which no
+//! other test here reads.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -521,4 +525,148 @@ async fn dropping_the_guard_kills_the_process_group() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The session sidecar for the `FreshClaudeState` stop test: it answers
+/// `create`, starts a grandchild (the CLI's stand-in) whose pid it writes to
+/// `PID_FILE`, and exits 0 on the shutdown line WITHOUT stopping that
+/// grandchild, so the session stop must find and kill it. CommonJS (`.cjs`):
+/// `FreshClaudeState` runs the entry as `node <entry>`.
+const SESSION_SIDECAR: &str = r#"
+const fs = require('node:fs')
+const { spawn } = require('node:child_process')
+const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+grandchild.on('spawn', () => fs.writeFileSync(PID_FILE, String(grandchild.pid)))
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  let msg
+  try { msg = JSON.parse(line) } catch { return }
+  if (msg.type === 'create') {
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId: 'teardownConfirmSession01' }) + '\n')
+  } else if (msg.type === 'shutdown') {
+    process.exit(0)
+  }
+})
+setInterval(() => {}, 1000)
+"#;
+
+/// `freshagent.claude.teardown` events, captured on this test's thread.
+mod teardown_log {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    pub type Fields = BTreeMap<String, String>;
+
+    #[derive(Default)]
+    struct Visitor(Fields);
+    impl Visit for Visitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(
+                field.name().to_string(),
+                format!("{value:?}").replace('"', ""),
+            );
+        }
+    }
+
+    struct Capture(Arc<Mutex<Vec<Fields>>>);
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            if visitor.0.get("event").map(String::as_str) == Some("freshagent.claude.teardown") {
+                self.0.lock().expect("capture lock").push(visitor.0);
+            }
+        }
+    }
+
+    pub fn install() -> (Arc<Mutex<Vec<Fields>>>, tracing::subscriber::DefaultGuard) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+}
+
+/// A session's stop through the public `FreshClaudeState` API answers
+/// `confirmed` only when the sidecar's whole tree is gone. The session
+/// handoff turns that answer into `StopResult::Reaped` (a new writer may
+/// start). On Linux it comes from the `/proc` ownership confirmation; on
+/// Windows and macOS, where the crate's unit tests cannot run, from the
+/// process-tree guard, and this is the test that pins that mapping there.
+#[tokio::test]
+async fn a_session_stop_confirms_the_whole_sidecar_tree_gone() {
+    let (events, _capture) = teardown_log::install();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("grandchild.pid");
+    let entry = dir.path().join("session-sidecar.cjs");
+    std::fs::write(
+        &entry,
+        format!(
+            "const PID_FILE = {}\n{SESSION_SIDECAR}",
+            serde_json::to_string(&pid_file).expect("encode the pid file path")
+        ),
+    )
+    .unwrap();
+    std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &entry);
+    std::env::set_var("CLAUDE_CONFIG_DIR", dir.path().join("claude"));
+    let (tx, mut frames) = tokio::sync::broadcast::channel::<String>(64);
+    let state = freshell_freshagent::claude::FreshClaudeState::new(std::sync::Arc::new(tx));
+
+    state
+        .handle_create(
+            serde_json::from_value(serde_json::json!({
+                "requestId": "teardown-confirm",
+                "sessionType": "freshclaude",
+                "provider": "claude",
+            }))
+            .expect("a freshclaude create"),
+            None,
+        )
+        .await;
+    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+    let created = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(20), frames.recv())
+            .await
+            .expect("the create answers")
+            .expect("read a broadcast frame");
+        let frame: serde_json::Value = serde_json::from_str(&frame).expect("a JSON frame");
+        if frame["requestId"] == "teardown-confirm" {
+            break frame;
+        }
+    };
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let grandchild_pid: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sidecar started its grandchild"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let grandchild = ProcessProbe::open(grandchild_pid);
+    assert!(grandchild.alive());
+
+    state.shutdown().await;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+    let logged = events.lock().expect("capture lock").clone();
+    assert_eq!(logged.len(), 1, "one logged stop: {logged:?}");
+    assert_eq!(
+        logged[0].get("confirmation").map(String::as_str),
+        Some("confirmed"),
+        "{logged:?}"
+    );
+    assert!(
+        !grandchild.alive(),
+        "the grandchild the sidecar left behind was killed"
+    );
 }

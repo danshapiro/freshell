@@ -121,9 +121,11 @@ jobs:
         run: cargo test --locked -p freshell-platform --lib process_job::tests
 
       # The Claude sidecar's process-tree guard (a Job Object on Windows, a
-      # process group on macOS) and the graceful sidecar stop, against Node
-      # fake sidecars. The crate's unit tests do not build on Windows, so
-      # this behavior lives in an integration target that runs everywhere.
+      # process group on macOS), the graceful sidecar stop, and a session
+      # stop's "confirmed" answer (what lets a session handoff start a new
+      # writer), against Node fake sidecars. The crate's unit tests do not
+      # build on Windows, so this behavior lives in an integration target
+      # that runs everywhere.
       - name: Test Claude sidecar tree guard (Windows)
         if: ${{ !cancelled() && matrix.os == 'windows-2022' }}
         run: cargo test --locked -p freshell-freshagent --test claude_sidecar_teardown
