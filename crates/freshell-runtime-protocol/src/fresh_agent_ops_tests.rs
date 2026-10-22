@@ -139,3 +139,31 @@ fn host_configure_command_keeps_the_semantic_request_id_and_settings() {
         } if restored_id == request_id && restored_settings == settings
     ));
 }
+
+#[test]
+fn admin_configure_envelope_keeps_the_semantic_request_id() {
+    let request_id = RequestId::parse("request-admin-configure-1").unwrap();
+    let admin = Envelope::new(
+        request_id.clone(),
+        ControlRole::Web,
+        AdminCommand::FreshAgentConfigure(FreshAgentConfigureRequest {
+            soul_id: SoulId::parse("soul-admin-configure").unwrap(),
+            settings: FreshAgentTurnSettings {
+                cwd: None,
+                model: Some("opus".into()),
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+            },
+            expected_control_epoch: Some(3),
+        }),
+    );
+    let restored: Envelope<AdminCommand> =
+        serde_json::from_value(serde_json::to_value(admin).unwrap()).unwrap();
+    assert_eq!(restored.request_id, request_id);
+    let AdminCommand::FreshAgentConfigure(request) = restored.body else {
+        panic!("configure must decode as configure");
+    };
+    assert_eq!(request.settings.model.as_deref(), Some("opus"));
+    assert_eq!(request.expected_control_epoch, Some(3));
+}

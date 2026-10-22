@@ -2861,6 +2861,7 @@ pub enum AdminCommand {
     FreshAgentSend(FreshAgentSendRequest),
     FreshAgentFork(FreshAgentForkRequest),
     FreshAgentCompact(FreshAgentCompactRequest),
+    FreshAgentConfigure(FreshAgentConfigureRequest),
     FreshAgentRollback(FreshAgentRollbackRequest),
     FreshAgentCapture(FreshAgentCaptureRequest),
     FreshAgentResolve(FreshAgentResolveRequest),
