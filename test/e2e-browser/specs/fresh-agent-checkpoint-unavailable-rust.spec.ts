@@ -47,7 +47,6 @@ test.describe('fresh-agent checkpoint availability', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-checkpoint-restore-'))
     const projectDir = path.join(sharedRoot, 'selected-workspace')
     const sourceFile = path.join(projectDir, 'state.txt')
-    const codexHome = path.join(sharedRoot, 'codex-home')
     let server: RustServer | undefined
     let context: Awaited<ReturnType<typeof createFreshE2ePage>>['context'] | undefined
 
@@ -58,7 +57,6 @@ test.describe('fresh-agent checkpoint availability', () => {
       server = new RustServer({
         env: {
           CODEX_CMD: fakeCodexPath,
-          CODEX_HOME: codexHome,
           FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
           FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
         },
@@ -171,7 +169,6 @@ test.describe('fresh-agent checkpoint availability', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-checkpoint-unavailable-'))
     const projectDir = path.join(sharedRoot, 'project')
     const trackedFile = path.join(projectDir, 'private-fixture.txt')
-    const codexHome = path.join(sharedRoot, 'codex-home')
     let server: RustServer | undefined
     let context: Awaited<ReturnType<typeof createFreshE2ePage>>['context'] | undefined
 
@@ -190,7 +187,6 @@ test.describe('fresh-agent checkpoint availability', () => {
       server = new RustServer({
         env: {
           CODEX_CMD: fakeCodexPath,
-          CODEX_HOME: codexHome,
           FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
           FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
         },
@@ -294,15 +290,30 @@ test.describe('fresh-agent checkpoint availability', () => {
       await expect(reloadedUserTurn.getByRole('button', { name: 'Rewind unavailable for this message' }))
         .toBeDisabled()
 
-      const threadId = content.sessionId ?? content.sessionRef?.sessionId
+      // Provider ground truth: the turn the unavailable checkpoint belongs to
+      // really ran. The fake app-server records every turn/start under the
+      // spawned server's isolated CODEX_HOME (RustServer pins it to
+      // <homeDir>/.codex), so read it there.
+      const threadId = content.sessionRef?.sessionId ?? content.sessionId
       expect(threadId).toBeTruthy()
-      const recordedTurnsPath = path.join(codexHome, 'fake-turns', `${threadId}.json`)
+      const unavailableOutcome = content.checkpointOutcomes.find((entry: any) => entry.status === 'unavailable'
+        && entry.code === 'checkpoint_path_unreadable')
+      expect(unavailableOutcome?.nativeTurnId).toEqual(expect.any(String))
+      const recordedTurnsPath = path.join(info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
       await expect.poll(async () => {
         const raw = await fs.readFile(recordedTurnsPath, 'utf8').catch(() => '[]')
-        const turns = JSON.parse(raw) as Array<{ items?: Array<{ type?: string; content?: Array<{ text?: string }> }> }>
-        return turns.some((turn) => turn.items?.some((item) => item.type === 'userMessage'
-          && item.content?.some((part) => part.text === marker)))
-      }, { timeout: 20_000 }).toBe(true)
+        const turns = JSON.parse(raw) as Array<{
+          id?: string
+          status?: string
+          items?: Array<{ type?: string; content?: Array<{ text?: string }> }>
+        }>
+        const turn = turns.find((candidate) => candidate.id === unavailableOutcome.nativeTurnId)
+        return {
+          status: turn?.status,
+          carriesMarker: turn?.items?.some((item) => item.type === 'userMessage'
+            && item.content?.some((part) => part.text === marker)) ?? false,
+        }
+      }, { timeout: 20_000 }).toEqual({ status: 'completed', carriesMarker: true })
     } finally {
       await context?.close().catch(() => {})
       await server?.stop().catch(() => {})
