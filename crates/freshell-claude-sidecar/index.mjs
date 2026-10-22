@@ -38,7 +38,8 @@
 //                                  with a send still pending) — the abort/sdk.exit requested-teardown path
 //                                  stays silent
 //     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
-//     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
+//     { type:'sdk.status',              sessionId, status }               // compacting (an ended stream sends
+//                                  no status: the server reports the session as exited)
 //     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
 //                                  (sanitized text, no [ede_diagnostic] lines); never for the user's own Stop
 //     { type:'sdk.stream.ended',        sessionId, reason, message }      // the session's SDK stream ended
@@ -379,9 +380,6 @@ async function consumeStream(sessionId, sdkQuery) {
         st.lastTurnCompleteAt = at
         emit({ type: 'sdk.turn.complete', sessionId, at })
       }
-      // Interim, until the exited status replaces it (C09): the idle status
-      // takes a compacting pane out of its busy state.
-      emit({ type: 'sdk.status', sessionId, status: 'idle' })
       // The end of the stream is the end of this sidecar (G02): report how
       // the stream ended, last, and exit, so the server's end-of-output path
       // ends the session instead of keeping a sidecar with no session.

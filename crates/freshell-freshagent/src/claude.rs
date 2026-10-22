@@ -291,6 +291,12 @@ pub struct FreshClaudeState {
     /// (idempotent in the store) even when blank settings bypass
     /// `record_binding`.
     naming_handles: Arc<TokioMutex<HashMap<String, String>>>,
+    /// Sessions whose sidecar ended unrequested (C09, G05): the end-of-output
+    /// path records each one here as it evicts it from [`Self::sessions`], so the
+    /// pane's ids still resolve to an ended session — its snapshot overlay says
+    /// `exited` and a send to it is refused visibly. Resuming or closing the
+    /// session forgets the record. See [`crate::claude_dead_sessions`].
+    dead_sessions: Arc<std::sync::Mutex<crate::claude_dead_sessions::DeadClaudeSessions>>,
 }
 
 /// Focused-ep5-r1 Finding 1: retention for demoted alias records. The
@@ -791,6 +797,7 @@ impl FreshClaudeState {
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             naming: crate::naming::NamingSink::default(),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
+            dead_sessions: Arc::default(),
             handoff_kill_pause: None,
             rollback_adopt_parked: None,
             rollback_adopt_release: None,
@@ -2667,6 +2674,10 @@ impl FreshClaudeState {
                 last_status,
             },
         );
+        // C09: a create that resumes an ended session makes it live again.
+        if let Some(sid) = resume_sid.as_deref() {
+            self.forget_dead_sessions(&[sid], "resumed");
+        }
 
         // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
         // dead-state re-check. The commit above and a kill's retire serialize
@@ -3627,6 +3638,8 @@ impl FreshClaudeState {
         // Live-state destruction begins (every durable id the one envelope
         // covers is durably closed by this point). The consumer ABORT stays
         // synchronous (the minter channel closes).
+        // C09: a closed session is not an ended one waiting to be resumed.
+        self.forget_dead_sessions(&retire_ids, "killed");
         let removed = self.sessions.lock().await.remove(&map_key);
         // The gate entry dies with the session (the map rule was the gate's
         // whole meaning; an aborted session adopts nothing more).
@@ -4471,7 +4484,7 @@ impl FreshClaudeState {
                 break handles;
             }
             if !self.rollback_in_flight.contains(&session_id) {
-                self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+                self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
                 return;
             }
             tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
@@ -4601,7 +4614,7 @@ impl FreshClaudeState {
                 }),
                 None => {
                     drop(guard);
-                    self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+                    self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
                     return;
                 }
             }
@@ -4636,7 +4649,7 @@ impl FreshClaudeState {
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
             undo_turn_op_arm(&in_turn, &turn_tracker, send_was_busy);
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
             return;
         };
         // Address the sidecar by ITS id for this session (== the map key for created
@@ -5253,24 +5266,50 @@ impl FreshClaudeState {
         Ok(snapshot)
     }
 
+    /// Test seam (`test-support`, C09 rigs): the live-state overlay the snapshot
+    /// route applies ([`Self::apply_snapshot_metadata`]), over an empty snapshot. A
+    /// rig cannot read a transcript through its server (the store root comes from
+    /// this process's environment), so it reads the overlay directly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn live_snapshot_overlay(&self, any_id: &str) -> Value {
+        let mut snapshot = json!({});
+        self.apply_snapshot_metadata(any_id, &mut snapshot).await;
+        snapshot
+    }
+
+    /// The snapshot overlay from the server's own state: the live session's status,
+    /// settings and commands, or, for a session whose sidecar ended unrequested,
+    /// `exited` with the settings and commands it last had (C09, G05). Both are
+    /// live-state truth (`statusFromLiveState`), so the client adopts the status.
+    /// An id the server holds nothing for leaves the snapshot untouched.
     pub(crate) async fn apply_snapshot_metadata(&self, any_id: &str, snapshot: &mut Value) {
-        let Some(key) = self.resolve_session_key(any_id).await else {
-            return;
+        let live = match self.resolve_session_key(any_id).await {
+            Some(key) => self.sessions.lock().await.get(&key).map(|session| {
+                let status = session.current_status();
+                let status = if status == "idle"
+                    && session.in_turn.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    "running".to_string()
+                } else {
+                    status
+                };
+                (
+                    status,
+                    session.configuration.settings.clone(),
+                    session.configuration.commands.clone(),
+                )
+            }),
+            None => None,
         };
-        let sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get(&key) else {
-            return;
+        let (status, settings, commands) = match live {
+            Some(live) => live,
+            None => match self.dead_session(any_id) {
+                Some(dead) => ("exited".to_string(), dead.settings, dead.commands),
+                None => return,
+            },
         };
-        let status = session.current_status();
-        snapshot["status"] = json!(if status == "idle"
-            && session.in_turn.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            "running".to_string()
-        } else {
-            status
-        });
+        snapshot["status"] = json!(status);
         snapshot["extensions"]["claude"]["statusFromLiveState"] = json!(true);
-        let settings = &session.configuration.settings;
         let mut fields = Map::new();
         for (key, value) in [
             ("model", &settings.model),
@@ -5284,7 +5323,7 @@ impl FreshClaudeState {
         if !fields.is_empty() {
             snapshot["settings"] = Value::Object(fields);
         }
-        if let Some(commands) = &session.configuration.commands {
+        if let Some(commands) = &commands {
             snapshot["commands"] = json!(commands);
         }
     }
@@ -5323,6 +5362,104 @@ impl FreshClaudeState {
             return false;
         };
         self.sessions.lock().await.contains_key(&key)
+    }
+
+    /// The record of the session answering to `id` whose sidecar ended unrequested
+    /// and that has not been resumed or closed since (C09, G05).
+    fn dead_session(&self, id: &str) -> Option<crate::claude_dead_sessions::DeadClaudeSession> {
+        self.dead_sessions
+            .lock()
+            .expect("dead sessions lock")
+            .find(id)
+            .cloned()
+    }
+
+    /// Record a session the end-of-output path just evicted (C09): it answers to
+    /// its map key, its envelope stamp and every durable id it held.
+    fn record_dead_session(
+        &self,
+        map_key: &str,
+        stamp: &str,
+        session_type: &str,
+        durables: &[String],
+        evicted: &ClaudeSession,
+        reason: &str,
+    ) {
+        let mut ids = vec![map_key.to_string()];
+        for id in std::iter::once(stamp)
+            .chain(durables.iter().map(String::as_str))
+            .chain(evicted.cli_session_id.as_deref())
+        {
+            if !ids.iter().any(|known| known == id) {
+                ids.push(id.to_string());
+            }
+        }
+        let dead = crate::claude_dead_sessions::DeadClaudeSession {
+            ids: ids.clone(),
+            settings: evicted.configuration.settings.clone(),
+            commands: evicted.configuration.commands.clone(),
+            reason: reason.to_string(),
+            at_ms: crate::rollback_record::now_ms(),
+        };
+        let (dropped, remembered) = {
+            let mut store = self.dead_sessions.lock().expect("dead sessions lock");
+            let dropped = store.record(dead);
+            (dropped, store.len())
+        };
+        tracing::info!(target: "freshell_freshagent::claude",
+            provider = PROVIDER, session_id = %stamp, session_type = %session_type,
+            ids = ?ids, reason, remembered,
+            "freshagent.claude.dead_session_recorded");
+        if let Some(dropped) = dropped {
+            tracing::info!(target: "freshell_freshagent::claude",
+                provider = PROVIDER, ids = ?dropped.ids, died_at_ms = dropped.at_ms,
+                cap = crate::claude_dead_sessions::DEAD_SESSIONS_CAP,
+                "freshagent.claude.dead_session_dropped");
+        }
+    }
+
+    /// Forget the dead-session records answering to any of `ids`: the session is
+    /// live again (`resumed`) or the pane closed it (`killed`).
+    fn forget_dead_sessions<S: AsRef<str>>(&self, ids: &[S], reason: &'static str) {
+        let forgotten = self
+            .dead_sessions
+            .lock()
+            .expect("dead sessions lock")
+            .forget(ids);
+        if forgotten > 0 {
+            let ids: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
+            tracing::info!(target: "freshell_freshagent::claude",
+                provider = PROVIDER, ids = ?ids, reason, forgotten,
+                "freshagent.claude.dead_session_forgotten");
+        }
+    }
+
+    /// A send whose session is not live (C09, G05). A send to a dead session is
+    /// refused visibly: the lost-session frame for the id the pane sent (the
+    /// client starts its recovery from it) and a request error that hands the
+    /// message back to the composer. Until the transparent resume (C20) it is
+    /// never accepted. Any other id keeps the `SESSION_NOT_FOUND` request error.
+    fn refuse_send_to_missing_session(
+        &self,
+        request_id: &Option<String>,
+        session_id: &str,
+        session_type: SessionType,
+    ) {
+        let Some(dead) = self.dead_session(session_id) else {
+            self.send_error(request_id, "SESSION_NOT_FOUND", "claude session not found");
+            return;
+        };
+        tracing::warn!(target: "freshell_freshagent::claude",
+            provider = PROVIDER, session_id = %session_id,
+            session_type = session_type_str(session_type), request_id = ?request_id,
+            reason = %dead.reason, died_at_ms = dead.at_ms,
+            "freshagent.claude.send_to_dead_session");
+        self.broadcast(&lost_session_frame(session_id, session_type));
+        self.send_request_error(
+            request_id,
+            ErrorCode::InvalidSessionId,
+            crate::claude_dead_sessions::SEND_TO_DEAD_SESSION_MESSAGE,
+        );
     }
 
     pub(crate) async fn local_snapshot_owner(
@@ -7428,6 +7565,8 @@ impl FreshClaudeState {
             .lock()
             .await
             .insert(durable.to_string(), msg.session_id.clone());
+        // C09: the session is live again, so it is no longer an ended one.
+        self.forget_dead_sessions(&[msg.session_id.as_str(), durable], "resumed");
         // Test seam (Task 6 round-3 review I-1): park with the target
         // session REGISTERED (map + cli_index) but the resume unreturned —
         // the fresh-arm target-spawn-window abort test's deterministic
@@ -7547,13 +7686,22 @@ impl FreshClaudeState {
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
+        self.send_request_error(
+            request_id,
+            ErrorCode::InternalError,
+            &format!("{code}: {message}"),
+        );
+    }
+
+    /// A top-level `error` frame correlated to `request_id`.
+    fn send_request_error(&self, request_id: &Option<String>, code: ErrorCode, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
             provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
-            code: ErrorCode::InternalError,
-            message: format!("{code}: {message}"),
+            code,
+            message: message.to_string(),
             timestamp: now_iso(),
             actual_session_ref: None,
             expected_session_ref: None,
@@ -8916,6 +9064,23 @@ impl FreshClaudeState {
                         "freshclaude/consumer-exit",
                     );
                 }
+                let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                // G05 (C09): the ended session stays known as ended — its ids
+                // resolve to a dead record, not to nothing. Recorded before the
+                // reap's wait, so a resume that lands meanwhile forgets it.
+                let reason = stream_ended
+                    .as_ref()
+                    .map_or(crate::claude_sidecar_exit::PROCESS_ENDED_REASON, |ended| {
+                        ended.reason.as_str()
+                    });
+                state.record_dead_session(
+                    &session_id,
+                    &stamp,
+                    &session_type,
+                    &removed_durables,
+                    &evicted,
+                    reason,
+                );
                 // Reap the sidecar for its exit status: the cause of a death that
                 // reported no stream end, and no zombie left behind.
                 let status = crate::claude_sidecar_exit::reap(&mut evicted.child).await;
@@ -8929,7 +9094,6 @@ impl FreshClaudeState {
                 // UNREQUESTED-end only: `handle_kill`/`shutdown`/attach-teardown all
                 // remove the map entry (and abort this consumer) first, so nothing is
                 // evicted here and it stays silent.
-                let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                 let rings = crate::claude_sidecar_exit::death_rings(turn_was_in_flight, &cause);
                 tracing::warn!(target: "freshell_freshagent::claude",
                     provider = PROVIDER,
@@ -8941,6 +9105,17 @@ impl FreshClaudeState {
                     turn_in_flight = turn_was_in_flight,
                     rings,
                     "freshagent.claude.sidecar_exit");
+                // G05: every pane learns the session exited — a compacting or
+                // running pane stops being busy and offers Resume — unless a
+                // resume already brought it back during the reap.
+                if state.dead_session(&stamp).is_some() {
+                    state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: crate::claude_dead_sessions::exited_status_event(&stamp),
+                        provider: PROVIDER.to_string(),
+                        session_id: stamp.clone(),
+                        session_type: session_type.clone(),
+                    }));
+                }
                 state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
                     event: crate::claude_sidecar_exit::sidecar_exited_event(&stamp, &cause),
                     provider: PROVIDER.to_string(),
@@ -20897,6 +21072,114 @@ rl.on('line', (line) => {
         assert!(
             !st.sessions.lock().await.contains_key(&session_id),
             "dead session must still be evicted from the sessions map"
+        );
+    }
+
+    /// C09: crash the session's sidecar (an unrequested death, not `handle_kill`)
+    /// and wait for its exit report. Returns the session's map key.
+    async fn crash_a_new_session(
+        st: &FreshClaudeState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        request_id: &str,
+    ) -> String {
+        st.handle_create(dedup_create_msg(request_id), None).await;
+        let created = await_claude_created_and_session_init(rx, request_id).await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&session_id)
+            .expect("live session in map")
+            .child
+            .start_kill()
+            .expect("kill the sidecar");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let frame: Value = match rx.recv().await {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
+                if frame["event"]["code"] == "SIDECAR_EXITED" {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the death is reported");
+        session_id
+    }
+
+    /// C09: once an ended session is resumed (here by an attach, the reload and
+    /// reconnect path) it is live again, so none of its ids may still read as
+    /// ended — not even the old pane id the resumed session no longer uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_dead_session_no_longer_reads_as_ended() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        // The fake sidecar's session reports this durable id.
+        const DURABLE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let (st, mut rx) = state_with_bus();
+        let old_pane_id = crash_a_new_session(&st, &mut rx, "req-dead-resume").await;
+        for id in [old_pane_id.as_str(), DURABLE] {
+            assert_eq!(
+                st.live_snapshot_overlay(id).await["status"],
+                "exited",
+                "{id} reads as ended after the crash"
+            );
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        st.handle_attach(attach_msg_with_resume("pane-after-reload", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert!(st.has_live_session(DURABLE).await, "the attach resumed it");
+
+        assert_ne!(st.live_snapshot_overlay(DURABLE).await["status"], "exited");
+        assert_eq!(
+            st.live_snapshot_overlay(&old_pane_id).await,
+            json!({}),
+            "the old pane id no longer names an ended session"
+        );
+    }
+
+    /// C09: closing an ended session forgets it: its snapshot no longer says
+    /// `exited`, and a later send is an ordinary unknown-session refusal, not the
+    /// ended session's lost frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_dead_session_forgets_it() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let pane_id = crash_a_new_session(&st, &mut rx, "req-dead-close").await;
+        assert_eq!(st.live_snapshot_overlay(&pane_id).await["status"], "exited");
+
+        st.handle_kill(kill_msg(&pane_id)).await;
+        assert_eq!(st.live_snapshot_overlay(&pane_id).await, json!({}));
+
+        while rx.try_recv().is_ok() {}
+        let mut send = send_msg(&pane_id, "after the close");
+        send.request_id = Some("send-after-close".into());
+        st.handle_send(send).await;
+        let mut frames = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            frames.push(serde_json::from_str::<Value>(&raw).unwrap());
+        }
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame["event"]["code"] != "INVALID_SESSION_ID"),
+            "no lost frame for a closed session: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|frame| frame["type"] == "error"
+                && frame["requestId"] == "send-after-close"
+                && frame["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("SESSION_NOT_FOUND"))),
+            "the send is refused as unknown: {frames:?}"
         );
     }
 

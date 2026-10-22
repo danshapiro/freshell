@@ -76,6 +76,24 @@ describe('the sidecar exits when its SDK stream ends', () => {
     // Interim (until Rust mints every edge, C18): the sidecar still rings the
     // result-less turn end, once.
     expect(framesOf(sidecar, 'sdk.turn.complete')).toHaveLength(1)
+    // No stream-end idle: the server reports the ended session as `exited` (C09).
+    expect(framesOf(sidecar, 'sdk.status').filter((frame) => frame.status === 'idle')).toEqual([])
+  })
+
+  it('a CLI crash mid-compaction ends with no status after compacting: the server reports exited', async () => {
+    const sidecar = await startRealSidecar()
+    const sessionId = await bootedSession(sidecar)
+    sidecar.send({ type: 'send', sessionId, text: 'something to compact' })
+    await sidecar.waitFor('sdk.turn.complete')
+    sidecar.send({ type: 'send', sessionId, text: '/compact HANG' })
+    await sidecar.waitFor('sdk.status')
+    expect(framesOf(sidecar, 'sdk.status').at(-1)).toMatchObject({ status: 'compacting' })
+    // Kill the (stand-in) CLI, not the sidecar.
+    process.kill((await sidecar.waitForBoot()).cliPid, 'SIGKILL')
+
+    expect(await sidecar.waitExit()).toEqual({ code: STREAM_ENDED_EXIT_CODE, signal: null })
+    expect(sidecar.frames.at(-1)).toMatchObject({ type: 'sdk.stream.ended', sessionId, reason: 'cli_exited' })
+    expect(framesOf(sidecar, 'sdk.status').map((frame) => frame.status)).toEqual(['compacting'])
   })
 
   it('a natural end of stream mid-turn (the CLI exits 0): sdk.stream.ended (stream_eof) and exit code 3', async () => {

@@ -520,6 +520,15 @@ function getEffectiveFreshAgentPermissionMode(content: FreshAgentPaneContent): s
   return content.provider === 'opencode' ? undefined : content.permissionMode
 }
 
+/**
+ * Why a send was refused, from its request error's message: the reason alone,
+ * without the `CODE: ` prefix some server errors carry.
+ */
+function sendFailureReason(message: unknown): string {
+  const text = typeof message === 'string' ? message.trim() : ''
+  return text.replace(/^[A-Z][A-Z0-9_]+:\s*/, '') || 'the server refused it'
+}
+
 function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
@@ -3107,6 +3116,7 @@ export function FreshAgentView({
         // the three leaks a failed send otherwise leaves behind -- the
         // pending-metadata entry, the stale local echo (dual-write), and the
         // optimistic `running` status.
+        const failedText = pendingSendMetadataRef.current.get(failedRequestId)?.text
         pendingSendMetadataRef.current.delete(failedRequestId)
         if (outgoingTurnRef.current?.requestId === failedRequestId) {
           outgoingTurnRef.current = null
@@ -3117,6 +3127,19 @@ export function FreshAgentView({
         }
         if (current.provider === 'opencode' && current.status === 'running') {
           dispatch(mergePaneContent({ tabId, paneId, updates: { status: 'idle' } }))
+        }
+        // G05 (C09): a claude send the server refused was never sent — for
+        // example its session ended — so the text goes back into the
+        // composer with the reason instead of vanishing with the echo.
+        if (current.provider === 'claude' && failedText) {
+          composerRef.current?.restoreText(failedText)
+          setNotice(`Message not sent: ${sendFailureReason(message.message)}`)
+          log.warn('fresh_agent.send_refused', {
+            provider: current.provider,
+            sessionType: current.sessionType,
+            sessionId: current.sessionId,
+            code: typeof message.code === 'string' ? message.code : undefined,
+          })
         }
         return
       }
@@ -3955,6 +3978,14 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // The durable conversation an ended session's Resume reopens (triggerRecovery
+  // resolves the same id): codex threads, and claude/kilroy sessions whose
+  // sidecar died (G05).
+  const endedSessionResumeId = paneContent.provider === 'codex'
+    ? getCanonicalCodexResumeSessionId(paneContent)
+    : paneContent.provider === 'claude'
+      ? getCanonicalDurableSessionId(claudeSession) ?? getCanonicalPaneResumeSessionId(paneContent)
+      : undefined
   isBusyRef.current = isBusy
   // kata 1wxv: snapshot-stamped rollback capabilities drive every client affordance
   // (per-turn icon, slash/menus, the pre-flight gate). Legacy servers emit neither
@@ -4621,9 +4652,7 @@ export function FreshAgentView({
                 <div className="fresh-agent-session-ended-card flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
                   <div className="flex flex-wrap gap-2">
-                    {paneContent.provider === 'codex'
-                      && effectiveStatus === 'exited'
-                      && getCanonicalCodexResumeSessionId(paneContent) ? (
+                    {effectiveStatus === 'exited' && endedSessionResumeId ? (
                         <button
                           type="button"
                           className="fresh-agent-session-ended-action rounded border border-border/70 px-2 py-1 text-xs"
@@ -4883,6 +4912,7 @@ export function FreshAgentView({
     claudeSession?.restoreFailureMessage,
     activeStyle,
     composerDisabled,
+    endedSessionResumeId,
     contextUsage,
     descriptor?.icon,
     descriptor?.label,

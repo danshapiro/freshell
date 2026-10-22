@@ -9970,6 +9970,111 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.recovery.stop' }))
   })
 
+  // G05 (core-runtime design §8, C09): the server reports an ended claude
+  // session (its sidecar died) as `exited`, even in the middle of a /compact.
+  it.each(['freshclaude', 'kilroy'] as const)('offers Resume for an ended %s session, even mid-compaction, and resumes the same durable conversation', async (sessionType) => {
+    const store = createStore()
+    const durable = '7f3c1e2a-9b4d-4c8e-a1f0-2d6e5b7c9a10'
+    const locator = { sessionId: `${sessionType}-pane-exited`, sessionType, provider: 'claude' as const }
+    store.dispatch(sessionInit({ ...locator, cliSessionId: durable }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        ...locator,
+        createRequestId: `req-${sessionType}-exited`,
+        sessionRef: { provider: 'claude', sessionId: durable },
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.status', sessionId: locator.sessionId, status: 'compacting' } }))
+    expect(screen.queryByRole('button', { name: 'Resume session' })).not.toBeInTheDocument()
+
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.status', sessionId: locator.sessionId, status: 'exited' } }))
+    const resume = await screen.findByRole('button', { name: 'Resume session' })
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    await waitFor(() => expect(getFreshAgentPaneContent(store).status).toBe('exited'))
+
+    wsMock.send.mockClear()
+    fireEvent.click(resume)
+    await waitFor(() => {
+      const pane = getFreshAgentPaneContent(store)
+      expect(pane.status).toBe('creating')
+      expect(pane.sessionId).toBeUndefined()
+      expect(pane.sessionRef).toEqual({ provider: 'claude', sessionId: durable })
+      expect(pane.resumeSessionId).toBe(durable)
+      expect(pane.sessionType).toBe(sessionType)
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+  })
+
+  // C09: a claude send the server refuses (the session ended, or anything
+  // else) was never sent, so its text goes back into the composer with the
+  // reason, instead of vanishing with the local echo.
+  it.each([
+    ['freshclaude', 'INVALID_SESSION_ID', 'The Claude agent process for this session exited. Resume the session to continue.',
+      'The Claude agent process for this session exited. Resume the session to continue.'],
+    ['kilroy', 'INTERNAL_ERROR', 'SESSION_NOT_FOUND: claude session not found', 'claude session not found'],
+  ] as const)('puts a refused %s send back into the composer and says why (%s)', async (sessionType, code, message, reason) => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true },
+      turns: [],
+    })
+    const durable = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType,
+        provider: 'claude',
+        createRequestId: `req-${sessionType}-refused`,
+        sessionId: `${sessionType}-pane-refused`,
+        sessionRef: { provider: 'claude', sessionId: durable },
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    fireEvent.change(composer, { target: { value: 'please keep this' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.send').some((frame) => frame.text === 'please keep this')).toBe(true)
+    })
+    const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(composer).toHaveValue('')
+
+    act(() => {
+      onMessage?.({ type: 'error', code, message, requestId: sendFrame?.requestId, timestamp: new Date().toISOString() })
+    })
+
+    await waitFor(() => expect(composer).toHaveValue('please keep this'))
+    expect(screen.getByText(`Message not sent: ${reason}`)).toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+  })
+
   it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))

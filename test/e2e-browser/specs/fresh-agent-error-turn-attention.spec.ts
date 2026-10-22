@@ -25,7 +25,7 @@
 //      unit-pinned; e2e asserts the fold partition);
 //   5. a mid-turn end of the SDK stream (the finally-minted edge, then
 //      sdk.stream.ended and the sidecar's exit) rings exactly one edge,
-//      resolves the pane to idle, reports the exit (SIDECAR_EXITED), and the
+//      resolves the pane to exited, reports the exit (SIDECAR_EXITED), and the
 //      sidecar process is gone: a stream end is a session end (G02), and the
 //      server does not ring a second time for the reported end.
 //
@@ -53,6 +53,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -125,6 +126,87 @@ function findFreshAgentLeaf(node: any): any {
     }
   }
   return null
+}
+
+/**
+ * Boot a server whose claude sidecar is the PRODUCTION sidecar over the CLI
+ * simulator (with its ledger, and `extraEnv` such as a simulator program), and
+ * open a freshclaude or kilroy pane on its boot tab.
+ */
+async function bootProductionClaudePane(
+  page: Page,
+  flavour: 'freshclaude' | 'kilroy',
+  rootPrefix: string,
+  extraEnv: Record<string, string> = {},
+) {
+  const label = flavour === 'kilroy' ? 'Kilroy' : 'Freshclaude'
+  const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), `${rootPrefix}-${flavour}-`))
+  const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
+  let server: RustServer | undefined
+  const stop = async () => {
+    await server?.stop().catch(() => {})
+    await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+  }
+  try {
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    server = new RustServer({
+      env: {
+        FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR,
+        FRESHELL_CLAUDE_NODE: process.execPath,
+        FRESHELL_CLAUDE_SDK_QUERY_MODULE: CLAUDE_CLI_SIMULATOR,
+        FRESHELL_CLAUDE_SIM_LEDGER: simLedger,
+        // Kilroy is behind its feature flag.
+        ...(flavour === 'kilroy' ? { KILROY_ENABLED: '1' } : {}),
+        ...extraEnv,
+      },
+      setupHome: async (homeDir) => {
+        const freshellDir = path.join(homeDir, '.freshell')
+        await fs.mkdir(freshellDir, { recursive: true })
+        await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+          version: 1,
+          settings: {
+            codingCli: { enabledProviders: ['claude'] },
+            freshAgent: { enabled: true },
+          },
+        }, null, 2))
+      },
+    })
+    const info = await server.start()
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const harness = new TestHarness(page)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'connection/setAvailableClis',
+        payload: { claude: true },
+      })
+    })
+    const picker = await openPanePicker(page)
+    await picker.getByRole('button', { name: new RegExp(`^${label}$`, 'i') }).click({ force: true })
+    const directoryInput = page.getByLabel(new RegExp(`^Starting directory for ${label}$`, 'i'))
+    await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+    await directoryInput.fill(projectDir)
+    await directoryInput.press('Enter')
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+    await expect(paneRoot).toBeVisible({ timeout: 15_000 })
+    const tabA = (await harness.getActiveTabId())!
+    expect(tabA).toBeTruthy()
+    const paneId: string = await expect.poll(async () => {
+      const layout = await harness.getPaneLayout(tabA)
+      return findFreshAgentLeaf(layout)?.id ?? null
+    }, { timeout: 15_000 }).not.toBeNull().then(async () => {
+      const layout = await harness.getPaneLayout(tabA)
+      return findFreshAgentLeaf(layout).id as string
+    })
+    return { harness, simLedger, projectDir, paneRoot, tabA, paneId, stop }
+  } catch (error) {
+    await stop()
+    throw error
+  }
 }
 
 test.describe('fresh-agent error-turn attention (unified needs-attention signal)', () => {
@@ -377,8 +459,8 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
         .poll(async () => {
           const layout = await harness.getPaneLayout(tabA)
           return findFreshAgentLeaf(layout)?.content?.status ?? null
-        }, { timeout: 30_000, message: 'the pane resolves to idle after the stream ends' })
-        .toBe('idle')
+        }, { timeout: 30_000, message: 'the pane reads as ended (exited, not busy) after the stream ends' })
+        .toBe('exited')
       // The server reported the sidecar's exit to the pane.
       await expect
         .poll(async () => {
@@ -430,67 +512,10 @@ test.describe('fresh-agent user Stop on the production claude sidecar', () => {
   test.setTimeout(180_000)
 
   for (const flavour of ['freshclaude', 'kilroy'] as const) {
-    const label = flavour === 'kilroy' ? 'Kilroy' : 'Freshclaude'
-
     test(`${flavour}: a user Stop rings nothing, marks nothing and shows no error banner; the next turn still rings`, async ({ page }) => {
-      const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), `freshell-user-stop-${flavour}-`))
-      const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
-      let server: RustServer | undefined
+      const lane = await bootProductionClaudePane(page, flavour, 'freshell-user-stop')
+      const { harness, simLedger, paneRoot, tabA, paneId } = lane
       try {
-        const projectDir = path.join(sharedRoot, 'project')
-        await fs.mkdir(projectDir, { recursive: true })
-        server = new RustServer({
-          env: {
-            FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR,
-            FRESHELL_CLAUDE_NODE: process.execPath,
-            FRESHELL_CLAUDE_SDK_QUERY_MODULE: CLAUDE_CLI_SIMULATOR,
-            FRESHELL_CLAUDE_SIM_LEDGER: simLedger,
-            // Kilroy is behind its feature flag.
-            ...(flavour === 'kilroy' ? { KILROY_ENABLED: '1' } : {}),
-          },
-          setupHome: async (homeDir) => {
-            const freshellDir = path.join(homeDir, '.freshell')
-            await fs.mkdir(freshellDir, { recursive: true })
-            await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
-              version: 1,
-              settings: {
-                codingCli: { enabledProviders: ['claude'] },
-                freshAgent: { enabled: true },
-              },
-            }, null, 2))
-          },
-        })
-        const info = await server.start()
-        await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-        const harness = new TestHarness(page)
-        await harness.waitForHarness()
-        await harness.waitForConnection()
-
-        await page.evaluate(() => {
-          window.__FRESHELL_TEST_HARNESS__?.dispatch({
-            type: 'connection/setAvailableClis',
-            payload: { claude: true },
-          })
-        })
-        const picker = await openPanePicker(page)
-        await picker.getByRole('button', { name: new RegExp(`^${label}$`, 'i') }).click({ force: true })
-        const directoryInput = page.getByLabel(new RegExp(`^Starting directory for ${label}$`, 'i'))
-        await expect(directoryInput).toBeVisible({ timeout: 15_000 })
-        await directoryInput.fill(projectDir)
-        await directoryInput.press('Enter')
-
-        const paneRoot = page.locator('[data-context="fresh-agent"]').last()
-        await expect(paneRoot).toBeVisible({ timeout: 15_000 })
-        const tabA = (await harness.getActiveTabId())!
-        expect(tabA).toBeTruthy()
-        const paneId: string = await expect.poll(async () => {
-          const layout = await harness.getPaneLayout(tabA)
-          return findFreshAgentLeaf(layout)?.id ?? null
-        }, { timeout: 15_000 }).not.toBeNull().then(async () => {
-          const layout = await harness.getPaneLayout(tabA)
-          return findFreshAgentLeaf(layout).id as string
-        })
-
         const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
         const sendButton = paneRoot.getByRole('button', { name: 'Send' })
         const stopButton = paneRoot.getByRole('button', { name: 'Stop' })
@@ -578,8 +603,122 @@ test.describe('fresh-agent user Stop on the production claude sidecar', () => {
           .toBe(true)
         await expect(errorBanner, 'still no error banner after the next turn').toHaveCount(0)
       } finally {
-        await server?.stop().catch(() => {})
-        await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+        await lane.stop()
+      }
+    })
+  }
+})
+
+/**
+ * The simulated CLI dies (SIGKILL, T14) 3s into a CRASH_NOW turn: the window
+ * in which the lane moves the user to another tab.
+ */
+const CRASH_PROGRAM = {
+  rules: [
+    {
+      on: 'msg:prompt',
+      match: { text: 'CRASH_NOW' },
+      emit: [
+        { kind: 'text', data: { text: 'working on it' } },
+        { kind: 'crash', delayMs: 3_000 },
+      ],
+    },
+  ],
+}
+
+// G05 (core-runtime design §8 and §11.6, C09): a sidecar that dies under a
+// turn the user is not watching rings once, highlights the tab, and leaves the
+// pane ended with Resume; Resume brings the same conversation back in place,
+// with no page reload, and it takes the next message.
+test.describe('fresh-agent crash on the production claude sidecar', () => {
+  test.setTimeout(180_000)
+
+  for (const flavour of ['freshclaude', 'kilroy'] as const) {
+    test(`${flavour}: a background crash rings once and highlights the tab; Resume restores the conversation with no reload`, async ({ page }) => {
+      const lane = await bootProductionClaudePane(page, flavour, 'freshell-crash-resume', {
+        FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify(CRASH_PROGRAM),
+      })
+      const { harness, simLedger, paneRoot, tabA } = lane
+      try {
+        const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+        const sendButton = paneRoot.getByRole('button', { name: 'Send' })
+        const tabALocator = page.locator(`[data-context="tab"][data-tab-id="${tabA}"]`)
+        const paneLeaf = async () => findFreshAgentLeaf(await harness.getPaneLayout(tabA))
+        const paneStatus = () => expect.poll(async () => (await paneLeaf())?.content?.status ?? null, { timeout: 30_000 })
+        const turnCompletionState = () => harness.getState().then((s: any) => s?.turnCompletion ?? {})
+
+        await paneStatus().toMatch(/^(connected|idle)$/)
+        // A first turn, watched, so the conversation has history to restore.
+        await composer.fill('remember this line')
+        await sendButton.click()
+        await expect
+          .poll(async () => (await turnCompletionState()).seq ?? 0,
+            { timeout: 30_000, message: 'the first turn rings (seq 1)' })
+          .toBe(1)
+        await paneStatus().toBe('idle')
+        const durable: string = await expect.poll(async () => (await paneLeaf())?.content?.sessionRef?.sessionId ?? null,
+          { timeout: 30_000 }).not.toBeNull().then(async () => (await paneLeaf()).content.sessionRef.sessionId as string)
+        // A reload would wipe this marker: Resume must restore in place.
+        await page.evaluate(() => { (window as any).__freshellNoReloadMarker = 'crash-resume-lane' })
+
+        // ── The crash, while the user is in another tab ───────────────────
+        await composer.fill('CRASH_NOW')
+        await sendButton.click()
+        await page.getByRole('button', { name: 'New shell tab' }).click()
+        await harness.waitForTabCount(2)
+        const tabB = (await harness.getActiveTabId())!
+        expect(tabB).not.toBe(tabA)
+
+        await expect
+          .poll(async () => (await turnCompletionState()).seq ?? 0,
+            { timeout: 30_000, message: 'the crashed turn rings exactly once (seq 2)' })
+          .toBe(2)
+        await expect
+          .poll(async () => (await turnCompletionState()).attentionByTab?.[tabA] ?? null,
+            { timeout: 15_000, message: 'the crash highlights the background tab' })
+          .toBe(true)
+        await expect(tabALocator, 'the background tab carries the attention highlight').toHaveClass(/bg-emerald-100/)
+        await paneStatus().toBe('exited')
+        // One ring only, stable across a settle window.
+        await page.waitForTimeout(1_500)
+        expect((await turnCompletionState()).seq).toBe(2)
+
+        // ── Back on the tab: ended, with Resume ──────────────────────────
+        await tabALocator.click()
+        await expect(paneRoot.getByText('This session has ended')).toBeVisible({ timeout: 15_000 })
+        await expect(composer, 'nothing can be typed into an ended session').toBeDisabled()
+        const resume = paneRoot.getByRole('button', { name: 'Resume session' })
+        await expect(resume).toBeVisible()
+        await resume.click()
+
+        // The same durable conversation boots again (a resume, not a new session)...
+        await expect
+          .poll(() => readJsonl(simLedger).filter((row) => row.kind === 'query' && row.options?.resume === durable).length,
+            { timeout: 30_000, message: 'Resume boots the CLI with resume: <the durable id>' })
+          .toBe(1)
+        await paneStatus().toMatch(/^(connected|idle)$/)
+        expect((await paneLeaf())?.content?.sessionRef?.sessionId, 'the pane keeps its durable id').toBe(durable)
+        await expect(paneRoot.getByText('This session has ended')).toHaveCount(0)
+        // ...shows the conversation it had, and the page never reloaded.
+        await expect(paneRoot).toContainText('remember this line', { timeout: 30_000 })
+        expect(await page.evaluate(() => (window as any).__freshellNoReloadMarker), 'Resume must not reload the page')
+          .toBe('crash-resume-lane')
+
+        // The resumed session takes the next message and rings for it.
+        await expect(composer).toBeEnabled({ timeout: 15_000 })
+        await composer.fill('after the resume')
+        await sendButton.click()
+        await expect
+          .poll(() => readJsonl(simLedger).filter((row) => row.kind === 'prompt').map((row) => String(row.text ?? '')),
+            { timeout: 30_000, message: 'the resumed CLI ran the next prompt' })
+          .toContain('after the resume')
+        await expect
+          .poll(async () => (await turnCompletionState()).seq ?? 0,
+            { timeout: 30_000, message: 'the resumed session\'s turn rings (seq 3)' })
+          .toBe(3)
+        await paneStatus().toBe('idle')
+      } finally {
+        await lane.stop()
       }
     })
   }

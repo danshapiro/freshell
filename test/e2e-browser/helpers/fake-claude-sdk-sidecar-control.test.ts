@@ -451,6 +451,11 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       expect(out.filter((o) => o.type === 'sdk.turn.complete'), 'exactly the result-less turn end rings').toHaveLength(1)
       expect(out.filter((o) => o.type === 'sdk.result'), 'the turn ended with no result').toEqual([])
       expect(out.filter((o) => o.type === 'sdk.error'), 'the end report carries the cause; no error frame repeats it').toEqual([])
+      const edgeIdx = out.findIndex((o) => o.type === 'sdk.turn.complete')
+      expect(
+        out.slice(edgeIdx).filter((o) => o.type === 'sdk.status'),
+        'no stream-end status: the server reports the ended session as exited',
+      ).toEqual([])
     } finally {
       await fx.stop()
     }

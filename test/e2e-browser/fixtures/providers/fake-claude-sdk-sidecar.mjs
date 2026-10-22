@@ -81,7 +81,7 @@
 // interrupt never rings).
 // The `stream-error` lane models the real sidecar's end of stream (its
 // consumeStream finally): cancel the parked cards, the finally-minted edge for
-// a turn that ends with no result, the stream-end idle, then
+// a turn that ends with no result, then
 // `sdk.stream.ended {reason, message}` as the LAST line and exit code 3 (each
 // sidecar hosts one session, so its stream's end is the sidecar's end). The
 // Rust server reports the exit (SIDECAR_EXITED) and, because the end was
@@ -313,8 +313,9 @@ async function render(event) {
       // The real sidecar's end of stream (index.mjs consumeStream finally):
       // cancel every parked entry, mint the unified attention edge (a turn
       // ended with NO result frame: pendingResults > 0; a pending Stop mark
-      // never silences a result-less end), the stream-end idle, then
-      // sdk.stream.ended as the LAST line and exit code 3. The separate
+      // never silences a result-less end), then sdk.stream.ended as the LAST
+      // line and exit code 3 (no stream-end status: the server reports the
+      // ended session as exited). The separate
       // `crash` lane deliberately stays different: no protocol frame + exit.
       const st = sessions.get(sessionId)
       if (st) {
@@ -332,7 +333,6 @@ async function render(event) {
           emit({ type: 'sdk.turn.complete', sessionId, at })
         }
       }
-      emit({ type: 'sdk.status', sessionId, status: 'idle' })
       if (st) sessions.delete(sessionId)
       emit({
         type: 'sdk.stream.ended',

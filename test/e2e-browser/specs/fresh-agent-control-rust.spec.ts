@@ -22,9 +22,10 @@
  *     `/session/:id/fork` ({messageID}); per lane: (a) source unchanged after
  *     fork + parent kill, (b) the child's history stops at the fork point,
  *     (c) the child is durable across reload AND a server restart.
- *   AGENT-24 (kilroy parity): full lifecycle (KILROY_ENABLED=1 gate), crash
- *     mid-turn + restart recovery on the SAME durable id, never a fabricated
- *     completion.
+ *   AGENT-24 (kilroy parity): full lifecycle (KILROY_ENABLED=1 gate), a crash
+ *     mid-turn in a background tab (one server ring, the highlight, then
+ *     Resume with no reload) + restart recovery on the SAME durable id, never
+ *     a fabricated completion.
  *   Plus the capability-gate pin: /fork is NOT offered for claude/kilroy
  *     (snapshot capabilities.fork=false) — so AGENT-05/06 surfaces never
  *     expose a fork affordance that would hit the refusal table.
@@ -210,9 +211,11 @@ const CLAUDE_PROGRAM = {
       ],
     },
     {
+      // The 3s delay is the window in which the crash lane moves the user to
+      // another tab, so the crash ends a turn nobody is watching.
       on: 'msg:send',
       match: { text: 'CRASH_NOW' },
-      emit: [{ kind: 'crash', delayMs: 20, data: { code: 1 } }],
+      emit: [{ kind: 'crash', delayMs: 3_000, data: { code: 1 } }],
     },
   ],
 }
@@ -1248,46 +1251,69 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
     }
   })
 
-  test('kilroy crash mid-turn + restart recover the SAME durable session, never a fabricated completion', async ({ page }) => {
+  test('kilroy crash mid-turn in the background: one ring, Resume (no reload) and restart recover the SAME durable session', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       const durableBefore = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const tabLocator = page.locator(`[data-context="tab"][data-tab-id="${lane.tabId}"]`)
+      const turnCompletion = async () => ((await lane.harness.getState()) as any)?.turnCompletion ?? {}
+      const seqBefore = (await turnCompletion()).seq ?? 0
+      // A page reload would wipe this marker: Resume must restore the
+      // conversation in place.
+      await page.evaluate(() => { (window as any).__freshellNoReloadMarker = 'kilroy-crash-lane' })
 
-      // Crash mid-turn: the fixture exits(1) with no protocol frames.
+      // Crash mid-turn while the user is in another tab: the fixture
+      // exits(1) with no protocol frames (a Node death), 3s after the send.
       await sendComposerText(page, 'CRASH_NOW')
+      await page.getByRole('button', { name: 'New shell tab' }).click()
+      await lane.harness.waitForTabCount(2)
       await waitForLogEntry(
         lane.eventsLog,
         (e) => e.kind === 'crash',
         'fixture crash event',
       )
-      // The SIDECAR_EXITED edge is user-visible (never a fabricated turn).
-      await expect(
-        page.getByRole('alert').filter({ hasText: 'exited unexpectedly' }),
-        'the sidecar death must surface as a visible banner',
-      ).toBeVisible({ timeout: 30_000 })
-      // Ground truth: the crashed turn produced NO completion event.
+      // The server rings the lost turn exactly once (G05: a crash is a turn
+      // end the user did not witness) and the background tab is highlighted.
+      await expect
+        .poll(async () => (await turnCompletion()).seq ?? 0,
+          { timeout: 30_000, message: 'the crashed turn rings exactly one event' })
+        .toBe(seqBefore + 1)
+      expect((await turnCompletion()).attentionByTab?.[lane.tabId], 'the crash highlights the tab').toBe(true)
+      await expect(tabLocator, 'the background tab carries the attention highlight').toHaveClass(/bg-emerald-100/)
+      // Ground truth: the fixture fabricated no completion; the one ring is
+      // the server's for the dead sidecar.
       expect(
         readJsonl(lane.eventsLog).filter((e) => e.kind === 'completion'),
         'no completion may be fabricated for the crashed turn',
       ).toEqual([])
 
-      // Recovery via reload: the same durable session re-attaches (the durable
-      // transcript the fixture wrote makes resume possible).
-      await flushPersistence(page)
-      await page.reload({ waitUntil: 'domcontentloaded' })
-      await waitForWsReady(page)
-      const harness2 = new TestHarness(page)
-      await harness2.waitForHarness()
-      await harness2.waitForConnection()
-      const tabId2 = (await harness2.getActiveTabId())!
-      expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      // Back on the tab: the session reads as ended, with Resume, and the
+      // composer is disabled (nothing typed there could be lost).
+      await tabLocator.click()
+      await expect(
+        page.getByRole('alert').filter({ hasText: 'exited unexpectedly' }),
+        'the sidecar death must surface as a visible banner',
+      ).toBeVisible({ timeout: 30_000 })
+      await expect(paneRoot.getByText('This session has ended')).toBeVisible({ timeout: 30_000 })
+      await waitForPaneStatus(lane.harness, lane.tabId, 'exited')
+      await expect(paneRoot.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+
+      // Resume reopens the SAME durable session in place, with no reload.
+      await paneRoot.getByRole('button', { name: 'Resume session' }).click()
       await waitForLogEntry(
         lane.eventsLog,
         (e) => e.kind === 'resume' && e.data?.id === durableBefore,
         'the replacement sidecar resumed the crashed durable session',
       )
+      expect(await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
+      await expect(paneRoot.getByText('This session has ended')).toHaveCount(0)
+      expect(
+        await page.evaluate(() => (window as any).__freshellNoReloadMarker),
+        'Resume must not reload the page',
+      ).toBe('kilroy-crash-lane')
 
       // The recovered session answers a follow-up turn — gated on the REAL
       // landing (the sidecar saw the send and completed it), never the
@@ -1299,14 +1325,14 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
         'post-crash send frame',
         30_000,
       )
-      await waitForPaneStatus(harness2, tabId2, 'idle')
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await expect(paneRoot).toContainText('post-crash recovery turn', { timeout: 30_000 })
 
       // Restart mid-session: graceful reboot on the same home/port/token;
       // the pane re-hydrates from the durable transcript and resumes.
       await lane.server.restart()
       await waitForWsReady(page)
-      expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      expect(await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
       await expect.poll(() => readJsonl(lane.eventsLog)
         .filter((e) => e.kind === 'resume' && e.data?.id === durableBefore).length,
       { timeout: 60_000, message: 'the restarted server resumed the same durable session' }).toBeGreaterThanOrEqual(2)
@@ -1317,7 +1343,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
         'post-restart send frame (lands on the new sidecar process)',
         60_000,
       )
-      await waitForPaneStatus(harness2, tabId2, 'idle', 60_000)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle', 60_000)
       await expect(paneRoot).toContainText('post-restart turn', { timeout: 30_000 })
       // Ground truth at the durable store: all three user turns sit in the
       // SAME transcript — the crash never forked the identity.

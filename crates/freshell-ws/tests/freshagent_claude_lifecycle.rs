@@ -9,6 +9,10 @@
 //! one attention edge when a turn was running, and no live session left behind.
 //! A Node death reports nothing, so the server rings for it itself.
 //!
+//! An ended session is not forgotten (C09, G05): it reports `status: exited`, the
+//! server keeps a dead-session record so its snapshot says `exited` (from live
+//! state), and a send to it is refused visibly instead of vanishing.
+//!
 //! Unix only: the tests read the sidecar's pid and signal it (rust-gate runs on Linux).
 #![cfg(unix)]
 
@@ -157,8 +161,8 @@ async fn a_cli_crash_mid_turn_rings_once_and_reports_the_cause() {
 
 /// The CLI ends the stream cleanly in the middle of the session's second turn (it
 /// exits 0, so the SDK's iterator just ends). The earlier turn's result must not
-/// leave the session busy (G23): the session ends, its last status is idle, and
-/// the server no longer holds it as live.
+/// leave the session busy (G23): the session ends, its last status is `exited`
+/// (not busy), and the server no longer holds it as live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_natural_end_of_stream_mid_turn_leaves_the_session_not_busy() {
     let rig = rig_with_program(
@@ -184,8 +188,8 @@ async fn a_natural_end_of_stream_mid_turn_leaves_the_session_not_busy() {
     conn.read_for(QUIET).await;
     assert_eq!(
         statuses(&conn, &session_id).last().map(String::as_str),
-        Some("idle"),
-        "the session's last status is idle; frames: {:?}",
+        Some("exited"),
+        "the session's last status is exited; frames: {:?}",
         conn.frames
     );
     assert!(
@@ -211,8 +215,7 @@ async fn a_node_death_mid_turn_rings_once() {
         .await;
     conn.wait_for_event("freshAgent.session.init").await;
     let pid = sidecar_pid(&rig).await;
-    // SAFETY: the pid is this rig's own sidecar, read from its simulator's ledger.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    sigkill(pid);
 
     let exited = wait_for_sidecar_exited(&mut conn, &session_id).await;
     assert_eq!(exited["cause"]["reason"], "sidecar_exited", "{exited}");
@@ -228,7 +231,8 @@ async fn a_node_death_mid_turn_rings_once() {
     );
 }
 
-/// An idle session whose CLI dies ends with the exit report and no edge.
+/// An idle session whose CLI dies ends with the exit report, status `exited`, and
+/// no edge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_cli_death_reports_the_exit_without_an_edge() {
     let rig =
@@ -244,6 +248,138 @@ async fn an_idle_cli_death_reports_the_exit_without_an_edge() {
         conn.events_seen("freshAgent.turn.complete"),
         0,
         "{:?}",
+        conn.frames
+    );
+    assert_eq!(
+        statuses(&conn, &session_id),
+        vec!["exited".to_string()],
+        "an idle session that ends reports exited; frames: {:?}",
+        conn.frames
+    );
+}
+
+/// Kill the rig's sidecar process (the simulator runs inside it).
+fn sigkill(pid: i32) {
+    // SAFETY: the pid is this rig's own sidecar, read from its simulator's ledger.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+}
+
+/// The Node sidecar is killed while a `/compact` runs (G05: an out-of-memory kill
+/// mid-compaction). The pane must not stay `compacting` (busy) forever: the session
+/// reports `exited`, the lost compaction rings exactly once, and the snapshot
+/// overlay, read from the server's live state, says `exited` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sidecar_death_mid_compact_ends_exited_with_one_ring_and_an_exited_snapshot() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
+    let mut conn = rig.connect().await;
+    let session_id = conn.create("create-1").await;
+    conn.send_text(&session_id, "send-1", "something to compact")
+        .await;
+    conn.wait_for_event("freshAgent.turn.complete").await;
+    let durable = durable_id(&conn, &session_id);
+    let pid = sidecar_pid(&rig).await;
+
+    // `/compact HANG`: the simulated compaction never finishes on its own.
+    conn.send(json!({
+        "type": "freshAgent.compact",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": session_id,
+        "requestId": "compact-1",
+        "instructions": "HANG",
+    }))
+    .await;
+    conn.wait_for("freshAgent.status{compacting}", |v| {
+        v["type"] == "freshAgent.event"
+            && v["event"]["type"] == "freshAgent.status"
+            && v["event"]["status"] == "compacting"
+    })
+    .await;
+    let edges_before = conn.events_seen("freshAgent.turn.complete");
+    sigkill(pid);
+
+    let exited = wait_for_sidecar_exited(&mut conn, &session_id).await;
+    assert_eq!(exited["cause"]["signal"], "SIGKILL", "{exited}");
+    wait_until_gone(pid).await;
+    conn.read_for(QUIET).await;
+
+    assert_eq!(
+        statuses(&conn, &session_id).last().map(String::as_str),
+        Some("exited"),
+        "exited replaces compacting; frames: {:?}",
+        conn.frames
+    );
+    assert_eq!(
+        conn.events_seen("freshAgent.turn.complete") - edges_before,
+        1,
+        "the lost compaction rings exactly once; frames: {:?}",
+        conn.frames
+    );
+    assert!(!rig.fresh_claude.has_live_session(&durable).await);
+    for id in [&durable, &session_id] {
+        let overlay = rig.fresh_claude.live_snapshot_overlay(id).await;
+        assert_eq!(overlay["status"], "exited", "snapshot for {id}: {overlay}");
+        assert_eq!(
+            overlay["extensions"]["claude"]["statusFromLiveState"], true,
+            "the exited status is live state, not a guess: {overlay}"
+        );
+    }
+}
+
+/// A send that reaches a session whose sidecar has ended is refused visibly: the
+/// pane's lost-session frame (nested `INVALID_SESSION_ID`, which starts the client's
+/// recovery) and a request error that hands the message back to the composer. It is
+/// never accepted and never silently dropped. Either id the pane may hold works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_to_a_dead_session_gets_the_lost_frame_and_a_request_error() {
+    let rig = ClaudeRig::start(RigKind::Sim).await;
+    let mut conn = rig.connect().await;
+    let session_id = conn.create("create-1").await;
+    conn.send_text(&session_id, "send-1", "first").await;
+    conn.wait_for_event("freshAgent.turn.complete").await;
+    let durable = durable_id(&conn, &session_id);
+    let pid = sidecar_pid(&rig).await;
+    sigkill(pid);
+    wait_for_sidecar_exited(&mut conn, &session_id).await;
+    wait_until_gone(pid).await;
+    assert!(
+        !rig.fresh_claude.has_live_session(&durable).await,
+        "a dead session is not live"
+    );
+
+    for (id, request_id) in [(session_id.clone(), "send-2"), (durable.clone(), "send-3")] {
+        conn.send_text(&id, request_id, "after the death").await;
+        let lost = conn
+            .wait_for(&format!("the lost frame for {id}"), |v| {
+                v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == "freshAgent.error"
+                    && v["event"]["code"] == "INVALID_SESSION_ID"
+                    && v["sessionId"] == id.as_str()
+            })
+            .await;
+        assert_eq!(lost["event"]["sessionId"], id.as_str(), "{lost}");
+        assert_eq!(lost["sessionType"], "freshclaude", "{lost}");
+        let error = conn
+            .wait_for(&format!("the request error for {request_id}"), |v| {
+                v["type"] == "error" && v["requestId"] == request_id
+            })
+            .await;
+        assert_eq!(error["code"], "INVALID_SESSION_ID", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("exited")),
+            "the error says why: {error}"
+        );
+    }
+    conn.read_for(QUIET).await;
+    assert!(
+        !conn
+            .frames
+            .iter()
+            .any(|v| v["type"] == "freshAgent.send.accepted"
+                && matches!(v["requestId"].as_str(), Some("send-2" | "send-3"))),
+        "no send after the death was accepted; frames: {:?}",
         conn.frames
     );
 }
