@@ -3,6 +3,7 @@ import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { receiveSessionNames } from '@/store/sessionNamesSlice'
 import { bootstrapSessionNames } from '@/lib/session-names'
+import { spentPendingNamingHandles } from '@/lib/terminal-naming-rebind'
 import {
   buildTerminalDurableSessionRefUpdate,
   flushPersistedLayoutNow,
@@ -14,6 +15,7 @@ import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 type Dispatch = (action: any) => unknown
 type SessionAssociationState = Pick<RootState, 'panes' | 'tabs' | 'sessionActivity'>
+  & Partial<Pick<RootState, 'sessionNames'>>
 
 /**
  * Shared ratchet-only migration core: copy the activity stored under one
@@ -181,10 +183,12 @@ export function reconcileTerminalSessionAssociation({
   let conflictingPane = false
   let shouldFlush = false
   const matchedSinglePaneTabs: Array<{ tabId: string; content: TerminalPaneContent }> = []
+  const matchedContents: TerminalPaneContent[] = []
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
     const matches: Array<{ paneId: string; content: TerminalPaneContent }> = []
     collectMatchingTerminalPanes(layout, terminalId, matches)
     if (matches.length === 0) continue
+    for (const { content } of matches) matchedContents.push(content)
 
     matchedAnyPane = true
     // A server-authoritative rebind (previousSessionId names the ref being
@@ -245,11 +249,19 @@ export function reconcileTerminalSessionAssociation({
   if (!matchedAnyPane) return 'ignored'
 
   // Name reliability (Task 10, G45): the rebind token rides along so the
-  // reducer releases the superseded conversation's naming identity.
+  // reducer releases the superseded conversation's naming identity — a
+  // pending handle only once the server spent it (its pending→durable
+  // redirect is cached); a still-pending one stays the pane's binding, as it
+  // stays the server row's.
+  const isRebind = typeof previousSessionId === 'string' && previousSessionId.length > 0
+  const spentNamingHandles = isRebind
+    ? spentPendingNamingHandles(matchedContents, state.sessionNames?.redirects)
+    : []
   dispatch(reconcileTerminalSessionRefByTerminalId({
     terminalId,
     sessionRef,
-    ...(typeof previousSessionId === 'string' && previousSessionId.length > 0 ? { previousSessionId } : {}),
+    ...(isRebind ? { previousSessionId } : {}),
+    ...(spentNamingHandles.length > 0 ? { spentNamingHandles } : {}),
   }))
 
   // Unified agent names (Task 5): the accepted rebind also moves the pane's

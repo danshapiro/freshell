@@ -588,6 +588,7 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         session_id: session_id.clone(),
                         create_request_id: key.clone(),
                         cwd,
+                        replaces_terminal_id: ev.terminal_id.clone(),
                     };
                     match driver.respawn(&spec).await {
                         Ok(new_tid) => {
@@ -760,6 +761,9 @@ pub(crate) struct RespawnSpec {
     pub session_id: String,
     pub create_request_id: String,
     pub cwd: Option<String>,
+    /// The crashed terminal this respawn replaces (its naming handle may
+    /// carry over).
+    pub replaces_terminal_id: String,
 }
 
 /// The production [`AutoResumeDriver`]: delegates to the real registry /
@@ -1317,6 +1321,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             session_id: req.session_id.clone(),
             create_request_id: req.create_request_id.clone(),
             cwd: req.cwd.clone(),
+            replaces_terminal_id: Some(req.replaces_terminal_id.clone()),
         };
         async move {
             crate::terminal::respawn_agent_terminal(&state, &req)
@@ -2082,6 +2087,9 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
         tokio::task::yield_now().await;
         assert_eq!(fake.respawn_calls().len(), 1);
+        // Name reliability (Task 10): the respawn names the crashed row, so
+        // the replacement can inherit its still-pending naming handle.
+        assert_eq!(fake.respawn_calls()[0].replaces_terminal_id, "t1");
         assert_eq!(
             fake.replaced_calls(),
             vec![("t1".into(), "t-new".into(), 1u32)]

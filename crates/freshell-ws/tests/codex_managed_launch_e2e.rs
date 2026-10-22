@@ -748,6 +748,7 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
             session_id: "thread-e2e-auto-resume".into(),
             create_request_id: "req-auto-resume".into(),
             cwd: Some(tmp_cwd.to_string_lossy().into_owned()),
+            replaces_terminal_id: None,
         },
     )
     .await

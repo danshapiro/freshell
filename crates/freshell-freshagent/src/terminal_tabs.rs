@@ -3439,14 +3439,20 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         crate::terminal_name_binding::NamingBindHint {
             mode: mode.clone(),
             cwd: spec.cwd.clone(),
+            // A managed descriptor's session counts only when it is not this
+            // create's own (prospective) preallocated `--session-id`.
             resume_session_id: accepted_session_ref
                 .as_ref()
                 .filter(|sref| sref.provider == mode)
                 .map(|sref| sref.session_id.clone())
                 .or_else(|| {
-                    registry
-                        .managed_descriptor(&terminal_id)
-                        .and_then(|descriptor| descriptor.resume_session_id)
+                    crate::terminal_name_binding::managed_reused_session(
+                        &registry,
+                        &terminal_id,
+                        resume_session_id
+                            .as_deref()
+                            .filter(|_| claude_fresh_prealloc),
+                    )
                 }),
             naming_handle: body
                 .get("namingHandle")
@@ -3982,6 +3988,11 @@ pub(crate) async fn wait_for(
 // Slice 1 route tests (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8.1)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Name reliability (Task 10): the REST door's terminal naming tests.
+#[cfg(test)]
+#[path = "terminal_tabs_naming_tests.rs"]
+mod naming_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4027,7 +4038,7 @@ mod tests {
             .clone()
     }
 
-    fn state_with_registry() -> FreshAgentState {
+    pub(super) fn state_with_registry() -> FreshAgentState {
         // Every REST test that can reach an amplifier create flows through
         // this constructor — isolate at the choke point (Task 11 Step 1).
         let _ = isolate_amplifier_home();
@@ -4036,7 +4047,7 @@ mod tests {
             .with_terminal_registry(freshell_terminal::TerminalRegistry::new())
     }
 
-    fn app(state: FreshAgentState) -> Router {
+    pub(super) fn app(state: FreshAgentState) -> Router {
         crate::router(state)
     }
 
@@ -4054,7 +4065,12 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    async fn post(router: Router, uri: &str, body: Value, auth: bool) -> (StatusCode, Value) {
+    pub(super) async fn post(
+        router: Router,
+        uri: &str,
+        body: Value,
+        auth: bool,
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method("POST")
             .uri(uri)
@@ -7154,203 +7170,6 @@ if (args.includes('app-server')) {{
             "ordinary REST creates retain the missing-session ledger transition"
         );
         assert!(registry.directory().is_empty(), "nothing was launched");
-    }
-
-    /// A supervisor that launches whatever it is asked to (the REST managed
-    /// door's controller for the naming tests).
-    struct LaunchingManagedController;
-
-    impl freshell_terminal::registry::ManagedTerminalController for LaunchingManagedController {
-        fn lookup_terminal<'a>(
-            &'a self,
-            _: &'a str,
-            _: Option<String>,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<
-            'a,
-            Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String>,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn launch<'a>(
-            &'a self,
-            request: freshell_terminal::registry::ManagedTerminalLaunch,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<
-            'a,
-            Result<
-                freshell_terminal::registry::ManagedTerminalDescriptor,
-                freshell_terminal::registry::ManagedTerminalLaunchError,
-            >,
-        > {
-            Box::pin(async move {
-                Ok(freshell_terminal::registry::ManagedTerminalDescriptor {
-                    soul_id: format!("soul-{}", request.terminal_id),
-                    incarnation_id: format!("incarnation-{}", request.terminal_id),
-                    terminal_id: request.terminal_id,
-                    stream_id: request.stream_id,
-                    mode: request.mode,
-                    cwd: request.spec.cwd.unwrap_or_else(|| "/workspace".into()),
-                    resume_session_id: request.resume_session_id,
-                    create_request_id: request.create_request_id,
-                })
-            })
-        }
-
-        fn input<'a>(
-            &'a self,
-            _: freshell_terminal::registry::ManagedTerminalDescriptor,
-            _: String,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn resize<'a>(
-            &'a self,
-            _: freshell_terminal::registry::ManagedTerminalDescriptor,
-            _: u16,
-            _: u16,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn stop<'a>(
-            &'a self,
-            _: freshell_terminal::registry::ManagedTerminalDescriptor,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn read_output<'a>(
-            &'a self,
-            _: freshell_terminal::registry::ManagedTerminalDescriptor,
-            _: i64,
-            _: u64,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<
-            'a,
-            Result<freshell_terminal::registry::ManagedOutputRead, String>,
-        > {
-            Box::pin(async { Err("no output in the naming test".into()) })
-        }
-    }
-
-    /// The shared identity table `freshell-server` injects into the REST
-    /// door, as a recording fake.
-    #[derive(Default)]
-    struct RecordingNameBinder {
-        bindings: std::sync::Mutex<
-            std::collections::HashMap<String, freshell_protocol::session_names::SessionNameRef>,
-        >,
-    }
-
-    impl crate::terminal_name_binding::TerminalNameBinder for RecordingNameBinder {
-        fn set_name_binding(
-            &self,
-            terminal_id: &str,
-            name_ref: &freshell_protocol::session_names::SessionNameRef,
-            _naming_handle: Option<&str>,
-        ) {
-            self.bindings
-                .lock()
-                .unwrap()
-                .insert(terminal_id.to_string(), name_ref.clone());
-        }
-
-        fn name_ref_of(
-            &self,
-            terminal_id: &str,
-        ) -> Option<freshell_protocol::session_names::SessionNameRef> {
-            self.bindings.lock().unwrap().get(terminal_id).cloned()
-        }
-
-        fn naming_handle_of(&self, _terminal_id: &str) -> Option<String> {
-            None
-        }
-
-        fn durable_session_of(&self, _terminal_id: &str) -> Option<(String, String)> {
-            None
-        }
-    }
-
-    /// Name reliability (Task 10): a REST managed create resuming a soul's
-    /// session binds the row to that session — in the registry AND the
-    /// shared identity table — and presents its saved name (the row was
-    /// titled "Shell" and its name cache stayed empty).
-    #[tokio::test]
-    async fn rest_managed_create_binds_naming() {
-        use crate::naming::SessionNaming as _;
-        use freshell_protocol::session_names::{NameIntent, NamedProvider, SessionNameRef};
-
-        let binder = Arc::new(RecordingNameBinder::default());
-        let state = state_with_registry()
-            .with_cli_commands(Arc::new(vec![freshell_platform::CliCommandSpec {
-                name: "opencode".into(),
-                label: "OpenCode".into(),
-                default_cmd: "opencode".into(),
-                ..Default::default()
-            }]))
-            .with_terminal_name_binder(binder.clone());
-        let sink = crate::naming::test_support::RecordingSink::new();
-        state.set_session_naming(sink.clone());
-        let durable = SessionNameRef::Session {
-            provider: NamedProvider::Opencode,
-            session_id: "ses_rest_soul".into(),
-        };
-        sink.ensure_pending(crate::naming::PendingNameInput {
-            handle: "seed-rest-soul".into(),
-            provider: NamedProvider::Opencode,
-            cwd: None,
-        })
-        .await
-        .unwrap();
-        sink.bind_pending(crate::naming::BindNameInput {
-            pending: SessionNameRef::Pending {
-                id: "seed-rest-soul".into(),
-            },
-            target: durable.clone(),
-            acquisition: crate::naming::test_support::verified_claude_acquisition("seed"),
-        })
-        .await
-        .unwrap();
-        sink.rename(crate::naming::RenameNameInput {
-            target: durable.clone(),
-            name: "Survivor".into(),
-            intent: NameIntent::User,
-            if_revision: None,
-        })
-        .await
-        .unwrap();
-        let registry = state.terminal_registry.clone().expect("registry wired");
-        registry.set_managed_controller(Some(Arc::new(LaunchingManagedController)));
-
-        let (status, body) = post(
-            app(state.clone()),
-            "/api/tabs",
-            json!({
-                "mode": "opencode",
-                "cwd": std::env::temp_dir().to_string_lossy(),
-                "sessionRef": { "provider": "opencode", "sessionId": "ses_rest_soul" },
-            }),
-            true,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let terminal_id = body["data"]["terminalId"]
-            .as_str()
-            .expect("terminalId")
-            .to_string();
-
-        assert!(registry.is_managed(&terminal_id), "the managed door ran");
-        assert_eq!(registry.name_ref_of(&terminal_id), Some(durable.clone()));
-        assert_eq!(
-            binder.bindings.lock().unwrap().get(&terminal_id),
-            Some(&durable),
-            "the shared identity table carries the same binding"
-        );
-        assert_eq!(
-            registry.session_name_of(&terminal_id).map(|r| r.name),
-            Some("Survivor".to_string())
-        );
-        assert_eq!(registry.title_of(&terminal_id).as_deref(), Some("Survivor"));
     }
 
     #[test]

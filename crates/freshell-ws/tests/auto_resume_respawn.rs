@@ -157,6 +157,7 @@ async fn respawn_spawns_resume_generation_with_same_create_request_id() {
             session_id: session_id.clone(),
             create_request_id: create_request_id.into(),
             cwd: None,
+            replaces_terminal_id: None,
         },
     )
     .await
@@ -235,6 +236,7 @@ async fn respawn_is_rejected_loud_when_spawn_gate_queue_is_full() {
             session_id: "sess-gate-pin".into(),
             create_request_id: "req-gate-pin".into(),
             cwd: None,
+            replaces_terminal_id: None,
         },
     )
     .await
@@ -463,6 +465,7 @@ async fn respawn_with_absent_session_spawns_fresh_and_retires_binding() {
             session_id: "stale-amp".into(),
             create_request_id: "req-respawn-gate-1".into(),
             cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            replaces_terminal_id: None,
         },
     )
     .await
@@ -590,6 +593,7 @@ async fn respawn_with_unknown_existence_resumes_exactly_as_today() {
             session_id: "maybe-amp".into(),
             create_request_id: "req-respawn-gate-2".into(),
             cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            replaces_terminal_id: None,
         },
     )
     .await

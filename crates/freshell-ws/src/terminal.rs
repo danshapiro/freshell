@@ -4791,6 +4791,9 @@ pub(crate) async fn prepare_launch(
 /// deferred to the reconcile tick with the binding kept — a read failure on
 /// a resume never falls into the fresh pending path, and a failed
 /// `ensure_pending` still leaves the row bound to its pending handle.
+/// `preallocated_session_id` is this create's own server-preallocated
+/// `--session-id` (a fresh Claude create), which is prospective.
+#[allow(clippy::too_many_arguments)]
 async fn admit_create_naming(
     state: &WsState,
     create: &TerminalCreate,
@@ -4799,6 +4802,7 @@ async fn admit_create_naming(
     cwd: Option<&str>,
     session_locator: Option<&SessionLocator>,
     fallback_title: String,
+    preallocated_session_id: Option<&str>,
 ) -> Option<(
     freshell_protocol::session_names::SessionNameRef,
     freshell_protocol::session_names::SessionNameRecord,
@@ -4807,7 +4811,8 @@ async fn admit_create_naming(
     // session's own record — established identities are never re-pended. So
     // does a managed create the supervisor answered with an existing soul's
     // native session (a retried create after a web restart). The server-side
-    // PREALLOCATED identity is deliberately NOT durable input: a fresh
+    // PREALLOCATED identity is deliberately NOT durable input — not even when
+    // the supervisor echoes it back in the managed descriptor: a fresh
     // `--session-id` spawn is prospective (the transcript does not exist
     // yet), so a fresh create always admits its pre-durable handle and the
     // verified-bind lanes transfer it at materialization.
@@ -4815,10 +4820,11 @@ async fn admit_create_naming(
         .filter(|locator| locator.provider == mode)
         .map(|locator| locator.session_id.clone())
         .or_else(|| {
-            state
-                .registry
-                .managed_descriptor(terminal_id)
-                .and_then(|descriptor| descriptor.resume_session_id)
+            freshell_freshagent::terminal_name_binding::managed_reused_session(
+                &state.registry,
+                terminal_id,
+                preallocated_session_id,
+            )
         });
     let outcome = crate::terminal_naming::bind_ws_terminal_naming(
         state,
@@ -7530,6 +7536,9 @@ pub(crate) async fn handle_create(
         spec.cwd.as_deref(),
         create_session_locator(&create).as_ref(),
         mode_label(&mode, cli.as_ref()),
+        resume_session_id
+            .as_deref()
+            .filter(|_| claude_fresh_prealloc),
     )
     .await;
     let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
@@ -7629,6 +7638,11 @@ pub struct AgentRespawnRequest {
     /// SAME as the dead generation (cap continuity)
     pub create_request_id: String,
     pub cwd: Option<String>,
+    /// The crashed generation's terminal id. Name reliability (Task 10):
+    /// its still-pending naming handle (one not yet transferred onto a
+    /// durable session) carries over, so a pre-durable name survives the
+    /// respawn. `None` for a respawn with no predecessor row.
+    pub replaces_terminal_id: Option<String>,
 }
 
 /// Why a respawn could not produce a terminal. The orchestrator (Task 5)
@@ -8204,7 +8218,10 @@ pub async fn respawn_agent_terminal(
     // durable session, so it binds that session's saved name (its title was
     // "<Mode> (auto-resumed)" with no binding at all). With no record yet the
     // auto-resumed label stays. A gate-fired fresh respawn (the cached session
-    // is gone) is prospective, so it admits a pending handle instead.
+    // is gone) is prospective, so it admits a pending handle instead. The
+    // crashed row's STILL-PENDING handle carries over (a rename before the
+    // first message), so its pre-durable name survives and the bind lane
+    // can still transfer it.
     crate::terminal_naming::bind_ws_terminal_naming(
         state,
         &terminal_id,
@@ -8214,7 +8231,10 @@ pub async fn respawn_agent_terminal(
             resume_session_id: resume_session_id
                 .clone()
                 .filter(|_| launch_intent == LaunchIntent::Resume),
-            naming_handle: None,
+            naming_handle: req
+                .replaces_terminal_id
+                .as_deref()
+                .and_then(|crashed| crate::terminal_naming::still_pending_handle(state, crashed)),
             fallback_title: format!("{} (auto-resumed)", mode_label(&mode, cli.as_ref())),
         },
     )
@@ -12832,6 +12852,12 @@ mod connection_span_filter_tests {
     }
 }
 
+/// Name reliability (Task 10): every WebSocket-side terminal row path binds
+/// its saved name (a child of this module, so it drives the real entries).
+#[cfg(test)]
+#[path = "terminal_naming_tests.rs"]
+mod terminal_naming_tests;
+
 /// Task 2 (reconnect-revive): the `pane.reconcile.request` capability gate.
 /// A request arriving on a connection that did NOT negotiate `paneReconcileV1`
 /// must get an explicit terminal refusal carrying the reconcileId (the client
@@ -12840,10 +12866,6 @@ mod connection_span_filter_tests {
 /// pending-verdict until the next reconnect (the reported gray-and-dead
 /// shape). Pre-reconcile ("frozen") clients never send the request, so the
 /// error code can never reach them (frozen-client wire parity).
-#[cfg(test)]
-#[path = "terminal_naming_tests.rs"]
-mod terminal_naming_tests;
-
 #[cfg(test)]
 mod pane_reconcile_gate_tests {
     use super::*;
