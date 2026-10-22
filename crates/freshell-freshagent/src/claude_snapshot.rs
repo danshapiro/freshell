@@ -1370,7 +1370,11 @@ pub(crate) fn build_claude_snapshot_from_projection(
     revision: i64,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Value {
-    let crate::claude_projection::ClaudeProjection { turns, diffs } = projection;
+    let crate::claude_projection::ClaudeProjection {
+        turns,
+        diffs,
+        token_usage,
+    } = projection;
     let latest_turn_id = turns
         .last()
         .and_then(|t| t.get("turnId"))
@@ -1410,7 +1414,7 @@ pub(crate) fn build_claude_snapshot_from_projection(
                 "sandbox": "unsupported",
             },
         },
-        "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
+        "tokenUsage": token_usage,
         "pendingApprovals": [],
         "pendingQuestions": [],
         "worktrees": [],

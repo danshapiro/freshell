@@ -417,3 +417,50 @@ fn a_transcript_without_file_edits_has_no_changed_files() {
     assert!(diffs_of(real_cli_fixture!("compact-ok")).is_empty());
     assert!(diffs_of(real_cli_fixture!("image")).is_empty());
 }
+
+// ── A6: token usage shares the session indexer's definition ───────────────
+
+#[test]
+fn token_usage_matches_the_session_indexers_definition() {
+    for transcript in [
+        real_cli_fixture!("tools-sync"),
+        real_cli_fixture!("agent-async"),
+        real_cli_fixture!("compact-ok"),
+        real_cli_fixture!("image"),
+    ] {
+        let indexed = freshell_sessions::parse_session_content(transcript, &Default::default())
+            .token_usage
+            .expect("the fixture carries assistant usage");
+        let projection = ClaudeTranscriptProjector::project("s", transcript);
+        assert_eq!(
+            projection.token_usage,
+            json!({
+                "inputTokens": indexed.input_tokens,
+                "outputTokens": indexed.output_tokens,
+                "cachedTokens": indexed.cached_tokens,
+                "totalTokens": indexed.total_tokens,
+                "contextTokens": indexed.context_tokens,
+                "compactPercent": indexed.compact_percent,
+            })
+        );
+        assert!(indexed.input_tokens > 0);
+    }
+}
+
+#[test]
+fn a_transcript_without_usage_reports_zero_tokens() {
+    let projection = ClaudeTranscriptProjector::project("s", real_cli_fixture!("api-error"));
+    assert!(freshell_sessions::parse_session_content(
+        real_cli_fixture!("api-error"),
+        &Default::default()
+    )
+    .token_usage
+    .is_none_or(|usage| usage.input_tokens == 0));
+    let zero = ClaudeTranscriptProjector::project("s", "");
+    assert_eq!(
+        zero.token_usage,
+        json!({ "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 })
+    );
+    // The synthetic API-error line's usage (if any) never inflates the meter.
+    assert_eq!(projection.token_usage["outputTokens"], json!(0));
+}

@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use freshell_sessions::{ClaudeUsageAccumulator, ParseSessionOptions};
 use serde_json::{json, Value};
 
 use crate::claude_snapshot::{
@@ -102,6 +103,7 @@ impl SubagentSource for FsSubagents {
 pub(crate) struct ClaudeProjection {
     pub turns: Vec<Value>,
     pub diffs: Vec<Value>,
+    pub token_usage: Value,
 }
 
 /// Where a projected item lives: `turns[turn].items[item]`. Turns are only
@@ -129,6 +131,8 @@ pub(crate) struct ClaudeTranscriptProjector {
     tool_calls: HashMap<String, (String, Value)>,
     /// Files changed by successful edit tools, by path (one row per path).
     changed_files: BTreeMap<String, ChangedFile>,
+    /// The session indexer's own token-usage definition (one context meter).
+    usage: ClaudeUsageAccumulator,
 }
 
 /// What the session did to one file.
@@ -165,6 +169,7 @@ impl ClaudeTranscriptProjector {
             compact_boundaries: HashSet::new(),
             tool_calls: HashMap::new(),
             changed_files: BTreeMap::new(),
+            usage: ClaudeUsageAccumulator::new(),
         }
     }
 
@@ -195,11 +200,15 @@ impl ClaudeTranscriptProjector {
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             return;
         };
+        // Every line, before any display filtering: the indexer's definition
+        // sees (and dedupes) them all.
+        self.usage.push(&obj, line);
         self.push_value(&obj);
     }
 
-    /// Project one parsed transcript line.
-    pub(crate) fn push_value(&mut self, obj: &Value) {
+    /// Project one parsed transcript line (display content only; token usage
+    /// is fed by [`Self::push_line`]).
+    fn push_value(&mut self, obj: &Value) {
         let uuid = obj
             .get("uuid")
             .and_then(Value::as_str)
@@ -275,6 +284,7 @@ impl ClaudeTranscriptProjector {
         ClaudeProjection {
             turns: self.turns,
             diffs,
+            token_usage: token_usage_json(&self.usage),
         }
     }
 
@@ -649,6 +659,30 @@ fn subagent_activity_rows(transcript: &str) -> Vec<Value> {
         }
     }
     rows
+}
+
+/// The snapshot's `tokenUsage`: the indexer's summary in the contract's
+/// shape (no `costUsd`: the transcript does not persist it), zeros before
+/// the first assistant usage.
+fn token_usage_json(usage: &ClaudeUsageAccumulator) -> Value {
+    match usage.summary(&ParseSessionOptions::default()) {
+        Some(summary) => {
+            let mut value = json!({
+                "inputTokens": summary.input_tokens.max(0),
+                "outputTokens": summary.output_tokens.max(0),
+                "cachedTokens": summary.cached_tokens.max(0),
+                "totalTokens": summary.total_tokens.max(0),
+            });
+            if let Some(context) = summary.context_tokens {
+                value["contextTokens"] = json!(context.max(0));
+            }
+            if let Some(percent) = summary.compact_percent {
+                value["compactPercent"] = json!(percent.max(0));
+            }
+            value
+        }
+        None => json!({ "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 }),
+    }
 }
 
 /// A line's message content blocks (empty for string content).

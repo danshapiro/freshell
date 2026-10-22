@@ -343,3 +343,12 @@ fn the_snapshot_lists_changed_files_and_advertises_the_diff_panel() {
     assert_eq!(untouched["capabilities"]["diffs"], json!(false));
     assert_eq!(untouched["diffs"], json!([]));
 }
+
+#[test]
+fn the_snapshot_reports_the_transcripts_token_usage() {
+    let transcript = real_cli_fixture!("tools-sync");
+    let snapshot = build_claude_snapshot_json("freshclaude", "s", transcript, 0, None);
+    let projection = crate::claude_projection::ClaudeTranscriptProjector::project("s", transcript);
+    assert_eq!(snapshot["tokenUsage"], projection.token_usage);
+    assert!(snapshot["tokenUsage"]["contextTokens"].as_i64().unwrap() > 0);
+}

@@ -46,7 +46,9 @@ pub mod watch_plan;
 pub(crate) static HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use meta::{CodexTaskEventSnapshot, ParsedSessionMeta, TokenSummary};
-pub use parse::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
+pub use parse::{
+    parse_codex_session_content, parse_session_content, ClaudeUsageAccumulator, ParseSessionOptions,
+};
 pub use search::{extract_snippet, search_session_file, FileSearchMatch, FileSearchTier};
 
 #[cfg(test)]
