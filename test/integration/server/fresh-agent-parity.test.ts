@@ -2,13 +2,17 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
-import { prepareProviderParityUserRoots } from '../../helpers/provider-parity-environment.js'
+import { authorizeFreshAgentParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes, readProviderParitySource, type ProviderParitySource } from '../../helpers/provider-parity-broker.js'
+import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots } from '../../helpers/provider-parity-environment.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
+import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [
@@ -68,11 +72,23 @@ class FreshWire {
 
 describe('hosted fresh-agent provider inputs', () => {
   let rig: ManagedRuntimeBrowserRig
+  let workspace: string
   let opencodeProject: string
   let homeDir: string
   let onecli: ReturnType<typeof fakeOnecliGrants>
   let restoreOnecliEnvironment: (() => void) | undefined
+  let providerSource: ProviderParitySource
   const wires: FreshWire[] = []
+  const registeredVolumes: (InitialProviderVolumeAuthorization & { requestId: string })[] = []
+
+  // The restricted broker serves a soul's initial provider volume only after
+  // the fixture registers that soul, so register each create before sending it.
+  function authorizeFreshRequest(provider: typeof providers[number]['provider'], requestId: string) {
+    const authorization = authorizeFreshAgentParityRequest(rig.runtime.broker, providerSource, provider, requestId)
+    registeredVolumes.push({ ...authorization, requestId })
+    rig.runtime.writeIncident('fresh-agent-parity-registered-requests', registeredVolumes)
+    return authorization
+  }
 
   beforeAll(async () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-provider-parity-home-'))
@@ -92,26 +108,44 @@ describe('hosted fresh-agent provider inputs', () => {
       fixtureFreshAgentModes: providers.map(row => row.sessionType),
     }, homeDir)
     await rig.start()
-    opencodeProject = fs.mkdtempSync(path.join(root, '.opencode-parity-'))
+    const health = await rig.runtime.adminOk(rig.supervisor, { method: 'health' })
+    expect(health.kind).toBe('health')
+    providerSource = await readProviderParitySource(rig.runtime, health.data.installation_id)
+    // Select a synthetic project, so providers never inherit this checkout's
+    // own skills, installed dependencies, or linked-worktree Git topology.
+    workspace = path.join(rig.runtime.testRoot, 'workspace')
+    fs.mkdirSync(workspace)
+    execFileSync('git', ['init', '--quiet', workspace])
+    // Every create selects this plugin directory relative to its cwd.
+    fs.mkdirSync(path.join(workspace, 'fixture-plugin/.claude-plugin'), { recursive: true })
+    fs.writeFileSync(path.join(workspace, 'fixture-plugin/.claude-plugin/plugin.json'), JSON.stringify({ name: 'fixture-plugin' }))
+    opencodeProject = fs.mkdtempSync(path.join(workspace, '.opencode-parity-'))
     fs.mkdirSync(path.join(opencodeProject, '.opencode'), { recursive: true })
+    const projectPlugin = path.join(opencodeProject, 'project-plugin.ts')
+    fs.writeFileSync(projectPlugin, 'export const Project = async () => ({})\n')
     fs.writeFileSync(path.join(opencodeProject, '.opencode/opencode.json'), JSON.stringify({
       provider: { project_fixture: { name: 'project fixture' } },
       mcp: { project_fixture: { type: 'local', command: ['project-mcp'] } },
     }))
     fs.writeFileSync(path.join(opencodeProject, '.opencode/opencode.jsonc'),
-      '{ // project JSONC remains a user source\n "plugin": ["file:///project-plugin.ts",], "theme": "project", }')
+      `{ // project JSONC remains a user source\n "plugin": [${JSON.stringify(pathToFileURL(projectPlugin).href)},], "theme": "project", }`)
+    // Providers read their selected project inputs as the provider user.
+    makeProviderParityResourcesReadable(workspace)
+    const globalPlugin = path.join(rig.info.homeDir, 'custom-xdg/opencode/global-plugin.ts')
     for (const row of providers) {
       const file = path.join(rig.info.homeDir, row.config)
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 })
       const contents = row.provider === 'codex'
         ? 'fixture_setting = true\n\n[mcp_servers.user_fixture]\ncommand = "user-fixture-mcp"\n'
         : row.provider === 'opencode'
-          ? '{ // global JSONC\n "provider":{"global_fixture":{"name":"global fixture"}}, "mcp":{"user_fixture":{"type":"local","command":["user-fixture-mcp"]}}, "plugin":["file:///global-plugin.ts",], }'
+          ? `{ // global JSONC\n "provider":{"global_fixture":{"name":"global fixture"}}, "mcp":{"user_fixture":{"type":"local","command":["user-fixture-mcp"]}}, "plugin":[${JSON.stringify(pathToFileURL(globalPlugin).href)},], }`
         : JSON.stringify({ fixtureSetting: true, mcpServers: { user_fixture: { command: 'user-fixture-mcp' } } }) + '\n'
       fs.writeFileSync(file, contents)
       fs.chmodSync(path.dirname(file), 0o755)
       fs.chmodSync(file, 0o644)
     }
+    fs.writeFileSync(globalPlugin, 'export const Global = async () => ({})\n')
+    fs.chmodSync(globalPlugin, 0o644)
     fs.writeFileSync(path.join(rig.info.homeDir, 'custom-xdg/opencode/opencode.json'), JSON.stringify({
       mcp: { other_global: { type: 'local', command: ['other-global-mcp'] } },
     }))
@@ -121,15 +155,28 @@ describe('hosted fresh-agent provider inputs', () => {
   }, 900_000)
 
   afterAll(async () => {
-    await Promise.allSettled(wires.map(wire => wire.close()))
-    if (rig) {
-      const cleanup = await rig.stop()
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    try {
+      await Promise.allSettled(wires.map(wire => wire.close()))
+      if (rig) {
+        let volumes: ReturnType<typeof captureProviderParityVolumes> = []
+        let captureError: unknown
+        try {
+          volumes = captureProviderParityVolumes(registeredVolumes)
+          rig.runtime.writeIncident('fresh-agent-parity-registered-volumes', volumes)
+        } catch (error) { captureError = error }
+        const cleanup = await rig.stop()
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+        if (captureError) throw captureError
+        rig.runtime.writeIncident('fresh-agent-parity-registered-volume-cleanup', {
+          removed: cleanupProviderParityVolumes(volumes),
+        })
+      }
+    } finally {
+      if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
+      if (homeDir) fs.rmSync(homeDir, { recursive: true, force: true })
+      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
+      restoreOnecliEnvironment?.()
     }
-    if (opencodeProject) fs.rmSync(opencodeProject, { recursive: true, force: true })
-    if (homeDir) fs.rmSync(homeDir, { recursive: true, force: true })
-    if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
-    restoreOnecliEnvironment?.()
   }, 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {
@@ -137,7 +184,7 @@ describe('hosted fresh-agent provider inputs', () => {
     wires.push(wire)
     const requestId = `fresh-parity-${randomUUID()}`
     const namingHandle = `nh-${randomUUID()}`
-    const cwd = row.provider === 'opencode' ? opencodeProject : root
+    const cwd = row.provider === 'opencode' ? opencodeProject : workspace
     const createRequest = {
       type: 'freshAgent.create', requestId, sessionType: row.sessionType,
       provider: row.provider, cwd, model: 'fixture-model',
@@ -145,6 +192,7 @@ describe('hosted fresh-agent provider inputs', () => {
       effort: 'low', permissionMode: 'default', sandbox: 'workspace-write',
       plugins: ['fixture-plugin'], namingHandle, tabId: `tab-${requestId}`,
     }
+    const owner = authorizeFreshRequest(row.provider, requestId)
     wire.send(createRequest)
     const created = await wire.wait(frame => frame.requestId === requestId
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
@@ -158,6 +206,7 @@ describe('hosted fresh-agent provider inputs', () => {
       const candidate = await rig.runningViewForFreshSession(created.sessionId)
       return candidate?.containerId ? candidate : undefined
     })
+    expect(view.soulId).toBe(owner.soulId)
     const recorded = JSON.parse(rig.ownedProviderExec(view.containerId!, [
       'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
     ]))
@@ -168,7 +217,16 @@ describe('hosted fresh-agent provider inputs', () => {
       plugins: ['fixture-plugin'],
       modelSelection: { kind: 'exact', modelId: 'fixture-model' },
     })
-    expect(profile.providerLaunchContext.config.length).toBeGreaterThan(0)
+    // Ordinary user configuration reaches the provider through the prepared
+    // generation's config binds; staged references still carry directories.
+    const launchContext = profile.providerLaunchContext
+    const stagedConfig: any[] = launchContext.config ?? []
+    const deliveredConfigFiles: string[] = [
+      ...(launchContext.preparedInputs?.configBinds ?? []).map((bind: any) => bind.effectiveDestination),
+      ...stagedConfig.filter(config => config.format !== 'directory')
+        .map(config => path.posix.join('/home/freshell/provider', config.providerRelativePath)),
+    ]
+    expect(deliveredConfigFiles.length).toBeGreaterThan(0)
     expect(profile.providerLaunchContext.mcpCapability.grantId).toMatch(/^grant-/)
     expect(profile.providerSecretReferences).toHaveLength(1)
     for (const reference of profile.providerSecretReferences) {
@@ -187,10 +245,15 @@ describe('hosted fresh-agent provider inputs', () => {
     expect(childObservation.onecliControlPresent).toBe(false)
     expect(JSON.stringify(recorded)).not.toContain('fixture-secret-byte')
     const preparation = profile.providerLaunchContext.preparation
+    // Hosted fresh Claude and Codex keep the managed Freshell MCP recipe
+    // (pinned by the managed_provider_fresh_* tests in fresh_agent_proxy_tests.rs).
     if (row.provider === 'claude') {
-      expect(preparation.claude?.mcp_args).toEqual([])
+      expect(preparation.claude?.mcp_args).toEqual(['--mcp-config', '.claude/freshell-mcp.json'])
     } else if (row.provider === 'codex') {
-      expect(preparation.codex).toMatchObject({ tui_args: [], sidecar_args: [] })
+      expect(preparation.codex.tui_args).toEqual(expect.arrayContaining([
+        'mcp_servers.freshell.command="node"', 'mcp_servers.freshell.args=["/opt/freshell-mcp/server.js"]',
+      ]))
+      expect(preparation.codex.sidecar_args).toEqual(preparation.codex.tui_args)
     } else {
       expect(preparation.opencode).toMatchObject({ inline_config: false, tui_config: null })
       expect(JSON.stringify(preparation)).not.toContain('freshell-mcp')
@@ -207,18 +270,15 @@ describe('hosted fresh-agent provider inputs', () => {
         expect.stringContaining('freshell-rebind-plugin.ts'),
       ])
     }
-    for (const config of profile.providerLaunchContext.config) {
-      if (config.format === 'directory') {
-        if (row.provider === 'opencode' && config.relativePath === 'plugin') {
-          expect(rig.ownedProviderExec(view.containerId!, [
-            'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath, 'user-plugin.ts'),
-          ])).toContain('export const User')
-        }
-        continue
+    for (const config of stagedConfig) {
+      if (row.provider === 'opencode' && config.format === 'directory' && config.relativePath === 'plugin') {
+        expect(rig.ownedProviderExec(view.containerId!, [
+          'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath, 'user-plugin.ts'),
+        ])).toContain('export const User')
       }
-      const contents = rig.ownedProviderExec(view.containerId!, [
-        'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath),
-      ])
+    }
+    for (const file of deliveredConfigFiles) {
+      const contents = rig.ownedProviderExec(view.containerId!, ['cat', file])
       if (row.provider === 'opencode') {
         expect(contents).toMatch(/global_fixture|other_global|project_fixture|project JSONC/)
       } else {
@@ -244,6 +304,8 @@ describe('hosted fresh-agent provider inputs', () => {
     let rejectedCreate: { requestType: string; responseType: string } | undefined
     await withMissingGrant(onecli.grants[row.provider], async () => {
       const badRequestId = `bad-grant-${randomUUID()}`
+      // Registered like any create, so only the missing grant can refuse it.
+      authorizeFreshRequest(row.provider, badRequestId)
       wire.send({ ...createRequest, requestId: badRequestId,
         namingHandle: `nh-${badRequestId}`, tabId: `tab-${badRequestId}` })
       const bad = await wire.wait(frame => frame.requestId === badRequestId
@@ -267,7 +329,7 @@ describe('hosted fresh-agent provider inputs', () => {
       ]) expect(material).not.toContain(sentinel)
       fs.writeFileSync(path.join(evidenceDir, `fresh-hosted-${row.provider}.json`), JSON.stringify({
         provider: row.provider, nativeSessionId: recorded.nativeSessionId,
-        configCount: profile.providerLaunchContext.config.length,
+        configCount: deliveredConfigFiles.length,
         plugin: profile.plugins,
         secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
         onecli: {
