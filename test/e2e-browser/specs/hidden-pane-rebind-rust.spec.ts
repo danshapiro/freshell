@@ -348,11 +348,11 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       // pre-restart Redux state also shows `sessionId` + 'idle', so client
       // state alone proves nothing. The discriminator is SERVER-SIDE: the
       // sidecar request log must contain a `create` carrying
-      // `resumeSessionId === originalDurable`, which only the restart-parity
+      // a resume boot of originalDurable, which only the restart-parity
       // resume arm emits, and it only runs when THIS hidden pane's
       // post-restart freshAgent.attach actually went out (the rebind queue
       // under test driving the attach arm). The initial pane create carries
-      // NO resumeSessionId, so a matching entry is unambiguous post-restart
+      // a fresh boot, so a matching entry is unambiguous post-restart
       // evidence. Do not weaken either conjunct.
       await expect
         .poll(async () => {
@@ -371,9 +371,9 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
             .some(
               (e) =>
                 e.msg?.type === 'create' &&
-                typeof e.msg?.resumeSessionId === 'string' &&
-                (e.msg.resumeSessionId === originalDurable ||
-                  e.msg.resumeSessionId.endsWith(`/${originalDurable}.jsonl`)),
+                typeof e.msg?.boot?.resume === 'string' &&
+                (e.msg.boot.resume === originalDurable ||
+                  e.msg.boot.resume.endsWith(`/${originalDurable}.jsonl`)),
             )
           return usable && resumed ? `resumed:${status}` : null
         }, { timeout: 30_000 })

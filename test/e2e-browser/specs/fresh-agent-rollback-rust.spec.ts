@@ -22,7 +22,7 @@
  *     (decision 5 — the reserved-name interception; the wire refusal stays as
  *     backstop).
  *   claude AND kilroy (fork-at-point emulation): /undo re-keys the pane via a
- *     forkSession:true sidecar create that MINTS a fresh durable id (the s2rk
+ *     fork-boot sidecar create that MINTS a fresh durable id (the s2rk
  *     correction), refills the composer, never touches checkpoints (decision
  *     1 — zero /checkpoints/restore traffic), and /redo re-forks the retained
  *     original (the tip/LCP contract).
@@ -952,14 +952,14 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         .poll(() => composerLocator(page).inputValue(), { timeout: 15_000 })
         .toBe('prompt two')
 
-      // Exactly ONE fork-at-point create: forkSession:true + resumeSessionId
-      // ORIG + a resumeSessionAt the raw-chain resume point (the sidecar's
+      // Exactly ONE fork-at-point create: a fork boot of ORIG at a
+      // resumeSessionAt the raw-chain resume point (the sidecar's
       // guard validated — no guard-refusal retry would land a second create).
       const forks = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'create' && f?.forkSession === true)
+        .filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork')
       expect(forks).toHaveLength(1)
-      expect(forks[0].resumeSessionId).toBe(ORIG)
-      expect(typeof forks[0].resumeSessionAt).toBe('string')
+      expect(forks[0].boot.resume).toBe(ORIG)
+      expect(typeof forks[0].boot.resumeSessionAt).toBe('string')
       // The wire log's sdk.session.init for the fork carries the NEW id.
       const wires = readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
       expect(
@@ -991,9 +991,9 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', REDONE)), { timeout: 15_000 })
         .toBe(2)
       const reforks = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'create' && f?.forkSession === true)
+        .filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork')
       expect(reforks.length).toBe(2)
-      expect(reforks[1].resumeSessionId).toBe(ORIG)
+      expect(reforks[1].boot.resume).toBe(ORIG)
 
       // Rollback never touches files: ZERO checkpoint-restore traffic.
       expect(checkpointRestores).toEqual([])
@@ -1030,10 +1030,10 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       const CHILD = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionRef?.sessionId as string
       expect(CHILD).toMatch(CANONICAL_UUID_RE)
       const forks = readStdinFrames(lane.stdinLog)
-        .filter((f) => f?.type === 'create' && f?.forkSession === true)
+        .filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork')
       expect(forks).toHaveLength(1)
-      expect(forks[0].resumeSessionId).toBe(ORIG)
-      expect(typeof forks[0].resumeSessionAt).toBe('string')
+      expect(forks[0].boot.resume).toBe(ORIG)
+      expect(typeof forks[0].boot.resumeSessionAt).toBe('string')
       await expect
         .poll(() => composerLocator(page).inputValue(), { timeout: 15_000 })
         .toBe('prompt two')
@@ -1184,7 +1184,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       expect(userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG))).toBe(1)
       await expect(card).toBeVisible()
       expect(
-        readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'create' && f?.forkSession === true),
+        readStdinFrames(lane.stdinLog).filter((f) => f?.type === 'create' && f?.boot?.kind === 'fork'),
         'no fork-at-point create ever left the client for the refused /undo',
       ).toEqual([])
 
@@ -1207,8 +1207,8 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       // response, so the row is on disk before the ack that refills the
       // composer). NOTE: this tail is a FIRST-TURN rollback — the resume point
       // resolves to None (claude_snapshot.rs), so the rollback create is a
-      // FRESH-conversation create carrying NO resumeSessionId/forkSession keys;
-      // counting forkSession:true frames here would count ZERO by design.
+      // FRESH-conversation create (a fresh boot, no resume or fork);
+      // counting fork-boot frames here would count ZERO by design.
       const isRollbackCreate = (f: any) =>
         f?.type === 'create' && typeof f?.requestId === 'string' && (f.requestId as string).startsWith('rollback-')
       await waitForStdinFrame(lane.stdinLog, isRollbackCreate, 'the tail /undo rollback create')

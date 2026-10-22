@@ -207,10 +207,10 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
       await waitForWsReady(page)
 
       // Positive proof (same discriminator as the hidden-pane spec): the
-      // sidecar request log must contain a `create` carrying
-      // resumeSessionId === originalDurable -- only the restart-parity
-      // resume arm emits that, and the initial create carries NO
-      // resumeSessionId, so a match is unambiguous post-restart evidence.
+      // sidecar request log must contain a `create` whose resume boot names
+      // originalDurable -- only the restart-parity resume arm emits that, and
+      // the initial create boots fresh, so a match is unambiguous
+      // post-restart evidence.
       // The parity arm resumes by durable UUID or by the transcript's
       // .jsonl PATH; both carry the durable UUID -- accept either shape.
       await expect
@@ -226,9 +226,9 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
             .some(
               (e) =>
                 e.msg?.type === 'create' &&
-                typeof e.msg?.resumeSessionId === 'string' &&
-                (e.msg.resumeSessionId === originalDurable ||
-                  e.msg.resumeSessionId.endsWith(`/${originalDurable}.jsonl`)),
+                typeof e.msg?.boot?.resume === 'string' &&
+                (e.msg.boot.resume === originalDurable ||
+                  e.msg.boot.resume.endsWith(`/${originalDurable}.jsonl`)),
             )
           return usable && resumed ? `resumed:${status}` : null
         }, { timeout: 30_000 })
