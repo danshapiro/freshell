@@ -289,6 +289,20 @@ describe('TerminalView OSC title scope', () => {
     expect(store.getState().tabs.tabs[0].title).toBe('vim README.md')
   })
 
+  it('a registry title for a shell pane inside a session-owned tab does not retitle the tab', async () => {
+    const { store, paneContent, tabId, paneId, terminalId } = createSplitStore({ owned: true })
+    await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const onMessage = wsMocks.onMessage.mock.calls[wsMocks.onMessage.mock.calls.length - 1]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage({ type: 'terminal.title.updated', terminalId, title: 'Registry title' })
+    })
+
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Registry title')
+    expect(store.getState().tabs.tabs[0].title).toBe('LotL')
+  })
+
   it('the exit suffix never touches a session-owned tab', async () => {
     const { store, paneContent, tabId, paneId, terminalId } = createSplitStore({ owned: true })
     await renderAndGetTitleCb(store, paneContent, tabId, paneId)
