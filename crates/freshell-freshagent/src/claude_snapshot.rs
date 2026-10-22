@@ -471,11 +471,27 @@ fn subdirs_sorted(dir: &Path, errors: &mut ScanErrors) -> Vec<PathBuf> {
             return Vec::new();
         }
     };
+    collect_subdirs(
+        entries
+            .map(|entry| entry.and_then(|entry| Ok((entry.file_type()?.is_dir(), entry.path())))),
+        errors,
+    )
+}
+
+/// The per-entry half of [`subdirs_sorted`]: each listed entry is
+/// `(is_dir, path)` or the error reading it. Directories are kept, sorted;
+/// an entry's error goes to `errors` and the fold keeps going, so one bad
+/// entry never hides the readable ones. Split out because the test
+/// filesystems (ext4/tmpfs report `d_type`) cannot make one entry fail.
+fn collect_subdirs(
+    entries: impl IntoIterator<Item = std::io::Result<(bool, PathBuf)>>,
+    errors: &mut ScanErrors,
+) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for entry in entries {
-        match entry.and_then(|entry| Ok((entry.file_type()?, entry.path()))) {
-            Ok((file_type, path)) if file_type.is_dir() => out.push(path),
-            Ok(_) => {}
+        match entry {
+            Ok((true, path)) => out.push(path),
+            Ok((false, _)) => {}
             Err(e) => errors.remember(e),
         }
     }
