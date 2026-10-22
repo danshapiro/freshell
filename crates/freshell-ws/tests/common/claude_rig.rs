@@ -12,6 +12,9 @@
 //!   (`test/integration/providers/claude-local-provider.mjs --serve`) with a dummy
 //!   key. It never contacts the real API.
 //!
+//! Each rig's server is wired like production: one ownership coordinator shared by
+//! the WS state and the claude lane (main.rs does the same).
+//!
 //! Each rig gets a throwaway HOME / CLAUDE_CONFIG_DIR / workspace, and its server's
 //! [`freshell_freshagent::FreshClaudeState`] gives every sidecar exactly the rig's
 //! environment (the `test-support` seam `with_sidecar_environment`), so nothing from
@@ -340,6 +343,55 @@ impl RigConnection {
         .await;
     }
 
+    /// A send the way the browser client makes every send (`FreshAgentView`'s
+    /// `sendFreshAgentSendFrame`): with a checkpoint intent, and with the owner pair
+    /// (epoch, generation) of the latest `session.runtimeOwner` frame this
+    /// connection read for the session's durable id, once there is one.
+    pub async fn send_checkpointed_text(&mut self, session_id: &str, request_id: &str, text: &str) {
+        let mut frame = json!({
+            "type": "freshAgent.send",
+            "provider": "claude",
+            "sessionType": "freshclaude",
+            "sessionId": session_id,
+            "requestId": request_id,
+            "checkpointIntent": { "logicalAttemptId": format!("attempt-{request_id}") },
+            "text": text,
+        });
+        if let Some((epoch, generation)) = self.observed_owner(session_id) {
+            frame["observedEpoch"] = json!(epoch);
+            frame["observedGeneration"] = json!(generation);
+        }
+        self.send(frame).await;
+    }
+
+    /// The owner pair the client would hold for this pane's session: the latest
+    /// `session.runtimeOwner` frame for the durable id its `session.init` named.
+    fn observed_owner(&self, session_id: &str) -> Option<(u64, u64)> {
+        let durable = self.frames.iter().rev().find_map(|v| {
+            (v["type"] == "freshAgent.event"
+                && v["event"]["type"] == "freshAgent.session.init"
+                && v["event"]["sessionId"] == session_id)
+                .then(|| v["event"]["cliSessionId"].as_str().map(str::to_string))
+                .flatten()
+        })?;
+        self.frames.iter().rev().find_map(|v| {
+            (v["type"] == "session.runtimeOwner"
+                && v["provider"] == "claude"
+                && v["sessionId"] == durable.as_str())
+            .then(|| Some((v["epoch"].as_u64()?, v["generation"].as_u64()?)))
+            .flatten()
+        })
+    }
+
+    /// Top-level `error` frames answering this request id, read so far.
+    pub fn request_errors(&self, request_id: &str) -> Vec<Value> {
+        self.frames
+            .iter()
+            .filter(|v| v["type"] == "error" && v["requestId"] == request_id)
+            .cloned()
+            .collect()
+    }
+
     /// The first `freshAgent.event` whose inner event has this type.
     pub async fn wait_for_event(&mut self, event_type: &str) -> Value {
         self.wait_for(&format!("a {event_type} event"), |v| {
@@ -467,6 +519,13 @@ async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
     *handshake_settings.write().await =
         serde_json::from_value(settings_value).expect("valid settings fixture");
 
+    // The ONE ownership coordinator, wired into the WS state and the claude lane
+    // the way main.rs wires it.
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
+        .with_sidecar_environment(environment);
+    fresh_claude.set_ownership(Arc::clone(&ownership));
+
     let state = WsState {
         layout: Default::default(),
         terminal_meta: Default::default(),
@@ -485,8 +544,7 @@ async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
             Arc::clone(&broadcast_tx),
             json!({ "freshAgent": { "enabled": true } }),
         ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
-            .with_sidecar_environment(environment),
+        fresh_claude,
         fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
             freshell_freshagent::FreshAgentState::new(
                 Arc::clone(&auth_token),
@@ -519,7 +577,7 @@ async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
         session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
-        ownership: None,
+        ownership: Some(ownership),
     };
 
     let router = freshell_ws::router(state);
