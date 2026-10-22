@@ -1,5 +1,10 @@
+import { useId } from 'react'
 import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { selectAttentionTabIds, selectTabAttentionStyle } from '@/store/selectors/tabAttentionSelectors'
+import { otherTabsNeedAttentionLabel, tabAttentionClassName } from '@/lib/tab-attention'
+import { cn } from '@/lib/utils'
+import { TabAttentionIndicator } from '@/components/TabAttentionIndicator'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
@@ -35,9 +40,24 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
     (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
   )
   const extensions = useAppSelector((s) => s.extensions?.entries)
+  const attentionTabIds = useAppSelector(selectAttentionTabIds)
+  const tabAttentionStyle = useAppSelector(selectTabAttentionStyle)
+  const descriptionIdBase = useId()
 
   const activeIndex = tabs.findIndex((t) => t.id === activeTabId)
   const activeTab = activeIndex >= 0 ? tabs[activeIndex] : null
+
+  // Needs-attention marks (same style-gated union as the desktop tabs): the
+  // active title, a count of the OTHER marked tabs, and a dot on the chevron
+  // pointing toward marked tabs.
+  const activeNeedsAttention = Boolean(activeTab && attentionTabIds.includes(activeTab.id))
+  const otherAttentionCount = attentionTabIds.length - (activeNeedsAttention ? 1 : 0)
+  const attentionIndexes = attentionTabIds.map((id) => tabs.findIndex((t) => t.id === id))
+  const earlierNeedsAttention = activeIndex >= 0 && attentionIndexes.some((index) => index >= 0 && index < activeIndex)
+  const laterNeedsAttention = activeIndex >= 0 && attentionIndexes.some((index) => index > activeIndex)
+  const activeDescriptionId = `${descriptionIdBase}-active-attention`
+  const prevDescriptionId = `${descriptionIdBase}-prev-attention`
+  const nextDescriptionId = `${descriptionIdBase}-next-attention`
 
   const displayTitle = activeTab
     ? getTabDisplayTitle(activeTab, paneLayouts[activeTab.id], paneTitles?.[activeTab.id], extensions)
@@ -69,6 +89,9 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
 
   return (
     <div className="relative z-20 h-12 shrink-0 flex items-center px-2 bg-background border-b border-border/30">
+      {activeNeedsAttention && <span id={activeDescriptionId} className="sr-only">This tab needs attention</span>}
+      {earlierNeedsAttention && <span id={prevDescriptionId} className="sr-only">An earlier tab needs attention</span>}
+      {laterNeedsAttention && <span id={nextDescriptionId} className="sr-only">A later tab needs attention</span>}
       {sidebarCollapsed && onToggleSidebar && (
         <button
           className="min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
@@ -80,21 +103,41 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
         </button>
       )}
       <button
-        className="min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground disabled:opacity-30"
+        className="relative min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground disabled:opacity-30"
         onClick={() => { triggerHapticFeedback(); dispatch(switchToPrevTab()) }}
         disabled={isFirst}
         aria-label="Previous tab"
+        aria-describedby={earlierNeedsAttention ? prevDescriptionId : undefined}
       >
         <ChevronLeft className="h-5 w-5" />
+        {earlierNeedsAttention && (
+          <TabAttentionIndicator
+            variant="dot"
+            label="An earlier tab needs attention"
+            style={tabAttentionStyle}
+            className="absolute right-1.5 top-2"
+          />
+        )}
       </button>
 
       <button
         className="flex-1 flex items-center justify-center gap-2 min-h-11 rounded-md"
         onClick={() => { triggerHapticFeedback(); onOpenSwitcher?.() }}
         aria-label="Open tab switcher"
+        aria-describedby={activeNeedsAttention ? activeDescriptionId : undefined}
       >
         <span className="flex min-w-0 items-center gap-2">
-          <span className="text-sm font-medium truncate max-w-[160px]">
+          <span
+            className={cn(
+              'text-sm font-medium truncate max-w-[160px]',
+              tabAttentionClassName({
+                needsAttention: activeNeedsAttention,
+                style: tabAttentionStyle,
+                active: true,
+                surface: 'pill',
+              }),
+            )}
+          >
             {displayTitle || 'Untitled'}
           </span>
           {isActiveBusy && (
@@ -111,12 +154,28 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
         </span>
       </button>
 
+      <TabAttentionIndicator
+        count={otherAttentionCount}
+        label={otherTabsNeedAttentionLabel(otherAttentionCount)}
+        style={tabAttentionStyle}
+        className="px-1"
+      />
+
       <button
-        className="min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
+        className="relative min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
         onClick={handleRightAction}
         aria-label={isLast ? 'New tab' : 'Next tab'}
+        aria-describedby={laterNeedsAttention ? nextDescriptionId : undefined}
       >
         {isLast ? <Plus className="h-5 w-5" /> : <ChevronRight className="h-5 w-5" />}
+        {laterNeedsAttention && (
+          <TabAttentionIndicator
+            variant="dot"
+            label="A later tab needs attention"
+            style={tabAttentionStyle}
+            className="absolute right-1.5 top-2"
+          />
+        )}
       </button>
     </div>
   )
