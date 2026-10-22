@@ -64,6 +64,7 @@ fn names_state(home: &std::path::Path) -> SessionNamesState {
         auth_token: Arc::new("tok".to_string()),
         names,
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        index: None,
     }
 }
 
@@ -456,6 +457,190 @@ async fn every_surface_renames_the_same_durable_record_across_all_six_modes() {
     }
 }
 
+/// Name-reliability Task 4: an automation rename reports whether it
+/// applied, at each route's own nesting — the canonical route answers the
+/// update itself (`outcome`), the session and terminal routes nest it under
+/// `sessionName`, and the fresh-agent pane/tab routes under
+/// `data.sessionName`. A protected name answers `protected_name` on every
+/// surface; a rename to the target's own folder name answers
+/// `default_label`, classified with the best-known folder each surface has
+/// (an identity row's cwd for the canonical route, the pane content's
+/// `initialCwd` for the pane route).
+#[tokio::test]
+async fn automation_rename_outcome_reaches_every_route_response() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let names = state.names.clone();
+    let protected_id = "eeee5555-0000-4000-8000-000000000005";
+    let folder_id = "ffff6666-0000-4000-8000-000000000006";
+    admit_pending(
+        &names,
+        "handle-protected",
+        NamedProvider::Claude,
+        Some("/w"),
+    )
+    .await;
+    bind_verified(
+        &names,
+        "handle-protected",
+        NamedProvider::Claude,
+        protected_id,
+    )
+    .await;
+    let protected = SessionNameRef::Session {
+        provider: NamedProvider::Claude,
+        session_id: protected_id.to_string(),
+    };
+    names
+        .rename(RenameNameInput {
+            target: protected.clone(),
+            name: "LotL".into(),
+            intent: NameIntent::User,
+            if_revision: None,
+            cwd: None,
+        })
+        .await
+        .expect("the user names it");
+    let refused = json!({ "applied": false, "reason": "protected_name" });
+
+    // 1. The canonical route: the update itself.
+    let (status, body) = patch(
+        super::router(state.clone()),
+        "/api/session-names",
+        json!({
+            "target": { "kind": "session", "provider": "claude", "sessionId": protected_id },
+            "name": "Agent suggestion",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], refused, "canonical: {body}");
+    assert_eq!(body["record"]["name"], "LotL");
+
+    // 2. The session route: `sessionName.outcome`.
+    let (status, body) = patch(
+        sessions_router(&home, &names),
+        &format!("/api/sessions/{protected_id}?provider=claude"),
+        json!({ "titleOverride": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sessionName"]["outcome"], refused, "session: {body}");
+
+    // 3. The terminal route: `sessionName.outcome`.
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    identity.set_session_naming(names.clone());
+    identity.upsert(
+        "term-out",
+        Some("claude"),
+        Some(protected_id),
+        Some("/w"),
+        1_000,
+    );
+    identity.set_name_binding("term-out", Some(protected.clone()), None);
+    let terminals = crate::terminals::router(crate::terminals::TerminalsState {
+        auth_token: Arc::new("tok".to_string()),
+        settings: crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]),
+        registry: freshell_terminal::TerminalRegistry::new(),
+        broadcast_tx: Arc::new(tx),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        identity,
+    });
+    let (status, body) = patch(
+        terminals,
+        "/api/terminals/term-out",
+        json!({ "titleOverride": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sessionName"]["outcome"], refused, "terminal: {body}");
+
+    // 4 + 5. The fresh-agent pane and tab routes: `data.sessionName.outcome`.
+    let content = scoped_pane_content("claude", "claude", protected_id);
+    for (uri, label) in [("/api/panes/p1", "pane"), ("/api/tabs/t1", "tab")] {
+        let (status, body) = patch(
+            fresh_router(&names, content.clone()),
+            uri,
+            json!({ "name": "Agent suggestion" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+        assert_eq!(
+            body["data"]["sessionName"]["outcome"], refused,
+            "{label}: {body}"
+        );
+    }
+    let still = names.get(vec![protected.clone()]).await.unwrap();
+    assert_eq!(still[0].record.name, "LotL", "no surface changed the name");
+
+    // The folder rule, through the canonical route (an identity row bound to
+    // the session knows its cwd) and the pane route (its `initialCwd`).
+    admit_pending(&names, "handle-folder", NamedProvider::Claude, Some("/w")).await;
+    bind_verified(&names, "handle-folder", NamedProvider::Claude, folder_id).await;
+    let folder_target = SessionNameRef::Session {
+        provider: NamedProvider::Claude,
+        session_id: folder_id.to_string(),
+    };
+    let canonical_state = names_state_sharing(&state);
+    canonical_state.identity.upsert(
+        "term-folder",
+        Some("claude"),
+        Some(folder_id),
+        Some("/home/dan/code/freshell"),
+        1_000,
+    );
+    canonical_state
+        .identity
+        .set_name_binding("term-folder", Some(folder_target.clone()), None);
+    let (status, body) = patch(
+        super::router(canonical_state),
+        "/api/session-names",
+        json!({
+            "target": { "kind": "session", "provider": "claude", "sessionId": folder_id },
+            "name": "freshell",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["outcome"],
+        json!({ "applied": false, "reason": "default_label" }),
+        "canonical folder rule: {body}"
+    );
+
+    let mut folder_content = scoped_pane_content("claude", "claude", folder_id);
+    folder_content["initialCwd"] = json!("/home/dan/code/freshell");
+    let (status, body) = patch(
+        fresh_router(&names, folder_content),
+        "/api/panes/p1",
+        json!({ "name": "freshell" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["sessionName"]["outcome"],
+        json!({ "applied": false, "reason": "default_label" }),
+        "pane folder rule: {body}"
+    );
+    let folder_record = names.get(vec![folder_target]).await.unwrap();
+    assert_eq!(
+        folder_record[0].record.name, "w",
+        "the folder name never applied"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A second state over the SAME store with its own (empty) identity table.
+fn names_state_sharing(state: &SessionNamesState) -> SessionNamesState {
+    SessionNamesState {
+        auth_token: Arc::clone(&state.auth_token),
+        names: state.names.clone(),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        index: None,
+    }
+}
+
 /// A pending pane renamed BEFORE its durable identity exists keeps the name
 /// through the verified bind: the pre-durable rename targets the pending
 /// handle, and the bind transfers it onto the durable record atomically (the
@@ -609,6 +794,7 @@ async fn scoped_reset_is_refused_on_every_surface() {
             name: "Protected".into(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
         .unwrap();
@@ -1132,6 +1318,7 @@ async fn two_store_participants_converge_through_unconditional_refresh() {
         name: "Renamed By A".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
@@ -1185,6 +1372,7 @@ async fn a_foreign_status_only_native_sync_transition_republishes_on_adoption() 
         name: "Manually Named".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .unwrap();
@@ -1324,6 +1512,7 @@ async fn verified_relocation_retains_the_name_and_leaves_non_targets_untouched()
             name: "Kept Through Move".into(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
         .unwrap();

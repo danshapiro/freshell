@@ -985,6 +985,7 @@ mod tests {
                         document_generation: 1,
                         changed: false,
                         native_sync: None,
+                        outcome: None,
                     },
                 )
                 .collect();
@@ -1030,6 +1031,7 @@ mod tests {
                     document_generation: 1,
                     changed: true,
                     native_sync: None,
+                    outcome: None,
                 })
             })
         }

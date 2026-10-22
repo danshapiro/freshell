@@ -386,6 +386,7 @@ impl NamingProbeSink {
             document_generation: 1,
             changed,
             native_sync: None,
+            outcome: None,
         }
     }
 }

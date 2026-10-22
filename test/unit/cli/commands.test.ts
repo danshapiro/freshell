@@ -17,8 +17,9 @@ const cliPath = resolve(process.cwd(), 'tools/freshell-cli/index.ts')
 const tsxLoader = pathToFileURL(require.resolve('tsx')).href
 
 /** Spawns the real CLI (retained-flags.test.ts pattern) against a stub HTTP
- * server and records every resulting HTTP call. */
-async function invokeCli(args: string[]) {
+ * server and records every resulting HTTP call. `outcome` (name-reliability
+ * Task 4) is the rename outcome the stub's accepted update carries. */
+async function invokeCli(args: string[], opts: { outcome?: unknown } = {}) {
   const requests: Array<{ url: string; body: any }> = []
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = []
@@ -41,6 +42,7 @@ async function invokeCli(args: string[]) {
             documentGeneration: 9,
             redirects: [],
             changed: true,
+            ...(opts.outcome !== undefined ? { outcome: opts.outcome } : {}),
           },
         },
       }))
@@ -270,6 +272,35 @@ describe('CLI commands', () => {
       expect(result.code).toBe(1)
       expect(result.requests).toEqual([])
       expect(result.stderr).toContain('--name-intent')
+    })
+
+    it('rename-tab reports a refused automation rename on stderr', async () => {
+      const result = await invokeCli(['rename-tab', '--target', 't1', 'Bot name'], {
+        outcome: { applied: false, reason: 'protected_name' },
+      })
+      expect(result.code).toBe(0)
+      expect(result.stderr).toContain('name not applied: protected_name')
+      // The accepted (unchanged) record is still printed.
+      expect(result.stdout).toContain('Accepted server name')
+    })
+
+    it('rename-pane reports a refused default label on stderr', async () => {
+      const result = await invokeCli(['rename-pane', '--target', 'p1', 'Tab 3'], {
+        outcome: { applied: false, reason: 'default_label' },
+      })
+      expect(result.code).toBe(0)
+      expect(result.stderr).toContain('name not applied: default_label')
+    })
+
+    it('an applied or unchanged rename prints nothing on stderr', async () => {
+      const applied = await invokeCli(['rename-tab', '--target', 't1', 'Good name'], {
+        outcome: { applied: true },
+      })
+      expect(applied.stderr).toBe('')
+      const unchanged = await invokeCli(['rename-pane', '--target', 'p1', 'Same name'], {
+        outcome: { applied: true, reason: 'unchanged' },
+      })
+      expect(unchanged.stderr).toBe('')
     })
 
     it('reflects the server-accepted name in the response, not the submitted string', async () => {

@@ -802,6 +802,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         name: "Pre Identity Name".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .expect("pre-identity rename lands on the pending record");
@@ -894,6 +895,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         name: "C Own Name".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .expect("name C2");
@@ -942,6 +944,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         name: "Renamed After Switch".into(),
         intent: NameIntent::User,
         if_revision: None,
+        cwd: None,
     })
     .await
     .expect("rename through the pane's current binding");

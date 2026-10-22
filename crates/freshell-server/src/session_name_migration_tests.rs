@@ -1216,6 +1216,7 @@ async fn late_legacy_imports_cannot_beat_post_migration_names() {
             name: "Fresh User Rename".into(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
         .unwrap();

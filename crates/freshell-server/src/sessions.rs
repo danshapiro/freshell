@@ -354,12 +354,19 @@ async fn scoped_session_rename(
                 .into_response()
         }
     };
+    // Name-reliability Task 4 (LB-B8): the session index row's folder.
+    let cwd = crate::session_name_routes::rename_target_cwd(
+        &target,
+        &state.identity,
+        state.index.as_deref(),
+    );
     let update = match crate::session_name_routes::rename_through_authority(
         sink.as_ref(),
         target,
         name.to_string(),
         intent,
         if_revision,
+        cwd,
     )
     .await
     {

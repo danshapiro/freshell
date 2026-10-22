@@ -103,6 +103,7 @@ async fn rename_user(
             name: name.to_string(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
 }

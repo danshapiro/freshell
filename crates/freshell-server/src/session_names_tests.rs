@@ -64,6 +64,7 @@ async fn rename_user(
             name: name.to_string(),
             intent: NameIntent::User,
             if_revision: None,
+            cwd: None,
         })
         .await
 }
@@ -80,6 +81,7 @@ async fn rename_user_cas(
             name: name.to_string(),
             intent: NameIntent::User,
             if_revision: Some(if_revision),
+            cwd: None,
         })
         .await
 }
@@ -95,6 +97,7 @@ async fn rename_automatic(
             name: name.to_string(),
             intent: NameIntent::Automatic,
             if_revision: None,
+            cwd: None,
         })
         .await
 }
@@ -2232,18 +2235,26 @@ async fn observe_native_folds_provider_titles_and_own_write_echoes() {
     assert!(!stale.changed, "old-location observations never fold names");
     assert_eq!(stale.record.name, "Native title");
 
-    // Equal-rank automatic observations preserve the accepted value.
+    // Name-reliability Task 4: an ECHO of the native title the provider
+    // already reported (the record's baseline) preserves the accepted value
+    // at the current location — provenance only, no document write.
+    let echo_generation = read_raw_document(dir.path()).document_generation;
     let equal = store
         .observe_native(observe(
             target.clone(),
-            "Different provider title",
+            "Native title",
             NativeNameOrigin::ProviderAi,
             1,
         ))
         .await
-        .expect("equal-rank observation");
+        .expect("echo observation");
     assert!(!equal.changed);
     assert_eq!(equal.record.name, "Native title");
+    assert_eq!(
+        read_raw_document(dir.path()).document_generation,
+        echo_generation,
+        "an echo writes nothing"
+    );
 
     // Invalid titles (an external rename over the accepted-name cap) never
     // fail the transaction: only the offer is skipped — no rename, no error
@@ -2285,6 +2296,21 @@ async fn observe_native_folds_provider_titles_and_own_write_echoes() {
         observation.location_revision, 0,
         "the losing no-op observation did not overwrite the committed provenance"
     );
+
+    // Name-reliability Task 4: a provider title that actually CHANGED (it
+    // differs from the baseline) replaces the older provider-level name.
+    let changed = store
+        .observe_native(observe(
+            target.clone(),
+            "Different provider title",
+            NativeNameOrigin::ProviderAi,
+            1,
+        ))
+        .await
+        .expect("changed-title observation");
+    assert!(changed.changed);
+    assert_eq!(changed.record.name, "Different provider title");
+    assert_eq!(changed.record.source, NameSource::ProviderAi);
 }
 
 /// Delta-review round 4, finding 2: the mutate-then-`Decision::Read` hazard.
@@ -2405,13 +2431,14 @@ async fn observation_only_native_titles_do_not_rewrite_the_document() {
     assert_eq!(folded.record.name, "Native title");
     let generation = read_raw_document(dir.path()).document_generation;
 
-    // An equal-rank automatic observation LOSES (equal-rank observations
-    // preserve the accepted value) and there is no series to rearm: the only
-    // thing this observation could move is last_observation.at.
+    // An echo of the same native title (the record's baseline; name-
+    // reliability Task 4 — a CHANGED title would now replace the name)
+    // changes nothing and there is no series to rearm: the only thing this
+    // observation could move is last_observation.at.
     let noop = store
         .observe_native(observe(
             target.clone(),
-            "A different provider title",
+            "Native title",
             NativeNameOrigin::ProviderAi,
             0,
         ))
@@ -2746,6 +2773,7 @@ async fn publisher_recovers_a_lagged_subscription_by_re_diffing_every_record() {
         document_generation: 1,
         changed: true,
         native_sync: None,
+        outcome: None,
     };
     tx.send(dummy("buried-1")).expect("send 1");
     tx.send(dummy("buried-2")).expect("send 2");
@@ -2848,6 +2876,7 @@ async fn publisher_directory_invalidation_tracks_title_overriding_changes() {
         document_generation: 1,
         changed,
         native_sync: None,
+        outcome: None,
     };
 
     // An automatic first-message install (changed: true) and a status-only

@@ -1978,37 +1978,15 @@ async fn main() -> ExitCode {
     // the durable opencode session's record, else the terminal's own
     // (pending) naming ref. A detached fold never disturbs the activity
     // lane; no wired store (degraded boot) drops the observation.
-    let opencode_native_title_observer: freshell_ws::opencode_lane::NativeTitleObserver = {
-        let identity = terminal_identity.clone();
-        let names = session_names.clone();
-        std::sync::Arc::new(move |terminal_id: &str, session_id: &str, title: &str| {
-            let Some(names) = names.clone() else {
-                return;
-            };
-            let identity = identity.clone();
-            let terminal_id = terminal_id.to_string();
-            let session_id = session_id.to_string();
-            let title = title.to_string();
-            tokio::spawn(async move {
-                let sink: Option<std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>> =
-                    Some(names);
-                let target = identity
-                    .named_session_ref_of("opencode", &session_id)
-                    .or_else(|| identity.name_ref_for(&terminal_id));
-                let Some(target) = target else {
-                    return;
-                };
-                let _ = freshell_freshagent::naming::observe_native_live(
-                    &sink,
-                    target,
-                    &title,
-                    freshell_freshagent::naming::NativeNameOrigin::Snapshot,
-                    None,
-                )
-                .await;
-            });
-        })
-    };
+    // Name-reliability Task 4: built in `freshell_ws::opencode_title_naming`
+    // (stream-ordered, placeholder-free, never stalls the lane).
+    let opencode_native_title_observer: freshell_ws::opencode_lane::NativeTitleObserver =
+        freshell_ws::opencode_title_naming::naming_title_observer(
+            terminal_identity.clone(),
+            session_names.clone().map(|names| {
+                names as std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>
+            }),
+        );
     activity_hub.set_opencode_lane_deps(std::sync::Arc::new(
         freshell_ws::opencode_lane::OpencodeLaneDeps {
             http: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneHttp::new()),
@@ -2816,6 +2794,8 @@ async fn main() -> ExitCode {
     // Task 6: the sessions router's provider-generated short-circuit reads
     // the SAME session index (another clone before the move below).
     let sessions_state_index = session_index.clone();
+    // Name-reliability Task 4: the canonical rename route's folder lookup.
+    let session_name_routes_index = session_index.clone();
     // The session-metadata store was created above (before the sweeps) —
     // both the `POST /api/session-metadata` write route below and Task
     // 20's session-directory read-join share that instance.
@@ -3259,6 +3239,9 @@ async fn main() -> ExitCode {
                         // terminal import targets (the same registry every
                         // rename surface reads).
                         identity: terminal_identity.clone(),
+                        // Name-reliability Task 4: the best-known folder of a
+                        // session-key rename target.
+                        index: session_name_routes_index.clone(),
                     })
                 })
                 .unwrap_or_default(),

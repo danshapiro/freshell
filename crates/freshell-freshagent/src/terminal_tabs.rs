@@ -3494,6 +3494,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                                         intent:
                                             freshell_protocol::session_names::NameIntent::Automatic,
                                         if_revision: None,
+                                        cwd: spec.cwd.clone(),
                                     })
                                     .await
                                 {
