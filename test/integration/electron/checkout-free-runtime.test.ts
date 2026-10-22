@@ -590,11 +590,11 @@ describe('checkout-free Electron runtime acceptance', () => {
         (message) => message.type === 'sdk.session.changed',
       ])
       claude.stdin?.write(`${JSON.stringify({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'checkout-free-create' })}\n`)
-      const [created, catalog] = await responses
+      const [created, commandCatalog] = await responses
       expect(created).toMatchObject({ type: 'created', requestId: 'checkout-free-create', protocol: 2 })
       const sessionId = (created as { sessionId?: string }).sessionId
       expect(sessionId).toEqual(expect.any(String))
-      expect(catalog).toMatchObject({ type: 'sdk.session.changed', sessionId, reason: 'session-commands', commands: [{ name: 'checkout-free-command' }] })
+      expect(commandCatalog).toMatchObject({ type: 'sdk.session.changed', sessionId, reason: 'session-commands', commands: [{ name: 'checkout-free-command' }] })
       claude.stdin?.write('{"type":"shutdown"}\n')
       await waitForExit(claude)
 
