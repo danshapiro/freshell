@@ -155,20 +155,33 @@ fn document_json(dir: &std::path::Path) -> Value {
     serde_json::from_slice(&bytes).expect("document parses")
 }
 
-/// Wait for the store to PUBLISH `target`'s native projection at `status` —
-/// the worker's own fold event — on a receiver subscribed BEFORE the work
-/// that produces it could run, then confirm the durable read agrees. A worker
-/// cycle is several durable transactions (plus any capability re-probe
-/// window before it), so it takes as long as the disk does; the bound only
-/// turns a series that never converges into a failure instead of a hang.
+/// How long a real-clock test waits for a worker cycle to converge. A cycle
+/// is several durable transactions, so it takes as long as the disk does;
+/// this bound only turns a series that never converges into a failure
+/// instead of a hang.
+const REAL_CLOCK_CONVERGENCE_BOUND: Duration = Duration::from_secs(30);
+
+/// The paused-clock bound for a capability-test series to converge once its
+/// capability is present (from its arrival, or from worker start for a
+/// series that never lacked it) — the five seconds these tests have always
+/// allowed. Blocking
+/// document IO does not advance the paused clock, so this measures only the
+/// worker's own polls and re-probe window, whatever the disk speed.
+const CAPABILITY_ARRIVAL_CONVERGENCE_BOUND: Duration = Duration::from_secs(5);
+
+/// Wait (at most `within`, on tokio's clock) for the store to PUBLISH
+/// `target`'s native projection at `status` — the worker's own fold event —
+/// on a receiver subscribed BEFORE the work that produces it could run, then
+/// confirm the durable read agrees.
 async fn await_published_native_status(
     store: &Arc<SessionNames>,
     published: &mut tokio::sync::broadcast::Receiver<SessionNameUpdate>,
     target: &SessionNameRef,
     status: NativeSyncStatus,
+    within: Duration,
     failure: &str,
 ) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(within, async {
         loop {
             let update = published
                 .recv()
@@ -1187,6 +1200,7 @@ async fn the_worker_loop_converges_an_armed_series() {
         &mut published,
         &target,
         NativeSyncStatus::Synced,
+        REAL_CLOCK_CONVERGENCE_BOUND,
         "the worker must converge the armed series",
     )
     .await;
@@ -2241,23 +2255,74 @@ async fn the_opencode_read_gates_on_the_effective_database_context() {
 // and work proceeds once the capability arrives.
 // ---------------------------------------------------------------------------
 
+/// When an absent capability arrived and when the worker's probe first
+/// reported it available, on tokio's clock. The capability-pause tests run
+/// on the paused clock, where only the worker's own timers advance time
+/// (blocking document IO does not), so the gap measures the worker's re-probe
+/// scheduling exactly, never disk speed.
+#[derive(Clone, Copy, Debug, Default)]
+struct CapabilityArrival {
+    wired_at: Option<tokio::time::Instant>,
+    first_available_probe: Option<tokio::time::Instant>,
+}
+
+impl CapabilityArrival {
+    fn wired(&mut self) {
+        self.wired_at = Some(tokio::time::Instant::now());
+        self.first_available_probe = None;
+    }
+
+    fn probed_available(&mut self) {
+        if self.wired_at.is_some() && self.first_available_probe.is_none() {
+            self.first_available_probe = Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// The re-probe contract: a refused series rotates out of selection for
+    /// one `CAPABILITY_REPROBE_DELAY` and re-probes at the first worker poll
+    /// after that, so capability arrival is discovered within one window
+    /// plus one `WORKER_POLL_INTERVAL`.
+    fn assert_discovered_within_one_reprobe_window(&self, what: &str) {
+        let wired_at = self
+            .wired_at
+            .unwrap_or_else(|| panic!("{what}: the capability was never wired"));
+        let probed_at = self
+            .first_available_probe
+            .unwrap_or_else(|| panic!("{what}: no probe ever saw the arrived capability"));
+        let latency = probed_at.duration_since(wired_at);
+        let window = super::CAPABILITY_REPROBE_DELAY + super::WORKER_POLL_INTERVAL;
+        assert!(
+            latency <= window,
+            "{what}: the arrived capability was first probed {latency:?} after it \
+             arrived; one re-probe window allows {window:?}"
+        );
+    }
+}
+
 /// A dispatch-shaped backend whose wired adapter can swap mid-test: `None`
 /// models the degraded boot (no adapter for the provider — every operation
 /// answers the production `Unsupported`), `Some(scripted)` models the
 /// capability arriving.
 struct SwappableDispatch {
     live: Arc<std::sync::RwLock<Option<Arc<ScriptedBackend>>>>,
+    arrival: Mutex<CapabilityArrival>,
 }
 
 impl SwappableDispatch {
     fn unwired() -> Arc<Self> {
         Arc::new(Self {
             live: Arc::new(std::sync::RwLock::new(None)),
+            arrival: Mutex::new(CapabilityArrival::default()),
         })
     }
 
     fn wire(self: &Arc<Self>, backend: Arc<ScriptedBackend>) {
         *self.live.write().unwrap() = Some(backend);
+        self.arrival.lock().unwrap().wired();
+    }
+
+    fn arrival(&self) -> CapabilityArrival {
+        *self.arrival.lock().unwrap()
     }
 }
 
@@ -2288,6 +2353,9 @@ impl NativeNameBackend for SwappableDispatch {
 
     fn route_available(&self, _target: NativeNameTarget) -> super::NativeProbeFuture {
         let live = self.live.read().unwrap().is_some();
+        if live {
+            self.arrival.lock().unwrap().probed_available();
+        }
         Box::pin(async move { live })
     }
 }
@@ -2295,9 +2363,11 @@ impl NativeNameBackend for SwappableDispatch {
 /// T3-I3: rename a session whose provider capability is ABSENT (a degraded
 /// boot with no adapter wired): no cycle is consumed, the series stays
 /// `pending` and discoverable, and the work proceeds once the capability
-/// arrives — never a burned cycle and a misleading `unsupported` per
-/// decision.
-#[tokio::test]
+/// arrives — discovered within one re-probe window — never a burned cycle
+/// and a misleading `unsupported` per decision. Paused clock: the worker's
+/// poll and re-probe timers are virtual, so the discovery bound is exact and
+/// the durable writes in between take as long as the disk does.
+#[tokio::test(start_paused = true)]
 async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
     let dir = temp_data_dir();
     let store = open_store(dir.path());
@@ -2310,8 +2380,8 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
         inert_generation(dir.path()),
     );
     // Ample opportunity for the loop to (wrongly) claim while the capability
-    // is absent — the worker polls every 500ms.
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // is absent: several re-probe windows of worker polls (virtual time).
+    tokio::time::sleep(3 * (super::CAPABILITY_REPROBE_DELAY + super::WORKER_POLL_INTERVAL)).await;
 
     let sync = native_sync_of(&store, target.clone())
         .await
@@ -2332,8 +2402,8 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
         "no cycle is consumed while the capability is absent"
     );
 
-    // The capability arrives: the SAME series proceeds and converges (after
-    // the refused probe's re-probe window, through its own cycle).
+    // The capability arrives: the SAME series is re-probed within one
+    // re-probe window and converges through its own cycle.
     let mut published = store.subscribe();
     let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
     backend.set_title(Some("Divergent"));
@@ -2343,10 +2413,14 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
         &mut published,
         &target,
         NativeSyncStatus::Synced,
+        CAPABILITY_ARRIVAL_CONVERGENCE_BOUND,
         "the paused series must converge once the capability arrives",
     )
     .await;
     worker.abort();
+    dispatch
+        .arrival()
+        .assert_discovered_within_one_reprobe_window("the paused series");
     assert_eq!(backend.writes(), 1);
     assert_eq!(backend.reads(), 2);
 }
@@ -2358,6 +2432,8 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
 struct SelectiveCapabilityBackend {
     scripted: Arc<ScriptedBackend>,
     refused: Arc<Mutex<Vec<String>>>,
+    /// Arrival of each refused root's capability, keyed by config root.
+    arrivals: Mutex<std::collections::BTreeMap<String, CapabilityArrival>>,
 }
 
 impl SelectiveCapabilityBackend {
@@ -2367,11 +2443,27 @@ impl SelectiveCapabilityBackend {
             refused: Arc::new(Mutex::new(
                 roots.iter().map(|root| root.to_string()).collect(),
             )),
+            arrivals: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
     fn wire(&self, root: &str) {
         self.refused.lock().unwrap().retain(|r| r != root);
+        self.arrivals
+            .lock()
+            .unwrap()
+            .entry(root.to_string())
+            .or_default()
+            .wired();
+    }
+
+    fn arrival(&self, root: &str) -> CapabilityArrival {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .get(root)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -2386,12 +2478,20 @@ impl NativeNameBackend for SelectiveCapabilityBackend {
 
     fn route_available(&self, target: NativeNameTarget) -> super::NativeProbeFuture {
         let refused = match &target.location {
-            NativeLocation::Claude { config_root, .. } => self
-                .refused
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|r| r == config_root),
+            NativeLocation::Claude { config_root, .. } => {
+                let refused = self
+                    .refused
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r == config_root);
+                if !refused {
+                    if let Some(arrival) = self.arrivals.lock().unwrap().get_mut(config_root) {
+                        arrival.probed_available();
+                    }
+                }
+                refused
+            }
             _ => false,
         };
         Box::pin(async move { !refused })
@@ -2402,9 +2502,11 @@ impl NativeNameBackend for SelectiveCapabilityBackend {
 /// starve the armed series behind it. A probe refusal rotates the paused
 /// head out of selection for a bounded window: the READY series converges,
 /// the paused series itself stays pending, discoverable, and uncharged, and
-/// once its capability arrives it converges within one bounded window —
-/// the rotation is a re-probe backoff, never an eviction.
-#[tokio::test]
+/// once its capability arrives it is re-probed within one bounded window and
+/// converges — the rotation is a re-probe backoff, never an eviction. Paused
+/// clock, as in the capability-pause test above: the window is measured on
+/// the worker's virtual timers, independent of disk speed.
+#[tokio::test(start_paused = true)]
 async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
     let dir = temp_data_dir();
     let store = open_store(dir.path());
@@ -2438,12 +2540,15 @@ async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
         &mut published,
         &ready,
         NativeSyncStatus::Synced,
+        CAPABILITY_ARRIVAL_CONVERGENCE_BOUND,
         "the ready series must converge despite the paused head",
     )
     .await;
 
-    // The paused head consumed nothing while refused: still pending, still
-    // discoverable work, its whole allowance intact.
+    // The paused head stays refused across several re-probe windows
+    // (virtual time) and consumed nothing: still pending, still discoverable
+    // work, its whole allowance intact.
+    tokio::time::sleep(3 * (super::CAPABILITY_REPROBE_DELAY + super::WORKER_POLL_INTERVAL)).await;
     let sync = native_sync_of(&store, paused.clone())
         .await
         .expect("series projected");
@@ -2466,17 +2571,22 @@ async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
         "the refused head consumed no cycle"
     );
 
-    // The capability arrives: the paused head converges too.
+    // The capability arrives: the paused head is re-probed within one
+    // re-probe window and converges too.
     dispatch.wire("/paused/.claude");
     await_published_native_status(
         &store,
         &mut published,
         &paused,
         NativeSyncStatus::Synced,
+        CAPABILITY_ARRIVAL_CONVERGENCE_BOUND,
         "the paused head must converge once its capability arrives",
     )
     .await;
     worker.abort();
+    dispatch
+        .arrival("/paused/.claude")
+        .assert_discovered_within_one_reprobe_window("the paused head");
     // Both series converged through their own full cycles — one write and
     // two reads each — and nothing was double-dispatched while paused.
     assert_eq!(scripted.writes(), 2);
