@@ -602,4 +602,69 @@ mod checkpointed_sends {
         );
         assert_eq!(turn_completes(&conn.frames, &session_id).len(), 1);
     }
+
+    /// Before the CLI reports the session, the coordinator can still hold a
+    /// record under the pane's placeholder id: a lifecycle operation started from
+    /// a pane with no durable id addresses the session by that id. A message sent
+    /// while the operation is in flight is refused and never reaches the sidecar;
+    /// once the operation settles and nothing owns the placeholder, the same
+    /// message runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_a_lifecycle_operation_on_the_placeholder_before_the_session_is_reported() {
+        let _env = CLAUDE_ENV_LOCK.lock().await;
+        let sidecar = FakeSidecar::install(InitAt::FirstPrompt);
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let url = spawn_server(Arc::clone(&ownership)).await;
+        let mut conn = Conn::connect(&url).await;
+
+        let session_id = conn.create("create-1").await;
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_handoff(
+            "claude",
+            &session_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "test-placeholder-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the handoff on the unreported session's placeholder must be granted")
+        };
+
+        conn.send_like_the_browser(&session_id, "send-during", "message during the handoff")
+            .await;
+        let refusal = conn.send_outcome("send-during").await;
+        assert_eq!(refusal["type"], "error", "{refusal}");
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("SESSION_RESERVED")
+                && message
+                    .contains(freshell_freshagent::ownership_lane::LIFECYCLE_OP_GUARD_MESSAGE),
+            "refused while the handoff owns the placeholder: {refusal}"
+        );
+
+        assert!(
+            matches!(
+                ownership.fail(
+                    "claude",
+                    &session_id,
+                    "test-placeholder-handoff",
+                    generation,
+                    false
+                ),
+                freshell_ownership::FailOutcome::Vacant { .. }
+            ),
+            "fixture: the failed handoff leaves the placeholder vacant"
+        );
+        conn.send_like_the_browser(&session_id, "send-after", "message after the handoff")
+            .await;
+        conn.expect_send_runs(&session_id, "send-after", 1).await;
+
+        conn.kill(&session_id).await;
+        assert_eq!(
+            sidecar.prompts(),
+            vec!["message after the handoff".to_string()],
+            "the message sent during the handoff never reached the sidecar"
+        );
+        assert_eq!(turn_completes(&conn.frames, &session_id).len(), 1);
+    }
 }
