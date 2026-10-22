@@ -133,8 +133,9 @@ pub(crate) struct ClaudeTranscriptProjector {
     /// `system/compact_boundary` uuids, to tell whether a compaction recap
     /// already has its marker.
     compact_boundaries: HashSet<String>,
-    /// Every tool call seen so far: tool_use id -> (name, input).
-    tool_calls: HashMap<String, (String, Value)>,
+    /// File-editing tool calls seen so far: tool_use id -> the path their
+    /// input names (the result line names only the tool_use id).
+    edit_calls: HashMap<String, Option<String>>,
     /// Files changed by successful edit tools, by path (one row per path).
     changed_files: BTreeMap<String, ChangedFile>,
     /// The session indexer's own token-usage definition (one context meter).
@@ -176,7 +177,7 @@ impl ClaudeTranscriptProjector {
             delegations: HashMap::new(),
             projected_uuids: HashSet::new(),
             compact_boundaries: HashSet::new(),
-            tool_calls: HashMap::new(),
+            edit_calls: HashMap::new(),
             changed_files: BTreeMap::new(),
             usage: ClaudeUsageAccumulator::new(),
             recent_line_uuids: VecDeque::with_capacity(TRANSCRIPT_LINE_UUID_WINDOW),
@@ -246,7 +247,7 @@ impl ClaudeTranscriptProjector {
             self.remember(uuid);
             return;
         }
-        self.record_tool_calls(obj);
+        self.record_edit_calls(obj);
         self.record_changed_files(obj);
         let Some(mut turn) = parse_transcript_turn(obj, &self.thread_id, self.turns.len()) else {
             return;
@@ -317,9 +318,8 @@ impl ClaudeTranscriptProjector {
         self.recent_line_uuids.push_back(uuid.to_string());
     }
 
-    /// Remember every tool call's name and input (the result line names only
-    /// the tool_use id).
-    fn record_tool_calls(&mut self, obj: &Value) {
+    /// Remember each file-editing tool call and the path its input names.
+    fn record_edit_calls(&mut self, obj: &Value) {
         if obj.get("type").and_then(Value::as_str) != Some("assistant") {
             return;
         }
@@ -333,9 +333,11 @@ impl ClaudeTranscriptProjector {
             ) else {
                 continue;
             };
-            let input = block.get("input").cloned().unwrap_or(Value::Null);
-            self.tool_calls
-                .insert(id.to_string(), (name.to_string(), input));
+            if !FILE_EDIT_TOOLS.contains(&name) {
+                continue;
+            }
+            let path = block.get("input").and_then(edited_path).map(str::to_string);
+            self.edit_calls.insert(id.to_string(), path);
         }
     }
 
@@ -359,27 +361,14 @@ impl ClaudeTranscriptProjector {
         let Some(structured) = obj.get("toolUseResult").filter(|value| value.is_object()) else {
             return;
         };
-        let Some((name, input)) = result
+        let Some(input_path) = result
             .get("tool_use_id")
             .and_then(Value::as_str)
-            .and_then(|id| self.tool_calls.get(id))
+            .and_then(|id| self.edit_calls.get(id))
         else {
             return;
         };
-        if !FILE_EDIT_TOOLS.contains(&name.as_str()) {
-            return;
-        }
-        let path_keys = ["filePath", "file_path", "notebook_path"];
-        let Some(path) = path_keys
-            .iter()
-            .find_map(|key| structured.get(*key).and_then(Value::as_str))
-            .or_else(|| {
-                path_keys
-                    .iter()
-                    .find_map(|key| input.get(*key).and_then(Value::as_str))
-            })
-            .filter(|path| !path.is_empty())
-        else {
+        let Some(path) = edited_path(structured).or(input_path.as_deref()) else {
             return;
         };
         let file = self.changed_files.entry(path.to_string()).or_default();
@@ -712,6 +701,14 @@ fn token_usage_json(usage: &ClaudeUsageAccumulator) -> Value {
         }
         None => json!({ "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 }),
     }
+}
+
+/// The file an edit tool's input or structured result names.
+fn edited_path(value: &Value) -> Option<&str> {
+    ["filePath", "file_path", "notebook_path"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .filter(|path| !path.is_empty())
 }
 
 /// A line's message content blocks (empty for string content).
