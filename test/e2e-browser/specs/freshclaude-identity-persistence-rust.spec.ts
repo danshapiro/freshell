@@ -205,8 +205,17 @@ async function sendFreshAgentTurn(
     })
     .toBe('idle')
   const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+  const turnCompletionSeq = async () => ((await harness.getState()) as any)?.turnCompletion?.seq ?? 0
+  const seqBefore = await turnCompletionSeq()
   await composer.fill(text)
   await paneRoot.getByRole('button', { name: 'Send' }).click()
+  // The turn has landed when its completion edge arrives: the fixture writes
+  // both transcript lines before it. The pane still reads idle in the instant
+  // after the click, so an idle poll alone can return before the send reaches
+  // the sidecar, and a caller reading the transcript then raced the fixture.
+  await expect
+    .poll(turnCompletionSeq, { timeout: 30_000, message: `the turn "${text}" completes` })
+    .toBeGreaterThan(seqBefore)
   await expect
     .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
       timeout: 30_000,
