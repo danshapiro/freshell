@@ -464,3 +464,50 @@ fn a_transcript_without_usage_reports_zero_tokens() {
     // The synthetic API-error line's usage (if any) never inflates the meter.
     assert_eq!(projection.token_usage["outputTokens"], json!(0));
 }
+
+// ── A7: recent transcript line uuids (the live tail's landing check) ──────
+
+/// Distinct line uuids in file order (the CLI re-appends a compaction's
+/// preserved tail under its original uuid; it is one line identity).
+fn uuid_lines(transcript: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for uuid in fixture_lines(transcript)
+        .into_iter()
+        .filter_map(|line| line["uuid"].as_str().map(str::to_string))
+    {
+        if !out.contains(&uuid) {
+            out.push(uuid);
+        }
+    }
+    out
+}
+
+#[test]
+fn recent_line_uuids_include_lines_the_display_drops_or_absorbs() {
+    let transcript = real_cli_fixture!("agent-async");
+    let projection = ClaudeTranscriptProjector::project("s", transcript);
+    let all = uuid_lines(transcript);
+    assert!(all.len() <= TRANSCRIPT_LINE_UUID_WINDOW);
+    assert_eq!(projection.transcript_line_uuids, all);
+    let notification = uuid_of(transcript, |line| {
+        line["origin"]["kind"] == "task-notification"
+    });
+    assert!(projection.transcript_line_uuids.contains(&notification));
+}
+
+#[test]
+fn recent_line_uuids_keep_only_the_newest_window() {
+    let transcript = format!(
+        "{}{}{}",
+        real_cli_fixture!("compact-ok"),
+        real_cli_fixture!("tools-sync"),
+        real_cli_fixture!("agent-async")
+    );
+    let all = uuid_lines(&transcript);
+    assert!(all.len() > TRANSCRIPT_LINE_UUID_WINDOW, "{}", all.len());
+    let projection = ClaudeTranscriptProjector::project("s", &transcript);
+    assert_eq!(
+        projection.transcript_line_uuids,
+        all[all.len() - TRANSCRIPT_LINE_UUID_WINDOW..].to_vec()
+    );
+}

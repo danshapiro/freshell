@@ -352,3 +352,15 @@ fn the_snapshot_reports_the_transcripts_token_usage() {
     assert_eq!(snapshot["tokenUsage"], projection.token_usage);
     assert!(snapshot["tokenUsage"]["contextTokens"].as_i64().unwrap() > 0);
 }
+
+#[test]
+fn the_snapshot_exposes_recent_transcript_line_uuids() {
+    let transcript = real_cli_fixture!("tools-sync");
+    let snapshot = build_claude_snapshot_json("freshclaude", "s", transcript, 0, None);
+    let projection = crate::claude_projection::ClaudeTranscriptProjector::project("s", transcript);
+    assert_eq!(
+        snapshot["extensions"]["claude"]["transcriptLineUuids"],
+        json!(projection.transcript_line_uuids)
+    );
+    assert!(!projection.transcript_line_uuids.is_empty());
+}

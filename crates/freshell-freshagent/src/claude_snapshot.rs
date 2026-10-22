@@ -1374,6 +1374,7 @@ pub(crate) fn build_claude_snapshot_from_projection(
         turns,
         diffs,
         token_usage,
+        transcript_line_uuids,
     } = projection;
     let latest_turn_id = turns
         .last()
@@ -1421,7 +1422,10 @@ pub(crate) fn build_claude_snapshot_from_projection(
         "diffs": diffs,
         "childThreads": [],
         "turns": turns,
-        "extensions": {},
+        // The newest transcript line uuids, including lines that produce no
+        // turn (absorbed results, hidden bookkeeping): the live tail's landing
+        // check (transcript-live plan §4.4).
+        "extensions": { "claude": { "transcriptLineUuids": transcript_line_uuids } },
     });
     if let Some(record) = rollback {
         // The marker bucket is LEDGER-SOURCED (r3): the record's entries union —

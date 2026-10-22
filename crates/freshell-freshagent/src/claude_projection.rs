@@ -12,7 +12,7 @@
 //! - a compaction recap (`isCompactSummary`) with no preceding
 //!   `system/compact_boundary` line still gets a `context_compaction` marker.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use freshell_sessions::{ClaudeUsageAccumulator, ParseSessionOptions};
@@ -31,6 +31,11 @@ const DELEGATION_TOOL_NAMES: [&str; 2] = ["Agent", "Task"];
 
 /// Tools whose successful result changes a file (the diff panel's rows).
 const FILE_EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// How many recent uuid-bearing lines the snapshot lists. The live tail
+/// (transcript-live plan §4.4) checks an announced message uuid against the
+/// turn ids PLUS these, because absorbed and hidden lines produce no turn.
+pub(crate) const TRANSCRIPT_LINE_UUID_WINDOW: usize = 64;
 
 /// The claude CLI's default subagent type when the model names none.
 const DEFAULT_SUBAGENT: &str = "general-purpose";
@@ -104,6 +109,7 @@ pub(crate) struct ClaudeProjection {
     pub turns: Vec<Value>,
     pub diffs: Vec<Value>,
     pub token_usage: Value,
+    pub transcript_line_uuids: Vec<String>,
 }
 
 /// Where a projected item lives: `turns[turn].items[item]`. Turns are only
@@ -133,6 +139,9 @@ pub(crate) struct ClaudeTranscriptProjector {
     changed_files: BTreeMap<String, ChangedFile>,
     /// The session indexer's own token-usage definition (one context meter).
     usage: ClaudeUsageAccumulator,
+    /// The newest uuid-bearing lines in file order, whether or not they
+    /// produced a turn.
+    recent_line_uuids: VecDeque<String>,
 }
 
 /// What the session did to one file.
@@ -170,6 +179,7 @@ impl ClaudeTranscriptProjector {
             tool_calls: HashMap::new(),
             changed_files: BTreeMap::new(),
             usage: ClaudeUsageAccumulator::new(),
+            recent_line_uuids: VecDeque::with_capacity(TRANSCRIPT_LINE_UUID_WINDOW),
         }
     }
 
@@ -203,6 +213,7 @@ impl ClaudeTranscriptProjector {
         // Every line, before any display filtering: the indexer's definition
         // sees (and dedupes) them all.
         self.usage.push(&obj, line);
+        self.note_line_uuid(&obj);
         self.push_value(&obj);
     }
 
@@ -285,7 +296,25 @@ impl ClaudeTranscriptProjector {
             turns: self.turns,
             diffs,
             token_usage: token_usage_json(&self.usage),
+            transcript_line_uuids: self.recent_line_uuids.into(),
         }
+    }
+
+    fn note_line_uuid(&mut self, obj: &Value) {
+        let Some(uuid) = obj
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|uuid| !uuid.is_empty())
+        else {
+            return;
+        };
+        if self.recent_line_uuids.iter().any(|seen| seen == uuid) {
+            return;
+        }
+        if self.recent_line_uuids.len() == TRANSCRIPT_LINE_UUID_WINDOW {
+            self.recent_line_uuids.pop_front();
+        }
+        self.recent_line_uuids.push_back(uuid.to_string());
     }
 
     /// Remember every tool call's name and input (the result line names only
