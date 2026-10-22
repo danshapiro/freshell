@@ -1009,14 +1009,8 @@ impl OpencodeProvider {
             // opencode's own title (provider-generated) and never need the
             // lookup, so listing cost scales with the small unnamed subset,
             // not with DB size.
-            let needs_naming = row
-                .title
-                .as_deref()
-                .map(|t| {
-                    t.trim().is_empty()
-                        || crate::name_evidence::is_provider_placeholder_title("opencode", t)
-                })
-                .unwrap_or(true);
+            let needs_naming =
+                !crate::opencode_row_title::is_opencode_session_name(row.title.as_deref());
             let first_user_message = if needs_naming {
                 first_user_message_for_session(&conn, &row.session_id)
             } else {

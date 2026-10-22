@@ -27,6 +27,7 @@ pub mod directory_index;
 pub mod meta;
 pub mod name_evidence;
 pub mod opencode_locator;
+mod opencode_row_title;
 pub mod parse;
 pub mod provider_layout;
 pub mod resume_input;
