@@ -6,6 +6,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { userTurnText } from '../helpers/fresh-agent-transcript.js'
 
 /**
  * AGENT-14 -- "Implement checkpoint create/list/metadata/restore. Preserve
@@ -230,7 +231,7 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
           }, { timeout: 20_000 }).toBe('idle')
           await composer.fill(text)
           await sendButton.click()
-          await expect(paneRoot.getByText(text)).toBeVisible({ timeout: 10_000 })
+          await expect(userTurnText(paneRoot, text)).toBeVisible({ timeout: 10_000 })
           await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 20_000 })
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
@@ -345,7 +346,7 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
         const modelBeforeRestart = postRestoreLeaf?.content?.model
 
         await sendLiveTurn(turn2Text)
-        await expect(paneRoot.getByText(turn2Text)).toBeVisible()
+        await expect(userTurnText(paneRoot, turn2Text)).toBeVisible()
 
         // --- Restart the server AFTER the restore: the durable session
         // identity, model selection, and (as far as this fixture can prove

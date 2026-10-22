@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 
 import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
-import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
+import { authorizeFreshAgentParityRequest, authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
 import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
 
 it('executes file and package TUI entrypoints while observing the selected project settings', async () => {
@@ -1551,6 +1551,21 @@ describe('fixed indexed publisher broker',()=>{
       expect(() => instance.authorizeInitialProviderVolume({ ...owner, soulId: 'foreign' })).toThrow()
       expect(() => instance.authorizeInitialProviderVolume({ ...owner, daemonId: 'foreign' })).toThrow()
       expect(() => instance.authorizeInitialProviderVolume({ ...owner, binarySha256: 'b'.repeat(64) })).toThrow()
+    })
+  })
+  it('registers a fresh-agent parity request under its fresh soul, distinct from a terminal soul for the same request', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const { soulId: _soulId, providerVolumeName: _volume, ...source } = sourceAuthorization()
+      const requestId = 'fresh-parity-claude-exact-request'
+      const fresh = authorizeFreshAgentParityRequest(instance, source, 'claude', requestId)
+      const terminal = authorizeProviderParityRequest(instance, source, requestId)
+      expect(fresh.soulId).toMatch(/^soul-fresh-claude-[a-f0-9]{32}$/)
+      expect(fresh.soulId.slice(-32)).toBe(terminal.soulId.slice(-32))
+      expect(fresh.providerVolumeName).not.toBe(terminal.providerVolumeName)
+      expect(instance.receipts()).toEqual([])
+      expect((await request('GET', `/v1.47/volumes/${fresh.providerVolumeName}`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/volumes/${terminal.providerVolumeName}`)).status).toBe(200)
+      expect(forwarded).toHaveLength(2)
     })
   })
   it('observes and creates only the explicitly reserved initial soul volume before any workload receipt',async()=>{

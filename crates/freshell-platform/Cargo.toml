@@ -18,5 +18,17 @@ url = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.186"
 
+[target.'cfg(windows)'.dependencies]
+# `process_job`: the kill-on-close Job Object that owns a whole child process
+# tree on native Windows (checkpoint Git children; the Claude sidecar and its
+# SDK-spawned CLI). Same exact pin as freshell-server's copy.
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"

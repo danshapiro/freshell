@@ -4892,30 +4892,41 @@ pub(crate) mod tests {
             "the append changes evidence but not the display row"
         );
         index.mark_dirty(&[(newer_path.clone(), "codex".to_string())]);
+        // Wait for the WHOLE sweep `mark_dirty` started, not for its first
+        // visible side effect. The sweep rewrites the file-cache entry before
+        // it publishes the snapshot, bumps the change generation and counts
+        // the change for persistence, so a cache entry that already shows the
+        // new evidence does not mean the generation has advanced yet.
+        // `mark_dirty` hands the refresh lock to that sweep before returning
+        // (no other sweep is running here), so the lock going idle is exactly
+        // "the requested refresh finished".
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            index.wait_for_refresh_idle_for_test(),
+        )
+        .await
+        .expect("the refresh requested by mark_dirty finishes");
         assert!(
-            wait_until(Duration::from_secs(3), || {
-                index
-                    .file_cache
-                    .lock()
-                    .unwrap()
-                    .get(&newer_path)
-                    .is_some_and(|entry| {
-                        entry
-                            .codex_evidence
-                            .as_ref()
-                            .and_then(|evidence| evidence.interval)
-                            .is_some_and(|interval| {
-                                interval.end_nanos
-                                    == chrono::DateTime::parse_from_rfc3339(
-                                        "2026-10-03T00:00:10.010000Z",
-                                    )
-                                    .unwrap()
-                                    .timestamp_nanos_opt()
-                                    .unwrap()
-                            })
-                    })
-            })
-            .await,
+            index
+                .file_cache
+                .lock()
+                .unwrap()
+                .get(&newer_path)
+                .is_some_and(|entry| {
+                    entry
+                        .codex_evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.interval)
+                        .is_some_and(|interval| {
+                            interval.end_nanos
+                                == chrono::DateTime::parse_from_rfc3339(
+                                    "2026-10-03T00:00:10.010000Z",
+                                )
+                                .unwrap()
+                                .timestamp_nanos_opt()
+                                .unwrap()
+                        })
+                }),
             "the append refreshes persisted-record evidence"
         );
         assert!(

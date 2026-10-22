@@ -6,6 +6,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { userTurnText } from '../helpers/fresh-agent-transcript.js'
 
 /**
  *
@@ -1113,7 +1114,7 @@ test.describe('Restore Matrix', () => {
           }, { timeout: 20_000 }).toBe('idle')
           await composer.fill(text)
           await sendButton.click()
-          await expect(paneRoot.getByText(text, { exact: true })).toBeVisible({ timeout: 10_000 })
+          await expect(userTurnText(paneRoot, text)).toBeVisible({ timeout: 10_000 })
           const fixtureReplies = paneRoot.getByText('Fixture turn', { exact: true })
           await expect(fixtureReplies).toHaveCount(expectedReplyCount, { timeout: 20_000 })
           await expect(fixtureReplies.nth(expectedReplyCount - 1)).toBeVisible()
@@ -1134,8 +1135,8 @@ test.describe('Restore Matrix', () => {
         // These survive the second authoritative snapshot before the restart,
         // proving this is the fixture's durable transcript rather than two
         // local optimistic echoes.
-        await expect(paneRoot.getByText(turn1Text)).toBeVisible({ timeout: 20_000 })
-        await expect(paneRoot.getByText(turn2Text)).toBeVisible({ timeout: 20_000 })
+        await expect(userTurnText(paneRoot, turn1Text)).toBeVisible({ timeout: 20_000 })
+        await expect(userTurnText(paneRoot, turn2Text)).toBeVisible({ timeout: 20_000 })
 
         await page.evaluate(() => {
           window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
@@ -1203,8 +1204,8 @@ test.describe('Restore Matrix', () => {
         await expect(resumedReplies).toHaveCount(2, { timeout: 20_000 })
         await expect(resumedReplies.nth(0)).toBeVisible()
         await expect(resumedReplies.nth(1)).toBeVisible()
-        await expect(resumedPane.getByText(turn1Text)).toBeVisible({ timeout: 20_000 })
-        await expect(resumedPane.getByText(turn2Text)).toBeVisible({ timeout: 20_000 })
+        await expect(userTurnText(resumedPane, turn1Text)).toBeVisible({ timeout: 20_000 })
+        await expect(userTurnText(resumedPane, turn2Text)).toBeVisible({ timeout: 20_000 })
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(rehydratedTabId!)
           return findFreshAgentLeaf(layout)?.content?.status
@@ -1378,7 +1379,7 @@ test.describe('Restore Matrix', () => {
         await composer.fill('term18-retry-after-crash probe')
         await paneRoot.getByRole('button', { name: 'Send' }).click()
 
-        await expect(paneRoot.getByText('term18-retry-after-crash probe')).toBeVisible({ timeout: 15_000 })
+        await expect(userTurnText(paneRoot, 'term18-retry-after-crash probe')).toBeVisible({ timeout: 15_000 })
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(tabId)
           return findFreshAgentLeaf(layout)?.content?.status
@@ -1531,7 +1532,7 @@ test.describe('Restore Matrix', () => {
           }, { timeout: 20_000 }).toBe('idle')
           await composer.fill(text)
           await sendButton.click()
-          await expect(paneRoot.getByText(text, { exact: true })).toBeVisible({ timeout: 10_000 })
+          await expect(userTurnText(paneRoot, text)).toBeVisible({ timeout: 10_000 })
           const fixtureReplies = paneRoot.getByText('Fixture turn', { exact: true })
           await expect(fixtureReplies).toHaveCount(expectedReplyCount, { timeout: 20_000 })
           await expect(fixtureReplies.nth(expectedReplyCount - 1)).toBeVisible()
@@ -1550,9 +1551,9 @@ test.describe('Restore Matrix', () => {
         await sendLiveTurn(turn2Text, 2)
         await sendLiveTurn(turn3Text, 3)
 
-        await expect(paneRoot.getByText(turn1Text, { exact: true })).toBeVisible()
-        await expect(paneRoot.getByText(turn2Text, { exact: true })).toBeVisible()
-        await expect(paneRoot.getByText(turn3Text, { exact: true })).toBeVisible()
+        await expect(userTurnText(paneRoot, turn1Text)).toBeVisible()
+        await expect(userTurnText(paneRoot, turn2Text)).toBeVisible()
+        await expect(userTurnText(paneRoot, turn3Text)).toBeVisible()
         await expect(paneRoot.getByText('Fixture turn', { exact: true })).toHaveCount(3)
 
         // Wire delivery remains an independent receipt for all three sends.
@@ -1667,7 +1668,7 @@ test.describe('Restore Matrix', () => {
           }, { timeout: 20_000 }).toBe('idle')
           await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill(text)
           await paneRoot.getByRole('button', { name: 'Send' }).click()
-          await expect(paneRoot.getByText(text, { exact: true })).toBeVisible({ timeout: 10_000 })
+          await expect(userTurnText(paneRoot, text)).toBeVisible({ timeout: 10_000 })
           const fixtureReplies = paneRoot.getByText('Fixture turn', { exact: true })
           await expect(fixtureReplies).toHaveCount(expectedReplyCount, { timeout: 20_000 })
           await expect(fixtureReplies.nth(expectedReplyCount - 1)).toBeVisible()
@@ -1702,7 +1703,7 @@ test.describe('Restore Matrix', () => {
         await harness.clearSentWsMessages()
         await paneRootBeforeReload.getByRole('textbox', { name: 'Chat message input' }).fill(turn3Text)
         await paneRootBeforeReload.getByRole('button', { name: 'Send' }).click()
-        await expect(paneRootBeforeReload.getByText(turn3Text)).toBeVisible({ timeout: 10_000 })
+        await expect(userTurnText(paneRootBeforeReload, turn3Text)).toBeVisible({ timeout: 10_000 })
         const sendMessageSentAt: number = await expect.poll(async () => {
           const sent = await harness.getSentWsMessages()
           const match = sent.find((m: any) => m?.type === 'freshAgent.send' && m?.text === turn3Text)
@@ -1764,9 +1765,9 @@ test.describe('Restore Matrix', () => {
         // transcript must contain the three unique prompts and exactly three
         // repeated fixture replies after the reload.
         const resumedPane = page.locator('[data-context="fresh-agent"]').last()
-        await expect(resumedPane.getByText(turn1Text, { exact: true })).toBeVisible({ timeout: 20_000 })
-        await expect(resumedPane.getByText(turn2Text, { exact: true })).toBeVisible({ timeout: 20_000 })
-        await expect(resumedPane.getByText(turn3Text, { exact: true })).toBeVisible({ timeout: 20_000 })
+        await expect(userTurnText(resumedPane, turn1Text)).toBeVisible({ timeout: 20_000 })
+        await expect(userTurnText(resumedPane, turn2Text)).toBeVisible({ timeout: 20_000 })
+        await expect(userTurnText(resumedPane, turn3Text)).toBeVisible({ timeout: 20_000 })
         const resumedReplies = resumedPane.getByText('Fixture turn', { exact: true })
         await expect(resumedReplies).toHaveCount(3, { timeout: 20_000 })
         await expect(resumedReplies.nth(2)).toBeVisible()
