@@ -443,6 +443,14 @@ async fn claude_catalog_probe_uses_the_configured_sidecar_directory() {
         directory.path().join("exec-profile.mjs"),
     )
     .expect("copy model catalog exec dependency");
+    std::fs::copy(
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../freshell-claude-sidecar/sdk-env.mjs"
+        )),
+        directory.path().join("sdk-env.mjs"),
+    )
+    .expect("copy model catalog environment dependency");
     std::fs::write(
         &sdk_entry,
         r#"

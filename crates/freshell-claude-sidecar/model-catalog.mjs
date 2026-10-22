@@ -1,12 +1,13 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { managedSdkSpawn } from './exec-profile.mjs'
+import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 
 const log = (message, details = {}) => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-model-catalog', message, ...details })}\n`)
 
 /** A short-lived SDK control query; an empty stream never starts an agent turn. */
 export async function probeModelCatalog(query, { env = process.env, timeoutMs = 10_000 } = {}) {
-  const { CLAUDECODE: _claudeCode, ANTHROPIC_API_KEY: _apiKey, ...cleanEnv } = env
+  const cleanEnv = createClaudeSdkCleanEnv(env)
   const abortController = new AbortController()
   const stderr = env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
     ? data => log('Claude capability probe stderr', { bytes: Buffer.byteLength(String(data)) })

@@ -80,6 +80,7 @@ import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
+import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -111,13 +112,6 @@ function nanoid(size = 21) {
   let id = ''
   for (let i = 0; i < size; i++) id += NANOID_ALPHABET[bytes[i] & 63]
   return id
-}
-
-// ── clean env (server/sdk-bridge.ts:64-66) ──────────────────────────────────
-function createClaudeSdkCleanEnv(env = process.env) {
-  const { CLAUDECODE: _c, ANTHROPIC_API_KEY: apiKey, FRESHELL_CLAUDE_ONECLI_API_KEY: onecliApiKey, ...cleanEnv } = env
-  if (onecliApiKey === '1' && apiKey) cleanEnv.ANTHROPIC_API_KEY = apiKey
-  return cleanEnv
 }
 
 // ── streaming input stream (server/sdk-bridge.ts:274-316) ────────────────────
