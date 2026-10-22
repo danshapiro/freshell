@@ -60,8 +60,79 @@ pub(crate) fn claude_home_candidates_from(
     out
 }
 
-/// `find_transcript` across every candidate root, in resolution order.
-/// Positive denial (attach) and snapshot 404 both require a miss EVERYWHERE.
+/// Where a claude transcript stands across the store roots (G28). Only a CLEAN
+/// miss in EVERY candidate root is [`TranscriptLocation::Absent`] -- the positive
+/// "session gone" evidence attach, snapshot and rollback act on. Any IO failure
+/// that could be hiding the file is [`TranscriptLocation::Unreadable`]: the
+/// caller must treat it as "cannot check" (transient / 500 / retryable), never
+/// as lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptLocation {
+    /// The transcript file, found under one of the roots (a hit wins even when
+    /// another root or project dir failed to read).
+    Found(PathBuf),
+    /// Every root was fully readable and none holds the transcript.
+    Absent,
+    /// No hit, and at least one root could not be fully checked (or there is
+    /// no root at all).
+    Unreadable(LocateError),
+}
+
+/// Why the store could not be checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocateError {
+    /// No store root resolves at all (no CLAUDE_CONFIG_DIR / CLAUDE_HOME and
+    /// no platform home).
+    NoStoreRoot,
+    /// The first IO error met while scanning `root` (expected absence --
+    /// `NotFound` / `NotADirectory` -- is a clean miss, never an error).
+    Io {
+        root: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+impl TranscriptLocation {
+    /// The located path, if found. Callers that only DISPLAY (redo
+    /// availability, naming evidence) may collapse Absent and Unreadable;
+    /// callers that DECIDE "lost" must match all three states instead.
+    pub fn found(self) -> Option<PathBuf> {
+        match self {
+            Self::Found(path) => Some(path),
+            Self::Absent | Self::Unreadable(_) => None,
+        }
+    }
+}
+
+impl LocateError {
+    fn io(root: &Path, error: &std::io::Error) -> Self {
+        Self::Io {
+            root: root.to_path_buf(),
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for LocateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoStoreRoot => f.write_str(
+                "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/platform home all unset)",
+            ),
+            Self::Io { root, message, .. } => write!(
+                f,
+                "claude transcript store {} unreadable: {message}",
+                root.display()
+            ),
+        }
+    }
+}
+
+/// [`TranscriptLocation`] for `session_id` across [`claude_home_candidates`],
+/// in resolution order. Positive denial (attach), the snapshot 404 and the
+/// rollback "nothing there" answers all require a CLEAN miss EVERYWHERE.
 /// `pub` + re-exported at the crate root (kata 09v1): `freshell-server`'s
 /// `IndexExistenceProbe` consults this SAME check before finalizing a
 /// warm-index `Absent` for claude — an on-disk transcript can be cwd-less
@@ -69,10 +140,39 @@ pub(crate) fn claude_home_candidates_from(
 /// fail the index's R10b cwd gate while the attach arm would still attempt
 /// resume on it; the reconcile arm and the attach arm must share one
 /// definition of "the transcript exists".
+pub fn locate_transcript_state(session_id: &str) -> TranscriptLocation {
+    locate_transcript_state_in(&claude_home_candidates(), session_id)
+}
+
+/// [`locate_transcript_state`] over explicit roots: the first hit wins;
+/// otherwise the first root error makes the answer Unreadable; only an
+/// all-clean miss is Absent; no roots at all is `Unreadable(NoStoreRoot)`.
+pub(crate) fn locate_transcript_state_in(
+    roots: &[PathBuf],
+    session_id: &str,
+) -> TranscriptLocation {
+    if roots.is_empty() {
+        return TranscriptLocation::Unreadable(LocateError::NoStoreRoot);
+    }
+    let mut first_error: Option<LocateError> = None;
+    for root in roots {
+        match find_transcript_state(root, session_id) {
+            TranscriptLocation::Found(path) => return TranscriptLocation::Found(path),
+            TranscriptLocation::Absent => {}
+            TranscriptLocation::Unreadable(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(TranscriptLocation::Absent, TranscriptLocation::Unreadable)
+}
+
+/// Found-only view of [`locate_transcript_state`] for DISPLAY callers
+/// (`claude_can_redo_now`: an unreadable original reads as "no redo now").
+/// Anything that decides "this session is gone" must match the three-state
+/// [`locate_transcript_state`] instead.
 pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
-    claude_home_candidates()
-        .iter()
-        .find_map(|root| find_transcript(root, session_id))
+    locate_transcript_state(session_id).found()
 }
 
 /// Unified agent names (Task 2): a located transcript PLUS the routing
@@ -184,46 +284,74 @@ pub fn transcript_cwd_bounded(path: &Path) -> Option<String> {
 /// Locate `<claude_home>/projects/*/<session_id>.jsonl` (or one subdir deeper, e.g.
 /// `<project>/<session-id-dir>/...` layouts). Filename scan, NEVER slug re-derivation:
 /// the cwd->slug encoding is lossy (`docs/port-plan.md:45`). Sorted dirs for
-/// determinism (mirrors `directory_index.rs::discover_claude_home`).
+/// determinism (mirrors `directory_index.rs::discover_claude_home`). Found-only
+/// projection of [`find_transcript_state`] (one traversal).
 pub(crate) fn find_transcript(claude_home: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty()
-        || session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-    {
-        return None;
+    find_transcript_state(claude_home, session_id).found()
+}
+
+/// The three-state traversal of ONE store root, same layout as
+/// [`find_transcript`] (direct, plus one nested level; only real directories
+/// are descended). Expected absence (`NotFound` / `NotADirectory`) is a clean
+/// miss. Any other error is REMEMBERED and the scan keeps going -- a later hit
+/// still wins -- so the root answers Unreadable only when nothing was found
+/// and something could not be checked.
+pub(crate) fn find_transcript_state(claude_home: &Path, session_id: &str) -> TranscriptLocation {
+    if !is_safe_session_id(session_id) {
+        return TranscriptLocation::Absent;
     }
     let filename = format!("{session_id}.jsonl");
-    let projects = claude_home.join("projects");
-    let entries = std::fs::read_dir(&projects).ok()?;
-    let mut dirs: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.path())
-        .collect();
-    dirs.sort();
+    let dirs = match read_subdirs_sorted_or_empty(&claude_home.join("projects")) {
+        Ok(dirs) => dirs,
+        Err(e) => return TranscriptLocation::Unreadable(LocateError::io(claude_home, &e)),
+    };
+    let mut first_error: Option<LocateError> = None;
+    let mut remember = |e: std::io::Error| {
+        first_error.get_or_insert_with(|| LocateError::io(claude_home, &e));
+    };
     for dir in &dirs {
-        let direct = dir.join(&filename);
-        if direct.is_file() {
-            return Some(direct);
+        match candidate_is_file(&dir.join(&filename)) {
+            Ok(true) => return TranscriptLocation::Found(dir.join(&filename)),
+            Ok(false) => {}
+            Err(e) => remember(e),
         }
-        let Ok(nested) = std::fs::read_dir(dir) else {
-            continue;
+        let subdirs = match read_subdirs_sorted_or_empty(dir) {
+            Ok(subdirs) => subdirs,
+            Err(e) => {
+                remember(e);
+                continue;
+            }
         };
-        let mut subdirs: Vec<PathBuf> = nested
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.path())
-            .collect();
-        subdirs.sort();
         for sub in &subdirs {
             let candidate = sub.join(&filename);
-            if candidate.is_file() {
-                return Some(candidate);
+            match candidate_is_file(&candidate) {
+                Ok(true) => return TranscriptLocation::Found(candidate),
+                Ok(false) => {}
+                Err(e) => remember(e),
             }
         }
     }
-    None
+    first_error.map_or(TranscriptLocation::Absent, TranscriptLocation::Unreadable)
+}
+
+/// Sorted child DIRECTORIES of `dir` -- the historic [`find_transcript`]
+/// filter (`DirEntry::file_type`, which does not follow symlinks). Expected
+/// absence reads as an empty listing; any other error propagates.
+fn read_subdirs_sorted_or_empty(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if is_expected_absence(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Error-AWARE variant of [`locate_transcript`] for the resolve endpoint's
@@ -1456,6 +1584,206 @@ mod tests {
         assert_eq!(
             claude_home_candidates_from(env_of(&[]), None),
             Vec::<PathBuf>::new()
+        );
+    }
+
+    // -- G28: three-state transcript locator --------------------------------
+    //
+    // Found / Absent / Unreadable: only a CLEAN miss everywhere is Absent
+    // (the positive "session gone" evidence); an IO failure is Unreadable and
+    // must never read as gone. Hermetic: explicit temp roots, no env.
+
+    const LOCATE_ID: &str = "abcdabcd-abcd-4bcd-8bcd-abcdabcdabcd";
+
+    /// Makes `dir` unreadable (mode 000) and restores it on drop so the
+    /// TempDir cleanup works even if an assertion panics. `None` when the
+    /// process bypasses permission bits (root / CAP_DAC_OVERRIDE): those
+    /// runs cannot produce the EACCES under test, so the caller skips.
+    #[cfg(unix)]
+    struct UnreadableDir(PathBuf);
+    #[cfg(unix)]
+    impl UnreadableDir {
+        fn make(dir: &Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let guard = Self(dir.to_path_buf());
+            if std::fs::read_dir(dir).is_ok() {
+                eprintln!("skipping: euid bypasses permission checks");
+                return None;
+            }
+            Some(guard)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for UnreadableDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn plant(root: &Path, project: &str, id: &str) -> PathBuf {
+        let dir = root.join("projects").join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&file, "{}\n").unwrap();
+        file
+    }
+
+    fn io_kind(location: &TranscriptLocation) -> Option<std::io::ErrorKind> {
+        match location {
+            TranscriptLocation::Unreadable(LocateError::Io { kind, .. }) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn locate_state_reads_a_missing_projects_dir_as_absent() {
+        let home = temp_home(); // no projects/ at all
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Absent
+        );
+        // A store root that does not exist at all is also a clean miss.
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().join("never-created")], LOCATE_ID),
+            TranscriptLocation::Absent
+        );
+    }
+
+    #[test]
+    fn locate_state_with_no_store_root_is_unreadable_never_absent() {
+        assert_eq!(
+            locate_transcript_state_in(&[], LOCATE_ID),
+            TranscriptLocation::Unreadable(LocateError::NoStoreRoot)
+        );
+    }
+
+    #[test]
+    fn locate_state_finds_the_direct_and_the_one_level_nested_layouts() {
+        let home = temp_home();
+        let direct = plant(home.path(), "-repo", LOCATE_ID);
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Found(direct)
+        );
+        let nested_id = "dcbadcba-dcba-4cba-8cba-dcbadcbadcba";
+        let nested_dir = home.path().join("projects").join("-repo").join("sessions");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join(format!("{nested_id}.jsonl"));
+        std::fs::write(&nested, "{}\n").unwrap();
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], nested_id),
+            TranscriptLocation::Found(nested)
+        );
+        // Traversal-shaped ids are a clean miss, never a probe outside the store.
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], "../etc/passwd"),
+            TranscriptLocation::Absent
+        );
+    }
+
+    #[test]
+    fn locate_state_ignores_a_regular_file_in_the_projects_dir() {
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("-not-a-dir"), "i am a file\n").unwrap();
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Absent
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_reports_an_unreadable_projects_dir_as_unreadable() {
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let Some(_locked) = UnreadableDir::make(&projects) else {
+            return;
+        };
+        let location = locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID);
+        assert_eq!(
+            io_kind(&location),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "an EACCES store is unreadable, never absent: {location:?}"
+        );
+        match location {
+            TranscriptLocation::Unreadable(LocateError::Io { root, .. }) => {
+                assert_eq!(root, home.path(), "the error names the failing store root");
+            }
+            other => panic!("expected Unreadable(Io), got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_finds_a_hit_under_a_later_root_despite_an_unreadable_earlier_root() {
+        let bad = temp_home();
+        let good = temp_home();
+        let bad_projects = bad.path().join("projects");
+        std::fs::create_dir_all(&bad_projects).unwrap();
+        let file = plant(good.path(), "-repo", LOCATE_ID);
+        let Some(_locked) = UnreadableDir::make(&bad_projects) else {
+            return;
+        };
+        assert_eq!(
+            locate_transcript_state_in(
+                &[bad.path().to_path_buf(), good.path().to_path_buf()],
+                LOCATE_ID
+            ),
+            TranscriptLocation::Found(file)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_with_one_unreadable_root_and_one_clean_miss_is_unreadable() {
+        let bad = temp_home();
+        let clean = temp_home();
+        let bad_projects = bad.path().join("projects");
+        std::fs::create_dir_all(&bad_projects).unwrap();
+        std::fs::create_dir_all(clean.path().join("projects").join("-other")).unwrap();
+        let Some(_locked) = UnreadableDir::make(&bad_projects) else {
+            return;
+        };
+        for roots in [
+            vec![bad.path().to_path_buf(), clean.path().to_path_buf()],
+            vec![clean.path().to_path_buf(), bad.path().to_path_buf()],
+        ] {
+            let location = locate_transcript_state_in(&roots, LOCATE_ID);
+            assert_eq!(
+                io_kind(&location),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "a miss that could not check every root is not proof of absence: {location:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_keeps_scanning_past_an_unreadable_project_dir() {
+        let home = temp_home();
+        let locked_project = home.path().join("projects").join("-a-locked");
+        std::fs::create_dir_all(&locked_project).unwrap();
+        let Some(_locked) = UnreadableDir::make(&locked_project) else {
+            return;
+        };
+        // No hit anywhere else: the locked project dir could hold the nested
+        // transcript, so the answer is Unreadable.
+        let location = locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID);
+        assert_eq!(
+            io_kind(&location),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "{location:?}"
+        );
+        // A hit in a LATER project dir still wins over the remembered error.
+        let file = plant(home.path(), "-b-open", LOCATE_ID);
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Found(file)
         );
     }
 

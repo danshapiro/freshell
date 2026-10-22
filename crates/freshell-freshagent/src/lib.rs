@@ -69,8 +69,9 @@ pub use claude::FreshClaudeState;
 // claude fallback pairs with it (`claude-transcript-locator.ts` parity).
 // Keep the rest of claude_snapshot crate-private.
 pub use claude_snapshot::{
-    locate_transcript, locate_transcript_checked, locate_transcript_selected, transcript_cwd,
-    transcript_cwd_bounded, transcript_cwd_checked, SelectedTranscript,
+    locate_transcript, locate_transcript_checked, locate_transcript_selected,
+    locate_transcript_state, transcript_cwd, transcript_cwd_bounded, transcript_cwd_checked,
+    LocateError, SelectedTranscript, TranscriptLocation,
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
