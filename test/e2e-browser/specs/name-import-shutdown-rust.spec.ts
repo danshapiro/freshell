@@ -1,4 +1,4 @@
-import type { BrowserContext, Page } from '@playwright/test'
+import type { Browser, BrowserContext, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import {
@@ -26,26 +26,62 @@ import type { SessionNameRef } from '../../../shared/session-names.js'
 // Each case runs an OWNED Rust server (isolated HOME, ephemeral port) with
 // the fake Claude CLI and a fake Gemini that answers 403, so no AI name ever
 // lands and the saved name is the folder or first-message name. The
-// server's record (name + revision) is the truth; every page counts its
-// import POSTs.
+// server's record (name + revision) is the truth. One counter per browser
+// context sees every page's import POSTs, attached before the first page
+// navigates: the old client sent its import on the connection-ready edge of
+// every boot, so a counter attached after a page connected would miss it.
 
 test.setTimeout(360_000)
 
 const IMPORT_PATH = '/api/session-names/import'
 const FIRST_MESSAGE = 'Repair the sardine factory line'
 
-/** Count `POST /api/session-names/import` requests a page sends. */
-function countImportPosts(page: Page): { readonly count: number } {
-  const counter = { count: 0 }
-  page.on('request', (request) => {
+type ImportCounter = {
+  /** Every import POST the context's pages sent. */
+  readonly count: number
+  /** The import POSTs one page sent (across its reloads). */
+  countFor(page: Page): number
+}
+
+/** Count `POST /api/session-names/import` requests from every page of
+ * `context`. Call it before the context's first navigation. */
+function countImportPosts(context: BrowserContext): ImportCounter {
+  let total = 0
+  const byPage = new Map<Page, number>()
+  context.on('request', (request) => {
     if (request.method() !== 'POST') return
+    let pathname: string
     try {
-      if (new URL(request.url()).pathname === IMPORT_PATH) counter.count += 1
+      pathname = new URL(request.url()).pathname
     } catch {
-      // Not a URL we care about.
+      return
     }
+    if (pathname !== IMPORT_PATH) return
+    total += 1
+    let page: Page | null = null
+    try {
+      page = request.frame().page()
+    } catch {
+      // A service-worker request has no frame; it still counts in the total.
+    }
+    if (page) byPage.set(page, (byPage.get(page) ?? 0) + 1)
   })
-  return counter
+  return {
+    get count() { return total },
+    countFor: (page) => byPage.get(page) ?? 0,
+  }
+}
+
+/** A new browser context whose import POSTs are counted from its first
+ * request, and its first connected page. */
+async function connectCountedPage(
+  browser: Browser,
+  journey: Journey,
+): Promise<{ context: BrowserContext; page: Page; harness: TestHarness; imports: ImportCounter }> {
+  const context = await browser.newContext()
+  const imports = countImportPosts(context)
+  const { page, harness } = await connectUnifiedPage({ browser, info: journey.server.info, context })
+  return { context, page, harness, imports }
 }
 
 async function bootForbiddenGeminiJourney(): Promise<Journey> {
@@ -182,8 +218,7 @@ test.describe('name import shutdown', () => {
   test('reload keeps the saved name and sends no import', async ({ browser }) => {
     const journey = await bootForbiddenGeminiJourney()
     try {
-      const { context, page, harness } = await connectUnifiedPage({ browser, info: journey.server.info })
-      const imports = countImportPosts(page)
+      const { context, page, harness, imports } = await connectCountedPage(browser, journey)
       const { handle, ref } = await createClaudeSession(journey, page, harness)
       const before = await settledRecord(journey, ref)
       await expectTabLabel(page, handle.tabId, before.name)
@@ -203,8 +238,7 @@ test.describe('name import shutdown', () => {
   test('a second window keeps the saved name', async ({ browser }) => {
     const journey = await bootForbiddenGeminiJourney()
     try {
-      const { context, page, harness } = await connectUnifiedPage({ browser, info: journey.server.info })
-      const firstImports = countImportPosts(page)
+      const { context, page, harness, imports } = await connectCountedPage(browser, journey)
       const { handle, ref, sessionId } = await createClaudeSession(journey, page, harness)
       const before = await settledRecord(journey, ref)
       await expectTabLabel(page, handle.tabId, before.name)
@@ -212,11 +246,11 @@ test.describe('name import shutdown', () => {
       // A new page in the same context: shared localStorage, a fresh
       // sessionStorage, so a new window id that rebuilds from the server.
       const second = await openWindow(context, journey)
-      const secondImports = countImportPosts(second.page)
       await quietPeriod(second.page)
 
-      expect(firstImports.count).toBe(0)
-      expect(secondImports.count).toBe(0)
+      // Per window (the second one's boot included), then the whole context.
+      expect([imports.countFor(page), imports.countFor(second.page)]).toEqual([0, 0])
+      expect(imports.count).toBe(0)
       expect(await readNameRecord(journey, ref)).toMatchObject(before)
       await expectTabLabel(page, handle.tabId, before.name)
       await expectTabLabel(second.page, await tabIdOfSession(second.harness, handle, sessionId), before.name)
@@ -229,8 +263,7 @@ test.describe('name import shutdown', () => {
   test('two windows with different stale tab titles never change the name', async ({ browser }) => {
     const journey = await bootForbiddenGeminiJourney()
     try {
-      const { context, page, harness } = await connectUnifiedPage({ browser, info: journey.server.info })
-      const counters = [countImportPosts(page)]
+      const { context, page, harness, imports } = await connectCountedPage(browser, journey)
       const { ref, sessionId } = await createClaudeSession(journey, page, harness)
       const before = await settledRecord(journey, ref)
 
@@ -271,16 +304,19 @@ test.describe('name import shutdown', () => {
       }, { staleWindows })
 
       const windows = [await openWindow(context, journey), await openWindow(context, journey)]
-      for (const win of windows) counters.push(countImportPosts(win.page))
+      const perWindow = () => [page, ...windows.map((win) => win.page)].map((each) => imports.countFor(each))
       for (const win of windows) await quietPeriod(win.page)
-      expect(counters.map((counter) => counter.count)).toEqual([0, 0, 0])
+      // Every window's first boot is counted, then every reload.
+      expect(perWindow()).toEqual([0, 0, 0])
+      expect(imports.count).toBe(0)
       expect(await readNameRecord(journey, ref)).toMatchObject(before)
 
       for (let round = 1; round <= 3; round += 1) {
         for (const win of windows) {
           await reloadAndConnect(win.page)
           await quietPeriod(win.page)
-          expect(counters.map((counter) => counter.count), `reload round ${round}`).toEqual([0, 0, 0])
+          expect(perWindow(), `reload round ${round}`).toEqual([0, 0, 0])
+          expect(imports.count, `reload round ${round}`).toBe(0)
           expect(await readNameRecord(journey, ref), `reload round ${round}`).toMatchObject(before)
         }
       }
