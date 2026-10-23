@@ -39,7 +39,7 @@ vi.mock('@/lib/ws-client', () => ({
 
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab, closeTab, reopenClosedTab, setTabNameSource } from '../../../../src/store/tabsSlice'
-import panesReducer, { addPane, initLayout } from '../../../../src/store/panesSlice'
+import panesReducer, { addPane, initLayout, updatePaneTitle } from '../../../../src/store/panesSlice'
 import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
 
 describe('tabsSlice closed registry capture', () => {
@@ -194,5 +194,36 @@ describe('tabsSlice closed registry capture — unified agent names (Task 6)', (
     const reopened = store.getState().tabs.tabs.find((t) => t.id !== tabId)
     expect(reopened).toBeTruthy()
     expect(reopened?.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+  })
+})
+
+describe('tabsSlice closed registry capture — name reliability (Task 9)', () => {
+  it('the closed snapshot carries the pane user flag of a renamed pane', async () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+      },
+    })
+
+    store.dispatch(addTab({ title: 'MyShellTab', titleSetByUser: true }))
+    const tabId = store.getState().tabs.tabs[0]!.id
+    store.dispatch(initLayout({
+      tabId,
+      paneId: 'pane-renamed',
+      content: { kind: 'terminal', mode: 'shell' },
+    }))
+    store.dispatch(updatePaneTitle({ tabId, paneId: 'pane-renamed', title: 'KeepMePane', setByUser: true }))
+
+    await store.dispatch(closeTab(tabId) as any)
+
+    const closedRecords = Object.values(store.getState().tabRegistry.localClosed)
+    expect(closedRecords).toHaveLength(1)
+    expect(closedRecords[0]!.panes[0]).toMatchObject({
+      paneId: 'pane-renamed',
+      title: 'KeepMePane',
+      titleSetByUser: true,
+    })
   })
 })

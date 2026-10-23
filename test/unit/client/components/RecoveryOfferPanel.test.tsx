@@ -671,3 +671,58 @@ describe('RecoveryOfferPanel — unified agent names (Task 6)', () => {
     expect(restoredPaneIds).toContain((tab?.nameSource as { paneId: string }).paneId)
   })
 })
+
+describe('RecoveryOfferPanel — name reliability (Task 9)', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    vi.mocked(getRecoveryInventory).mockReset()
+  })
+
+  afterEach(() => cleanup())
+
+  it('accept restores a renamed shell tab and pane with their user flags', async () => {
+    const inventory: RecoveryInventory = {
+      recoverable: true,
+      contentId: 'cid-renamed',
+      device: {
+        deviceId: 'd',
+        deviceLabel: 'l',
+        capturedAt: 1,
+        tabs: [{
+          tabKey: 'k-renamed',
+          tabName: 'MyShellTab',
+          titleSetByUser: true,
+          nameSource: { kind: 'legacy' },
+          panes: [{
+            paneId: 'p-renamed',
+            kind: 'terminal',
+            mode: 'shell',
+            shell: null,
+            cwd: '/w',
+            title: 'KeepMePane',
+            titleSetByUser: true,
+            payload: {},
+            sessionRef: null,
+            ledgerState: 'unknown',
+            live: false,
+          }],
+        }],
+      },
+      otherDevices: [],
+      ledgerOnly: [],
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    await userEvent.click(await screen.findByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    const tab = store.getState().tabs.tabs.find((t) => t.title === 'MyShellTab')
+    expect(tab?.titleSetByUser).toBe(true)
+    // Cross-device recovery remints the pane id; the title and flag follow it.
+    const [leaf] = collectAllLeaves(store.getState().panes.layouts[tab!.id])
+    expect(leaf.id).not.toBe('p-renamed')
+    expect(store.getState().panes.paneTitles[tab!.id]).toEqual({ [leaf.id]: 'KeepMePane' })
+    expect(store.getState().panes.paneTitleSetByUser[tab!.id]).toEqual({ [leaf.id]: true })
+  })
+})

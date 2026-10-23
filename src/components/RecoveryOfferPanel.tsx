@@ -167,8 +167,15 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         // Unified agent names (Task 6): the restored tab keeps its stable
         // naming-source relationship, remapped to the reminted pane ids.
         ...(plan.nameSource ? { nameSource: plan.nameSource } : {}),
+        // Name reliability (Task 9): a tab a person renamed stays protected.
+        ...(plan.titleSetByUser ? { titleSetByUser: true } : {}),
       }))
-      dispatch(restoreLayout({ tabId: plan.tabId, layout: plan.layout, paneTitles: plan.paneTitles }))
+      dispatch(restoreLayout({
+        tabId: plan.tabId,
+        layout: plan.layout,
+        paneTitles: plan.paneTitles,
+        paneTitleSetByUser: plan.paneTitleSetByUser,
+      }))
       // Focused-episode-6 round 5 (Finding F1): live terminal panes reattach
       // to their still-running terminals — arm the plan's one-shot
       // paneId→terminalId targets (pane node ids survive restoreLayout

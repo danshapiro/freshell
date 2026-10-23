@@ -193,11 +193,14 @@ export async function restoreMachineWorkspace(
       // naming-source relationship (the plan remapped it through the
       // old→new pane-id map; machine bootstrap preserves ids verbatim).
       ...(plan.nameSource ? { nameSource: plan.nameSource } : {}),
+      // Name reliability (Task 9): a tab a person renamed stays protected.
+      ...(plan.titleSetByUser ? { titleSetByUser: true } : {}),
     }))
     store.dispatch(restoreLayout({
       tabId: plan.tabId,
       layout: plan.layout,
       paneTitles: plan.paneTitles,
+      paneTitleSetByUser: plan.paneTitleSetByUser,
       // The inventory is scoped to this selected machine and the plan already
       // chose only valid snapshot IDs. Preserve that durable pane identity;
       // ordinary and cross-device restore callers intentionally omit this.
@@ -219,5 +222,13 @@ export async function restoreMachineWorkspace(
   // workspace successfully. This marker is local metadata, never server
   // snapshot state and never a cross-device recovery channel.
   persistMachineWorkspaceOriginId(machineId)
+  log.info('machine workspace rebuilt from server inventory', {
+    reason: options.reason,
+    machineId,
+    restoredTabs: plans.length,
+    restoredPaneTitles: plans.reduce((n, plan) => n + Object.keys(plan.paneTitles).length, 0),
+    restoredPaneUserFlags: plans.reduce((n, plan) => n + Object.keys(plan.paneTitleSetByUser).length, 0),
+    restoredTabUserFlags: plans.filter((plan) => plan.titleSetByUser).length,
+  })
   return { restoredTabs: plans.length }
 }

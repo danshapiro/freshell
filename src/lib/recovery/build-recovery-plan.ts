@@ -7,8 +7,12 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import { remapTabNameSource, resolveInitialTabNameSource, parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
-import type { RecoveryInventory, RecoveryPane, LedgerOnlyEntry } from './types'
+import { stripScopedPaneTitleMetadata } from '@/lib/session-name-migration'
+import { createLogger } from '@/lib/client-logger'
+import type { RecoveryInventory, RecoveryPane, RecoveryTab, LedgerOnlyEntry } from './types'
 import type { TabNameSource } from '@shared/session-names'
+
+const log = createLogger('recovery-plan')
 
 
 function terminalContent(p: {
@@ -150,8 +154,20 @@ export interface RecoveryTabPlan {
    * from the restored layout's initial content.
    */
   nameSource?: TabNameSource
+  /**
+   * Name reliability (Task 9, D7): true when a person renamed this tab, so
+   * the restored name stays protected from automatic titles. Restored only
+   * for a tab that is not session-owned (a session-owned tab's name follows
+   * its saved session record).
+   */
+  titleSetByUser?: boolean
   layout: PaneNode
+  /** The recorded pane titles, keyed by the RESTORED pane ids (remapped
+   * through the old→new pane-id map). Scoped agent panes never get one:
+   * their saved session record names them. */
   paneTitles: Record<string, string>
+  /** The panes a person renamed, keyed like `paneTitles`. */
+  paneTitleSetByUser: Record<string, boolean>
   /**
    * Focused-episode-6 round 5 (Finding F1): the plan's LIVE terminal panes
    * reattach to their still-running server terminals — one-shot
@@ -357,6 +373,69 @@ export function countRecoverablePanes(inv: RecoveryInventory): number {
   return device + joined
 }
 
+/** Re-key a pane-id map through the explicit old→new pane-id map; entries
+ * whose pane is not restored are dropped. */
+function remapPaneKeyedMap<T>(
+  map: Record<string, T>,
+  paneIdMap: ReadonlyMap<string, string>,
+): Record<string, T> {
+  const remapped: Record<string, T> = {}
+  for (const [oldPaneId, value] of Object.entries(map)) {
+    const newPaneId = paneIdMap.get(oldPaneId)
+    if (newPaneId) remapped[newPaneId] = value
+  }
+  return remapped
+}
+
+/**
+ * Name reliability (Task 9, D7): the names a rebuilt tab gets back — the
+ * recorded pane titles and "user renamed" flags, remapped to the restored
+ * pane ids, minus every scoped agent pane's (the one client sanitizer,
+ * `stripScopedPaneTitleMetadata`), and the tab's own flag unless the tab is
+ * session-owned (its owner is the recorded pointer, or the rebuilt layout's
+ * first leaf when the record predates it).
+ */
+function restoredTabNames(
+  tab: RecoveryTab,
+  restoredPanes: RecoveryPane[],
+  layout: PaneNode,
+  paneIdMap: ReadonlyMap<string, string>,
+  nameSource: TabNameSource | undefined,
+): Pick<RecoveryTabPlan, 'titleSetByUser' | 'paneTitles' | 'paneTitleSetByUser'> {
+  const recordedTitles: Record<string, string> = {}
+  const recordedFlags: Record<string, boolean> = {}
+  for (const p of restoredPanes) {
+    if (typeof p.title === 'string' && p.title.length > 0) recordedTitles[p.paneId] = p.title
+    if (p.titleSetByUser === true) recordedFlags[p.paneId] = true
+  }
+  const remappedTitles = remapPaneKeyedMap(recordedTitles, paneIdMap)
+  const remappedFlags = remapPaneKeyedMap(recordedFlags, paneIdMap)
+  const KEY = 'tab'
+  const sanitized = stripScopedPaneTitleMetadata(
+    { [KEY]: layout },
+    { [KEY]: remappedTitles },
+    { [KEY]: remappedFlags },
+  )
+  const paneTitles = sanitized.paneTitles[KEY] ?? {}
+  const paneTitleSetByUser = sanitized.paneTitleSetByUser[KEY] ?? {}
+  const owner = nameSource ?? resolveInitialTabNameSource(layout)
+  const sessionOwned = owner?.kind === 'session'
+  const titleSetByUser = tab.titleSetByUser === true && !sessionOwned
+  const droppedScopedTitles = Object.keys(remappedTitles).length - Object.keys(paneTitles).length
+  if (droppedScopedTitles > 0 || (tab.titleSetByUser === true && sessionOwned)) {
+    log.debug('recovery plan dropped names owned by saved session records', {
+      tabKey: tab.tabKey,
+      droppedScopedPaneTitles: droppedScopedTitles,
+      droppedTabUserFlag: tab.titleSetByUser === true && sessionOwned,
+    })
+  }
+  return {
+    ...(titleSetByUser ? { titleSetByUser: true } : {}),
+    paneTitles,
+    paneTitleSetByUser,
+  }
+}
+
 export function buildRecoveryPlan(
   inv: RecoveryInventory,
   options: BuildRecoveryPlanOptions = {},
@@ -386,7 +465,8 @@ export function buildRecoveryPlan(
       // restore mints fresh ids through this map so the recorded nameSource
       // remaps to the pane that now holds the source content.
       const paneIdMap = new Map<string, string>()
-      for (const p of t.panes.filter(isRestorablePane)) {
+      const restoredPanes = t.panes.filter(isRestorablePane)
+      for (const p of restoredPanes) {
         const paneId = options.preserveIdsForMachine ? p.paneId : paneIdMap.get(p.paneId) ?? nanoid()
         paneIdMap.set(p.paneId, paneId)
         const content = paneContent(p, Boolean(options.preserveIdsForMachine))
@@ -414,16 +494,17 @@ export function buildRecoveryPlan(
         }
         leaves.push(node)
       }
-      return { tab: t, leaves, liveTerminalReattach, paneIdMap }
+      return { tab: t, leaves, liveTerminalReattach, paneIdMap, restoredPanes }
     })
     .filter(({ leaves }) => leaves.length > 0)
-    .map(({ tab: t, leaves, liveTerminalReattach, paneIdMap }) => {
+    .map(({ tab: t, leaves, liveTerminalReattach, paneIdMap, restoredPanes }) => {
+      const layout = chain(leaves)
       // Unified agent names (Task 6): remap the recorded pointer through the
       // explicit old→new pane-id map; an unresolvable pointer (its pane was
       // dropped from the restore, or the record predates the field) derives
       // from the rebuilt layout's initial content instead of a stale id.
       const nameSource = t.nameSource
-        ? remapTabNameSource(t.nameSource, paneIdMap) ?? resolveInitialTabNameSource(chain(leaves))
+        ? remapTabNameSource(t.nameSource, paneIdMap) ?? resolveInitialTabNameSource(layout)
         : undefined
       return {
         tabId: options.preserveIdsForMachine
@@ -432,8 +513,8 @@ export function buildRecoveryPlan(
         title: t.tabName || 'Recovered',
         sourceTabKey: t.tabKey,
         ...(nameSource ? { nameSource } : {}),
-        layout: chain(leaves),
-        paneTitles: {},
+        layout,
+        ...restoredTabNames(t, restoredPanes, layout, paneIdMap, nameSource),
         ...(liveTerminalReattach.length ? { liveTerminalReattach } : {}),
       }
     })

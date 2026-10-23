@@ -55,6 +55,12 @@ export const RegistryPaneSnapshotSchema = z.preprocess(normalizeRegistryPaneSnap
   paneId: z.string().min(1),
   kind: RegistryPaneKindSchema,
   title: z.string().optional(),
+  /** Name reliability (Task 9): true when a person renamed this pane, so a
+   * new window that rebuilds the pane from the registry keeps the name
+   * protected from automatic titles. Absent when the title is automatic.
+   * Additive optional; schema parsing strips unknown fields, so it must be
+   * declared here to survive registry snapshots. */
+  titleSetByUser: z.boolean().optional(),
   payload: z.record(z.string(), z.unknown()),
 }))
 export type RegistryPaneSnapshot = z.infer<typeof RegistryPaneSnapshotSchema>
