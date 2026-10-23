@@ -974,7 +974,7 @@ async fn snapshot_route_value(
 
 #[tokio::test]
 async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_registration() {
-    use freshell_freshagent::hosted_rest::HostedRestSnapshot;
+    use freshell_freshagent::rest_lane::RestLaneSnapshot;
     for scenario in [
         "empty",
         "nonempty",
@@ -1031,7 +1031,7 @@ async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_regi
         });
         let proxy = snapshot_outage_proxy(&socket);
         let result = proxy
-            .snapshot(HostedRestSnapshot {
+            .snapshot(RestLaneSnapshot {
                 session_id: "managed-opencode-public".into(),
                 provider: "opencode".into(),
                 session_type: "freshopencode".into(),

@@ -5,10 +5,10 @@
 
 use super::tests::{app, create_shell_tab, delete, get, patch, post, state_with_registry};
 use super::*;
-use crate::hosted_rest;
+use crate::rest_lane;
 use tower::util::ServiceExt;
 
-struct HostedRestFake {
+struct RestLaneFake {
     creates: std::sync::atomic::AtomicUsize,
     sends: std::sync::atomic::AtomicUsize,
     captures: std::sync::atomic::AtomicUsize,
@@ -16,11 +16,11 @@ struct HostedRestFake {
 }
 
 #[async_trait::async_trait]
-impl hosted_rest::HostedFreshAgentRestGateway for HostedRestFake {
+impl rest_lane::FreshAgentRestLane for RestLaneFake {
     async fn create_agent(
         self: Arc<Self>,
-        request: hosted_rest::HostedRestCreate,
-    ) -> Result<hosted_rest::HostedRestCreated, ()> {
+        request: rest_lane::RestLaneCreate,
+    ) -> Result<rest_lane::RestLaneCreated, ()> {
         assert_eq!(request.cwd.as_deref(), Some("/workspace"));
         self.identities
             .lock()
@@ -28,15 +28,15 @@ impl hosted_rest::HostedFreshAgentRestGateway for HostedRestFake {
             .push((request.provider, request.session_type));
         self.creates
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(hosted_rest::HostedRestCreated {
+        Ok(rest_lane::RestLaneCreated {
             session_id: "managed-rest-session".into(),
         })
     }
 
     async fn send_agent(
         &self,
-        request: hosted_rest::HostedRestSend,
-    ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+        request: rest_lane::RestLaneSend,
+    ) -> Result<rest_lane::RestLaneSendResult, ()> {
         assert_eq!(request.session_id, "managed-rest-session");
         assert_eq!(
             (request.provider.as_str(), request.session_type.as_str()),
@@ -44,7 +44,7 @@ impl hosted_rest::HostedFreshAgentRestGateway for HostedRestFake {
         );
         assert_eq!(request.text, "continue");
         self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(hosted_rest::HostedRestSendResult {
+        Ok(rest_lane::RestLaneSendResult {
             session_id: request.session_id,
             completed: true,
         })
@@ -52,15 +52,15 @@ impl hosted_rest::HostedFreshAgentRestGateway for HostedRestFake {
 
     async fn capture(
         &self,
-        request: hosted_rest::HostedRestCapture,
-    ) -> Result<hosted_rest::HostedRestCaptureResult, hosted_rest::HostedRestCaptureError> {
+        request: rest_lane::RestLaneCapture,
+    ) -> Result<rest_lane::RestLaneCaptureResult, rest_lane::RestLaneCaptureError> {
         assert_eq!(
             (request.provider.as_str(), request.session_type.as_str()),
             ("opencode", "freshopencode")
         );
         self.captures
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(hosted_rest::HostedRestCaptureResult {
+        Ok(rest_lane::RestLaneCaptureResult {
             session_id: request.session_id,
             native_session_id: "native-rest-session".into(),
             text: "user: continue\nassistant: done\n".into(),
@@ -729,7 +729,7 @@ async fn fresh_agent_rest_create_registers_tab_and_pane_in_the_layout_store() {
 #[tokio::test]
 async fn hosted_rest_create_and_send_never_start_the_web_owned_opencode_transport() {
     let state = state_with_registry();
-    let gateway = Arc::new(HostedRestFake {
+    let gateway = Arc::new(RestLaneFake {
         creates: std::sync::atomic::AtomicUsize::new(0),
         sends: std::sync::atomic::AtomicUsize::new(0),
         captures: std::sync::atomic::AtomicUsize::new(0),
@@ -790,7 +790,7 @@ async fn hosted_rest_create_and_send_never_start_the_web_owned_opencode_transpor
 #[tokio::test]
 async fn hosted_rest_tab_routes_every_fresh_agent_mode_to_the_typed_gateway() {
     let state = state_with_registry();
-    let gateway = Arc::new(HostedRestFake {
+    let gateway = Arc::new(RestLaneFake {
         creates: std::sync::atomic::AtomicUsize::new(0),
         sends: std::sync::atomic::AtomicUsize::new(0),
         captures: std::sync::atomic::AtomicUsize::new(0),

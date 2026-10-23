@@ -3,13 +3,13 @@
 use super::*;
 
 #[async_trait::async_trait]
-impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
+impl FreshAgentRestLane for HostedFreshAgentProxy {
     async fn snapshot(
         &self,
-        request: freshell_freshagent::hosted_rest::HostedRestSnapshot,
-    ) -> Result<Option<serde_json::Value>, freshell_freshagent::hosted_rest::HostedRestSnapshotError>
+        request: freshell_freshagent::rest_lane::RestLaneSnapshot,
+    ) -> Result<Option<serde_json::Value>, freshell_freshagent::rest_lane::RestLaneSnapshotError>
     {
-        use freshell_freshagent::hosted_rest::HostedRestSnapshotError::{
+        use freshell_freshagent::rest_lane::RestLaneSnapshotError::{
             ManagedUnavailable, OwnershipUnavailable,
         };
         let (provider, session_type) =
@@ -121,10 +121,7 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
         );
         Ok(Some(snapshot))
     }
-    async fn create_agent(
-        self: Arc<Self>,
-        request: HostedRestCreate,
-    ) -> Result<HostedRestCreated, ()> {
+    async fn create_agent(self: Arc<Self>, request: RestLaneCreate) -> Result<RestLaneCreated, ()> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
         let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
@@ -160,10 +157,10 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
                 .map(|value| value.session_id.as_str()),
         );
         self.create(message).await?;
-        Ok(HostedRestCreated { session_id })
+        Ok(RestLaneCreated { session_id })
     }
 
-    async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
+    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, ()> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
         let soul = self
@@ -187,7 +184,7 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             Duration::from_millis(request.timeout_ms),
         )
         .await;
-        Ok(HostedRestSendResult {
+        Ok(RestLaneSendResult {
             session_id: request.session_id,
             completed,
         })
@@ -195,24 +192,24 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
 
     async fn capture(
         &self,
-        request: HostedRestCapture,
-    ) -> Result<HostedRestCaptureResult, HostedRestCaptureError> {
+        request: RestLaneCapture,
+    ) -> Result<RestLaneCaptureResult, RestLaneCaptureError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)
-                .map_err(|_| HostedRestCaptureError::Unavailable)?;
+                .map_err(|_| RestLaneCaptureError::Unavailable)?;
         let soul = self
             .resolve_soul(&provider, session_type, &request.session_id)
             .await
-            .ok_or(HostedRestCaptureError::Unavailable)?;
+            .ok_or(RestLaneCaptureError::Unavailable)?;
         let capture = self
             .client
             .fresh_agent_capture(soul, request.max_bytes.min(256 * 1024) as u32)
             .await
             .map_err(|error| match error.runtime_code() {
-                Some(RuntimeErrorCode::UnsupportedOperation) => HostedRestCaptureError::Unsupported,
-                _ => HostedRestCaptureError::Unavailable,
+                Some(RuntimeErrorCode::UnsupportedOperation) => RestLaneCaptureError::Unsupported,
+                _ => RestLaneCaptureError::Unavailable,
             })?;
-        Ok(HostedRestCaptureResult {
+        Ok(RestLaneCaptureResult {
             session_id: capture.presentation_session_id,
             native_session_id: capture.native_session_id,
             text: capture.text,

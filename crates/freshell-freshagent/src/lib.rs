@@ -54,7 +54,6 @@ pub(crate) mod claude_test_holds;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
 pub(crate) mod delegation;
-pub mod hosted_rest;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
@@ -69,6 +68,7 @@ mod pane_resize;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/process_probe.rs"]
 mod process_probe;
+pub mod rest_lane;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;
@@ -2051,7 +2051,7 @@ pub struct FreshAgentState {
     opencode: SharedOpencodeManagerHandle,
     /// Opt-in durable host gateway. When installed, REST/MCP fresh-agent
     /// requests never touch this web process's legacy provider manager.
-    hosted_rest: Arc<std::sync::OnceLock<hosted_rest::SharedHostedFreshAgentRestGateway>>,
+    hosted_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
     /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): the SAME
@@ -2515,14 +2515,14 @@ impl FreshAgentState {
 
     pub fn set_hosted_rest_gateway(
         &self,
-        gateway: hosted_rest::SharedHostedFreshAgentRestGateway,
+        gateway: rest_lane::SharedFreshAgentRestLane,
     ) -> Result<(), &'static str> {
         self.hosted_rest
             .set(gateway)
             .map_err(|_| "hosted fresh-agent REST gateway is already installed")
     }
 
-    fn hosted_rest_gateway(&self) -> Option<hosted_rest::SharedHostedFreshAgentRestGateway> {
+    fn hosted_rest_gateway(&self) -> Option<rest_lane::SharedFreshAgentRestLane> {
         self.hosted_rest.get().cloned()
     }
 
@@ -4828,7 +4828,7 @@ async fn create_tab(
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
     if let Some(gateway) = state.hosted_rest_gateway() {
-        let provider_inputs = match hosted_rest::provider_inputs(&body) {
+        let provider_inputs = match rest_lane::provider_inputs(&body) {
             Ok(inputs) => inputs,
             Err(error) => return fail_json(StatusCode::BAD_REQUEST, error),
         };
@@ -4846,10 +4846,10 @@ async fn create_tab(
                 }
             },
         };
-        return create_hosted_agent_tab(
+        return create_lane_agent_tab(
             &state,
             gateway,
-            hosted_rest::HostedRestCreate {
+            rest_lane::RestLaneCreate {
                 request_id: Uuid::new_v4().simple().to_string(),
                 provider: provider.into(),
                 session_type: session_type.into(),
@@ -5017,10 +5017,10 @@ async fn create_tab(
     )
 }
 
-async fn create_hosted_agent_tab(
+async fn create_lane_agent_tab(
     state: &FreshAgentState,
-    gateway: hosted_rest::SharedHostedFreshAgentRestGateway,
-    request: hosted_rest::HostedRestCreate,
+    gateway: rest_lane::SharedFreshAgentRestLane,
+    request: rest_lane::RestLaneCreate,
     name: Option<String>,
 ) -> Response {
     let created = match gateway.create_agent(request.clone()).await {
@@ -5032,7 +5032,7 @@ async fn create_hosted_agent_tab(
             )
         }
     };
-    let hosted_rest::HostedRestCreate {
+    let rest_lane::RestLaneCreate {
         request_id,
         provider,
         session_type,
@@ -6348,7 +6348,7 @@ async fn send_keys(
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
         let result = gateway
-            .send_agent(hosted_rest::HostedRestSend {
+            .send_agent(rest_lane::RestLaneSend {
                 request_id: request_id.clone(),
                 session_id: pane.placeholder_id.clone(),
                 provider: pane.provider.clone(),
@@ -7052,7 +7052,7 @@ async fn capture(
             .unwrap_or(256 * 1024)
             .clamp(1, 256 * 1024);
         return match gateway
-            .capture(hosted_rest::HostedRestCapture {
+            .capture(rest_lane::RestLaneCapture {
                 session_id,
                 provider: pane.provider.clone(),
                 session_type: pane.session_type.clone(),
@@ -7061,11 +7061,11 @@ async fn capture(
             .await
         {
             Ok(capture) => text_plain(capture.text),
-            Err(hosted_rest::HostedRestCaptureError::Unsupported) => fail_json(
+            Err(rest_lane::RestLaneCaptureError::Unsupported) => fail_json(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "hosted fresh-agent provider does not support transcript capture".to_string(),
             ),
-            Err(hosted_rest::HostedRestCaptureError::Unavailable) => fail_json(
+            Err(rest_lane::RestLaneCaptureError::Unavailable) => fail_json(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "hosted fresh-agent transcript is temporarily unavailable".to_string(),
             ),
@@ -9236,28 +9236,28 @@ mod tests {
     // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
 
     #[derive(Default)]
-    struct RecordingHostedRestGateway {
-        sends: Mutex<Vec<hosted_rest::HostedRestSend>>,
-        captures: Mutex<Vec<hosted_rest::HostedRestCapture>>,
+    struct RecordingRestLaneGateway {
+        sends: Mutex<Vec<rest_lane::RestLaneSend>>,
+        captures: Mutex<Vec<rest_lane::RestLaneCapture>>,
     }
 
     #[async_trait::async_trait]
-    impl hosted_rest::HostedFreshAgentRestGateway for RecordingHostedRestGateway {
+    impl rest_lane::FreshAgentRestLane for RecordingRestLaneGateway {
         async fn create_agent(
             self: Arc<Self>,
-            _request: hosted_rest::HostedRestCreate,
-        ) -> Result<hosted_rest::HostedRestCreated, ()> {
-            Ok(hosted_rest::HostedRestCreated {
+            _request: rest_lane::RestLaneCreate,
+        ) -> Result<rest_lane::RestLaneCreated, ()> {
+            Ok(rest_lane::RestLaneCreated {
                 session_id: "managed-kilroy-recovered".into(),
             })
         }
 
         async fn send_agent(
             &self,
-            request: hosted_rest::HostedRestSend,
-        ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+            request: rest_lane::RestLaneSend,
+        ) -> Result<rest_lane::RestLaneSendResult, ()> {
             self.sends.lock().expect("sends mutex").push(request);
-            Ok(hosted_rest::HostedRestSendResult {
+            Ok(rest_lane::RestLaneSendResult {
                 session_id: "managed-kilroy-recovered".into(),
                 completed: true,
             })
@@ -9265,11 +9265,10 @@ mod tests {
 
         async fn capture(
             &self,
-            request: hosted_rest::HostedRestCapture,
-        ) -> Result<hosted_rest::HostedRestCaptureResult, hosted_rest::HostedRestCaptureError>
-        {
+            request: rest_lane::RestLaneCapture,
+        ) -> Result<rest_lane::RestLaneCaptureResult, rest_lane::RestLaneCaptureError> {
             self.captures.lock().expect("captures mutex").push(request);
-            Ok(hosted_rest::HostedRestCaptureResult {
+            Ok(rest_lane::RestLaneCaptureResult {
                 session_id: "managed-kilroy-recovered".into(),
                 native_session_id: "kilroy-native".into(),
                 text: "recovered transcript".into(),
@@ -9282,7 +9281,7 @@ mod tests {
     async fn hosted_rest_send_and_capture_recover_pane_from_persisted_layout_after_web_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout.json");
-        let gateway = Arc::new(RecordingHostedRestGateway::default());
+        let gateway = Arc::new(RecordingRestLaneGateway::default());
         let first = state().with_layout(layout_store::LayoutStore::with_persistence(path.clone()));
         first.set_hosted_rest_gateway(gateway.clone()).unwrap();
         let mut headers = HeaderMap::new();

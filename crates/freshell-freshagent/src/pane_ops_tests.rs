@@ -5,7 +5,7 @@
 //! module's `pub(super)` helpers).
 
 use super::*;
-use crate::hosted_rest;
+use crate::rest_lane;
 use axum::body::Body;
 use axum::http::Request;
 use std::sync::Arc;
@@ -14,24 +14,24 @@ use tower::util::ServiceExt;
 struct SplitHostedGateway;
 
 #[async_trait::async_trait]
-impl hosted_rest::HostedFreshAgentRestGateway for SplitHostedGateway {
+impl rest_lane::FreshAgentRestLane for SplitHostedGateway {
     async fn create_agent(
         self: Arc<Self>,
-        request: hosted_rest::HostedRestCreate,
-    ) -> Result<hosted_rest::HostedRestCreated, ()> {
+        request: rest_lane::RestLaneCreate,
+    ) -> Result<rest_lane::RestLaneCreated, ()> {
         assert_eq!(
             (request.provider.as_str(), request.session_type.as_str()),
             ("claude", "freshclaude")
         );
-        Ok(hosted_rest::HostedRestCreated {
+        Ok(rest_lane::RestLaneCreated {
             session_id: "managed-split-claude".into(),
         })
     }
 
     async fn send_agent(
         &self,
-        _request: hosted_rest::HostedRestSend,
-    ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+        _request: rest_lane::RestLaneSend,
+    ) -> Result<rest_lane::RestLaneSendResult, ()> {
         unreachable!("split creation does not send a prompt")
     }
 }

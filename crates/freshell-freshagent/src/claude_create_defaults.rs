@@ -26,7 +26,7 @@ pub fn resolve_claude_rest_create(
     if !matches!(session_type, "freshclaude" | "kilroy") {
         return Err(format!("unsupported Claude session type: {session_type}"));
     }
-    let inputs = crate::hosted_rest::provider_inputs(body)?;
+    let inputs = crate::rest_lane::provider_inputs(body)?;
     let saved = &settings.providers[session_type];
     let model_selection = match inputs.model_selection {
         Some(selection) => selection,

@@ -3,12 +3,11 @@
 //! Opt-in external gateway from the retained fresh-agent wire to the
 //! supervisor/session-host actor. This module owns no provider process.
 
-use freshell_freshagent::hosted_rest::{
-    HostedFreshAgentRestGateway, HostedRestCapture, HostedRestCaptureError,
-    HostedRestCaptureResult, HostedRestCreate, HostedRestCreated, HostedRestSend,
-    HostedRestSendResult,
-};
 use freshell_freshagent::naming::{admit_pending_projection, session_projection, SessionNaming};
+use freshell_freshagent::rest_lane::{
+    FreshAgentRestLane, RestLaneCapture, RestLaneCaptureError, RestLaneCaptureResult,
+    RestLaneCreate, RestLaneCreated, RestLaneSend, RestLaneSendResult,
+};
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
     AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentForked,

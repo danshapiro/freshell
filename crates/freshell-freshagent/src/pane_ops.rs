@@ -45,7 +45,7 @@ use crate::layout_store::RenameOutcome;
 use crate::target_resolver::{resolve_target, ResolvedTarget};
 use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
 use crate::{
-    approx_json, authorized, fail_json, hosted_rest, ok_json, parse_required_name, rest_agent_mode,
+    approx_json, authorized, fail_json, ok_json, parse_required_name, rest_agent_mode, rest_lane,
     FreshAgentState, PaneEntry, PaneNameResolution,
 };
 
@@ -213,7 +213,7 @@ pub(crate) async fn split_pane(
             },
         };
         let request_id = uuid::Uuid::new_v4().simple().to_string();
-        let provider_inputs = match hosted_rest::provider_inputs(&body) {
+        let provider_inputs = match rest_lane::provider_inputs(&body) {
             Ok(inputs) => inputs,
             Err(error) => {
                 let _ = state.layout.close_pane(&new_pane_id);
@@ -230,7 +230,7 @@ pub(crate) async fn split_pane(
             .and_then(Value::as_str)
             .map(str::to_string);
         let created = match gateway
-            .create_agent(hosted_rest::HostedRestCreate {
+            .create_agent(rest_lane::RestLaneCreate {
                 request_id: request_id.clone(),
                 provider: provider.into(),
                 session_type: session_type.into(),

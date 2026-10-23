@@ -1,19 +1,19 @@
-//! Typed seam for routing the REST/MCP fresh-agent ingress to the durable
-//! session-host owner. The implementation lives in `freshell-server`; this
-//! crate deliberately knows nothing about supervisor IPC.
+//! Typed REST/MCP ingress shared by local and hosted fresh-agent runtimes.
+//! Hosted implementations live in `freshell-server`; this crate deliberately
+//! knows nothing about supervisor IPC.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 #[derive(Default)]
-pub struct HostedRestProviderInputs {
+pub struct RestLaneProviderInputs {
     pub plugins: Option<Vec<String>>,
     pub model_selection: Option<Option<freshell_protocol::ModelSelection>>,
     pub permission_mode: Option<String>,
     pub sandbox: Option<freshell_protocol::Sandbox>,
 }
 
-pub fn provider_inputs(body: &Value) -> Result<HostedRestProviderInputs, String> {
+pub fn provider_inputs(body: &Value) -> Result<RestLaneProviderInputs, String> {
     let plugins = body
         .get("plugins")
         .map(|value| {
@@ -38,7 +38,7 @@ pub fn provider_inputs(body: &Value) -> Result<HostedRestProviderInputs, String>
             serde_json::from_value(value.clone()).map_err(|_| "invalid sandbox".to_string())
         })
         .transpose()?;
-    Ok(HostedRestProviderInputs {
+    Ok(RestLaneProviderInputs {
         plugins,
         model_selection,
         permission_mode,
@@ -47,7 +47,7 @@ pub fn provider_inputs(body: &Value) -> Result<HostedRestProviderInputs, String>
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct HostedRestCreate {
+pub struct RestLaneCreate {
     pub request_id: String,
     pub provider: String,
     pub session_type: String,
@@ -62,14 +62,14 @@ pub struct HostedRestCreate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostedRestCreated {
+pub struct RestLaneCreated {
     /// Stable presentation identity used by the web layout and gateway alias
     /// table. It is not substituted for the provider's native identity.
     pub session_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostedRestSend {
+pub struct RestLaneSend {
     pub request_id: String,
     pub session_id: String,
     pub provider: String,
@@ -79,13 +79,13 @@ pub struct HostedRestSend {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostedRestSendResult {
+pub struct RestLaneSendResult {
     pub session_id: String,
     pub completed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostedRestCapture {
+pub struct RestLaneCapture {
     pub session_id: String,
     pub provider: String,
     pub session_type: String,
@@ -93,7 +93,7 @@ pub struct HostedRestCapture {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostedRestCaptureResult {
+pub struct RestLaneCaptureResult {
     pub session_id: String,
     pub native_session_id: String,
     pub text: String,
@@ -101,50 +101,50 @@ pub struct HostedRestCaptureResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostedRestCaptureError {
+pub enum RestLaneCaptureError {
     Unsupported,
     Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostedRestSnapshot {
+pub struct RestLaneSnapshot {
     pub session_id: String,
     pub provider: String,
     pub session_type: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostedRestSnapshotError {
+pub enum RestLaneSnapshotError {
     OwnershipUnavailable,
     ManagedUnavailable,
 }
 
 #[async_trait]
-pub trait HostedFreshAgentRestGateway: Send + Sync {
+pub trait FreshAgentRestLane: Send + Sync {
     /// None leaves genuinely unmanaged threads on their existing read path.
     /// A hosted read failure must never fall back to saved history as live truth.
     async fn snapshot(
         &self,
-        _request: HostedRestSnapshot,
-    ) -> Result<Option<Value>, HostedRestSnapshotError> {
-        Err(HostedRestSnapshotError::OwnershipUnavailable)
+        _request: RestLaneSnapshot,
+    ) -> Result<Option<Value>, RestLaneSnapshotError> {
+        Err(RestLaneSnapshotError::OwnershipUnavailable)
     }
     async fn create_agent(
         self: std::sync::Arc<Self>,
-        request: HostedRestCreate,
-    ) -> Result<HostedRestCreated, ()>;
+        request: RestLaneCreate,
+    ) -> Result<RestLaneCreated, ()>;
 
-    async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()>;
+    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, ()>;
 
     async fn capture(
         &self,
-        _request: HostedRestCapture,
-    ) -> Result<HostedRestCaptureResult, HostedRestCaptureError> {
-        Err(HostedRestCaptureError::Unsupported)
+        _request: RestLaneCapture,
+    ) -> Result<RestLaneCaptureResult, RestLaneCaptureError> {
+        Err(RestLaneCaptureError::Unsupported)
     }
 }
 
-pub type SharedHostedFreshAgentRestGateway = std::sync::Arc<dyn HostedFreshAgentRestGateway>;
+pub type SharedFreshAgentRestLane = std::sync::Arc<dyn FreshAgentRestLane>;
 
 #[cfg(test)]
 mod tests {

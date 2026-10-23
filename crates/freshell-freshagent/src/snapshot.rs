@@ -212,7 +212,7 @@ async fn get_snapshot(
     {
         if let Some(gateway) = state.opencode.hosted_rest_gateway() {
             match gateway
-                .snapshot(crate::hosted_rest::HostedRestSnapshot {
+                .snapshot(crate::rest_lane::RestLaneSnapshot {
                     session_id: thread_id.clone(),
                     provider: provider.clone(),
                     session_type: session_type.clone(),
@@ -221,13 +221,13 @@ async fn get_snapshot(
             {
                 Ok(Some(snapshot)) => return Json(snapshot).into_response(),
                 Ok(None) => {}
-                Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable) => {
+                Err(crate::rest_lane::RestLaneSnapshotError::ManagedUnavailable) => {
                     return fail(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Managed conversation snapshot unavailable".into(),
                     );
                 }
-                Err(crate::hosted_rest::HostedRestSnapshotError::OwnershipUnavailable) => {
+                Err(crate::rest_lane::RestLaneSnapshotError::OwnershipUnavailable) => {
                     return state
                         .saved_history_or_unavailable(&session_type, &provider, &thread_id)
                         .await
@@ -504,26 +504,25 @@ mod tests {
     struct SnapshotGateway;
 
     #[async_trait::async_trait]
-    impl crate::hosted_rest::HostedFreshAgentRestGateway for SnapshotGateway {
+    impl crate::rest_lane::FreshAgentRestLane for SnapshotGateway {
         async fn create_agent(
             self: Arc<Self>,
-            _: crate::hosted_rest::HostedRestCreate,
-        ) -> Result<crate::hosted_rest::HostedRestCreated, ()> {
+            _: crate::rest_lane::RestLaneCreate,
+        ) -> Result<crate::rest_lane::RestLaneCreated, ()> {
             panic!("GET must not create")
         }
         async fn send_agent(
             &self,
-            _: crate::hosted_rest::HostedRestSend,
-        ) -> Result<crate::hosted_rest::HostedRestSendResult, ()> {
+            _: crate::rest_lane::RestLaneSend,
+        ) -> Result<crate::rest_lane::RestLaneSendResult, ()> {
             panic!("GET must not send")
         }
         async fn snapshot(
             &self,
-            request: crate::hosted_rest::HostedRestSnapshot,
-        ) -> Result<Option<serde_json::Value>, crate::hosted_rest::HostedRestSnapshotError>
-        {
+            request: crate::rest_lane::RestLaneSnapshot,
+        ) -> Result<Option<serde_json::Value>, crate::rest_lane::RestLaneSnapshotError> {
             if request.session_id == "unavailable-host" {
-                return Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable);
+                return Err(crate::rest_lane::RestLaneSnapshotError::ManagedUnavailable);
             }
             Ok(Some(
                 json!({"threadId":request.session_id,"status":"running",
