@@ -78,7 +78,16 @@ pub struct RigOptions {
     /// The session handoff route (`POST /api/sessions/handoff`) on the rig's
     /// server, driven by a runner over the same lanes (main.rs's wiring).
     pub handoff: bool,
+    /// The ordinary Freshell MCP wiring main.rs installs (G19): the claude lane
+    /// gets the rig server's own endpoint (its bound loopback port and
+    /// [`AUTH_TOKEN`]) and a recipe provider answering what this cell holds at
+    /// each sidecar launch (a test changes it to flip the setting).
+    pub freshell_mcp: Option<RigFreshellMcp>,
 }
+
+/// What the rig's Freshell MCP recipe provider answers, changeable mid-test.
+pub type RigFreshellMcp =
+    Arc<std::sync::Mutex<freshell_freshagent::claude_freshell_mcp::ClaudeFreshellMcpResolution>>;
 
 pub struct ClaudeRig {
     pub kind: RigKind,
@@ -1004,6 +1013,21 @@ async fn spawn_rig_server(
         .await
         .expect("bind an ephemeral loopback port");
     let addr = listener.local_addr().expect("local addr");
+    if let Some(resolution) = options.freshell_mcp.clone() {
+        // main.rs wires the same two pieces from its bound port and token.
+        assert!(lane.set_freshell_endpoint(
+            freshell_freshagent::claude_freshell_mcp::FreshellEndpoint {
+                url: format!("http://{addr}"),
+                token: AUTH_TOKEN.to_string(),
+            }
+        ));
+        let provider: freshell_freshagent::claude_freshell_mcp::ClaudeFreshellMcpProvider =
+            Arc::new(move || {
+                let answer = resolution.lock().expect("rig mcp resolution").clone();
+                Box::pin(async move { answer })
+            });
+        assert!(lane.set_freshell_mcp_provider(provider));
+    }
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

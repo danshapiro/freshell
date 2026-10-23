@@ -403,6 +403,9 @@ impl FreshClaudeState {
             .spawn_sidecar_process(&spec.session_type)
             .await
             .map_err(EstablishError::Spawn)?;
+        // The Freshell MCP recipe is resolved per launch (G19), so the
+        // setting applies to the next sidecar without a restart.
+        let spec = &self.freshell_mcp.launch(spec.clone()).await;
         // Arm the lease's TTL tree-kill path now that the child and its tag exist.
         if let Some(guard) = lease_guard {
             if let Some(pid) = child.id() {
@@ -734,6 +737,7 @@ impl FreshClaudeState {
                 ClaudeSession {
                     configuration: ClaudeConfiguration {
                         settings: configuration_settings,
+                        freshell_context: spec.freshell_context.clone(),
                         ..ClaudeConfiguration::default()
                     },
                     stdin,

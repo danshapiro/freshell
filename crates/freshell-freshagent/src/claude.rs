@@ -115,6 +115,11 @@ pub struct FreshClaudeState {
     /// Host-only selection of the fixed Freshell stdio MCP recipe. Its endpoint
     /// and grant remain in the child environment, never in create IPC.
     hosted_mcp: bool,
+    /// The ordinary Freshell MCP (G19): the endpoint every sidecar's
+    /// environment carries and the recipe provider asked at each launch, both
+    /// wired by `freshell-server` ([`Self::set_freshell_endpoint`],
+    /// [`Self::set_freshell_mcp_provider`]); unwired in the session host.
+    freshell_mcp: crate::claude_freshell_mcp::ClaudeFreshellMcpWiring,
     /// Test seam (`test-support` feature, C04 rigs): the complete environment of
     /// every claude sidecar this state spawns, replacing the inherited one (the
     /// ownership tag is still layered on). `None` in production: the sidecar
@@ -732,6 +737,9 @@ struct ClaudeConfiguration {
     commands: Option<Vec<Value>>,
     needs_configure: bool,
     runtime_cwd: Option<String>,
+    /// The pane this runtime was launched for (G19): an undo's replacement and
+    /// a fork's child launch for the same pane.
+    freshell_context: Option<crate::claude_freshell_mcp::ClaudeFreshellContext>,
 }
 
 impl ClaudeSession {
@@ -795,6 +803,7 @@ impl FreshClaudeState {
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
             hosted_mcp: false,
+            freshell_mcp: Default::default(),
             sidecar_environment: None,
             broadcast_tx,
             checkpoint_event_sink: crate::CheckpointEventSink::default(),
@@ -836,6 +845,26 @@ impl FreshClaudeState {
     pub fn with_hosted_mcp(mut self, selected: bool) -> Self {
         self.hosted_mcp = selected;
         self
+    }
+
+    /// Wire where every sidecar's CLI reaches this server (G19): its
+    /// environment carries `FRESHELL=1`, `FRESHELL_URL` and `FRESHELL_TOKEN`.
+    /// Set-once; `false` when an endpoint was already wired.
+    pub fn set_freshell_endpoint(
+        &self,
+        endpoint: crate::claude_freshell_mcp::FreshellEndpoint,
+    ) -> bool {
+        self.freshell_mcp.set_endpoint(endpoint)
+    }
+
+    /// Wire the Freshell MCP recipe provider (G19), asked at every sidecar
+    /// launch of a lane that did not select the hosted recipe. Set-once;
+    /// `false` when a provider was already wired.
+    pub fn set_freshell_mcp_provider(
+        &self,
+        provider: crate::claude_freshell_mcp::ClaudeFreshellMcpProvider,
+    ) -> bool {
+        self.freshell_mcp.set_provider(provider)
     }
 
     /// Test seam (see [`Self::sidecar_environment`]): every sidecar this state
@@ -887,7 +916,12 @@ impl FreshClaudeState {
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
     /// come through here) for a session of `session_type`.
     async fn spawn_sidecar_process(&self, session_type: &str) -> Result<SpawnedSidecar, String> {
-        spawn_sidecar(self.sidecar_environment.as_deref(), session_type).await
+        spawn_sidecar(
+            self.sidecar_environment.as_deref(),
+            self.freshell_mcp.endpoint(),
+            session_type,
+        )
+        .await
     }
 
     pub fn set_checkpoint_event_persister(
@@ -2425,7 +2459,13 @@ impl FreshClaudeState {
             self.hosted_mcp,
         )
         .with_session_id(boot_session_id)
-        .with_model_selection(serde_json::to_value(&msg.model_selection).ok());
+        .with_model_selection(serde_json::to_value(&msg.model_selection).ok())
+        .with_freshell_context(
+            crate::claude_freshell_mcp::ClaudeFreshellContext::from_ids(
+                msg.tab_id.as_deref(),
+                msg.pane_id.as_deref(),
+            ),
+        );
         // b8ke focused episode-2 round-2 F2: the create's claim owns this
         // runtime's coordinator transition (the session-init adoption's Blocked
         // arm correlates its own in-flight claim through it).
@@ -5716,7 +5756,13 @@ impl FreshClaudeState {
             &rec,
             self.hosted_mcp,
         )
-        .with_session_id(minted_id);
+        .with_session_id(minted_id)
+        .with_freshell_context(
+            crate::claude_freshell_mcp::ClaudeFreshellContext::from_ids(
+                msg.tab_id.as_deref(),
+                msg.pane_id.as_deref(),
+            ),
+        );
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
         // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane. The
@@ -7979,6 +8025,7 @@ pub(crate) fn sidecar_node_command(
 /// `test-support` seam); otherwise it inherits this process's.
 async fn spawn_sidecar(
     environment: Option<&[(String, String)]>,
+    freshell_endpoint: Option<&crate::claude_freshell_mcp::FreshellEndpoint>,
     session_type: &str,
 ) -> Result<SpawnedSidecar, String> {
     let entry = sidecar_entry_path();
@@ -7998,7 +8045,8 @@ async fn spawn_sidecar(
         crate::claude_spawn::ClaudeNodeCommand::new(&entry),
         &ownership_id,
     )
-    .with_complete_environment(environment);
+    .with_complete_environment(environment)
+    .with_freshell_endpoint(freshell_endpoint);
     let node = command.node().to_string();
     let (mut child, tree_guard) = command.spawn_guarded().map_err(|error| match error {
         crate::claude_spawn::ClaudeSpawnError::ExecProfile(classification) => classification,
@@ -8049,7 +8097,7 @@ mod provider_exec_tests {
                     .collect(),
             )
             .unwrap();
-            let mut result = spawn_sidecar(None, "freshclaude").await;
+            let mut result = spawn_sidecar(None, None, "freshclaude").await;
             if let Ok(SpawnedSidecar { child, .. }) = &mut result {
                 let pid = child.id().unwrap();
                 child.kill().await.unwrap();

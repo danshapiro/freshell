@@ -5,8 +5,8 @@
 //! handoff resume, a rollback respawn) describes itself as one
 //! [`ClaudeLaunchSpec`], and [`ClaudeLaunchSpec::create_request`] is the only
 //! builder of the sidecar's `create` line. So no launch can drop a field another
-//! carries: the pane's plugins and the hosted Freshell MCP reach the CLI on every
-//! launch (G15).
+//! carries: the pane's plugins, the hosted or ordinary Freshell MCP and the pane
+//! context reach the CLI on every launch (G15, G19).
 //!
 //! The line names its stdio protocol ([`SIDECAR_PROTOCOL`]) and a [`ClaudeBoot`]:
 //! a fresh conversation, a resume, or a fork of a parent conversation at a point.
@@ -20,6 +20,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::claude_freshell_mcp::{ClaudeFreshellContext, ClaudeFreshellMcp};
 use crate::claude_snapshot::{LocateError, TranscriptLocation};
 use crate::identity_sink::FreshAgentSettings;
 
@@ -166,6 +167,12 @@ pub(crate) struct ClaudeLaunchSpec {
     /// The id a fresh or forked boot writes the conversation under (the
     /// session's own id when it boots from its genesis, design §4.2).
     pub(crate) session_id: Option<String>,
+    /// The ordinary Freshell MCP recipe (G19), resolved when the sidecar is
+    /// launched (`claude_freshell_mcp`); never for a hosted lane.
+    pub(crate) freshell_mcp: Option<ClaudeFreshellMcp>,
+    /// The pane the session runs for (G19): a create's or an attach's pane, or
+    /// the replaced or forked session's.
+    pub(crate) freshell_context: Option<ClaudeFreshellContext>,
 }
 
 impl ClaudeLaunchSpec {
@@ -193,7 +200,15 @@ impl ClaudeLaunchSpec {
             hosted_mcp,
             model_selection: None,
             session_id: None,
+            freshell_mcp: None,
+            freshell_context: None,
         }
+    }
+
+    /// This launch running for the pane `context` (G19).
+    pub(crate) fn with_freshell_context(mut self, context: Option<ClaudeFreshellContext>) -> Self {
+        self.freshell_context = context;
+        self
     }
 
     /// This launch writing a fresh or forked conversation under `session_id`.
@@ -210,9 +225,9 @@ impl ClaudeLaunchSpec {
 
     /// The sidecar `create` line. Every line carries the same keys, whatever
     /// the launch: `type`, `protocol`, `requestId`, `sessionType`, `boot`, and
-    /// `sessionId`, `cwd`, `model`, `permissionMode`, `effort`, `plugins` (each
-    /// `null` when unset) and `hostedMcp`; `modelSelection` only when the
-    /// launch has one.
+    /// `sessionId`, `cwd`, `model`, `permissionMode`, `effort`, `plugins`,
+    /// `freshellMcp`, `freshellContext` (each `null` when unset) and
+    /// `hostedMcp`; `modelSelection` only when the launch has one.
     pub(crate) fn create_request(&self) -> Value {
         let mut line = Map::new();
         line.insert("type".into(), json!("create"));
@@ -227,6 +242,8 @@ impl ClaudeLaunchSpec {
         line.insert("effort".into(), json!(self.effort));
         line.insert("plugins".into(), json!(self.plugins));
         line.insert("hostedMcp".into(), json!(self.hosted_mcp));
+        line.insert("freshellMcp".into(), json!(self.freshell_mcp));
+        line.insert("freshellContext".into(), json!(self.freshell_context));
         if let Some(selection) = &self.model_selection {
             line.insert("modelSelection".into(), selection.clone());
         }
@@ -522,8 +539,69 @@ mod tests {
                 "effort": "high",
                 "plugins": ["/w/.claude/plugins/review"],
                 "hostedMcp": true,
+                "freshellMcp": null,
+                "freshellContext": null,
             })
         );
+    }
+
+    /// G19: whatever the boot, the line hands the sidecar the ordinary
+    /// Freshell MCP recipe and the pane context the launch carries (only the
+    /// command and its arguments, never an environment), and names both keys
+    /// when unset.
+    #[test]
+    fn every_boot_carries_the_freshell_mcp_recipe_and_the_pane_context() {
+        let recipe = ClaudeFreshellMcp {
+            command: "node".into(),
+            args: vec!["/srv/freshell-mcp/server.js".into()],
+        };
+        for boot in [
+            ClaudeBoot::Fresh,
+            ClaudeBoot::Resume { resume: "P".into() },
+            ClaudeBoot::Fork {
+                resume: "P".into(),
+                at: Some("a1".into()),
+                drops_turn: None,
+            },
+        ] {
+            let kind = boot.kind();
+            let mut spec = ClaudeLaunchSpec::new(
+                "req",
+                "kilroy",
+                boot.clone(),
+                None,
+                &FreshAgentSettings::default(),
+                false,
+            )
+            .with_freshell_context(ClaudeFreshellContext::from_ids(
+                Some("tab-1"),
+                Some("pane-1"),
+            ));
+            spec.freshell_mcp = Some(recipe.clone());
+            let line = spec.create_request();
+            assert_eq!(
+                line["freshellMcp"],
+                json!({ "command": "node", "args": ["/srv/freshell-mcp/server.js"] }),
+                "{kind}"
+            );
+            assert_eq!(
+                line["freshellContext"],
+                json!({ "tabId": "tab-1", "paneId": "pane-1" }),
+                "{kind}"
+            );
+
+            let bare = ClaudeLaunchSpec::new(
+                "req",
+                "kilroy",
+                boot,
+                None,
+                &FreshAgentSettings::default(),
+                false,
+            )
+            .create_request();
+            assert_eq!(bare.get("freshellMcp"), Some(&Value::Null), "{kind}");
+            assert_eq!(bare.get("freshellContext"), Some(&Value::Null), "{kind}");
+        }
     }
 
     /// G15: whatever the boot, the line hands the sidecar the session's plugins

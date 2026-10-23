@@ -38,6 +38,7 @@
 
 pub mod claude;
 pub(crate) mod claude_dead_sessions;
+pub mod claude_freshell_mcp;
 pub(crate) mod claude_handshake;
 pub(crate) mod claude_launch;
 pub(crate) mod claude_live_events;
