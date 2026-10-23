@@ -15,16 +15,34 @@ import type { AppDispatch } from '@/store/store'
 const { focus } = vi.hoisted(() => ({ focus: { watched: false } }))
 vi.mock('@/lib/window-focus', () => ({ isWindowFocused: () => focus.watched }))
 
-function createStore() {
+type PaneIdentity = { sessionId: string; sessionRef?: { provider: string; sessionId: string } }
+
+function createStore(options: Partial<PaneIdentity> & { additionalPanes?: PaneIdentity[] } = {}) {
+  const sessionId = options.sessionId ?? 'session-1'
+  const paneIdentities = [{ sessionId, sessionRef: options.sessionRef }, ...(options.additionalPanes ?? [])]
+  const panes = paneIdentities.map((identity, index) => ({
+    type: 'leaf' as const,
+    id: `pane-${index + 1}`,
+    content: {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshclaude' as const,
+      provider: 'claude' as const,
+      sessionId: identity.sessionId,
+      ...(identity.sessionRef ? { sessionRef: identity.sessionRef } : {}),
+    },
+  }))
+  const layout = panes.length === 1 ? panes[0] : {
+    type: 'split' as const,
+    id: 'split-1',
+    direction: 'horizontal' as const,
+    children: [panes[0], panes[1]] as [typeof panes[number], typeof panes[number]],
+    sizes: [50, 50] as [number, number],
+  }
   const store = configureStore({
     reducer: {
       turnCompletion: reducer,
       tabs: (state = { activeTabId: 'tab-1' }) => state,
-      panes: (state = { layouts: {
-        'tab-1': { type: 'leaf', id: 'pane-1', content: {
-          kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', sessionId: 'session-1',
-        } },
-      } }) => state,
+      panes: (state = { layouts: { 'tab-1': layout } }) => state,
       freshAgent: (state = { sessions: {} }) => state,
     },
     middleware: (getDefault) => getDefault().concat(turnCompletionReceiptMiddleware),
@@ -130,6 +148,81 @@ describe('fresh-agent reconnect attention', () => {
     dispatch(foldReadyFreshAgentAttention(mark(100, 110)))
     expect(store.getState().turnCompletion.seq).toBe(0)
     dispatch(foldReadyFreshAgentAttention(mark(101, 111)))
+    expect(store.getState().turnCompletion.seq).toBe(2)
+  })
+
+  it('does not replay one missed edge again when a durable alias appears on a later ready', () => {
+    const runtimeId = 'runtime-id'
+    const durableId = 'durable-id'
+    const { store, dispatch } = createStore({
+      sessionId: runtimeId,
+      sessionRef: { provider: 'claude', sessionId: durableId },
+    })
+    const attentionMark = (sessionId: string, at: number, waitingAt?: number) => ({
+      provider: 'claude', sessionId, sessionType: 'freshclaude', lastTurnCompleteAt: at,
+      ...(waitingAt === undefined ? {} : { lastWaitingAt: waitingAt }),
+    })
+
+    // Both aliases are known to the pane, but the client first reconnects
+    // before the server's ready snapshot contains its durable ledger entry.
+    dispatch(observeFreshAgentSession({ provider: 'claude', sessionId: runtimeId }))
+    dispatch(observeFreshAgentSession({ provider: 'claude', sessionId: durableId }))
+    dispatch(applyFreshAgentCompletion({ provider: 'claude', sessionId: runtimeId, at: 100 }))
+    dispatch(applyFreshAgentWaiting({ provider: 'claude', sessionId: runtimeId, at: 110 }))
+    expect(store.getState().turnCompletion.seq).toBe(2)
+
+    // The waiting timestamp is lower than the completion timestamp; the
+    // `#waiting` namespace must still replay its independent unseen edge.
+    dispatch(foldReadyFreshAgentAttention([attentionMark(runtimeId, 200, 150)]))
+    expect(store.getState().turnCompletion.seq).toBe(4)
+
+    dispatch(foldReadyFreshAgentAttention([
+      attentionMark(durableId, 200, 150),
+      attentionMark(runtimeId, 200, 150),
+    ]))
+    dispatch(foldReadyFreshAgentAttention([
+      attentionMark(runtimeId, 200, 150),
+      attentionMark(durableId, 200, 150),
+    ]))
+    expect(store.getState().turnCompletion.seq).toBe(4)
+  })
+
+  it('replays an unknown runtime alias when its pane has an observed durable baseline', () => {
+    const runtimeId = 'runtime-id'
+    const durableId = 'durable-id'
+    const { store, dispatch } = createStore({
+      sessionId: runtimeId,
+      sessionRef: { provider: 'claude', sessionId: durableId },
+    })
+    const mark = (sessionId: string) => ({
+      provider: 'claude', sessionId, sessionType: 'freshclaude', lastWaitingAt: 200,
+    })
+
+    dispatch(observeFreshAgentSession({ provider: 'claude', sessionId: durableId }))
+    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:runtime-id']).toBe(0)
+    dispatch(foldReadyFreshAgentAttention([mark(runtimeId)]))
+    expect(store.getState().turnCompletion.seq).toBe(1)
+
+    dispatch(foldReadyFreshAgentAttention([mark(durableId)]))
+    expect(store.getState().turnCompletion.seq).toBe(1)
+  })
+
+  it('keeps equal-time completions independent across different pane identities', () => {
+    const { store, dispatch } = createStore({
+      sessionId: 'runtime-one',
+      sessionRef: { provider: 'claude', sessionId: 'durable-one' },
+      additionalPanes: [{
+        sessionId: 'runtime-two',
+        sessionRef: { provider: 'claude', sessionId: 'durable-two' },
+      }],
+    })
+    for (const sessionId of ['runtime-one', 'durable-one', 'runtime-two', 'durable-two']) {
+      dispatch(observeFreshAgentSession({ provider: 'claude', sessionId }))
+    }
+
+    dispatch(applyFreshAgentCompletion({ provider: 'claude', sessionId: 'runtime-one', at: 200 }))
+    dispatch(applyFreshAgentCompletion({ provider: 'claude', sessionId: 'runtime-two', at: 200 }))
+
     expect(store.getState().turnCompletion.seq).toBe(2)
   })
 

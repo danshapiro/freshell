@@ -20,11 +20,51 @@ function waitingDedupeKey(provider: string, sessionId: string): string {
   return `${completionDedupeKey(provider, sessionId)}#waiting`
 }
 
+type FreshAgentPaneLocation = {
+  tabId: string
+  paneId: string
+  sessionKeys: string[]
+}
+
+function attentionDedupeKeys(
+  provider: string,
+  sessionId: string,
+  location: FreshAgentPaneLocation | undefined,
+  waiting: boolean,
+): string[] {
+  const sessionKeys = new Set([
+    ...(location?.sessionKeys ?? []),
+    completionDedupeKey(provider, sessionId),
+  ])
+  return [...sessionKeys].map((key) => waiting ? `${key}#waiting` : key)
+}
+
+function newestKnownAt(state: RootState, terminalIds: string[]): number | undefined {
+  let newest: number | undefined
+  for (const terminalId of terminalIds) {
+    const at = state.turnCompletion?.lastAtByTerminalId[terminalId]
+    if (at !== undefined && (newest === undefined || at > newest)) newest = at
+  }
+  return newest
+}
+
+function advanceAttentionAliases(dispatch: AppDispatch, terminalIds: string[], at: number): void {
+  for (const terminalId of terminalIds) {
+    dispatch(advanceCompletionBaseline({ terminalId, at }))
+  }
+}
+
 /** A newly registered session's first turn can end while this page is offline. */
 export function observeFreshAgentSession(payload: { provider: string; sessionId: string }) {
-  return (dispatch: AppDispatch): void => {
-    for (const terminalId of [completionDedupeKey(payload.provider, payload.sessionId), waitingDedupeKey(payload.provider, payload.sessionId)]) {
-      dispatch(advanceCompletionBaseline({ terminalId, at: 0 }))
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    const location = findFreshAgentPaneBySessionKey(
+      getState(), completionDedupeKey(payload.provider, payload.sessionId),
+    )
+    for (const waiting of [false, true]) {
+      const terminalIds = attentionDedupeKeys(payload.provider, payload.sessionId, location, waiting)
+      for (const terminalId of terminalIds) {
+        dispatch(advanceCompletionBaseline({ terminalId, at: 0 }))
+      }
     }
   }
 }
@@ -32,10 +72,18 @@ export function observeFreshAgentSession(payload: { provider: string; sessionId:
 /** Materialization changes the envelope, not what this page has witnessed. */
 export function rekeyFreshAgentAttention(payload: { provider: string; previousSessionId: string; sessionId: string }) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
-    for (const keyFor of [completionDedupeKey, waitingDedupeKey]) {
-      const previousKey = keyFor(payload.provider, payload.previousSessionId)
-      const at = getState().turnCompletion?.lastAtByTerminalId[previousKey] ?? 0
-      dispatch(advanceCompletionBaseline({ terminalId: keyFor(payload.provider, payload.sessionId), at }))
+    const state = getState()
+    const previousKey = completionDedupeKey(payload.provider, payload.previousSessionId)
+    const nextKey = completionDedupeKey(payload.provider, payload.sessionId)
+    const location = findFreshAgentPaneBySessionKey(state, previousKey)
+      ?? findFreshAgentPaneBySessionKey(state, nextKey)
+    for (const waiting of [false, true]) {
+      const terminalIds = [...new Set([
+        ...attentionDedupeKeys(payload.provider, payload.previousSessionId, location, waiting),
+        ...attentionDedupeKeys(payload.provider, payload.sessionId, location, waiting),
+      ])]
+      const at = newestKnownAt(state, terminalIds) ?? 0
+      advanceAttentionAliases(dispatch, terminalIds, at)
     }
   }
 }
@@ -45,19 +93,62 @@ export function foldReadyFreshAgentAttention(marks: ReadyMessage['freshAgentAtte
   return (dispatch: AppDispatch, getState: () => RootState): void => {
     for (const mark of marks ?? []) {
       const payload = { provider: mark.provider, sessionId: mark.sessionId }
-      for (const [terminalId, at, apply] of [
-        [completionDedupeKey(mark.provider, mark.sessionId), mark.lastTurnCompleteAt, applyFreshAgentCompletion],
-        [waitingDedupeKey(mark.provider, mark.sessionId), mark.lastWaitingAt, applyFreshAgentWaiting],
+      const location = findFreshAgentPaneBySessionKey(
+        getState(), completionDedupeKey(mark.provider, mark.sessionId),
+      )
+      for (const [waiting, at, apply] of [
+        [false, mark.lastTurnCompleteAt, applyFreshAgentCompletion],
+        [true, mark.lastWaitingAt, applyFreshAgentWaiting],
       ] as const) {
-        const known = getState().turnCompletion.lastAtByTerminalId[terminalId]
+        const terminalIds = attentionDedupeKeys(mark.provider, mark.sessionId, location, waiting)
+        const known = newestKnownAt(getState(), terminalIds)
         if (known === undefined) {
-          dispatch(advanceCompletionBaseline({ terminalId, at: at ?? 0 }))
+          advanceAttentionAliases(dispatch, terminalIds, at ?? 0)
         } else if (at !== undefined && at > known) {
-          log.info('fresh_agent_attention_replayed', { terminalId, at })
+          log.info('fresh_agent_attention_replayed', {
+            terminalId: completionDedupeKey(mark.provider, mark.sessionId),
+            at,
+          })
           dispatch(apply({ ...payload, at }))
+        } else {
+          // A ready snapshot may introduce a second id for the same pane on a
+          // later reconnect. Copy the pane's high-water mark to that alias so
+          // the same edge cannot be replayed once per id.
+          advanceAttentionAliases(dispatch, terminalIds, known)
         }
       }
     }
+  }
+}
+
+function applyFreshAgentAttentionEdge(
+  payload: ApplyFreshAgentCompletionPayload,
+  waiting: boolean,
+) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    dispatch(observeFreshAgentSession(payload))
+    const state = getState()
+    const sessionKey = completionDedupeKey(payload.provider, payload.sessionId)
+    const location = findFreshAgentPaneBySessionKey(state, sessionKey)
+    const terminalIds = attentionDedupeKeys(payload.provider, payload.sessionId, location, waiting)
+    const known = newestKnownAt(state, terminalIds)
+
+    if (!location) {
+      advanceAttentionAliases(dispatch, terminalIds, Math.max(known ?? 0, payload.at))
+      return
+    }
+    if (known !== undefined && payload.at <= known) {
+      advanceAttentionAliases(dispatch, terminalIds, known)
+      return
+    }
+
+    dispatch(recordTurnComplete({
+      tabId: location.tabId,
+      paneId: location.paneId,
+      terminalId: waiting ? waitingDedupeKey(payload.provider, payload.sessionId) : sessionKey,
+      at: payload.at,
+    }))
+    advanceAttentionAliases(dispatch, terminalIds, payload.at)
   }
 }
 
@@ -148,23 +239,7 @@ export type ApplyFreshAgentCompletionPayload = {
  * values are dropped by the same baseline as live edges.
  */
 export function applyFreshAgentCompletion(payload: ApplyFreshAgentCompletionPayload) {
-  return (dispatch: AppDispatch, getState: () => RootState): void => {
-    dispatch(observeFreshAgentSession(payload))
-    const state = getState()
-    const sessionKey = completionDedupeKey(payload.provider, payload.sessionId)
-    const location = findFreshAgentPaneBySessionKey(state, sessionKey)
-    if (!location) {
-      dispatch(advanceCompletionBaseline({ terminalId: sessionKey, at: payload.at }))
-      return
-    }
-
-    dispatch(recordTurnComplete({
-      tabId: location.tabId,
-      paneId: location.paneId,
-      terminalId: sessionKey,
-      at: payload.at,
-    }))
-  }
+  return applyFreshAgentAttentionEdge(payload, false)
 }
 
 export type ApplyFreshAgentWaitingPayload = {
@@ -185,36 +260,19 @@ export type ApplyFreshAgentWaitingPayload = {
  * waiting edge, and prevents a reconnect from ringing the same approval twice.
  */
 export function applyFreshAgentWaiting(payload: ApplyFreshAgentWaitingPayload) {
-  return (dispatch: AppDispatch, getState: () => RootState): void => {
-    dispatch(observeFreshAgentSession(payload))
-    const state = getState()
-    const sessionKey = completionDedupeKey(payload.provider, payload.sessionId)
-    const terminalId = waitingDedupeKey(payload.provider, payload.sessionId)
-    const location = findFreshAgentPaneBySessionKey(state, sessionKey)
-    if (!location) {
-      dispatch(advanceCompletionBaseline({ terminalId, at: payload.at }))
-      return
-    }
-
-    dispatch(recordTurnComplete({
-      tabId: location.tabId,
-      paneId: location.paneId,
-      terminalId,
-      at: payload.at,
-    }))
-  }
+  return applyFreshAgentAttentionEdge(payload, true)
 }
 
 function findFreshAgentPaneBySessionKey(
   state: RootState,
   sessionKey: string,
-): { tabId: string; paneId: string } | undefined {
+): FreshAgentPaneLocation | undefined {
   const layouts = state.panes?.layouts
   if (!layouts) return undefined
   const sessions = state.freshAgent?.sessions ?? {}
   const activeTabId = state.tabs?.activeTabId
 
-  const scan = (tabId: string, layout: PaneNode): { tabId: string; paneId: string } | undefined => {
+  const scan = (tabId: string, layout: PaneNode): FreshAgentPaneLocation | undefined => {
     for (const entry of collectPaneEntries(layout)) {
       if (entry.content.kind !== 'fresh-agent') continue
       const content = entry.content as FreshAgentPaneContent
@@ -231,8 +289,13 @@ function findFreshAgentPaneBySessionKey(
       // resolveFreshAgentSessionKey prefers — so we must match the runtime handle too,
       // or restored Claude sessions would silently drop every chime.
       const runtimeKey = content.sessionId ? `${content.provider}:${content.sessionId}` : undefined
-      if (runtimeKey === sessionKey || resolveFreshAgentSessionKey(content, session) === sessionKey) {
-        return { tabId, paneId: entry.paneId }
+      const resolvedKey = resolveFreshAgentSessionKey(content, session)
+      if (runtimeKey === sessionKey || resolvedKey === sessionKey) {
+        return {
+          tabId,
+          paneId: entry.paneId,
+          sessionKeys: [...new Set([runtimeKey, resolvedKey, sessionKey].filter((key): key is string => Boolean(key)))],
+        }
       }
     }
     return undefined
