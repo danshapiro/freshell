@@ -24,8 +24,9 @@
  *     (c) the child is durable across reload AND a server restart.
  *   AGENT-24 (kilroy parity): full lifecycle (KILROY_ENABLED=1 gate), a crash
  *     mid-turn in a background tab (one server ring, the highlight, then
- *     Resume with no reload) + restart recovery on the SAME durable id, never
- *     a fabricated completion.
+ *     Resume with no reload), a second crash recovered by a page reload, and
+ *     restart recovery, all on the SAME durable id, never a fabricated
+ *     completion.
  *   Plus the capability-gate pin: /fork is NOT offered for claude/kilroy
  *     (snapshot capabilities.fork=false) — so AGENT-05/06 surfaces never
  *     expose a fork affordance that would hit the refusal table.
@@ -1251,7 +1252,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
     }
   })
 
-  test('kilroy crash mid-turn in the background: one ring, Resume (no reload) and restart recover the SAME durable session', async ({ page }) => {
+  test('kilroy crash mid-turn in the background: one ring, Resume (no reload), a reload and restart recover the SAME durable session', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1328,14 +1329,49 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await expect(paneRoot).toContainText('post-crash recovery turn', { timeout: 30_000 })
 
+      // A second crash, recovered by reloading the page instead: the pane
+      // hydrates as ended, and its attach must still resume the SAME durable
+      // session (the server holds a dead-session record for it until then).
+      const crashes = () => readJsonl(lane.eventsLog).filter((e) => e.kind === 'crash').length
+      const resumes = () => readJsonl(lane.eventsLog)
+        .filter((e) => e.kind === 'resume' && e.data?.id === durableBefore).length
+      const resumesBeforeReload = resumes()
+      await sendComposerText(page, 'CRASH_NOW')
+      await expect.poll(crashes, { timeout: 30_000, message: 'the second fixture crash' }).toBe(2)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'exited')
+      await expect(paneRoot.getByText('This session has ended')).toBeVisible({ timeout: 30_000 })
+      await flushPersistence(page)
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await waitForWsReady(page)
+      const harness2 = new TestHarness(page)
+      await harness2.waitForHarness()
+      await harness2.waitForConnection()
+      const tabId2 = (await harness2.getActiveTabId())!
+      await expect.poll(resumes, {
+        timeout: 30_000,
+        message: 'the reloaded pane resumed the crashed durable session',
+      }).toBe(resumesBeforeReload + 1)
+      expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      await waitForPaneStatus(harness2, tabId2, ['idle', 'connected'])
+      await expect(paneRoot.getByText('This session has ended')).toHaveCount(0)
+      await sendComposerText(page, 'post-reload recovery turn')
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'send' && f?.text === 'post-reload recovery turn',
+        'post-reload send frame',
+        30_000,
+      )
+      await waitForPaneStatus(harness2, tabId2, 'idle')
+      await expect(paneRoot).toContainText('post-reload recovery turn', { timeout: 30_000 })
+
       // Restart mid-session: graceful reboot on the same home/port/token;
       // the pane re-hydrates from the durable transcript and resumes.
       await lane.server.restart()
       await waitForWsReady(page)
-      expect(await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
-      await expect.poll(() => readJsonl(lane.eventsLog)
-        .filter((e) => e.kind === 'resume' && e.data?.id === durableBefore).length,
-      { timeout: 60_000, message: 'the restarted server resumed the same durable session' }).toBeGreaterThanOrEqual(2)
+      expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      await expect.poll(resumes,
+        { timeout: 60_000, message: 'the restarted server resumed the same durable session' })
+        .toBeGreaterThanOrEqual(resumesBeforeReload + 2)
       await sendComposerText(page, 'post-restart turn')
       await waitForStdinFrame(
         lane.stdinLog,
@@ -1343,10 +1379,10 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
         'post-restart send frame (lands on the new sidecar process)',
         60_000,
       )
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle', 60_000)
+      await waitForPaneStatus(harness2, tabId2, 'idle', 60_000)
       await expect(paneRoot).toContainText('post-restart turn', { timeout: 30_000 })
-      // Ground truth at the durable store: all three user turns sit in the
-      // SAME transcript — the crash never forked the identity.
+      // Ground truth at the durable store: every user turn sits in the SAME
+      // transcript — neither crash forked the identity.
       const transcriptFile = path.join(
         lane.info.homeDir,
         '.claude',
@@ -1359,7 +1395,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
           .filter((l) => l.type === 'user')
           .map((l) => l.message?.content?.[0]?.text)
         expect(userTexts).toEqual(
-          expect.arrayContaining(['CRASH_NOW', 'post-crash recovery turn', 'post-restart turn']),
+          expect.arrayContaining(['CRASH_NOW', 'post-crash recovery turn', 'post-reload recovery turn', 'post-restart turn']),
         )
       }).toPass({ timeout: 30_000 })
     } finally {
