@@ -549,7 +549,9 @@ const freshAgentSlice = createSlice({
       if (!session) return
       writeSessionStatus(session, 'idle')
       session.streamingActive = false
-      session.totalCostUsd += action.payload.costUsd ?? 0
+      // The SDK's total_cost_usd already covers the whole session so far: it
+      // is the total, never an increment. (Token usage is per turn, so it adds.)
+      if (typeof action.payload.costUsd === 'number') session.totalCostUsd = action.payload.costUsd
       session.totalInputTokens += action.payload.usage?.input_tokens ?? 0
       session.totalOutputTokens += action.payload.usage?.output_tokens ?? 0
     },
