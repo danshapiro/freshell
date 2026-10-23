@@ -597,9 +597,8 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
                 .map(|s| s.session_id.as_str())
                 .collect::<HashSet<&str>>(),
         );
-        let items = maintenance.into_items();
-        if !items.is_empty() || names.has_staged_native_baselines() {
-            if let Err(error) = names.sweep_maintenance(items).await {
+        if !maintenance.is_empty() || names.has_staged_native_baselines() {
+            if let Err(error) = names.sweep_maintenance(maintenance).await {
                 tracing::warn!(
                     target: "freshell_server::session_names",
                     op = "sweep_maintenance",

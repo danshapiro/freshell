@@ -34,6 +34,8 @@
 //! pre-checks call the same ones, so the pre-check and the apply never
 //! drift.
 
+use std::cell::RefCell;
+
 use freshell_freshagent::naming::NameActivityReason;
 use freshell_protocol::session_names::{NameSource, SessionNameRecord};
 use freshell_sessions::{is_default_or_derived_name, NameEvidenceContext};
@@ -204,11 +206,13 @@ fn droppable(series: &GenerationState) -> bool {
     )
 }
 
-/// Apply a planned series change; `true` when the document changed.
+/// Apply a planned series change; `true` when the document changed. A
+/// guard drop is recorded in `refusals`.
 pub(super) fn apply_series_plan(
     document: &mut StoredDocument,
     key: &str,
     plan: SeriesPlan,
+    refusals: &InputRefusals,
 ) -> bool {
     match plan {
         SeriesPlan::Arm {
@@ -248,7 +252,7 @@ pub(super) fn apply_series_plan(
         SeriesPlan::DropInput => document
             .generation
             .get_mut(key)
-            .is_some_and(|series| drop_refused_input(series, RefusalSite::Activity)),
+            .is_some_and(|series| drop_refused_input(series, RefusalSite::Activity, refusals)),
     }
 }
 
@@ -289,8 +293,14 @@ impl RefusalSite {
 }
 
 /// The prompt-input guard's drop: no input, resting Idle, nothing consumed
-/// or refunded. `true` when the series changed; logs which guard fired.
-pub(super) fn drop_refused_input(series: &mut GenerationState, site: RefusalSite) -> bool {
+/// or refunded. `true` when the series changed; the drop and the guard
+/// that fired are recorded in `refusals`, which the transaction logs once
+/// it commits.
+pub(super) fn drop_refused_input(
+    series: &mut GenerationState,
+    site: RefusalSite,
+    refusals: &InputRefusals,
+) -> bool {
     if !droppable(series) || !holds_refused_input(series) {
         return false;
     }
@@ -298,26 +308,59 @@ pub(super) fn drop_refused_input(series: &mut GenerationState, site: RefusalSite
     series.excerpt = None;
     series.status = GenerationStatus::Idle;
     series.next_due = None;
-    tracing::info!(
-        target: "freshell_server::session_names",
-        op = "generation_input_refused",
-        site = site.as_str(),
-        series = %series.series_id,
-        consumed = series.consumed,
-        "session_names.generation_input_refused: stored AI-naming input is wrapper or derived text; it was dropped and the series rests"
-    );
+    refusals.record(site, series);
     true
+}
+
+/// One transaction's prompt-input guard drops. The
+/// `session_names.generation_input_refused` line says the input "was
+/// dropped", so it is written only after the drop committed
+/// ([`InputRefusals::log_committed`]); a transaction whose commit fails
+/// writes none (the input is still stored, and a later transaction drops
+/// it again).
+#[derive(Debug, Default)]
+pub(super) struct InputRefusals(RefCell<Vec<InputRefusal>>);
+
+#[derive(Debug)]
+struct InputRefusal {
+    site: RefusalSite,
+    series: String,
+    consumed: u32,
+}
+
+impl InputRefusals {
+    fn record(&self, site: RefusalSite, series: &GenerationState) {
+        self.0.borrow_mut().push(InputRefusal {
+            site,
+            series: series.series_id.clone(),
+            consumed: series.consumed,
+        });
+    }
+
+    /// The transaction committed: log each drop once.
+    pub(super) fn log_committed(&self) {
+        for refusal in self.0.take() {
+            tracing::info!(
+                target: "freshell_server::session_names",
+                op = "generation_input_refused",
+                site = refusal.site.as_str(),
+                series = %refusal.series,
+                consumed = refusal.consumed,
+                "session_names.generation_input_refused: stored AI-naming input is wrapper or derived text; it was dropped and the series rests"
+            );
+        }
+    }
 }
 
 /// The bind's explicit-open hook for one series: an Idle, never-attempted
 /// series with usable input becomes Eligible (the user opened the session);
 /// one holding refused input stays Idle and drops it. `true` when changed.
-pub(super) fn explicit_open(series: &mut GenerationState) -> bool {
+pub(super) fn explicit_open(series: &mut GenerationState, refusals: &InputRefusals) -> bool {
     if series.status != GenerationStatus::Idle || series.consumed != 0 {
         return false;
     }
     if holds_refused_input(series) {
-        return drop_refused_input(series, RefusalSite::Bind);
+        return drop_refused_input(series, RefusalSite::Bind, refusals);
     }
     if series.input_fingerprint.is_none() {
         return false;

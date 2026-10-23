@@ -582,6 +582,64 @@ async fn wrapper_excerpt_is_never_armed() {
     assert_eq!(refusal_sites(&claim_series), vec!["claim"]);
 }
 
+/// `session_names.generation_input_refused` says the input "was dropped",
+/// so it is written only once the drop committed: a transaction whose
+/// commit fails writes none (the input is still stored), and its retry
+/// writes one.
+#[tokio::test]
+async fn the_input_refusal_is_logged_only_after_the_commit() {
+    let events = crate::test_trace_capture::captured_trace_events();
+    let dir = temp_dir();
+    let store = open(dir.path());
+    let target = directory_record(&store, NamedProvider::Codex, "s-wrapper-uncommitted").await;
+    let series_id = format!("series-wrapper-{}", Uuid::new_v4());
+    rewrite(dir.path(), |document| {
+        let mut series = series_with_input(RECOMMENDED_PLUGINS, GenerationStatus::Idle, 0);
+        series.series_id = series_id.clone();
+        document.generation.insert(name_ref_key(&target), series);
+    });
+    let store = open(dir.path());
+    let refusals = || {
+        events
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event
+                    .message
+                    .starts_with("session_names.generation_input_refused")
+                    && event.fields.get("series") == Some(&series_id)
+            })
+            .count()
+    };
+    set_test_hooks(dir.path(), vec![TestHook::PreReplace]);
+
+    let failed = store
+        .activity(activity_input(&target, NameActivityReason::Opened, None))
+        .await;
+
+    assert!(
+        matches!(failed, Err(NameError::Persistence(_))),
+        "{failed:?}"
+    );
+    assert_eq!(
+        series_of(dir.path(), &target)
+            .expect("series kept")
+            .excerpt
+            .as_deref(),
+        Some(excerpt_of(RECOMMENDED_PLUGINS).as_str()),
+        "the failed commit dropped nothing"
+    );
+    assert_eq!(refusals(), 0, "no drop was saved, so none is logged");
+
+    clear_test_hooks(dir.path());
+    activity(&store, &target, NameActivityReason::Opened, None).await;
+    assert_eq!(
+        series_of(dir.path(), &target).expect("series").excerpt,
+        None
+    );
+    assert_eq!(refusals(), 1, "the committed drop is logged once");
+}
+
 /// Pinning the other side of the guard: an activity carrying a real first
 /// message replaces the wrapper input and arms with it.
 #[tokio::test]

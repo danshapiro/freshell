@@ -482,3 +482,123 @@ async fn a_superseded_staged_baseline_is_never_read_as_the_baseline() {
         "A dropped the superseded baseline"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The pass summary (`session_names.sweep_maintenance`)
+// ---------------------------------------------------------------------------
+
+const SUMMARY: &str = "session_names.sweep_maintenance";
+
+/// The position after every event captured so far.
+fn mark() -> usize {
+    crate::test_trace_capture::captured_trace_events()
+        .snapshot()
+        .len()
+}
+
+/// Every pass summary captured since `since`, as `(data_dir, healed,
+/// baselines, deferred)` (`data_dir` is empty when the line has none).
+fn summaries_since(since: usize) -> Vec<(String, usize, usize, usize)> {
+    let count = |fields: &std::collections::BTreeMap<String, String>, name: &str| {
+        fields
+            .get(name)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("a summary carries {name}"))
+    };
+    crate::test_trace_capture::captured_trace_events()
+        .snapshot()
+        .into_iter()
+        .skip(since)
+        .filter(|event| event.message == SUMMARY)
+        .map(|event| {
+            assert_eq!(event.level, tracing::Level::INFO, "summaries log at INFO");
+            (
+                event.fields.get("data_dir").cloned().unwrap_or_default(),
+                count(&event.fields, "healed"),
+                count(&event.fields, "baselines"),
+                count(&event.fields, "deferred"),
+            )
+        })
+        .collect()
+}
+
+/// The summaries THIS store wrote since `since`, as `(healed, baselines,
+/// deferred)`; other tests' stores write their own.
+fn store_summaries(since: usize, data_dir: &Path) -> Vec<(usize, usize, usize)> {
+    let data_dir = std::fs::canonicalize(data_dir)
+        .expect("the data dir exists")
+        .display()
+        .to_string();
+    summaries_since(since)
+        .into_iter()
+        .filter(|(dir, ..)| *dir == data_dir)
+        .map(|(_, healed, baselines, deferred)| (healed, baselines, deferred))
+        .collect()
+}
+
+/// A pass that finds more heals than one batch holds reports how many are
+/// still waiting: 60 junk names heal over three passes, and the summaries
+/// count 35, then 10, then nothing left.
+#[tokio::test]
+async fn the_pass_summary_counts_the_heals_left_for_later_passes() {
+    let home = temp_dir();
+    let data_dir = home.path().join(".freshell");
+    let store = open(&data_dir);
+    const JUNK: usize = 60;
+    seed_junk(&store, JUNK).await;
+    let sweep = sweep_state(home.path(), store.clone());
+    let rows = sweep_rows(JUNK);
+    let since = mark();
+
+    for _ in 0..3 {
+        crate::auto_title_sweep::run_auto_title_pass(&sweep, &rows).await;
+    }
+
+    assert_eq!(healed_count(&store, JUNK).await, JUNK);
+    assert_eq!(
+        store_summaries(since, &data_dir),
+        vec![(25, 0, 35), (25, 0, 10), (10, 0, 0)],
+        "every summary seen: {:?}",
+        summaries_since(since)
+    );
+}
+
+/// The summary describes a committed batch: a batch whose commit fails
+/// writes none (nothing was healed), and its retry writes one.
+#[tokio::test]
+async fn the_batch_summary_is_written_only_after_the_commit() {
+    let dir = temp_dir();
+    let store = open(dir.path());
+    seed_junk(&store, 3).await;
+    let items = || -> Vec<SweepMaintenanceItem> {
+        (0..3)
+            .map(|i| SweepMaintenanceItem {
+                hydrate: Some(indexed(
+                    &format!("s-junk-{i}"),
+                    None,
+                    Some(&heal_message(i)),
+                )),
+                activity: None,
+            })
+            .collect()
+    };
+    set_test_hooks(dir.path(), vec![TestHook::PreReplace]);
+    let since = mark();
+
+    let failed = store.sweep_maintenance(items()).await;
+
+    assert!(
+        matches!(failed, Err(NameError::Persistence(_))),
+        "{failed:?}"
+    );
+    assert_eq!(healed_count(&store, 3).await, 0, "nothing was saved");
+    clear_test_hooks(dir.path());
+    let report = store.sweep_maintenance(items()).await.expect("the retry");
+    assert_eq!(report.healed, 3);
+    assert_eq!(
+        store_summaries(since, dir.path()),
+        vec![(3, 0, 0)],
+        "one summary, for the committed retry; every summary seen: {:?}",
+        summaries_since(since)
+    );
+}
