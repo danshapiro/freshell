@@ -167,12 +167,14 @@ export function reconcileTerminalSessionAssociation({
   terminalId,
   sessionRef: rawSessionRef,
   previousSessionId,
+  nameRef,
 }: {
   dispatch: Dispatch
   getState: () => SessionAssociationState
   terminalId?: string
   sessionRef?: unknown
   previousSessionId?: string
+  nameRef?: unknown
 }): TerminalSessionAssociationReconcileStatus {
   if (!terminalId) return 'ignored'
   const sessionRef = sanitizeSessionRef(rawSessionRef)
@@ -249,10 +251,9 @@ export function reconcileTerminalSessionAssociation({
   if (!matchedAnyPane) return 'ignored'
 
   // Name reliability (Task 10, G45): the rebind token rides along so the
-  // reducer releases the superseded conversation's naming identity — a
-  // pending handle only once the server spent it (its pending→durable
-  // redirect is cached); a still-pending one stays the pane's binding, as it
-  // stays the server row's.
+  // reducer adopts the server's current naming binding, even before cached
+  // redirects load. Older servers omit it: their pending handle is released
+  // only once the cache proves the server spent it; an unspent handle stays.
   const isRebind = typeof previousSessionId === 'string' && previousSessionId.length > 0
   const spentNamingHandles = isRebind
     ? spentPendingNamingHandles(matchedContents, state.sessionNames?.redirects)
@@ -262,6 +263,7 @@ export function reconcileTerminalSessionAssociation({
     sessionRef,
     ...(isRebind ? { previousSessionId } : {}),
     ...(spentNamingHandles.length > 0 ? { spentNamingHandles } : {}),
+    ...(nameRef !== undefined ? { nameRef } : {}),
   }))
 
   // Unified agent names (Task 5): the accepted rebind also moves the pane's

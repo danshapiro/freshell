@@ -1682,6 +1682,10 @@ export type TerminalSessionAssociatedMessage = {
    * client-validated; old clients ignore it and keep the conflict veto).
    */
   previousSessionId?: string
+  /** The server's current naming binding after association. Unlike the
+   * client redirect cache, this distinguishes spent and still-pending
+   * handles immediately after a reload. Optional for older servers. */
+  nameRef?: SessionNameRef
 }
 
 export type TerminalCodexDurabilityUpdatedMessage = {

@@ -1,5 +1,25 @@
-import { sessionNameRefKey } from '@shared/session-names'
+import { SessionNameRefSchema, sessionNameRefKey, type SessionNameRef } from '@shared/session-names'
 import type { SessionLocator, TerminalPaneContent } from '@/store/paneTypes'
+
+/** Adopt the server's naming binding for an accepted session association or
+ * materialization. This works before the non-persisted redirect cache
+ * loads: a durable binding releases the old pending handle; a still-pending
+ * binding preserves the zero-turn name the server will transfer later. */
+export function adoptAuthoritativeConversationNameRef(
+  content: { nameRef?: SessionNameRef; namingHandle?: string },
+  sessionRef: SessionLocator,
+  rawNameRef: unknown,
+): boolean {
+  const parsed = SessionNameRefSchema.safeParse(rawNameRef)
+  if (!parsed.success) return false
+  const ref = parsed.data
+  if (ref.kind === 'session' && (
+    ref.provider !== sessionRef.provider || ref.sessionId !== sessionRef.sessionId
+  )) return false
+  content.nameRef = ref
+  content.namingHandle = ref.kind === 'pending' ? ref.id : undefined
+  return true
+}
 
 /**
  * Name reliability (Task 10, G45): a server-authoritative conversation switch

@@ -1619,6 +1619,7 @@ export default function App() {
             getState: appStore.getState,
             terminalId: (msg as any).terminalId,
             sessionRef: (msg as any).sessionRef,
+            nameRef: msg.type === 'terminal.session.associated' ? msg.nameRef : undefined,
             // Only terminal.session.associated frames carry the
             // server-authoritative rebind token; other frames never rebind.
             previousSessionId: msg.type === 'terminal.session.associated'

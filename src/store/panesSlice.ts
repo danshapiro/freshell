@@ -41,7 +41,7 @@ import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, pr
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
-import { releaseSupersededConversationNaming } from '@/lib/terminal-naming-rebind'
+import { adoptAuthoritativeConversationNameRef, releaseSupersededConversationNaming } from '@/lib/terminal-naming-rebind'
 import { ManagedRuntimeProjectionFieldsSchema, type ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
 
@@ -53,6 +53,7 @@ type FreshAgentSessionMaterializedPayload = {
   sessionType: FreshAgentPaneContent['sessionType']
   provider: FreshAgentPaneContent['provider']
   sessionRef?: SessionLocator
+  nameRef?: unknown
 }
 
 function normalizeManagedRuntimeProjection(
@@ -767,8 +768,11 @@ function buildMaterializedFreshAgentContent(
     provider: materialized.provider,
     sessionId: materialized.sessionId,
   }
+  const namingIdentity = { nameRef: content.nameRef, namingHandle: content.namingHandle }
+  adoptAuthoritativeConversationNameRef(namingIdentity, sessionRef, materialized.nameRef)
   return normalizePaneContent({
     ...content,
+    ...namingIdentity,
     sessionId: materialized.sessionId,
     resumeSessionId: materialized.sessionId,
     sessionRef,
@@ -2372,6 +2376,7 @@ export const panesSlice = createSlice({
         sessionRef: unknown
         previousSessionId?: string
         spentNamingHandles?: string[]
+        nameRef?: unknown
       }>
     ) => {
       const terminalId = action.payload.terminalId
@@ -2389,13 +2394,16 @@ export const panesSlice = createSlice({
             return
           }
 
+          const adoptedNameRef = adoptAuthoritativeConversationNameRef(content, canonicalSessionRef, action.payload.nameRef)
           if (!sessionRefsEqual(content.sessionRef, canonicalSessionRef)) {
-            releaseSupersededConversationNaming(
-              content,
-              canonicalSessionRef,
-              action.payload.previousSessionId,
-              action.payload.spentNamingHandles,
-            )
+            if (!adoptedNameRef) {
+              releaseSupersededConversationNaming(
+                content,
+                canonicalSessionRef,
+                action.payload.previousSessionId,
+                action.payload.spentNamingHandles,
+              )
+            }
             content.sessionRef = canonicalSessionRef
           }
           content.resumeSessionId = undefined
