@@ -563,6 +563,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_rest_lane_does_not_replace_the_claude_snapshot_reader() {
+        let state = snapshot_state();
+        state
+            .opencode
+            .set_claude_rest_lane(Arc::new(SnapshotGateway))
+            .unwrap();
+        let response = get_snapshot(
+            State(state),
+            Path((
+                "freshclaude".into(),
+                "claude".into(),
+                "absent-local-rest-snapshot".into(),
+            )),
+            Query(HashMap::new()),
+            headers_with_token("tok"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn missing_auth_header_is_401() {
         let resp = get_snapshot(
             State(snapshot_state()),

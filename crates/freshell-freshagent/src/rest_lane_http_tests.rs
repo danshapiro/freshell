@@ -2,7 +2,7 @@ use super::tests::{app, get, post, state_with_registry};
 use crate::ownership_lane::TerminalOwnerFields;
 use crate::rest_lane::*;
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 struct RefusingLane(RestLaneErrorKind);
@@ -216,4 +216,224 @@ async fn claude_defaults_are_read_once_and_used_for_the_runtime_and_pane() {
         2,
         "one settings read per create"
     );
+}
+
+#[tokio::test]
+async fn an_explicit_model_override_clears_a_different_saved_exact_selection() {
+    let state = state_with_registry();
+    let lane = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_hosted_rest_gateway(lane.clone()).unwrap();
+    state
+        .set_rest_create_settings_reader(Arc::new(|| {
+            Box::pin(async {
+                freshell_protocol::SettingsFreshAgent {
+                    default_plugins: vec![],
+                    enabled: true,
+                    initial_setup_done: None,
+                    providers: json!({ "freshclaude": {
+            "modelSelection": { "kind": "exact", "modelId": "saved-model" },
+            "modelEffortLevels": { "modelId": "saved-model", "levels": [] },
+        } }),
+                }
+            })
+        }))
+        .unwrap();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({ "agent": "claude", "model": "explicit-model" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = lane.creates.lock().unwrap().last().unwrap().clone();
+    assert_eq!(request.model.as_deref(), Some("explicit-model"));
+    assert_eq!(
+        request.model_selection,
+        Some(None),
+        "provider create must not prefer an unrelated saved selection"
+    );
+    let content = state
+        .layout
+        .get_pane_snapshot(request.pane_id.as_ref().unwrap())
+        .unwrap()
+        .pane_content
+        .unwrap();
+    assert_eq!(content["model"], "explicit-model");
+    assert_eq!(content["modelSelection"], Value::Null);
+    assert!(content.get("modelEffortLevels").is_none());
+}
+
+#[tokio::test]
+async fn local_claude_lane_creates_tabs_and_splits_without_enabling_codex() {
+    let state = state_with_registry();
+    let (_, original_pane) = state.layout.create_tab(Some("Original"));
+    let lane = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state.clone());
+    for (uri, agent) in [
+        ("/api/tabs".to_string(), "claude"),
+        (format!("/api/panes/{original_pane}/split"), "kilroy"),
+    ] {
+        let (status, body) = post(router.clone(), &uri, json!({"agent":agent}), true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let request = lane.creates.lock().unwrap().last().unwrap().clone();
+        assert_eq!(request.provider, "claude");
+        assert_eq!(
+            request.session_type,
+            if agent == "claude" {
+                "freshclaude"
+            } else {
+                "kilroy"
+            }
+        );
+    }
+    assert_eq!(lane.creates.lock().unwrap().len(), 2);
+    let (status, _) = post(router, "/api/tabs", json!({"agent":"codex"}), true).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(lane.creates.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn hosted_gateway_takes_precedence_over_the_local_claude_lane() {
+    let state = state_with_registry();
+    let local = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    let hosted = Arc::new(ContextLane {
+        layout: state.layout.clone(),
+        creates: Default::default(),
+    });
+    state.set_claude_rest_lane(local.clone()).unwrap();
+    state.set_hosted_rest_gateway(hosted.clone()).unwrap();
+    let (status, body) = post(app(state), "/api/tabs", json!({"agent":"claude"}), true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hosted.creates.lock().unwrap().len(), 1);
+    assert!(local.creates.lock().unwrap().is_empty());
+}
+
+#[derive(Default)]
+struct ControlLane {
+    sends: std::sync::Mutex<Vec<RestLaneSend>>,
+    captures: std::sync::Mutex<Vec<RestLaneCapture>>,
+}
+
+#[async_trait::async_trait]
+impl FreshAgentRestLane for ControlLane {
+    async fn create_agent(
+        self: Arc<Self>,
+        _: RestLaneCreate,
+    ) -> Result<RestLaneCreated, RestLaneError> {
+        unreachable!("pane was created by the browser")
+    }
+    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError> {
+        let noop = request.text == "\n";
+        let result = RestLaneSendResult {
+            session_id: request.session_id.clone(),
+            completed: true,
+            submitted_turn_id: (!noop).then(|| "actual-submitted-uuid".into()),
+            noop,
+        };
+        self.sends.lock().unwrap().push(request);
+        Ok(result)
+    }
+    async fn capture(
+        &self,
+        request: RestLaneCapture,
+    ) -> Result<RestLaneCaptureResult, RestLaneCaptureError> {
+        let result = RestLaneCaptureResult {
+            session_id: request.session_id.clone(),
+            native_session_id: request.session_id.clone(),
+            text: "saved conversation".into(),
+            truncated: false,
+        };
+        self.captures.lock().unwrap().push(request);
+        Ok(result)
+    }
+}
+
+async fn capture_response(router: axum::Router, pane_id: &str) -> (StatusCode, String) {
+    use tower::util::ServiceExt;
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/panes/{pane_id}/capture?maxBytes=30"))
+                .header("x-auth-token", "tok")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn local_lane_controls_browser_created_panes_using_the_provider_matched_durable_ref() {
+    const DURABLE_ID: &str = "67cebd37-9576-4de0-93bb-8f286f5fc499";
+    let state = state_with_registry();
+    let (tab, pane_id) = state.layout.create_tab(Some("Browser-created"));
+    state.layout.attach_pane_content(
+        &tab,
+        &pane_id,
+        json!({
+            "kind":"fresh-agent", "provider":"claude", "sessionType":"kilroy",
+            "sessionId":"legacy-alias", "sessionRef":{"provider":"claude", "sessionId":DURABLE_ID},
+        }),
+    );
+    let lane = Arc::new(ControlLane::default());
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state);
+    let (status, body) = post(
+        router.clone(),
+        &format!("/api/panes/{pane_id}/send-keys"),
+        json!({"data":"continue", "requestId":"caller-request"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["submittedTurnId"], "actual-submitted-uuid");
+    assert_eq!(body["data"]["sessionRef"]["sessionId"], DURABLE_ID);
+    let sent = lane.sends.lock().unwrap().last().unwrap().clone();
+    assert_eq!(sent.session_id, DURABLE_ID);
+    assert_eq!(sent.request_id, "caller-request");
+    assert_eq!(sent.session_type, "kilroy");
+    let (status, text) = capture_response(router, &pane_id).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(text, "saved conversation");
+    let captured = lane.captures.lock().unwrap().last().unwrap().clone();
+    assert_eq!(captured.session_id, DURABLE_ID);
+    assert_eq!(captured.max_bytes, 30);
+}
+
+#[tokio::test]
+async fn lane_noop_does_not_report_a_submitted_turn() {
+    let state = state_with_registry();
+    let (tab, pane_id) = state.layout.create_tab(None);
+    state.layout.attach_pane_content(&tab, &pane_id, json!({
+        "kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude", "sessionId":"durable-uuid",
+    }));
+    state
+        .set_hosted_rest_gateway(Arc::new(ControlLane::default()))
+        .unwrap();
+    let (status, body) = post(
+        app(state),
+        &format!("/api/panes/{pane_id}/send-keys"),
+        json!({"data":"\n"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["status"], "noop");
+    assert!(body["data"].get("submittedTurnId").is_none(), "{body}");
 }

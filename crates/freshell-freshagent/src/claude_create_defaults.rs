@@ -28,14 +28,16 @@ pub fn resolve_claude_rest_create(
     }
     let inputs = crate::rest_lane::provider_inputs(body)?;
     let saved = &settings.providers[session_type];
+    let explicit_model = optional_string(body, "model")?;
     let model_selection = match inputs.model_selection {
         Some(selection) => selection,
+        None if explicit_model.is_some() => None,
         None => saved
             .get("modelSelection")
             .and_then(|selection| serde_json::from_value::<ModelSelection>(selection.clone()).ok())
             .filter(|selection| selection.kind == "exact" && !selection.model_id.trim().is_empty()),
     };
-    let model = optional_string(body, "model")?
+    let model = explicit_model
         .or_else(|| {
             model_selection
                 .as_ref()

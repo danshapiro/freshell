@@ -2063,6 +2063,7 @@ pub struct FreshAgentState {
     /// Opt-in durable host gateway. When installed, REST/MCP fresh-agent
     /// requests never touch this web process's legacy provider manager.
     hosted_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
+    local_claude_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
     rest_create_settings: Arc<std::sync::OnceLock<rest_lane::RestCreateSettingsReader>>,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
@@ -2402,6 +2403,7 @@ impl FreshAgentState {
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             hosted_rest: Arc::new(std::sync::OnceLock::new()),
+            local_claude_rest: Arc::new(std::sync::OnceLock::new()),
             rest_create_settings: Arc::new(std::sync::OnceLock::new()),
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
@@ -2537,6 +2539,25 @@ impl FreshAgentState {
 
     fn hosted_rest_gateway(&self) -> Option<rest_lane::SharedFreshAgentRestLane> {
         self.hosted_rest.get().cloned()
+    }
+
+    pub fn set_claude_rest_lane(
+        &self,
+        lane: rest_lane::SharedFreshAgentRestLane,
+    ) -> Result<(), &'static str> {
+        self.local_claude_rest
+            .set(lane)
+            .map_err(|_| "local Claude REST lane is already installed")
+    }
+
+    fn rest_lane_for(&self, provider: &str) -> Option<rest_lane::SharedFreshAgentRestLane> {
+        self.hosted_rest_gateway().or_else(|| {
+            if provider == "claude" {
+                self.local_claude_rest.get().cloned()
+            } else {
+                None
+            }
+        })
     }
 
     /// Install a scripted model-catalog probe (tests) — the registry's
@@ -4865,7 +4886,7 @@ async fn create_tab(
         .map(str::to_string);
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
-    if let Some(gateway) = state.hosted_rest_gateway() {
+    if let Some(gateway) = state.rest_lane_for(provider) {
         let request = match state
             .build_rest_lane_create(provider, session_type, &body)
             .await
@@ -4876,9 +4897,8 @@ async fn create_tab(
         return create_lane_agent_tab(&state, gateway, request, name).await;
     }
 
-    // The retained in-process implementation is OpenCode-only. Every hosted
-    // mode above uses the common supervisor gateway; never silently fall back
-    // to a web-owned Claude/Codex provider.
+    // OpenCode retains its existing implementation. Codex REST creation needs
+    // the opt-in hosted gateway; the local lane drives Claude modes only.
     if agent != "opencode" {
         return fail_json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5115,20 +5135,20 @@ fn register_fresh_agent_tab(
         .insert(pane_id.to_string(), tab_id.to_string());
 }
 
-/// A web restart drops the REST pane map while the shared layout and hosted
-/// runtime survive. Resolve hosted panes from the persisted layout on a miss;
-/// the gateway still checks the session against the supervisor inventory.
+/// Browser-created panes and a restored layout need not have a REST pane row.
+/// Resolve them when their provider has a lane; that lane owns the live-session
+/// checks and transcript lookup.
 fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
     if let Some(pane) = state.panes.lock().expect("panes mutex").get(pane_id) {
         return Some(pane.clone());
     }
-    state.hosted_rest_gateway()?;
     let snapshot = state.layout.get_pane_snapshot(pane_id)?;
     let content = snapshot.pane_content?;
     if content.get("kind")?.as_str()? != "fresh-agent" {
         return None;
     }
     let provider = content.get("provider")?.as_str()?;
+    state.rest_lane_for(provider)?;
     let session_type = content.get("sessionType")?.as_str()?;
     if !matches!(
         (provider, session_type),
@@ -5143,6 +5163,12 @@ fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<Pane
     if session_id.is_empty() {
         return None;
     }
+    let durable_id = content
+        .get("sessionRef")
+        .and_then(|value| serde_json::from_value::<SessionLocator>(value.clone()).ok())
+        .filter(|locator| locator.provider == provider && !locator.session_id.is_empty())
+        .map(|locator| locator.session_id)
+        .unwrap_or_else(|| session_id.clone());
     Some(PaneEntry {
         placeholder_id: session_id.clone(),
         provider: provider.to_string(),
@@ -5159,7 +5185,7 @@ fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<Pane
             .get("effort")
             .and_then(Value::as_str)
             .map(str::to_string),
-        durable_id: Some(session_id),
+        durable_id: Some(durable_id),
     })
 }
 
@@ -6339,7 +6365,7 @@ async fn send_keys(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_TURN_TIMEOUT);
 
-    if let Some(gateway) = state.hosted_rest_gateway() {
+    if let Some(gateway) = state.rest_lane_for(&pane.provider) {
         let request_id = body
             .get("requestId")
             .and_then(Value::as_str)
@@ -6349,7 +6375,10 @@ async fn send_keys(
         let result = gateway
             .send_agent(rest_lane::RestLaneSend {
                 request_id: request_id.clone(),
-                session_id: pane.placeholder_id.clone(),
+                session_id: pane
+                    .durable_id
+                    .clone()
+                    .unwrap_or_else(|| pane.placeholder_id.clone()),
                 provider: pane.provider.clone(),
                 session_type: pane.session_type.clone(),
                 text,
@@ -6357,26 +6386,24 @@ async fn send_keys(
             })
             .await;
         return match result {
-            Ok(result) if result.completed => ok_json(
-                json!({
+            Ok(result) => {
+                let mut data = json!({
                     "paneId":pane_id,
                     "sessionId":result.session_id,
-                    "submittedTurnId":request_id,
                     "sessionRef":{"provider":pane.provider,"sessionId":result.session_id},
-                    "status":"idle",
-                }),
-                "prompt sent",
-            ),
-            Ok(result) => approx_json(
-                json!({
-                    "paneId":pane_id,
-                    "sessionId":result.session_id,
-                    "submittedTurnId":request_id,
-                    "sessionRef":{"provider":pane.provider,"sessionId":result.session_id},
-                    "status":"approx",
-                }),
-                "prompt sent; turn did not complete within deadline",
-            ),
+                    "status":if result.noop { "noop" } else if result.completed { "idle" } else { "approx" },
+                });
+                if !result.noop {
+                    data["submittedTurnId"] = json!(result.submitted_turn_id.unwrap_or(request_id));
+                }
+                if result.noop {
+                    ok_json(data, "no input sent")
+                } else if result.completed {
+                    ok_json(data, "prompt sent")
+                } else {
+                    approx_json(data, "prompt sent; turn did not complete within deadline")
+                }
+            }
             Err(error) => rest_lane_failure(error),
         };
     }
@@ -7037,7 +7064,7 @@ async fn capture(
             return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
         }
     };
-    if let Some(gateway) = state.hosted_rest_gateway() {
+    if let Some(gateway) = state.rest_lane_for(&pane.provider) {
         let session_id = pane
             .durable_id
             .clone()
@@ -9257,6 +9284,7 @@ mod tests {
             Ok(rest_lane::RestLaneSendResult {
                 session_id: "managed-kilroy-recovered".into(),
                 completed: true,
+                ..Default::default()
             })
         }
 

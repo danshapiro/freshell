@@ -140,7 +140,7 @@ pub(crate) fn resolve_pane_target(state: &FreshAgentState, raw: &str) -> PaneTar
 /// via `attachPaneContent` (`router.ts:1374`). A store miss (unknown pane)
 /// responds Node's `approx('pane split requested; not applied')`
 /// (`router.ts:1312-1314`). `agent`-based fresh-agent splits route through the
-/// same typed hosted gateway used by tab creation, roll the tentative layout
+/// same typed runtime lane used by tab creation, roll the tentative layout
 /// mutation back on launch failure, and attach the returned provider-native
 /// session to the store-minted pane. Response + broadcast shapes remain
 /// compatible with Slice 3b-1.
@@ -190,7 +190,7 @@ pub(crate) async fn split_pane(
                 format!("unknown agent \"{agent}\""),
             );
         };
-        let Some(gateway) = state.hosted_rest_gateway() else {
+        let Some(gateway) = state.rest_lane_for(provider) else {
             let _ = state.layout.close_pane(&new_pane_id);
             return fail_json(
                 StatusCode::SERVICE_UNAVAILABLE,

@@ -196,6 +196,7 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
         Ok(RestLaneSendResult {
             session_id: request.session_id,
             completed,
+            ..Default::default()
         })
     }
 

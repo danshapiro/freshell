@@ -136,10 +136,12 @@ pub struct RestLaneSend {
     pub timeout_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestLaneSendResult {
     pub session_id: String,
     pub completed: bool,
+    pub submitted_turn_id: Option<String>,
+    pub noop: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

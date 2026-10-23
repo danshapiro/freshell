@@ -48,6 +48,7 @@ impl rest_lane::FreshAgentRestLane for RestLaneFake {
         Ok(rest_lane::RestLaneSendResult {
             session_id: request.session_id,
             completed: true,
+            ..Default::default()
         })
     }
 
