@@ -45,6 +45,9 @@ use crate::naming::{
     SessionNaming,
 };
 
+#[path = "terminal_name_cache.rs"]
+mod cache;
+
 /// The bounded retry schedule for a transient store failure: each delay
 /// precedes one more attempt, so a persistently busy store costs at most
 /// ~1.3 s before the bind defers to the tick.
@@ -599,9 +602,20 @@ pub async fn reconcile_terminal_names(
             provider,
             cwd: row.cwd.clone(),
             name_ref: bound,
+            durable_target: binder.durable_session_of(terminal_id).and_then(
+                |(provider, session_id)| {
+                    named_provider_for(Some(&provider), None).map(|provider| {
+                        SessionNameRef::Session {
+                            provider,
+                            session_id,
+                        }
+                    })
+                },
+            ),
+            fallback_title: label_for(&row.mode),
         });
     }
-    let fill = fill_uncached_rows(sink.as_ref(), registry, &uncached).await;
+    let fill = fill_uncached_rows(sink.as_ref(), registry, binder, &uncached).await;
     tick.settle_pass(pass, &fill.empty, &waiting);
     report.filled = fill.filled;
     report
@@ -620,6 +634,8 @@ struct UncachedRow {
     provider: NamedProvider,
     cwd: Option<String>,
     name_ref: SessionNameRef,
+    durable_target: Option<SessionNameRef>,
+    fallback_title: String,
 }
 
 /// What one cache-fill pass found.
@@ -637,6 +653,7 @@ struct FillReport {
 async fn fill_uncached_rows(
     sink: &dyn SessionNaming,
     registry: &TerminalRegistry,
+    binder: &dyn TerminalNameBinder,
     uncached: &[UncachedRow],
 ) -> FillReport {
     let mut report = FillReport::default();
@@ -668,8 +685,9 @@ async fn fill_uncached_rows(
             continue;
         }
         if let Some(update) = updates.iter().find(|update| answers(update, &row.name_ref)) {
-            registry.update_session_name(&row.terminal_id, &update.record);
-            report.filled += 1;
+            if cache::accept_answer(registry, binder, row, &update.record) {
+                report.filled += 1;
+            }
             continue;
         }
         let SessionNameRef::Pending { id } = &row.name_ref else {
@@ -692,8 +710,9 @@ async fn fill_uncached_rows(
                 log_superseded(&row.terminal_id, &row.name_ref);
             }
             Ok(update) => {
-                registry.update_session_name(&row.terminal_id, &update.record);
-                report.filled += 1;
+                if cache::accept_answer(registry, binder, row, &update.record) {
+                    report.filled += 1;
+                }
             }
             Err(error) => log_name_error("ensure_pending", &row.name_ref, &error),
         }

@@ -987,6 +987,47 @@ async fn a_record_less_resume_target_never_binds_through_a_spent_handle() {
     assert_eq!(reads[0].record.name, "First thread", "T1 is untouched");
 }
 
+#[tokio::test(start_paused = true)]
+async fn tick_after_failed_pending_admission_rejects_a_handle_spent_on_another_session() {
+    let sink = FaultySink::new();
+    let old = session(NamedProvider::Codex, "thread-old");
+    let current = session(NamedProvider::Codex, "thread-current");
+    spend_handle_onto(sink.as_ref(), "spent-retry", &old, "Old thread").await;
+    sink.fail_ensures.store(true, Ordering::SeqCst);
+    let registry = TerminalRegistry::new();
+    headless_row(&registry, "T-retry", "codex");
+    let binder = FakeBinder::default();
+    binder
+        .durable
+        .lock()
+        .unwrap()
+        .insert("T-retry".into(), ("codex".into(), "thread-current".into()));
+    let outcome = bind_terminal_naming_from_identity(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        "T-retry",
+        hint("codex", Some("thread-current"), Some("spent-retry")),
+    )
+    .await;
+    assert!(matches!(outcome, NamingBindOutcome::Deferred { .. }));
+    sink.fail_ensures.store(false, Ordering::SeqCst);
+    reconcile_terminal_names(
+        dyn_sink(&sink).as_ref(),
+        &registry,
+        &binder,
+        &|mode| format!("{mode}-label"),
+        &TerminalNamesTick::default(),
+    )
+    .await;
+    assert_eq!(registry.name_ref_of("T-retry"), Some(current.clone()));
+    assert_eq!(binder.name_ref_of("T-retry"), Some(current));
+    assert!(
+        registry.session_name_of("T-retry").is_none(),
+        "a successful retry cannot cache the old conversation"
+    );
+}
+
 /// The same arm with a STILL-pending persisted handle (a zero-turn pane whose
 /// server restarted) takes the pending path: the row binds the handle's own
 /// record, which the verified bind lane later transfers.
