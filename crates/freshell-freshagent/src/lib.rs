@@ -5192,16 +5192,18 @@ fn pane_entry_from_layout(state: &FreshAgentState, pane_id: &str) -> Option<Pane
     ) {
         return None;
     }
-    let session_id = content.get("sessionId")?.as_str()?.to_string();
-    if session_id.is_empty() {
-        return None;
-    }
     let durable_id = content
         .get("sessionRef")
         .and_then(|value| serde_json::from_value::<SessionLocator>(value.clone()).ok())
         .filter(|locator| locator.provider == provider && !locator.session_id.is_empty())
-        .map(|locator| locator.session_id)
-        .unwrap_or_else(|| session_id.clone());
+        .map(|locator| locator.session_id);
+    let session_id = content
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| durable_id.clone())?;
+    let durable_id = durable_id.unwrap_or_else(|| session_id.clone());
     Some(PaneEntry {
         placeholder_id: session_id.clone(),
         provider: provider.to_string(),

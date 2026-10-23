@@ -346,3 +346,125 @@ async fn actual_fenced_send_refusal_reports_its_owner_and_keeps_the_prompt_unsen
     assert_eq!(rig.ledger_rows("prompt")[0]["text"], "current prompt");
     rig.fresh_claude.shutdown().await;
 }
+
+async fn clear_rekeys_the_headless_rest_pane(kind: RigKind) {
+    let rig = ClaudeRig::start_with_options(kind, options()).await;
+    let created = create(&rig, "claude").await;
+    let old_id = created["sessionId"].as_str().unwrap();
+    let pane = created["paneId"].as_str().unwrap();
+    let route = format!("/api/panes/{pane}/send-keys");
+    let first = send(&rig, pane, "before clear conversation").await;
+    wait_for_saved_turn(&rig, old_id, first["submittedTurnId"].as_str().unwrap()).await;
+    let (_, old_capture) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert!(
+        old_capture.contains("before clear conversation"),
+        "{old_capture}"
+    );
+    let (status, cleared) = rig
+        .post_json(
+            &route,
+            &json!({"data":"/clear", "requestId":"rest-request", "timeout":15}),
+        )
+        .await;
+    assert_eq!(status, 200, "{cleared}");
+    assert_eq!(cleared["data"]["status"], "idle", "{cleared}");
+    let new_id = cleared["data"]["sessionId"].as_str().unwrap();
+    assert_ne!(new_id, old_id, "clear chooses a new conversation");
+    assert!(uuid::Uuid::parse_str(new_id).is_ok());
+    assert_eq!(
+        cleared["data"]["sessionRef"],
+        json!({"provider":"claude", "sessionId":new_id})
+    );
+    let (status, fresh_capture) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert_eq!(status, 200, "{fresh_capture}");
+    assert!(
+        fresh_capture.is_empty(),
+        "the same headless pane now captures the new empty conversation: {fresh_capture}"
+    );
+    let next = send(&rig, pane, "after clear conversation").await;
+    assert_eq!(next["status"], "idle");
+    assert_eq!(next["sessionId"], new_id);
+    wait_for_saved_turn(&rig, new_id, next["submittedTurnId"].as_str().unwrap()).await;
+    let (status, next_capture) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert_eq!(status, 200, "{next_capture}");
+    assert!(
+        next_capture.contains("after clear conversation"),
+        "{next_capture}"
+    );
+    assert!(
+        !next_capture.contains("before clear conversation"),
+        "{next_capture}"
+    );
+    let old_path = rig.wait_for_transcript(old_id).await;
+    let old_lines: Vec<Value> = std::fs::read_to_string(old_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(old_lines.iter().any(|line| line["type"] == "user"));
+    assert!(
+        old_lines.iter().any(|line| line["type"] == "assistant"),
+        "clear preserves the previous conversation"
+    );
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_sim_rekeys_the_headless_rest_pane_before_capture_and_next_send() {
+    clear_rekeys_the_headless_rest_pane(RigKind::Sim).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_pinned_cli_rekeys_the_headless_rest_pane_before_capture_and_next_send() {
+    clear_rekeys_the_headless_rest_pane(RigKind::Cli).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_send_reports_the_accepted_replacement_and_updates_headless_capture() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let created = create(&rig, "claude").await;
+    let original = created["sessionId"].as_str().unwrap();
+    let pane = created["paneId"].as_str().unwrap();
+    for text in ["kept timeout conversation", "removed timeout conversation"] {
+        let sent = send(&rig, pane, text).await;
+        wait_for_saved_turn(&rig, original, sent["submittedTurnId"].as_str().unwrap()).await;
+    }
+    // A protocol client performs the undo but never mirrors a browser layout.
+    // The REST pane still addresses A when the runtime supersedes it with B.
+    let mut control = rig.connect().await;
+    let owner = rig.fresh_claude.ownership_snapshot("claude", original);
+    control.send(json!({
+        "type":"freshAgent.undo", "provider":"claude", "sessionType":"freshclaude", "sessionId":original,
+        "requestId":"undo-before-timeout", "mode":"step", "observedEpoch":owner.epoch, "observedGeneration":owner.generation,
+    })).await;
+    let ack = control
+        .wait_for("undo replacement", |frame| {
+            frame["event"]["requestId"] == "undo-before-timeout"
+                && matches!(
+                    frame["event"]["type"].as_str(),
+                    Some("freshAgent.rolledBack" | "freshAgent.error")
+                )
+        })
+        .await;
+    assert_eq!(ack["event"]["type"], "freshAgent.rolledBack", "{ack}");
+    let replacement = ack["event"]["newSessionId"].as_str().unwrap();
+    assert_ne!(replacement, original);
+    let (status, body) = rig
+        .post_json(
+            &format!("/api/panes/{pane}/send-keys"),
+            &json!({"data":"HANG", "timeout":1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["status"], "approx");
+    assert_eq!(body["data"]["sessionId"], replacement);
+    assert_eq!(body["data"]["sessionRef"]["sessionId"], replacement);
+    let (status, captured) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert_eq!(status, 200, "{captured}");
+    assert!(captured.contains("kept timeout conversation"), "{captured}");
+    assert!(
+        !captured.contains("removed timeout conversation"),
+        "{captured}"
+    );
+    rig.fresh_claude.shutdown().await;
+}

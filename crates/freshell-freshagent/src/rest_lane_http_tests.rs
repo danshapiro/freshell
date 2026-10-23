@@ -507,6 +507,38 @@ async fn local_lane_controls_browser_created_panes_using_the_provider_matched_du
 }
 
 #[tokio::test]
+async fn a_restored_pane_with_only_its_durable_ref_supports_send_and_capture() {
+    const ID: &str = "67cebd37-9576-4de0-93bb-8f286f5fc499";
+    let state = state_with_registry();
+    let (tab, pane) = state.layout.create_tab(None);
+    state.layout.attach_pane_content(
+        &tab,
+        &pane,
+        json!({
+            "kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude",
+            "sessionRef":{"provider":"claude", "sessionId":ID},
+        }),
+    );
+    let lane = Arc::new(ControlLane::default());
+    state.set_claude_rest_lane(lane.clone()).unwrap();
+    let router = app(state);
+    let (status, sent) = post(
+        router.clone(),
+        &format!("/api/panes/{pane}/send-keys"),
+        json!({"data":"restored prompt"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["data"]["sessionId"], ID);
+    assert_eq!(lane.sends.lock().unwrap().last().unwrap().session_id, ID);
+    let (status, text) = capture_response(router, &pane).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(text, "saved conversation");
+    assert_eq!(lane.captures.lock().unwrap().last().unwrap().session_id, ID);
+}
+
+#[tokio::test]
 async fn lane_noop_does_not_report_a_submitted_turn() {
     let state = state_with_registry();
     let (tab, pane_id) = state.layout.create_tab(None);

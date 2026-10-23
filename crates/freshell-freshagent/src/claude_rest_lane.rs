@@ -150,7 +150,7 @@ impl ClaudeRestLane {
         .await?;
         let completed = settled_key.is_some();
         Ok(RestLaneSendResult {
-            session_id: settled_key.unwrap_or_else(|| request.session_id.clone()),
+            session_id: settled_key.unwrap_or(session_key),
             completed,
             submitted_turn_id: Some(submitted_turn_id),
             noop: false,

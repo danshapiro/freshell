@@ -76,8 +76,8 @@ test.describe('external REST/MCP controls the shared Claude runtime', () => {
       expect(captured).toContain(`user: ${PROMPT}`)
       expect(captured).toContain(`assistant: ${REPLY}`)
       await mcp.callFreshellAction('select-tab', { target: tabId })
-      await expect(page.locator(`[data-pane-id="${paneId}"]`)).toBeVisible()
-      await expect(page.locator(`[data-pane-id="${paneId}"]`)).toContainText(REPLY)
+      await expect(page.locator(`[data-context="fresh-agent"][data-pane-id="${paneId}"]`)).toBeVisible()
+      await expect(page.locator(`[data-context="fresh-agent"][data-pane-id="${paneId}"]`)).toContainText(REPLY)
       expect(await page.evaluate(() => (window as typeof window & { __restNotificationPlays?: number }).__restNotificationPlays)).toBe(1)
 
       const split = await mcp.callFreshellAction('split-pane', { target: paneId, agent: 'kilroy', cwd: lane.workspace, direction: 'vertical' })
@@ -85,8 +85,8 @@ test.describe('external REST/MCP controls the shared Claude runtime', () => {
       const splitId = split.data.paneId
       await expect.poll(async () => leaf(await harness.getPaneLayout(tabId), splitId)?.content?.sessionType, { timeout: 20_000 }).toBe('kilroy')
       await mcp.callFreshellAction('send-keys', { target: splitId, keys: 'kilroy hello\r', literal: true })
-      await expect(page.locator(`[data-pane-id="${splitId}"]`)).toBeVisible()
-      await expect(page.locator(`[data-pane-id="${splitId}"]`)).toContainText('Kilroy REST reply')
+      await expect(page.locator(`[data-context="fresh-agent"][data-pane-id="${splitId}"]`)).toBeVisible()
+      await expect(page.locator(`[data-context="fresh-agent"][data-pane-id="${splitId}"]`)).toContainText('Kilroy REST reply')
 
       // With no browser to attach or repair a REST pane row, the persisted
       // layout and durable transcript must still serve the external client.
