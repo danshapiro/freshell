@@ -1742,9 +1742,9 @@ pub(crate) fn build_claude_snapshot_from_projection(
     snapshot
 }
 
-/// Locate + read + build. `revision` = transcript mtime in ms (monotonic as the file
-/// grows -- `mergeSnapshotForDisplay` DROPS revision regressions), fallback turn count;
-/// kata 1wxv Task 5 floors it at the rollback record's `lastOpAtMs`.
+/// [`get_claude_snapshot_in`] over this process's store roots (tests that
+/// stage a store through `CLAUDE_CONFIG_DIR`).
+#[cfg(test)]
 pub(crate) async fn get_claude_snapshot(
     session_type: &str,
     thread_id: &str,
@@ -1753,9 +1753,14 @@ pub(crate) async fn get_claude_snapshot(
     get_claude_snapshot_in(&claude_home_candidates(), session_type, thread_id, rollback).await
 }
 
-/// [`get_claude_snapshot`] over explicit store roots (the production caller
-/// passes [`claude_home_candidates`]; tests pass temp roots, no env mutation).
-async fn get_claude_snapshot_in(
+/// Locate + read + build, over explicit store roots (the claude lane passes the
+/// roots its sidecars write to,
+/// [`crate::claude::FreshClaudeState::transcript_store_roots`]; tests pass
+/// temp roots, no env mutation). `revision` = transcript mtime in ms
+/// (monotonic as the file grows -- `mergeSnapshotForDisplay` DROPS revision
+/// regressions), fallback turn count; kata 1wxv Task 5 floors it at the
+/// rollback record's `lastOpAtMs`.
+pub(crate) async fn get_claude_snapshot_in(
     roots: &[PathBuf],
     session_type: &str,
     thread_id: &str,

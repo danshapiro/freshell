@@ -457,3 +457,46 @@ async fn a_send_that_changes_the_permission_mode_broadcasts_metadata_stating_it(
     assert_eq!(metadata["sessionId"], json!(session.pane), "{metadata}");
     assert_eq!(metadata["event"]["permissionMode"], "acceptEdits");
 }
+
+/// A lane whose sidecars get an explicit environment (a test rig) serves
+/// snapshots from the transcript store that environment names, the store its
+/// CLI writes, not from this process's.
+#[tokio::test]
+async fn snapshots_read_the_store_the_lanes_sidecars_write() {
+    let _env = super::tests::CLAUDE_ENV_LOCK.lock().await;
+    let process_store = tempfile::tempdir().expect("this process's store");
+    std::env::set_var("CLAUDE_CONFIG_DIR", process_store.path());
+    let sidecar_store = tempfile::tempdir().expect("the sidecars' store");
+    let thread = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let project = sidecar_store.path().join("projects").join("-ws");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join(format!("{thread}.jsonl")),
+        format!(
+            "{}\n",
+            json!({
+                "type": "user", "uuid": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                "sessionId": thread, "message": { "role": "user", "content": "hello" },
+            })
+        ),
+    )
+    .unwrap();
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+    let st = FreshClaudeState::new(Arc::new(tx)).with_sidecar_environment([
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            sidecar_store.path().to_string_lossy().into_owned(),
+        ),
+        ("HOME".to_string(), "/nonexistent-home".to_string()),
+    ]);
+
+    let snapshot = st
+        .get_snapshot(SessionType::Freshclaude, thread)
+        .await
+        .expect("the snapshot reads the sidecars' store");
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    assert_eq!(
+        snapshot["turns"][0]["items"][0]["text"], "hello",
+        "{snapshot}"
+    );
+}

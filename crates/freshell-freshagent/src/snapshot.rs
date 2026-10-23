@@ -38,7 +38,7 @@
 //! the typed ownership refusals or the EMPTY-FROM-DISK snapshot and never
 //! spawn (cold resume only via the explicit lifecycle); while
 //! **freshclaude/claude** and **kilroy/claude** are a
-//! disk+env adapter ([`crate::claude_snapshot::get_claude_snapshot`]) that reads the CLI's
+//! disk adapter ([`crate::claude::FreshClaudeState::transcript_snapshot`]) that reads the CLI's
 //! own transcript store directly (`<claude_home>/projects/*/<threadId>.jsonl`) — no sidecar
 //! required, so snapshots survive a server restart. When the session is LIVE, the route
 //! overlays its folded pending approvals/questions onto the disk-built JSON and flips the
@@ -125,13 +125,11 @@ impl SnapshotState {
                 .flatten()?,
             ("freshclaude" | "kilroy", "claude") => {
                 let rollback = self.claude.load_rollback_record(native_id).await;
-                let saved = crate::claude_snapshot::get_claude_snapshot(
-                    session_type,
-                    native_id,
-                    rollback.as_ref(),
-                )
-                .await
-                .ok()?;
+                let saved = self
+                    .claude
+                    .transcript_snapshot(session_type, native_id, rollback.as_ref())
+                    .await
+                    .ok()?;
                 crate::native_history::readonly_snapshot(provider, saved).ok()?
             }
             ("freshopencode", "opencode") => {
@@ -325,12 +323,10 @@ async fn get_snapshot(
             // floor). The record is ledger-sync (memory-fast) and resolves by the
             // DURABLE id even when no session is live (durable+multi-client truth).
             let rollback = state.claude.load_rollback_record(&thread_id).await;
-            match crate::claude_snapshot::get_claude_snapshot(
-                &session_type,
-                &thread_id,
-                rollback.as_ref(),
-            )
-            .await
+            match state
+                .claude
+                .transcript_snapshot(&session_type, &thread_id, rollback.as_ref())
+                .await
             {
                 Ok(mut snapshot) => {
                     // Task 3 (reload-while-pending): overlay the session's LIVE pending

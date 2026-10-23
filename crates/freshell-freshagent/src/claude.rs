@@ -862,6 +862,45 @@ impl FreshClaudeState {
         self
     }
 
+    /// The transcript store roots this lane's CLI writes to: the ones the
+    /// configured sidecar environment names (a test rig's isolated HOME /
+    /// CLAUDE_CONFIG_DIR), else this process's
+    /// ([`crate::claude_snapshot::claude_home_candidates`]). Snapshots read
+    /// from here, so they always read the store the sessions write.
+    pub(crate) fn transcript_store_roots(&self) -> Vec<std::path::PathBuf> {
+        match self.sidecar_environment.as_deref() {
+            None => crate::claude_snapshot::claude_home_candidates(),
+            Some(environment) => {
+                let var = |key: &str| {
+                    environment
+                        .iter()
+                        .rev()
+                        .find(|(name, _)| name == key)
+                        .map(|(_, value)| value.clone())
+                };
+                let home = var("HOME").map(std::path::PathBuf::from);
+                crate::claude_snapshot::claude_home_candidates_from(var, home)
+            }
+        }
+    }
+
+    /// The snapshot built from `thread_id`'s transcript in
+    /// [`Self::transcript_store_roots`], without the live overlays.
+    pub(crate) async fn transcript_snapshot(
+        &self,
+        session_type: &str,
+        thread_id: &str,
+        rollback: Option<&crate::rollback_record::RollbackRecord>,
+    ) -> Result<Value, crate::claude_snapshot::ClaudeSnapshotError> {
+        crate::claude_snapshot::get_claude_snapshot_in(
+            &self.transcript_store_roots(),
+            session_type,
+            thread_id,
+            rollback,
+        )
+        .await
+    }
+
     /// Test seam (see [`crate::claude_test_holds`]): every later session
     /// registration waits `hold` between starting the session's consumer and
     /// inserting its record, the way a production resume create awaits its
@@ -5314,20 +5353,17 @@ impl FreshClaudeState {
         thread_id: &str,
     ) -> Result<Value, String> {
         let rollback = self.load_rollback_record(thread_id).await;
-        let mut snapshot = crate::claude_snapshot::get_claude_snapshot(
-            session_type_str(session_type),
-            thread_id,
-            rollback.as_ref(),
-        )
-        .await
-        .map_err(|error| match error {
-            crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
-                "claude session not found".to_string()
-            }
-            crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
-                "claude snapshot unavailable".to_string()
-            }
-        })?;
+        let mut snapshot = self
+            .transcript_snapshot(session_type_str(session_type), thread_id, rollback.as_ref())
+            .await
+            .map_err(|error| match error {
+                crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                    "claude session not found".to_string()
+                }
+                crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
+                    "claude snapshot unavailable".to_string()
+                }
+            })?;
         let (approvals, questions) = self.snapshot_pending_overlay(thread_id).await;
         crate::claude_snapshot::apply_pending_overlay(&mut snapshot, approvals, questions);
         self.apply_snapshot_metadata(thread_id, &mut snapshot).await;
@@ -5335,9 +5371,9 @@ impl FreshClaudeState {
     }
 
     /// Test seam (`test-support`, C09 rigs): the live-state overlay the snapshot
-    /// route applies ([`Self::apply_snapshot_metadata`]), over an empty snapshot. A
-    /// rig cannot read a transcript through its server (the store root comes from
-    /// this process's environment), so it reads the overlay directly.
+    /// route applies ([`Self::apply_snapshot_metadata`]), over an empty snapshot,
+    /// for a check that needs no transcript (the overlay alone, before the
+    /// session wrote one).
     #[cfg(any(test, feature = "test-support"))]
     pub async fn live_snapshot_overlay(&self, any_id: &str) -> Value {
         let mut snapshot = json!({});
