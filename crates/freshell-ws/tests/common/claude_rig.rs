@@ -816,9 +816,10 @@ async fn spawn_rig_server(
         .with_hosted_mcp(options.hosted_claude);
     fresh_claude.set_ownership(Arc::clone(&ownership));
     if let Some(ledger) = pane_ledger.as_ref() {
-        fresh_claude.set_identity_sink(Arc::new(super::ledger_sink::LedgerSink::new(Arc::clone(
-            ledger,
-        ))));
+        fresh_claude.set_identity_sink(Arc::new(super::ledger_sink::LedgerSink::with_ownership(
+            Arc::clone(ledger),
+            Some(Arc::clone(&ownership)),
+        )));
     }
     let lane = fresh_claude.clone();
     let fresh_agent_state = freshell_freshagent::FreshAgentState::new(

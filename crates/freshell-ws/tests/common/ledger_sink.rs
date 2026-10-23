@@ -5,10 +5,10 @@
 //! (the production bridge; the ws-test crate cannot depend on freshell-server, the
 //! dependency edge runs the other way): awaited `spawn_blocking` writes, inline
 //! memory reads, the same settings gates, the tri-state provenance policy and the
-//! claude rollback-row re-key that rides the binding batch. The one omission is the
-//! authoritative-write ownership consult (only the handoff runner's own target
-//! bindings set `authoritative`, and the production consult's refusal is pinned in
-//! freshell-server's own tests).
+//! claude rollback-row re-key that rides the binding batch, and the authoritative
+//! write's ownership consult (the handoff runner's target bindings set
+//! `authoritative`; the consult reads the coordinator the sink was given, and an
+//! authoritative write to a sink with none is refused, as in production).
 
 use std::sync::Arc;
 
@@ -25,12 +25,76 @@ use freshell_ws::pane_ledger::{
 
 pub struct LedgerSink {
     pub ledger: Arc<PaneLedger>,
+    /// The ownership coordinator an authoritative write is re-validated
+    /// against (the one the lanes writing through this sink are wired to).
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
 }
 
 impl LedgerSink {
+    /// A sink over `ledger` with no ownership coordinator.
     pub fn new(ledger: Arc<PaneLedger>) -> Self {
-        Self { ledger }
+        Self {
+            ledger,
+            ownership: None,
+        }
     }
+
+    /// A sink over `ledger` whose authoritative writes are re-validated against
+    /// `ownership`.
+    pub fn with_ownership(
+        ledger: Arc<PaneLedger>,
+        ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    ) -> Self {
+        Self { ledger, ownership }
+    }
+}
+
+/// The production bridge's authoritative-write consult
+/// (`freshell-server/src/identity_sink.rs`), run at execution time inside the
+/// write: an authoritative write must carry its observed pair, and the handoff
+/// that minted it must still own the key's transition at that pair.
+fn authoritative_write_refusal(
+    ownership: Option<&freshell_ownership::RuntimeOwnershipRegistry>,
+    upsert: &FreshAgentBindingUpsert,
+) -> Option<std::io::Error> {
+    if !upsert.authoritative {
+        return None;
+    }
+    let (Some(epoch), Some(generation)) = (upsert.observed_epoch, upsert.observed_generation)
+    else {
+        return Some(std::io::Error::other(
+            "STALE_TRANSITION_BINDING: an authoritative write must carry its observed \
+             (epoch, generation) pair",
+        ));
+    };
+    let Some(registry) = ownership else {
+        return Some(std::io::Error::other(
+            "STALE_TRANSITION_BINDING: an authoritative write arrived at a bridge with no \
+             ownership coordinator wired",
+        ));
+    };
+    let snap = registry.observe(&upsert.provider, &upsert.session_id);
+    let transition_owned = snap.epoch == epoch
+        && match &snap.state {
+            freshell_ownership::OwnershipState::Handoff {
+                generation: owned, ..
+            } => *owned == generation,
+            freshell_ownership::OwnershipState::Live {
+                owner,
+                generation: owned,
+                ..
+            } => {
+                *owned == generation
+                    && owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            }
+            _ => false,
+        };
+    (!transition_owned).then(|| {
+        std::io::Error::other(
+            "STALE_TRANSITION_BINDING: the authoritative write's handoff operation no \
+             longer owns the key's transition at its generation",
+        )
+    })
 }
 
 fn now_ms() -> i64 {
@@ -75,8 +139,12 @@ impl PaneIdentitySink for LedgerSink {
 
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
         let ledger = self.ledger.clone();
+        let ownership = self.ownership.clone();
         let now = now_ms();
         blocking(move || {
+            if let Some(refusal) = authoritative_write_refusal(ownership.as_deref(), &upsert) {
+                return Err(refusal);
+            }
             let provenance = match &upsert.provenance {
                 ProvenanceUpdate::Replace(stamps) => ProvenancePolicy::Replace(ProvenanceStamps {
                     client_instance_id: stamps.client_instance_id.as_deref(),

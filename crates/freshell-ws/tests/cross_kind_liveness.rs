@@ -25,6 +25,8 @@
 //! unconfirmable-prior arm SIGKILLs its own fake sidecar, the lease-suite
 //! class).
 
+mod common;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,12 +36,11 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use freshell_freshagent::{
-    ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
-    SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite, SinkWrite,
-};
-use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
+use freshell_freshagent::{FreshAgentBindingUpsert, PaneIdentitySink};
+use freshell_ws::pane_ledger::PaneLedger;
 use freshell_ws::WsState;
+
+use common::ledger_sink::LedgerSink;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
@@ -707,473 +708,6 @@ async fn spawn_merged_server_with_hooks(
     }
 }
 
-// ── b8ke focused ep5 r2 F1: the ledger-backed identity sink for the real-ledger
-//    merged harness (copied from freshagent_claude_rollback.rs — the ws-test
-//    crate cannot depend on freshell-server: the dep edge runs the other way) ──
-
-/// The rollback-record-provisioning identity sink, backed by the REAL pane
-/// ledger — mirrors `freshell-server/src/identity_sink.rs`'s LedgerIdentitySink
-/// (the ws-test crate cannot depend on freshell-server: the dep edge runs the
-/// other way), INCLUDING the claude-adoption rollback-row re-key that rides the
-/// awaited binding batch.
-struct TestLedgerSink {
-    ledger: Arc<PaneLedger>,
-    /// b8ke focused ep5 r3 F1: the merged harness's ONE ownership
-    /// coordinator — the authoritative write's ownership re-validation
-    /// consults it (mirrors the production bridge's consult verbatim).
-    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
-}
-impl TestLedgerSink {
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-    }
-}
-impl PaneIdentitySink for TestLedgerSink {
-    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, m, c) = (
-            placeholder_id.to_string(),
-            mode.to_string(),
-            cwd.map(str::to_string),
-        );
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.record_pending(
-                    &p,
-                    &m,
-                    c.as_deref(),
-                    None,
-                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
-                    now,
-                )
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let ownership = self.ownership.clone();
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                // b8ke focused ep5 r3 F1: the authoritative write's
-                // ownership re-validation — mirrors the production bridge
-                // (crates/freshell-server/src/identity_sink.rs) verbatim:
-                // the consult runs INSIDE the spawn_blocking closure, at
-                // execution time, and refuses typed when the write's
-                // handoff no longer owns the key's transition at its
-                // (epoch, generation) pair.
-                if upsert.authoritative {
-                    let (Some(w_epoch), Some(w_generation)) =
-                        (upsert.observed_epoch, upsert.observed_generation)
-                    else {
-                        return Err(std::io::Error::other(
-                            "STALE_TRANSITION_BINDING: an authoritative write must \
-                             carry its observed (epoch, generation) pair — the \
-                             ownership re-validation cannot run (kata b8ke focused \
-                             ep5 r3 F1)",
-                        ));
-                    };
-                    let Some(registry) = ownership.as_ref() else {
-                        return Err(std::io::Error::other(
-                            "STALE_TRANSITION_BINDING: an authoritative write \
-                             arrived at a bridge with no ownership coordinator \
-                             wired — authoritative markers are minted only by \
-                             coordinator-driven handoff lanes (kata b8ke focused \
-                             ep5 r3 F1)",
-                        ));
-                    };
-                    let snap = registry.observe(&upsert.provider, &upsert.session_id);
-                    let transition_owned = snap.epoch == w_epoch
-                        && match &snap.state {
-                            freshell_ownership::OwnershipState::Handoff {
-                                generation,
-                                ..
-                            } => *generation == w_generation,
-                            freshell_ownership::OwnershipState::Live {
-                                owner,
-                                generation,
-                                ..
-                            } => {
-                                *generation == w_generation
-                                    && owner.kind
-                                        == freshell_ownership::RuntimeOwnerKind::FreshAgent
-                            }
-                            _ => false,
-                        };
-                    if !transition_owned {
-                        return Err(std::io::Error::other(
-                            "STALE_TRANSITION_BINDING: the authoritative write's \
-                             handoff operation no longer owns the key's transition \
-                             at its generation (canceled, superseded, restored, \
-                             vacated, or a new boot epoch) — the write is refused \
-                             (kata b8ke focused ep5 r3 F1)",
-                        ));
-                    }
-                }
-                let stored_genesis = upsert.genesis.stored_value();
-                let w = FreshAgentBindingWrite {
-                    genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
-                        stored_genesis.as_ref(),
-                        upsert.genesis.is_clear(),
-                    ),
-                    provider: &upsert.provider,
-                    session_id: &upsert.session_id,
-                    mode: &upsert.mode,
-                    cwd: upsert.settings.cwd.as_deref(),
-                    create_request_id: upsert.create_request_id.as_deref(),
-                    model: upsert.settings.model.as_deref(),
-                    sandbox: upsert.settings.sandbox.as_deref(),
-                    permission_mode: upsert.settings.permission_mode.as_deref(),
-                    effort: upsert.settings.effort.as_deref(),
-                    supersedes: upsert.supersedes.as_deref(),
-                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
-                    observed_epoch: upsert.observed_epoch,
-                    observed_generation: upsert.observed_generation,
-                    authoritative: upsert.authoritative,
-                    now_ms: now,
-                    plugins: upsert.settings.plugins.as_deref(),
-                };
-                ledger.record_fresh_agent_binding(&w)?;
-                // kata 1wxv Task 4 (claude adoption): the rollback row re-keys
-                // old→new in the SAME awaited batch as the binding write.
-                if upsert.provider == "claude" {
-                    if let Some(old_id) = upsert.supersedes.as_deref() {
-                        if old_id != upsert.session_id {
-                            if let Some(payload) =
-                                ledger.load_rollback_row(&upsert.provider, old_id)
-                            {
-                                ledger.record_rollback_row(
-                                    &upsert.provider,
-                                    &upsert.session_id,
-                                    &payload,
-                                    now,
-                                )?;
-                                if let Err(e) = ledger.delete_rollback_row(&upsert.provider, old_id) {
-                                    tracing::warn!(error = %e, session = %old_id, "rollback row re-key: old row delete failed (cosmetic)");
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(p) = upsert.resolves_pending.as_deref() {
-                    let _ = ledger.delete_pending(p);
-                }
-                Ok(())
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings> {
-        // b8ke focused ep5 r5 F1: mirror the PRODUCTION bridge's read
-        // verbatim (the rollback-focused `None` stub this copy inherited
-        // silently disabled the ordinary cold resume's RECOVERED path —
-        // `recovered` never answered Some, so the recovered-session
-        // binding write never ran in this harness). Memory-only against
-        // the real ledger, the same fresh-agent gate + settings-bearing
-        // gate as `LedgerIdentitySink::load_settings`.
-        let row = self.ledger.load_binding(provider, session_id)?;
-        if row.pane_kind.as_deref() != Some("fresh-agent") {
-            return None;
-        }
-        let s = FreshAgentSettings {
-            model: row.model,
-            sandbox: row.sandbox,
-            permission_mode: row.permission_mode,
-            effort: row.effort,
-            cwd: row.cwd,
-            plugins: row.plugins,
-        };
-        if s == FreshAgentSettings::default() {
-            return None;
-        }
-        Some(s)
-    }
-    fn load_provenance(
-        &self,
-        _provider: &str,
-        _session_id: &str,
-    ) -> Option<freshell_freshagent::BindProvenance> {
-        // Rollback-focused double (like `load_settings` above): these
-        // rollback tests never cold-attach a codex/opencode session, so the
-        // provenance read-back is out of their contract.
-        None
-    }
-    fn load_genesis(
-        &self,
-        provider: &str,
-        session_id: &str,
-    ) -> Option<freshell_freshagent::RecordedGenesis> {
-        let row = self.ledger.load_binding(provider, session_id)?;
-        if row.pane_kind.as_deref() != Some("fresh-agent") {
-            return None;
-        }
-        freshell_freshagent::RecordedGenesis::from_row(
-            provider,
-            session_id,
-            row.genesis.as_ref(),
-            row.updated_at,
-        )
-    }
-
-    fn clear_genesis(&self, provider: &str, session_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.clear_binding_genesis(&p, &s, now).map(|_| ())
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-
-    fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
-        self.ledger.load_binding(provider, session_id).is_some()
-    }
-    fn record_rollback(
-        &self,
-        provider: &str,
-        session_id: &str,
-        record: RollbackRecord,
-    ) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let payload = serde_json::to_value(&record).map_err(std::io::Error::other)?;
-                ledger.record_rollback_row(&p, &s, &payload, TestLedgerSink::now_ms())
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn repair_failed_transition(
-        &self,
-        provider: &str,
-        session_id: &str,
-        epoch: u64,
-        generation: u64,
-    ) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        let now = Self::now_ms();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        })
-    }
-    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
-        // Mirror of freshell-server's LedgerIdentitySink: the shared migrating
-        // reader owns the version gate + the legacy epochless-union migration
-        // (focused ep1-r1 F3, absence-keyed per ep1-r2 F1).
-        let payload = self.ledger.load_rollback_row(provider, session_id)?;
-        RollbackRecord::from_stored_payload(payload)
-    }
-    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.delete_rollback_row(&p, &s))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-
-    fn lookup_by_create_request_id(
-        &self,
-        provider: &str,
-        create_request_id: &str,
-    ) -> Option<String> {
-        self.ledger
-            .lookup_by_create_request_id(provider, create_request_id)
-            .map(|row| row.session_id)
-    }
-
-    // Retire-on-kill (delta-review round 5): the same real-ledger pass-through
-    // the LedgerIdentitySink this double mirrors now implements.
-    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                ledger.retire_closed(&p, &s, TestLedgerSink::now_ms())
-            })
-            .await
-            .map_err(|join| {
-                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
-                    join,
-                ))
-            })?;
-            result.map_err(|err| match err {
-                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
-                }
-                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
-                }
-            })
-        })
-    }
-
-    /// Delta-r6-r3: the real-ledger delegation mirrors
-    /// `freshell-server/src/identity_sink.rs`'s `retire_closed_batch`
-    /// (the ledger envelope is the atomicity point; one spawn_blocking hop).
-    fn retire_closed_batch(
-        &self,
-        provider: &str,
-        session_ids: &[String],
-        pending_ids: &[String],
-    ) -> SinkCloseWrite {
-        let ledger = self.ledger.clone();
-        let p = provider.to_string();
-        let ids = session_ids.to_vec();
-        let pendings = pending_ids.to_vec();
-        Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                ledger.close_identities(&p, &ids, &pendings, TestLedgerSink::now_ms())
-            })
-            .await
-            .map_err(|join| {
-                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
-                    join,
-                ))
-            })?;
-            result.map_err(|err| match err {
-                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
-                }
-                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
-                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
-                }
-            })
-        })
-    }
-    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let p = placeholder_id.to_string();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.delete_pending(&p))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-
-    // Focused-ep5-r1 Finding 2: same real-ledger pass-through as `retire_closed`.
-    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.clear_kill_tombstone(&p, &s))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-
-    // Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the snapshot read is
-    // a memory-only inline pass-through (the LedgerIdentitySink discipline).
-    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
-        self.ledger.kill_tombstone_at(provider, session_id)
-    }
-
-    // Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the alias-tombstone
-    // retention probe — memory-only inline pass-through like the snapshot read.
-    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
-        self.ledger.row_is_bound(provider, session_id)
-    }
-
-    // Focused-ep5-r3 Findings 1+3: the conditional single-transition claim
-    // commit — a faithful pass-through to the real ledger op.
-    fn commit_claim(
-        &self,
-        provider: &str,
-        session_id: &str,
-        expect_killed_at_ms: Option<i64>,
-    ) -> SinkCommitWrite {
-        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
-    }
-    // Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the aliased commit's
-    // faithful pass-through (the alias gate lives inside the ledger's
-    // guarded transition).
-    fn commit_claim_aliased(
-        &self,
-        provider: &str,
-        session_id: &str,
-        expect_killed_at_ms: Option<i64>,
-        fence_checked_aliases: &[String],
-    ) -> SinkCommitWrite {
-        let ledger = self.ledger.clone();
-        let (p, s) = (provider.to_string(), session_id.to_string());
-        let aliases: Vec<String> = fence_checked_aliases.to_vec();
-        Box::pin(async move {
-            let outcome = tokio::task::spawn_blocking(move || {
-                ledger.commit_claim_aliased(
-                    &p,
-                    &s,
-                    expect_killed_at_ms,
-                    &aliases,
-                    TestLedgerSink::now_ms(),
-                )
-            })
-            .await
-            .map_err(std::io::Error::other)??;
-            Ok(match outcome {
-                freshell_ws::pane_ledger::ClaimCommitOutcome::Committed => ClaimCommit::Committed,
-                freshell_ws::pane_ledger::ClaimCommitOutcome::RefusedStale => {
-                    ClaimCommit::RefusedStale
-                }
-            })
-        })
-    }
-    // Finding 2's alias-record pass-throughs (same disciplines as the rest of
-    // the test double).
-    fn record_alias_tombstone(
-        &self,
-        provider: &str,
-        placeholder: &str,
-        durable: &str,
-        at_ms: i64,
-    ) -> SinkWrite {
-        let ledger = self.ledger.clone();
-        let (p, ph, d) = (
-            provider.to_string(),
-            placeholder.to_string(),
-            durable.to_string(),
-        );
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.record_alias_tombstone(&p, &ph, &d, at_ms))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
-        self.ledger.alias_tombstone_records(provider, placeholder)
-    }
-    fn clear_alias_tombstones_for_durable(
-        &self,
-        provider: &str,
-        durable: &str,
-    ) -> SinkAliasClearWrite {
-        let ledger = self.ledger.clone();
-        let (p, d) = (provider.to_string(), durable.to_string());
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.clear_alias_tombstones_for_durable(&p, &d))
-                .await
-                .map_err(std::io::Error::other)?
-        })
-    }
-}
-
 /// b8ke focused ep5 r2 F1: [`spawn_merged_server`] over a REAL pane ledger
 /// (a tempdir root) with the ledger-backed identity sink wired into the
 /// fresh states — the fresh-agent lanes' binding rows actually LAND (the
@@ -1188,20 +722,20 @@ async fn spawn_merged_server_with_ledger() -> (MergedHarness, Arc<PaneLedger>) {
 
     // The REAL ledger (tempdir-rooted) replaces the disabled one BEFORE any
     // write can flow; the fresh states write through the same ledger via the
-    // TestLedgerSink.
+    // shared `common::ledger_sink::LedgerSink`.
     let ledger_root =
         std::env::temp_dir().join(format!("freshell-cross-kind-ledger-{}", uuid_like_suffix()));
     std::fs::create_dir_all(&ledger_root).expect("create the ledger root");
     let pane_ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
         ledger_root.clone(),
     )));
-    let sink: std::sync::Arc<dyn PaneIdentitySink> = Arc::new(TestLedgerSink {
-        ledger: Arc::clone(&pane_ledger),
-        // b8ke focused ep5 r3 F1: the same ONE coordinator the merged
-        // harness wired into the lanes — the sink's authoritative-write
-        // consult reads the same transitions the runner drives.
-        ownership: state.ownership.clone(),
-    });
+    // b8ke focused ep5 r3 F1: the same ONE coordinator the merged harness
+    // wired into the lanes — the sink's authoritative-write consult reads the
+    // same transitions the runner drives.
+    let sink: std::sync::Arc<dyn PaneIdentitySink> = Arc::new(LedgerSink::with_ownership(
+        Arc::clone(&pane_ledger),
+        state.ownership.clone(),
+    ));
     state.fresh_claude.set_identity_sink(sink.clone());
     state.fresh_codex.set_identity_sink(sink.clone());
     state.fresh_opencode.set_identity_sink(sink.clone());
@@ -3751,10 +3285,7 @@ async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end()
     let row_before = pane_ledger
         .load_binding("claude", &sid)
         .expect("the row exists before the stale write");
-    let sink = TestLedgerSink {
-        ledger: Arc::clone(&pane_ledger),
-        ownership: h.ws_state.ownership.clone(),
-    };
+    let sink = LedgerSink::with_ownership(Arc::clone(&pane_ledger), h.ws_state.ownership.clone());
     let err = sink
         .record_binding(FreshAgentBindingUpsert {
             genesis: freshell_freshagent::GenesisUpdate::Keep,
@@ -3908,10 +3439,7 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
     //    (epoch, generation) fails and its cleanup fires the repair —
     //    the row the target's own write produced retires typed
     //    FailedTransition, and the durable fence is fed.
-    let sink = TestLedgerSink {
-        ledger: Arc::clone(&pane_ledger),
-        ownership: h.ws_state.ownership.clone(),
-    };
+    let sink = LedgerSink::with_ownership(Arc::clone(&pane_ledger), h.ws_state.ownership.clone());
     sink.repair_failed_transition("claude", &sid, epoch, generation)
         .await
         .expect("the cleanup's repair lands");
@@ -3987,7 +3515,7 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
 
 /// b8ke focused ep5 r5 F1 (e2e): an ORDINARY codex cold resume with
 /// RECOVERED settings succeeds end-to-end over the PRODUCTION-shaped
-/// consulting sink (the merged harness's TestLedgerSink mirrors the
+/// consulting sink (the merged harness's shared LedgerSink mirrors the
 /// production bridge's ownership consult verbatim, over the real
 /// ledger). The recovered-session binding write is a LANE write — never
 /// the authoritative marker without its pair — so the thread registers,
