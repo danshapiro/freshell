@@ -1,4 +1,5 @@
 import { expect, test } from '../helpers/fixtures.js'
+import { withholdSavedNames } from '../helpers/withhold-saved-names.js'
 import type { SessionNameRef } from '../../../shared/session-names.js'
 import {
   createNamedAgent,
@@ -105,6 +106,19 @@ test.describe('[claude] unified agent names', () => {
         timeout: 30_000,
       }).toBe('LotL')
 
+      // A restored window has the mirrored title and its original pending
+      // handle, but may switch before the redirect/name cache loads. The
+      // authoritative association binding must release that spent handle.
+      const withholding = await withholdSavedNames(page)
+      await page.reload()
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      handle = await refreshHandle(harness, handle, 'claude')
+      await expect(page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`))
+        .toContainText('LotL', { timeout: 30_000 })
+      expect(Object.keys((await harness.getState() as { sessionNames: { records: Record<string, unknown> } })
+        .sessionNames.records)).toEqual([])
+
       // The switch: the CLI starts a new conversation inside the same pane.
       await sendFirstMessage(page, harness, handle, 'claude', '/clear')
       let sessionB = ''
@@ -114,15 +128,23 @@ test.describe('[claude] unified agent names', () => {
         return sessionB
       }, { timeout: 45_000, intervals: [500, 1_000, 2_000] }).toBeTruthy()
       const paneHeader = page.locator('[data-context="pane-header"]:visible').first()
+      const tab = page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`)
       await expect(paneHeader, 'the pane leaves the old conversation\'s name').not.toContainText('LotL', {
         timeout: 30_000,
       })
+      await expect(tab, 'the tab leaves the old conversation\'s name').not.toContainText('LotL', { timeout: 30_000 })
+      await expect.poll(async () => {
+        const state = await harness.getState() as { tabs: { tabs: Array<{ id: string; title: string }> } }
+        return state.tabs.tabs.find((candidate) => candidate.id === handle.tabId)?.title
+      }, { timeout: 30_000 }).toMatch(/^Tab \d+$/)
       expect((await terminalRow(journey, terminalId))?.sessionName?.name).not.toBe('LotL')
 
       // The new conversation's first message names it.
+      withholding.release()
       handle = await refreshHandle(harness, handle, 'claude')
       await sendFirstMessage(page, harness, handle, 'claude', 'Billing bug in invoices')
       await expect(paneHeader).toContainText('Billing bug in invoices', { timeout: 90_000 })
+      await expect(tab).toContainText('Billing bug in invoices', { timeout: 30_000 })
       await expect.poll(async () => (await terminalRow(journey, terminalId))?.sessionName?.name, {
         timeout: 30_000,
       }).toBe('Billing bug in invoices')
