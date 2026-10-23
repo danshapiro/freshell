@@ -64,5 +64,11 @@ describe('Claude sidecar with a lost stdout reader', () => {
     ]).finally(() => clearTimeout(timer))
     expect(exit, stderr).toEqual({ code: 0, signal: null })
     expect(fs.readFileSync(record, 'utf8').split('\n'), stderr).toEqual(expect.arrayContaining(['aborted', 'closed']))
+    // The server re-emits this record at its severity (claude_sidecar_io.rs);
+    // it is the one log line that says why the sidecar stopped on its own.
+    const records = stderr.split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line))
+    expect(records.filter((entry) => entry.event === 'stdout.closed'), stderr).toEqual([
+      expect.objectContaining({ severity: 'warn', component: 'claude-sidecar', event: 'stdout.closed', code: 'EPIPE', error: expect.any(String) }),
+    ])
   })
 })

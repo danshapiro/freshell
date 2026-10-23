@@ -1,6 +1,7 @@
 // Contract harness (audit G31): the REAL Claude sidecar (crates/freshell-claude-sidecar/index.mjs)
-// over the pinned SDK 0.3.237 and bundled native CLI 2.1.237, against an isolated local
-// provider endpoint (the real Anthropic API is never contacted). Mid-turn, the sidecar is
+// over the pinned SDK and its bundled native CLI (resolvePinnedClaude), in the shared throwaway
+// fixture (createClaudeFixture), against an isolated local provider endpoint (the real Anthropic
+// API is never contacted). Mid-turn, the sidecar is
 // stopped the way Rust's graceful teardown stops it. The receipt records how long node, the CLI
 // process and the provider request took to go away; the grace period the Rust teardown grants
 // (2 s) depends on all three being fast.
@@ -14,10 +15,10 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import http from 'node:http'
-import { spawn, execFile, execFileSync } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
+import { createClaudeFixture, FAKE_MODEL, resolvePinnedClaude } from './claude-local-provider.mjs'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
@@ -25,25 +26,10 @@ const mode = process.argv[3] ?? 'shutdown'
 if (mode !== 'shutdown' && mode !== 'stdout-closed') throw new Error(`unknown mode ${mode}`)
 
 const sidecarDir = path.join(repoRoot, 'crates/freshell-claude-sidecar')
-const sdkDir = path.join(sidecarDir, 'node_modules/@anthropic-ai/claude-agent-sdk')
-const sdkPackage = JSON.parse(await fs.readFile(path.join(sdkDir, 'package.json'), 'utf8'))
-if (sdkPackage.version !== '0.3.237' || sdkPackage.claudeCodeVersion !== '2.1.237') {
-  throw new Error('the Claude sidecar shutdown contract requires SDK 0.3.237 and CLI 2.1.237')
-}
-const storeRoot = path.join(repoRoot, 'node_modules/.pnpm')
-const optionalStore = (await fs.readdir(storeRoot)).find(name =>
-  name.startsWith('@anthropic-ai+claude-agent-sdk-linux-x64@0.3.237'))
-if (!optionalStore) throw new Error('the pinned Linux x64 Claude CLI package is not installed')
-const bundleDir = path.join(storeRoot, optionalStore, 'node_modules/@anthropic-ai/claude-agent-sdk-linux-x64')
-const nativeCli = await fs.realpath(path.join(bundleDir, 'claude'))
-
-const fixture = await fs.mkdtemp(path.join(repoRoot, '.tmp-claude-sidecar-shutdown-'))
-await fs.chmod(fixture, 0o700)
-const home = path.join(fixture, 'home')
-const cwd = path.join(fixture, 'workspace')
-for (const directory of [home, cwd, path.join(fixture, 'tmp')]) {
-  await fs.mkdir(directory, { recursive: true, mode: 0o700 })
-}
+// Checks the pinned SDK and CLI versions (and runs the CLI once) for this platform.
+const pinned = await resolvePinnedClaude(repoRoot)
+const fixture = await createClaudeFixture({ prefix: 'freshell-claude-sidecar-shutdown-' })
+const { cwd } = fixture
 
 const alive = pid => {
   try { process.kill(pid, 0); return true } catch (error) { return error.code === 'EPERM' }
@@ -71,11 +57,6 @@ let cliExitedAt
 let shutdownSentAt
 
 try {
-  const { stdout: nativeVersion } = await promisify(execFile)(nativeCli, ['--version'], {
-    cwd, env: { HOME: home, PATH: '/usr/bin:/bin' }, timeout: 10_000, maxBuffer: 8192,
-  })
-  if (!/^2\.1\.237(?:\s|$)/.test(nativeVersion.trim())) throw new Error('native CLI did not report version 2.1.237')
-
   failureStage = 'local provider'
   // A turn that stays open until the client goes away: one text delta, then pings (or, in
   // `stdout-closed` mode, a text delta every 25 ms).
@@ -93,7 +74,7 @@ try {
     response.on('close', () => { providerRequestClosedAt ??= Date.now() })
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'request-id': randomUUID() })
     const send = (type, data) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
-    send('message_start', { message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: 'claude-sonnet-4-5-20250929', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })
+    send('message_start', { message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })
     send('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
     send('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'streaming' } })
     streamingStarted()
@@ -114,26 +95,13 @@ try {
   failureStage = 'sidecar start'
   sidecar = spawn(process.execPath, [path.join(sidecarDir, 'index.mjs')], {
     cwd: sidecarDir,
-    env: {
-      HOME: home,
-      PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
-      TMPDIR: path.join(fixture, 'tmp'),
-      XDG_CONFIG_HOME: path.join(home, '.config'),
-      XDG_CACHE_HOME: path.join(home, '.cache'),
-      XDG_DATA_HOME: path.join(home, '.local/share'),
-      CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
-      CLAUDE_CMD: nativeCli,
-      ANTHROPIC_API_KEY: randomUUID(),
+    // The shared fixture's complete environment (a dead proxy for any egress but the
+    // loopback provider), plus the CLI to run and the managed-key flag that lets the
+    // sidecar pass the dummy key on to it.
+    env: fixture.env(`http://127.0.0.1:${server.address().port}`, {
+      CLAUDE_CMD: pinned.nativeCli,
       FRESHELL_CLAUDE_ONECLI_API_KEY: '1',
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`,
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      DISABLE_TELEMETRY: '1',
-      DISABLE_ERROR_REPORTING: '1',
-      DISABLE_AUTOUPDATER: '1',
-      CLAUDE_CODE_DISABLE_METRICS: '1',
-      CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
-      LANG: 'C.UTF-8',
-    },
+    }),
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   sidecar.stderr.on('data', () => {})
@@ -159,7 +127,7 @@ try {
 
   failureStage = 'create'
   const requestId = randomUUID()
-  write({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, cwd, model: 'claude-sonnet-4-5-20250929', permissionMode: 'bypassPermissions' })
+  write({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId, cwd, model: FAKE_MODEL, permissionMode: 'bypassPermissions' })
   const created = await waitFor(frame => frame.requestId === requestId && (frame.type === 'created' || frame.type === 'create.failed'), 30_000, 'created')
   if (created.type !== 'created') throw new Error('the sidecar refused the create')
 
@@ -200,16 +168,16 @@ try {
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))
   }
-  await fs.rm(fixture, { recursive: true, force: true })
+  await fixture.cleanup()
 }
 
 const since = at => (at === undefined || shutdownSentAt === undefined ? null : at - shutdownSentAt)
-const fixtureRemoved = !(await fs.stat(fixture).catch(() => null))
+const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))
 process.stdout.write(`${JSON.stringify({
   verdict,
   mode,
-  sdkVersion: sdkPackage.version,
-  bundledCliVersion: sdkPackage.claudeCodeVersion,
+  sdkVersion: pinned.sdkVersion,
+  bundledCliVersion: pinned.cliVersion,
   sidecarExit,
   sidecarExitMs: since(sidecarExitedAt),
   nativeCliExitMs: since(cliExitedAt),
