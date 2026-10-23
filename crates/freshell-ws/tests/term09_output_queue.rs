@@ -596,8 +596,9 @@ async fn drain_throttled_until_marker(
     // data (possibly straddling a frame boundary), so scanning the whole
     // accumulated text per message would be quadratic — at incident-scale
     // flood sizes that alone throttles the drain and masquerades as server
-    // slowness. The tail spans several marker lengths; a few hundred bytes
-    // bounds the scan at O(1) per message.
+    // slowness. Each scan covers the fresh data plus the previous data's
+    // last `marker.len() - 1` bytes, which is exactly what a straddling
+    // marker needs.
     let mut tail = String::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -635,13 +636,17 @@ async fn drain_throttled_until_marker(
                     Some("terminal.output.gap") => report.gaps.push(value),
                     _ => {}
                 }
-                if tail.len() > 4 * marker.len() {
-                    let keep = tail.len() - 2 * marker.len();
-                    tail.drain(..keep);
-                }
+                // Scan before trimming: the frame that carries the marker
+                // usually carries more output after it (the shell prompt),
+                // and trimming first would cut the marker away.
                 if tail.contains(marker) {
                     break;
                 }
+                let mut carried_from = tail.len().saturating_sub(marker.len() - 1);
+                while !tail.is_char_boundary(carried_from) {
+                    carried_from -= 1;
+                }
+                tail.drain(..carried_from);
             }
             Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
                 report.closed = true;
