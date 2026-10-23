@@ -236,7 +236,7 @@ describe('framesForSdkMessage over the pinned CLI\'s recorded sequences', () => 
 // hook produces (rate_limit_event, informational: the SDK's own typings).
 const RETRY = { type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 10, retry_delay_ms: 563, error_status: 529, error: 'overloaded', session_id: 'c1', uuid: '67c2e12a-e020-406a-b7b8-4d90df03dc10' }
 const rateLimit = (info: Record<string, unknown>) => ({ type: 'rate_limit_event', rate_limit_info: info, session_id: 'c1', uuid: '8a2f7c1e-55a0-4d3b-9f1e-2b6c0d9e4a11' })
-const informational = (level: string, content: string) => ({ type: 'system', subtype: 'informational', content, level, session_id: 'c1', uuid: 'f3b1c2d4-1e2f-4a3b-8c4d-5e6f7a8b9c0d' })
+const informational = (level: string, content: string, extra: Record<string, unknown> = {}) => ({ type: 'system', subtype: 'informational', content, level, session_id: 'c1', uuid: 'f3b1c2d4-1e2f-4a3b-8c4d-5e6f7a8b9c0d', ...extra })
 
 describe('framesForSdkMessage: provider events that never end a turn', () => {
   it('an API retry becomes sdk.retry with its attempt, limit, delay and error', () => {
@@ -266,14 +266,27 @@ describe('framesForSdkMessage: provider events that never end a turn', () => {
     expect(rejected.message).not.toBe(framesForSdkMessage('s1', rateLimit({ status: 'allowed_warning' }), session())[0].message)
   })
 
-  it('an informational message becomes a notice with its text; only a warning is more than info', () => {
+  it('a warning or suggestion the CLI shows prominently becomes a notice with its text', () => {
     expect(framesForSdkMessage('s1', informational('warning', '  A hook blocked this prompt.\n'), session())).toEqual([
       { type: 'sdk.notice', sessionId: 's1', level: 'warning', code: 'INFORMATIONAL', message: 'A hook blocked this prompt.' },
     ])
-    for (const level of ['info', 'notice', 'suggestion', undefined]) {
-      expect(framesForSdkMessage('s1', informational(level as string, 'Plain status'), session())[0]).toMatchObject({ level: 'info', code: 'INFORMATIONAL', message: 'Plain status' })
-    }
+    expect(framesForSdkMessage('s1', informational('suggestion', 'Try /compact'), session())).toEqual([
+      { type: 'sdk.notice', sessionId: 's1', level: 'info', code: 'INFORMATIONAL', message: 'Try /compact' },
+    ])
     expect(framesForSdkMessage('s1', informational('warning', '   '), session())).toEqual([])
+  })
+
+  it('the CLI\'s quiet informational chatter (info, notice, per-tool progress) is no notice', () => {
+    for (const level of ['info', 'notice', undefined]) {
+      expect(framesForSdkMessage('s1', informational(level as string, 'Plain status'), session())).toEqual([])
+    }
+    expect(framesForSdkMessage('s1', informational('info', 'Reading files…', { tool_use_id: 'toolu_1' }), session())).toEqual([])
+  })
+
+  it('a quiet message that stops the turn is still a warning notice', () => {
+    expect(framesForSdkMessage('s1', informational('notice', 'A Stop hook ended the turn.', { prevent_continuation: true }), session())).toEqual([
+      { type: 'sdk.notice', sessionId: 's1', level: 'warning', code: 'INFORMATIONAL', message: 'A Stop hook ended the turn.' },
+    ])
   })
 })
 
@@ -288,7 +301,7 @@ describe('frameLogRecord', () => {
     expect(frameLogRecord(warning)).toEqual({ severity: 'warn', event: 'notice', fields: { sessionId: 's1', code: 'RATE_LIMIT_WARNING', rateLimitStatus: 'allowed_warning', rateLimitType: 'five_hour', resetsAt: 1761300000 } })
     const [rejected] = framesForSdkMessage('s1', rateLimit({ status: 'rejected' }), session())
     expect(frameLogRecord(rejected)).toMatchObject({ severity: 'error', event: 'notice', fields: { code: 'RATE_LIMITED' } })
-    const [info] = framesForSdkMessage('s1', informational('notice', 'text a hook wrote'), session())
+    const [info] = framesForSdkMessage('s1', informational('suggestion', 'text a hook wrote'), session())
     const record = frameLogRecord(info)
     expect(record).toEqual({ severity: 'info', event: 'notice', fields: { sessionId: 's1', code: 'INFORMATIONAL', bytes: 17 } })
     expect(JSON.stringify(record)).not.toContain('hook wrote')

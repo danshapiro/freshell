@@ -51,8 +51,9 @@
 //     { type:'sdk.notice',              sessionId, level:'info'|'warning'|'error', code, message, rateLimit? }
 //                                  — a non-terminal provider notice: RATE_LIMIT_WARNING / RATE_LIMITED
 //                                    (rateLimit {status, resetsAt?, rateLimitType?, utilization?}),
-//                                    INFORMATIONAL (the CLI's own banner text), COMPACTION_FAILED (the
-//                                    CLI's reason); never a turn end
+//                                    INFORMATIONAL (the CLI's own warning or suggestion text, or a message
+//                                    that stops the turn; its quiet info/notice levels are not sent),
+//                                    COMPACTION_FAILED (the CLI's reason); never a turn end
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
 //                                  the stopped turn's own aborted result (an accepted user interrupt's mark

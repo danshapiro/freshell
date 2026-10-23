@@ -81,11 +81,11 @@ export function resultFrames(sessionId, result, { userStopped }) {
 // framesForSdkMessage maps the SDK messages whose content reaches the server:
 // assistant and user messages, stream events, the status frames (compacting,
 // a compaction's outcome, the CLI's permission mode), and the provider events
-// that never end a turn (an API retry becomes `sdk.retry`; a rate limit, an
-// informational message or a failed compaction becomes `sdk.notice`). Every
-// other kind maps to no frame here: `result`, `system/init`,
-// `commands_changed` and the checkpoint replay binding carry side effects, so
-// index.mjs handles them itself.
+// that never end a turn (an API retry becomes `sdk.retry`; a rate limit, a
+// prominent informational message or a failed compaction becomes
+// `sdk.notice`). Every other kind maps to no frame here: `result`,
+// `system/init`, `commands_changed` and the checkpoint replay binding carry
+// side effects, so index.mjs handles them itself.
 //
 // Transcript announcements: the CLI writes each assistant and user message,
 // each compaction boundary and each local command's output to its transcript
@@ -287,14 +287,23 @@ export function rateLimitFrames(sessionId, msg) {
   return [{ type: 'sdk.notice', sessionId, ...notice, rateLimit }]
 }
 
+/** The informational levels the CLI itself shows prominently (SDKInformationalMessage.level). */
+const PROMINENT_INFORMATIONAL_LEVELS = new Set(['warning', 'suggestion'])
+
 /**
  * A banner the CLI shows as plain text (hook feedback, status lines): a
- * notice with its text. Only the CLI's `warning` level is more than info.
+ * notice with its text when the CLI shows it prominently (a warning or a
+ * suggestion) or when it stops the turn. The CLI's own quiet levels stay
+ * quiet: `info` (transcript mode only) and `notice` (inactive gray text,
+ * including its per-tool progress lines) never interrupt the pane.
  */
 export function informationalFrames(sessionId, msg) {
+  const stopsTurn = msg.prevent_continuation === true
+  if (!stopsTurn && !PROMINENT_INFORMATIONAL_LEVELS.has(msg.level)) return []
   const message = typeof msg.content === 'string' ? msg.content.trim() : ''
   if (!message) return []
-  return [{ type: 'sdk.notice', sessionId, level: msg.level === 'warning' ? 'warning' : 'info', code: 'INFORMATIONAL', message }]
+  const level = stopsTurn || msg.level === 'warning' ? 'warning' : 'info'
+  return [{ type: 'sdk.notice', sessionId, level, code: 'INFORMATIONAL', message }]
 }
 
 const NOTICE_SEVERITY = { info: 'info', warning: 'warn', error: 'error' }
