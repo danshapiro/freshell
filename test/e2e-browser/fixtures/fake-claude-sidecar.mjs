@@ -149,8 +149,7 @@ rl.on('line', (line) => {
       model,
     })
     // A turn ends the way the real sidecar ends it: its result, then the
-    // attention edge. No per-turn idle (the real sidecar sends idle only when
-    // its stream ends).
+    // attention edge. No per-turn idle (the real sidecar sends no idle at all).
     emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: { input_tokens: 1, output_tokens: 1 } })
     emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at: Date.now() })
   } else if (msg.type === 'shutdown') {

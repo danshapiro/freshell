@@ -8794,10 +8794,12 @@ impl FreshClaudeState {
                 // outstanding op's own edge. Any `sdk.error` clears the QUEUE
                 // outright (the queued ops provably never arrive) while leaving
                 // the running op / `in_turn` fail-closed untouched.
-                // A turn ends with its `sdk.result` alone: the real sidecar
-                // sends `sdk.status:idle` only when its stream ends, right
-                // before `sdk.stream.ended` and its exit (G23), so an idle is
-                // never a result's trailing punctuation and always folds.
+                // A turn ends with its `sdk.result` alone. The real sidecar
+                // sends no `sdk.status:idle` at all since C09 (its stream's end
+                // is `sdk.stream.ended` and its exit, G23); only the legacy
+                // protocol fakes still send one, until C17/C18 delete this arm.
+                // An idle is never a result's trailing punctuation, so it
+                // always folds.
                 // ep4-r2 F2: the fold NEVER serializes behind rollback's
                 // turn_lock (blocking it let rollback absorb compact debt and
                 // then miss a compaction that started in the sidecar behind
@@ -9007,7 +9009,7 @@ impl FreshClaudeState {
                 // (:445) — so a mid-turn "compacting" can never wedge the tracker
                 // for the rest of the session's life — and the raw sdk.status wire
                 // value folds on top (:351-352 compacting announces truthfully
-                // mid-turn; the stream-end idle is a no-op after the last result).
+                // mid-turn; only the legacy protocol fakes still send an idle).
                 match value.get("type").and_then(Value::as_str) {
                     Some("sdk.assistant") => {
                         *last_status.lock().expect("last status lock") = "running".to_string();
@@ -9278,8 +9280,8 @@ impl FreshClaudeState {
 /// Stream invariants the attribution leans on (provider FIFO discipline): the
 /// sidecar processes its input queue strictly in acceptance order; at most one
 /// op runs at a time; EVERY op ends with exactly one logical terminal edge —
-/// a turn emits `sdk.result` (any subtype) — the sidecar's only idle comes
-/// when its stream ends, right before it exits (G23) — or a completed
+/// a turn emits `sdk.result` (any subtype) — the real sidecar sends no idle
+/// (G23; only the legacy protocol fakes do, until C17/C18) — or a completed
 /// interrupt stands in for the
 /// running op's edge at the write site (no result frame exists, Task 4 edge
 /// (d)); and a compact's terminal edge is ALWAYS preceded by its
@@ -9481,7 +9483,8 @@ fn absorb_unstarted_compact_debt(
 }
 
 /// The in-stream TERMINAL-edge fold (`sdk.result` any subtype; `sdk.status:idle`,
-/// which the sidecar sends only when its stream ends). Attribution
+/// which only the legacy protocol fakes still send: the real sidecar sends none
+/// since C09). Attribution
 /// retires the OLDEST outstanding op:
 ///
 ///   (running) the edge belongs to the op in the `running` slot — the active
@@ -12153,7 +12156,7 @@ rl.on('line', (line) => {
     // receipt is written BEFORE the interrupted turn's terminal `sdk.result`
     // — so the fake mirrors: settle frame first, then (accepted case) the
     // interrupted turn's own result, IN THAT ORDER (no trailing idle: the
-    // real sidecar sends idle only when its stream ends). The
+    // real sidecar sends none). The
     // rollback gate opens at the RESULTS, never at the receipt. A knocked-out
     // settle (probe on an idle sidecar) still stands alone: with no in-flight
     // op the result folds harmlessly on an empty tracker.
@@ -21782,14 +21785,16 @@ rl.on('line', (line) => {
         }
     }
 
-    /// G23: the real sidecar sends `sdk.status:idle` only when its stream ends
-    /// (right before `sdk.stream.ended` and its exit), never as a result's
-    /// trailing punctuation. A stream that ends while a second turn runs, after
-    /// the first turn's result, must release the busy truth: the deleted
-    /// result/idle pair latch skipped exactly this idle and left the session
-    /// busy (`apply_snapshot_metadata` then reported `running`).
+    /// The consumer's `sdk.status:idle` arm, which only the legacy protocol fakes
+    /// still reach (the real sidecar sends no idle since C09; C17/C18 delete the
+    /// arm). An idle after an earlier turn's result is an edge of its own and
+    /// releases the busy truth: the deleted result/idle pair latch skipped
+    /// exactly this idle and left the session busy (`apply_snapshot_metadata`
+    /// then reported `running`). The real sidecar's G23 behavior is pinned on
+    /// RealSidecarSim by `a_natural_end_of_stream_mid_turn_leaves_the_session_not_busy`
+    /// (crates/freshell-ws/tests/freshagent_claude_lifecycle.rs).
     #[tokio::test]
-    async fn a_stream_end_idle_after_an_earlier_result_releases_the_busy_truth() {
+    async fn a_legacy_fake_idle_after_an_earlier_result_releases_the_busy_truth() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
@@ -21805,7 +21810,7 @@ rl.on('line', (line) => {
 
         st.handle_send(send_msg(&sid, "turn two")).await;
         assert!(in_turn_of(&st, &sid).await, "the second turn is running");
-        // The stream ends mid-turn: the sidecar's stream-end idle.
+        // A legacy fake's idle while the second turn runs.
         inject_raw_send(&st, &sid, "__emit_idle__").await;
         await_in_turn(&st, &sid, false).await;
         drop(env);

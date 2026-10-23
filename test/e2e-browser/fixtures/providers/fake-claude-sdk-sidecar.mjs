@@ -39,7 +39,7 @@
 // the turn; when no rule emitted completion/crash — AND no approval/question
 // parked the turn — the canned assistant+result+turn.complete success turn
 // closes it. Like the real sidecar, a turn ends with its result alone: there
-// is no per-turn idle (the real sidecar sends idle only when its stream ends).
+// is no per-turn idle (the real sidecar sends no idle at all).
 // A turn that raised an approval/question PARKS: it stays open
 // until a matching permission.respond/question.respond (or interrupt) arrives,
 // exactly like the real sidecar's parked canUseTool promise.

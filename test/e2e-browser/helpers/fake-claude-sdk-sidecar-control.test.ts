@@ -346,7 +346,7 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       expect(resultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
       expect(denyEdgeIdx, 'the edge follows the errored result in stream order').toBeGreaterThan(resultIdx)
       // Like the real sidecar, the turn ends with its result alone: no idle
-      // follows it (the real sidecar sends idle only when its stream ends).
+      // follows it (the real sidecar sends no idle at all).
       expect(
         out.filter((o, i) => i > resultIdx && o.type === 'sdk.status' && o.sessionId === sessionId && o.status === 'idle'),
         'no per-turn idle after the result',

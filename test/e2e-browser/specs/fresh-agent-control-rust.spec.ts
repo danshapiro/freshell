@@ -751,7 +751,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         wires
           .slice(denyResultIdx)
           .filter((r) => r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId && r.frame?.status === 'idle'),
-        'no per-turn idle follows the result (the real sidecar sends idle only when its stream ends)',
+        'no per-turn idle follows the result (the real sidecar sends no idle at all)',
       ).toEqual([])
       expect(
         wires.some((r) => r.frame?.type === 'sdk.assistant' && r.frame?.sessionId === deniedBridgeId
