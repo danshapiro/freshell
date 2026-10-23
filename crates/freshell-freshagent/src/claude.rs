@@ -5254,7 +5254,12 @@ impl FreshClaudeState {
     /// Unified agent names: the frame carries the durable record's current
     /// projection — the pending→durable transfer commits in
     /// [`Self::adopt_session_init`] BEFORE this publishes the identity.
-    async fn broadcast_materialized(&self, old_id: &str, new_id: &str, session_type: &str) {
+    async fn materialized_message(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        session_type: &str,
+    ) -> ServerMessage {
         let projection = if session_type == "kilroy" {
             None
         } else {
@@ -5292,6 +5297,13 @@ impl FreshClaudeState {
                 );
             }
         }
+        message
+    }
+
+    async fn broadcast_materialized(&self, old_id: &str, new_id: &str, session_type: &str) {
+        let message = self
+            .materialized_message(old_id, new_id, session_type)
+            .await;
         self.broadcast(&message);
     }
 
@@ -5309,263 +5321,6 @@ impl FreshClaudeState {
             .await
             .contains_key(&mapped)
             .then_some(mapped)
-    }
-
-    // ── freshAgent.attach (restart parity: resume untracked sessions in place) ──────────
-
-    /// Handle a `freshAgent.attach` for claude/kilroy. Decision table (restart parity):
-    ///
-    /// | State | Action |
-    /// |---|---|
-    /// | tracked under `msg.session_id` | no-op -- NO frame (wire-shape parity, unchanged). Safe against dead sidecars ONLY because the consumer-exit eviction removes dead entries (ledger A9) |
-    /// | untracked, no canonical durable id on the message | `lost_session_frame` (`INVALID_SESSION_ID`) -- unchanged fallback (also covers the verified A2 edge: a pane that never learned its UUID pre-kill attaches bare; lost -> client re-create is the designed, non-destructive outcome) |
-    /// | untracked, durable id already in `cli_index`, aliased session LIVE | REBIND + ACK (Task 10b): flip the live session's envelope stamp to the durable id and answer with the `freshAgent.session.snapshot` stamped with the durable and the session's TRACKED status (the consumer's turn-lifecycle + sdk.status fold, never a hardcoded idle) -- the attaching client must observe success, never silence. The map is never re-keyed (alias, don't move) |
-    /// | untracked, durable id in `cli_index` but aliased session GONE (stale row, eviction in flight) | fall through to the resume path below (the session is dead; resuming converges the client) |
-    /// | untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit a `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID -- NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) -- carrying the session's tracked status ("idle" for a fresh resume, by construction) |
-    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable), binding row records a genesis (core design §4.2/§4.3: a zero-turn session, a pending fork) | boot it from the genesis under the durable id (`Fresh`, or the lazy fork of its parent), register and acknowledge exactly like the resume row above |
-    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable), no genesis | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
-    /// | untracked, store UNREADABLE (no store root, or an IO error other than NotFound/NotADirectory while scanning) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- cannot check, so NEVER the lost frame (G28) |
-    /// | untracked, spawn/pipe/created failure | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
-    pub async fn handle_attach(&self, msg: FreshAgentAttach) {
-        // b8ke delta review F7: a half-sent observed pair (exactly one of
-        // epoch/generation) is the typed invalid-fence refusal — before any
-        // state interaction. The attach never proceeds as a silently
-        // downgraded legacy request.
-        let attach_fence =
-            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
-                Ok(fence) => fence,
-                Err(err) => {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %msg.session_id, code = err.code(),
-                    "fresh_agent_attach_refused: the observed fence is half-sent (invalid)");
-                    self.emit_fresh_agent_error(
-                        &msg.session_id,
-                        session_type_str(msg.session_type),
-                        err.code(),
-                        err.message(),
-                    );
-                    return;
-                }
-            };
-        // b8ke delta round-3 F2: BOTH existing-session early exits consult
-        // the coordinator — a delayed attach during a Handoff (the map
-        // entry exists until the stop lands) must be BLOCKED or typed,
-        // never a silent parity no-op or rebind against a runtime the
-        // handoff owns.
-        let coordinator_in_flight = |state: &freshell_ownership::OwnershipState| {
-            matches!(
-                state,
-                freshell_ownership::OwnershipState::Handoff { .. }
-                    | freshell_ownership::OwnershipState::Starting { .. }
-                    | freshell_ownership::OwnershipState::Stopping { .. }
-                    | freshell_ownership::OwnershipState::Fenced { .. }
-            )
-        };
-        if self.sessions.lock().await.contains_key(&msg.session_id) {
-            // The gate observes the session's CANONICAL durable id (the
-            // registry keys the coordinator record there — the map key is
-            // the lane's own).
-            let durable = {
-                let sessions = self.sessions.lock().await;
-                sessions
-                    .get(&msg.session_id)
-                    .and_then(|s| s.cli_session_id.clone())
-            };
-            let observed_id = durable.as_deref().unwrap_or(&msg.session_id);
-            let snap = self.ownership_snapshot(PROVIDER, observed_id);
-            if coordinator_in_flight(&snap.state) {
-                tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %msg.session_id, state = ?snap.state,
-                    "fresh_agent_attach_refused: a lifecycle transition owns this \
-                     session — the tracked-and-alive fast path is blocked (typed)");
-                self.emit_fresh_agent_error(
-                    &msg.session_id,
-                    session_type_str(msg.session_type),
-                    "SESSION_RESERVED",
-                    "A lifecycle operation owns this session; retry after it settles",
-                );
-                return;
-            }
-            return; // tracked-and-alive: no frame (wire-shape parity with codex)
-        }
-        let Some(durable) = attach_durable_id(&msg) else {
-            // No durable identity to resume from: the pre-parity fallback (PR #529).
-            self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
-            return;
-        };
-        // A lifecycle transition blocks either a live rebind or a cold
-        // resume. The coordinator is the authority for both paths.
-        let rebind_key = self.resolve_ownership_key(&durable);
-        let rebind_snap = self.ownership_snapshot(PROVIDER, &rebind_key);
-        if coordinator_in_flight(&rebind_snap.state) {
-            tracing::warn!(target: "freshell_freshagent::claude",
-                session_id = %durable, state = ?rebind_snap.state,
-                "fresh_agent_attach_refused: a lifecycle transition owns this \
-                 session — the rebind fast path is blocked (typed)");
-            self.emit_fresh_agent_error(
-                &msg.session_id,
-                session_type_str(msg.session_type),
-                "SESSION_RESERVED",
-                "A lifecycle operation owns this session; retry after it settles",
-            );
-            return;
-        }
-        // A fresh server has no live alias or coordinator record to guard.
-        // Only the observer rebind needs an attach guard; a cold resume claims
-        // the vacant key through begin_lane_claim_at below. Check both maps:
-        // a stale cli_index row whose session was evicted is cold too.
-        let mapped = { self.cli_index.lock().await.get(&durable).cloned() };
-        let live_rebind_candidate = match mapped {
-            Some(map_key) => self.sessions.lock().await.contains_key(&map_key),
-            None => false,
-        };
-        if live_rebind_candidate {
-            // b8ke ext r12 F2: the rebind's REAL claim — the guard arms under
-            // the coordinator lock and is held ACROSS the rebind, so the
-            // coordinator covers the attach through completion: a handoff or
-            // stop beginning inside the window answers the typed Blocked
-            // outcome and can never commit around the rebind (pre-r12 the
-            // point-in-time snapshot closed no window).
-            // b8ke ext r38 F1: `try_rebind_to_live` is an OBSERVER bind (the
-            // broadcast alias flip + the status ack; it never spawns or
-            // restarts — the fall-through RESUME claims independently through
-            // `begin_lane_claim_at` with the attach's observed fence, the
-            // Task-3 round-2 discipline). So the rebind ADOPTS SPECIFICALLY
-            // when the request carries a pair (a superseded-session bind —
-            // ownership advanced or a foreign owner — refuses typed, the
-            // laundering class closed), and keeps the pre-r38 owner-agnostic
-            // window when the pair is ABSENT (the observer boundary: a pane
-            // bind misdirected by a mid-window handoff self-heals through
-            // the dead-session/reconcile flow; no writer hazard).
-            let expected_fresh_owner = freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: None,
-                pid: None,
-                ownership_id: None,
-            };
-            let rebind_guard = match attach_fence {
-                Some(adopt_fence) => {
-                    match crate::ownership_lane::arm_adopt_guard(
-                        &self.ownership,
-                        PROVIDER,
-                        &rebind_key,
-                        &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
-                        &expected_fresh_owner,
-                        adopt_fence,
-                        "freshclaude/attach-rebind",
-                    ) {
-                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
-                        crate::ownership_lane::LaneAttachGuard::Unwired => None,
-                        crate::ownership_lane::LaneAttachGuard::Refused => {
-                            self.emit_fresh_agent_error(
-                                &msg.session_id,
-                                session_type_str(msg.session_type),
-                                "SESSION_RESERVED",
-                                "A lifecycle operation owns this session; retry after it settles",
-                            );
-                            return;
-                        }
-                    }
-                }
-                None => match crate::ownership_lane::arm_attach_guard(
-                    &self.ownership,
-                    PROVIDER,
-                    &rebind_key,
-                    &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
-                    None,
-                    "freshclaude/attach-rebind",
-                ) {
-                    crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
-                    crate::ownership_lane::LaneAttachGuard::Unwired => None,
-                    crate::ownership_lane::LaneAttachGuard::Refused => {
-                        self.emit_fresh_agent_error(
-                            &msg.session_id,
-                            session_type_str(msg.session_type),
-                            "SESSION_RESERVED",
-                            "A lifecycle operation owns this session; retry after it settles",
-                        );
-                        return;
-                    }
-                },
-            };
-            let rebound = self
-                .try_rebind_to_live(&durable, session_type_str(msg.session_type))
-                .await;
-            drop(rebind_guard);
-            if rebound {
-                // Task 10b: a live alias answers with a rebind ACK. If its
-                // session dies inside the guarded window, the failed rebind
-                // falls through to the cold claim below.
-                return;
-            }
-        }
-        let Some(_flight) = self.try_resume_flight(&durable) else {
-            return;
-        };
-        match self
-            .resume_untracked(&msg, &durable, attach_fence, true)
-            .await
-        {
-            Ok(()) => {}
-            Err(recovery::RuntimeResumeError::Lost | recovery::RuntimeResumeError::Closed) => {
-                self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
-            }
-            Err(recovery::RuntimeResumeError::Unavailable { code, message, .. }) => {
-                if code == "SESSION_RESERVED" {
-                    self.emit_fresh_agent_error(
-                        &msg.session_id,
-                        session_type_str(msg.session_type),
-                        code,
-                        &message,
-                    );
-                } else {
-                    self.send_error(&None, code, &message);
-                }
-            }
-        }
-    }
-
-    /// Task 10b's REBIND + ACK: if `durable` is in `cli_index` and its aliased session
-    /// is LIVE, flip the session's envelope stamp to the durable id and broadcast the
-    /// snapshot ack (stamped with the durable) announcing the session's REAL tracked
-    /// status — never a hardcoded "idle" (which flipped panes idle mid-turn and left
-    /// dead-window completions stale-busy forever). Returns `false` when the index has
-    /// no row or the row is stale (aliased session gone). The sessions map is never
-    /// re-keyed (alias, don't move -- in-flight consumers hold the placeholder key;
-    /// sends and kills resolve through `cli_index`).
-    async fn try_rebind_to_live(&self, durable: &str, session_type: &str) -> bool {
-        let Some(map_key) = self.cli_index.lock().await.get(durable).cloned() else {
-            return false;
-        };
-        let rebound_status = {
-            let guard = self.sessions.lock().await;
-            match guard.get(&map_key) {
-                Some(session) => {
-                    // Alias, don't move: flip only the envelope stamp. The status the
-                    // ack speaks is the consumer's tracked-status fold — truth at
-                    // ack time (a completed turn settles it; a live compaction or
-                    // in-flight turn announces truthfully).
-                    let previous = std::mem::replace(
-                        &mut *session.broadcast_id.lock().expect("broadcast id lock"),
-                        durable.to_string(),
-                    );
-                    self.edges.rekeyed(&previous, durable);
-                    Some(session.current_status())
-                }
-                None => None,
-            }
-        };
-        let Some(status) = rebound_status else {
-            return false;
-        };
-        self.broadcast(&status_snapshot_frame(
-            durable,
-            durable,
-            &status,
-            session_type,
-        ));
-        true
     }
 
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
@@ -5737,27 +5492,6 @@ impl FreshClaudeState {
         )
         .await
         .map_err(|error| ResumeClaudeError::Transient(error.resume_detail()))?;
-        let session_type = session_type.to_string();
-
-        // Read the tracked status through the same `current_status()` helper the
-        // rebind arm uses (the session was registered above; the lease-revocation
-        // teardown already returned). Identical to the hardcoded "idle" it replaces
-        // for a fresh resume — truthful by construction. The None fallback covers a
-        // sidecar that died before this read (already EOF-evicted by its consumer):
-        // nothing was ever announced, so "idle" stays the truthful default.
-        let last_announced = self
-            .sessions
-            .lock()
-            .await
-            .get(&msg.session_id)
-            .map(ClaudeSession::current_status)
-            .unwrap_or_else(|| "idle".to_string());
-        self.broadcast(&status_snapshot_frame(
-            &msg.session_id,
-            durable,
-            &last_announced,
-            &session_type,
-        ));
         Ok(())
     }
 
@@ -7476,8 +7210,10 @@ fn attach_durable_id(msg: &FreshAgentAttach) -> Option<String> {
     let candidate = msg
         .session_ref
         .as_ref()
+        .filter(|reference| reference.provider == PROVIDER)
         .map(|r| r.session_id.clone())
-        .or_else(|| msg.resume_session_id.clone())?;
+        .or_else(|| msg.resume_session_id.clone())
+        .or_else(|| is_canonical_claude_uuid(&msg.session_id).then(|| msg.session_id.clone()))?;
     is_canonical_claude_uuid(&candidate).then_some(candidate)
 }
 
@@ -8224,6 +7960,7 @@ pub use create_outcome::ClaudeCreateOutcome;
 mod send_outcome;
 pub use send_outcome::ClaudeSendOutcome;
 
+mod attach;
 mod establish;
 mod fork;
 mod genesis;
@@ -8502,7 +8239,7 @@ pub(crate) mod tests {
     async fn handle_attach_untracked_session_emits_lost_session_frame() {
         let (st, mut rx) = state_with_bus();
 
-        st.handle_attach(attach_msg("does-not-exist")).await;
+        st.attach_for_test(attach_msg("does-not-exist")).await;
 
         let raw = rx.try_recv().expect("a lost-session frame was broadcast");
         let frame: Value = serde_json::from_str(&raw).unwrap();
@@ -8527,7 +8264,7 @@ pub(crate) mod tests {
             msg.observed_epoch = epoch;
             msg.observed_generation = generation;
 
-            st.handle_attach(msg).await;
+            st.attach_for_test(msg).await;
 
             let raw = rx.try_recv().expect("the typed refusal frame");
             let frame: Value = serde_json::from_str(&raw).unwrap();
@@ -8557,7 +8294,7 @@ pub(crate) mod tests {
         let mut msg = attach_msg("kilroy-gone");
         msg.session_type = SessionType::Kilroy;
 
-        st.handle_attach(msg).await;
+        st.attach_for_test(msg).await;
 
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["sessionType"], "kilroy");
@@ -8565,22 +8302,20 @@ pub(crate) mod tests {
         assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
     }
 
-    /// Wire-shape parity with codex's tracked-and-alive row (codex.rs decision table /
-    /// `handle_attach_known_alive_session_emits_no_frame_regardless_of_turn_state`):
-    /// attaching to a session this process DOES track must broadcast nothing -- above all
-    /// it must never declare a live session lost (which would make the client kill and
-    /// re-create a healthy pane).
+    /// A page observing a live UUID receives its current status without
+    /// creating or replacing a runtime.
     #[tokio::test]
-    async fn handle_attach_tracked_session_broadcasts_nothing() {
+    async fn handle_attach_tracked_session_acknowledges_its_status() {
         let (st, mut rx) = state_with_bus();
-        insert_fake_claude_session(&st, "still-alive").await;
+        let id = uuid::Uuid::new_v4().to_string();
+        insert_fake_claude_session(&st, &id).await;
 
-        st.handle_attach(attach_msg("still-alive")).await;
+        st.attach_for_test(attach_msg(&id)).await;
 
-        assert!(
-            rx.try_recv().is_err(),
-            "tracked attach must not broadcast any frame (wire-shape parity)"
-        );
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["sessionId"], id);
+        assert_eq!(frame["event"]["status"], "idle");
+        assert_eq!(st.sessions.lock().await.len(), 1);
     }
 
     // ── freshAgent.attach: resume-on-attach (restart parity, Task 6) ──────────────
@@ -8726,15 +8461,15 @@ pub(crate) mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
 
         let (st, mut rx) = state_with_bus();
-        st.handle_attach(attach_msg_with_resume("client-nanoid-1", durable))
+        st.attach_for_test(attach_msg_with_resume("client-nanoid-1", durable))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
-        // Registered under the CLIENT's id (envelope tagging + send routing depend on it).
-        assert!(st.sessions.lock().await.contains_key("client-nanoid-1"));
+        // A legacy pane now observes the canonical runtime.
+        assert!(st.sessions.lock().await.contains_key(durable));
         assert_eq!(
             st.cli_index.lock().await.get(durable),
-            Some(&"client-nanoid-1".to_string())
+            Some(&durable.to_string())
         );
         // The fake received the resume boot (spawn log now records the create request).
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
@@ -8744,7 +8479,7 @@ pub(crate) mod tests {
         );
         // Idle snapshot frame, tagged with the client's id + the durable timeline id.
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
-        assert_eq!(frame["sessionId"], "client-nanoid-1");
+        assert_eq!(frame["sessionId"], durable);
         assert_eq!(frame["event"]["status"], "idle");
         assert_eq!(frame["event"]["timelineSessionId"], durable);
         drop(env);
@@ -8757,7 +8492,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(home.path().join("projects")).unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         let (st, mut rx) = state_with_bus();
-        st.handle_attach(attach_msg_with_resume(
+        st.attach_for_test(attach_msg_with_resume(
             "client-nanoid-2",
             "88888888-8888-4888-8888-888888888888",
         ))
@@ -8776,14 +8511,13 @@ pub(crate) mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         std::env::set_var("FRESHELL_CLAUDE_NODE", "/nonexistent-node-binary");
         let (st, mut rx) = state_with_bus();
-        st.handle_attach(attach_msg_with_resume("client-nanoid-3", durable))
+        st.attach_for_test(attach_msg_with_resume("client-nanoid-3", durable))
             .await;
         std::env::remove_var("FRESHELL_CLAUDE_NODE");
         std::env::remove_var("CLAUDE_CONFIG_DIR");
-        // Mirrors codex: transient => top-level error with the provider code,
-        // explicitly NOT INVALID_SESSION_ID.
-        let err = await_top_level_error(&mut rx).await;
-        assert!(err.contains("CLAUDE_ATTACH_RESUME_FAILED"));
+        let err = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(err["event"]["code"], "CLAUDE_ATTACH_RESUME_FAILED");
+        assert_eq!(err["sessionId"], "client-nanoid-3");
         assert!(st.sessions.lock().await.is_empty());
     }
 
@@ -8791,7 +8525,7 @@ pub(crate) mod tests {
     async fn attach_untracked_without_any_durable_id_still_emits_lost_frame() {
         // The pre-parity fallback (PR #529) is preserved verbatim.
         let (st, mut rx) = state_with_bus();
-        st.handle_attach(attach_msg("no-resume-anywhere")).await;
+        st.attach_for_test(attach_msg("no-resume-anywhere")).await;
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
         assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
     }
@@ -8809,41 +8543,33 @@ pub(crate) mod tests {
         let b = st.clone();
         let m1 = attach_msg_with_resume("nano-a", durable);
         let m2 = attach_msg_with_resume("nano-b", durable);
-        tokio::join!(a.handle_attach(m1), b.handle_attach(m2));
+        tokio::join!(a.attach_for_test(m1), b.attach_for_test(m2));
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(env.spawn_count(), 1, "single-flight per durable id");
         drop(env);
     }
 
-    /// Decision-table row 3 (Task 10b pins the NEW contract): a durable id already in
-    /// `cli_index` whose aliased session is LIVE is REBOUND -- the envelope stamp flips
-    /// to the durable id and the idle snapshot ack (stamped with the durable) answers
-    /// the attach. The sessions map is never re-keyed (alias, don't move).
+    /// A legacy page observes the same canonical runtime and receives its
+    /// correction before its status acknowledgement.
     #[tokio::test]
-    async fn attach_with_durable_id_already_indexed_rebinds_and_acks() {
+    async fn attach_to_a_live_uuid_keeps_its_envelope_and_acknowledges_the_legacy_page() {
         let (st, mut rx) = state_with_bus();
         let durable = "56565656-5656-4656-8656-565656565656";
-        insert_fake_claude_session(&st, "earlier-winner").await;
-        st.cli_index
-            .lock()
-            .await
-            .insert(durable.to_string(), "earlier-winner".to_string());
-        st.handle_attach(attach_msg_with_resume("late-attacher", durable))
+        insert_fake_claude_session(&st, durable).await;
+        st.attach_for_test(attach_msg_with_resume("late-attacher", durable))
             .await;
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
         assert_eq!(frame["sessionId"], durable);
         assert_eq!(frame["event"]["status"], "idle");
         assert_eq!(frame["event"]["timelineSessionId"], durable);
-        // Alias, don't move: the map still holds the placeholder key...
         let sessions = st.sessions.lock().await;
         let session = sessions
-            .get("earlier-winner")
-            .expect("map key never re-keyed");
-        // ...and the live record's envelope stamp now reads the durable id.
+            .get(durable)
+            .expect("the canonical runtime stays registered");
         assert_eq!(
             session.broadcast_id.lock().unwrap().as_str(),
             durable,
-            "rebind must flip the envelope stamp to the durable id"
+            "attaching a page preserves the runtime's canonical envelope"
         );
     }
 
@@ -8885,7 +8611,7 @@ pub(crate) mod tests {
         await_status_on_wire(&mut rx, "compacting").await;
 
         // The reconnect rescue: attach addressing the durable id → the REBIND arm.
-        st.handle_attach(attach_msg_with_resume("late-attacher", durable))
+        st.attach_for_test(attach_msg_with_resume("late-attacher", durable))
             .await;
 
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -8940,7 +8666,7 @@ pub(crate) mod tests {
 
         // The reconnect rescue AFTER the turn settled: the ack must speak "idle",
         // never the pre-completion "compacting".
-        st.handle_attach(attach_msg_with_resume("late-attacher-settled", durable))
+        st.attach_for_test(attach_msg_with_resume("late-attacher-settled", durable))
             .await;
 
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -8985,7 +8711,7 @@ pub(crate) mod tests {
         let _ = await_frame_of_inner_type(&mut rx, "freshAgent.assistant").await;
 
         // The reconnect rescue mid-turn: the ack must speak "running".
-        st.handle_attach(attach_msg_with_resume("late-attacher-midturn", durable))
+        st.attach_for_test(attach_msg_with_resume("late-attacher-midturn", durable))
             .await;
 
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -9012,12 +8738,12 @@ pub(crate) mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
 
         let (st, mut rx) = state_with_bus();
-        st.handle_attach(attach_msg_with_resume("client-fresh-resume", durable))
+        st.attach_for_test(attach_msg_with_resume("client-fresh-resume", durable))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
-        assert_eq!(frame["sessionId"], "client-fresh-resume");
+        assert_eq!(frame["sessionId"], durable);
         assert_eq!(
             frame["event"]["status"], "idle",
             "a freshly resumed session's ack must announce idle (the tracked default): {frame}"
@@ -9045,7 +8771,7 @@ pub(crate) mod tests {
         .unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         let (st, mut rx) = state_with_bus();
-        st.handle_attach(attach_msg_with_resume("client-nanoid-4", durable))
+        st.attach_for_test(attach_msg_with_resume("client-nanoid-4", durable))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
@@ -12202,7 +11928,7 @@ rl.on('line', (line) => {
 
         // A delayed ATTACH: the tracked-and-alive fast path is BLOCKED
         // with the typed error (pre-d3: the silent parity return).
-        st.handle_attach(freshell_protocol::FreshAgentAttach {
+        st.attach_for_test(freshell_protocol::FreshAgentAttach {
             tab_id: None,
             pane_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -13014,8 +12740,6 @@ rl.on('line', (line) => {
     }
 
     // ── b8ke focused episode-2 round-1: the adoption's atomicity tests ─────
-
-    /// The fake sidecar's durable id for a create with NO resume boot.
 
     /// A minimal thread-local tracing capture (the session_handoff
     /// tracing_capture pattern, trimmed to the events the e2r1 tests need).
@@ -15761,7 +15485,7 @@ rl.on('line', (line) => {
         // The attach (conn-less): resume succeeds; the row must be Bound
         // again even though no settings-bearing adoption write ever runs.
         state
-            .handle_attach(attach_msg_with_resume("client-lineage-attach", DURABLE))
+            .attach_for_test(attach_msg_with_resume("client-lineage-attach", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
@@ -15827,7 +15551,7 @@ rl.on('line', (line) => {
         // resume parks inside its provider await.
         let st2 = state.clone();
         let attach = tokio::spawn(async move {
-            st2.handle_attach(attach_msg_with_resume("client-kill-mid-resume", DURABLE))
+            st2.attach_for_test(attach_msg_with_resume("client-kill-mid-resume", DURABLE))
                 .await;
         });
         // Determinism: wait until the resume's create request has REACHED the
@@ -15887,11 +15611,8 @@ rl.on('line', (line) => {
             "the newer kill's fence stands — never cleared by the stale claim"
         );
         assert!(
-            fake.claim_refusals
-                .lock()
-                .unwrap()
-                .contains(&("claude".to_string(), DURABLE.to_string())),
-            "the refusal is positively logged"
+            fake.claim_commits.lock().unwrap().is_empty(),
+            "the closed pane never commits a launch claim"
         );
         assert!(
             !fake
@@ -16256,7 +15977,7 @@ rl.on('line', (line) => {
         let stall = fake.arm_post_commit_stall("claude", DURABLE);
         let st2 = state.clone();
         let attach = tokio::spawn(async move {
-            st2.handle_attach(attach_msg_with_resume("client-killed-post-commit", DURABLE))
+            st2.attach_for_test(attach_msg_with_resume("client-killed-post-commit", DURABLE))
                 .await;
         });
         stall
@@ -16844,13 +16565,13 @@ rl.on('line', (line) => {
 
         // The reconnect's late attach RIDES the fenced seat to the durable.
         state
-            .handle_attach(attach_msg_with_resume("seat-closed", DURABLE))
+            .attach_for_test(attach_msg_with_resume("seat-closed", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         let mut saw_resume_failed = false;
         while let Ok(raw) = rx.try_recv() {
-            if raw.contains("CLAUDE_ATTACH_RESUME_FAILED") {
+            if raw.contains("SESSION_CLOSED") {
                 saw_resume_failed = true;
             }
         }
@@ -16864,11 +16585,8 @@ rl.on('line', (line) => {
             "no registration alias survives"
         );
         assert!(
-            fake.claim_refusals
-                .lock()
-                .unwrap()
-                .contains(&("claude".to_string(), DURABLE.to_string())),
-            "the refusal is positively logged"
+            fake.claim_commits.lock().unwrap().is_empty(),
+            "the closed pane never commits a launch claim"
         );
         assert!(
             fake.kill_tombstone_at_ms("claude", DURABLE).is_none(),
@@ -16961,13 +16679,13 @@ rl.on('line', (line) => {
 
         // The NEW pane (a fresh seat) genuinely reopens the session.
         state
-            .handle_attach(attach_msg_with_resume("seat-new", DURABLE))
+            .attach_for_test(attach_msg_with_resume("seat-new", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         assert!(
-            state.sessions.lock().await.contains_key("seat-new"),
-            "the clean-seat attach registers"
+            state.sessions.lock().await.contains_key(DURABLE),
+            "the clean-seat attach registers under the durable id"
         );
         assert!(
             fake.kill_tombstone_at_ms("claude", DURABLE).is_none(),
@@ -16984,9 +16702,8 @@ rl.on('line', (line) => {
         );
         assert!(
             fake.alias_tombstone_records("claude", "seat-new")
-                .iter()
-                .any(|(d, _)| d == DURABLE),
-            "the attach registration persisted its alias record"
+                .is_empty(),
+            "the canonical runtime needs no new placeholder alias record"
         );
         assert!(
             fake.alias_tombstone_records("claude", "seat-old")
@@ -17029,7 +16746,7 @@ rl.on('line', (line) => {
         // The commit's io failure knob (Finding 5's shape).
         fake.set_fail_writes(true);
         state
-            .handle_attach(attach_msg_with_resume("client-commit-error", DURABLE))
+            .attach_for_test(attach_msg_with_resume("client-commit-error", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
@@ -18440,7 +18157,7 @@ rl.on('line', (line) => {
         let fresh_create_durable_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         assert_eq!(created["type"], "freshAgent.created", "{created}");
 
-        prepare_legacy_init(&st, &created["sessionId"].as_str().unwrap()).await;
+        prepare_legacy_init(&st, created["sessionId"].as_str().unwrap()).await;
         while rx.try_recv().is_ok() {}
         fake.set_fail_writes(true);
         st.adopt_session_init(
@@ -18576,7 +18293,7 @@ rl.on('line', (line) => {
 
         // Drive the donor resume flow (attach to DURABLE with a transcript on disk).
         state
-            .handle_attach(attach_msg_with_resume("client-nanoid-settings", DURABLE))
+            .attach_for_test(attach_msg_with_resume("client-nanoid-settings", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
@@ -18607,19 +18324,19 @@ rl.on('line', (line) => {
         let (state, _rx) = state_with_bus();
         let mut msg = attach_msg_with_resume("client-nanoid-logs", DURABLE);
         msg.session_type = SessionType::Kilroy;
-        state.handle_attach(msg).await;
+        state.attach_for_test(msg).await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         let ownership_id = state
             .sessions
             .lock()
             .await
-            .get("client-nanoid-logs")
+            .get(DURABLE)
             .map(|session| session.ownership_id.clone())
-            .expect("the attach resumed a session under the client's id");
+            .expect("the attach resumed the canonical session");
         let bound = with_message(&events, "freshagent.claude.sidecar_bound");
         assert_eq!(bound.len(), 1, "{bound:?}");
-        assert_eq!(bound[0].field("session_id"), Some("client-nanoid-logs"));
+        assert_eq!(bound[0].field("session_id"), Some(DURABLE));
         assert_eq!(bound[0].field("session_type"), Some("kilroy"));
         assert_eq!(bound[0].field("ownership_id"), Some(ownership_id.as_str()));
         drop(env);
@@ -18653,7 +18370,7 @@ rl.on('line', (line) => {
         state.set_identity_sink(settings);
 
         state
-            .handle_attach(attach_msg_with_resume("client-after-restart", DURABLE))
+            .attach_for_test(attach_msg_with_resume("client-after-restart", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
@@ -18672,7 +18389,7 @@ rl.on('line', (line) => {
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
-        assert_eq!(frame["sessionId"], "client-after-restart");
+        assert_eq!(frame["sessionId"], DURABLE);
         assert!(matches!(
             ownership.observe("claude", DURABLE).state,
             freshell_ownership::OwnershipState::Live { .. }
@@ -18709,7 +18426,7 @@ rl.on('line', (line) => {
         ));
 
         state
-            .handle_attach(attach_msg_with_resume(
+            .attach_for_test(attach_msg_with_resume(
                 "client-nanoid-empty-resume",
                 DURABLE,
             ))
@@ -18756,7 +18473,7 @@ rl.on('line', (line) => {
         state.set_identity_sink(fake.clone());
 
         state
-            .handle_attach(attach_msg_with_resume("client-nanoid-norec", DURABLE))
+            .attach_for_test(attach_msg_with_resume("client-nanoid-norec", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
@@ -18826,7 +18543,7 @@ rl.on('line', (line) => {
         state.set_identity_sink(fake);
 
         state
-            .handle_attach(attach_msg_with_resume("client-nanoid-alarm", DURABLE))
+            .attach_for_test(attach_msg_with_resume("client-nanoid-alarm", DURABLE))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
@@ -19154,7 +18871,7 @@ rl.on('line', (line) => {
         let home = tempfile::tempdir().unwrap();
         write_fake_transcript(home.path(), durable);
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
-        st.handle_attach(attach_msg_with_resume("pane-after-reload", durable))
+        st.attach_for_test(attach_msg_with_resume("pane-after-reload", durable))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert!(st.has_live_session(durable).await, "the attach resumed it");
@@ -19201,7 +18918,7 @@ rl.on('line', (line) => {
         let home = tempfile::tempdir().unwrap();
         write_fake_transcript(home.path(), durable);
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
-        st.handle_attach(attach_msg_with_resume("pane-after-reload", durable))
+        st.attach_for_test(attach_msg_with_resume("pane-after-reload", durable))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert!(st.has_live_session(durable).await, "the attach resumed it");
@@ -19231,12 +18948,12 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let _env = FakeClaudeSidecarEnv::install();
         // The fake sidecar's session reports this durable id.
-        const DURABLE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let (st, mut rx) = state_with_bus();
         st.handle_create(dedup_create_msg("req-reap-resume"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-reap-resume").await;
         let pane_id = created["sessionId"].as_str().unwrap().to_string();
+        let durable = pane_id.as_str();
         // The fake never answers a plain send: the turn stays in flight.
         st.handle_send(send_msg(&pane_id, "a turn the sidecar dies in"))
             .await;
@@ -19256,12 +18973,12 @@ rl.on('line', (line) => {
             .expect("the end-of-output path reached the exit report");
 
         let home = tempfile::tempdir().unwrap();
-        write_fake_transcript(home.path(), DURABLE);
+        write_fake_transcript(home.path(), durable);
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
-        st.handle_attach(attach_msg_with_resume(&pane_id, DURABLE))
+        st.attach_for_test(attach_msg_with_resume(&pane_id, durable))
             .await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
-        assert!(st.has_live_session(DURABLE).await, "the attach resumed it");
+        assert!(st.has_live_session(durable).await, "the attach resumed it");
         while rx.try_recv().is_ok() {}
 
         hold.release();
