@@ -4799,7 +4799,9 @@ export function FreshAgentView({
                     showTimecodes={effectiveShowTimecodes}
                     showTranscriptMinimap={showTranscriptMinimap}
                     isStreaming={isBusy && !liveTailActive}
-                    tail={liveSessionKey ? (
+                    // A background pane keeps its tail in the store but renders
+                    // none of it: no markdown re-parse per token while unseen.
+                    tail={liveSessionKey && !hidden ? (
                       <FreshAgentLiveTail
                         sessionKey={liveSessionKey}
                         landed={landedTranscript}

@@ -87,13 +87,13 @@ function assistantTool(id: string, name: string): Turn {
   }
 }
 
-function claudeSnapshot(turns: Turn[], lineUuids: string[] = turns.map((turn) => turn.turnId)) {
+function claudeSnapshot(turns: Turn[], lineUuids: string[] = turns.map((turn) => turn.turnId), revision = 1) {
   return {
     sessionType: 'freshclaude',
     provider: 'claude',
     threadId: SESSION_ID,
     sessionId: SESSION_ID,
-    revision: 1,
+    revision,
     latestTurnId: turns.at(-1)?.turnId ?? null,
     status: 'idle',
     summary: '',
@@ -136,13 +136,13 @@ function createStore() {
 
 type Store = ReturnType<typeof createStore>
 
-function StoreBackedView() {
+function StoreBackedView({ hidden = false }: { hidden?: boolean }) {
   const content = useAppSelector((state) => {
     const layout = state.panes.layouts['tab-1']
     if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('missing pane')
     return layout.content
   })
-  return <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+  return <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} hidden={hidden} />
 }
 
 /** What App and the mounted view both receive for one server frame. */
@@ -310,6 +310,29 @@ describe('FreshAgentView live transcript (transcript-live D5)', () => {
     await settleRefetches(2)
     expect(screen.queryByRole('article', { name: /live response/ })).not.toBeInTheDocument()
     expect(screen.getAllByText('Slow to land')).toHaveLength(1)
+  })
+
+  it('renders the tail only while the pane is visible, and shows the whole tail on reveal', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')]))
+    const store = createStore()
+    const view = render(<Provider store={store}><StoreBackedView hidden /></Provider>)
+    await advance(0)
+    await advance(SNAPSHOT_DEBOUNCE_MS)
+
+    deliver(store, { type: 'freshAgent.status', status: 'running' })
+    deliver(store, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+    deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Written while hidden' } }))
+    await advance(LIVE_STREAM_FLUSH_MS)
+    // A background pane keeps the tail in the store but renders none of it.
+    expect(store.getState().freshAgentLive.bySession[KEY].blocks.map((block) => block.text)).toEqual(['Written while hidden'])
+    expect(screen.queryByRole('article', { name: /live response/ })).not.toBeInTheDocument()
+
+    // On reveal the pane refreshes its (now stale) transcript first, as for any
+    // hidden pane, then shows the tail as it stands.
+    serve(() => claudeSnapshot([userTurn('u-user', 'question')], ['u-user'], 2))
+    view.rerender(<Provider store={store}><StoreBackedView /></Provider>)
+    await settleRefetches(3)
+    expect(screen.getByRole('article', { name: /live response/ })).toHaveTextContent('Written while hidden')
   })
 
   it('shows one live reel: the transcript\'s own live strip yields to the live tail', async () => {
