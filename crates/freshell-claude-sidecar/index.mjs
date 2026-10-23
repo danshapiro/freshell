@@ -563,7 +563,7 @@ function handleCreate(req) {
         plugins: Array.isArray(req.plugins)
           ? req.plugins.map(path => ({ type: 'local', path }))
           : undefined,
-        mcpServers: mcpServersFor(req),
+        mcpServers: mcpServersFor(req, process.env, { fields: { sessionId } }),
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
         // This is the SDK's native persisted-user witness. Without the replay

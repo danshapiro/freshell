@@ -16,11 +16,18 @@
 import { describe, expect, it } from 'vitest'
 // @ts-expect-error JavaScript sidecar module has no declaration file.
 import { mcpServersFor, withFreshellContext } from '../../../crates/freshell-claude-sidecar/mcp-servers.mjs'
-import { startRealSidecar } from './harness'
+import { startRealSidecar, type RealSidecar } from './harness'
 
 const HOSTED_RECIPE = { freshell: { command: 'node', args: ['/opt/freshell-mcp/server.js'] } }
 const ORDINARY = { command: '/usr/bin/node', args: ['--import', '/repo/tsx/loader.mjs', '/repo/tools/freshell-mcp/server.ts'] }
 const hosted = (provider = 'claude') => ({ FRESHELL_HOSTED_FRESH_AGENT: provider })
+
+/** The sidecar's structured log records so far (stderr, one JSON object per line). */
+function logRecords(sidecar: RealSidecar): Array<Record<string, any>> {
+  return sidecar.stderr().split('\n').flatMap((line) => {
+    try { return [JSON.parse(line)] } catch { return [] }
+  })
+}
 
 /** No server config in `servers` has an `env` key. */
 function expectNoEnvKey(servers: Record<string, Record<string, unknown>> | undefined) {
@@ -61,7 +68,7 @@ describe('mcpServersFor', () => {
     expectNoEnvKey(mcpServersFor({ hostedMcp: true }, hosted()))
   })
 
-  it('ignores a malformed ordinary recipe instead of handing the CLI a broken server', () => {
+  it('leaves out a malformed ordinary recipe instead of handing the CLI a broken server, and says so', () => {
     for (const freshellMcp of [
       { args: [] },
       { command: '', args: [] },
@@ -69,8 +76,22 @@ describe('mcpServersFor', () => {
       { command: 'node', args: ['server.js', 7] },
       'node server.js',
     ]) {
-      expect(mcpServersFor({ freshellMcp }, {}), JSON.stringify(freshellMcp)).toBeUndefined()
+      const records: unknown[][] = []
+      const log = (...record: unknown[]) => { records.push(record) }
+      expect(mcpServersFor({ freshellMcp }, {}, { log, fields: { sessionId: 's-1' } }), JSON.stringify(freshellMcp)).toBeUndefined()
+      expect(records, JSON.stringify(freshellMcp)).toEqual([
+        ['warn', 'mcp.freshell_recipe_rejected', expect.objectContaining({ sessionId: 's-1' })],
+      ])
     }
+  })
+
+  it('logs nothing when the server sent no recipe or a well-formed one', () => {
+    const records: unknown[][] = []
+    const log = (...record: unknown[]) => { records.push(record) }
+    mcpServersFor({}, {}, { log })
+    mcpServersFor({ freshellMcp: null }, {}, { log })
+    mcpServersFor({ freshellMcp: ORDINARY }, {}, { log })
+    expect(records).toEqual([])
   })
 })
 
@@ -115,6 +136,17 @@ describe('the sidecar hands query() the MCP recipe and the pane context', () => 
     await sidecar.create({ freshellMcp: null, freshellContext: null })
     const { options } = await sidecar.waitForLedger((row) => row.kind === 'query', 'the query() options')
     expect(options.mcpServers).toBeUndefined()
+    expect(logRecords(sidecar).filter((record) => record.event === 'mcp.freshell_recipe_rejected')).toEqual([])
+  })
+
+  it('starts the session without a malformed recipe and logs a warning naming the session', async () => {
+    const sidecar = await startRealSidecar()
+    const sessionId = await sidecar.create({ freshellMcp: { command: 'node', args: ['server.js', 7] } })
+    const { options } = await sidecar.waitForLedger((row) => row.kind === 'query', 'the query() options')
+    expect(options.mcpServers).toBeUndefined()
+    expect(logRecords(sidecar).filter((record) => record.event === 'mcp.freshell_recipe_rejected')).toEqual([
+      expect.objectContaining({ severity: 'warn', component: 'claude-sidecar', sessionId }),
+    ])
   })
 
   it('passes the fixed hosted recipe, never the ordinary one, in a hosted kilroy sidecar', async () => {

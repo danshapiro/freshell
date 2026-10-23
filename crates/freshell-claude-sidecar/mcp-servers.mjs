@@ -16,6 +16,7 @@
 // CLI passes its environment on to the stdio MCP child.
 
 import { usesHostedClaudeRuntime } from './hosted.mjs'
+import { log as sidecarLog } from './log.mjs'
 
 /** The MCP server name both recipes register (its tools are `mcp__freshell__*`). */
 export const FRESHELL_MCP_SERVER_NAME = 'freshell'
@@ -36,15 +37,25 @@ function ordinaryRecipe(recipe) {
 
 /**
  * The `mcpServers` option for the session `req` creates: the hosted recipe,
- * the ordinary recipe, or undefined (never both, never an `env` key).
+ * the ordinary recipe, or undefined (never both, never an `env` key). An
+ * ordinary recipe that is present but malformed is left out and logged as a
+ * warning (`mcp.freshell_recipe_rejected`, with `fields`): the server already
+ * logged the launch as resolved, so this record is the only sign the pane
+ * runs without the Freshell MCP.
  */
-export function mcpServersFor(req, env = process.env) {
+export function mcpServersFor(req, env = process.env, { log = sidecarLog, fields = {} } = {}) {
   if (usesHostedClaudeRuntime(env)) {
     if (req?.hostedMcp !== true) return undefined
     return { [FRESHELL_MCP_SERVER_NAME]: { command: HOSTED_RECIPE.command, args: [...HOSTED_RECIPE.args] } }
   }
-  const recipe = ordinaryRecipe(req?.freshellMcp)
-  return recipe ? { [FRESHELL_MCP_SERVER_NAME]: recipe } : undefined
+  const sent = req?.freshellMcp
+  if (sent === undefined || sent === null) return undefined
+  const recipe = ordinaryRecipe(sent)
+  if (!recipe) {
+    log('warn', 'mcp.freshell_recipe_rejected', { ...fields, recipeType: Array.isArray(sent) ? 'array' : typeof sent })
+    return undefined
+  }
+  return { [FRESHELL_MCP_SERVER_NAME]: recipe }
 }
 
 /**
