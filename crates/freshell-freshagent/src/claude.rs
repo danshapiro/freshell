@@ -582,6 +582,8 @@ struct ResponseSession {
 
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
+    session_type: String,
+    quiet: deadman::QuietWatch,
     configuration: ClaudeConfiguration,
     /// Per-runtime stdin writer; await only after dropping the sessions map lock.
     stdin: crate::claude_sidecar_io::SidecarWriter,
@@ -691,10 +693,11 @@ impl ClaudeSession {
     /// The session's effective status (design §5.2) — the truth the attach
     /// acknowledgements and the snapshot overlay speak.
     fn current_status(&self) -> String {
+        let quiet = self.quiet.state.lock().expect("quiet deadman lock");
         self.ledger
             .lock()
             .expect("turn ledger lock")
-            .effective_status(false, false)
+            .effective_status(false, quiet.is_stuck())
             .as_str()
             .to_string()
     }
@@ -4108,6 +4111,7 @@ impl FreshClaudeState {
         Arc<TokioMutex<()>>,
         crate::claude_turns::SharedLedger,
         Option<String>,
+        deadman::SharedQuiet,
     )> {
         let key = self.resolve_session_key(wire_id).await?;
         let sessions = self.sessions.lock().await;
@@ -4117,6 +4121,7 @@ impl FreshClaudeState {
             session.turn_lock.clone(),
             session.ledger.clone(),
             session.cli_session_id.clone(),
+            session.quiet.state.clone(),
         ))
     }
 
@@ -4217,7 +4222,7 @@ impl FreshClaudeState {
                 )
             }
         };
-        let Some((map_key, turn_lock, ledger, durable_before_wait)) =
+        let Some((map_key, turn_lock, ledger, durable_before_wait, quiet)) =
             self.turn_locked_handles(&resolved).await
         else {
             return self.refuse_send_after_runtime_stopped(
@@ -4390,11 +4395,18 @@ impl FreshClaudeState {
             request_id.clone(),
             crate::claude_turns::SendKind::Turn,
         );
-        self.publish_claude_status(&ledger, &stamp, session_type, false);
+        self.arm_claude_quiet(&map_key, &ledger).await;
+        self.publish_claude_status(&ledger, &quiet, &stamp, session_type, false);
         let guard = self.sessions.lock().await;
         let Some(session) = guard.get(&map_key) else {
             drop(guard);
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &submitted_turn_id);
+            self.take_back_unwritten_send(
+                &ledger,
+                &quiet,
+                &stamp,
+                session_type,
+                &submitted_turn_id,
+            );
             return self.refuse_send_after_runtime_stopped(
                 &request_id,
                 &session_id,
@@ -4421,7 +4433,13 @@ impl FreshClaudeState {
         if let Err(err) = writer.write(&send_req).await {
             // The write never went out: take back exactly this send (whatever
             // else is owed stays).
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &submitted_turn_id);
+            self.take_back_unwritten_send(
+                &ledger,
+                &quiet,
+                &stamp,
+                session_type,
+                &submitted_turn_id,
+            );
             return self.refuse_send(&request_id, "CLAUDE_SEND_FAILED", &err);
         }
         drop(ownership_guard);
@@ -4645,7 +4663,7 @@ impl FreshClaudeState {
                 return;
             }
         };
-        let Some((map_key, turn_lock, _, durable_before_wait)) =
+        let Some((map_key, turn_lock, _, durable_before_wait, _)) =
             self.turn_locked_handles(&resolved).await
         else {
             self.emit_control_error(
@@ -4971,7 +4989,7 @@ impl FreshClaudeState {
                 return;
             }
         };
-        let Some((map_key, turn_lock, ledger, durable_before_wait)) =
+        let Some((map_key, turn_lock, ledger, durable_before_wait, quiet)) =
             self.turn_locked_handles(&resolved).await
         else {
             self.emit_control_error(
@@ -5049,11 +5067,12 @@ impl FreshClaudeState {
             None,
             crate::claude_turns::SendKind::Compact,
         );
-        self.publish_claude_status(&ledger, &stamp, session_type, false);
+        self.arm_claude_quiet(&map_key, &ledger).await;
+        self.publish_claude_status(&ledger, &quiet, &stamp, session_type, false);
         let guard = self.sessions.lock().await;
         let Some(session) = guard.get(&map_key) else {
             drop(guard);
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
+            self.take_back_unwritten_send(&ledger, &quiet, &stamp, session_type, &uuid);
             self.emit_control_error(
                 &session_id,
                 msg.session_type,
@@ -5082,7 +5101,7 @@ impl FreshClaudeState {
         drop(guard);
         if let Err(err) = writer.write(&send_req).await {
             // The write never went out: take back exactly this compact.
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
+            self.take_back_unwritten_send(&ledger, &quiet, &stamp, session_type, &uuid);
             self.emit_control_error(
                 &session_id,
                 msg.session_type,
@@ -6367,6 +6386,7 @@ impl FreshClaudeState {
         broadcast_id: Arc<std::sync::Mutex<String>>,
         pending: Arc<std::sync::Mutex<ClaudePending>>,
         ledger: crate::claude_turns::SharedLedger,
+        quiet: deadman::SharedQuiet,
         // The session's attention clock (see [`ClaudeSession::clock`]). Held by
         // the consumer (like the ledger above) so the unrequested-death arm
         // below can mint AFTER the eviction has already torn the session record
@@ -6391,12 +6411,21 @@ impl FreshClaudeState {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, None)
+                        .await;
                     continue;
                 }
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, None)
+                        .await;
                     continue;
                 };
                 if let Some(ended) = crate::claude_sidecar_exit::StreamEnded::from_line(&value) {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, Some(&value))
+                        .await;
                     stream_ended = Some(ended);
                     continue;
                 }
@@ -6425,6 +6454,11 @@ impl FreshClaudeState {
                 // §5.2) before anything else reads it: a gate, an attach
                 // acknowledgement or the status published below sees it.
                 let step = state.fold_into_ledger(&ledger, &value, &broadcast_id, &session_type);
+                if !is_pending_frame(&value) && value["type"] != "sdk.send.rejected" {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, Some(&value))
+                        .await;
+                }
                 // C18: a latched Stop that missed a command the CLI was still
                 // starting is sent again now (design §5.4); a refused one is
                 // disarmed (the turn keeps running and rings when it ends).
@@ -6471,7 +6505,12 @@ impl FreshClaudeState {
                             .take_back_rejected_send(&ledger, &stamp, &session_type, &rejection),
                         fact => fact.log(&stamp, &session_type),
                     }
-                    state.publish_claude_status(&ledger, &stamp, &session_type, false);
+                    if value["type"] == "sdk.send.rejected" {
+                        state
+                            .note_claude_stdout(&session_id, &ownership_id, Some(&value))
+                            .await;
+                    }
+                    state.publish_claude_status(&ledger, &quiet, &stamp, &session_type, false);
                     continue;
                 }
                 if value.get("type").and_then(Value::as_str) == Some("sdk.status") {
@@ -6600,7 +6639,7 @@ impl FreshClaudeState {
                     LedgerStep::Settled(settled) => value["sessionBusy"] = json!(settled.busy),
                     _ => {
                         let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                        state.publish_claude_status(&ledger, &stamp, &session_type, false);
+                        state.publish_claude_status(&ledger, &quiet, &stamp, &session_type, false);
                     }
                 }
                 // Restart-parity (plan §2.8 item 2): record the durable Claude UUID
@@ -6696,7 +6735,7 @@ impl FreshClaudeState {
                 };
                 if let LedgerStep::Settled(settled) = step {
                     state.ring_settled_turn(&record, settled);
-                    state.publish_claude_status(&ledger, &stamp, &session_type, true);
+                    state.publish_claude_status(&ledger, &quiet, &stamp, &session_type, true);
                 }
             }
             // C17: the end of output ends whatever the CLI owed (its queue died
@@ -6706,6 +6745,7 @@ impl FreshClaudeState {
             // time the unrequested-death arm below runs the ledger is cleared
             // and the session record evicted (the clock and id handles it needs
             // are consumer-owned locals that survive the eviction).
+            quiet.lock().expect("quiet deadman lock").disarm();
             let turn_was_in_flight = ledger.lock().expect("turn ledger lock").eof();
             // Consumer exit == this sidecar's stdout closed == the sidecar ended
             // (ledger A9): it exits after reporting its SDK stream's end
@@ -7981,6 +8021,7 @@ fn log_claude_teardown(
 
 mod create_binding;
 mod create_outcome;
+mod deadman;
 mod recovery;
 pub use create_outcome::ClaudeCreateOutcome;
 
@@ -8046,6 +8087,7 @@ pub(crate) mod tests {
 
     mod control_tests;
     mod create_binding_tests;
+    mod deadman_tests;
     mod recovery_tests;
     mod refusal_tests;
 
@@ -8114,6 +8156,8 @@ pub(crate) mod tests {
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
+                session_type: "freshclaude".into(),
+                quiet: Default::default(),
                 configuration: ClaudeConfiguration::default(),
                 stdin: stdin.into(),
                 child,
@@ -17016,6 +17060,8 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
+                session_type: "freshclaude".into(),
+                quiet: Default::default(),
                 configuration: ClaudeConfiguration::default(),
                 stdin: stdin.into(),
                 child,
@@ -17680,6 +17726,7 @@ rl.on('line', (line) => {
         let st = state();
         insert_fake_claude_session(&st, "fold-session").await;
         let pending = st.sessions.lock().await["fold-session"].pending.clone();
+        let quiet = st.sessions.lock().await["fold-session"].quiet.state.clone();
         let consumer = st.spawn_consumer(
             reader,
             "fold-session".to_string(),
@@ -17690,6 +17737,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
             crate::claude_turns::SharedLedger::default(),
+            quiet,
             crate::attention::AttentionClock::default(),
             None, // provenance: test lane is conn-less (D8)
             false,
@@ -19215,6 +19263,7 @@ rl.on('line', (line) => {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let clock = crate::attention::AttentionClock::default();
         let turn_lock = Arc::new(TokioMutex::new(()));
+        let quiet = deadman::QuietWatch::default();
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
         let consumer = st.spawn_consumer(
             reader,
@@ -19226,6 +19275,7 @@ rl.on('line', (line) => {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&ledger),
+            quiet.state.clone(),
             clock.clone(),
             None, // provenance: test lane is conn-less (D8)
             false,
@@ -19233,6 +19283,8 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             map_key.to_string(),
             ClaudeSession {
+                session_type: "freshclaude".into(),
+                quiet,
                 configuration: ClaudeConfiguration::default(),
                 stdin: stdin.into(),
                 child,

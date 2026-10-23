@@ -99,6 +99,8 @@ async fn fake_session(
         while let Ok(Some(_)) = lines.next_line().await {}
     });
     let session = ClaudeSession {
+        session_type: "freshclaude".into(),
+        quiet: Default::default(),
         configuration: ClaudeConfiguration::default(),
         stdin: stdin.into(),
         child,

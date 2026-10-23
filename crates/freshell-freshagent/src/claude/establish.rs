@@ -768,6 +768,7 @@ impl FreshClaudeState {
                 clock: dead.map(|dead| dead.clock).unwrap_or_default(),
             }
         });
+        let quiet = super::deadman::QuietWatch::default();
         let (stdin, fault) = crate::claude_sidecar_io::SidecarWriter::spawn(
             stdin,
             log_labels,
@@ -786,6 +787,7 @@ impl FreshClaudeState {
                 Arc::clone(&broadcast_id),
                 Arc::clone(&pending),
                 Arc::clone(&ledger),
+                quiet.state.clone(),
                 clock.clone(),
                 provenance.clone(),
                 naming.is_some(),
@@ -794,6 +796,8 @@ impl FreshClaudeState {
             sessions.insert(
                 map_key.clone(),
                 ClaudeSession {
+                    session_type: spec.session_type.clone(),
+                    quiet,
                     configuration: ClaudeConfiguration {
                         settings: configuration_settings,
                         freshell_context: spec.freshell_context.clone(),
