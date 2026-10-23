@@ -1532,6 +1532,7 @@ export const closeTab = createAsyncThunk(
             layout: frozenLayout,
             serverInstanceId,
             paneTitles: frozenPaneTitles,
+            paneTitleSetByUser: frozenPaneTitleSetByUser,
             extensions: stateAtClose.extensions?.entries,
             deviceId: tabRegistryState.deviceId,
             deviceLabel: tabRegistryState.deviceLabel,

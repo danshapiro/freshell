@@ -922,3 +922,116 @@ describe('unified agent names (Task 7): recovery carries no scoped title aliases
     expect(content.namingHandle).toBe('handle-p-agent')
   })
 })
+
+// Name reliability (Task 9, D7): a new window (or any inventory rebuild)
+// restores shell/browser/editor tab and pane names WITH their "user renamed"
+// protection. Scoped agent panes are named by their saved session record, so
+// their titles never come back as local aliases.
+describe('name reliability (Task 9): recovery restores legacy names and user flags', () => {
+  const shellPane = (paneId: string, over: Partial<ReturnType<typeof pane>> = {}) => pane({
+    paneId,
+    payload: { createRequestId: `crid-${paneId}` },
+    ...over,
+  })
+  const browserPane = (paneId: string, over: Record<string, unknown> = {}) => pane({
+    paneId,
+    kind: 'browser',
+    mode: null,
+    cwd: null,
+    payload: { url: 'https://example.com/docs', devToolsOpen: false },
+    ...over,
+  })
+  const claudePane = (paneId: string, over: Record<string, unknown> = {}) => pane({
+    paneId,
+    kind: 'terminal',
+    mode: 'claude',
+    payload: { createRequestId: `crid-${paneId}` },
+    sessionRef: { provider: 'claude', sessionId: `sess-${paneId}` },
+    ledgerState: 'bound' as const,
+    ...over,
+  })
+
+  it('buildRecoveryPlan restores pane titles and flags through the pane-id remap', () => {
+    const inventory = inv([
+      shellPane('p-shell', { title: 'KeepMePane', titleSetByUser: true }),
+      browserPane('p-docs', { title: 'Example Domain' }),
+      shellPane('p-plain'),
+    ])
+    inventory.device!.tabs[0].tabKey = 'd:tab-shell'
+    inventory.device!.tabs[0].tabName = 'MyShellTab'
+    inventory.device!.tabs[0].titleSetByUser = true
+    inventory.device!.tabs[0].nameSource = { kind: 'legacy' }
+
+    // Cross-device recovery remints every pane id: titles and flags follow
+    // their panes through the old->new map.
+    const [plan] = buildRecoveryPlan(inventory)
+    const [shellLeaf, docsLeaf, plainLeaf] = leavesOf(plan.layout)
+    expect(shellLeaf.id).not.toBe('p-shell')
+    expect(plan.title).toBe('MyShellTab')
+    expect(plan.titleSetByUser).toBe(true)
+    expect(plan.paneTitles).toEqual({ [shellLeaf.id]: 'KeepMePane', [docsLeaf.id]: 'Example Domain' })
+    expect(plan.paneTitleSetByUser).toEqual({ [shellLeaf.id]: true })
+    expect(plan.paneTitles).not.toHaveProperty(plainLeaf.id)
+
+    // Same-machine bootstrap keeps the ids, so the maps keep them too.
+    const [samePlan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    expect(samePlan.titleSetByUser).toBe(true)
+    expect(samePlan.paneTitles).toEqual({ 'p-shell': 'KeepMePane', 'p-docs': 'Example Domain' })
+    expect(samePlan.paneTitleSetByUser).toEqual({ 'p-shell': true })
+  })
+
+  it('a tab and panes nobody renamed restore without user flags', () => {
+    const inventory = inv([shellPane('p-osc', { title: 'user@host: ~' })])
+    inventory.device!.tabs[0].tabKey = 'd:tab-osc'
+    inventory.device!.tabs[0].tabName = 'user@host: ~'
+    inventory.device!.tabs[0].titleSetByUser = false
+
+    const [plan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    expect(plan.titleSetByUser).toBeUndefined()
+    expect(plan.paneTitles).toEqual({ 'p-osc': 'user@host: ~' })
+    expect(plan.paneTitleSetByUser).toEqual({})
+  })
+
+  it('buildRecoveryPlan never restores titles for scoped agent panes', () => {
+    // A session-owned tab: the Claude pane names the tab; a shell pane split
+    // beside it keeps its own (legacy) name.
+    const owned = inv([
+      claudePane('p-agent', { title: 'Old agent alias', titleSetByUser: true }),
+      shellPane('p-side', { title: 'Side shell', titleSetByUser: true }),
+    ])
+    owned.device!.tabs[0].tabKey = 'd:tab-owned'
+    owned.device!.tabs[0].tabName = 'Billing bug'
+    owned.device!.tabs[0].titleSetByUser = true
+    owned.device!.tabs[0].nameSource = { kind: 'session', paneId: 'p-agent' }
+
+    const [plan] = buildRecoveryPlan(owned, { preserveIdsForMachine: 'd' })
+    expect(plan.paneTitles).toEqual({ 'p-side': 'Side shell' })
+    expect(plan.paneTitleSetByUser).toEqual({ 'p-side': true })
+    // The tab's name follows its saved session record: no freeze flag.
+    expect(plan.titleSetByUser).toBeUndefined()
+
+    // A record that predates nameSource: the rebuilt layout's first leaf is
+    // the scoped pane, so the tab is session-owned all the same.
+    const unpointed = inv([
+      claudePane('p-agent', { title: 'Old agent alias', titleSetByUser: true }),
+    ])
+    unpointed.device!.tabs[0].tabKey = 'd:tab-unpointed'
+    unpointed.device!.tabs[0].titleSetByUser = true
+    const [unpointedPlan] = buildRecoveryPlan(unpointed)
+    expect(unpointedPlan.titleSetByUser).toBeUndefined()
+    expect(unpointedPlan.paneTitles).toEqual({})
+    expect(unpointedPlan.paneTitleSetByUser).toEqual({})
+  })
+
+  it('a closed-verdict pane takes its title with it', () => {
+    const inventory = inv([
+      shellPane('p-kept', { title: 'Kept pane', titleSetByUser: true }),
+      shellPane('p-closed', { title: 'Closed pane', titleSetByUser: true, ledgerState: 'closed' }),
+    ])
+    inventory.device!.tabs[0].tabKey = 'd:tab-mixed'
+
+    const [plan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    expect(plan.paneTitles).toEqual({ 'p-kept': 'Kept pane' })
+    expect(plan.paneTitleSetByUser).toEqual({ 'p-kept': true })
+  })
+})

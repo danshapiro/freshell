@@ -52,9 +52,13 @@ test.describe('local-first machine workspace', () => {
   })
   test.afterAll(async () => { await server?.stop() })
 
+  // Mango's pane title is automatic and Apple's is user-set. Rebuilds keep
+  // the user flag (name reliability, Task 9), so Scenario 3's cross-window
+  // step needs a pane whose title is automatic from the start (mango): a
+  // user-set pane never takes an automatic title.
   const TABS = [
-    { id: 'tab-mango', title: 'Mango', file: '/tmp/mango.md', pane: 'tab-mango-pane', paneTitle: 'Mango notes' },
-    { id: 'tab-apple', title: 'Apple', file: '/tmp/apple.md', pane: 'tab-apple-pane', paneTitle: 'Apple notes' },
+    { id: 'tab-mango', title: 'Mango', file: '/tmp/mango.md', pane: 'tab-mango-pane', paneTitle: 'Mango notes', userSet: false },
+    { id: 'tab-apple', title: 'Apple', file: '/tmp/apple.md', pane: 'tab-apple-pane', paneTitle: 'Apple notes', userSet: true },
   ]
 
   /** Spec-LOCAL fs-poll (the donor idiom, recover-my-panes-rust.spec.ts:452-494,
@@ -157,7 +161,7 @@ test.describe('local-first machine workspace', () => {
             content: { kind: 'editor', filePath: t.file, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
           },
         })
-        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'panes/updatePaneTitle', payload: { tabId: t.id, paneId: t.pane, title: t.paneTitle, setByUser: true } })
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'panes/updatePaneTitle', payload: { tabId: t.id, paneId: t.pane, title: t.paneTitle, setByUser: t.userSet } })
       }, t)
     }
     await page.evaluate((id) => window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/setActiveTab', payload: id }), 'tab-mango')
@@ -197,7 +201,8 @@ test.describe('local-first machine workspace', () => {
     expect(kept.tabs.activeTabId).toBe('tab-mango')
     expect(kept.panes.paneTitles['tab-mango']['tab-mango-pane']).toBe('Mango notes')
     expect(kept.panes.paneTitles['tab-apple']['tab-apple-pane']).toBe('Apple notes')
-    expect(kept.panes.paneTitleSetByUser['tab-mango']['tab-mango-pane']).toBe(true)
+    expect(kept.panes.paneTitleSetByUser['tab-apple']['tab-apple-pane']).toBe(true)
+    expect(kept.panes.paneTitleSetByUser['tab-mango']?.['tab-mango-pane']).toBeFalsy()
     expect(JSON.stringify(kept.panes.layouts['tab-mango'])).toContain('tab-mango-pane')
 
     // ── Scenario 2: corrupt envelope → bootstrap rebuild, ids preserved ──
@@ -232,6 +237,13 @@ test.describe('local-first machine workspace', () => {
     expect(rebuilt.tabs.tabs.map((t: { title: string }) => t.title).sort()).toEqual(['Apple notes', 'Mango notes'])
     expect(JSON.stringify(rebuilt.panes.layouts['tab-mango'])).toContain('tab-mango-pane')
     expect(JSON.stringify(rebuilt.panes.layouts['tab-apple'])).toContain('tab-apple-pane')
+    // Name reliability (Task 9): the rebuild restores the pane titles with
+    // their user flags (the user-set apple title stays protected; the
+    // automatic mango title stays automatic).
+    expect(rebuilt.panes.paneTitles['tab-mango']['tab-mango-pane']).toBe('Mango notes')
+    expect(rebuilt.panes.paneTitles['tab-apple']['tab-apple-pane']).toBe('Apple notes')
+    expect(rebuilt.panes.paneTitleSetByUser['tab-apple']?.['tab-apple-pane']).toBe(true)
+    expect(rebuilt.panes.paneTitleSetByUser['tab-mango']?.['tab-mango-pane']).toBeFalsy()
   })
 
   test('cross-window pane-title hydration is title-only: newer titles deliver, older do not clobber, user-set survives, each window keeps its own arrangement, and received titles are durable across the receiver\u2019s reload', async ({ page }) => {

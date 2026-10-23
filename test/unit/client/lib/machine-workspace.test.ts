@@ -709,3 +709,55 @@ describe('restoreMachineWorkspace — unified agent names (Task 7)', () => {
     expect(store.getState().panes.paneTitleSetByUser['recovered-tab'] ?? {}).toEqual({})
   })
 })
+
+// ── name reliability (Task 9) ────────────────────────────────────────────────
+
+describe('restoreMachineWorkspace — name reliability (Task 9)', () => {
+  beforeEach(() => {
+    vi.mocked(getRecoveryInventory).mockReset()
+    localStorage.clear()
+  })
+
+  it('restoreMachineWorkspace keeps titleSetByUser on legacy tabs', async () => {
+    const store = createStore()
+    addForeignWorkspace(store)
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0] = {
+      tabKey: `${MACHINE_ID}:recovered-tab`,
+      tabName: 'MyShellTab',
+      titleSetByUser: true,
+      nameSource: { kind: 'legacy' },
+      panes: [{
+        paneId: 'recovered-pane',
+        kind: 'terminal',
+        mode: 'shell',
+        shell: null,
+        cwd: '/work',
+        title: 'KeepMePane',
+        titleSetByUser: true,
+        payload: { createRequestId: 'crid-shell' },
+        sessionRef: null,
+        ledgerState: 'unknown',
+        live: false,
+      }],
+    }
+    addRecoveredTab(inventory, MACHINE_ID, 'unrenamed-tab', 'user@host: ~')
+    inventory.device!.tabs[1].panes[0].title = 'user@host: ~'
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'absent' })
+
+    const state = store.getState()
+    const renamed = state.tabs.tabs.find((tab) => tab.id === 'recovered-tab')
+    expect(renamed?.title).toBe('MyShellTab')
+    expect(renamed?.titleSetByUser).toBe(true)
+    expect(state.panes.paneTitles['recovered-tab']).toEqual({ 'recovered-pane': 'KeepMePane' })
+    expect(state.panes.paneTitleSetByUser['recovered-tab']).toEqual({ 'recovered-pane': true })
+
+    // A tab nobody renamed restores its automatic titles, unprotected.
+    const unrenamed = state.tabs.tabs.find((tab) => tab.id === 'unrenamed-tab')
+    expect(unrenamed?.titleSetByUser).toBeFalsy()
+    expect(state.panes.paneTitles['unrenamed-tab']).toEqual({ 'unrenamed-tab-pane': 'user@host: ~' })
+    expect(state.panes.paneTitleSetByUser['unrenamed-tab'] ?? {}).toEqual({})
+  })
+})
