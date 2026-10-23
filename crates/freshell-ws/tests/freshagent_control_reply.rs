@@ -9,8 +9,8 @@
 //! `"Fork is …"`, `"Compact is …"`) under code `UNSUPPORTED_CAPABILITY`; every handled
 //! cell routes to a real dispatch arm. Task 4 landed the codex/opencode compact arms
 //! (their cells dropped from the table) and pins the unconditional amplifier x op
-//! refusal cells; Task 5 landed the opencode fork arm, Task 6 the codex fork arm (both
-//! cells dropped — the remaining fork refusals are claude [permanent] and amplifier).
+//! refusal cells; Task 5 landed the opencode fork arm, Task 6 the codex fork arm and C14
+//! the claude fork arm (all three cells dropped — the remaining fork refusal is amplifier).
 //! The whole-branch-review follow-up completed the matrix (question.respond refusals
 //! for codex/opencode, approval.respond refusal for opencode, claude question.respond
 //! dispatch reachability) and flipped BOTH compact unknown-session legs to the nested
@@ -171,9 +171,14 @@ async fn opencode_question_respond_is_refused_with_the_parity_capability_message
     );
 }
 
-/// Refusal-matrix cell: claude has no fork — refused with the parity capability text.
+/// Dispatch-matrix cell (C14): claude fork is NO LONGER refused — it reaches
+/// `FreshClaudeState::handle_fork`, which answers an unknown parent session with the
+/// nested `freshAgent.error{INVALID_SESSION_ID}` lost-session shape ON THE REQUESTING
+/// CONNECTION (never UNSUPPORTED_CAPABILITY, never silence). This pin began life as
+/// `claude_fork_is_refused_with_the_parity_capability_message` and flipped when C14
+/// added the claude fork arm (G09).
 #[tokio::test]
-async fn claude_fork_is_refused_with_the_parity_capability_message() {
+async fn claude_fork_reaches_the_claude_dispatch_arm() {
     let (url, _registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
@@ -191,12 +196,16 @@ async fn claude_fork_is_refused_with_the_parity_capability_message() {
     .await;
 
     let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
-    assert_capability_refusal(
-        &frame,
-        "ses-fork-1",
-        "claude",
-        "freshclaude",
-        "Fork is not supported for freshclaude",
+    assert_eq!(frame["provider"], serde_json::json!("claude"));
+    assert_eq!(frame["sessionType"], serde_json::json!("freshclaude"));
+    assert_eq!(
+        frame["event"]["type"],
+        serde_json::json!("freshAgent.error")
+    );
+    assert_eq!(
+        frame["event"]["code"],
+        serde_json::json!("INVALID_SESSION_ID"),
+        "the frame reached the claude handler (a refusal-table answer would be UNSUPPORTED_CAPABILITY): {frame}"
     );
 }
 

@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+pub use crate::claude_launch::ClaudeGenesis;
 use crate::rollback_record::RollbackRecord;
 #[cfg(test)]
 use crate::rollback_record::ROLLBACK_RECORD_VERSION;
@@ -23,6 +24,20 @@ pub struct FreshAgentSettings {
     pub permission_mode: Option<String>,
     pub effort: Option<String>,
     pub cwd: Option<String>,
+    /// The claude pane's local plugin directories (G15): every launch of the
+    /// session hands them to the sidecar. `None` (never an empty list) when
+    /// the pane has none — see [`Self::with_plugins`].
+    pub plugins: Option<Vec<String>>,
+}
+
+impl FreshAgentSettings {
+    /// These settings with `plugins` as the pane's plugin directories. An
+    /// empty list is no plugins and is kept as `None`, so a pane that names
+    /// none records nothing (its row stays lineage-only).
+    pub fn with_plugins(mut self, plugins: Option<Vec<String>>) -> Self {
+        self.plugins = plugins.filter(|plugins| !plugins.is_empty());
+        self
+    }
 }
 
 /// D8 (restore-open-sessions-only) bind-lane provenance: WHICH browser client
@@ -145,6 +160,75 @@ impl From<Option<BindProvenance>> for ProvenanceUpdate {
     }
 }
 
+/// What a binding write does to the row's genesis (claude core design §4.1;
+/// the ledger's `GenesisWrite`). The genesis is not part of the settings
+/// snapshot: it is set by the write that mints a session with no transcript
+/// yet and cleared once the transcript is observed on disk, and every other
+/// write keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum GenesisUpdate {
+    #[default]
+    Keep,
+    Set(ClaudeGenesis),
+    Clear,
+}
+
+impl GenesisUpdate {
+    /// The genesis a `Set` stores in the binding row (the ledger keeps it
+    /// opaque); `None` for `Keep` and `Clear`.
+    pub fn stored_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Set(genesis) => Some(genesis.to_value()),
+            Self::Keep | Self::Clear => None,
+        }
+    }
+
+    pub fn is_clear(&self) -> bool {
+        matches!(self, Self::Clear)
+    }
+}
+
+/// A binding row's genesis, with the row's last write time: the revision
+/// floor of the snapshot a pending session serves (design §4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedGenesis {
+    pub genesis: ClaudeGenesis,
+    pub updated_at_ms: i64,
+}
+
+impl RecordedGenesis {
+    /// The genesis a binding row stores (`raw`, opaque to the ledger) as the
+    /// claude lane reads it. A shape this server does not know (a newer
+    /// server's kind) reads as no genesis, the way an older server reads it,
+    /// and is logged.
+    pub fn from_row(
+        provider: &str,
+        session_id: &str,
+        raw: Option<&serde_json::Value>,
+        updated_at_ms: i64,
+    ) -> Option<Self> {
+        let raw = raw?;
+        match ClaudeGenesis::from_value(raw) {
+            Some(genesis) => Some(Self {
+                genesis,
+                updated_at_ms,
+            }),
+            None => {
+                tracing::warn!(
+                    component = "freshagent.claude",
+                    event = "freshagent.claude.genesis_unreadable",
+                    provider,
+                    session_id,
+                    genesis = %raw,
+                    "a binding row's genesis has a shape this server does not know; \
+                     the session is treated as having none"
+                );
+                None
+            }
+        }
+    }
+}
+
 /// One fresh-agent identity event. Settings are a FULL snapshot (replace,
 /// not merge). `resolves_pending` names a pending marker (placeholder id)
 /// this binding supersedes.
@@ -209,6 +293,8 @@ pub struct FreshAgentBindingUpsert {
     /// refresh.
     pub authoritative: bool,
     pub settings: FreshAgentSettings,
+    /// What this write does to the row's genesis (see [`GenesisUpdate`]).
+    pub genesis: GenesisUpdate,
 }
 
 impl FreshAgentBindingUpsert {
@@ -344,6 +430,13 @@ pub trait PaneIdentitySink: Send + Sync {
     fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite;
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite;
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings>;
+    /// The fresh-agent binding row's genesis (claude core design §4.1), bound
+    /// or retired; `None` when it has none or there is no fresh-agent row.
+    /// Memory-only.
+    fn load_genesis(&self, provider: &str, session_id: &str) -> Option<RecordedGenesis>;
+    /// Drop the row's genesis: the session's transcript has been observed on
+    /// disk. AWAITED; no row, or a row without a genesis, is a no-op.
+    fn clear_genesis(&self, provider: &str, session_id: &str) -> SinkWrite;
     /// Task 3 semantics change: true iff a SETTINGS-BEARING record was
     /// persisted for this key — a lineage-only binding row (all-blank
     /// settings snapshot, recorded unconditionally at materialization so the
@@ -429,6 +522,14 @@ pub trait PaneIdentitySink: Send + Sync {
         provider: &str,
         create_request_id: &str,
     ) -> Option<String>;
+    /// The live end of the supersession chain that starts at `session_id`
+    /// (claude core design §4.5: an undo or redo's replacement supersedes the
+    /// session it replaced): `Some(terminus)` only when a later session
+    /// superseded `session_id`. Memory-only, like `load_settings`. A sink that
+    /// keeps no supersession chain answers `None`.
+    fn chain_terminus(&self, _provider: &str, _session_id: &str) -> Option<String> {
+        None
+    }
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
     /// explicit `freshAgent.kill` is an INTENTIONAL session end — the pane's
     /// binding row retires `Closed` on every kill entry point, so the
@@ -763,6 +864,13 @@ pub(crate) struct FakeIdentitySink {
     /// "the lane carries the delayed-write fence" (pre-r29 every lane
     /// wrote (None, None) here on its refreshes).
     pub binding_pairs: std::sync::Mutex<ObservedBindingPairMap>,
+    /// Claude core design §4.1: the row's CURRENT genesis per identity — the
+    /// ledger's genesis column in memory. Every `record_binding` applies its
+    /// [`GenesisUpdate`] (a `Keep` advances the row's write time, like the
+    /// ledger's `updated_at`), and `clear_genesis` drops it.
+    pub geneses: std::sync::Mutex<std::collections::HashMap<(String, String), RecordedGenesis>>,
+    /// Every `clear_genesis` call, in order, whether or not a genesis existed.
+    pub genesis_clears: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 /// b8ke ext r29 F3: the observed (epoch, generation) pair a binding write
@@ -957,6 +1065,7 @@ impl FakeIdentitySink {
                 .insert((provider.into(), session_id.into()), s.clone());
         }
         self.bindings.lock().unwrap().push(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: provider.into(),
             session_id: session_id.into(),
@@ -1367,7 +1476,44 @@ impl FakeIdentitySink {
                 }
             }
         }
+        {
+            let key = (upsert.provider.clone(), upsert.session_id.clone());
+            let now = crate::rollback_record::now_ms();
+            let mut geneses = self.geneses.lock().unwrap();
+            match &upsert.genesis {
+                GenesisUpdate::Keep => {
+                    if let Some(recorded) = geneses.get_mut(&key) {
+                        recorded.updated_at_ms = now;
+                    }
+                }
+                GenesisUpdate::Set(genesis) => {
+                    geneses.insert(
+                        key,
+                        RecordedGenesis {
+                            genesis: genesis.clone(),
+                            updated_at_ms: now,
+                        },
+                    );
+                }
+                GenesisUpdate::Clear => {
+                    geneses.remove(&key);
+                }
+            }
+        }
         self.bindings.lock().unwrap().push(upsert);
+    }
+
+    /// Seed a row's genesis (a session minted with no transcript yet) as the
+    /// binding write that mints it would record it.
+    #[allow(dead_code)]
+    pub fn seed_genesis(&self, provider: &str, session_id: &str, genesis: ClaudeGenesis) {
+        self.geneses.lock().unwrap().insert(
+            (provider.into(), session_id.into()),
+            RecordedGenesis {
+                genesis,
+                updated_at_ms: crate::rollback_record::now_ms(),
+            },
+        );
     }
 }
 
@@ -1447,6 +1593,26 @@ impl PaneIdentitySink for FakeIdentitySink {
             .unwrap()
             .get(&(provider.into(), session_id.into()))
             .cloned()
+    }
+    fn load_genesis(&self, provider: &str, session_id: &str) -> Option<RecordedGenesis> {
+        self.geneses
+            .lock()
+            .unwrap()
+            .get(&(provider.into(), session_id.into()))
+            .cloned()
+    }
+    fn clear_genesis(&self, provider: &str, session_id: &str) -> SinkWrite {
+        self.genesis_clears
+            .lock()
+            .unwrap()
+            .push((provider.into(), session_id.into()));
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.geneses
+                .lock()
+                .unwrap()
+                .remove(&(provider.to_string(), session_id.to_string()));
+        }
+        self.write_result()
     }
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
         self.recorded
@@ -1982,6 +2148,27 @@ impl PaneIdentitySink for FakeIdentitySink {
             })
             .map(|b| b.session_id.clone())
     }
+
+    fn chain_terminus(&self, provider: &str, session_id: &str) -> Option<String> {
+        // The ledger's `supersededBy` walk over the bindings log's
+        // `supersedes` edges (newest edge wins), with its hop cap.
+        let bindings = self.bindings.lock().unwrap();
+        let successor = |id: &str| {
+            bindings
+                .iter()
+                .rev()
+                .find(|b| b.provider == provider && b.supersedes.as_deref() == Some(id))
+                .map(|b| b.session_id.clone())
+        };
+        let mut current = successor(session_id)?;
+        for _ in 0..32 {
+            match successor(&current) {
+                Some(next) if next != current => current = next,
+                _ => break,
+            }
+        }
+        Some(current)
+    }
 }
 
 #[cfg(test)]
@@ -1996,6 +2183,7 @@ mod tests {
             .await
             .expect("pending write ok");
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_1".into(),
@@ -2014,6 +2202,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("low".into()),
                 cwd: Some("/w".into()),
+                plugins: None,
             },
         })
         .await
@@ -2039,6 +2228,7 @@ mod tests {
     async fn fake_sink_blank_settings_binding_is_lineage_only() {
         let fake = Arc::new(FakeIdentitySink::default());
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_blank".into(),
@@ -2086,6 +2276,7 @@ mod tests {
     async fn fake_sink_lookup_by_create_request_id_resolves_lineage() {
         let fake = Arc::new(FakeIdentitySink::default());
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_abc".into(),
@@ -2225,6 +2416,7 @@ mod tests {
 
         // A stamped lineage-only row (blank settings) still answers.
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2260,6 +2452,7 @@ mod tests {
         // A later conn-less write (all-None stamps) keeps them — and a partial
         // stamp touches NOTHING (the attribution fact is atomic).
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2277,6 +2470,7 @@ mod tests {
         .await
         .expect("conn-less refresh ok");
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2315,6 +2509,7 @@ mod tests {
         // mirrored): an OLDER full-triple assertion never drags the
         // attribution back; an equal-or-newer one replaces it.
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2340,6 +2535,7 @@ mod tests {
         assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
         assert_eq!(p.asserted_at, 111, "the older assertion never applies");
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2367,6 +2563,7 @@ mod tests {
 
         // A genuinely unattributed row answers None — never Some(default).
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_unstamped".into(),
@@ -2395,6 +2592,7 @@ mod tests {
     async fn fake_sink_clear_provenance_erases_the_tracked_stamps() {
         let fake = Arc::new(FakeIdentitySink::default());
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
@@ -2419,6 +2617,7 @@ mod tests {
         assert!(fake.load_provenance("opencode", "ses_clr").is_some());
 
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
@@ -2442,6 +2641,7 @@ mod tests {
         );
         // Inherit afterwards has nothing to keep: the stamps stay gone.
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
@@ -2470,6 +2670,7 @@ mod tests {
     async fn fake_sink_mirrors_the_kill_tombstone_fence_and_the_claim_clear() {
         let fake = Arc::new(FakeIdentitySink::default());
         let upsert = || FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "durable-m".into(),
@@ -2583,6 +2784,7 @@ mod tests {
             "the refusal never revived"
         );
         fake.record_binding(FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "durable-cc".into(),
@@ -2619,6 +2821,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn fake_orphan_gate_applies_at_release_against_the_tombstone_state() {
         let upsert = || FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "durable-g".into(),

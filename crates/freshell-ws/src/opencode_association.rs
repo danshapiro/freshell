@@ -1319,6 +1319,7 @@ mod tests {
         state
             .pane_ledger
             .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
+                genesis: crate::pane_ledger::GenesisWrite::Keep,
                 provider: "opencode",
                 session_id: SID,
                 mode: "freshopencode",
@@ -1335,6 +1336,7 @@ mod tests {
 
                 authoritative: false,
                 now_ms: now_ms(),
+                plugins: None,
             })
             .expect("seed fresh-agent ledger row");
 

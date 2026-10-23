@@ -69,14 +69,14 @@ use tokio::sync::Mutex as TokioMutex;
 use freshell_codex::next_monotonic_turn_complete_at;
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
-    FreshAgentConfigure, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
-    FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendAccepted,
-    FreshAgentSessionMaterialized, ServerMessage, SessionRuntimeOwner, SessionType,
+    FreshAgentConfigure, FreshAgentCreate, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
+    FreshAgentKill, FreshAgentKilled, FreshAgentQuestionRespond, FreshAgentSend,
+    FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage, SessionRuntimeOwner,
+    SessionType,
 };
 
 use crate::claude_handshake::{read_created, BootContext};
-use crate::claude_launch::{create_line, ClaudeBoot};
+use crate::claude_launch::{ClaudeBoot, ClaudeLaunchSpec};
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
@@ -108,11 +108,6 @@ const PENDING_CLAUDE_CREATE_PREFIX: &str = "pending-create-";
 const CLAUDE_SIDECAR_OWNERSHIP_ENV: &str = crate::claude_spawn::CLAUDE_SIDECAR_OWNERSHIP_ENV;
 /// Cold-boot budget for the sidecar to answer the `create` request (`created`).
 const SIDECAR_CREATE_BUDGET: Duration = Duration::from_secs(45);
-/// kata 1wxv task 4 review (C1): `handle_send`'s re-resolve cadence while a
-/// rollback holds the session's teardown→respawn window open. The loop is
-/// bounded by the rollback's own lifetime (`rollback_in_flight` membership
-/// clears when the handler ends, on EVERY terminal path).
-const MID_ROLLBACK_PARK_TICK: Duration = Duration::from_millis(10);
 
 /// Shared, cheaply-cloneable freshclaude WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -249,10 +244,13 @@ pub struct FreshClaudeState {
     /// Rollback-vs-rollback single-flight (kata 1wxv Task 4), keyed by the
     /// CURRENT durable id. [`Self::handle_rollback`] acquires it BEFORE the
     /// session's `turn_lock` (lock order: rollback_in_flight FIRST, then the
-    /// turn lock — never the reverse); `handle_send` never ACQUIRES it but
-    /// polls its membership (task 4 review C1) to PARK a send that resolves
-    /// inside the rollback's teardown→respawn window rather than refuse it.
+    /// turn lock — never the reverse); nothing else acquires it.
     rollback_in_flight: crate::InFlightRegistry,
+    /// Fork-vs-fork single-flight (C14), keyed by the parent's sessions-map
+    /// key: a second Fork click on the same pane while the first one boots its
+    /// child is refused, never a second child the pane cannot adopt (the
+    /// codex `fork_in_flight` rule).
+    fork_in_flight: crate::InFlightRegistry,
     /// Focused-ep5-r1 Finding 1 (retire-on-kill round 2): retained ALIAS
     /// tombstones. When a session's `cli_index` aliases are evicted (consumer
     /// exit, kill, a lease-revoked/rollback teardown), the mapping is DEMOTED
@@ -559,22 +557,6 @@ struct PendingQuestionEntry {
     questions: Value,
 }
 
-/// kata 1wxv Task 4: the rollback-fork adoption wiring handed to the stdout
-/// consumer. The handler PREREAD the respawned sidecar's `sdk.session.init`
-/// line (the `--resume-drops-turn` refusal watch lives in that pre-read, before
-/// any durable state moves); the consumer runs the adoption for it EXACTLY like
-/// an in-stream init (cli_index insert + AWAITED binding carrying
-/// `supersedes` = the pre-rollback durable id + the rollback-row re-key old→new
-/// inside the SAME awaited batch), then resolves `adopted_tx` so the parked
-/// rollback handler proceeds with the new durable id.
-struct RollbackAdoption {
-    /// The pre-rollback durable id this create supersedes.
-    supersedes: String,
-    /// The preread `sdk.session.init` line (consumed by the handler's pre-read).
-    preseeded_init: Value,
-    adopted_tx: tokio::sync::oneshot::Sender<Option<String>>,
-}
-
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
     configuration: ClaudeConfiguration,
@@ -688,10 +670,9 @@ struct ClaudeSession {
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
     /// reads → record pre-write → pending-cancel → kill+spawn+adoption → reply);
     /// `handle_send` waits on it, then proceeds and destroys redo — and never
-    /// ACQUIRES `rollback_in_flight` (task 4 review C1: it only polls membership
-    /// to park through the teardown→respawn window — no circular wait exists).
-    /// Carried across the rollback's kill+respawn so a send that resolved its
-    /// handle (or parked through the window) serializes identically.
+    /// ACQUIRES `rollback_in_flight` (no circular wait exists). The replacement
+    /// an undo or redo registers takes this lock over, so a request that waited
+    /// on it follows the replacement (`live_key_after_turn_wait`).
     turn_lock: Arc<TokioMutex<()>>,
     /// Focused ep4-r2/ep4-r3 (probe protocol): rollback's pre-teardown quiesce
     /// probe registers its probeId + a oneshot here before writing the
@@ -713,6 +694,12 @@ struct ClaudeSession {
     /// the hardcoded "idle" that used to wedge stale-busy/stale-idle panes.
     /// Starts "idle" — a fresh/just-resumed session has announced nothing else.
     last_status: Arc<std::sync::Mutex<String>>,
+    /// The genesis this runtime was launched from when it had no transcript yet
+    /// (an undo's replacement, a fork's child; design §4.1), stamped with the
+    /// launch time. The snapshot serves it when the ledger records none: a lane
+    /// with no ledger (the hosted session host) still shows a pending session's
+    /// conversation. A transcript on disk always wins over it.
+    launch_genesis: Option<crate::identity_sink::RecordedGenesis>,
 }
 
 /// The sidecar's signed answer to a `rollback.quiesce` probe (ep4-r3). All
@@ -821,6 +808,7 @@ impl FreshClaudeState {
             ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
             terminal_liveness: Arc::new(|_, _| false),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            fork_in_flight: crate::InFlightRegistry::new(),
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             naming: crate::naming::NamingSink::default(),
@@ -862,45 +850,6 @@ impl FreshClaudeState {
         self
     }
 
-    /// The transcript store roots this lane's CLI writes to: the ones the
-    /// configured sidecar environment names (a test rig's isolated HOME /
-    /// CLAUDE_CONFIG_DIR), else this process's
-    /// ([`crate::claude_snapshot::claude_home_candidates`]). Snapshots read
-    /// from here, so they always read the store the sessions write.
-    pub(crate) fn transcript_store_roots(&self) -> Vec<std::path::PathBuf> {
-        match self.sidecar_environment.as_deref() {
-            None => crate::claude_snapshot::claude_home_candidates(),
-            Some(environment) => {
-                let var = |key: &str| {
-                    environment
-                        .iter()
-                        .rev()
-                        .find(|(name, _)| name == key)
-                        .map(|(_, value)| value.clone())
-                };
-                let home = var("HOME").map(std::path::PathBuf::from);
-                crate::claude_snapshot::claude_home_candidates_from(var, home)
-            }
-        }
-    }
-
-    /// The snapshot built from `thread_id`'s transcript in
-    /// [`Self::transcript_store_roots`], without the live overlays.
-    pub(crate) async fn transcript_snapshot(
-        &self,
-        session_type: &str,
-        thread_id: &str,
-        rollback: Option<&crate::rollback_record::RollbackRecord>,
-    ) -> Result<Value, crate::claude_snapshot::ClaudeSnapshotError> {
-        crate::claude_snapshot::get_claude_snapshot_in(
-            &self.transcript_store_roots(),
-            session_type,
-            thread_id,
-            rollback,
-        )
-        .await
-    }
-
     /// Test seam (see [`crate::claude_test_holds`]): every later session
     /// registration waits `hold` between starting the session's consumer and
     /// inserting its record, the way a production resume create awaits its
@@ -914,8 +863,25 @@ impl FreshClaudeState {
     /// end-of-output path after it recorded the dead session, before it reaps the
     /// sidecar and reports the exit, until the returned hold is released.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn hold_exit_reports(&self) -> Arc<crate::claude_test_holds::ExitReportHold> {
+    pub fn hold_exit_reports(&self) -> Arc<crate::claude_test_holds::StepHold> {
         self.test_holds.hold_exit_report()
+    }
+
+    /// Test seam (see [`crate::claude_test_holds`]): park every later undo or
+    /// redo after it wrote its durable record (holding the session's turn
+    /// lock), before it boots the replacement runtime, until the returned hold
+    /// is released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_rollback_boot(&self) -> Arc<crate::claude_test_holds::StepHold> {
+        self.test_holds.hold_rollback_boot()
+    }
+
+    /// Test seam: park every later fork once its child runtime is established,
+    /// before it records the child's binding row, until the returned hold is
+    /// released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_fork_child(&self) -> Arc<crate::claude_test_holds::StepHold> {
+        self.test_holds.hold_fork_child()
     }
 
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
@@ -939,26 +905,18 @@ impl FreshClaudeState {
     }
 
     /// b8ke focused episode-2 round-3 F3: crate-visible adoption driver for
-    /// in-crate cross-module tests (the handoff-runner tests simulate the
-    /// rollback's fork re-key publication).
+    /// in-crate cross-module tests (the handoff-runner tests drive an
+    /// in-stream re-key: an init naming a durable id other than the one the
+    /// session already carries).
     #[cfg(test)]
     pub(crate) async fn test_adopt_session_init(
         &self,
         cli_id: &str,
         session_id: &str,
         session_type: &str,
-        supersedes: Option<&str>,
     ) {
-        self.adopt_session_init(
-            cli_id,
-            session_id,
-            session_type,
-            None,
-            supersedes,
-            None,
-            None,
-        )
-        .await;
+        self.adopt_session_init(cli_id, session_id, session_type, None, None, None)
+            .await;
     }
 
     /// b8ke focused episode-2 round-2 F3 test seam installer.
@@ -1470,51 +1428,24 @@ impl FreshClaudeState {
         // D8 same-kind lease claim (the provider backstop — the coordinator
         // claim is the runner's, under-ticket).
         let resume_request_id = format!("handoff-resume-{}", uuid::Uuid::new_v4());
-        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
-        for round in 0..2u8 {
-            match self.leases.claim(
-                PROVIDER,
-                session_id,
-                &resume_request_id,
-                crate::session_lease::now_epoch_ms(),
-            ) {
-                crate::session_lease::FreshSessionClaim::Acquired => {
-                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                        Arc::clone(&self.leases),
-                        PROVIDER,
-                        session_id,
-                        &resume_request_id,
-                    ));
-                    break;
-                }
-                crate::session_lease::FreshSessionClaim::BoundLive { .. }
-                | crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    return Err((
-                        "another lifecycle operation holds this session's lease".to_string(),
-                        session_id.to_string(),
-                    ));
-                }
-                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
-                    if round == 0
-                        && crate::session_lease::kill_and_confirm_tree_dead(
-                            pid,
-                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                            &ownership_id,
-                        )
-                        .await
-                    {
-                        self.leases
-                            .force_release_after_confirmed_kill(PROVIDER, session_id);
-                        continue;
-                    }
-                    return Err((
-                        "the prior lease holder expired and could not be confirmed dead"
-                            .to_string(),
-                        session_id.to_string(),
-                    ));
-                }
+        let mut lease_guard = match self
+            .claim_launch_lease(session_id, &resume_request_id)
+            .await
+        {
+            LaunchLease::Acquired(guard) => Some(guard),
+            LaunchLease::BoundLive { .. } | LaunchLease::Held => {
+                return Err((
+                    "another lifecycle operation holds this session's lease".to_string(),
+                    session_id.to_string(),
+                ));
             }
-        }
+            LaunchLease::ExpiredUnconfirmed => {
+                return Err((
+                    "the prior lease holder expired and could not be confirmed dead".to_string(),
+                    session_id.to_string(),
+                ));
+            }
+        };
         let msg = FreshAgentAttach {
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
@@ -1635,7 +1566,8 @@ impl FreshClaudeState {
     }
 
     /// b8ke focused episode-2 round-2 F1: commit the rollback's claim by
-    /// RE-KEYING — the start's `Starting{op}` record under the OLD durable
+    /// RE-KEYING (C13: `expected_live_session_key` is the original runtime's
+    /// map key, `live_session_key` the replacement's) — the start's `Starting{op}` record under the OLD durable
     /// id moves to the NEW client-visible durable id in ONE atomic registry
     /// step (`commit_live_rekey`: never both-Live, never both-Vacant), the
     /// stamp is retained under the NEW id (the lane's kill/exit paths key
@@ -1652,6 +1584,7 @@ impl FreshClaudeState {
         old_durable_id: &str,
         ticket: &mut Option<freshell_ownership::OperationTicket>,
         new_durable_id: &str,
+        expected_live_session_key: &str,
         live_session_key: &str,
         pid: Option<u32>,
         initiator: &str,
@@ -1711,7 +1644,7 @@ impl FreshClaudeState {
                     PROVIDER,
                     old_durable_id,
                     new_durable_id,
-                    live_session_key,
+                    expected_live_session_key,
                     replacement_owner,
                     initiator,
                     // b8ke ext r6 F5: the rekey transition's operation id —
@@ -2071,7 +2004,7 @@ impl FreshClaudeState {
         &self,
         msg: FreshAgentCreate,
         provenance: Option<crate::BindProvenance>,
-    ) {
+    ) -> ClaudeCreateOutcome {
         let request_id = msg.request_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -2091,13 +2024,16 @@ impl FreshClaudeState {
                     provider: PROVIDER.to_string(),
                     request_id,
                     runtime_provider: PROVIDER.to_string(),
-                    session_id: cached.session_id,
+                    session_id: cached.session_id.clone(),
                     session_type: session_type.to_string(),
-                    session_ref: cached.session_ref,
+                    session_ref: cached.session_ref.clone(),
                     name_ref,
                     session_name,
                 }));
-                return;
+                return ClaudeCreateOutcome::Created {
+                    session_id: cached.session_id,
+                    session_ref: cached.session_ref,
+                };
             }
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
@@ -2162,8 +2098,8 @@ impl FreshClaudeState {
                 let owner_fields = crate::ownership_lane::terminal_owner_fields_from_snapshot(
                     &self.ownership_snapshot(PROVIDER, sid),
                 );
-                self.fail_create_session_reserved_with_owner(&request_id, owner_fields.as_ref());
-                return;
+                return self
+                    .fail_create_session_reserved_with_owner(&request_id, owner_fields.as_ref());
             }
             // b8ke delta round-3 F2: the existing-session ADOPT is
             // COORDINATED — the coordinator claim decides BEFORE any
@@ -2188,8 +2124,7 @@ impl FreshClaudeState {
                     tracing::warn!(target: "freshell_freshagent::claude",
                         session_id = %sid, request_id = %request_id, code = err.code(),
                         "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    self.fail_create(&request_id, err.code(), err.message());
-                    return;
+                    return self.fail_create(&request_id, err.code(), err.message());
                 }
             };
             match self.begin_lane_claim_at(
@@ -2260,16 +2195,14 @@ impl FreshClaudeState {
                                      moved on while the live-runtime adopt committed — the \
                                      create is refused (never a live writer left unowned)"
                                 );
-                                self.fail_create(
+                                return self.fail_create(
                                     &request_id,
                                     "STALE_CLAIM",
                                     "ownership moved on while adopting the live session; refresh and retry",
                                 );
-                                return;
                             }
                         }
-                        self.adopt_live_create(&request_id, sid, session_type).await;
-                        return;
+                        return self.adopt_live_create(&request_id, sid, session_type).await;
                     }
                     own_ticket = Some(ticket);
                     // b8ke delta round-2 F2: register the start's
@@ -2290,16 +2223,14 @@ impl FreshClaudeState {
                     // live session adopts, spawn nothing. With no
                     // coordinator there is no fence to consult.
                     if self.has_live_session(sid).await {
-                        self.adopt_live_create(&request_id, sid, session_type).await;
-                        return;
+                        return self.adopt_live_create(&request_id, sid, session_type).await;
                     }
                 }
                 crate::ownership_lane::LaneClaim::Adopt => {
                     // A same-kind live runtime the coordinator names —
                     // adopt it, spawn nothing (the COORDINATED map-hit:
                     // the claim already verified the key's state).
-                    self.adopt_live_create(&request_id, sid, session_type).await;
-                    return;
+                    return self.adopt_live_create(&request_id, sid, session_type).await;
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_freshagent::claude",
@@ -2315,60 +2246,21 @@ impl FreshClaudeState {
                         &self.ownership,
                         &outcome,
                     );
-                    self.fail_create_session_reserved_with_owner(
+                    return self.fail_create_session_reserved_with_owner(
                         &request_id,
                         owner_fields.as_ref(),
                     );
-                    return;
                 }
             }
-            for round in 0..2u8 {
-                match self.leases.claim(
-                    PROVIDER,
-                    sid,
-                    &request_id,
-                    crate::session_lease::now_epoch_ms(),
-                ) {
-                    crate::session_lease::FreshSessionClaim::Acquired => {
-                        lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                            Arc::clone(&self.leases),
-                            PROVIDER,
-                            sid,
-                            &request_id,
-                        ));
-                        break;
-                    }
-                    crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
-                        // Under-lock ADOPT: the winner completed between our pre-check
-                        // and the claim (the V5 TOCTOU window).
-                        self.adopt_live_create(&request_id, sid, session_type).await;
-                        return;
-                    }
-                    crate::session_lease::FreshSessionClaim::Held { .. } => {
-                        self.fail_create_session_reserved(&request_id);
-                        return;
-                    }
-                    crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
-                        pid,
-                        ownership_id,
-                    } => {
-                        if round == 0
-                            && crate::session_lease::kill_and_confirm_tree_dead(
-                                pid,
-                                CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                                &ownership_id,
-                            )
-                            .await
-                        {
-                            self.leases
-                                .force_release_after_confirmed_kill(PROVIDER, sid);
-                            continue;
-                        }
-                        tracing::error!(target: "invariant", pid, session_id = sid,
-                            "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                        self.fail_create_session_reserved(&request_id);
-                        return;
-                    }
+            match self.claim_launch_lease(sid, &request_id).await {
+                LaunchLease::Acquired(guard) => lease_guard = Some(guard),
+                LaunchLease::BoundLive { .. } => {
+                    // Under-lock ADOPT: the winner completed between our pre-check
+                    // and the claim (the V5 TOCTOU window).
+                    return self.adopt_live_create(&request_id, sid, session_type).await;
+                }
+                LaunchLease::Held | LaunchLease::ExpiredUnconfirmed => {
+                    return self.fail_create_session_reserved(&request_id);
                 }
             }
         }
@@ -2416,9 +2308,9 @@ impl FreshClaudeState {
                     // (the key is Aliased{to: the live session} after its
                     // mint-time rekey); the idempotent re-drive ADOPTS the
                     // live session, spawning nothing.
-                    self.adopt_live_create(&request_id, &claim_key, session_type)
+                    return self
+                        .adopt_live_create(&request_id, &claim_key, session_type)
                         .await;
-                    None
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     // A duplicate create for this pane is still in flight
@@ -2434,11 +2326,10 @@ impl FreshClaudeState {
                         &self.ownership,
                         &outcome,
                     );
-                    self.fail_create_session_reserved_with_owner(
+                    return self.fail_create_session_reserved_with_owner(
                         &request_id,
                         owner_fields.as_ref(),
                     );
-                    None
                 }
             }
         } else {
@@ -2447,7 +2338,7 @@ impl FreshClaudeState {
 
         // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
         // 4+5): an explicit create-with-resume GENUINELY CLAIMS the durable
-        // identity — but the claim COMMITS only further down, once the
+        // identity — but the claim COMMITS only in `establish_runtime`, once the
         // replacement session is established (sidecar created + `created`
         // answered). Clearing the fence before the spawn (round 2's
         // placement) left a failed create's identity UNFENCED — an older
@@ -2458,437 +2349,126 @@ impl FreshClaudeState {
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
         // SNAPSHOT is taken here — at claim start, after the lease and
         // before the spawn — so a kill that lands while the resume awaits
-        // `created` advances the durable tombstone past it and the commit
-        // below REFUSES instead of undoing the newer close.
+        // `created` advances the durable tombstone past it and the commit in
+        // `establish_runtime` REFUSES instead of undoing the newer close.
         let claim_dead_state = resume_sid
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
 
-        let SpawnedSidecar {
-            mut child,
-            mut stdin,
-            stdout,
-            ownership_id,
-            log_labels,
-            tree_guard,
-        } = match self.spawn_sidecar_process(session_type).await {
-            Ok(spawned) => spawned,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
+        // Which conversation the resume boots (design §4.2, §4.3): a session
+        // that has no transcript yet boots from the genesis its binding row
+        // records (an undo's replacement or a fork's child whose sidecar died
+        // before its first send), never as a resume the CLI refuses (T5).
+        let genesis_boot = match resume_sid.as_deref() {
+            Some(sid) => match self.decide_create_resume_boot(sid) {
+                Ok(decided) => decided,
+                Err(ResumeClaudeError::NotFound) => {
+                    return self.fail_create(
+                        &request_id,
+                        "CONVERSATION_NOT_FOUND",
+                        &format!("No conversation found with session ID: {sid}"),
+                    );
                 }
-                self.fail_create(&request_id, "CLAUDE_SIDECAR_START_FAILED", &err);
-                return;
-            }
+                Err(ResumeClaudeError::Transient(detail)) => {
+                    return self.answer_create_failure(
+                        &request_id,
+                        ClaudeCreateOutcome::Failed {
+                            code: crate::claude_handshake::CREATE_FAILED_CODE.to_string(),
+                            message: format!(
+                                "The Claude transcript store could not be read: {detail}"
+                            ),
+                            retryable: Some(true),
+                            owner: None,
+                        },
+                    );
+                }
+            },
+            None => None,
         };
-        // Arm the TTL tree-kill path now that the child + its ownership tag exist.
-        if let Some(g) = lease_guard.as_mut() {
-            if let Some(pid) = child.id() {
-                g.set_kill_handle(pid, &ownership_id);
-            }
-        }
-        // kata b8ke Task 3: the spawn's partial runtime (the watchdog's
-        // reap target) + the pid for the commit's owner identity (captured
-        // before `child` moves into the session entry).
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: arm the registered start cancellation —
-        // from here the watchdog's cancel SIGTERMs this child.
-        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
-        if let Some(sid) = resume_sid.as_deref() {
-            crate::ownership_lane::register_partial_fresh_runtime(
-                &self.ownership,
-                PROVIDER,
-                sid,
-                &own_ticket,
-                sid,
-                sidecar_pid,
-            );
-        }
-        // b8ke ext r22 F1: the fresh path registers its spawn's partial
-        // runtime under the pane-scoped claim key (the ticket's key — the
-        // watchdog's reap target through the window; the `created` mint
-        // rekey below carries it onto the client-visible key's record).
-        if let Some(claim_key) = fresh_claim_key.as_deref() {
-            crate::ownership_lane::register_partial_fresh_runtime(
-                &self.ownership,
-                PROVIDER,
-                claim_key,
-                &own_ticket,
-                claim_key,
-                sidecar_pid,
-            );
-        }
+        let (boot, boot_cwd, boot_session_id, boot_genesis, recorded_genesis) = match genesis_boot {
+            Some(decided) => (
+                decided.boot,
+                decided.cwd.or_else(|| msg.cwd.clone()),
+                decided.session_id,
+                decided.genesis,
+                Some(decided.recorded),
+            ),
+            None => (
+                ClaudeBoot::resume_or_fresh(resume_sid.as_deref()),
+                msg.cwd.clone(),
+                None,
+                None,
+                None,
+            ),
+        };
 
-        // P1.13: FULL settings snapshot for the binding row the consumer writes at
-        // `sdk.session.init` (claude has no sandbox concept — always `None`). Built
-        // from the SAME values the create request below actually sends.
+        // P1.13: the FULL settings snapshot the session records at
+        // `sdk.session.init` (claude has no sandbox concept: always `None`), and
+        // the launch is built from the same values (G15: the plugins too).
         let settings = crate::identity_sink::FreshAgentSettings {
             model: msg.model.clone(),
             sandbox: None,
             permission_mode: msg.permission_mode.clone(),
             effort: msg.effort.clone(),
             cwd: msg.cwd.clone(),
-        };
-
-        // Send the create request (faithful to createClaudeSdkOptions inputs).
-        let boot = ClaudeBoot::resume_or_fresh(resume_sid.as_deref());
-        let create_req = create_line(
-            &request_id,
+            plugins: None,
+        }
+        .with_plugins(msg.plugins.clone());
+        let spec = ClaudeLaunchSpec::new(
+            request_id.clone(),
             session_type,
-            &boot,
-            json!({
-                "cwd": msg.cwd,
-                "model": msg.model,
-                "permissionMode": msg.permission_mode,
-                "effort": msg.effort,
-                "plugins": msg.plugins,
-                "hostedMcp": self.hosted_mcp,
-                "modelSelection": msg.model_selection,
-            }),
-        );
-        if let Err(err) = write_line(&mut stdin, &create_req).await {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            // Own tree torn down above -- releasing the lease is safe (no orphan writer).
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
-            self.fail_create(&request_id, "CLAUDE_SIDECAR_WRITE_FAILED", &err);
-            return;
-        }
-
-        // Read stdout until `created` / `create.failed` (bounded): the sidecar answers
-        // `created` only once the CLI has booted the conversation, and a refused boot
-        // (a resume of a conversation the CLI does not have, a CLAUDE_CMD that is not
-        // the CLI) is a typed `create.failed`, never a session that is already dead.
-        // Keep the reader to hand to the consumer so no post-created event line is lost.
-        let mut reader = BufReader::new(stdout).lines();
-        let boot_context = BootContext {
-            request_id: &request_id,
-            session_type,
-            boot: &boot,
-        };
-        let created = match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
-            Ok(created) => created.session_id,
-            Err(failure) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                // Own tree torn down above -- release so the loser can acquire.
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                self.fail_create(&request_id, failure.code(), failure.message());
-                return;
-            }
-        };
-
-        // Retire-on-kill round 3 (focused-ep5-r2 Findings 4+5): the genuine
-        // claim COMMITS here — the replacement session is ESTABLISHED
-        // (sidecar created + `created` answered), so the durable kill fence
-        // the close recorded is cleared, the stale placeholder alias
-        // tombstones pointing at this durable are consumed, and a
-        // kill-closed ledger row returns to Bound. Every failure arm ABOVE
-        // precedes the commit, so a failed spawn/write/create keeps the
-        // fence by never touching it (Finding 5); the lease-revoke arm below
-        // is the ONE post-commit failure and rolls the claim back
-        // (`rollback_session_claim` re-raises the fence and re-retires the
-        // row). The commit runs BEFORE `spawn_consumer` by construction, so
-        // the consumer's `sdk.session.init` adoption write can never consult
-        // a fence whose clear it raced — the ordering is structural, not
-        // scheduled.
-        //
-        // Unified agent names (Task 2): the pre-durable handle is admitted
-        // with the placeholder session id — BEFORE any failure arm that
-        // would otherwise strand a handle the pane content already carries
-        // (creation/recovery retries re-ensure the same handle idempotently).
-        let naming_projection = self.admit_create_handle(&msg, session_type, &created).await;
-        //
-        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL —
-        // if a kill landed while this create awaited `created`, the durable
-        // dead-state has advanced past the claim-start snapshot and the
-        // commit refuses with NO side effects: the just-built session is an
-        // orphan of the pane the user already closed, so it is torn down
-        // here (own tree killed, lease failed open) and the row the kill
-        // retired STAYS Retired. Nothing was registered yet (the
-        // consumer/`cli_index`/sessions inserts all follow the commit), so
-        // a plain process teardown is the entire arm.
-        if let Some(sid) = resume_sid.as_deref() {
-            // Round 6 (Finding 2): the commit's placeholder-fence consult —
-            // the claim's identity registers under the just-minted `created`
-            // seat; a close fence under it blocks the commit exactly like
-            // one under the durable.
-            if !self
-                .commit_session_claim(sid, claim_dead_state, std::slice::from_ref(&created))
-                .await
-            {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                self.fail_create(
-                    &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session closed while the resume was in flight; torn down",
-                );
-                return;
-            }
-        }
-
-        // b8ke ext r22 F1: the FRESH path's mint-time rekey — the SAME
-        // ticket's in-flight record moves from the pane-scoped provisional
-        // key to the just-minted client-visible session id in ONE atomic
-        // step (`rekey_starting`: the provisional key becomes
-        // `Aliased{to: <created>}` — the rekey family's resolution record,
-        // so an idempotent re-drive of this createRequestId resolves to the
-        // session and adopts — and the `created` key holds the SAME
-        // operation's `Starting` through this handler's tail; the ticket
-        // survives via `rekey_session_id`, so the RAII typed drop at
-        // handler end settles the window record). A record already under
-        // the `created` key (a competitor claimed the freshly discoverable
-        // id inside the window) REFUSES typed — the minted runtime is torn
-        // down below (never two writers, never an orphan).
-        if fresh_claim_key.is_some() {
-            if let Some(ticket) = own_ticket.as_mut() {
-                let Some(registry) = self.ownership.as_ref() else {
-                    unreachable!("a live ticket implies a wired coordinator");
-                };
-                match registry.rekey_starting(
-                    PROVIDER,
-                    ticket.session_id(),
-                    &created,
-                    ticket.operation_id(),
-                    ticket.generation(),
-                ) {
-                    freshell_ownership::CommitOutcome::Committed => {
-                        ticket.rekey_session_id(&created);
-                    }
-                    outcome => {
-                        tracing::error!(target: "invariant",
-                            provider = PROVIDER, session_id = %created, request_id = %request_id,
-                            outcome = ?outcome,
-                            "freshagent.claude.create_rekey_refused: the minted session id \
-                             was claimed by another owner during the create window — the \
-                             minted runtime is torn down (kata b8ke ext r22 F1)"
-                        );
-                        let _ = child.start_kill();
-                        reap_owned_claude_sidecars(&ownership_id);
-                        self.fail_create(
-                            &request_id,
-                            "FRESH_AGENT_CREATE_FAILED",
-                            "the minted session id was claimed by another owner during the create; torn down",
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-
-        // V5 interleaving 2 (Task 12): on the create-resume path, insert
-        // `cli_index[durable] = map_key` SYNCHRONOUSLY at session registration
-        // (mirroring the attach path) -- NOT lazily at `sdk.session.init`, which lands
-        // hundreds of ms later and leaves `has_live_session` blind exactly when the 1s
-        // loser retry arrives. The `sdk.session.init` write stays as a corrector.
-        if let Some(sid) = resume_sid.as_deref() {
-            self.cli_index
-                .lock()
-                .await
-                .insert(sid.to_string(), created.clone());
-        }
-
-        // Start the stdout consumer (the completion edge normalization + the Task 2
-        // pending-set fold live here) and register the session, under the sessions
-        // map lock (review PRB-C10): the consumer reaches its session only through
-        // that lock, so no line it reads -- the boot's command catalog, a CLI death
-        // right after the boot -- can find the session missing. `Some(settings)` =>
-        // the consumer records a binding row at `sdk.session.init`.
-        let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        // Task 5: the fresh session's death-mint clock (see the field doc).
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
-        let turn_lock = Arc::new(TokioMutex::new(()));
-        // Fresh session: nothing announced yet; the consumer's status fold owns it.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        {
-            let mut sessions = self.sessions.lock().await;
-            let consumer = self.spawn_consumer(
-                reader,
-                created.clone(),
-                session_type.to_string(),
-                created.clone(),
-                Some(settings.clone()),
-                Arc::clone(&broadcast_id),
-                Arc::clone(&pending),
-                Arc::clone(&last_status),
-                Arc::clone(&in_turn),
-                Arc::clone(&turn_tracker),
-                Arc::clone(&last_synthesized_complete_at),
-                None,
-                provenance,
-            );
-            self.test_holds.registration().await;
-            sessions.insert(
-                created.clone(),
-                ClaudeSession {
-                    configuration: ClaudeConfiguration {
-                        settings,
-                        ..ClaudeConfiguration::default()
-                    },
-                    stdin,
-                    child,
-                    tree_guard,
-                    ownership_id: ownership_id.clone(),
-                    consumer,
-                    sidecar_session_id: created.clone(),
-                    cli_session_id: resume_sid.clone(),
-                    // b8ke focused episode-2 round-2 F2: the owning lifecycle op
-                    // — the create-resume claim's op id, so the session-init
-                    // adoption's Blocked arm can correlate its OWN in-flight
-                    // claim (a foreign blocker tears down instead).
-                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+            boot,
+            boot_cwd,
+            &settings,
+            self.hosted_mcp,
+        )
+        .with_session_id(boot_session_id)
+        .with_model_selection(serde_json::to_value(&msg.model_selection).ok());
+        // b8ke focused episode-2 round-2 F2: the create's claim owns this
+        // runtime's coordinator transition (the session-init adoption's Blocked
+        // arm correlates its own in-flight claim through it).
+        let owning_operation = own_ticket.as_ref().map(|t| t.operation_id().to_string());
+        let established = match self
+            .establish_runtime(
+                EstablishPlan {
+                    lane: EstablishLane::Create,
+                    spec,
+                    register_under: RegisterUnder::Minted,
+                    claim: resume_sid.clone().map(|durable| DurableClaim {
+                        durable,
+                        dead_state: claim_dead_state,
+                    }),
+                    rekey_provisional_claim: fresh_claim_key.is_some(),
+                    recorded_settings: Some(settings),
+                    owning_operation,
                     owning_generation: None,
-                    broadcast_id,
-                    pending,
-                    in_turn,
-                    turn_tracker,
-                    last_synthesized_complete_at,
-                    turn_lock,
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
+                    provenance,
+                    naming: Some(&msg),
+                    partial_runtime_key: resume_sid.clone().or_else(|| fresh_claim_key.clone()),
+                    start_pid_slot: &start_pid_slot,
+                    inherit: None,
+                    genesis: boot_genesis,
+                    retry: resume_sid.clone().map(|durable| BootRetry {
+                        durable,
+                        genesis: recorded_genesis,
+                    }),
                 },
-            );
-            // C09: a create that resumes an ended session makes it live again.
-            // Forgotten before the lock is released, so a death of this new
-            // incarnation is recorded after it, never forgotten by it.
-            if let Some(sid) = resume_sid.as_deref() {
-                self.dead_sessions.forget(&[sid], "resumed");
-            }
-        }
-        // Round 6 (Finding 2): the alias mapping is durable at registration (the
-        // adopt path's corrector re-stamps it later).
-        if let Some(sid) = resume_sid.as_deref() {
-            if let Some(sink) = self.identity_sink() {
-                if let Err(e) = sink
-                    .record_alias_tombstone(
-                        PROVIDER,
-                        &created,
-                        sid,
-                        crate::session_lease::now_epoch_ms() as i64,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %sid, placeholder = %created,
-                        "freshagent.claude.alias_tombstone_write_failed");
-                }
-            }
-        }
-
-        // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
-        // dead-state re-check. The commit above and a kill's retire serialize
-        // on the ledger guard, so a kill QUEUED behind a successful commit
-        // (its decision pre-dated the kill) lands while this lane is between
-        // the commit and the registration above. Now that the session is
-        // registered (kill-visible), re-validate against the claim-start
-        // snapshot: an advanced fence means the row was retired after our
-        // commit — the registered session is a late orphan of the pane the
-        // user closed. Tear it down (the kill's retire already left the row
-        // Retired; the kill's post-close sweep covers the mirror order) and
-        // answer failed. Kill always wins vs an in-flight claim.
-        if let Some(sid) = resume_sid.as_deref() {
-            if self.claim_dead_state_advanced(sid, claim_dead_state) {
-                tracing::info!(target: "freshell_freshagent::claude",
-                    durable = %sid,
-                    "freshagent.claude.claim_late_orphan_torn_down: a close landed between the \
-                     claim's commit and its registration; the registered orphan is torn down"
-                );
-                if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    // R2-2: the typed outcome is propagated; this unwind path holds no
-                    // coordinator fence, so the helper's typed log + its detached
-                    // escalation are the whole discipline here.
-                    let _teardown: LoggedTeardown =
-                        self.teardown_removed_session_logged(session).await;
-                }
-                // Demote (never drop) the torn-down registration: a later
-                // kill naming this placeholder still resolves the durable.
-                self.evict_cli_index_aliases(&created).await;
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                self.fail_create(
+                &mut lease_guard,
+                &mut own_ticket,
+            )
+            .await
+        {
+            Ok(established) => established,
+            Err(error) => {
+                return self.fail_create(
                     &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session closed while the resume was in flight; torn down",
+                    error.create_code(),
+                    &error.message(EstablishLane::Create),
                 );
-                return;
             }
-        }
-
-        // Task 12: bind the durable id to this live session + release the lease in ONE
-        // lock scope. A revoked lease (expired handle-less holder) means we must NOT
-        // keep the session -- tear down our own tree and answer failed.
-        if let Some(mut g) = lease_guard.take() {
-            if !g.complete(&created) {
-                if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    session.consumer.abort();
-                    let mut child = session.child;
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&session.ownership_id);
-                }
-                if let Some(sid) = resume_sid.as_deref() {
-                    // Finding 5's re-raise: the ONE post-commit failure arm —
-                    // the session is torn back down, so the close the commit
-                    // undid is durable again (fence re-raised, the revived
-                    // row re-retired) before any orphan write can land.
-                    self.rollback_session_claim(sid).await;
-                    // Finding 1: demote (not drop) the torn-down alias.
-                    self.evict_cli_index_aliases(&created).await;
-                    let _ = sid;
-                }
-                g.fail(); // own tree torn down -- reopen the key
-                self.fail_create(
-                    &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session lease revoked during create; torn down",
-                );
-                return;
-            }
-        }
-
-        // kata b8ke Task 3: the create's registration survived every teardown
-        // gate — commit `Live{FreshAgent}` under the claimed durable id (the
-        // sessions-map key is the `created` placeholder; the stamp lands in
-        // the lane's retained map under the CANONICAL durable). The FRESH
-        // create lane (no resume id) never claimed — nothing to commit (the
-        // canonical durable id only materializes at `sdk.session.init`; the
-        // residual is covered by the D7 probe backstop).
-        if let Some(sid) = resume_sid.as_deref() {
-            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, &created, sidecar_pid)
-            {
-                tracing::error!(target: "invariant",
-                    provider = PROVIDER, session_id = %sid, request_id = %request_id,
-                    outcome = ?outcome,
-                    "freshagent.claude.create_commit_stale: the coordinator moved on while \
-                     the create registered; the uncommitted session is torn down"
-                );
-                if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    // R2-2: the typed outcome is propagated; this unwind path holds no
-                    // coordinator fence, so the helper's typed log + its detached
-                    // escalation are the whole discipline here.
-                    let _teardown: LoggedTeardown =
-                        self.teardown_removed_session_logged(session).await;
-                }
-                self.evict_cli_index_aliases(&created).await;
-                self.fail_create(
-                    &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session ownership changed during create; torn down",
-                );
-                return;
-            }
-        }
+        };
+        let created = established.map_key;
+        let naming_projection = established.naming_projection;
 
         // Cache the completed create for requestId dedup BEFORE responding (mirrors
         // codex/opencode: a duplicate `create` arriving right after this point must see
@@ -2920,43 +2500,48 @@ impl FreshClaudeState {
             provider: PROVIDER.to_string(),
             request_id,
             runtime_provider: PROVIDER.to_string(),
-            session_id: created,
+            session_id: created.clone(),
             session_type: session_type.to_string(),
-            session_ref,
+            session_ref: session_ref.clone(),
             name_ref,
             session_name,
         }));
+        ClaudeCreateOutcome::Created {
+            session_id: created,
+            session_ref,
+        }
     }
 
-    fn fail_create(&self, request_id: &str, code: &str, message: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
+    /// Answer the create `request_id` with the failed `outcome` on the bus, and
+    /// return the outcome (I1: the frame is built from it).
+    fn answer_create_failure(
+        &self,
+        request_id: &str,
+        outcome: ClaudeCreateOutcome,
+    ) -> ClaudeCreateOutcome {
+        if let Some(frame) = outcome.create_failed_frame(request_id) {
+            self.broadcast(&frame);
+        }
+        outcome
+    }
+
+    fn fail_create(&self, request_id: &str, code: &str, message: &str) -> ClaudeCreateOutcome {
+        self.answer_create_failure(
+            request_id,
+            ClaudeCreateOutcome::Failed {
                 code: code.to_string(),
                 message: message.to_string(),
-                request_id: request_id.to_string(),
                 retryable: None,
+                owner: None,
             },
-        ));
+        )
     }
 
     /// The D8 loser answer (Task 12): reuses the existing create-failed frame with the
     /// fixed reservation code — NO new protocol fields (deliberate: avoids a C3 wire
     /// change; the client re-drive uses a fixed floor).
-    fn fail_create_session_reserved(&self, request_id: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
-                code: "SESSION_RESERVED".to_string(),
-                message: "Another resume for this session is in flight".to_string(),
-                request_id: request_id.to_string(),
-                retryable: Some(true),
-            },
-        ));
+    fn fail_create_session_reserved(&self, request_id: &str) -> ClaudeCreateOutcome {
+        self.fail_create_session_reserved_with_owner(request_id, None)
     }
 
     /// [`Self::fail_create_session_reserved`] + the coordinator's additive
@@ -2968,33 +2553,28 @@ impl FreshClaudeState {
         &self,
         request_id: &str,
         owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
-    ) {
-        let (owner_kind, owner_generation, owner_epoch) = match owner {
-            Some(fields) => (
-                Some(fields.owner_kind.to_string()),
-                Some(fields.owner_generation),
-                Some(fields.owner_epoch),
-            ),
-            None => (None, None, None),
-        };
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind,
-                owner_generation,
-                owner_epoch,
+    ) -> ClaudeCreateOutcome {
+        self.answer_create_failure(
+            request_id,
+            ClaudeCreateOutcome::Failed {
                 code: "SESSION_RESERVED".to_string(),
                 message: "Another resume for this session is in flight".to_string(),
-                request_id: request_id.to_string(),
                 retryable: Some(true),
+                owner: owner.cloned(),
             },
-        ));
+        )
     }
 
     /// The HAS-LIVE→ADOPT arm (Task 12, V1: new server behavior): answer a loser's
     /// create-with-resume with `freshAgent.created` naming the adopted DURABLE session
     /// (send/attach route to it via Task 10b's `cli_index` resolution) under the
     /// loser's own `requestId` — no spawn, no second writer.
-    async fn adopt_live_create(&self, request_id: &str, durable: &str, session_type: &str) {
+    async fn adopt_live_create(
+        &self,
+        request_id: &str,
+        durable: &str,
+        session_type: &str,
+    ) -> ClaudeCreateOutcome {
         self.create_dedup
             .record_success(
                 request_id,
@@ -3028,6 +2608,10 @@ impl FreshClaudeState {
             name_ref,
             session_name,
         }));
+        ClaudeCreateOutcome::Created {
+            session_id: durable.to_string(),
+            session_ref: Some(claude_session_ref(durable)),
+        }
     }
 
     // ── freshAgent.kill (WS) ─────────────────────────────────────────────────
@@ -4537,6 +4121,82 @@ impl FreshClaudeState {
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
 
+    /// The session `wire_id` names, with what a turn-locked request needs from
+    /// it: its map key, turn lock, busy truth (`in_turn`, `turn_tracker`) and
+    /// durable id. `None` when no live session answers to `wire_id`.
+    #[allow(clippy::type_complexity)] // the handles every turn-locked request reads
+    async fn turn_locked_handles(
+        &self,
+        wire_id: &str,
+    ) -> Option<(
+        String,
+        Arc<TokioMutex<()>>,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::Mutex<TurnTracker>>,
+        Option<String>,
+    )> {
+        let key = self.resolve_session_key(wire_id).await?;
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&key)?;
+        Some((
+            key,
+            session.turn_lock.clone(),
+            session.in_turn.clone(),
+            session.turn_tracker.clone(),
+            session.cli_session_id.clone(),
+        ))
+    }
+
+    /// The live session a request (`op`) resolved before it waited on
+    /// `turn_lock`, after the wait (design §3.3, §4.5 and §4.8): the same map
+    /// key while it is still registered; else, when an undo or redo replaced
+    /// that runtime while the request waited, the live end of the durable
+    /// ledger chain from the session's durable id (`durable`), then the wire
+    /// id's own resolution. Only a session that took this very lock over
+    /// counts: a request never lands on a runtime it did not serialize behind.
+    /// Every request the turn lock serializes (send, configure, compact, fork)
+    /// re-resolves through here.
+    pub(super) async fn live_key_after_turn_wait(
+        &self,
+        op: TurnLockedRequest,
+        map_key: &str,
+        wire_id: &str,
+        durable: Option<&str>,
+        turn_lock: &Arc<TokioMutex<()>>,
+    ) -> Option<String> {
+        if self.sessions.lock().await.contains_key(map_key) {
+            return Some(map_key.to_string());
+        }
+        let terminus = durable.and_then(|durable| {
+            self.identity_sink()
+                .and_then(|sink| sink.chain_terminus(PROVIDER, durable))
+        });
+        let candidates = terminus.iter().map(String::as_str).chain([wire_id]);
+        for candidate in candidates {
+            let Some(key) = self.resolve_session_key(candidate).await else {
+                continue;
+            };
+            let same_lock = self
+                .sessions
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|session| Arc::ptr_eq(&session.turn_lock, turn_lock));
+            if same_lock {
+                tracing::info!(target: "freshell_freshagent::claude",
+                    event = op.followed_replacement_event(),
+                    session_id = %wire_id,
+                    replaced = %map_key,
+                    replacement = %key,
+                    through_ledger_chain = terminus.as_deref() == Some(candidate),
+                    "a request that waited behind a rollback goes to the replacement runtime"
+                );
+                return Some(key);
+            }
+        }
+        None
+    }
+
     /// Handle a `freshAgent.send` for claude: push the user turn into the sidecar's SDK
     /// input stream, then broadcast `freshAgent.send.accepted`. The stdout consumer surfaces
     /// the unified attention edge (sidecar `sdk.turn.complete` — minted for EVERY result
@@ -4562,51 +4222,38 @@ impl FreshClaudeState {
 
         // Task 10b: a durable claude UUID resolves through `cli_index` to the live
         // session -- no more SESSION_NOT_FOUND for a durable id the index maps.
-        //
-        // kata 1wxv task 4 review (C1): a resolve/handles MISS while
-        // `rollback_in_flight` names this id means the rollback's teardown→respawn
-        // window swallowed the map entry (removed at teardown, re-inserted
-        // post-spawn under the SAME key with the turn lock carried across). PARK
-        // on the registry's membership and re-resolve instead of dying with
-        // SESSION_NOT_FOUND — the send then serializes BEHIND the rollback on the
-        // carried-over turn lock and lands on the POST-rollback (adopted) session
-        // («send waits, rollback wins, then destroys»). `handle_send` still never
-        // ACQUIRES `rollback_in_flight` (no circular wait exists): it only polls
-        // membership. A miss persisting after the rollback exits means the session
-        // is genuinely gone (a provably-rejected fork is torn down) — the honest
-        // SESSION_NOT_FOUND leg.
-        let (map_key, turn_lock, in_turn, turn_tracker) = loop {
-            let handles = match self.resolve_session_key(&session_id).await {
-                Some(key) => {
-                    let guard = self.sessions.lock().await;
-                    guard.get(&key).map(|s| {
-                        (
-                            key,
-                            s.turn_lock.clone(),
-                            s.in_turn.clone(),
-                            s.turn_tracker.clone(),
-                        )
-                    })
-                }
-                None => None,
-            };
-            if let Some(handles) = handles {
-                break handles;
-            }
-            if !self.rollback_in_flight.contains(&session_id) {
-                self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
-                return;
-            }
-            tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
+        // An undo or redo never hides the session from this resolution (C13:
+        // the replacement registers, and the original's ids alias it, in one
+        // step under the map locks), so a miss is a session that is gone.
+        let Some((map_key, turn_lock, in_turn, turn_tracker, durable_before_wait)) =
+            self.turn_locked_handles(&session_id).await
+        else {
+            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
+            return;
         };
         // r2 serialization discipline: hold the session turn lock across the
         // busy-set AND the sidecar write — the check-then-set window vs
         // `handle_rollback`'s busy gate is closed (a rollback holding this lock
-        // observes either no-send or a fully-marked in-flight turn). The lock
-        // handle is carried across the rollback's kill+respawn, so a send that
-        // resolved before the teardown window serializes identically to one that
-        // parked through it.
+        // observes either no-send or a fully-marked in-flight turn).
         let _turn = turn_lock.lock().await;
+        // An undo or redo that held this lock may have replaced the runtime
+        // the send resolved (C13: the replacement registers under its own id
+        // and takes this same lock over). The send goes to the replacement,
+        // found through the durable supersession chain, never to the stopped
+        // original and never to a revived one.
+        let Some(map_key) = self
+            .live_key_after_turn_wait(
+                TurnLockedRequest::Send,
+                &map_key,
+                &session_id,
+                durable_before_wait.as_deref(),
+                &turn_lock,
+            )
+            .await
+        else {
+            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
+            return;
+        };
         // Arm the coordinator guard only after the send has waited behind any
         // earlier turn. A lifecycle transition during that wait advances the
         // generation, so the captured fence is checked against the owner that
@@ -4945,7 +4592,6 @@ impl FreshClaudeState {
                 map_key,
                 session_type,
                 Some(&effective),
-                None,
                 self.identity_sink(),
                 // Settings-apply is conn-less from the pane's perspective: not a
                 // browser assertion — the ledger merge keeps the row's prior
@@ -4962,24 +4608,37 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = msg.request_id.clone();
 
-        let (map_key, turn_lock) = loop {
-            let handles = match self.resolve_session_key(&session_id).await {
-                Some(key) => {
-                    let guard = self.sessions.lock().await;
-                    guard.get(&key).map(|s| (key, s.turn_lock.clone()))
-                }
-                None => None,
-            };
-            if let Some(handles) = handles {
-                break handles;
-            }
-            if !self.rollback_in_flight.contains(&session_id) {
-                self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
-                return;
-            }
-            tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
+        let Some((map_key, turn_lock, _, _, durable_before_wait)) =
+            self.turn_locked_handles(&session_id).await
+        else {
+            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            return;
         };
         let _turn = turn_lock.lock().await;
+        // An undo or redo that held this lock may have replaced the runtime
+        // (C13): the setting applies to the replacement the pane now shows,
+        // never to the retired original.
+        let Some(live_key) = self
+            .live_key_after_turn_wait(
+                TurnLockedRequest::Configure,
+                &map_key,
+                &session_id,
+                durable_before_wait.as_deref(),
+                &turn_lock,
+            )
+            .await
+        else {
+            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            return;
+        };
+        // The pane follows a replacement through its `materialized` re-key, so
+        // it then knows the session by the replacement's id.
+        let session_id = if live_key == map_key {
+            session_id
+        } else {
+            live_key.clone()
+        };
+        let map_key = live_key;
 
         // kata z7j7: sandbox has NO claude-side concept — log observably
         // (id + boolean flag only), mirroring the send path's arm.
@@ -5212,10 +4871,10 @@ impl FreshClaudeState {
     /// normal `sdk.*` stream).
     ///
     /// Delta-r1 F1 (busy discipline): a compact IS a turn — the handler mirrors
-    /// [`Self::handle_send`] exactly: park through a mid-rollback teardown window
-    /// (poll `rollback_in_flight` membership; never acquire it), take the session
-    /// `turn_lock` (carried across the rollback kill+respawn, so the check-then-set
-    /// window against the rollback busy gate is closed), and set the busy truth
+    /// [`Self::handle_send`] exactly: take the session `turn_lock` (an undo's
+    /// replacement takes it over, and the compact follows the replacement, so
+    /// the check-then-set window against the rollback busy gate is closed), and
+    /// set the busy truth
     /// (`in_turn`) UNDER the lock BEFORE the sidecar write. A compact turn ends at
     /// the SDK's `sdk.result` frame (any subtype) — the existing four-edge clear
     /// set terminates it (plus `sdk.status:idle`, sidecar EOF, or a completed
@@ -5237,40 +4896,39 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
-        // The `handle_send` resolve discipline (task 4 review C1): a resolve/handles
-        // MISS while `rollback_in_flight` names this id means the rollback's
-        // teardown→respawn window swallowed the map entry — PARK on the registry's
-        // membership and re-resolve (the compact then serializes BEHIND the rollback
-        // on the carried-over turn lock). This handler never ACQUIRES
-        // `rollback_in_flight` (no circular wait exists): it only polls membership.
-        let (map_key, turn_lock, in_turn, turn_tracker) = loop {
-            let handles = match self.resolve_session_key(&session_id).await {
-                Some(key) => {
-                    let guard = self.sessions.lock().await;
-                    guard.get(&key).map(|s| {
-                        (
-                            key,
-                            s.turn_lock.clone(),
-                            s.in_turn.clone(),
-                            s.turn_tracker.clone(),
-                        )
-                    })
-                }
-                None => None,
-            };
-            if let Some(handles) = handles {
-                break handles;
-            }
-            if !self.rollback_in_flight.contains(&session_id) {
-                self.broadcast(&lost_session_frame(&session_id, msg.session_type));
-                return;
-            }
-            tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
+        // The `handle_send` resolve discipline: a miss is a session that is gone.
+        let Some((map_key, turn_lock, in_turn, turn_tracker, durable_before_wait)) =
+            self.turn_locked_handles(&session_id).await
+        else {
+            self.broadcast(&lost_session_frame(&session_id, msg.session_type));
+            return;
         };
         // Held across the busy-set AND the sidecar write (the handle_send r2
         // serialization discipline) — a rollback holding this lock observes either
         // no-compact or a fully-marked in-flight compact turn.
         let _turn = turn_lock.lock().await;
+        // An undo or redo that held this lock may have replaced the runtime
+        // (C13): the compact runs on the replacement the pane now shows, which
+        // took over this lock and the busy truth (`in_turn`, `turn_tracker`).
+        let Some(live_key) = self
+            .live_key_after_turn_wait(
+                TurnLockedRequest::Compact,
+                &map_key,
+                &session_id,
+                durable_before_wait.as_deref(),
+                &turn_lock,
+            )
+            .await
+        else {
+            self.broadcast(&lost_session_frame(&session_id, msg.session_type));
+            return;
+        };
+        let session_id = if live_key == map_key {
+            session_id
+        } else {
+            live_key.clone()
+        };
+        let map_key = live_key;
         // ep1-r3 F3 (the arm/await race): with a prior turn active this compact is
         // QUEUED — arm the tracker NOW, BEFORE the sidecar write await. The stdout
         // consumer's terminal-edge fold NEVER takes the turn lock, so an arm
@@ -5352,9 +5010,8 @@ impl FreshClaudeState {
         session_type: SessionType,
         thread_id: &str,
     ) -> Result<Value, String> {
-        let rollback = self.load_rollback_record(thread_id).await;
         let mut snapshot = self
-            .transcript_snapshot(session_type_str(session_type), thread_id, rollback.as_ref())
+            .disk_snapshot(session_type_str(session_type), thread_id)
             .await
             .map_err(|error| match error {
                 crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
@@ -5372,8 +5029,7 @@ impl FreshClaudeState {
 
     /// Test seam (`test-support`, C09 rigs): the live-state overlay the snapshot
     /// route applies ([`Self::apply_snapshot_metadata`]), over an empty snapshot,
-    /// for a check that needs no transcript (the overlay alone, before the
-    /// session wrote one).
+    /// for a test that checks the overlay alone (no transcript needed).
     #[cfg(any(test, feature = "test-support"))]
     pub async fn live_snapshot_overlay(&self, any_id: &str) -> Value {
         let mut snapshot = json!({});
@@ -5443,16 +5099,7 @@ impl FreshClaudeState {
         &self,
         any_id: &str,
     ) -> Option<crate::rollback_record::RollbackRecord> {
-        let durable = match self.resolve_session_key(any_id).await {
-            Some(map_key) => self
-                .sessions
-                .lock()
-                .await
-                .get(&map_key)
-                .and_then(|s| s.cli_session_id.clone())
-                .unwrap_or(map_key),
-            None => any_id.to_string(),
-        };
+        let durable = self.durable_session_id(any_id).await;
         self.identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, &durable))
     }
@@ -5516,81 +5163,6 @@ impl FreshClaudeState {
 
     // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 4; fork-at-point) ────
 
-    /// Decision 6: pending cards inside undone turns are CANCELLED, never silently
-    /// resolved. Emits the exact `freshAgent.permission.cancelled` /
-    /// `freshAgent.question.cancelled` frames the fold consumes, one per parked
-    /// entry, then clears the pending map. Invoked BEFORE the old sidecar is
-    /// torn down.
-    async fn emit_pending_cancellations(
-        &self,
-        map_key: &str,
-        session_id: &str,
-        session_type: &str,
-    ) {
-        let pending = {
-            let guard = self.sessions.lock().await;
-            guard.get(map_key).map(|s| Arc::clone(&s.pending))
-        };
-        let Some(pending) = pending else { return };
-        let (permissions, questions) = {
-            let mut p = pending.lock().expect("pending lock");
-            (
-                std::mem::take(&mut p.permissions),
-                std::mem::take(&mut p.questions),
-            )
-        };
-        for entry in permissions {
-            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                event: json!({
-                    "type": "freshAgent.permission.cancelled",
-                    "sessionId": session_id,
-                    "requestId": entry.request_id,
-                }),
-                provider: PROVIDER.to_string(),
-                session_id: session_id.to_string(),
-                session_type: session_type.to_string(),
-            }));
-        }
-        for entry in questions {
-            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                event: json!({
-                    "type": "freshAgent.question.cancelled",
-                    "sessionId": session_id,
-                    "requestId": entry.request_id,
-                }),
-                provider: PROVIDER.to_string(),
-                session_id: session_id.to_string(),
-                session_type: session_type.to_string(),
-            }));
-        }
-    }
-
-    /// Task-4 compensation: a fork/create failure AFTER the rollback record's
-    /// successful pre-write UNDOES that pre-write before the refusal is
-    /// answered — fork-at-point provably never mutates the ORIGINAL's history
-    /// (the Stage-2 hash-identical invariant), so the ledger must not describe a
-    /// rollback that never took effect. The provider-mutation triad (codex's
-    /// Rpc-vs-transport split) has no claude analog: EVERY claude failure leg is
-    /// provably-unmoved by construction. Task 4 review (Minor-3): when the
-    /// pre-op record was ABSENT, the faithful restore of "nothing was here" is
-    /// a DELETE of the just-created row — never a fabricated empty record.
-    async fn compensate_rollback_record(
-        &self,
-        durable_id: &str,
-        existing: Option<crate::rollback_record::RollbackRecord>,
-    ) {
-        let Some(sink) = self.identity_sink() else {
-            return;
-        };
-        let result = match existing {
-            Some(restore) => sink.record_rollback(PROVIDER, durable_id, restore).await,
-            None => sink.delete_rollback(PROVIDER, durable_id).await,
-        };
-        if let Err(e) = result {
-            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_compensate_failed");
-        }
-    }
-
     /// The pane re-key ride (kata 1wxv Task 4): the existing
     /// `freshAgent.session.materialized` broadcast shape (codex's mint-new respawn
     /// precedent), old client-facing id → new adopted durable id.
@@ -5637,1249 +5209,6 @@ impl FreshClaudeState {
         self.broadcast(&message);
     }
 
-    /// Handle a `freshAgent.undo` / `freshAgent.redo` for claude/kilroy (kata 1wxv
-    /// Task 4) — conversation rollback emulated by FORK-AT-POINT through the
-    /// sidecar: pre-write the durable record, cancel parked cards, kill the old
-    /// sidecar, and recreate it with the SDK `query()` options lane (`{resume,
-    /// resumeSessionAt, forkSession: true, resumeDropsTurn: <guard>}` — the
-    /// standalone `forkSession()` fn is FORBIDDEN, it remaps every uuid), then
-    /// adopt the minted durable id through the existing sdk.session.init machinery
-    /// (cli_index insert + AWAITED binding WITH supersedes + rollback-row re-key
-    /// old→new inside the same awaited batch).
-    ///
-    /// Redo re-forks at a LATER point from the retained ORIGINAL session (the
-    /// chain root), gated by the tip+LCP validity contract: the original's raw
-    /// chain tip must still equal the recorded `original_tip_uuid` AND the current
-    /// chain must still be a strict prefix of it — else `REDO_UNAVAILABLE` +
-    /// `REDO_REMOVED_HISTORY_COPY` (compaction/snips legitimately move things).
-    ///
-    /// First-turn rollback is LEGAL (r2): `resume_at_uuid: None` means "before the
-    /// first message" — the handler creates a FRESH conversation (NO resume keys;
-    /// the empty fresh transcript IS the rollback target) and records the
-    /// discarded session as the redo source.
-    ///
-    /// Ordering (durable-BEFORE-mutation + r2 lock discipline): toTurn validation
-    /// → rollback_in_flight single-flight (FIRST) → per-session turn lock (held
-    /// across the WHOLE handler) → busy gate (`in_turn` — the FIFO tracker's
-    /// DERIVED busy cache — ⇒ BUSY_TURN, the SOLE mid-turn protection; no
-    /// sidecar traffic at all on a refused attempt, ep2-r2) →
-    /// create-resume lease claim on the OLD durable id (so a concurrent attach
-    /// cannot bind the pre-rollback id mid-fork) → transcript reads + resume math
-    /// → AWAITED record pre-write (a pre-write failure REFUSES with
-    /// `LEDGER_WRITE_REFUSAL_COPY`, provider never touched) → pending-cancel
-    /// frames → kill+recreate (one `resumeDropsTurn` guard retry: the refusal
-    /// prefix maps to the plain-resume recovery, never surfaced raw) → adoption
-    /// → `materialized` OLD→NEW broadcast + envelope-stamp flip → rolledBack
-    /// broadcast → requesting-sink ack. A fork/create/adoption failure AFTER the
-    /// successful pre-write COMPENSATES the record (rewrites the pre-op record)
-    /// before the refusal is answered — the ledger never describes a rollback
-    /// the provider provably rejected. A rollback NEVER chimes.
-    pub async fn handle_rollback(
-        &self,
-        op: crate::rollback_record::RollbackRequest,
-        reply_sink: freshell_terminal::FrameSink,
-    ) {
-        use crate::claude_snapshot as snap;
-        use crate::rollback_record::*;
-
-        let Some(map_key) = self.resolve_session_key(&op.session_id).await else {
-            reply_sink(rollback_error_frame(
-                &op,
-                "INVALID_SESSION_ID",
-                "claude session not found",
-            ));
-            return;
-        };
-        // `turnId` absent on a toTurn frame is a SERVER-side validation error
-        // (never a zod refinement — the frozen contract keeps bare objects).
-        if op.mode == RollbackModeReq::ToTurn && op.turn_id.is_none() {
-            reply_sink(rollback_error_frame(
-                &op,
-                "INVALID_ROLLBACK_TARGET",
-                "rollback toTurn requires a turnId",
-            ));
-            return;
-        }
-        let (
-            durable_id,
-            in_turn,
-            turn_tracker,
-            turn_lock,
-            session_type,
-            last_synthesized_complete_at,
-        ) = {
-            let guard = self.sessions.lock().await;
-            match guard.get(&map_key) {
-                Some(s) => (
-                    s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
-                    s.in_turn.clone(),
-                    s.turn_tracker.clone(),
-                    s.turn_lock.clone(),
-                    session_type_str(op.session_type),
-                    // Task 5: the fork continues the SAME per-session
-                    // death-mint clock (carried like `in_turn` — the fork is
-                    // the same logical session lifetime, so a death-mint
-                    // after the fork can never regress past one before it).
-                    s.last_synthesized_complete_at.clone(),
-                ),
-                None => {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "INVALID_SESSION_ID",
-                        "claude session not found",
-                    ));
-                    return;
-                }
-            }
-        };
-        // Rollback-vs-rollback single-flight (lock order: FIRST, before the turn
-        // lock — never the reverse). handle_send never acquires this registry —
-        // it only POLLS membership to park through the teardown→respawn window
-        // (task 4 review C1).
-        let Some(_guard) = self.rollback_in_flight.try_acquire(&durable_id) else {
-            reply_sink(rollback_error_frame(
-                &op,
-                "INTERNAL_ERROR",
-                &format!("rollback already in progress for {durable_id}"),
-            ));
-            return;
-        };
-        // b8ke ext r29 F2 + focused ep5 r4 F3: the rollback's observed
-        // generation fence — the wire's observedEpoch/observedGeneration
-        // pair (additive since ext r21 F2) is HONORED verbatim: a request
-        // already stale on ARRIVAL (its pair predates a completed
-        // handoff/crash advance) can never be made current — the claim
-        // under the coordinator lock typed-refuses it, so a queued
-        // old-generation rollback can never tear down or roll back a
-        // newer runtime. A half-sent pair is the typed INVALID_FENCE
-        // refusal (the F7 discipline). And since ep5 r4 F3 the
-        // FULLY-ABSENT pair is the SAME typed refusal on a
-        // coordinator-wired lane — the ext-r13-F3 entry-observation
-        // discipline this replaces was the laundering the round-4
-        // reviewer rejects: a handler-START observation can detect an
-        // ownership change occurring AFTER it, but nothing can detect
-        // that an unfenced request was already stale WHEN RECEIVED
-        // (queued under generation N, arriving after the session moved
-        // away and returned at N+2 — indistinguishable from a current
-        // request, so it could adopt and roll back the NEWER owner).
-        // The refusal is the actionable contract (identical to the
-        // opencode lanes' FENCE_REQUIRED): the client re-observes the
-        // owner record and retries WITH the pair. Only the UNWIRED lane
-        // (no coordinator — the legacy no-coordinator lane) proceeds
-        // unfenced: there is nothing to launder against.
-        let rollback_fence =
-            match crate::ownership_lane::wire_fence(op.observed_epoch, op.observed_generation) {
-                Ok(fence) => fence,
-                Err(err) => {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                        session_id = %durable_id, request_id = %op.request_id, code = err.code(),
-                        "fresh_agent_rollback_refused: the observed fence is half-sent (invalid)");
-                    reply_sink(rollback_error_frame(&op, err.code(), err.message()));
-                    return;
-                }
-            };
-        let rollback_fence = match rollback_fence {
-            Some(fence) => Some(fence),
-            None => {
-                if self.ownership.is_some() {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                        session_id = %durable_id, request_id = %op.request_id,
-                        code = "INVALID_FENCE",
-                        "fresh_agent_rollback_refused: the rollback carried no observed \\
-                         ownership pair against a coordinator-wired lane — the client \\
-                         re-observes the owner record and retries with the pair (kata \\
-                         b8ke focused ep5 r4 F3)");
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "INVALID_FENCE",
-                        "the rollback carried no observed ownership pair; re-observe the \\
-                         session's owner record and retry",
-                    ));
-                    return;
-                }
-                None
-            }
-        };
-        // Held for the REST of this handler. in_turn is set by handle_send UNDER
-        // this same lock BEFORE the sidecar write (the check-then-set window is
-        // closed): observed false here means no op is in flight. Focused ep1-r1
-        // F1 through ep2-r2: `in_turn` is the FIFO tracker's DERIVED busy truth
-        // — recomputed from `TurnTracker::busy()` inside every mutation's
-        // critical section — so the gate stays closed through every op that is
-        // queued or mid-compaction, whether its turn ended technically (the
-        // interrupted active turn included, ep2-r2 F2: the queue survives it)
-        // or only structurally (every queued op owes its own terminal edge).
-        let _turn = turn_lock.lock().await;
-        if in_turn.load(std::sync::atomic::Ordering::SeqCst) {
-            // ep3-r3 F1: owed debt broken down — queue entries that are ONLY
-            // unpromoted compacts (nothing running, no candidate pending, no
-            // Turn owed) are provably quiescent and absorb (see
-            // [`absorb_unstarted_compact_debt`]). Everything else is genuinely
-            // mid-execution risk and refuses.
-            if !absorb_unstarted_compact_debt(&in_turn, &turn_tracker) {
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "BUSY_TURN",
-                    ROLLBACK_BUSY_MESSAGE,
-                ));
-                return;
-            }
-        }
-
-        // Lease discipline: claim the OLD durable id exactly like the
-        // create-resume path so a concurrent attach cannot bind the pre-rollback
-        // id mid-fork. A REFUSAL LEG — before any record write or teardown.
-        // kata b8ke Task 3: the coordinator claim comes FIRST — before the
-        // provider lease — so the rollback window (kill + re-resume of the
-        // same durable lane) is cross-kind-authoritative. The "we ARE the
-        // bound live owner" case surfaces as AdoptLive (same-kind live).
-        let rollback_lease_id = format!("rollback-{}", uuid::Uuid::new_v4());
-        // b8ke delta round-2 F2: the rollback-respawn start's watchdog
-        // machinery (the sidecar pid slot + the settle guard — see the
-        // create-resume claim site).
-        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
-        let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
-        let granted_ticket = match self.begin_lane_claim_at(
-            &durable_id,
-            &rollback_lease_id,
-            rollback_fence,
-            "freshclaude/rollback",
-        ) {
-            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            crate::ownership_lane::LaneClaim::Unwired => None,
-            crate::ownership_lane::LaneClaim::Adopt => {
-                // Same-kind live under this exact id (the lease arm's "we
-                // ARE the bound live owner" twin): proceed WITHOUT a claim
-                // — the binding already names this lane.
-                None
-            }
-            crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %durable_id, outcome = ?outcome,
-                    "fresh_agent_rollback_refused: the ownership coordinator refused the \
-                     claim (kata b8ke cross-kind authority)"
-                );
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                ));
-                return;
-            }
-        };
-        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
-        // b8ke delta round-2 F2 + focused episode-2 round-3 F5: the granted
-        // claim registers its REAL cancellation + settle with the watchdog
-        // IMMEDIATELY — the rollback's respawn helper (`rollback_spawn_
-        // create`) spawns the sidecar and then performs TWO sequential
-        // 45-second-budget reads; a watchdog sweep in those waits must
-        // find armed, cancellable evidence, never a fence with nothing
-        // registered. The sidecar pid slot arms when the child exists
-        // (below); the PARTIAL runtime registers NOW with the
-        // kind-appropriate identity (pid unknown until the spawn returns —
-        // the same evidence shape the codex spawn hook rearms with the
-        // real pid).
-        // b8ke ext r13 F3: the Adopt arm holds REAL authority across the
-        // replace window — the guard arms on the live incumbent's key and
-        // is held through the kill + respawn + register + rekey (this
-        // handler's scope), so a handoff or stop begin inside the window
-        // answers the typed Blocked outcome and can NEVER start a terminal
-        // beside the replacement (pre-r13 the Adopt arm proceeded with NO
-        // claim, and the rekey's verify was the only — post-overlap —
-        // defense).
-        // b8ke ext r38 F1: the arm is the ATOMIC ADOPT — the request's
-        // ORIGINAL observed fence (the pair the coordinator's claim already
-        // verified when it answered AdoptLive) plus the EXPECTED
-        // fresh-agent owner, validated in ONE coordinator-lock decision.
-        // Pre-r38 the arm RE-OBSERVED whatever was live and armed on it
-        // (the discard-and-re-observe laundering): a terminal handoff
-        // committing between the claim and the arm armed the guard on the
-        // TERMINAL owner and the rollback spawned a Fresh Claude sidecar
-        // beside the terminal before the late rekey tore it down — two
-        // live writers. The adopt closes the window: the observed pair
-        // names the record the rollback decided on; any advance or a
-        // foreign owner refuses typed BEFORE anything is killed or
-        // spawned.
-        let mut _rollback_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
-        if granted_ticket.is_none() && self.ownership.is_some() {
-            // Test seam (b8ke ext r38 F1): park with the claim ANSWERED
-            // (AdoptLive) but the adopt guard NOT yet armed — the
-            // claim-to-arm race test's deterministic hold (the test
-            // commits a terminal handoff against the key mid-park).
-            if let (Some(parked), Some(release)) = (
-                self.rollback_adopt_parked.as_ref(),
-                self.rollback_adopt_release.as_ref(),
-            ) {
-                parked.notify_one();
-                let _ = release.notified().await;
-            }
-            let resolved = self.resolve_ownership_key(&durable_id);
-            // The Adopt arm only fires on a WIRED lane, where the
-            // original pair is REQUIRED (the ep5-r4-F3 gate above refused
-            // the absent pair typed).
-            let Some(adopt_fence) = rollback_fence else {
-                tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %durable_id,
-                    "fresh_agent_rollback_refused: the Adopt arm requires the \
-                     original observed pair (unreachable — the gate above refused \
-                     the absent pair)"
-                );
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                ));
-                return;
-            };
-            let expected_fresh_owner = freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: None,
-                pid: None,
-                ownership_id: None,
-            };
-            match crate::ownership_lane::arm_adopt_guard(
-                &self.ownership,
-                PROVIDER,
-                &resolved,
-                &format!("rollback-adopt-{rollback_lease_id}"),
-                &expected_fresh_owner,
-                adopt_fence,
-                "freshclaude/rollback-adopt",
-            ) {
-                crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
-                    _rollback_adopt_guard = Some(guard);
-                }
-                crate::ownership_lane::LaneAttachGuard::Unwired => {}
-                crate::ownership_lane::LaneAttachGuard::Refused => {
-                    tracing::warn!(target: "freshell_freshagent::claude",
-                        session_id = %durable_id,
-                        "fresh_agent_rollback_refused: the Adopt arm's atomic adopt \
-                         refused to arm (ownership advanced or a foreign owner holds \
-                         the key) — the rollback aborts typed, nothing is killed or \
-                         spawned"
-                    );
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-            }
-        }
-        let mut own_ticket = granted_ticket;
-        if own_ticket.is_some() {
-            _start_cancellation = Some(
-                crate::ownership_lane::register_start_cancellation_for_ticket(
-                    &self.ownership,
-                    PROVIDER,
-                    &durable_id,
-                    &own_ticket,
-                    crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
-                ),
-            );
-            crate::ownership_lane::register_partial_fresh_runtime(
-                &self.ownership,
-                PROVIDER,
-                &durable_id,
-                &own_ticket,
-                &map_key,
-                None,
-            );
-        }
-        for round in 0..2u8 {
-            match self.leases.claim(
-                PROVIDER,
-                &durable_id,
-                &rollback_lease_id,
-                crate::session_lease::now_epoch_ms(),
-            ) {
-                crate::session_lease::FreshSessionClaim::Acquired => {
-                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                        Arc::clone(&self.leases),
-                        PROVIDER,
-                        &durable_id,
-                        &rollback_lease_id,
-                    ));
-                    break;
-                }
-                crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
-                    if live_session_key == map_key {
-                        // We ARE the bound live owner of this exact id — proceed
-                        // WITHOUT a lease (the binding already names this map key,
-                        // which the fork keeps).
-                        break;
-                    }
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
-                    if round == 0
-                        && crate::session_lease::kill_and_confirm_tree_dead(
-                            pid,
-                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                            &ownership_id,
-                        )
-                        .await
-                    {
-                        self.leases
-                            .force_release_after_confirmed_kill(PROVIDER, &durable_id);
-                        continue;
-                    }
-                    tracing::error!(target: "invariant", pid, session_id = %durable_id,
-                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    ));
-                    return;
-                }
-            }
-        }
-
-        let now = now_ms();
-        let existing = self
-            .identity_sink()
-            .and_then(|s| s.load_rollback(PROVIDER, &durable_id));
-
-        let (
-            resume_from,
-            source_path,
-            resume_at_uuid,
-            removed_turns,
-            prompt_text,
-            chain_root,
-            original_tip_uuid,
-            can_redo_after,
-            guard_uuid,
-        ) = match op.direction {
-            RollbackDirection::Undo => {
-                let path = match snap::locate_transcript_state(&durable_id) {
-                    snap::TranscriptLocation::Found(path) => path,
-                    snap::TranscriptLocation::Absent => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    snap::TranscriptLocation::Unreadable(error) => {
-                        reply_sink(snap::unreadable_rollback_refusal(&op, &durable_id, &error));
-                        return;
-                    }
-                };
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
-                        return;
-                    }
-                };
-                let target = match op.mode {
-                    RollbackModeReq::Step => snap::ResumeTarget::Step,
-                    RollbackModeReq::ToTurn => {
-                        snap::ResumeTarget::ToTurn(op.turn_id.clone().expect("validated"))
-                    }
-                };
-                let point = match snap::resolve_resume_point(&text, &durable_id, target) {
-                    Ok(p) => p, // resume_at_uuid None = "before the first message" — LEGAL (r2)
-                    Err(snap::ResumeResolveError::Empty) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "NOTHING_TO_UNDO",
-                            UNDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(_) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "INVALID_ROLLBACK_TARGET",
-                            &format!("turn {:?} is not in this conversation", op.turn_id),
-                        ));
-                        return;
-                    }
-                };
-                // Epoch rule (r2/r3): an undo landing while redo_destroyed is set
-                // re-roots the chain to the CURRENT durable id — the retained old
-                // original describes a branch a resend already permanently
-                // replaced; O's redo stays permanently dead.
-                let chain_root = existing
-                    .as_ref()
-                    .filter(|r| !r.redo_destroyed)
-                    .and_then(|r| r.original_session_id.clone())
-                    .unwrap_or_else(|| durable_id.clone());
-                // Tip anchor at UNDO time = the last raw-chain uuid of the
-                // CHAIN-ROOT transcript (at the first undo the current file IS the root).
-                let root_text = if chain_root == durable_id {
-                    text.clone()
-                } else {
-                    match snap::locate_transcript(&chain_root)
-                        .and_then(|p| std::fs::read_to_string(p).ok())
-                    {
-                        Some(t) => t,
-                        None => {
-                            reply_sink(rollback_error_frame(
-                                &op,
-                                "INTERNAL_ERROR",
-                                "chain-root transcript unreadable",
-                            ));
-                            return;
-                        }
-                    }
-                };
-                let tip = snap::raw_chain_tip(&root_text);
-                // The resumeDropsTurn guard uuid = the RAW chain entry at the
-                // removed step's first position (task 4 review nit 4 — SDK-exact
-                // + cheaper than the display projection; brief/SDK semantics:
-                // the guard declares the discarded turn's prompt).
-                let guard = point.guard_uuid.clone();
-                // can_redo after the undo: the removed content provably exists in
-                // the original beyond the resume point (on the r2 first-turn leg
-                // the fresh conversation's tip is NONE — strictly beyond holds
-                // whenever a tip exists).
-                (
-                    durable_id.clone(),
-                    path,
-                    point.resume_at_uuid,
-                    point.removed_turns,
-                    point.prompt_text,
-                    chain_root,
-                    tip,
-                    true,
-                    guard,
-                )
-            }
-            RollbackDirection::Redo => {
-                let Some(record) = existing.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                if record.redo_destroyed {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_DESTROYED_MESSAGE,
-                    ));
-                    return;
-                }
-                let Some(original) = record.original_session_id.clone() else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_EMPTY_MESSAGE,
-                    ));
-                    return;
-                };
-                let original_path = match snap::locate_transcript_state(&original) {
-                    snap::TranscriptLocation::Found(path) => path,
-                    snap::TranscriptLocation::Absent => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "REDO_UNAVAILABLE",
-                            REDO_REMOVED_HISTORY_COPY,
-                        ));
-                        return;
-                    }
-                    snap::TranscriptLocation::Unreadable(error) => {
-                        reply_sink(snap::unreadable_rollback_refusal(&op, &original, &error));
-                        return;
-                    }
-                };
-                let original_text = match std::fs::read_to_string(&original_path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
-                        return;
-                    }
-                };
-                let Some(current_path) = snap::locate_transcript(&durable_id) else {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "INTERNAL_ERROR",
-                        "current transcript missing",
-                    ));
-                    return;
-                };
-                // Task 4 review (Minor-2): classify the read OUTCOME — a missing
-                // file (or a raced deletion) is the DELIBERATE vacuous-empty leg
-                // (the post-first-turn-undo empty transcript; LCP admits the
-                // first group end), but any REAL read error on this
-                // existing-expected path is a loud INTERNAL_ERROR, exactly like
-                // the original's read leg above — never a silent empty-chain
-                // degradation yielding a false `redone` ack plus a pointless fork.
-                let current_text = match std::fs::read_to_string(&current_path) {
-                    Ok(t) => t,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(e) => {
-                        reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &e.to_string()));
-                        return;
-                    }
-                };
-                // Redo validity contract (wire design; LBC-9): the original must
-                // BE the history the undo observed — raw-chain tip == the
-                // recorded tip — AND the current chain must still be a strict
-                // prefix of it (the LCP resolves PAST the current tip). Any
-                // miss => loud REDO_UNAVAILABLE + REDO_REMOVED_HISTORY_COPY;
-                // never silently re-fork over moved history.
-                let original_tip = snap::raw_chain_tip(&original_text);
-                if original_tip != record.original_tip_uuid {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                if snap::raw_lcp_end(&current_text, &original_text)
-                    != snap::raw_chain_tip(&current_text)
-                {
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "REDO_UNAVAILABLE",
-                        REDO_REMOVED_HISTORY_COPY,
-                    ));
-                    return;
-                }
-                // The resume point = the LAST raw-chain uuid of the restored
-                // step's group — its assistant tail (r3 boundary rule).
-                let resume_at = match snap::redo_resume_target(&original_text, &current_text, &op) {
-                    Ok(Some(uuid)) => uuid,
-                    Ok(None) => {
-                        reply_sink(rollback_error_frame(
-                            &op,
-                            "REDO_UNAVAILABLE",
-                            REDO_EMPTY_MESSAGE,
-                        ));
-                        return;
-                    }
-                    Err(msg) => {
-                        reply_sink(rollback_error_frame(&op, "INVALID_ROLLBACK_TARGET", &msg));
-                        return;
-                    }
-                };
-                // The ack payload for a redo = the RESTORED slice (display
-                // projection of the original's range just-after-the-prefix
-                // through the resume point).
-                let restored =
-                    snap::restored_slice_turns(&original_text, &current_text, &resume_at);
-                let can_redo_after_redo = original_tip.as_deref() != Some(resume_at.as_str());
-                // The guard = the first ORIGINAL chain entry strictly AFTER the
-                // resume point (`None` — redoing TO the tip — omits it: the
-                // discard range is vacuous, never fabricated).
-                let guard = snap::raw_chain_successor(&original_text, &resume_at);
-                (
-                    original,
-                    original_path,
-                    Some(resume_at),
-                    restored.turns,
-                    restored.prompt_text,
-                    record.original_session_id.clone().expect("checked above"),
-                    record.original_tip_uuid.clone(),
-                    can_redo_after_redo,
-                    guard,
-                )
-            }
-        };
-
-        // Durable record FIRST (durable-BEFORE-mutation): computed from the
-        // pre-mutation reads, keyed by the CURRENT durable id, AWAITED before
-        // anything is torn down. The sdk.session.init adoption leg re-keys the
-        // row old→new inside its awaited binding batch — exactly one
-        // rollback-record-specific write, always pre-mutation. r3 UNION rule:
-        // `entries` accumulates; a NEW epoch freezes every prior entry (they stay
-        // first) and NEVER clears the bucket.
-        let mut record = existing
-            .clone()
-            .unwrap_or_else(|| RollbackRecord::empty(now));
-        match op.direction {
-            RollbackDirection::Undo => {
-                // Epoch rule (r3 + delta-r1 F8's literal bookkeeping): an undo
-                // landing while redo_destroyed was set (or whose chain root
-                // re-roots away from the prior record's) is a NEW epoch — bump
-                // `current_epoch` (every existing entry freezes with its own
-                // epoch), the destroyed bit clears so the record's redo fields
-                // describe the NEW chain (the prior chain's redo stays
-                // permanently dead), `entries` is NEVER cleared. Same-epoch
-                // undos splice the new (earlier-in-conversation) entry BEFORE
-                // the existing current-epoch block — positions never read
-                // timestamps.
-                let new_epoch = record.redo_destroyed
-                    || (existing
-                        .as_ref()
-                        .is_some_and(|r| r.original_session_id.is_some())
-                        && existing
-                            .as_ref()
-                            .and_then(|r| r.original_session_id.clone())
-                            .as_deref()
-                            != Some(chain_root.as_str()));
-                if new_epoch {
-                    record.redo_destroyed = false;
-                    record.begin_new_epoch();
-                }
-                record.splice_undo_entry(
-                    RollbackEntry {
-                        removed_turns: removed_turns.clone(),
-                        prompt_text: prompt_text.clone(),
-                        at_ms: now,
-                        epoch: record.current_epoch,
-                    },
-                    now,
-                );
-            }
-            RollbackDirection::Redo => {
-                // The restored turns leave the CURRENT-epoch marker portion (they
-                // are live again); frozen prior-epoch markers can never match a
-                // restorable id (the redo contract's LCP/tip validation can only
-                // restore from the current chain root).
-                let restored_id_set: std::collections::HashSet<&str> = removed_turns
-                    .iter()
-                    .filter_map(|t| {
-                        t.get("turnId")
-                            .or_else(|| t.get("id"))
-                            .and_then(Value::as_str)
-                    })
-                    .collect();
-                record.entries.retain_mut(|e| {
-                    e.removed_turns.retain(|t| {
-                        !t.get("turnId")
-                            .or_else(|| t.get("id"))
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| restored_id_set.contains(id))
-                    });
-                    !e.removed_turns.is_empty()
-                });
-            }
-        }
-        record.original_session_id = Some(chain_root.clone());
-        record.original_tip_uuid = original_tip_uuid.clone();
-        record.last_op_at_ms = now;
-        record.set_can_redo(can_redo_after, now);
-        if let Some(sink) = self.identity_sink() {
-            if let Err(e) = sink
-                .record_rollback(PROVIDER, &durable_id, record.clone())
-                .await
-            {
-                tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_pre_write_failed");
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "INTERNAL_ERROR",
-                    LEDGER_WRITE_REFUSAL_COPY,
-                ));
-                return;
-            }
-        }
-
-        // ep3-r5 F1 (the admit→teardown window): the gate's quiescence-proof is
-        // consumed ONCE at admission — a compact can arm and start (status
-        // folded, candidate set, gate re-boosted by ep3-r4 F1) while this
-        // already-admitted handler is doing transcript I/O. The quiesce probe
-        // above makes all provably-written evidence folded-visible; the
-        // recheck here (at the point of no return, immediately before
-        // teardown) aborts the rollback with BUSY_TURN plus a compensating
-        // ledger rewrite whenever that truth revived (the durable pre-write
-        // provably matches the provider: nothing was mutated).
-        if let Ok(ms) = std::env::var("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS") {
-            // Test-only knob: parks this handler in the admit→teardown window so
-            // the recheck choreography is deterministic (never in production).
-            if let Ok(ms) = ms.parse::<u64>() {
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-            }
-        }
-
-        // Focused ep4-r2/ep4-r3 (the post-admission evidence race, repaired
-        // for real): absorbed compact debt can STILL start in the sidecar
-        // after admission — the dispatch lifecycle is: sidecar input queue →
-        // SAME-TICK handoff when the SDK consumer is awaiting → SDK turn
-        // start (its `compacting` status folds the candidate here). The
-        // quiesce probe closes every leg of that lifecycle atomically: the
-        // sidecar (1) DROPS never-handed compacts from its own input queue
-        // (cancellation the SDK surface cannot provide for queue items), (2)
-        // reports in-flight/handed truth, and (3) answers on its stdout
-        // stream AFTER every already-emitted piece of evidence has been folded
-        // (stream order), correlated by probeId so a stale receipt can never
-        // close the probe. The verdict gates below plus the recheck cover the
-        // whole shape: all-clear → proceed; any busy signal or no answer →
-        // BUSY_TURN + compensating ledger rewrite. Skip when no live evidence
-        // path exists: write failure (sidecar already dead), or a FINISHED
-        // consumer (its EOF reaped the busy truth; nothing fresh can arrive).
-        let mut probe_armed = false;
-        let mut probe_rx = None;
-        let mut probe_id = String::new();
-        {
-            let mut guard = self.sessions.lock().await;
-            if let Some(session) = guard.get_mut(&map_key) {
-                if session.consumer.is_finished() {
-                    // EOF already zeroed the tracker — the recheck sees it.
-                } else {
-                    let (tx, rx) = tokio::sync::oneshot::channel::<QuiesceVerdict>();
-                    probe_id = uuid::Uuid::new_v4().to_string();
-                    *session
-                        .rollback_probe_slot
-                        .lock()
-                        .expect("rollback probe slot lock") = Some((probe_id.clone(), tx));
-                    // ep4-r3: the quiesce is its own request type — the sidecar
-                    // drains never-handed queued compacts and answers with its
-                    // own queue truth (the SDK's queued inputs cannot be
-                    // cancelled once handed).
-                    let probe_req = json!({
-                        "type": "rollback.quiesce",
-                        "sessionId": session.sidecar_session_id,
-                        "probeId": probe_id,
-                    });
-                    match write_line(&mut session.stdin, &probe_req).await {
-                        Ok(()) => {
-                            probe_armed = true;
-                            probe_rx = Some(rx);
-                        }
-                        Err(_) => {
-                            let _ = session
-                                .rollback_probe_slot
-                                .lock()
-                                .expect("rollback probe slot lock")
-                                .take();
-                        }
-                    }
-                }
-            }
-        }
-        if probe_armed {
-            let timeout_ms = std::env::var("FRESHELL_TEST_CLAUDE_ROLLBACK_PROBE_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(3000);
-            let verdict =
-                tokio::time::timeout(Duration::from_millis(timeout_ms), probe_rx.unwrap()).await;
-            match verdict {
-                Ok(Ok(QuiesceVerdict {
-                    cancelled_queue,
-                    in_flight_turn: false,
-                    handed_compact_likely: false,
-                })) => {
-                    if cancelled_queue > 0 {
-                        tracing::info!(
-                            session = %map_key,
-                            cancelled = cancelled_queue,
-                            "freshagent.claude.rollback_quiesce_cancelled_queue"
-                        );
-                    }
-                }
-                Ok(Ok(verdict)) => {
-                    // ep4-r3 F1: provider work crossed the un-cancellable
-                    // handoff (a turn mid-flight, or a compact already handed
-                    // to an awaiting SDK consumer) — refuse.
-                    tracing::info!(session = %map_key, ?verdict, "freshagent.claude.rollback_quiesce_busy");
-                    // ep4-r6 F5: never fabricate an empty row for a rollback
-                    // that never happened — the shared helper DELETES the
-                    // pre-write when the pre-op record was absent.
-                    self.compensate_rollback_record(&durable_id, existing.clone())
-                        .await;
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "BUSY_TURN",
-                        ROLLBACK_BUSY_MESSAGE,
-                    ));
-                    return;
-                }
-                _ => {
-                    // Timeout (or a dropped sender — impossible in practice
-                    // since the slot outlives this handler): the absorb premise
-                    // is unproven — refuse rather than tear a live provider
-                    // flow down blind. Clear OUR slot (a stale receipt must
-                    // never fire a later probe — ep4-r3 F2 defense in depth
-                    // on top of probeId correlation).
-                    if let Some(session) = self.sessions.lock().await.get(&map_key) {
-                        let mut slot = session
-                            .rollback_probe_slot
-                            .lock()
-                            .expect("rollback probe slot lock");
-                        if slot.as_ref().is_some_and(|(id, _)| *id == probe_id) {
-                            slot.take();
-                        }
-                    }
-                    // ep4-r6 F5: never fabricate an empty row for a rollback
-                    // that never happened — the shared helper DELETES the
-                    // pre-write when the pre-op record was absent.
-                    self.compensate_rollback_record(&durable_id, existing.clone())
-                        .await;
-                    reply_sink(rollback_error_frame(
-                        &op,
-                        "BUSY_TURN",
-                        ROLLBACK_BUSY_MESSAGE,
-                    ));
-                    return;
-                }
-            }
-        }
-
-        let revived = {
-            let tracker = turn_tracker.lock().expect("turn tracker lock");
-            tracker.running.is_some()
-                || tracker.compact_candidate
-                || tracker.queued.iter().any(|op| *op == TrackedOp::Turn)
-        };
-        if revived {
-            // Compensate the pre-op durable record: the provider was never
-            // touched, so the ledger must describe nothing happening —
-            // restore the pre-op record, and DELETE the just-written row when
-            // there was none (never fabricate, ep4-r6 F5).
-            self.compensate_rollback_record(&durable_id, existing.clone())
-                .await;
-            reply_sink(rollback_error_frame(
-                &op,
-                "BUSY_TURN",
-                ROLLBACK_BUSY_MESSAGE,
-            ));
-            return;
-        }
-
-        // Cancel pending cards BEFORE teardown (decision 6) — both spawn legs.
-        self.emit_pending_cancellations(&map_key, &op.session_id, session_type)
-            .await;
-
-        // Pre-compute the create-drive inputs: recovered settings + the resume
-        // value/cwd (ledger A15 slug scoping; the transcript-PATH escape hatch
-        // when the original cwd is gone). The fork READS: undo ⇒ the CURRENT
-        // session's file; redo ⇒ the chain-root ORIGINAL's file (`resume_from`)
-        // -- `source_path`, the file the arm above already located and read
-        // (G28: never a second scan that a store turning unreadable could miss
-        // AFTER the pre-write, with teardown next).
-        let recovered = self
-            .identity_sink()
-            .and_then(|s| s.load_settings(PROVIDER, &durable_id));
-        let original_cwd =
-            snap::transcript_cwd(&source_path).filter(|c| std::path::Path::new(c).is_dir());
-        // resume value (the fork leg): the durable id under its ORIGINAL cwd's
-        // slug scope when that cwd survives; else the transcript PATH (the
-        // verified cli.js escape hatch bypassing slug scoping).
-        let resume_value = match &original_cwd {
-            Some(_) => resume_from.clone(),
-            None => source_path.to_string_lossy().to_string(),
-        };
-        let spawn_cwd = original_cwd
-            .clone()
-            .or_else(|| op.cwd.clone())
-            .or_else(|| recovered.as_ref().and_then(|r| r.cwd.clone()));
-        // Tear down the old sidecar (handle_kill discipline): remove the record
-        // FIRST so its consumer's exit arm stays silent (evicted=false), then the
-        // shared kill-family teardown (G31: the shutdown request, escalation only
-        // after the grace period, the ownership sweep, the tree confirmation),
-        // and the create-dedup eviction so a replayed requestId genuinely
-        // re-spawns.
-        let old = self.sessions.lock().await.remove(&map_key);
-        self.create_dedup
-            .clear_for_session(|record| record.session_id == map_key)
-            .await;
-        if let Some(session) = old {
-            // An unconfirmed tree is logged and keeps escalating detached; the
-            // fork does not wait on it (it never did).
-            let _ = self.teardown_removed_session_logged(session).await;
-        }
-
-        // Kill + recreate via `spawn_sidecar` with the computed options. The
-        // create payload is selected by `resume_at_uuid`:
-        //   * Some(uuid) — fork-at-point (resume + resumeSessionAt + forkSession);
-        //   * None (r2 first-turn rollback) — a FRESH conversation with NO resume
-        //     keys at all (the empty fresh transcript IS the rollback target).
-        // ONE guard retry: a create whose early output carries the
-        // `Resume rejected by --resume-drops-turn:` prefix is retried ONCE with
-        // resumeDropsTurn omitted (the plain-resume recovery per the SDK docs —
-        // the raw guard text is never surfaced).
-        let mut guard_retried = guard_uuid.is_none(); // no guard => nothing to retry
-        let spawned = loop {
-            let mut create_req = Map::new();
-            if let Some(cwd) = &spawn_cwd {
-                create_req.insert("cwd".to_string(), json!(cwd));
-            }
-            if let Some(rec) = &recovered {
-                if let Some(model) = &rec.model {
-                    create_req.insert("model".to_string(), json!(model));
-                }
-                if let Some(permission_mode) = &rec.permission_mode {
-                    create_req.insert("permissionMode".to_string(), json!(permission_mode));
-                }
-                if let Some(effort) = &rec.effort {
-                    create_req.insert("effort".to_string(), json!(effort));
-                }
-            }
-            let boot = match &resume_at_uuid {
-                Some(resume_at) => ClaudeBoot::Fork {
-                    resume: resume_value.clone(),
-                    at: Some(resume_at.clone()),
-                    // attempt 1 arms the guard; the retried recovery omits it.
-                    drops_turn: guard_uuid.clone().filter(|_| !guard_retried),
-                },
-                None => ClaudeBoot::Fresh,
-            };
-            let create_req = create_line(
-                &format!("rollback-{}", uuid::Uuid::new_v4()),
-                session_type,
-                &boot,
-                Value::Object(create_req),
-            );
-            match self
-                .rollback_spawn_create(&create_req, &boot, session_type, lease_guard.as_mut())
-                .await
-            {
-                Ok(ok) => break Ok(ok),
-                Err(RollbackSpawnError::GuardRefusal) if !guard_retried => {
-                    tracing::warn!(session = %durable_id,
-                        "freshagent.claude.rollback_guard_refused_retrying_plain");
-                    guard_retried = true;
-                    continue;
-                }
-                Err(RollbackSpawnError::GuardRefusal) => {
-                    break Err("the --resume-drops-turn guard refusal persisted after the plain-resume recovery retry".to_string())
-                }
-                Err(RollbackSpawnError::Other(message)) => break Err(message),
-            }
-        };
-        let spawned = match spawned {
-            Ok(ok) => ok,
-            Err(err) => {
-                self.compensate_rollback_record(&durable_id, existing.clone())
-                    .await;
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
-                return;
-            }
-        };
-        let RollbackSpawned {
-            child,
-            tree_guard,
-            stdin,
-            reader,
-            ownership_id,
-            log_labels,
-            sidecar_session_id,
-            preseeded_init,
-            cli_id,
-        } = spawned;
-        // kata b8ke Task 3: the respawn's partial runtime (the watchdog's
-        // reap target) + the pid for the commit's owner identity (captured
-        // before `child` moves into the session entry).
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: arm the registered start cancellation.
-        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            &durable_id,
-            &own_ticket,
-            &map_key,
-            sidecar_pid,
-        );
-
-        // Register the replacement session under the SAME map key, INHERITING
-        // the turn lock + busy truth handles (a mid-rollback send serializes on
-        // the SAME lock regardless of when it resolved its handle).
-        let (adopted_tx, adopted_rx) = tokio::sync::oneshot::channel();
-        let broadcast_id = Arc::new(std::sync::Mutex::new(op.session_id.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        // The respawn is fresh: nothing announced yet; the consumer's status
-        // fold owns the tracked status from here.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        // Task 5: the fork CARRIES the pre-rollback session's death-mint
-        // clock (extracted with the other carried handles above) — the fork
-        // continues the same logical session lifetime, so its Rust-minted
-        // `at`s stay ordered against anything the session minted before.
-        // Spawned and registered under the sessions map lock (review PRB-C10): no
-        // line the consumer reads can find the replacement session missing.
-        {
-            let mut sessions = self.sessions.lock().await;
-            let consumer = self.spawn_consumer(
-                reader,
-                map_key.clone(),
-                session_type.to_string(),
-                sidecar_session_id.clone(),
-                recovered.clone(),
-                Arc::clone(&broadcast_id),
-                Arc::clone(&pending),
-                Arc::clone(&last_status),
-                in_turn.clone(),
-                turn_tracker.clone(),
-                Arc::clone(&last_synthesized_complete_at),
-                Some(RollbackAdoption {
-                    supersedes: durable_id.clone(),
-                    preseeded_init,
-                    adopted_tx,
-                }),
-                // Conn-less lane (D8): the rollback respawn has no client
-                // connection — the ledger merge inherits the superseded parent's
-                // stamps.
-                None,
-            );
-            self.test_holds.registration().await;
-            sessions.insert(
-                map_key.clone(),
-                ClaudeSession {
-                    configuration: ClaudeConfiguration {
-                        settings: recovered.clone().unwrap_or_default(),
-                        ..ClaudeConfiguration::default()
-                    },
-                    stdin,
-                    child,
-                    tree_guard,
-                    ownership_id,
-                    consumer,
-                    sidecar_session_id,
-                    cli_session_id: Some(cli_id.clone()),
-                    // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
-                    // owns this respawn's coordinator transition — the
-                    // adoption's Blocked arm correlates through the op id.
-                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
-                    owning_generation: None,
-                    broadcast_id: Arc::clone(&broadcast_id),
-                    pending,
-                    in_turn: in_turn.clone(),
-                    turn_tracker: turn_tracker.clone(),
-                    last_synthesized_complete_at,
-                    turn_lock: turn_lock.clone(),
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
-                },
-            );
-        }
-
-        // Adoption rides the EXISTING sdk.session.init consumer (preseeded):
-        // cli_index insert + AWAITED binding WITH supersedes + rollback-row
-        // re-key old→new inside the same awaited batch — then resolves this
-        // channel with the adopted durable id.
-        let adopted_id = match tokio::time::timeout(SIDECAR_CREATE_BUDGET, adopted_rx).await {
-            Ok(Ok(Some(id))) if !id.is_empty() => id,
-            _ => {
-                tracing::error!(target: "invariant", session = %durable_id,
-                    "freshagent.claude.rollback_adoption_failed: the consumer never resolved the init adoption");
-                self.compensate_rollback_record(&durable_id, existing.clone())
-                    .await;
-                // Tear the fork down — an unadopted fork must never answer sends.
-                self.teardown_rollback_fork(&map_key).await;
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "INTERNAL_ERROR",
-                    "rollback adoption failed on the forked sidecar",
-                ));
-                return;
-            }
-        };
-
-        // Lease completion: bind the OLD durable id to the live map key and
-        // release the lease in one lock scope. A revoked lease means we must NOT
-        // keep the fork — tear down, compensate, refuse.
-        if let Some(mut g) = lease_guard.take() {
-            if !g.complete(&map_key) {
-                self.compensate_rollback_record(&durable_id, existing.clone())
-                    .await;
-                self.teardown_rollback_fork(&map_key).await;
-                g.fail(); // own tree torn down — reopen the key
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "INTERNAL_ERROR",
-                    "session lease revoked during rollback; torn down",
-                ));
-                return;
-            }
-        }
-
-        // kata b8ke Task 3 + focused episode-2 round-2 F1: the rollback's
-        // replacement session is registered — commit `Live{FreshAgent}`
-        // under the CLIENT-VISIBLE durable id. The fork's
-        // `sdk.session.init` minted `adopted_id`, and the materialization
-        // below replaces every pane's sessionRef with it — so the
-        // coordinator record RE-KEYS to the same id (one atomic registry
-        // step: the old key goes Vacant, the new key goes Live; the old id
-        // becomes a resolvable alias). One source of truth: a later
-        // handoff on the pane's sessionRef finds the prior owner, stops
-        // it, and transfers atomically — never a Vacant-looking split
-        // identity with a live runtime beside a second writer.
-        if let Err(outcome) = self.commit_lane_claim_rekey_at(
-            &durable_id,
-            &mut own_ticket,
-            &adopted_id,
-            &map_key,
-            sidecar_pid,
-            "claude/rollback",
-        ) {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %durable_id,
-                outcome = ?outcome,
-                "freshagent.claude.rollback_commit_stale: the coordinator moved on while \
-                 the rollback registered; the uncommitted session is torn down"
-            );
-            self.compensate_rollback_record(&durable_id, existing.clone())
-                .await;
-            self.teardown_rollback_fork(&map_key).await;
-            reply_sink(rollback_error_frame(
-                &op,
-                "INTERNAL_ERROR",
-                "session ownership changed during rollback; torn down",
-            ));
-            return;
-        }
-
-        // Pane re-key: the existing materialized broadcast (old → new) goes out
-        // BEFORE any frame stamped with the new id; the envelope-stamp flip
-        // follows it so the re-key never outruns the pane.
-        self.broadcast_materialized(&op.session_id, &adopted_id, session_type)
-            .await;
-        *broadcast_id.lock().expect("broadcast id lock") = adopted_id.clone();
-
-        let removed_ids: Vec<String> = removed_turns
-            .iter()
-            .filter_map(|t| {
-                t.get("turnId")
-                    .or_else(|| t.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect();
-        // Re-stamp the op for the NEW live id so every outbound frame names the
-        // adopted session.
-        let switch = RollbackRequest {
-            session_id: adopted_id.clone(),
-            ..op
-        };
-        self.broadcast(&rollback_broadcast_frame(
-            &switch,
-            &adopted_id,
-            &removed_ids,
-            record.can_redo(),
-        ));
-        reply_sink(rollback_ack_frame(
-            &switch,
-            &adopted_id,
-            Some(&prompt_text),
-            &removed_ids,
-            record.can_redo(),
-            Some(&adopted_id),
-        ));
-    }
-
     /// Resolve a client-addressed session id to the sessions-map key (Task 10b): the id
     /// itself when tracked, else through [`Self::cli_index`] (durable UUID -> map key).
     /// The map is never re-keyed (in-flight consumers hold the placeholder key);
@@ -6907,7 +5236,8 @@ impl FreshClaudeState {
     /// | untracked, durable id already in `cli_index`, aliased session LIVE | REBIND + ACK (Task 10b): flip the live session's envelope stamp to the durable id and answer with the `freshAgent.session.snapshot` stamped with the durable and the session's TRACKED status (the consumer's turn-lifecycle + sdk.status fold, never a hardcoded idle) -- the attaching client must observe success, never silence. The map is never re-keyed (alias, don't move) |
     /// | untracked, durable id in `cli_index` but aliased session GONE (stale row, eviction in flight) | fall through to the resume path below (the session is dead; resuming converges the client) |
     /// | untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit a `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID -- NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) -- carrying the session's tracked status ("idle" for a fresh resume, by construction) |
-    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable) | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
+    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable), binding row records a genesis (core design §4.2/§4.3: a zero-turn session, a pending fork) | boot it from the genesis under the durable id (`Fresh`, or the lazy fork of its parent), register and acknowledge exactly like the resume row above |
+    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable), no genesis | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
     /// | untracked, store UNREADABLE (no store root, or an IO error other than NotFound/NotADirectory while scanning) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- cannot check, so NEVER the lost frame (G28) |
     /// | untracked, spawn/pipe/created failure | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
@@ -7169,87 +5499,34 @@ impl FreshClaudeState {
             }
         };
         let attach_request_id = format!("attach-{}", uuid::Uuid::new_v4());
-        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
-        for round in 0..2u8 {
-            match self.leases.claim(
-                PROVIDER,
-                &durable,
-                &attach_request_id,
-                crate::session_lease::now_epoch_ms(),
-            ) {
-                crate::session_lease::FreshSessionClaim::Acquired => {
-                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
-                        Arc::clone(&self.leases),
-                        PROVIDER,
-                        &durable,
-                        &attach_request_id,
-                    ));
-                    break;
-                }
-                crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
-                    // The winner completed while we contended: converge via the same
-                    // rebind + ack the cli_index arm performs; if the binding is stale
-                    // (session just died), answer RESERVED -- the client re-drive
-                    // converges on the reopened key.
-                    self.resuming
-                        .lock()
-                        .expect("resuming lock")
-                        .remove(&durable);
-                    if !self
+        let lease = self.claim_launch_lease(&durable, &attach_request_id).await;
+        let mut lease_guard = match lease {
+            LaunchLease::Acquired(guard) => Some(guard),
+            refused => {
+                self.resuming
+                    .lock()
+                    .expect("resuming lock")
+                    .remove(&durable);
+                // The winner completed while we contended: converge via the
+                // same rebind + ack the cli_index arm performs; if the binding
+                // is stale (session just died), or another launch holds the
+                // lease, answer RESERVED -- the client re-drive converges on
+                // the reopened key.
+                let rebound = matches!(refused, LaunchLease::BoundLive { .. })
+                    && self
                         .try_rebind_to_live(&durable, session_type_str(msg.session_type))
-                        .await
-                    {
-                        self.emit_fresh_agent_error(
-                            &msg.session_id,
-                            session_type_str(msg.session_type),
-                            "SESSION_RESERVED",
-                            "Another resume for this session is in flight",
-                        );
-                    }
-                    return;
-                }
-                crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    self.resuming
-                        .lock()
-                        .expect("resuming lock")
-                        .remove(&durable);
+                        .await;
+                if !rebound {
                     self.emit_fresh_agent_error(
                         &msg.session_id,
                         session_type_str(msg.session_type),
                         "SESSION_RESERVED",
                         "Another resume for this session is in flight",
                     );
-                    return;
                 }
-                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
-                    if round == 0
-                        && crate::session_lease::kill_and_confirm_tree_dead(
-                            pid,
-                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                            &ownership_id,
-                        )
-                        .await
-                    {
-                        self.leases
-                            .force_release_after_confirmed_kill(PROVIDER, &durable);
-                        continue;
-                    }
-                    tracing::error!(target: "invariant", pid, session_id = %durable,
-                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    self.resuming
-                        .lock()
-                        .expect("resuming lock")
-                        .remove(&durable);
-                    self.emit_fresh_agent_error(
-                        &msg.session_id,
-                        session_type_str(msg.session_type),
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    );
-                    return;
-                }
+                return;
             }
-        }
+        };
         // b8ke focused episode-2 round-2 F2: the attach's OWN claim owns
         // the transition while it is in flight — recorded for the
         // session-init adoption's Blocked correlation.
@@ -7328,8 +5605,9 @@ impl FreshClaudeState {
     }
 
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
-    /// flavored): transcript-present gate -> spawn sidecar with a resume boot ->
-    /// register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
+    /// flavored): boot decision (a found transcript resumes; a session with no
+    /// transcript yet boots from its binding row's genesis, design §4.2) -> spawn
+    /// sidecar with that boot -> register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
     /// attach-path D8 lease -- the kill handle is armed after the spawn and the lease
     /// completed (bound to the map key) at registration; error paths tear down their
     /// own sidecar and leave the guard for the caller to `fail()`.
@@ -7376,25 +5654,26 @@ impl FreshClaudeState {
             own_ticket,
             crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
         );
-        // Positive denial only on a CLEAN miss in EVERY candidate root
-        // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home -- ledger A3). An
-        // unreadable store (or no root at all) cannot CHECK, so it must not DENY.
-        let transcript = match crate::claude_snapshot::locate_transcript_state(durable) {
-            crate::claude_snapshot::TranscriptLocation::Found(path) => path,
-            crate::claude_snapshot::TranscriptLocation::Absent => {
-                return Err(ResumeClaudeError::NotFound);
-            }
-            crate::claude_snapshot::TranscriptLocation::Unreadable(error) => {
-                crate::claude_snapshot::log_transcript_unreadable("attach_resume", durable, &error);
-                return Err(ResumeClaudeError::Transient(error.to_string()));
-            }
-        };
-        // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
-        // resume-in-place does not silently revert model/permissionMode/effort. V7/A10
-        // alarm gate: alarm ONLY when the ledger PROVES prior recording yet no snapshot
-        // is recoverable. Never-recorded transcripts (the entire pre-existing
-        // ~/.claude/projects population — resume_for_attach exists FOR them) stay silent.
+        // Which conversation boots (design §4.2, I8): a found transcript resumes;
+        // a positive denial only on a CLEAN miss in every candidate root
+        // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home, ledger A3) of a session
+        // with no genesis; a session with no transcript yet boots from the genesis
+        // its binding row records (§4.3: a zero-turn session or a pending fork
+        // after a restart); an unreadable store (or no root at all) cannot CHECK,
+        // so it must not deny.
         let sink = self.identity_sink();
+        let (boot, transcript_cwd, minted_id) = self.decide_attach_boot(durable, sink.as_ref())?;
+        // The genesis the boot was decided from, for its one typed retry (§4.2).
+        let recorded_genesis = sink
+            .as_ref()
+            .and_then(|sink| sink.load_genesis(PROVIDER, durable))
+            .map(|recorded| recorded.genesis);
+        // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
+        // resume-in-place does not silently revert model/permissionMode/effort (or,
+        // G15, drop its plugins). V7/A10 alarm gate: alarm ONLY when the ledger
+        // PROVES prior recording yet no snapshot is recoverable. Never-recorded
+        // transcripts (the entire pre-existing ~/.claude/projects population —
+        // resume_for_attach exists FOR them) stay silent.
         let recovered = sink
             .as_ref()
             .and_then(|s| s.load_settings("claude", durable));
@@ -7413,336 +5692,71 @@ impl FreshClaudeState {
             );
         }
         let rec = recovered.clone().unwrap_or_default();
-        // The CLI's resume lookup is scoped to the ORIGINAL cwd's project slug
-        // (ledger A15) -- resume with the cwd recorded in the transcript itself.
-        // If that directory is gone, fall back to path-based resume
-        // (`--resume <path>.jsonl` bypasses slug scoping -- verified cli.js 2.1.220),
-        // keeping the attach cwd for the process itself. The path form is
-        // reserved for a transcript WITH records: a zero-turn transcript
-        // (touched at create, no records) has no cwd to resolve and NOTHING
-        // to path-resume — and the create line's resume boot names a
-        // SESSION ID (the real sidecar forwards it verbatim to the SDK's
-        // `resume` option), so a path there would make the recovered session
-        // write under a path-flattened phantom file. An empty transcript
-        // resumes by id.
-        let original_cwd = crate::claude_snapshot::transcript_cwd(&transcript)
-            .filter(|c| std::path::Path::new(c).is_dir());
-        let transcript_has_records = std::fs::metadata(&transcript)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false);
-        let (resume_value, resume_cwd) = match original_cwd {
-            Some(cwd) => (durable.to_string(), json!(cwd)),
-            None if transcript_has_records => (
-                transcript.to_string_lossy().to_string(),
-                json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
-            ),
-            // Attach cwd stays primary; the ledger record's cwd is a FINAL
-            // fallback only when both existing sources are absent (Task 10).
-            None => (
-                durable.to_string(),
-                json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
-            ),
-        };
-        let boot = ClaudeBoot::Resume {
-            resume: resume_value,
-        };
+        // The CLI runs where the conversation was recorded when that directory
+        // still exists; otherwise the attach cwd stays primary and the ledger
+        // record's cwd is a FINAL fallback only when both are absent (Task 10).
+        let resume_cwd = transcript_cwd
+            .or_else(|| msg.cwd.clone())
+            .or_else(|| rec.cwd.clone());
 
-        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
-        // SNAPSHOT — taken at claim start, before the sidecar spawn and the
-        // `created` await — so a kill landing while this resume is in flight
-        // advances the durable tombstone past it and the commit below
-        // REFUSES instead of undoing the newer close.
+        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state SNAPSHOT —
+        // taken at claim start, before the sidecar spawn and the `created` await —
+        // so a kill landing while this resume is in flight advances the durable
+        // tombstone past it and the commit REFUSES instead of undoing the newer
+        // close.
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
-        let SpawnedSidecar {
-            mut child,
-            mut stdin,
-            stdout,
-            ownership_id,
-            log_labels,
-            tree_guard,
-        } = self
-            .spawn_sidecar_process(session_type_str(msg.session_type))
-            .await
-            .map_err(ResumeClaudeError::Transient)?;
-        // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
-        if let Some(g) = lease_guard.as_mut() {
-            if let Some(pid) = child.id() {
-                g.set_kill_handle(pid, &ownership_id);
-            }
-        }
-        // kata b8ke Task 3: the spawn's partial runtime (the watchdog's reap
-        // target) + the pid for the commit's owner identity (captured before
-        // `child` moves into the session entry).
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: arm the registered start cancellation.
-        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            durable,
-            own_ticket,
-            durable,
-            sidecar_pid,
-        );
-        let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
         let session_type = session_type_str(msg.session_type);
-        let create_req = create_line(
-            &request_id,
+        let spec = ClaudeLaunchSpec::new(
+            format!("attach-resume-{}", uuid::Uuid::new_v4()),
             session_type,
-            &boot,
-            json!({
-                "cwd": resume_cwd,
-                // Recovered from the ledger record (Task 10); `json!` serializes
-                // `None` as `null`, preserving today's fallback wire shape exactly
-                // on a miss.
-                "model": rec.model,
-                "permissionMode": rec.permission_mode,
-                "effort": rec.effort,
-            }),
-        );
-        if let Err(err) = write_line(&mut stdin, &create_req).await {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            return Err(ResumeClaudeError::Transient(err));
-        }
-        let mut reader = BufReader::new(stdout).lines();
-        let boot_context = BootContext {
-            request_id: &request_id,
-            session_type,
-            boot: &boot,
-        };
-        // A refusal stays transient here: the transcript was found just above, so a
-        // CLI that cannot resume it is not proof the conversation is gone.
-        let sidecar_session_id =
-            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
-                Ok(created) => created.session_id,
-                Err(failure) => {
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&ownership_id);
-                    return Err(ResumeClaudeError::Transient(format!(
-                        "{}: {}",
-                        failure.code(),
-                        failure.message()
-                    )));
-                }
-            };
-
-        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
-        // 4+5): this attach is a NEW pane GENUINELY CLAIMING `durable` — the
-        // claim COMMITS here: the replacement session is established (sidecar
-        // created + `created` answered), every error return above precedes
-        // the commit (no spawn-sidecar/no-created failure disturbs a fence it
-        // never claimed), the commit still strictly precedes the consumer
-        // below (so its sdk.session.init adoption write is never suppressed
-        // as the killed session's stale orphan), and the commit now also
-        // consumes the stale placeholder alias tombstones pointing at
-        // `durable` (Finding 2) and returns a kill-closed row to Bound
-        // (Finding 4 — unconditional, independent of the settings snapshot).
-        //
-        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
-        // the claim-start dead-state snapshot. A kill that landed while this
-        // resume awaited `created` advanced the durable tombstone; the commit
-        // refuses with NO side effects, so the just-spawned session is an
-        // orphan of a pane the user closed mid-attach — tear it down here
-        // (nothing registered yet: consumer, sessions insert and cli_index
-        // all follow the commit) and leave the row Retired.
-        // Round 6 (focused-ep5-r5 Finding 2): the commit's placeholder-fence
-        // consult rides the ATTACHING pane's seat — `msg.session_id` — because
-        // that is exactly the identity a phantom post-restart close fenced: a
-        // pane the user closed while this slow resume was in flight fenced
-        // its (one-shot) placeholder, and a fence there blocks the commit
-        // exactly like one recorded under the durable id.
-        if !self
-            .commit_session_claim(
-                durable,
-                claim_dead_state,
-                std::slice::from_ref(&msg.session_id),
-            )
-            .await
-        {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
-            return Err(ResumeClaudeError::Transient(
-                "session closed while the resume was in flight; torn down".to_string(),
-            ));
-        }
-
-        let session_type = session_type_str(msg.session_type).to_string();
+            boot,
+            resume_cwd,
+            &rec,
+            self.hosted_mcp,
+        )
+        .with_session_id(minted_id);
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
-        // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane.
-        // The sidecar's created id is the eviction identity guard for this consumer.
-        // `settings` (P1.13, Task 10): `Some(rec)` re-records the row under any new
-        // cliSessionId (the old durable's row keeps serving `load_settings`, so later
-        // attaches with the old id still resolve — no repeat-fire, V7 §4); `None`
-        // records nothing (no laundered blank row under the new id, V7/A10).
-        let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        // Task 5: the resumed session's death-mint clock (see the field doc).
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
-        let turn_lock = Arc::new(TokioMutex::new(()));
-        // Freshly resumed session: the tracked status starts "idle" (truthful — no
-        // turn can be in flight before the client sends).
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        // Spawned and registered under the sessions map lock (review PRB-C10): no
-        // line the consumer reads can find the resumed session missing.
-        {
-            let mut sessions = self.sessions.lock().await;
-            let consumer = self.spawn_consumer(
-                reader,
-                msg.session_id.clone(),
-                session_type.clone(),
-                sidecar_session_id.clone(),
-                recovered.clone(),
-                Arc::clone(&broadcast_id),
-                Arc::clone(&pending),
-                Arc::clone(&last_status),
-                Arc::clone(&in_turn),
-                Arc::clone(&turn_tracker),
-                Arc::clone(&last_synthesized_complete_at),
-                None,
+        // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane. The
+        // sidecar's created id is the eviction identity guard for this consumer.
+        // `recorded_settings` (P1.13, Task 10): `Some(rec)` re-records the row under
+        // any new cliSessionId (the old durable's row keeps serving `load_settings`,
+        // so later attaches with the old id still resolve — no repeat-fire, V7 §4);
+        // `None` records nothing (no laundered blank row under the new id, V7/A10).
+        // A refusal stays transient: the transcript was found just above, so a CLI
+        // that cannot resume it is not proof the conversation is gone.
+        self.establish_runtime(
+            EstablishPlan {
+                lane: EstablishLane::AttachResume,
+                spec,
+                register_under: RegisterUnder::Pane(msg.session_id.clone()),
+                claim: Some(DurableClaim {
+                    durable: durable.to_string(),
+                    dead_state: claim_dead_state,
+                }),
+                rekey_provisional_claim: false,
+                recorded_settings: recovered,
+                owning_operation,
+                owning_generation: handoff_generation,
                 // Conn-less lane (D8): attach-resume is not a create; the ledger
                 // merge keeps the row's existing stamps.
-                None,
-            );
-            self.test_holds.registration().await;
-            sessions.insert(
-                msg.session_id.clone(),
-                ClaudeSession {
-                    configuration: ClaudeConfiguration {
-                        settings: recovered.unwrap_or_default(),
-                        ..ClaudeConfiguration::default()
-                    },
-                    stdin,
-                    child,
-                    tree_guard,
-                    ownership_id,
-                    consumer,
-                    sidecar_session_id,
-                    cli_session_id: Some(durable.to_string()),
-                    owning_operation,
-                    owning_generation: handoff_generation,
-                    broadcast_id,
-                    pending,
-                    in_turn,
-                    turn_tracker,
-                    last_synthesized_complete_at,
-                    turn_lock,
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
-                },
-            );
-            // C09: the session is live again, so it is no longer an ended one.
-            // Forgotten before the lock is released, so a death of this new
-            // incarnation is recorded after it, never forgotten by it.
-            self.dead_sessions
-                .forget(&[msg.session_id.as_str(), durable], "resumed");
-        }
-        self.cli_index
-            .lock()
-            .await
-            .insert(durable.to_string(), msg.session_id.clone());
-        // Test seam (Task 6 round-3 review I-1): park with the target
-        // session REGISTERED (map + cli_index) but the resume unreturned —
-        // the fresh-arm target-spawn-window abort test's deterministic
-        // hold. None in production and every other test.
-        if let Some(pause) = self.handoff_resume_pause.as_ref() {
-            let _ = pause.notified().await;
-        }
-        // Round 6 (Finding 2): the alias mapping is durable at registration.
-        if let Some(sink) = self.identity_sink() {
-            if let Err(e) = sink
-                .record_alias_tombstone(
-                    PROVIDER,
-                    &msg.session_id,
-                    durable,
-                    crate::session_lease::now_epoch_ms() as i64,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, session = %durable, placeholder = %msg.session_id,
-                    "freshagent.claude.alias_tombstone_write_failed");
-            }
-        }
-
-        // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
-        // dead-state re-check (the create lane's twin lives above
-        // `finish_create`). A kill QUEUED behind the successful commit lands
-        // between the commit and the registration; now that the session is
-        // registered (kill-visible), an advanced fence means the row was
-        // retired after our commit — the registered session is a late
-        // orphan: tear it down and fail the resume (the caller broadcasts
-        // `CLAUDE_ATTACH_RESUME_FAILED`), leaving the kill's row Retired.
-        if self.claim_dead_state_advanced(durable, claim_dead_state) {
-            tracing::info!(target: "freshell_freshagent::claude",
-                durable = %durable,
-                "freshagent.claude.claim_late_orphan_torn_down: a close landed between the \
-                 claim's commit and its registration; the registered orphan is torn down"
-            );
-            if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                // R2-2: the typed outcome is propagated; this unwind path holds no
-                // coordinator fence, so the helper's typed log + its detached
-                // escalation are the whole discipline here.
-                let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
-            }
-            self.evict_cli_index_aliases(&msg.session_id).await; // demote, never drop
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
-            return Err(ResumeClaudeError::Transient(
-                "session closed while the resume was in flight; torn down".to_string(),
-            ));
-        }
-
-        // Task 13: bind the durable id to this live session + release the lease. A
-        // revoked lease means we must NOT keep the session -- tear down and fail.
-        if let Some(mut g) = lease_guard.take() {
-            if !g.complete(&msg.session_id) {
-                if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                    session.consumer.abort();
-                    let mut child = session.child;
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&session.ownership_id);
-                }
-                // Finding 5's re-raise: the ONE post-commit failure arm — the
-                // session is torn back down, so the close the commit undid is
-                // durable again (fence re-raised, the revived row re-retired).
-                self.rollback_session_claim(durable).await;
-                self.evict_cli_index_aliases(&msg.session_id).await; // Finding 1: demote, never drop
-                g.fail(); // own tree torn down -- reopen the key
-                return Err(ResumeClaudeError::Transient(
-                    "session lease revoked during attach-resume; torn down".to_string(),
-                ));
-            }
-        }
-
-        // kata b8ke Task 3: the attach-resume's registration survived every
-        // teardown gate — commit `Live{FreshAgent}` under the durable id
-        // (the sessions-map key is the CLIENT's msg.session_id).
-        if let Err(outcome) = self.commit_lane_claim_at(own_ticket, &msg.session_id, sidecar_pid) {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %durable,
-                outcome = ?outcome,
-                "freshagent.claude.attach_commit_stale: the coordinator moved on while the \
-                 resume registered; the uncommitted session is torn down"
-            );
-            if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                // R2-2: the typed outcome is propagated; this unwind path holds no
-                // coordinator fence, so the helper's typed log + its detached
-                // escalation are the whole discipline here.
-                let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
-            }
-            self.evict_cli_index_aliases(&msg.session_id).await;
-            return Err(ResumeClaudeError::Transient(
-                "session ownership changed during attach-resume; torn down".to_string(),
-            ));
-        }
+                provenance: None,
+                naming: None,
+                partial_runtime_key: Some(durable.to_string()),
+                start_pid_slot: &start_pid_slot,
+                inherit: None,
+                genesis: None,
+                retry: Some(BootRetry {
+                    durable: durable.to_string(),
+                    genesis: recorded_genesis,
+                }),
+            },
+            lease_guard,
+            own_ticket,
+        )
+        .await
+        .map_err(|error| ResumeClaudeError::Transient(error.resume_detail()))?;
+        let session_type = session_type.to_string();
 
         // Read the tracked status through the same `current_status()` helper the
         // rebind arm uses (the session was registered above; the lease-revocation
@@ -7794,28 +5808,21 @@ impl FreshClaudeState {
         }));
     }
 
-    /// The sdk.session.init adoption block (the consumer's in-stream arm AND the
-    /// rollback-fork preseeded lane share it): record the durable Claude UUID in
-    /// cli_index + the session record, then AWAIT-write the identity binding row
-    /// (V8/A11). On the rollback lane the row carries `supersedes: old durable
-    /// id`, and the rollback-row re-key old→new rides the SAME awaited batch
-    /// (server-side sink). A failed write is surfaced user-visibly, never
-    /// warn-and-drop, then the identity event proceeds. No-laundering guard
-    /// (V7/A10): never persist an all-blank snapshot UNLESS a supersession edge
-    /// is being written (a supersession write always goes through — it is the
-    /// only record of the old→new linkage, G3). `provenance` (D8): the creating
-    /// connection's stamps, when this adoption flows from a connection-scoped
-    /// create; `None` on conn-less lanes — the ledger's keep-when-None merge
-    /// then keeps (or, under `supersedes`, inherits the parent's) prior stamps.
-    #[allow(clippy::too_many_arguments)] // Session-init wiring; the spawn_consumer precedent.
-    #[allow(clippy::too_many_arguments)] // the adoption field set (the e2r3 completion rides it)
+    /// The sdk.session.init adoption block (the consumer's in-stream arm, and
+    /// a settings apply; a rollback or a fork never adopts through it, C13/C14:
+    /// its runtime registers already adopted): record the durable Claude UUID
+    /// in cli_index + the session record, then AWAIT-write the identity binding
+    /// row (V8/A11). A failed write is surfaced user-visibly, never
+    /// warn-and-drop, then the identity event proceeds. `provenance` (D8): the
+    /// creating connection's stamps, when this adoption flows from a
+    /// connection-scoped create; `None` on conn-less lanes — the ledger's
+    /// keep-when-None merge then keeps the prior stamps.
     async fn adopt_session_init(
         &self,
         cli_id: &str,
         session_id: &str,
         session_type: &str,
         settings: Option<&crate::identity_sink::FreshAgentSettings>,
-        supersedes: Option<&str>,
         identity_sink: Option<SharedPaneIdentitySink>,
         provenance: Option<&crate::BindProvenance>,
     ) -> SessionInitAdoptionOutcome {
@@ -7824,7 +5831,6 @@ impl FreshClaudeState {
             session_id,
             session_type,
             settings,
-            supersedes,
             identity_sink,
             provenance,
             false,
@@ -7832,12 +5838,12 @@ impl FreshClaudeState {
         .await
     }
 
-    /// [`Self::adopt_session_init`] with the rollback preseed's completion
-    /// hook: `Deferred` outcomes settle asynchronously, and the deferred
-    /// task answers `Some(cli_id)` (published) or `None` (abandoned) on
-    /// the caller's channel — the rollback NEVER continues on an
-    /// unpublished id (finding 2: a failed publication fails the
-    /// adoption, not just the alias bookkeeping).
+    /// [`Self::adopt_session_init`] with a completion hook: `Deferred`
+    /// outcomes settle asynchronously, and the deferred task answers
+    /// `Some(cli_id)` (published) or `None` (abandoned) on the caller's
+    /// channel. Only tests observe the deferred adoption this way since the
+    /// rollback stopped adopting a pre-read init (C13).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)] // the adoption field set + the completion channel
     async fn adopt_session_init_with_completion(
         &self,
@@ -7845,15 +5851,13 @@ impl FreshClaudeState {
         session_id: &str,
         session_type: &str,
         settings: Option<&crate::identity_sink::FreshAgentSettings>,
-        supersedes: Option<&str>,
         identity_sink: Option<SharedPaneIdentitySink>,
         provenance: Option<&crate::BindProvenance>,
         on_settled: Option<tokio::sync::oneshot::Sender<Option<String>>>,
     ) -> SessionInitAdoptionOutcome {
-        // The preseed runs on the consumer task BEFORE the rollback
-        // handler inserts the replacement session — the registration gate
-        // must decide synchronously so the completion hook routes to the
-        // deferred task on `Deferred`.
+        // The adoption can run before its session is registered — the
+        // registration gate must decide synchronously so the completion hook
+        // routes to the deferred task on `Deferred`.
         let registered = self.sessions.lock().await.contains_key(session_id);
         if !registered {
             self.defer_session_init_adoption(
@@ -7864,7 +5868,6 @@ impl FreshClaudeState {
                 identity_sink,
                 provenance,
                 on_settled,
-                supersedes,
             );
             return SessionInitAdoptionOutcome::Deferred;
         }
@@ -7874,7 +5877,6 @@ impl FreshClaudeState {
                 session_id,
                 session_type,
                 settings,
-                supersedes,
                 identity_sink,
                 provenance,
                 false,
@@ -7916,7 +5918,6 @@ impl FreshClaudeState {
         identity_sink: Option<SharedPaneIdentitySink>,
         provenance: Option<&crate::BindProvenance>,
         on_settled: Option<tokio::sync::oneshot::Sender<Option<String>>>,
-        supersedes: Option<&str>,
     ) {
         let state = self.clone();
         let cli_id = cli_id.to_string();
@@ -7924,17 +5925,6 @@ impl FreshClaudeState {
         let session_type = session_type.to_string();
         let settings = settings.cloned();
         let provenance = provenance.cloned();
-        // b8ke focused episode-2 post-cap F2: the ROLLBACK/FORK CONTEXT
-        // rides the deferral. The normal rollback path NECESSARILY defers
-        // (the replacement session is inserted after the consumer starts);
-        // dropping `supersedes` here made the deferred adoption treat the
-        // rollback as an ordinary create — it claimed and occupied the NEW
-        // key, and the outer rekey then refused the occupied target and
-        // tore the replacement down. Carried through, the deferred
-        // adoption coordinates WITH the outer rekey: the fork gate keeps
-        // it publication-only (no claim on the new key), exactly like the
-        // synchronous fork path.
-        let supersedes = supersedes.map(str::to_string);
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
@@ -7945,7 +5935,6 @@ impl FreshClaudeState {
                             &session_id,
                             &session_type,
                             settings.as_ref(),
-                            supersedes.as_deref(),
                             identity_sink.clone(),
                             provenance.as_ref(),
                             true,
@@ -8095,13 +6084,12 @@ impl FreshClaudeState {
         session_id: &str,
         session_type: &str,
         settings: Option<&crate::identity_sink::FreshAgentSettings>,
-        supersedes: Option<&str>,
         identity_sink: Option<SharedPaneIdentitySink>,
         provenance: Option<&crate::BindProvenance>,
         deferred_reentry: bool,
     ) -> SessionInitAdoptionOutcome {
         // Phase 1 — the mint-gate READ scope (never publishes): the gate
-        // flag, the session's existing durable id (the rollback-fork remint
+        // flag, the session's existing durable id (the in-stream remint
         // test), the registration presence (the F2 pre-registration test),
         // and the sidecar pid.
         // b8ke ext r27 F2: the session's recorded handoff generation reads
@@ -8146,28 +6134,17 @@ impl FreshClaudeState {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = pause.notify.notified().await;
         }
-        // b8ke focused episode-2 round-1 F4: the ROLLBACK-FORK gate. A
-        // rollback's `sdk.session.init` deliberately MINTS A NEW durable
-        // id (the fork re-key) while the rollback path owns and commits
-        // the runtime under the OLD durable id — adopting under the NEW
-        // id here would commit a second Live{FreshAgent} record + stamp
-        // beside the old key's (contradictory snapshots; the old key
-        // left falsely Live after the runtime moves). Fork re-keys (a
-        // supersedes-carrying preseed, or an in-stream remint of a
-        // session that already carries a DIFFERENT durable id) publish
-        // the re-key bookkeeping ONLY — ownership stays wherever the
-        // rollback committed it.
-        let fork_rekey = supersedes.is_some()
-            || existing_cli_id
-                .as_deref()
-                .is_some_and(|existing| existing != cli_id);
-        // b8ke focused episode-2 round-3 F2: the registration gate applies
-        // to FORK REKEYS exactly like ordinary creates — the rollback
-        // spawns its consumer BEFORE inserting the replacement session, so
-        // the preseeded init can reach this point pre-registration; the
-        // publication then has no session to name and MUST NOT continue
-        // unaliased. The deferral settles post-registration and the
-        // completion hook answers the rollback.
+        // b8ke focused episode-2 round-1 F4: the in-stream REMINT gate. An
+        // init that names a durable id other than the one the session
+        // already carries (the CLI moved the conversation to a new id)
+        // must not adopt ownership under the new id: the runtime is owned
+        // and committed under the id it already carries, and a second
+        // Live{FreshAgent} record + stamp beside that key would leave
+        // contradictory snapshots. Such a re-key publishes the bookkeeping
+        // ONLY — ownership stays where it was committed.
+        let fork_rekey = existing_cli_id
+            .as_deref()
+            .is_some_and(|existing| existing != cli_id);
         if !registered {
             // b8ke focused episode-2 round-1 F2: the pre-registration
             // window must not expose a Live owner that cannot be killed —
@@ -8198,7 +6175,6 @@ impl FreshClaudeState {
                 identity_sink,
                 provenance,
                 None,
-                supersedes,
             );
             return SessionInitAdoptionOutcome::Deferred;
         }
@@ -8380,29 +6356,28 @@ impl FreshClaudeState {
         // zero-turn init whose transcript has not materialized yet retains
         // the handle and records only the acquired location (InitialRecovery
         // semantics — the name authority never moves on unverified
-        // evidence). A rollback fork classifies as InternalContinuation (the
-        // child is seeded once with the source preserved). Deliberately NOT
+        // evidence). Deliberately NOT
         // a lane blocker: a naming failure never fails the identity event
         // (the handle is retained; the main.rs naming tick retries the
         // transition visibly), and the bind targets the DURABLE session —
         // its verified transcript outlives even this runtime's teardown.
         let declared_transition = self
-            .bind_naming_handle_at_init(cli_id, session_id, session_type, supersedes)
+            .bind_naming_handle_at_init(cli_id, session_id, session_type)
             .await;
         if let Some(sink) = &identity_sink {
             if let Err(e) = sink
                 .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: cli_id.to_string(),
                     mode: session_type.to_string(),
                     create_request_id: None,
                     resolves_pending: None,
-                    supersedes: supersedes.map(str::to_string),
+                    supersedes: None,
                     // Unified agent names (Task 4, T2-M5 wired): the init lane's
                     // DECLARED classification — the same transition the direct
-                    // naming fold above consumed (InternalContinuation for a
-                    // rollback fork, InitialMaterialization otherwise), so the
-                    // identity event carries the naming fact alongside the
+                    // naming fold above consumed (InitialMaterialization), so
+                    // the identity event carries the naming fact alongside the
                     // ledger write.
                     name_transition: declared_transition,
                     provenance: provenance.cloned().into(),
@@ -8529,7 +6504,6 @@ impl FreshClaudeState {
         cli_id: &str,
         placeholder: &str,
         session_type: &str,
-        supersedes: Option<&str>,
     ) -> Option<crate::naming::NameTransition> {
         if session_type == "kilroy" {
             return None;
@@ -8577,18 +6551,13 @@ impl FreshClaudeState {
             provider: freshell_protocol::session_names::NamedProvider::Claude,
             session_id: cli_id.to_string(),
         };
-        // Transition classification: a rollback fork is an
-        // InternalContinuation (the child is seeded once with the source
-        // preserved — the store's collision rules keep a manual winner);
-        // every other init is the initial materialization. The shared
+        // Transition classification: an init is the initial
+        // materialization (a rollback's or a fork's runtime registers
+        // already adopted and never reaches here, C13/C14). The shared
         // classification-driven fold (plan Task 4) applies the policy:
         // verified persistence binds the handle, prospective evidence
         // RETAINS it (zero-turn rule — only the routing evidence moves).
-        let reason = if supersedes.is_some() {
-            crate::naming::NameTransitionReason::InternalContinuation
-        } else {
-            crate::naming::NameTransitionReason::InitialMaterialization
-        };
+        let reason = crate::naming::NameTransitionReason::InitialMaterialization;
         let transition = crate::naming::NameTransition {
             reason,
             acquisition,
@@ -8693,15 +6662,9 @@ impl FreshClaudeState {
         // arm below can mint AFTER the eviction has already torn the session
         // record out of the map.
         last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
-        // kata 1wxv Task 4: Some ONLY on the rollback fork/fresh respawn — the
-        // handler PREREAD the sdk.session.init line, so the consumer runs the
-        // adoption for it FIRST (supersedes-aware), then resolves the parked
-        // rollback handler with the adopted durable id.
-        adoption: Option<RollbackAdoption>,
-        // D8: the creating connection's provenance stamps, handed to both
-        // `adopt_session_init` arms (the rollback preseed lane and the
-        // in-stream `sdk.session.init`). `None` on conn-less consumers
-        // (rollback respawn, attach-resume) — the ledger merge keeps prior
+        // D8: the creating connection's provenance stamps, handed to the
+        // in-stream `sdk.session.init` adoption. `None` on conn-less consumers
+        // (rollback replacement, attach-resume) — the ledger merge keeps prior
         // stamps.
         provenance: Option<crate::BindProvenance>,
     ) -> tokio::task::JoinHandle<()> {
@@ -8710,48 +6673,6 @@ impl FreshClaudeState {
         let identity_sink = self.identity_sink();
         let state = self.clone();
         tokio::spawn(async move {
-            // Rollback-fork preseed (kata 1wxv Task 4): adoption via the EXISTING
-            // sdk.session.init adoption block (cli_index insert + AWAITED binding
-            // WITH supersedes — the rollback-row re-key old→new rides the SAME
-            // awaited batch server-side), then emit the mapped init frame, THEN
-            // resolve the parked rollback handler with the adopted durable id.
-            if let Some(adoption) = adoption {
-                let cli_id = adoption
-                    .preseeded_init
-                    .get("cliSessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                if let Some(cli_id) = cli_id.as_deref() {
-                    // b8ke focused episode-2 round-3 F2: the preseed
-                    // adoption routes through the completion hook — a
-                    // `Deferred` outcome hands the channel to the deferred
-                    // task (which answers `Some(id)` on publication or
-                    // `None` on abandon), and an `Abandoned` outcome
-                    // answers `None` HERE: the rollback handler tears the
-                    // replacement down instead of continuing with a live
-                    // runtime unreachable by its advertised id.
-                    let _ = state
-                        .adopt_session_init_with_completion(
-                            cli_id,
-                            &session_id,
-                            &session_type,
-                            settings.as_ref(),
-                            Some(&adoption.supersedes),
-                            identity_sink.clone(),
-                            provenance.as_ref(),
-                            Some(adoption.adopted_tx),
-                        )
-                        .await;
-                    let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                    if let Some(frame) =
-                        sdk_line_to_frame(&adoption.preseeded_init, &stamp, &session_type)
-                    {
-                        let _ = broadcast_tx.send(frame);
-                    }
-                } else {
-                    let _ = adoption.adopted_tx.send(None);
-                }
-            }
             // The sidecar's report of its SDK stream's end (its last line before it
             // exits), read by the end-of-output path below.
             let mut stream_ended: Option<crate::claude_sidecar_exit::StreamEnded> = None;
@@ -8859,6 +6780,10 @@ impl FreshClaudeState {
                     }
                     Some("sdk.result") => {
                         fold_terminal_edge(&in_turn, &turn_tracker);
+                        // Core design §4.1: a session booted from its genesis
+                        // writes its transcript around its first result; clear
+                        // the genesis once the transcript is on disk.
+                        state.spawn_genesis_clear_after_result(&session_id);
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("idle") =>
@@ -9050,7 +6975,6 @@ impl FreshClaudeState {
                                 &session_id,
                                 &session_type,
                                 current_settings.as_ref(),
-                                None,
                                 identity_sink.clone(),
                                 provenance.as_ref(),
                             )
@@ -9979,6 +7903,30 @@ enum ResumeClaudeError {
     Transient(String),
 }
 
+/// A request the session's turn lock serializes (design §3.3). Each one that
+/// waited on the lock re-resolves its session afterwards
+/// ([`FreshClaudeState::live_key_after_turn_wait`]): an undo or redo holding
+/// the lock may have replaced the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TurnLockedRequest {
+    Send,
+    Configure,
+    Compact,
+    Fork,
+}
+
+impl TurnLockedRequest {
+    /// The event logged when the request follows a replacement.
+    fn followed_replacement_event(self) -> &'static str {
+        match self {
+            Self::Send => "freshagent.claude.send_followed_replacement",
+            Self::Configure => "freshagent.claude.configure_followed_replacement",
+            Self::Compact => "freshagent.claude.compact_followed_replacement",
+            Self::Fork => "freshagent.claude.fork_followed_replacement",
+        }
+    }
+}
+
 fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMessage {
     ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event: json!({
@@ -9991,199 +7939,6 @@ fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMess
         session_id: session_id.to_string(),
         session_type: session_type_str(session_type).to_string(),
     })
-}
-
-/// The `resumeDropsTurn` refusal prefix (SDK-documented): an
-/// `error_during_execution` result whose message begins with this. NEVER
-/// surfaced raw — the consumer maps it to the plain-resume recovery (one retry
-/// with the guard omitted; the refusal is deterministic, so it is never retried
-/// twice).
-const RESUME_DROPS_TURN_REFUSAL_PREFIX: &str = "Resume rejected by --resume-drops-turn:";
-
-/// The `create.failed` code of the same refusal when the CLI reports it at boot
-/// (`crates/freshell-claude-sidecar/boot.mjs`).
-const FORK_GUARD_REFUSED_CODE: &str = "FORK_GUARD_REFUSED";
-
-/// Why one rollback-respawn attempt failed.
-enum RollbackSpawnError {
-    /// The create's early output carried the `--resume-drops-turn` refusal
-    /// prefix — retry ONCE with the guard omitted.
-    GuardRefusal,
-    Other(String),
-}
-
-/// The pieces of a successful rollback respawn, ready for registration + the
-/// consumer's preseeded adoption.
-struct RollbackSpawned {
-    child: Child,
-    tree_guard: crate::claude_spawn::SidecarTreeGuard,
-    stdin: ChildStdin,
-    /// The stdout line reader, positioned AFTER the preread `sdk.session.init`.
-    reader: tokio::io::Lines<BufReader<ChildStdout>>,
-    ownership_id: String,
-    /// The labels the respawn's stderr log carries (bound at registration).
-    log_labels: crate::claude_sidecar_io::SidecarLogLabels,
-    /// The sidecar-keyed id (`created.sessionId`).
-    sidecar_session_id: String,
-    /// The preread `sdk.session.init` line (the consumer adopts it preseeded).
-    preseeded_init: Value,
-    /// The new durable id (parsed from the preread init).
-    cli_id: String,
-}
-
-impl FreshClaudeState {
-    /// Rollback post-spawn failure teardown (kata 1wxv Task 4): drop the
-    /// freshly-registered fork's map record, kill its sidecar tree, and clear
-    /// this map key's cli_index aliases — used identically by the acceptance-
-    /// failure and lease-revoked legs (an unadopted/uncompleted fork must never
-    /// answer sends).
-    async fn teardown_rollback_fork(&self, map_key: &str) {
-        if let Some(session) = self.sessions.lock().await.remove(map_key) {
-            session.consumer.abort();
-            let mut child = session.child;
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&session.ownership_id);
-        }
-        // Finding 1: demote (not drop) the torn-down fork's aliases.
-        self.evict_cli_index_aliases(map_key).await;
-    }
-
-    /// One rollback-respawn attempt (kata 1wxv Task 4): spawn the sidecar, arm
-    /// the lease kill handle, write the create request, and PREREAD its output
-    /// until the `sdk.session.init` line — the `--resume-drops-turn` refusal
-    /// watch lives in this pre-read, BEFORE any durable state moves (the refusal
-    /// is retried by the caller with the guard omitted; the pre-read ordering is
-    /// how a refused fork can never adopt).
-    async fn rollback_spawn_create(
-        &self,
-        create_req: &Value,
-        boot: &ClaudeBoot,
-        session_type: &str,
-        lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
-    ) -> Result<RollbackSpawned, RollbackSpawnError> {
-        let SpawnedSidecar {
-            mut child,
-            mut stdin,
-            stdout,
-            ownership_id,
-            log_labels,
-            tree_guard,
-        } = self
-            .spawn_sidecar_process(session_type)
-            .await
-            .map_err(RollbackSpawnError::Other)?;
-        if let Some(g) = lease_guard {
-            if let Some(pid) = child.id() {
-                g.set_kill_handle(pid, &ownership_id);
-            }
-        }
-        if let Err(err) = write_line(&mut stdin, create_req).await {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            return Err(RollbackSpawnError::Other(err));
-        }
-        let mut reader = BufReader::new(stdout).lines();
-        let request_id = create_req
-            .get("requestId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let boot_context = BootContext {
-            request_id,
-            session_type,
-            boot,
-        };
-        let sidecar_session_id =
-            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
-                Ok(created) => created.session_id,
-                Err(failure) => {
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&ownership_id);
-                    // The CLI refuses a fork whose drops-turn guard does not hold at
-                    // boot (T5): the same refusal the init pre-read below watches for.
-                    return Err(if failure.is_refusal(FORK_GUARD_REFUSED_CODE) {
-                        RollbackSpawnError::GuardRefusal
-                    } else {
-                        RollbackSpawnError::Other(failure.message().to_string())
-                    });
-                }
-            };
-        match read_session_init(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(init) => {
-                let cli_id = init
-                    .get("cliSessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_default();
-                Ok(RollbackSpawned {
-                    child,
-                    tree_guard,
-                    stdin,
-                    reader,
-                    ownership_id,
-                    log_labels,
-                    sidecar_session_id,
-                    preseeded_init: init,
-                    cli_id,
-                })
-            }
-            Err(err) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                Err(err)
-            }
-        }
-    }
-}
-
-/// Read the respawned sidecar's output until `sdk.session.init`, mapping each
-/// line to its outcome: the init line (returned verbatim for preseeded
-/// adoption), or — checked FIRST — any line carrying the
-/// `--resume-drops-turn` refusal prefix (never surfaced raw). Other early lines
-/// (e.g. a pre-init `sdk.status`) are dropped at this seam; the consumer resumes
-/// at the NEXT line after init.
-async fn read_session_init(
-    reader: &mut tokio::io::Lines<BufReader<ChildStdout>>,
-    budget: Duration,
-) -> Result<Value, RollbackSpawnError> {
-    let read = async {
-        loop {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if trimmed.contains(RESUME_DROPS_TURN_REFUSAL_PREFIX) {
-                        return Err(RollbackSpawnError::GuardRefusal);
-                    }
-                    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                        continue;
-                    };
-                    if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
-                        return Ok(value);
-                    }
-                    // pre-init non-init line: tolerated, dropped.
-                }
-                Ok(None) => {
-                    return Err(RollbackSpawnError::Other(
-                        "sidecar stdout closed before sdk.session.init".to_string(),
-                    ))
-                }
-                Err(e) => {
-                    return Err(RollbackSpawnError::Other(format!(
-                        "sidecar stdout read error: {e}"
-                    )))
-                }
-            }
-        }
-    };
-    match tokio::time::timeout(budget, read).await {
-        Ok(result) => result,
-        Err(_) => Err(RollbackSpawnError::Other(format!(
-            "sidecar did not answer sdk.session.init within {}s",
-            budget.as_secs()
-        ))),
-    }
 }
 
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
@@ -10833,6 +8588,18 @@ fn log_claude_teardown(
     }
 }
 
+mod create_outcome;
+pub use create_outcome::ClaudeCreateOutcome;
+
+mod establish;
+mod fork;
+mod genesis;
+mod history;
+mod rollback;
+use establish::{
+    BootRetry, DurableClaim, EstablishLane, EstablishPlan, LaunchLease, RegisterUnder,
+};
+
 #[cfg(test)]
 mod teardown_tests;
 
@@ -10951,6 +8718,7 @@ pub(crate) mod tests {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                launch_genesis: None,
             },
         );
     }
@@ -12272,6 +10040,8 @@ const liveSessions = new Set(
 // cancellation authority at the pre-handoff residence.
 const compactQueue = []
 const configuredSettings = new Map()
+// Sessions booted under a server-minted id whose init waits for the first send.
+const deferredInit = new Map()
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
 rl.on('line', (line) => {
   const trimmed = line.trim()
@@ -12295,10 +10065,15 @@ rl.on('line', (line) => {
       liveSessions.add(sessionId)
       configuredSettings.set(sessionId, { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd: msg.cwd })
       process.stdout.write(JSON.stringify({ type: 'created', sessionId, protocol: 2 }) + '\n')
+      if (msg.sessionId) {
+        // A boot under a server-minted id (a rollback's replacement, a boot
+        // from a genesis): the CLI runs under that id and, like the real CLI
+        // (T1), reports it only once a prompt runs — at the first send.
+        deferredInit.set(sessionId, msg.sessionId)
+        return
+      }
       // Mirror the real sidecar's post-create init: echo the resume boot's id as the
       // durable id when present (resume continuity), else a fixed fake uuid.
-      // Task 4 (kata 1wxv): a fork boot mints a FRESH durable id,
-      // never an echo — fork-at-point adoption depends on the id changing.
       const cliSessionId = msg.boot?.kind === 'fork'
         ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
         : (msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
@@ -12319,6 +10094,11 @@ rl.on('line', (line) => {
     // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
     // the consumer-exit eviction path (ledger A9).
     if (msg.text === '__exit__') process.exit(0)
+    const deferredCliId = deferredInit.get(msg.sessionId)
+    if (deferredCliId) {
+      deferredInit.delete(msg.sessionId)
+      console.log(JSON.stringify({ type: 'sdk.session.init', sessionId: msg.sessionId, cliSessionId: deferredCliId, model: 'fake-model', cwd: '/tmp', tools: [] }))
+    }
     // Task 4 (kata 1wxv) in_turn edge hooks: each magic text emits ONE canned sdk.*
     // line so the four-edge/fail-closed busy contract can drive every edge.
     if (msg.text === '__emit_result_error__') {
@@ -13909,6 +11689,92 @@ rl.on('line', (line) => {
             "the provisional key is the rekey family's resolution alias — got {:?}",
             registry.observe(PROVIDER, provisional).state
         );
+    }
+
+    /// A fresh create whose pane-scoped claim the coordinator refuses (another
+    /// operation holds the key) answers that refusal and nothing else: no
+    /// sidecar is spawned and no `created` follows the `create.failed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_fresh_create_claim_answers_only_the_refusal_and_spawns_nothing() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                "pending-create-req-refused-claim",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-holding-the-pane-key",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+
+        let outcome = st
+            .handle_create(dedup_create_msg("req-refused-claim"), None)
+            .await;
+
+        let mut answers = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).expect("json frame");
+            if frame["requestId"] == json!("req-refused-claim") {
+                answers.push(frame);
+            }
+        }
+        assert_eq!(answers.len(), 1, "one answer: {answers:?}");
+        assert_eq!(answers[0]["type"], "freshAgent.create.failed");
+        assert_eq!(answers[0]["code"], "SESSION_RESERVED");
+        assert_eq!(env.spawn_count(), 0, "no sidecar was spawned");
+        // I1: the returned outcome is the answer the frame carries.
+        assert!(matches!(
+            &outcome,
+            ClaudeCreateOutcome::Failed { code, retryable: Some(true), .. } if code == "SESSION_RESERVED"
+        ));
+        assert_eq!(
+            serde_json::to_value(outcome.create_failed_frame("req-refused-claim").unwrap())
+                .unwrap(),
+            answers[0]
+        );
+    }
+
+    /// I1: a create returns the session its `freshAgent.created` frame names, with
+    /// the durable conversation when it resumed one.
+    #[tokio::test]
+    async fn a_create_returns_the_session_its_created_frame_names() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+
+        let fresh = st
+            .handle_create(dedup_create_msg("req-outcome-fresh"), None)
+            .await;
+        let frame = await_claude_created(&mut rx, "req-outcome-fresh").await;
+        assert_eq!(
+            fresh,
+            ClaudeCreateOutcome::Created {
+                session_id: frame["sessionId"].as_str().unwrap().to_string(),
+                session_ref: None,
+            }
+        );
+
+        let durable = "77777777-7777-4777-8777-777777777777";
+        let mut resume = dedup_create_msg("req-outcome-resume");
+        resume.resume_session_id = Some(durable.to_string());
+        let resumed = st.handle_create(resume, None).await;
+        let frame = await_claude_created(&mut rx, "req-outcome-resume").await;
+        assert_eq!(
+            resumed,
+            ClaudeCreateOutcome::Created {
+                session_id: frame["sessionId"].as_str().unwrap().to_string(),
+                session_ref: Some(claude_session_ref(durable)),
+            }
+        );
+        assert_eq!(frame["sessionRef"]["sessionId"], durable);
+        drop(env);
     }
 
     /// b8ke ext r22 F1 (b): a spawn-time provider rejection during the
@@ -15517,7 +13383,6 @@ rl.on('line', (line) => {
                 model: Some("gate-model".into()),
                 ..crate::identity_sink::FreshAgentSettings::default()
             }),
-            None,
             Some(fake.clone()),
             None,
         )
@@ -15664,7 +13529,6 @@ rl.on('line', (line) => {
             None,
             None,
             None,
-            None,
         )
         .await;
 
@@ -15783,12 +13647,13 @@ rl.on('line', (line) => {
         assert!(saw_lost, "the teardown engages the lost-session recovery");
     }
 
-    /// b8ke focused episode-2 round-1 F4: a ROLLBACK-FORK re-key never
-    /// adopts ownership under the NEW durable id — the rollback owns and
-    /// commits the runtime under the OLD durable id, so a second
-    /// Live{FreshAgent} record under the fork id would leave contradictory
-    /// snapshots (the old key falsely Live after the runtime moves).
-    /// The re-key bookkeeping (the alias) still lands.
+    /// b8ke focused episode-2 round-1 F4: an in-stream RE-KEY (an init
+    /// naming a durable id other than the one the session already carries)
+    /// never adopts ownership under the NEW durable id — the runtime is
+    /// owned and committed under the OLD durable id, so a second
+    /// Live{FreshAgent} record under the new id would leave contradictory
+    /// snapshots (the old key falsely Live after the runtime moves). The
+    /// re-key bookkeeping (the alias) still lands.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rollback_fork_rekey_never_adopts_ownership_under_the_new_id() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -15820,15 +13685,14 @@ rl.on('line', (line) => {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        // The ROLLBACK FORK: the respawned sidecar's sdk.session.init mints
-        // a NEW durable id (the supersedes-carrying preseed shape). The
-        // re-key bookkeeping lands — but NO ownership under the new id.
+        // The RE-KEY: the session's next sdk.session.init names a NEW durable
+        // id. The re-key bookkeeping lands — but NO ownership under the new
+        // id.
         st.adopt_session_init(
             "new-fork-id-e2r4",
             &placeholder,
             "freshclaude",
             None,
-            Some("old-durable-id"),
             None,
             None,
         )
@@ -16614,6 +14478,7 @@ rl.on('line', (line) => {
             &mut no_ticket,
             new_dur,
             &placeholder,
+            &placeholder,
             Some(replacement_pid),
             "claude/rollback",
         )
@@ -16763,7 +14628,6 @@ rl.on('line', (line) => {
                     stale_map_key,
                     "freshclaude",
                     Some(&settings),
-                    None,
                     sink2,
                     None,
                     Some(tx),
@@ -16822,101 +14686,10 @@ rl.on('line', (line) => {
         );
     }
 
-    /// b8ke focused episode-2 post-cap F2: the ROLLBACK/FORK CONTEXT
-    /// (`supersedes`) rides the registration-gated deferral. The normal
-    /// rollback path NECESSARILY defers (the replacement session is
-    /// inserted after the consumer starts); pre-fix the deferred call
-    /// passed `None`, `fork_rekey` became false, and the deferred
-    /// adoption claimed + occupied the NEW key as an ordinary create —
-    /// the outer rollback rekey then refused the occupied target and tore
-    /// the replacement down. Carried through, the deferred adoption stays
-    /// publication-only: it NEVER claims the new key, so the outer rekey
-    /// owns the move.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_deferred_fork_adoption_carries_supersedes_and_never_claims_the_new_key() {
-        let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let _env = FakeClaudeSidecarEnv::install();
-        let (mut st, mut rx) = state_with_bus();
-        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-        st.set_ownership(registry.clone());
-
-        st.handle_create(dedup_create_msg("req-postcap-f2"), None)
-            .await;
-        let created = await_claude_created(&mut rx, "req-postcap-f2").await;
-        let _created_session = created["sessionId"].as_str().unwrap().to_string();
-        // The first adoption publishes.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while st
-            .cli_index
-            .lock()
-            .await
-            .get(FRESH_CREATE_DURABLE_ID)
-            .is_none()
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the first create's adoption never published"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        // The fork rekey's preseed BEFORE registration → Deferred (the
-        // rollback's real ordering: the replacement session's map key is
-        // inserted AFTER the consumer starts), with the completion
-        // channel. The fork target is the NEW session's map key.
-        let fork_dur = "abcdeabc-abcd-4abc-8abc-abcdeabcdeab";
-        let fork_map_key = "fork-map-key-postcap-f2";
-        let (tx, mut rx_done) = tokio::sync::oneshot::channel::<Option<String>>();
-        let outcome = st
-            .adopt_session_init_with_completion(
-                fork_dur,
-                fork_map_key,
-                "freshclaude",
-                None,
-                Some(FRESH_CREATE_DURABLE_ID),
-                None,
-                None,
-                Some(tx),
-            )
-            .await;
-        assert!(
-            matches!(outcome, SessionInitAdoptionOutcome::Deferred),
-            "the unregistered fork preseed defers (the rollback's insert window)"
-        );
-        // The registration lands (the handler's insert); the deferred
-        // adoption settles with the fork context.
-        insert_fake_claude_session(&st, fork_map_key).await;
-        assert!(
-            registry
-                .observe("claude", fork_dur)
-                .state
-                .eq(&freshell_ownership::OwnershipState::Vacant),
-            "the NEW key is NEVER claimed by the deferred fork adoption — \
-             the outer rekey owns the move (pre-fix: the deferred adoption \
-             claimed it as an ordinary create and the outer rekey refused \
-             the occupied target)"
-        );
-        let answer = tokio::time::timeout(std::time::Duration::from_secs(15), &mut rx_done)
-            .await
-            .expect("the deferred adoption settles")
-            .expect("the completion channel survived");
-        assert_eq!(answer.as_deref(), Some(fork_dur));
-        // Still never claimed — publication-only bookkeeping.
-        assert!(matches!(
-            registry.observe("claude", fork_dur).state,
-            freshell_ownership::OwnershipState::Vacant
-        ));
-        assert_eq!(
-            st.cli_index.lock().await.get(fork_dur).cloned(),
-            Some(fork_map_key.to_string()),
-            "the fork publication landed (the alias bookkeeping)"
-        );
-    }
-
-    /// b8ke focused episode-2 round-3 F2: a FAILED preseed publication
-    /// FAILS the adoption — the completion hook answers `None` so the
-    /// rollback handler tears the replacement down instead of continuing
-    /// with a live runtime unreachable by its advertised id. The
+    /// b8ke focused episode-2 round-3 F2: a FAILED re-key publication (an
+    /// in-stream init naming a durable id other than the one the session
+    /// carries) FAILS the adoption — the completion hook answers `None`,
+    /// never a live runtime unreachable by its advertised id. The
     /// deterministic failure shape: the mint gate armed (a kill's
     /// enumeration in flight) → the publication abandons → `Abandoned`
     /// + `on_settled` receives None.
@@ -16962,7 +14735,6 @@ rl.on('line', (line) => {
                 &placeholder,
                 "freshclaude",
                 None,
-                Some(FRESH_CREATE_DURABLE_ID),
                 None,
                 None,
                 Some(tx),
@@ -17054,16 +14826,8 @@ rl.on('line', (line) => {
             .get_mut(&placeholder_a)
             .expect("session")
             .cli_session_id = None;
-        st.adopt_session_init(
-            foreign_dur,
-            &placeholder_a,
-            "freshclaude",
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
+        st.adopt_session_init(foreign_dur, &placeholder_a, "freshclaude", None, None, None)
+            .await;
         // The teardown is DETACHED (the adoption's caller is the session's
         // own consumer — the standard teardown aborts it, so the sequence
         // runs in a spawned task): bounded-poll for the fail-closed result.
@@ -17119,16 +14883,8 @@ rl.on('line', (line) => {
             session.owning_operation = Some("own-runner-op".to_string());
             session.cli_session_id = None;
         }
-        st.adopt_session_init(
-            own_dur,
-            &placeholder_b,
-            "freshclaude",
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
+        st.adopt_session_init(own_dur, &placeholder_b, "freshclaude", None, None, None)
+            .await;
         assert!(
             st.sessions.lock().await.contains_key(&placeholder_b),
             "the runtime's OWN operation proceeds — no teardown"
@@ -17189,7 +14945,7 @@ rl.on('line', (line) => {
         let st2 = st.clone();
         let ph = placeholder.clone();
         let mut adoption = tokio::spawn(async move {
-            st2.adopt_session_init(killed_dur, &ph, "freshclaude", None, None, None, None)
+            st2.adopt_session_init(killed_dur, &ph, "freshclaude", None, None, None)
                 .await;
         });
         // b8ke focused episode-2 round-3 F10: the test must PROVE the
@@ -17353,7 +15109,6 @@ rl.on('line', (line) => {
             &placeholder,
             "freshclaude",
             None,
-            None,
             Some(fake.clone()),
             None,
         )
@@ -17470,7 +15225,6 @@ rl.on('line', (line) => {
             gated,
             &placeholder,
             "freshclaude",
-            None,
             None,
             Some(fake.clone()),
             None,
@@ -18409,6 +16163,7 @@ rl.on('line', (line) => {
         // The lineage-only seed: a binding row exists, with an all-blank
         // settings snapshot (load_settings answers None).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: DURABLE.into(),
@@ -19989,6 +17744,7 @@ rl.on('line', (line) => {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                launch_genesis: None,
             },
         );
     }
@@ -20429,7 +18185,6 @@ rl.on('line', (line) => {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::Mutex::new(None)),
-            None,
             None, // provenance: test lane is conn-less (D8)
         );
 
@@ -20694,6 +18449,44 @@ rl.on('line', (line) => {
         assert_eq!(b.settings.permission_mode.as_deref(), Some("plan"));
         assert_eq!(b.settings.effort.as_deref(), Some("high"));
         assert!(b.settings.cwd.is_some());
+    }
+
+    /// G15: the create's plugins are part of the settings the session records
+    /// at `sdk.session.init`, so every later launch of the session can restore
+    /// them. An empty plugin list is no plugins: it records nothing, so a
+    /// create that names none keeps the lineage-only row shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_records_the_create_plugins_and_an_empty_list_as_none() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let mut msg = dedup_create_msg("req-binding-plugins");
+        msg.plugins = Some(vec!["/workspace/.claude/plugins/local".to_string()]);
+        state.handle_create(msg, None).await;
+        await_claude_created_and_session_init(&mut rx, "req-binding-plugins").await;
+        let row = await_claude_session_init_binding_row(&fake).await;
+        assert_eq!(
+            row.settings.plugins,
+            Some(vec!["/workspace/.claude/plugins/local".to_string()])
+        );
+
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+        let mut msg = dedup_create_msg("req-binding-no-plugins");
+        msg.plugins = Some(Vec::new());
+        state.handle_create(msg, None).await;
+        await_claude_created_and_session_init(&mut rx, "req-binding-no-plugins").await;
+        let row = await_claude_session_init_binding_row(&fake).await;
+        assert_eq!(
+            row.settings,
+            crate::identity_sink::FreshAgentSettings::default(),
+            "an empty plugin list records nothing"
+        );
+        drop(env);
     }
 
     /// b8ke ext r27 F4 reshape (was
@@ -20978,6 +18771,7 @@ rl.on('line', (line) => {
                 permission_mode: Some("plan".into()),
                 effort: Some("high".into()),
                 cwd: None,
+                plugins: None,
             },
         );
         state.set_identity_sink(fake);
@@ -21797,7 +19591,6 @@ rl.on('line', (line) => {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&last_synthesized_complete_at),
-            None,
             None, // provenance: test lane is conn-less (D8)
         );
         st.sessions.lock().await.insert(
@@ -21821,6 +19614,7 @@ rl.on('line', (line) => {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                launch_genesis: None,
             },
         );
         st.cli_index
@@ -21872,6 +19666,7 @@ rl.on('line', (line) => {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                launch_genesis: None,
             },
         );
         st.cli_index
@@ -21943,7 +19738,6 @@ rl.on('line', (line) => {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&last_synthesized_complete_at),
-            None,
             None, // provenance: test lane is conn-less (D8)
         );
         st.sessions.lock().await.insert(
@@ -21967,6 +19761,7 @@ rl.on('line', (line) => {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                launch_genesis: None,
             },
         );
         st.cli_index
@@ -21976,17 +19771,23 @@ rl.on('line', (line) => {
         stdin_log
     }
 
-    /// Poll until the session's `cli_session_id` differs from `prior` (the fork
-    /// adoption mints a NEW durable id mid-rollback) or the budget dies.
+    /// Poll until the session `map_key` names (C13: the rollback's
+    /// replacement, which the map key resolves to once it took the original's
+    /// place) has a `cli_session_id` other than `prior` (the replacement's
+    /// durable id), or the budget dies.
     async fn await_adopted_durable(st: &FreshClaudeState, map_key: &str, prior: &str) -> String {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let current = st
-                .sessions
-                .lock()
-                .await
-                .get(map_key)
-                .and_then(|s| s.cli_session_id.clone());
+            let key = st.resolve_session_key(map_key).await;
+            let current = match key {
+                Some(key) => st
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|s| s.cli_session_id.clone()),
+                None => None,
+            };
             if let Some(current) = current {
                 if current != prior {
                     return current;
@@ -25042,17 +22843,16 @@ rl.on('line', (line) => {
     }
 
     /// The r2 lock discipline on the claude lane: a send fired mid-rollback waits on
-    /// the per-session turn lock (handle_send NEVER acquires rollback_in_flight — it
-    /// only PARKS on the registry's membership while the rollback's teardown→respawn
-    /// window hides the map entry), then proceeds against the POST-rollback session
-    /// and destroys redo.
+    /// the per-session turn lock (handle_send NEVER acquires rollback_in_flight),
+    /// then proceeds against the POST-rollback session (the replacement took the
+    /// lock over) and destroys redo.
     ///
     /// DETERMINISM (task 4 review C1): the fake sidecar's create ANSWER is deferred
     /// 750ms — the spawn-log gate observes the create request receipt while the
-    /// rollback is PARKED inside `read_created`, so the send provably arrives in the
-    /// teardown→respawn window (the map entry is already removed). Pre-fix the send
-    /// died with SESSION_NOT_FOUND on a resolve-before-lock; post-fix it parks,
-    /// serializes behind the rollback, and lands on the adopted session.
+    /// rollback is PARKED inside `read_created` (the replacement's boot, the
+    /// original still registered), so the send provably arrives while the rollback
+    /// holds the lock; it serializes behind the rollback and lands on the
+    /// replacement.
     #[tokio::test]
     async fn concurrent_send_plus_undo_serializes_on_the_turn_lock_without_deadlock() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;

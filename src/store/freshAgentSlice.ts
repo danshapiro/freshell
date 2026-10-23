@@ -5,6 +5,7 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import type {
   FreshAgentPermissionRequest,
@@ -301,6 +302,12 @@ const freshAgentSlice = createSlice({
       const previousSession = state.sessions[previousKey]
       const nextSession = state.sessions[nextKey]
 
+      // A claude re-key to a durable id (an undo or redo's replacement, core
+      // design §4.5) names the session's durable id: the replacement reports
+      // no init before its first prompt (T1), so the replaced session's
+      // `cliSessionId` must not survive the merge and point the pane back at it.
+      const durableRekey = action.payload.provider === 'claude'
+        && isValidClaudeSessionId(action.payload.sessionId)
       if (previousSession || nextSession) {
         state.sessions[nextKey] = {
           ...(previousSession ?? createSession(nextLocator, 'connected')),
@@ -308,6 +315,9 @@ const freshAgentSlice = createSlice({
           ...nextLocator,
           sessionKey: nextKey,
           threadId: action.payload.sessionId,
+          ...(durableRekey
+            ? { cliSessionId: action.payload.sessionId, historySessionId: action.payload.sessionId }
+            : {}),
           lost: false,
           restoreFailureCode: undefined,
           restoreFailureMessage: undefined,

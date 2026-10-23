@@ -16,6 +16,7 @@ import path from 'node:path'
 import readline from 'node:readline'
 import { afterEach, describe, expect, it } from 'vitest'
 import { query } from '../../fixtures/claude-cli-sim/query.mjs'
+import { dropsTurnRefusal } from '../../fixtures/claude-cli-sim/transcript.mjs'
 import { REPO_ROOT } from './claude-cli-trace'
 
 const SIDECAR = path.join(REPO_ROOT, 'crates/freshell-claude-sidecar/index.mjs')
@@ -577,6 +578,36 @@ describe('Claude CLI simulator replay of a recorded real-CLI turn', () => {
     plain.prompt.push('GO write then edit then delegate')
     await plain.until(() => results(plain.messages).length === 1)
     expect(await fs.readdir(plain.home.cwd)).toEqual([])
+  })
+})
+
+// The simulator's port of the CLI's --resume-drops-turn validator. The
+// absorbed-send refusal is compared with the real CLI (absorbed-undo in
+// claude-cli-conformance.ts); these pin the other ranges a rollback relies on.
+describe('the drops-turn guard port', () => {
+  const U = (n: number) => `00000000-0000-4000-8000-00000000000${n}`
+  const prompt = (uuid: string, text = 'hi') => ({ type: 'user', uuid, message: { role: 'user', content: text }, promptSource: 'sdk' })
+  const reply = (uuid: string) => ({ type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } })
+  const tokens = (uuid: string) => ({ type: 'attachment', uuid, attachment: { type: 'total_tokens_reminder' } })
+
+  it('accepts a range that is the declared turn alone, its furniture included', () => {
+    expect(dropsTurnRefusal([prompt(U(1)), tokens(U(2)), reply(U(3))], U(1))).toBeNull()
+  })
+
+  it('refuses a range holding a second prompt: one guard declares one turn', () => {
+    expect(dropsTurnRefusal([prompt(U(1)), reply(U(2)), prompt(U(3)), reply(U(4))], U(1)))
+      .toBe(`range contains a user entry not attributable to the declared turn; entry 2 [type=user, uuid=${U(3)}]`)
+  })
+
+  it('refuses a range holding a task notification (an externally-sourced user entry)', () => {
+    const notification = { ...prompt(U(3), '<task-notification>done</task-notification>'), origin: { kind: 'task-notification' } }
+    expect(dropsTurnRefusal([prompt(U(1)), reply(U(2)), notification, reply(U(4))], U(1)))
+      .toBe(`range contains an externally-sourced user entry; entry 2 [type=user, uuid=${U(3)}]`)
+  })
+
+  it('refuses a range that does not start with the declared prompt', () => {
+    expect(dropsTurnRefusal([reply(U(2)), prompt(U(1))], U(1)))
+      .toBe(`range does not start with the declared turn prompt; first discarded entry 0 [type=assistant, uuid=${U(2)}]`)
   })
 })
 

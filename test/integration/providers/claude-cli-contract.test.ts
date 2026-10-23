@@ -284,6 +284,36 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(at(events, isMsg(isLifecycle('u4', 'queued')))).toBeLessThan(queuedFirst)
   }, SCENARIO_TIMEOUT)
 
+  it('T10 T5: an absorbed send is recorded as a queued_command attachment inside its turn, so a guarded fork that undoes that turn is refused', async () => {
+    const r = await real('absorbed-undo')
+    const { parent, afterGuard } = r.observations
+    // The absorbed send has no prompt line of its own: it is attachment content
+    // of the tool turn (the replay still carries our uuid, T8).
+    expect(parent.absorbed).toEqual([{ source: 'u3', prompt: [{ type: 'text', text: 'absorbed during tool' }], mode: 'prompt' }])
+    const shape = parent.shape as Array<{ type: string, uuid: string }>
+    expect(shape.some((line) => line.uuid === 'u3')).toBe(false)
+    expect(shape.filter((line) => line.type === 'user' && line.uuid.startsWith('u')).map((line) => line.uuid)).toEqual(['u1', 'u2'])
+    // Undoing the tool turn with the guard declaring its prompt is refused at
+    // boot, and the refusal names the absorbed content.
+    const guarded = messagesOf(r, 'guarded')
+    expect(guarded).toHaveLength(1)
+    expect(guarded[0]).toMatchObject({ type: 'result', subtype: 'error_during_execution', num_turns: 0 })
+    expect(guarded[0].errors[0]).toMatch(/^Resume rejected by --resume-drops-turn: resuming at keepAt would discard entries not attributable to turn u2: range contains absorbed queued content; entry \d+ \[type=attachment \(queued_command\), uuid=cli\]$/)
+    expect(afterGuard.files.map((f: string) => path.basename(f))).toEqual(['P.jsonl'])
+  }, SCENARIO_TIMEOUT)
+
+  it('T19 T5: a background agent\'s completion is a task-notification line inside the launching turn, so a guarded fork that undoes that turn is refused', async () => {
+    const r = await real('notification-undo')
+    const { parent } = r.observations
+    expect(parent.notifications).toEqual([{ type: 'user', origin: 'task-notification', xml: true }])
+    const shape = parent.shape as Array<{ type: string, uuid: string }>
+    expect(shape.filter((line) => line.type === 'user' && line.uuid.startsWith('u')).map((line) => line.uuid)).toEqual(['u1', 'u2'])
+    const guarded = messagesOf(r, 'guarded')
+    expect(guarded).toHaveLength(1)
+    expect(guarded[0]).toMatchObject({ type: 'result', subtype: 'error_during_execution', num_turns: 0 })
+    expect(guarded[0].errors[0]).toMatch(/^Resume rejected by --resume-drops-turn: resuming at keepAt would discard entries not attributable to turn u2: range contains an externally-sourced user entry; entry \d+ \[type=user, uuid=cli\]$/)
+  }, SCENARIO_TIMEOUT)
+
   it('T11: a warm interrupt ends the turn with error_during_execution, aborted_streaming or aborted_tools, diagnostic errors and a cancelled lifecycle; the receipt comes first', async () => {
     const r = await real('interrupts')
     const events = eventsOf(r, 'S')

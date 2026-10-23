@@ -29,8 +29,9 @@
 //! died a moment later. Only a kill nothing confirms (dropping the guard, a
 //! test reaping its own zombie later) is given time, with `exits_within`.
 //!
-//! Shared by the `claude_sidecar_teardown` integration test and the crate's
-//! unit tests (`lib.rs` includes this file under `cfg(all(test, unix))`).
+//! Shared by the `claude_sidecar_teardown` integration test, the crate's
+//! unit tests (`lib.rs` includes this file under `cfg(all(test, unix))`) and
+//! `freshell-ws`'s integration tests (`tests/common/mod.rs` includes it).
 #![allow(dead_code)] // each including test crate uses a different subset
 
 use std::time::{Duration, Instant};
