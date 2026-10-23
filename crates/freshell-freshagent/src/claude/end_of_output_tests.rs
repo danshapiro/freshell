@@ -366,6 +366,71 @@ fn field<'a>(fields: &'a capture::Fields, name: &str) -> Option<&'a str> {
 /// rings exactly once, from Rust (C18: the sidecar mints no edge of its own).
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn eof_drains_old_waiting_before_reaping_and_preserves_a_replacements_waiting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Default)]
+    struct Observer(AtomicBool);
+    impl crate::claude_edges::AttentionObserver for Observer {
+        fn on_waiting(&self, _: &str, _: &str, _: i64) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn on_pending_drained(&self, _: &str) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let mut session = EndingSession::start("stream-ends", None).await;
+    let observer = Arc::new(Observer::default());
+    session.st.clone().with_attention_observer(observer.clone());
+    let pending = session.st.sessions.lock().await[&session.pane]
+        .pending
+        .clone();
+    session
+        .st
+        .publish_pending_frame(
+            &session.pane,
+            &pending,
+            &json!({"type":"sdk.permission.request", "requestId":"old", "tool":{"name":"Bash"}}),
+            "freshclaude",
+        )
+        .await;
+    assert!(observer.0.load(Ordering::SeqCst));
+    let hold = session.st.hold_exit_reports();
+    session
+        .st
+        .handle_send(send_msg(&session.pane, "end while waiting"))
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), hold.parked())
+        .await
+        .unwrap();
+    let old_waiting_was_drained = !observer.0.load(Ordering::SeqCst);
+
+    // A resumed runtime raises another request while the old process tree is
+    // still being reaped. Finishing that old death must not drain this interval.
+    tests::insert_fake_claude_session_with_pending(&session.st, &session.pane, None, &[]).await;
+    let replacement = session.st.sessions.lock().await[&session.pane]
+        .pending
+        .clone();
+    session.st.publish_pending_frame(&session.pane, &replacement,
+        &json!({"type":"sdk.question.request", "requestId":"new", "questions":[{"question":"Continue?"}]}),
+        "freshclaude").await;
+    hold.release();
+    session
+        .await_frame("the old lost turn's edge", is_turn_complete)
+        .await;
+    let new_waiting_survived = observer.0.load(Ordering::SeqCst);
+    session.st.shutdown().await;
+    assert!(
+        old_waiting_was_drained,
+        "EOF must drain old pending attention before teardown awaits"
+    );
+    assert!(
+        new_waiting_survived,
+        "old teardown must not clear the resumed runtime's waiting interval"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn a_stream_end_is_reported_once_its_whole_tree_is_confirmed_gone() {
     let (events, _log) = capture::install();
     let mut session = EndingSession::start("stream-ends", None).await;

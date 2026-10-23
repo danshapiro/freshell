@@ -6900,14 +6900,24 @@ impl FreshClaudeState {
             // (ledger A9): it exits after reporting its SDK stream's end
             // (`sdk.stream.ended`, G02), or the Node process died. Evict the dead
             // session and its cli_index entries, identity-guarded: a newer session
-            // re-registered under the same map key (attach-resume, Task 6) has a
-            // DIFFERENT sidecar_session_id and must not be evicted by this stale
-            // consumer.
+            // re-registered under the same map key has a different pending-set
+            // allocation, even when it reuses a durable sidecar session id, and
+            // must not be evicted by this stale consumer.
             let evicted = {
                 let mut map = sessions.lock().await;
                 match map.get(&session_id) {
-                    Some(s) if s.sidecar_session_id == sidecar_session_id => {
-                        map.remove(&session_id)
+                    Some(s)
+                        if s.sidecar_session_id == sidecar_session_id
+                            && Arc::ptr_eq(&s.pending, &pending) =>
+                    {
+                        let stamp = s.broadcast_id.lock().expect("broadcast id lock").clone();
+                        let removed = map.remove(&session_id);
+                        // The old runtime has no actionable pending cards. Clear
+                        // waiting attention before any teardown await or new
+                        // registration; clearing it after reaping could erase a
+                        // resumed runtime's newly raised request (G25).
+                        state.edges.pending_drained(&stamp);
+                        removed
                     }
                     _ => None,
                 }
