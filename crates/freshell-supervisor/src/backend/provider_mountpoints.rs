@@ -453,12 +453,15 @@ mod tests {
             let expected = Arc::new(Mutex::new(None::<Value>));
             let requests = Arc::new(Mutex::new(Vec::<String>::new()));
             let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (body, seen, deleted, fixture_home, fixture_daemon) = (
+            // The helper reached its private exchange (the cancel point).
+            let exchange_reached = Arc::new(tokio::sync::Notify::new());
+            let (body, seen, deleted, fixture_home, fixture_daemon, reached) = (
                 expected.clone(),
                 requests.clone(),
                 removed.clone(),
                 home.clone(),
                 daemon.clone(),
+                exchange_reached.clone(),
             );
             let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
             let server = tokio::spawn(async move {
@@ -469,10 +472,11 @@ mod tests {
                         _=&mut stopped=>break,
                         accepted=listener.accept()=>{
                             let (mut stream,_)=accepted.unwrap();
-                            let (body,seen,deleted,home,daemon,private_jobs)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone());
+                            let (body,seen,deleted,home,daemon,private_jobs,reached)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone(),reached.clone());
                             jobs.spawn(async move {
                                 let mut header=Vec::new(); let mut byte=[0];
-                                while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
+                                // A caller may abandon a request it no longer waits for.
+                                while !header.ends_with(b"\r\n\r\n") {if stream.read_exact(&mut byte).await.is_err() {return;}header.push(byte[0]);assert!(header.len()<=32*1024);}
                                 let header=String::from_utf8(header).unwrap();
                                 let line=header.lines().next().unwrap().to_string();
                                 let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
@@ -494,6 +498,7 @@ mod tests {
                                     let exchange=expected["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|mount|mount["Target"]=="/run/freshell-input-exchange").unwrap()["Source"].as_str().unwrap().to_owned();
                                     private_jobs.lock().unwrap().push(tokio::spawn(async move {
                                         let mut channel=UnixStream::connect(Path::new(&exchange).join("reply.sock")).await.unwrap();
+                                        if mode=="cancel-private-exchange" {reached.notify_one();}
                                         if matches!(mode,"timeout"|"cancel-private-exchange") {tokio::time::sleep(Duration::from_secs(10)).await;return;}
                                         let length=channel.read_u32().await.unwrap() as usize; assert!(length<=1024*1024);
                                         let mut raw=vec![0;length];channel.read_exact(&mut raw).await.unwrap();
@@ -528,11 +533,19 @@ mod tests {
             });
             let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
             let mut helper = None;
-            let outcome=tokio::time::timeout(if mode=="cancel-private-exchange" {Duration::from_millis(50)} else {Duration::from_secs(3)},backend.run_provider_mountpoint_helper(
+            // The cancel mode drops the helper once it reaches its private
+            // exchange; every other mode runs it to completion.
+            let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::select! {
+                    result = backend.run_provider_mountpoint_helper(
                 MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
-            )).await;
+            ) => Some(result),
+                    _ = exchange_reached.notified(), if mode == "cancel-private-exchange" => None,
+                }
+            })
+            .await;
             if mode == "cancel-private-exchange" {
-                assert!(outcome.is_err());
+                assert!(matches!(outcome, Ok(None)), "dropped at the exchange");
                 let (name, body) = helper
                     .as_ref()
                     .expect("canceled private exchange must retain exact helper ownership");
@@ -556,7 +569,8 @@ mod tests {
                 continue;
             }
             let result = outcome
-                .expect("preparation and cleanup must both be bounded, including image lookup");
+                .expect("preparation and cleanup must both be bounded, including image lookup")
+                .expect("runs to completion");
             assert_eq!(
                 result.is_ok(),
                 matches!(mode, "prepared" | "empty"),
