@@ -10,14 +10,17 @@
 //     { type:'create',             protocol:2, requestId, sessionType?, sessionId?,
 //                                    boot:{kind:'fresh'} | {kind:'resume', resume}
 //                                         | {kind:'fork', resume, resumeSessionAt?, dropsTurn?},
-//                                    cwd?, model?, permissionMode?, effort?, plugins?, hostedMcp? }
+//                                    cwd?, model?, permissionMode?, effort?, plugins?, hostedMcp?,
+//                                    freshellMcp?:{command,args}, freshellContext?:{tabId?,paneId?} }
 //                                  — `boot` picks the conversation the CLI boots (bootOptions): a
 //                                    fork keeps the parent through-AND-including resumeSessionAt
 //                                    over the raw parentUuid chain, writes a NEW conversation and
 //                                    never rewrites the parent's JSONL; dropsTurn arms the SDK's
 //                                    fork-time discard guard. `sessionId` is the id Rust minted for
-//                                    a fresh or forked boot, when it minted one. One sidecar hosts
-//                                    one session: a second create is refused.
+//                                    a fresh or forked boot, when it minted one. `hostedMcp` and
+//                                    `freshellMcp` pick the Freshell MCP recipe (mcp-servers.mjs);
+//                                    `freshellContext` names the pane the CLI's environment carries.
+//                                    One sidecar hosts one session: a second create is refused.
 //     { type:'configure',          sessionId, requestId, settings }
 //     { type:'send',               sessionId, text, images? }
 //     { type:'interrupt',          sessionId }
@@ -111,12 +114,14 @@
 // nothing. If the PROCESS itself dies mid-turn, stdout simply ends with no
 // `sdk.stream.ended` — the one end the Rust side rings for itself.
 //
-// Scope discipline (ADR "keep it minimal — only what the claude T2 invariant set
-// needs"): the freshell MCP-server injection (createClaudeSdkMcpServers) is
-// DELIBERATELY OMITTED — a pinned pure-text T2 turn never calls a tool, MCP tools
-// are not in the T2 baseline, and injecting the MCP server would spawn an extra
-// node grandchild bound to the REST API. The interactive permission/question
-// RESPONSE channel IS in scope (permission-channel.mjs, a faithful port of
+// The Freshell MCP server (G19): the create line names the recipe, the hosted
+// one or the ordinary one the Rust server resolved while
+// settings.codingCli.mcpServer is on (mcp-servers.mjs; never both, never an env
+// key, since the SDK puts the MCP config on the CLI's argv). The endpoint and
+// token reach the MCP child through the inherited environment the Rust server
+// set on this process, and the pane context (`freshellContext`) is merged into
+// the SDK env here. The interactive permission/question RESPONSE channel IS in
+// scope (permission-channel.mjs, a faithful port of
 // server/sdk-bridge.ts): canUseTool parks a pending request, surfaces
 // sdk.permission.request / sdk.question.request, and waits for the Rust side's
 // permission.respond / question.respond (unknown respond ids are stderr-log-only
@@ -131,7 +136,7 @@ import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
-import { hostedMcpServers } from './hosted-mcp.mjs'
+import { mcpServersFor, withFreshellContext } from './mcp-servers.mjs'
 import { cliStderrLogger, errorText, log } from './log.mjs'
 import { isHostedSidecar } from './hosted.mjs'
 import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
@@ -558,7 +563,7 @@ function handleCreate(req) {
         plugins: Array.isArray(req.plugins)
           ? req.plugins.map(path => ({ type: 'local', path }))
           : undefined,
-        mcpServers: hostedMcpServers(req.hostedMcp),
+        mcpServers: mcpServersFor(req),
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
         // This is the SDK's native persisted-user witness. Without the replay
@@ -566,7 +571,7 @@ function handleCreate(req) {
         // sidecar, so checkpoint identity must remain unbound.
         extraArgs: { 'replay-user-messages': null },
         abortController: abort,
-        env: createClaudeSdkCleanEnv(process.env),
+        env: withFreshellContext(createClaudeSdkCleanEnv(process.env), req.freshellContext),
         settingSources: ['user', 'project', 'local'],
         spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
         stderr: sdkStderr,

@@ -48,7 +48,8 @@
 //                                       `query`, the ordinal of its query() call in
 //                                       this process. Rows: `query` (the options, env
 //                                       reduced to key names plus short sha256
-//                                       digests of credential values), `boot` (the session id
+//                                       digests of credential values and the
+//                                       Freshell context values), `boot` (the session id
 //                                       and the stand-in CLI's pid), `prompt` (each
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
@@ -1022,14 +1023,18 @@ class SimulatedCli {
 }
 
 /** The credentials whose value a test may need to tell apart (as a digest, never the value). */
-const DIGESTED_CREDENTIALS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN']
+const DIGESTED_CREDENTIALS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'FRESHELL_TOKEN']
+
+/** The non-secret Freshell context names whose values the ledger records (the token is digested). */
+const RECORDED_CONTEXT = ['FRESHELL', 'FRESHELL_URL', 'FRESHELL_TERMINAL_ID', 'FRESHELL_TAB_ID', 'FRESHELL_PANE_ID']
 
 /** A short sha256 digest of a credential value: enough to compare, useless to read. */
 const credentialDigest = (value) => createHash('sha256').update(String(value)).digest('hex').slice(0, 12)
 
 /**
  * The options as a ledger row: functions and controllers by kind, env by key
- * names only, plus a short digest of each credential the child got.
+ * names only, plus a short digest of each credential the child got and the
+ * values of the non-secret Freshell context names.
  */
 function describeOptions(options) {
   const out = {}
@@ -1038,6 +1043,7 @@ function describeOptions(options) {
       const env = value ?? {}
       out.envKeys = Object.keys(env).sort()
       out.envDigests = Object.fromEntries(DIGESTED_CREDENTIALS.filter((name) => env[name] !== undefined).map((name) => [name, credentialDigest(env[name])]))
+      out.envContext = Object.fromEntries(RECORDED_CONTEXT.filter((name) => env[name] !== undefined).map((name) => [name, env[name]]))
     } else if (key === 'abortController') out.abortController = Boolean(value)
     else if (typeof value === 'function') out[key] = '[function]'
     else out[key] = value

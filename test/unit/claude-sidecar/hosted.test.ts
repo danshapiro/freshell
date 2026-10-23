@@ -12,7 +12,7 @@ import { describe, expect, it } from 'vitest'
 // @ts-expect-error JavaScript sidecar module has no declaration file.
 import { hostedProvider, isHostedSidecar, usesHostedClaudeRuntime } from '../../../crates/freshell-claude-sidecar/hosted.mjs'
 // @ts-expect-error JavaScript sidecar module has no declaration file.
-import { hostedMcpServers } from '../../../crates/freshell-claude-sidecar/hosted-mcp.mjs'
+import { mcpServersFor } from '../../../crates/freshell-claude-sidecar/mcp-servers.mjs'
 // @ts-expect-error JavaScript sidecar module has no declaration file.
 import { managedSdkSpawn } from '../../../crates/freshell-claude-sidecar/exec-profile.mjs'
 
@@ -40,9 +40,9 @@ describe('Claude sidecar hosted mode', () => {
     expect(usesHostedClaudeRuntime(env())).toBe(false)
 
     const fixedRecipe = { freshell: { command: 'node', args: ['/opt/freshell-mcp/server.js'] } }
-    expect(hostedMcpServers(true, env('claude'))).toEqual(fixedRecipe)
-    expect(hostedMcpServers(true, env('kilroy'))).toEqual(fixedRecipe)
-    expect(hostedMcpServers(true, env())).toBeUndefined()
+    expect(mcpServersFor({ hostedMcp: true }, env('claude'))).toEqual(fixedRecipe)
+    expect(mcpServersFor({ hostedMcp: true }, env('kilroy'))).toEqual(fixedRecipe)
+    expect(mcpServersFor({ hostedMcp: true }, env())).toBeUndefined()
 
     // The managed spawn is Linux-only by design.
     const spawnKind = process.platform === 'linux' ? 'function' : 'undefined'
