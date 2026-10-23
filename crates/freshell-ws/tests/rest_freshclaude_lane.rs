@@ -55,6 +55,37 @@ async fn send(rig: &ClaudeRig, pane: &str, text: &str) -> Value {
     body["data"].clone()
 }
 
+async fn wait_for_saved_turn(rig: &ClaudeRig, id: &str, submitted: &str) {
+    // The pinned CLI flushes transcript lines after their SDK frames (T3).
+    // A completed REST send promises turn settlement; capture reads the saved
+    // history, so observe this exact turn on disk before asserting its text.
+    let path = rig.wait_for_transcript(id).await;
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    loop {
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let user = lines
+            .iter()
+            .rposition(|line| line["type"] == "user" && line["uuid"] == submitted);
+        if user.is_some_and(|at| {
+            lines[at + 1..]
+                .iter()
+                .any(|line| line["type"] == "assistant")
+        }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "submitted turn {submitted} never reached {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rest_create_send_capture_and_ws_create_replay_share_one_writer() {
     let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
@@ -113,6 +144,7 @@ async fn rest_create_send_capture_and_ws_create_replay_share_one_writer() {
     assert_eq!(prompts[0]["permissionMode"], "bypassPermissions");
     assert_eq!(sent["submittedTurnId"], prompts[0]["uuid"]);
     assert_ne!(sent["submittedTurnId"], "rest-request");
+    wait_for_saved_turn(&rig, id, sent["submittedTurnId"].as_str().unwrap()).await;
     observer
         .wait_for("REST turn completion", |frame| {
             frame["event"]["type"] == "freshAgent.turn.complete" && frame["sessionId"] == id
@@ -223,13 +255,16 @@ async fn rest_controls_a_browser_created_pane_and_capture_survives_server_restar
             frame["type"] == "pong"
         })
         .await;
-    assert_eq!(
-        send(&rig, "browser-pane", "browser pane via REST").await["status"],
-        "idle"
-    );
+    let sent = send(&rig, "browser-pane", "browser pane via REST").await;
+    assert_eq!(sent["status"], "idle");
+    wait_for_saved_turn(&rig, id, sent["submittedTurnId"].as_str().unwrap()).await;
     let (status, before) = get(&rig, "/api/panes/browser-pane/capture").await;
     assert_eq!(status, 200, "{before}");
-    assert!(before.contains("browser pane via REST"));
+    assert!(
+        before.contains("browser pane via REST"),
+        "capture after settlement: {before:?}; prompts: {:?}",
+        rig.ledger_rows("prompt")
+    );
     rig.restart().await;
     let (status, after) = get(&rig, "/api/panes/browser-pane/capture").await;
     assert_eq!(status, 200, "{after}");

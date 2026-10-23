@@ -126,7 +126,18 @@ impl ClaudeRestLane {
                 submitted_turn_id,
                 ownership_id,
             } => (session_key, submitted_turn_id, ownership_id),
-            ClaudeSendOutcome::Refused { code, message } => return Err(send_error(code, message)),
+            ClaudeSendOutcome::Refused {
+                code,
+                message,
+                retryable,
+                owner,
+            } => {
+                let mut error = send_error(code, message);
+                error.retryable = retryable.or(error.retryable);
+                error.retry_after_ms = error.retryable.filter(|retryable| *retryable).map(|_| 250);
+                error.owner = owner;
+                return Err(error);
+            }
         };
         let settled_key = wait_for_turn(
             &mut events,

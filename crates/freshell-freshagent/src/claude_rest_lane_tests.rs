@@ -120,7 +120,7 @@ fn settled(session: &str, request: &str, uuid: &str) -> ClaudeTurnEvent {
 }
 
 #[tokio::test]
-async fn completion_requires_the_accepted_session_uuid_and_request_even_when_both_sends_share_a_request_id(
+async fn completion_requires_the_accepted_command_uuid_and_request_even_when_sends_share_a_request_id(
 ) {
     let (tx, mut rx) = tokio::sync::broadcast::channel(16);
     let future = wait_for_turn(
