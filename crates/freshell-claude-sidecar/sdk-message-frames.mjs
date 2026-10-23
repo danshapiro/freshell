@@ -79,10 +79,12 @@ export function resultFrames(sessionId, result, { userStopped }) {
 // ── content kinds (docs/plans/2026-10-22-freshclaude-transcript-live.md §4.2) ──
 //
 // framesForSdkMessage maps the SDK messages whose content reaches the server:
-// assistant and user messages, stream events and the compaction status frames.
-// Every other kind maps to no frame here: `result`, `system/init`,
-// `commands_changed` and the checkpoint replay binding carry side effects, so
-// index.mjs handles them itself.
+// assistant and user messages, stream events, the compaction status frames,
+// and the provider events that never end a turn (an API retry becomes
+// `sdk.retry`; a rate limit or an informational message becomes
+// `sdk.notice`). Every other kind maps to no frame here: `result`,
+// `system/init`, `commands_changed` and the checkpoint replay binding carry
+// side effects, so index.mjs handles them itself.
 //
 // Transcript announcements: the CLI writes each assistant and user message,
 // each compaction boundary and each local command's output to its transcript
@@ -110,11 +112,14 @@ export function framesForSdkMessage(sessionId, msg, session) {
     case 'assistant': return assistantFrames(sessionId, msg)
     case 'user': return transcriptAnnouncement(sessionId, msg)
     case 'stream_event': return streamEventFrames(sessionId, msg, session.stream)
+    case 'rate_limit_event': return rateLimitFrames(sessionId, msg)
     case 'system':
       switch (msg.subtype) {
         case 'status': return statusFrames(sessionId, msg)
         case 'compact_boundary': return compactBoundaryFrames(sessionId, msg)
         case 'local_command_output': return transcriptAnnouncement(sessionId, msg)
+        case 'api_retry': return apiRetryFrames(sessionId, msg)
+        case 'informational': return informationalFrames(sessionId, msg)
         default: return []
       }
     default: return []
@@ -204,4 +209,77 @@ export function statusFrames(sessionId, msg) {
 export function compactBoundaryFrames(sessionId, msg) {
   const trigger = msg.compact_metadata?.trigger === 'manual' ? 'manual' : 'auto'
   return [{ type: 'sdk.compact_boundary', sessionId, trigger }, ...transcriptAnnouncement(sessionId, msg)]
+}
+
+/**
+ * The CLI will retry a failed API request (live only; never in the
+ * transcript): `sdk.retry`. `errorStatus` is null for a connection error.
+ */
+export function apiRetryFrames(sessionId, msg) {
+  return [{
+    type: 'sdk.retry',
+    sessionId,
+    attempt: msg.attempt,
+    maxRetries: msg.max_retries,
+    delayMs: msg.retry_delay_ms,
+    errorStatus: msg.error_status ?? null,
+    error: msg.error,
+  }]
+}
+
+const RATE_LIMIT_NOTICES = {
+  allowed_warning: { level: 'warning', code: 'RATE_LIMIT_WARNING', message: 'You are close to your Claude usage limit.' },
+  rejected: { level: 'error', code: 'RATE_LIMITED', message: 'You have reached your Claude usage limit.' },
+}
+const RATE_LIMIT_FIELDS = ['status', 'resetsAt', 'rateLimitType', 'utilization']
+
+/**
+ * A change in the account's usage limits: a notice when the limit is near
+ * (`allowed_warning`) or reached (`rejected`), carrying the limit so the
+ * client can show when it resets. An `allowed` status says nothing.
+ */
+export function rateLimitFrames(sessionId, msg) {
+  const info = msg.rate_limit_info ?? {}
+  const notice = RATE_LIMIT_NOTICES[info.status]
+  if (!notice) return []
+  const rateLimit = {}
+  for (const key of RATE_LIMIT_FIELDS) if (info[key] !== undefined) rateLimit[key] = info[key]
+  return [{ type: 'sdk.notice', sessionId, ...notice, rateLimit }]
+}
+
+/**
+ * A banner the CLI shows as plain text (hook feedback, status lines): a
+ * notice with its text. Only the CLI's `warning` level is more than info.
+ */
+export function informationalFrames(sessionId, msg) {
+  const message = typeof msg.content === 'string' ? msg.content.trim() : ''
+  if (!message) return []
+  return [{ type: 'sdk.notice', sessionId, level: msg.level === 'warning' ? 'warning' : 'info', code: 'INFORMATIONAL', message }]
+}
+
+const NOTICE_SEVERITY = { info: 'info', warning: 'warn', error: 'error' }
+
+/**
+ * The sidecar's log record for a frame worth logging (`{severity, event,
+ * fields}`), else undefined. Like every sidecar record (log.mjs) it carries
+ * ids, numbers and error text only: the text of an informational notice is
+ * logged by its size.
+ */
+export function frameLogRecord(frame) {
+  if (frame?.type === 'sdk.retry') {
+    const { type: _type, ...fields } = frame
+    return { severity: 'warn', event: 'api.retry', fields }
+  }
+  if (frame?.type === 'sdk.notice') {
+    const fields = { sessionId: frame.sessionId, code: frame.code }
+    if (frame.rateLimit) {
+      fields.rateLimitStatus = frame.rateLimit.status
+      if (frame.rateLimit.rateLimitType !== undefined) fields.rateLimitType = frame.rateLimit.rateLimitType
+      if (frame.rateLimit.resetsAt !== undefined) fields.resetsAt = frame.rateLimit.resetsAt
+    } else {
+      fields.bytes = Buffer.byteLength(frame.message ?? '')
+    }
+    return { severity: NOTICE_SEVERITY[frame.level] ?? 'info', event: 'notice', fields }
+  }
+  return undefined
 }

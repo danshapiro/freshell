@@ -45,6 +45,13 @@
 //                                    text/thinking deltas only, stamped with the API message id of the
 //                                    message being streamed (a subagent's events, tool input JSON,
 //                                    signatures, message_delta and message_stop are not sent)
+//     { type:'sdk.retry',               sessionId, attempt, maxRetries, delayMs, errorStatus, error }
+//                                  — the CLI will retry a failed API request (errorStatus null: no HTTP
+//                                    response); live only, never a turn end
+//     { type:'sdk.notice',              sessionId, level:'info'|'warning'|'error', code, message, rateLimit? }
+//                                  — a non-terminal provider notice: RATE_LIMIT_WARNING / RATE_LIMITED
+//                                    (rateLimit {status, resetsAt?, rateLimitType?, utilization?}),
+//                                    INFORMATIONAL (the CLI's own banner text); never a turn end
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
 //                                  the stopped turn's own aborted result (an accepted user interrupt's mark
@@ -114,7 +121,7 @@
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent } from './session-settings.mjs'
-import { createFrameState, framesForSdkMessage, resultFrames } from './sdk-message-frames.mjs'
+import { createFrameState, frameLogRecord, framesForSdkMessage, resultFrames } from './sdk-message-frames.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
@@ -358,9 +365,14 @@ function handleSdkMessage(sessionId, msg) {
     default:
       break
   }
-  // The content kinds (assistant, stream events, compaction): a pure mapping,
-  // sdk-message-frames.mjs. Any kind it does not map is dropped there.
-  for (const frame of framesForSdkMessage(sessionId, msg, { stream: st.frameState })) emit(frame)
+  // The content kinds (assistant, user, stream events, compaction, retries
+  // and notices): a pure mapping, sdk-message-frames.mjs. Any kind it does
+  // not map is dropped there.
+  for (const frame of framesForSdkMessage(sessionId, msg, { stream: st.frameState })) {
+    emit(frame)
+    const record = frameLogRecord(frame)
+    if (record) log(record.severity, record.event, record.fields)
+  }
 }
 
 async function consumeStream(sessionId, sdkQuery) {

@@ -15,6 +15,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   createFrameState,
+  frameLogRecord,
   framesForSdkMessage,
 } from '../../../crates/freshell-claude-sidecar/sdk-message-frames.mjs'
 
@@ -226,5 +227,76 @@ describe('framesForSdkMessage over the pinned CLI\'s recorded sequences', () => 
     expect(framesForSdkMessage('s1', { type: 'tool_progress', tool_use_id: 't1', heartbeat: true }, session())).toEqual([])
     expect(framesForSdkMessage('s1', { type: 'system', subtype: 'session_state_changed', state: 'idle' }, session())).toEqual([])
     expect(framesForSdkMessage('s1', {}, session())).toEqual([])
+  })
+})
+
+// Shapes the pinned CLI emits that the recordings above do not contain
+// (docs/plans/2026-10-22-freshclaude-transcript-live.md §3: F11 api_retry,
+// recorded from a 529 response) or that only a claude.ai subscription or a
+// hook produces (rate_limit_event, informational: the SDK's own typings).
+const RETRY = { type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 10, retry_delay_ms: 563, error_status: 529, error: 'overloaded', session_id: 'c1', uuid: '67c2e12a-e020-406a-b7b8-4d90df03dc10' }
+const rateLimit = (info: Record<string, unknown>) => ({ type: 'rate_limit_event', rate_limit_info: info, session_id: 'c1', uuid: '8a2f7c1e-55a0-4d3b-9f1e-2b6c0d9e4a11' })
+const informational = (level: string, content: string) => ({ type: 'system', subtype: 'informational', content, level, session_id: 'c1', uuid: 'f3b1c2d4-1e2f-4a3b-8c4d-5e6f7a8b9c0d' })
+
+describe('framesForSdkMessage: provider events that never end a turn', () => {
+  it('an API retry becomes sdk.retry with its attempt, limit, delay and error', () => {
+    expect(framesForSdkMessage('s1', RETRY, session())).toEqual([
+      { type: 'sdk.retry', sessionId: 's1', attempt: 1, maxRetries: 10, delayMs: 563, errorStatus: 529, error: 'overloaded' },
+    ])
+    // A connection error (a timeout) had no HTTP status.
+    expect(framesForSdkMessage('s1', { ...RETRY, attempt: 3, error_status: null, error: 'unknown' }, session())[0])
+      .toMatchObject({ attempt: 3, errorStatus: null, error: 'unknown' })
+  })
+
+  it('a rate limit warning or rejection becomes a notice carrying the limit; an allowed status says nothing', () => {
+    expect(framesForSdkMessage('s1', rateLimit({ status: 'allowed', resetsAt: 1761300000 }), session())).toEqual([])
+    expect(framesForSdkMessage('s1', rateLimit({ status: 'allowed_warning', resetsAt: 1761300000, rateLimitType: 'five_hour', utilization: 0.92, isUsingOverage: false }), session())).toEqual([
+      {
+        type: 'sdk.notice',
+        sessionId: 's1',
+        level: 'warning',
+        code: 'RATE_LIMIT_WARNING',
+        message: expect.any(String),
+        rateLimit: { status: 'allowed_warning', resetsAt: 1761300000, rateLimitType: 'five_hour', utilization: 0.92 },
+      },
+    ])
+    const [rejected] = framesForSdkMessage('s1', rateLimit({ status: 'rejected', resetsAt: 1761300000, rateLimitType: 'seven_day' }), session())
+    expect(rejected).toMatchObject({ type: 'sdk.notice', level: 'error', code: 'RATE_LIMITED', rateLimit: { status: 'rejected', resetsAt: 1761300000, rateLimitType: 'seven_day' } })
+    expect(rejected.rateLimit).not.toHaveProperty('utilization')
+    expect(rejected.message).not.toBe(framesForSdkMessage('s1', rateLimit({ status: 'allowed_warning' }), session())[0].message)
+  })
+
+  it('an informational message becomes a notice with its text; only a warning is more than info', () => {
+    expect(framesForSdkMessage('s1', informational('warning', '  A hook blocked this prompt.\n'), session())).toEqual([
+      { type: 'sdk.notice', sessionId: 's1', level: 'warning', code: 'INFORMATIONAL', message: 'A hook blocked this prompt.' },
+    ])
+    for (const level of ['info', 'notice', 'suggestion', undefined]) {
+      expect(framesForSdkMessage('s1', informational(level as string, 'Plain status'), session())[0]).toMatchObject({ level: 'info', code: 'INFORMATIONAL', message: 'Plain status' })
+    }
+    expect(framesForSdkMessage('s1', informational('warning', '   '), session())).toEqual([])
+  })
+})
+
+describe('frameLogRecord', () => {
+  it('logs a retry as a warning with its numbers', () => {
+    const [frame] = framesForSdkMessage('s1', RETRY, session())
+    expect(frameLogRecord(frame)).toEqual({ severity: 'warn', event: 'api.retry', fields: { sessionId: 's1', attempt: 1, maxRetries: 10, delayMs: 563, errorStatus: 529, error: 'overloaded' } })
+  })
+
+  it('logs a notice at its level, with the limit for a rate limit and only the size of an informational text', () => {
+    const [warning] = framesForSdkMessage('s1', rateLimit({ status: 'allowed_warning', resetsAt: 1761300000, rateLimitType: 'five_hour', utilization: 0.92 }), session())
+    expect(frameLogRecord(warning)).toEqual({ severity: 'warn', event: 'notice', fields: { sessionId: 's1', code: 'RATE_LIMIT_WARNING', rateLimitStatus: 'allowed_warning', rateLimitType: 'five_hour', resetsAt: 1761300000 } })
+    const [rejected] = framesForSdkMessage('s1', rateLimit({ status: 'rejected' }), session())
+    expect(frameLogRecord(rejected)).toMatchObject({ severity: 'error', event: 'notice', fields: { code: 'RATE_LIMITED' } })
+    const [info] = framesForSdkMessage('s1', informational('notice', 'text a hook wrote'), session())
+    const record = frameLogRecord(info)
+    expect(record).toEqual({ severity: 'info', event: 'notice', fields: { sessionId: 's1', code: 'INFORMATIONAL', bytes: 17 } })
+    expect(JSON.stringify(record)).not.toContain('hook wrote')
+  })
+
+  it('logs nothing for content frames', () => {
+    for (const { frames } of mapRecording('tools-sync')) {
+      for (const frame of frames) expect(frameLogRecord(frame)).toBeUndefined()
+    }
   })
 })
