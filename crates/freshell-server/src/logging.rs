@@ -51,7 +51,16 @@
 //!     carries `provider` + the spawned process `pid` (no `session_id` --
 //!     the spawn can precede session minting on the create path; the
 //!     pid<->session join is the same session's adjacent created/reaped
-//!     events). Prompt/turn CONTENT is never logged anywhere.
+//!     events). Prompt/turn CONTENT is never logged anywhere, with one
+//!     deliberate exception: saved session names (next item).
+//!   - Saved session names: `session_names.name_changed` (INFO, one line per
+//!     accepted saved-name change, after the durable commit) carries
+//!     `name_ref`, `cause`, `old_name`/`old_source`/`old_revision`,
+//!     `new_name`/`new_source`/`new_revision` and `self_heal` (field
+//!     meanings: `session_name_events`). It logs the saved names
+//!     themselves, which are at most 200 characters and can be the first
+//!     words of a session's first user message (the `first_message`
+//!     source, cut to 50 characters).
 //!   - Server lifecycle: `server.started` (`bind`, `port`, `boot_id`,
 //!     `instance_id`, `commit`, `dirty`) -> `server.stopping` (`signal`)
 //!     -> `server.stopped` (plus the `shutdown_forensics` diagnostic record)

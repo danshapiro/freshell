@@ -19,7 +19,24 @@
 //! `evidence_key` / `series` when they apply. Names are logged by design:
 //! they are what a reader needs to rebuild a name's history, they are the
 //! same text the name document and every naming surface already show, and
-//! every line passes the log writer's secret scrubber.
+//! every line passes the log writer's secret scrubber. Saved names are the
+//! only prompt-derived text these lines carry: a saved name is at most 200
+//! characters, and a `first_message` name is the first words of the
+//! session's first user message, cut to 50 characters.
+//!
+//! `self_heal` is true exactly when an automatic offer — a native
+//! observation, a first-message fallback, the session index (`hydrate`) or
+//! a bind's pending name (`bind_collision`) — replaced a self-heal record
+//! (an unprotected saved name the default/derived-name classifier
+//! recognizes, with the folder the offer knew) by a name whose source
+//! ranks the same or lower. Outside the self-heal rule an automatic offer
+//! applies only by raising the rank (or, for a provider's changed native
+//! title, at equal rank over an older provider-level name), so the flag
+//! marks the junk names the rule replaced. A change that raises the source
+//! rank (a folder name giving way to the first message) is `false` even
+//! when the replaced name was a self-heal record, whichever path made it,
+//! so the same before/after pair always logs the same flag. Renames, AI
+//! answers, imports and adopted external changes are always `false`.
 
 use std::collections::BTreeMap;
 
@@ -197,7 +214,9 @@ impl NameChangeEvent {
     /// Whether the change replaced junk only because of the self-heal rule:
     /// an automatic offer over a self-heal record that did not outrank it
     /// (an ordinary rank raise, such as a folder name giving way to the
-    /// first message, is not a heal).
+    /// first message, is not a heal — also when the session index made it,
+    /// so the flag depends on the before/after pair, never on the path; see
+    /// the module docs).
     fn heals(&self, new: &NameState) -> bool {
         self.cause.can_heal()
             && self.prior.as_ref().is_some_and(|prior| {
@@ -207,36 +226,29 @@ impl NameChangeEvent {
 }
 
 /// Log the changes a committed transaction made. A record changed by more
-/// than one decision in the transaction (an import with several candidates
-/// for one session, a sweep item that hydrated and then applied an
-/// activity) logs once: from its state before the first change to its
-/// committed state, under the last change's cause.
+/// than one decision in the transaction (an import with several winning
+/// candidates for one session) logs once: the last change measured from
+/// where the first one started ([`NameChangeEvent::after`], the same merge
+/// the sweep batch applies per record), so the old name and the self-heal
+/// flag are both judged against the record before the transaction.
 pub(super) fn log_name_changes<'a>(
     document: &StoredDocument,
     changes: impl IntoIterator<Item = (&'a str, &'a NameChangeEvent)>,
 ) {
     let mut order: Vec<&str> = Vec::new();
-    let mut merged: BTreeMap<&str, (Option<&'a Prior>, &'a NameChangeEvent)> = BTreeMap::new();
+    let mut merged: BTreeMap<&str, NameChangeEvent> = BTreeMap::new();
     for (key, event) in changes {
-        match merged.get_mut(key) {
-            Some((_, last)) => *last = event,
-            None => {
-                order.push(key);
-                merged.insert(key, (event.prior.as_ref(), event));
-            }
+        let earlier = merged.remove(key);
+        if earlier.is_none() {
+            order.push(key);
         }
+        merged.insert(key, event.clone().after(earlier));
     }
     for key in order {
-        let (prior, event) = merged[key];
         let Some(record) = document.record_at(key) else {
             continue;
         };
-        emit(
-            key,
-            prior.map(|prior| &prior.state),
-            &NameState::of(record),
-            event,
-        );
+        emit(key, &merged[key], &NameState::of(record));
     }
 }
 
@@ -280,17 +292,16 @@ impl ExternalChanges {
 
     pub(super) fn log(&self) {
         for (key, event, new) in &self.changes {
-            emit(
-                key,
-                event.prior.as_ref().map(|prior| &prior.state),
-                new,
-                event,
-            );
+            emit(key, event, new);
         }
     }
 }
 
-fn emit(key: &str, old: Option<&NameState>, new: &NameState, event: &NameChangeEvent) {
+/// Write one `session_names.name_changed` line for `event` ending at `new`:
+/// the old fields and the self-heal flag both come from the event's own
+/// prior record. Nothing is logged when the name and source did not move.
+fn emit(key: &str, event: &NameChangeEvent, new: &NameState) {
+    let old = event.prior.as_ref().map(|prior| &prior.state);
     if old.is_some_and(|old| !old.differs_from(new)) {
         return;
     }
