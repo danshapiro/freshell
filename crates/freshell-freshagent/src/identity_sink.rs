@@ -23,6 +23,20 @@ pub struct FreshAgentSettings {
     pub permission_mode: Option<String>,
     pub effort: Option<String>,
     pub cwd: Option<String>,
+    /// The claude pane's local plugin directories (G15): every launch of the
+    /// session hands them to the sidecar. `None` (never an empty list) when
+    /// the pane has none — see [`Self::with_plugins`].
+    pub plugins: Option<Vec<String>>,
+}
+
+impl FreshAgentSettings {
+    /// These settings with `plugins` as the pane's plugin directories. An
+    /// empty list is no plugins and is kept as `None`, so a pane that names
+    /// none records nothing (its row stays lineage-only).
+    pub fn with_plugins(mut self, plugins: Option<Vec<String>>) -> Self {
+        self.plugins = plugins.filter(|plugins| !plugins.is_empty());
+        self
+    }
 }
 
 /// D8 (restore-open-sessions-only) bind-lane provenance: WHICH browser client
@@ -2014,6 +2028,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("low".into()),
                 cwd: Some("/w".into()),
+                plugins: None,
             },
         })
         .await

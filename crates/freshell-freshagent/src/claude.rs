@@ -76,7 +76,7 @@ use freshell_protocol::{
 };
 
 use crate::claude_handshake::{read_created, BootContext};
-use crate::claude_launch::{create_line, ClaudeBoot};
+use crate::claude_launch::{BootDecision, ClaudeBoot, ClaudeLaunchSpec};
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
@@ -2416,431 +2416,67 @@ impl FreshClaudeState {
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
 
-        let SpawnedSidecar {
-            mut child,
-            mut stdin,
-            stdout,
-            ownership_id,
-            log_labels,
-            tree_guard,
-        } = match self.spawn_sidecar_process(session_type).await {
-            Ok(spawned) => spawned,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                self.fail_create(&request_id, "CLAUDE_SIDECAR_START_FAILED", &err);
-                return;
-            }
-        };
-        // Arm the TTL tree-kill path now that the child + its ownership tag exist.
-        if let Some(g) = lease_guard.as_mut() {
-            if let Some(pid) = child.id() {
-                g.set_kill_handle(pid, &ownership_id);
-            }
-        }
-        // kata b8ke Task 3: the spawn's partial runtime (the watchdog's
-        // reap target) + the pid for the commit's owner identity (captured
-        // before `child` moves into the session entry).
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: arm the registered start cancellation —
-        // from here the watchdog's cancel SIGTERMs this child.
-        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
-        if let Some(sid) = resume_sid.as_deref() {
-            crate::ownership_lane::register_partial_fresh_runtime(
-                &self.ownership,
-                PROVIDER,
-                sid,
-                &own_ticket,
-                sid,
-                sidecar_pid,
-            );
-        }
-        // b8ke ext r22 F1: the fresh path registers its spawn's partial
-        // runtime under the pane-scoped claim key (the ticket's key — the
-        // watchdog's reap target through the window; the `created` mint
-        // rekey below carries it onto the client-visible key's record).
-        if let Some(claim_key) = fresh_claim_key.as_deref() {
-            crate::ownership_lane::register_partial_fresh_runtime(
-                &self.ownership,
-                PROVIDER,
-                claim_key,
-                &own_ticket,
-                claim_key,
-                sidecar_pid,
-            );
-        }
-
-        // P1.13: FULL settings snapshot for the binding row the consumer writes at
-        // `sdk.session.init` (claude has no sandbox concept — always `None`). Built
-        // from the SAME values the create request below actually sends.
+        // P1.13: the FULL settings snapshot the session records at
+        // `sdk.session.init` (claude has no sandbox concept: always `None`), and
+        // the launch is built from the same values (G15: the plugins too).
         let settings = crate::identity_sink::FreshAgentSettings {
             model: msg.model.clone(),
             sandbox: None,
             permission_mode: msg.permission_mode.clone(),
             effort: msg.effort.clone(),
             cwd: msg.cwd.clone(),
-        };
-
-        // Send the create request (faithful to createClaudeSdkOptions inputs).
-        let boot = ClaudeBoot::resume_or_fresh(resume_sid.as_deref());
-        let create_req = create_line(
-            &request_id,
+            plugins: None,
+        }
+        .with_plugins(msg.plugins.clone());
+        let spec = ClaudeLaunchSpec::new(
+            request_id.clone(),
             session_type,
-            &boot,
-            json!({
-                "cwd": msg.cwd,
-                "model": msg.model,
-                "permissionMode": msg.permission_mode,
-                "effort": msg.effort,
-                "plugins": msg.plugins,
-                "hostedMcp": self.hosted_mcp,
-                "modelSelection": msg.model_selection,
-            }),
-        );
-        if let Err(err) = write_line(&mut stdin, &create_req).await {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            // Own tree torn down above -- releasing the lease is safe (no orphan writer).
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
-            self.fail_create(&request_id, "CLAUDE_SIDECAR_WRITE_FAILED", &err);
-            return;
-        }
-
-        // Read stdout until `created` / `create.failed` (bounded): the sidecar answers
-        // `created` only once the CLI has booted the conversation, and a refused boot
-        // (a resume of a conversation the CLI does not have, a CLAUDE_CMD that is not
-        // the CLI) is a typed `create.failed`, never a session that is already dead.
-        // Keep the reader to hand to the consumer so no post-created event line is lost.
-        let mut reader = BufReader::new(stdout).lines();
-        let boot_context = BootContext {
-            request_id: &request_id,
-            session_type,
-            boot: &boot,
-        };
-        let created = match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
-            Ok(created) => created.session_id,
-            Err(failure) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                // Own tree torn down above -- release so the loser can acquire.
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                self.fail_create(&request_id, failure.code(), failure.message());
-                return;
-            }
-        };
-
-        // Retire-on-kill round 3 (focused-ep5-r2 Findings 4+5): the genuine
-        // claim COMMITS here — the replacement session is ESTABLISHED
-        // (sidecar created + `created` answered), so the durable kill fence
-        // the close recorded is cleared, the stale placeholder alias
-        // tombstones pointing at this durable are consumed, and a
-        // kill-closed ledger row returns to Bound. Every failure arm ABOVE
-        // precedes the commit, so a failed spawn/write/create keeps the
-        // fence by never touching it (Finding 5); the lease-revoke arm below
-        // is the ONE post-commit failure and rolls the claim back
-        // (`rollback_session_claim` re-raises the fence and re-retires the
-        // row). The commit runs BEFORE `spawn_consumer` by construction, so
-        // the consumer's `sdk.session.init` adoption write can never consult
-        // a fence whose clear it raced — the ordering is structural, not
-        // scheduled.
-        //
-        // Unified agent names (Task 2): the pre-durable handle is admitted
-        // with the placeholder session id — BEFORE any failure arm that
-        // would otherwise strand a handle the pane content already carries
-        // (creation/recovery retries re-ensure the same handle idempotently).
-        let naming_projection = self.admit_create_handle(&msg, session_type, &created).await;
-        //
-        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL —
-        // if a kill landed while this create awaited `created`, the durable
-        // dead-state has advanced past the claim-start snapshot and the
-        // commit refuses with NO side effects: the just-built session is an
-        // orphan of the pane the user already closed, so it is torn down
-        // here (own tree killed, lease failed open) and the row the kill
-        // retired STAYS Retired. Nothing was registered yet (the
-        // consumer/`cli_index`/sessions inserts all follow the commit), so
-        // a plain process teardown is the entire arm.
-        if let Some(sid) = resume_sid.as_deref() {
-            // Round 6 (Finding 2): the commit's placeholder-fence consult —
-            // the claim's identity registers under the just-minted `created`
-            // seat; a close fence under it blocks the commit exactly like
-            // one under the durable.
-            if !self
-                .commit_session_claim(sid, claim_dead_state, std::slice::from_ref(&created))
-                .await
-            {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
-                self.fail_create(
-                    &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session closed while the resume was in flight; torn down",
-                );
-                return;
-            }
-        }
-
-        // b8ke ext r22 F1: the FRESH path's mint-time rekey — the SAME
-        // ticket's in-flight record moves from the pane-scoped provisional
-        // key to the just-minted client-visible session id in ONE atomic
-        // step (`rekey_starting`: the provisional key becomes
-        // `Aliased{to: <created>}` — the rekey family's resolution record,
-        // so an idempotent re-drive of this createRequestId resolves to the
-        // session and adopts — and the `created` key holds the SAME
-        // operation's `Starting` through this handler's tail; the ticket
-        // survives via `rekey_session_id`, so the RAII typed drop at
-        // handler end settles the window record). A record already under
-        // the `created` key (a competitor claimed the freshly discoverable
-        // id inside the window) REFUSES typed — the minted runtime is torn
-        // down below (never two writers, never an orphan).
-        if fresh_claim_key.is_some() {
-            if let Some(ticket) = own_ticket.as_mut() {
-                let Some(registry) = self.ownership.as_ref() else {
-                    unreachable!("a live ticket implies a wired coordinator");
-                };
-                match registry.rekey_starting(
-                    PROVIDER,
-                    ticket.session_id(),
-                    &created,
-                    ticket.operation_id(),
-                    ticket.generation(),
-                ) {
-                    freshell_ownership::CommitOutcome::Committed => {
-                        ticket.rekey_session_id(&created);
-                    }
-                    outcome => {
-                        tracing::error!(target: "invariant",
-                            provider = PROVIDER, session_id = %created, request_id = %request_id,
-                            outcome = ?outcome,
-                            "freshagent.claude.create_rekey_refused: the minted session id \
-                             was claimed by another owner during the create window — the \
-                             minted runtime is torn down (kata b8ke ext r22 F1)"
-                        );
-                        let _ = child.start_kill();
-                        reap_owned_claude_sidecars(&ownership_id);
-                        self.fail_create(
-                            &request_id,
-                            "FRESH_AGENT_CREATE_FAILED",
-                            "the minted session id was claimed by another owner during the create; torn down",
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-
-        // V5 interleaving 2 (Task 12): on the create-resume path, insert
-        // `cli_index[durable] = map_key` SYNCHRONOUSLY at session registration
-        // (mirroring the attach path) -- NOT lazily at `sdk.session.init`, which lands
-        // hundreds of ms later and leaves `has_live_session` blind exactly when the 1s
-        // loser retry arrives. The `sdk.session.init` write stays as a corrector.
-        if let Some(sid) = resume_sid.as_deref() {
-            self.cli_index
-                .lock()
-                .await
-                .insert(sid.to_string(), created.clone());
-        }
-
-        // Start the stdout consumer (the completion edge normalization + the Task 2
-        // pending-set fold live here) and register the session, under the sessions
-        // map lock (review PRB-C10): the consumer reaches its session only through
-        // that lock, so no line it reads -- the boot's command catalog, a CLI death
-        // right after the boot -- can find the session missing. `Some(settings)` =>
-        // the consumer records a binding row at `sdk.session.init`.
-        let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        // Task 5: the fresh session's death-mint clock (see the field doc).
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
-        let turn_lock = Arc::new(TokioMutex::new(()));
-        // Fresh session: nothing announced yet; the consumer's status fold owns it.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        {
-            let mut sessions = self.sessions.lock().await;
-            let consumer = self.spawn_consumer(
-                reader,
-                created.clone(),
-                session_type.to_string(),
-                created.clone(),
-                Some(settings.clone()),
-                Arc::clone(&broadcast_id),
-                Arc::clone(&pending),
-                Arc::clone(&last_status),
-                Arc::clone(&in_turn),
-                Arc::clone(&turn_tracker),
-                Arc::clone(&last_synthesized_complete_at),
-                None,
-                provenance,
-            );
-            self.test_holds.registration().await;
-            sessions.insert(
-                created.clone(),
-                ClaudeSession {
-                    configuration: ClaudeConfiguration {
-                        settings,
-                        ..ClaudeConfiguration::default()
-                    },
-                    stdin,
-                    child,
-                    tree_guard,
-                    ownership_id: ownership_id.clone(),
-                    consumer,
-                    sidecar_session_id: created.clone(),
-                    cli_session_id: resume_sid.clone(),
-                    // b8ke focused episode-2 round-2 F2: the owning lifecycle op
-                    // — the create-resume claim's op id, so the session-init
-                    // adoption's Blocked arm can correlate its OWN in-flight
-                    // claim (a foreign blocker tears down instead).
-                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+            ClaudeBoot::resume_or_fresh(resume_sid.as_deref()),
+            msg.cwd.clone(),
+            &settings,
+            self.hosted_mcp,
+        )
+        .with_model_selection(serde_json::to_value(&msg.model_selection).ok());
+        // b8ke focused episode-2 round-2 F2: the create's claim owns this
+        // runtime's coordinator transition (the session-init adoption's Blocked
+        // arm correlates its own in-flight claim through it).
+        let owning_operation = own_ticket.as_ref().map(|t| t.operation_id().to_string());
+        let established = match self
+            .establish_runtime(
+                EstablishPlan {
+                    lane: EstablishLane::Create,
+                    spec,
+                    register_under: RegisterUnder::Minted,
+                    claim: resume_sid.clone().map(|durable| DurableClaim {
+                        durable,
+                        dead_state: claim_dead_state,
+                    }),
+                    rekey_provisional_claim: fresh_claim_key.is_some(),
+                    recorded_settings: Some(settings),
+                    owning_operation,
                     owning_generation: None,
-                    broadcast_id,
-                    pending,
-                    in_turn,
-                    turn_tracker,
-                    last_synthesized_complete_at,
-                    turn_lock,
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
+                    provenance,
+                    naming: Some(&msg),
+                    partial_runtime_key: resume_sid.clone().or_else(|| fresh_claim_key.clone()),
+                    start_pid_slot: &start_pid_slot,
                 },
-            );
-            // C09: a create that resumes an ended session makes it live again.
-            // Forgotten before the lock is released, so a death of this new
-            // incarnation is recorded after it, never forgotten by it.
-            if let Some(sid) = resume_sid.as_deref() {
-                self.dead_sessions.forget(&[sid], "resumed");
-            }
-        }
-        // Round 6 (Finding 2): the alias mapping is durable at registration (the
-        // adopt path's corrector re-stamps it later).
-        if let Some(sid) = resume_sid.as_deref() {
-            if let Some(sink) = self.identity_sink() {
-                if let Err(e) = sink
-                    .record_alias_tombstone(
-                        PROVIDER,
-                        &created,
-                        sid,
-                        crate::session_lease::now_epoch_ms() as i64,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, session = %sid, placeholder = %created,
-                        "freshagent.claude.alias_tombstone_write_failed");
-                }
-            }
-        }
-
-        // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
-        // dead-state re-check. The commit above and a kill's retire serialize
-        // on the ledger guard, so a kill QUEUED behind a successful commit
-        // (its decision pre-dated the kill) lands while this lane is between
-        // the commit and the registration above. Now that the session is
-        // registered (kill-visible), re-validate against the claim-start
-        // snapshot: an advanced fence means the row was retired after our
-        // commit — the registered session is a late orphan of the pane the
-        // user closed. Tear it down (the kill's retire already left the row
-        // Retired; the kill's post-close sweep covers the mirror order) and
-        // answer failed. Kill always wins vs an in-flight claim.
-        if let Some(sid) = resume_sid.as_deref() {
-            if self.claim_dead_state_advanced(sid, claim_dead_state) {
-                tracing::info!(target: "freshell_freshagent::claude",
-                    durable = %sid,
-                    "freshagent.claude.claim_late_orphan_torn_down: a close landed between the \
-                     claim's commit and its registration; the registered orphan is torn down"
-                );
-                if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    // R2-2: the typed outcome is propagated; this unwind path holds no
-                    // coordinator fence, so the helper's typed log + its detached
-                    // escalation are the whole discipline here.
-                    let _teardown: LoggedTeardown =
-                        self.teardown_removed_session_logged(session).await;
-                }
-                // Demote (never drop) the torn-down registration: a later
-                // kill naming this placeholder still resolves the durable.
-                self.evict_cli_index_aliases(&created).await;
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
-                }
+                &mut lease_guard,
+                &mut own_ticket,
+            )
+            .await
+        {
+            Ok(established) => established,
+            Err(error) => {
                 self.fail_create(
                     &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session closed while the resume was in flight; torn down",
+                    error.create_code(),
+                    &error.message(EstablishLane::Create),
                 );
                 return;
             }
-        }
-
-        // Task 12: bind the durable id to this live session + release the lease in ONE
-        // lock scope. A revoked lease (expired handle-less holder) means we must NOT
-        // keep the session -- tear down our own tree and answer failed.
-        if let Some(mut g) = lease_guard.take() {
-            if !g.complete(&created) {
-                if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    session.consumer.abort();
-                    let mut child = session.child;
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&session.ownership_id);
-                }
-                if let Some(sid) = resume_sid.as_deref() {
-                    // Finding 5's re-raise: the ONE post-commit failure arm —
-                    // the session is torn back down, so the close the commit
-                    // undid is durable again (fence re-raised, the revived
-                    // row re-retired) before any orphan write can land.
-                    self.rollback_session_claim(sid).await;
-                    // Finding 1: demote (not drop) the torn-down alias.
-                    self.evict_cli_index_aliases(&created).await;
-                    let _ = sid;
-                }
-                g.fail(); // own tree torn down -- reopen the key
-                self.fail_create(
-                    &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session lease revoked during create; torn down",
-                );
-                return;
-            }
-        }
-
-        // kata b8ke Task 3: the create's registration survived every teardown
-        // gate — commit `Live{FreshAgent}` under the claimed durable id (the
-        // sessions-map key is the `created` placeholder; the stamp lands in
-        // the lane's retained map under the CANONICAL durable). The FRESH
-        // create lane (no resume id) never claimed — nothing to commit (the
-        // canonical durable id only materializes at `sdk.session.init`; the
-        // residual is covered by the D7 probe backstop).
-        if let Some(sid) = resume_sid.as_deref() {
-            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, &created, sidecar_pid)
-            {
-                tracing::error!(target: "invariant",
-                    provider = PROVIDER, session_id = %sid, request_id = %request_id,
-                    outcome = ?outcome,
-                    "freshagent.claude.create_commit_stale: the coordinator moved on while \
-                     the create registered; the uncommitted session is torn down"
-                );
-                if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    // R2-2: the typed outcome is propagated; this unwind path holds no
-                    // coordinator fence, so the helper's typed log + its detached
-                    // escalation are the whole discipline here.
-                    let _teardown: LoggedTeardown =
-                        self.teardown_removed_session_logged(session).await;
-                }
-                self.evict_cli_index_aliases(&created).await;
-                self.fail_create(
-                    &request_id,
-                    "FRESH_AGENT_CREATE_FAILED",
-                    "session ownership changed during create; torn down",
-                );
-                return;
-            }
-        }
+        };
+        let created = established.map_key;
+        let naming_projection = established.naming_projection;
 
         // Cache the completed create for requestId dedup BEFORE responding (mirrors
         // codex/opencode: a duplicate `create` arriving right after this point must see
@@ -6032,7 +5668,7 @@ impl FreshClaudeState {
             guard_uuid,
         ) = match op.direction {
             RollbackDirection::Undo => {
-                let path = match snap::locate_transcript_state(&durable_id) {
+                let path = match self.locate_transcript(&durable_id) {
                     snap::TranscriptLocation::Found(path) => path,
                     snap::TranscriptLocation::Absent => {
                         reply_sink(rollback_error_frame(
@@ -6154,7 +5790,7 @@ impl FreshClaudeState {
                     ));
                     return;
                 };
-                let original_path = match snap::locate_transcript_state(&original) {
+                let original_path = match self.locate_transcript(&original) {
                     snap::TranscriptLocation::Found(path) => path,
                     snap::TranscriptLocation::Absent => {
                         reply_sink(rollback_error_frame(
@@ -6530,19 +6166,17 @@ impl FreshClaudeState {
         let recovered = self
             .identity_sink()
             .and_then(|s| s.load_settings(PROVIDER, &durable_id));
-        let original_cwd =
-            snap::transcript_cwd(&source_path).filter(|c| std::path::Path::new(c).is_dir());
         // resume value (the fork leg): the durable id under its ORIGINAL cwd's
         // slug scope when that cwd survives; else the transcript PATH (the
         // verified cli.js escape hatch bypassing slug scoping).
-        let resume_value = match &original_cwd {
-            Some(_) => resume_from.clone(),
-            None => source_path.to_string_lossy().to_string(),
-        };
+        let (resume_value, original_cwd) =
+            crate::claude_launch::resume_target(&resume_from, &source_path);
         let spawn_cwd = original_cwd
-            .clone()
             .or_else(|| op.cwd.clone())
             .or_else(|| recovered.as_ref().and_then(|r| r.cwd.clone()));
+        // G15: the respawn runs with the session's recorded settings, plugins
+        // included, and the lane's hosted MCP selection.
+        let launch_settings = recovered.clone().unwrap_or_default();
         // Tear down the old sidecar (handle_kill discipline): remove the record
         // FIRST so its consumer's exit arm stays silent (evicted=false), then the
         // shared kill-family teardown (G31: the shutdown request, escalation only
@@ -6570,21 +6204,6 @@ impl FreshClaudeState {
         // the raw guard text is never surfaced).
         let mut guard_retried = guard_uuid.is_none(); // no guard => nothing to retry
         let spawned = loop {
-            let mut create_req = Map::new();
-            if let Some(cwd) = &spawn_cwd {
-                create_req.insert("cwd".to_string(), json!(cwd));
-            }
-            if let Some(rec) = &recovered {
-                if let Some(model) = &rec.model {
-                    create_req.insert("model".to_string(), json!(model));
-                }
-                if let Some(permission_mode) = &rec.permission_mode {
-                    create_req.insert("permissionMode".to_string(), json!(permission_mode));
-                }
-                if let Some(effort) = &rec.effort {
-                    create_req.insert("effort".to_string(), json!(effort));
-                }
-            }
             let boot = match &resume_at_uuid {
                 Some(resume_at) => ClaudeBoot::Fork {
                     resume: resume_value.clone(),
@@ -6594,14 +6213,16 @@ impl FreshClaudeState {
                 },
                 None => ClaudeBoot::Fresh,
             };
-            let create_req = create_line(
-                &format!("rollback-{}", uuid::Uuid::new_v4()),
+            let spec = ClaudeLaunchSpec::new(
+                format!("rollback-{}", uuid::Uuid::new_v4()),
                 session_type,
-                &boot,
-                Value::Object(create_req),
+                boot,
+                spawn_cwd.clone(),
+                &launch_settings,
+                self.hosted_mcp,
             );
             match self
-                .rollback_spawn_create(&create_req, &boot, session_type, lease_guard.as_mut())
+                .rollback_spawn_create(&spec, lease_guard.as_mut())
                 .await
             {
                 Ok(ok) => break Ok(ok),
@@ -7340,24 +6961,29 @@ impl FreshClaudeState {
             own_ticket,
             crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
         );
-        // Positive denial only on a CLEAN miss in EVERY candidate root
-        // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home -- ledger A3). An
-        // unreadable store (or no root at all) cannot CHECK, so it must not DENY.
-        let transcript = match crate::claude_snapshot::locate_transcript_state(durable) {
-            crate::claude_snapshot::TranscriptLocation::Found(path) => path,
-            crate::claude_snapshot::TranscriptLocation::Absent => {
-                return Err(ResumeClaudeError::NotFound);
-            }
-            crate::claude_snapshot::TranscriptLocation::Unreadable(error) => {
-                crate::claude_snapshot::log_transcript_unreadable("attach_resume", durable, &error);
-                return Err(ResumeClaudeError::Transient(error.to_string()));
-            }
-        };
+        // Which conversation boots (design §4.2, I8): a found transcript resumes;
+        // a positive denial only on a CLEAN miss in every candidate root
+        // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home, ledger A3); an
+        // unreadable store (or no root at all) cannot CHECK, so it must not deny.
+        let (boot, transcript_cwd) =
+            match crate::claude_launch::decide_boot(durable, self.locate_transcript(durable)) {
+                BootDecision::Boot { boot, cwd } => (boot, cwd),
+                BootDecision::Lost => return Err(ResumeClaudeError::NotFound),
+                BootDecision::Transient(error) => {
+                    crate::claude_snapshot::log_transcript_unreadable(
+                        "attach_resume",
+                        durable,
+                        &error,
+                    );
+                    return Err(ResumeClaudeError::Transient(error.to_string()));
+                }
+            };
         // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
-        // resume-in-place does not silently revert model/permissionMode/effort. V7/A10
-        // alarm gate: alarm ONLY when the ledger PROVES prior recording yet no snapshot
-        // is recoverable. Never-recorded transcripts (the entire pre-existing
-        // ~/.claude/projects population — resume_for_attach exists FOR them) stay silent.
+        // resume-in-place does not silently revert model/permissionMode/effort (or,
+        // G15, drop its plugins). V7/A10 alarm gate: alarm ONLY when the ledger
+        // PROVES prior recording yet no snapshot is recoverable. Never-recorded
+        // transcripts (the entire pre-existing ~/.claude/projects population —
+        // resume_for_attach exists FOR them) stay silent.
         let sink = self.identity_sink();
         let recovered = sink
             .as_ref()
@@ -7377,336 +7003,64 @@ impl FreshClaudeState {
             );
         }
         let rec = recovered.clone().unwrap_or_default();
-        // The CLI's resume lookup is scoped to the ORIGINAL cwd's project slug
-        // (ledger A15) -- resume with the cwd recorded in the transcript itself.
-        // If that directory is gone, fall back to path-based resume
-        // (`--resume <path>.jsonl` bypasses slug scoping -- verified cli.js 2.1.220),
-        // keeping the attach cwd for the process itself. The path form is
-        // reserved for a transcript WITH records: a zero-turn transcript
-        // (touched at create, no records) has no cwd to resolve and NOTHING
-        // to path-resume — and the create line's resume boot names a
-        // SESSION ID (the real sidecar forwards it verbatim to the SDK's
-        // `resume` option), so a path there would make the recovered session
-        // write under a path-flattened phantom file. An empty transcript
-        // resumes by id.
-        let original_cwd = crate::claude_snapshot::transcript_cwd(&transcript)
-            .filter(|c| std::path::Path::new(c).is_dir());
-        let transcript_has_records = std::fs::metadata(&transcript)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false);
-        let (resume_value, resume_cwd) = match original_cwd {
-            Some(cwd) => (durable.to_string(), json!(cwd)),
-            None if transcript_has_records => (
-                transcript.to_string_lossy().to_string(),
-                json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
-            ),
-            // Attach cwd stays primary; the ledger record's cwd is a FINAL
-            // fallback only when both existing sources are absent (Task 10).
-            None => (
-                durable.to_string(),
-                json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
-            ),
-        };
-        let boot = ClaudeBoot::Resume {
-            resume: resume_value,
-        };
+        // The CLI runs where the conversation was recorded when that directory
+        // still exists; otherwise the attach cwd stays primary and the ledger
+        // record's cwd is a FINAL fallback only when both are absent (Task 10).
+        let resume_cwd = transcript_cwd
+            .or_else(|| msg.cwd.clone())
+            .or_else(|| rec.cwd.clone());
 
-        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
-        // SNAPSHOT — taken at claim start, before the sidecar spawn and the
-        // `created` await — so a kill landing while this resume is in flight
-        // advances the durable tombstone past it and the commit below
-        // REFUSES instead of undoing the newer close.
+        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state SNAPSHOT —
+        // taken at claim start, before the sidecar spawn and the `created` await —
+        // so a kill landing while this resume is in flight advances the durable
+        // tombstone past it and the commit REFUSES instead of undoing the newer
+        // close.
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
-        let SpawnedSidecar {
-            mut child,
-            mut stdin,
-            stdout,
-            ownership_id,
-            log_labels,
-            tree_guard,
-        } = self
-            .spawn_sidecar_process(session_type_str(msg.session_type))
-            .await
-            .map_err(ResumeClaudeError::Transient)?;
-        // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
-        if let Some(g) = lease_guard.as_mut() {
-            if let Some(pid) = child.id() {
-                g.set_kill_handle(pid, &ownership_id);
-            }
-        }
-        // kata b8ke Task 3: the spawn's partial runtime (the watchdog's reap
-        // target) + the pid for the commit's owner identity (captured before
-        // `child` moves into the session entry).
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: arm the registered start cancellation.
-        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            durable,
-            own_ticket,
-            durable,
-            sidecar_pid,
-        );
-        let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
         let session_type = session_type_str(msg.session_type);
-        let create_req = create_line(
-            &request_id,
+        let spec = ClaudeLaunchSpec::new(
+            format!("attach-resume-{}", uuid::Uuid::new_v4()),
             session_type,
-            &boot,
-            json!({
-                "cwd": resume_cwd,
-                // Recovered from the ledger record (Task 10); `json!` serializes
-                // `None` as `null`, preserving today's fallback wire shape exactly
-                // on a miss.
-                "model": rec.model,
-                "permissionMode": rec.permission_mode,
-                "effort": rec.effort,
-            }),
+            boot,
+            resume_cwd,
+            &rec,
+            self.hosted_mcp,
         );
-        if let Err(err) = write_line(&mut stdin, &create_req).await {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            return Err(ResumeClaudeError::Transient(err));
-        }
-        let mut reader = BufReader::new(stdout).lines();
-        let boot_context = BootContext {
-            request_id: &request_id,
-            session_type,
-            boot: &boot,
-        };
-        // A refusal stays transient here: the transcript was found just above, so a
-        // CLI that cannot resume it is not proof the conversation is gone.
-        let sidecar_session_id =
-            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
-                Ok(created) => created.session_id,
-                Err(failure) => {
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&ownership_id);
-                    return Err(ResumeClaudeError::Transient(format!(
-                        "{}: {}",
-                        failure.code(),
-                        failure.message()
-                    )));
-                }
-            };
-
-        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
-        // 4+5): this attach is a NEW pane GENUINELY CLAIMING `durable` — the
-        // claim COMMITS here: the replacement session is established (sidecar
-        // created + `created` answered), every error return above precedes
-        // the commit (no spawn-sidecar/no-created failure disturbs a fence it
-        // never claimed), the commit still strictly precedes the consumer
-        // below (so its sdk.session.init adoption write is never suppressed
-        // as the killed session's stale orphan), and the commit now also
-        // consumes the stale placeholder alias tombstones pointing at
-        // `durable` (Finding 2) and returns a kill-closed row to Bound
-        // (Finding 4 — unconditional, independent of the settings snapshot).
-        //
-        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
-        // the claim-start dead-state snapshot. A kill that landed while this
-        // resume awaited `created` advanced the durable tombstone; the commit
-        // refuses with NO side effects, so the just-spawned session is an
-        // orphan of a pane the user closed mid-attach — tear it down here
-        // (nothing registered yet: consumer, sessions insert and cli_index
-        // all follow the commit) and leave the row Retired.
-        // Round 6 (focused-ep5-r5 Finding 2): the commit's placeholder-fence
-        // consult rides the ATTACHING pane's seat — `msg.session_id` — because
-        // that is exactly the identity a phantom post-restart close fenced: a
-        // pane the user closed while this slow resume was in flight fenced
-        // its (one-shot) placeholder, and a fence there blocks the commit
-        // exactly like one recorded under the durable id.
-        if !self
-            .commit_session_claim(
-                durable,
-                claim_dead_state,
-                std::slice::from_ref(&msg.session_id),
-            )
-            .await
-        {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
-            return Err(ResumeClaudeError::Transient(
-                "session closed while the resume was in flight; torn down".to_string(),
-            ));
-        }
-
-        let session_type = session_type_str(msg.session_type).to_string();
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
-        // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane.
-        // The sidecar's created id is the eviction identity guard for this consumer.
-        // `settings` (P1.13, Task 10): `Some(rec)` re-records the row under any new
-        // cliSessionId (the old durable's row keeps serving `load_settings`, so later
-        // attaches with the old id still resolve — no repeat-fire, V7 §4); `None`
-        // records nothing (no laundered blank row under the new id, V7/A10).
-        let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        // Task 5: the resumed session's death-mint clock (see the field doc).
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
-        let turn_lock = Arc::new(TokioMutex::new(()));
-        // Freshly resumed session: the tracked status starts "idle" (truthful — no
-        // turn can be in flight before the client sends).
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        // Spawned and registered under the sessions map lock (review PRB-C10): no
-        // line the consumer reads can find the resumed session missing.
-        {
-            let mut sessions = self.sessions.lock().await;
-            let consumer = self.spawn_consumer(
-                reader,
-                msg.session_id.clone(),
-                session_type.clone(),
-                sidecar_session_id.clone(),
-                recovered.clone(),
-                Arc::clone(&broadcast_id),
-                Arc::clone(&pending),
-                Arc::clone(&last_status),
-                Arc::clone(&in_turn),
-                Arc::clone(&turn_tracker),
-                Arc::clone(&last_synthesized_complete_at),
-                None,
+        // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane. The
+        // sidecar's created id is the eviction identity guard for this consumer.
+        // `recorded_settings` (P1.13, Task 10): `Some(rec)` re-records the row under
+        // any new cliSessionId (the old durable's row keeps serving `load_settings`,
+        // so later attaches with the old id still resolve — no repeat-fire, V7 §4);
+        // `None` records nothing (no laundered blank row under the new id, V7/A10).
+        // A refusal stays transient: the transcript was found just above, so a CLI
+        // that cannot resume it is not proof the conversation is gone.
+        self.establish_runtime(
+            EstablishPlan {
+                lane: EstablishLane::AttachResume,
+                spec,
+                register_under: RegisterUnder::Pane(msg.session_id.clone()),
+                claim: Some(DurableClaim {
+                    durable: durable.to_string(),
+                    dead_state: claim_dead_state,
+                }),
+                rekey_provisional_claim: false,
+                recorded_settings: recovered,
+                owning_operation,
+                owning_generation: handoff_generation,
                 // Conn-less lane (D8): attach-resume is not a create; the ledger
                 // merge keeps the row's existing stamps.
-                None,
-            );
-            self.test_holds.registration().await;
-            sessions.insert(
-                msg.session_id.clone(),
-                ClaudeSession {
-                    configuration: ClaudeConfiguration {
-                        settings: recovered.unwrap_or_default(),
-                        ..ClaudeConfiguration::default()
-                    },
-                    stdin,
-                    child,
-                    tree_guard,
-                    ownership_id,
-                    consumer,
-                    sidecar_session_id,
-                    cli_session_id: Some(durable.to_string()),
-                    owning_operation,
-                    owning_generation: handoff_generation,
-                    broadcast_id,
-                    pending,
-                    in_turn,
-                    turn_tracker,
-                    last_synthesized_complete_at,
-                    turn_lock,
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
-                },
-            );
-            // C09: the session is live again, so it is no longer an ended one.
-            // Forgotten before the lock is released, so a death of this new
-            // incarnation is recorded after it, never forgotten by it.
-            self.dead_sessions
-                .forget(&[msg.session_id.as_str(), durable], "resumed");
-        }
-        self.cli_index
-            .lock()
-            .await
-            .insert(durable.to_string(), msg.session_id.clone());
-        // Test seam (Task 6 round-3 review I-1): park with the target
-        // session REGISTERED (map + cli_index) but the resume unreturned —
-        // the fresh-arm target-spawn-window abort test's deterministic
-        // hold. None in production and every other test.
-        if let Some(pause) = self.handoff_resume_pause.as_ref() {
-            let _ = pause.notified().await;
-        }
-        // Round 6 (Finding 2): the alias mapping is durable at registration.
-        if let Some(sink) = self.identity_sink() {
-            if let Err(e) = sink
-                .record_alias_tombstone(
-                    PROVIDER,
-                    &msg.session_id,
-                    durable,
-                    crate::session_lease::now_epoch_ms() as i64,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, session = %durable, placeholder = %msg.session_id,
-                    "freshagent.claude.alias_tombstone_write_failed");
-            }
-        }
-
-        // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
-        // dead-state re-check (the create lane's twin lives above
-        // `finish_create`). A kill QUEUED behind the successful commit lands
-        // between the commit and the registration; now that the session is
-        // registered (kill-visible), an advanced fence means the row was
-        // retired after our commit — the registered session is a late
-        // orphan: tear it down and fail the resume (the caller broadcasts
-        // `CLAUDE_ATTACH_RESUME_FAILED`), leaving the kill's row Retired.
-        if self.claim_dead_state_advanced(durable, claim_dead_state) {
-            tracing::info!(target: "freshell_freshagent::claude",
-                durable = %durable,
-                "freshagent.claude.claim_late_orphan_torn_down: a close landed between the \
-                 claim's commit and its registration; the registered orphan is torn down"
-            );
-            if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                // R2-2: the typed outcome is propagated; this unwind path holds no
-                // coordinator fence, so the helper's typed log + its detached
-                // escalation are the whole discipline here.
-                let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
-            }
-            self.evict_cli_index_aliases(&msg.session_id).await; // demote, never drop
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
-            return Err(ResumeClaudeError::Transient(
-                "session closed while the resume was in flight; torn down".to_string(),
-            ));
-        }
-
-        // Task 13: bind the durable id to this live session + release the lease. A
-        // revoked lease means we must NOT keep the session -- tear down and fail.
-        if let Some(mut g) = lease_guard.take() {
-            if !g.complete(&msg.session_id) {
-                if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                    session.consumer.abort();
-                    let mut child = session.child;
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&session.ownership_id);
-                }
-                // Finding 5's re-raise: the ONE post-commit failure arm — the
-                // session is torn back down, so the close the commit undid is
-                // durable again (fence re-raised, the revived row re-retired).
-                self.rollback_session_claim(durable).await;
-                self.evict_cli_index_aliases(&msg.session_id).await; // Finding 1: demote, never drop
-                g.fail(); // own tree torn down -- reopen the key
-                return Err(ResumeClaudeError::Transient(
-                    "session lease revoked during attach-resume; torn down".to_string(),
-                ));
-            }
-        }
-
-        // kata b8ke Task 3: the attach-resume's registration survived every
-        // teardown gate — commit `Live{FreshAgent}` under the durable id
-        // (the sessions-map key is the CLIENT's msg.session_id).
-        if let Err(outcome) = self.commit_lane_claim_at(own_ticket, &msg.session_id, sidecar_pid) {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %durable,
-                outcome = ?outcome,
-                "freshagent.claude.attach_commit_stale: the coordinator moved on while the \
-                 resume registered; the uncommitted session is torn down"
-            );
-            if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                // R2-2: the typed outcome is propagated; this unwind path holds no
-                // coordinator fence, so the helper's typed log + its detached
-                // escalation are the whole discipline here.
-                let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
-            }
-            self.evict_cli_index_aliases(&msg.session_id).await;
-            return Err(ResumeClaudeError::Transient(
-                "session ownership changed during attach-resume; torn down".to_string(),
-            ));
-        }
+                provenance: None,
+                naming: None,
+                partial_runtime_key: Some(durable.to_string()),
+                start_pid_slot: &start_pid_slot,
+            },
+            lease_guard,
+            own_ticket,
+        )
+        .await
+        .map_err(|error| ResumeClaudeError::Transient(error.resume_detail()))?;
+        let session_type = session_type.to_string();
 
         // Read the tracked status through the same `current_status()` helper the
         // rebind arm uses (the session was registered above; the lease-revocation
@@ -9976,65 +9330,37 @@ impl FreshClaudeState {
         self.evict_cli_index_aliases(map_key).await;
     }
 
-    /// One rollback-respawn attempt (kata 1wxv Task 4): spawn the sidecar, arm
-    /// the lease kill handle, write the create request, and PREREAD its output
-    /// until the `sdk.session.init` line — the `--resume-drops-turn` refusal
+    /// One rollback-respawn attempt (kata 1wxv Task 4): boot a sidecar for
+    /// `spec` ([`Self::boot_sidecar`]: spawn, arm the lease kill handle, write
+    /// the create line, read `created`), then PREREAD its output until the
+    /// `sdk.session.init` line — the `--resume-drops-turn` refusal
     /// watch lives in this pre-read, BEFORE any durable state moves (the refusal
     /// is retried by the caller with the guard omitted; the pre-read ordering is
     /// how a refused fork can never adopt).
     async fn rollback_spawn_create(
         &self,
-        create_req: &Value,
-        boot: &ClaudeBoot,
-        session_type: &str,
+        spec: &ClaudeLaunchSpec,
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
     ) -> Result<RollbackSpawned, RollbackSpawnError> {
-        let SpawnedSidecar {
+        let BootedSidecar {
             mut child,
-            mut stdin,
-            stdout,
+            stdin,
+            mut reader,
             ownership_id,
             log_labels,
             tree_guard,
+            created,
         } = self
-            .spawn_sidecar_process(session_type)
+            .boot_sidecar(spec, lease_guard, None)
             .await
-            .map_err(RollbackSpawnError::Other)?;
-        if let Some(g) = lease_guard {
-            if let Some(pid) = child.id() {
-                g.set_kill_handle(pid, &ownership_id);
-            }
-        }
-        if let Err(err) = write_line(&mut stdin, create_req).await {
-            let _ = child.start_kill();
-            reap_owned_claude_sidecars(&ownership_id);
-            return Err(RollbackSpawnError::Other(err));
-        }
-        let mut reader = BufReader::new(stdout).lines();
-        let request_id = create_req
-            .get("requestId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let boot_context = BootContext {
-            request_id,
-            session_type,
-            boot,
-        };
-        let sidecar_session_id =
-            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
-                Ok(created) => created.session_id,
-                Err(failure) => {
-                    let _ = child.start_kill();
-                    reap_owned_claude_sidecars(&ownership_id);
-                    // The CLI refuses a fork whose drops-turn guard does not hold at
-                    // boot (T5): the same refusal the init pre-read below watches for.
-                    return Err(if failure.is_refusal(FORK_GUARD_REFUSED_CODE) {
-                        RollbackSpawnError::GuardRefusal
-                    } else {
-                        RollbackSpawnError::Other(failure.message().to_string())
-                    });
+            .map_err(|error| match error {
+                // The CLI refuses a fork whose drops-turn guard does not hold at
+                // boot (T5): the same refusal the init pre-read below watches for.
+                EstablishError::Boot(failure) if failure.is_refusal(FORK_GUARD_REFUSED_CODE) => {
+                    RollbackSpawnError::GuardRefusal
                 }
-            };
+                other => RollbackSpawnError::Other(other.message(EstablishLane::Create)),
+            })?;
         match read_session_init(&mut reader, SIDECAR_CREATE_BUDGET).await {
             Ok(init) => {
                 let cli_id = init
@@ -10049,7 +9375,7 @@ impl FreshClaudeState {
                     reader,
                     ownership_id,
                     log_labels,
-                    sidecar_session_id,
+                    sidecar_session_id: created.session_id,
                     preseeded_init: init,
                     cli_id,
                 })
@@ -10699,6 +10025,11 @@ fn log_claude_teardown(
         ),
     }
 }
+
+mod establish;
+use establish::{
+    BootedSidecar, DurableClaim, EstablishError, EstablishLane, EstablishPlan, RegisterUnder,
+};
 
 #[cfg(test)]
 mod teardown_tests;
@@ -20580,6 +19911,44 @@ rl.on('line', (line) => {
         assert!(b.settings.cwd.is_some());
     }
 
+    /// G15: the create's plugins are part of the settings the session records
+    /// at `sdk.session.init`, so every later launch of the session can restore
+    /// them. An empty plugin list is no plugins: it records nothing, so a
+    /// create that names none keeps the lineage-only row shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_records_the_create_plugins_and_an_empty_list_as_none() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let mut msg = dedup_create_msg("req-binding-plugins");
+        msg.plugins = Some(vec!["/workspace/.claude/plugins/local".to_string()]);
+        state.handle_create(msg, None).await;
+        await_claude_created_and_session_init(&mut rx, "req-binding-plugins").await;
+        let row = await_claude_session_init_binding_row(&fake).await;
+        assert_eq!(
+            row.settings.plugins,
+            Some(vec!["/workspace/.claude/plugins/local".to_string()])
+        );
+
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+        let mut msg = dedup_create_msg("req-binding-no-plugins");
+        msg.plugins = Some(Vec::new());
+        state.handle_create(msg, None).await;
+        await_claude_created_and_session_init(&mut rx, "req-binding-no-plugins").await;
+        let row = await_claude_session_init_binding_row(&fake).await;
+        assert_eq!(
+            row.settings,
+            crate::identity_sink::FreshAgentSettings::default(),
+            "an empty plugin list records nothing"
+        );
+        drop(env);
+    }
+
     /// b8ke ext r27 F4 reshape (was
     /// `session_init_with_all_blank_settings_records_no_binding`): an
     /// all-blank settings snapshot now records a LINEAGE-ONLY row — the
@@ -20862,6 +20231,7 @@ rl.on('line', (line) => {
                 permission_mode: Some("plan".into()),
                 effort: Some("high".into()),
                 cwd: None,
+                plugins: None,
             },
         );
         state.set_identity_sink(fake);

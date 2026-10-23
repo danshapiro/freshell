@@ -175,6 +175,7 @@ impl PaneIdentitySink for TestLedgerSink {
                     observed_generation: None,
                     authoritative: upsert.authoritative,
                     now_ms: now,
+                    plugins: upsert.settings.plugins.as_deref(),
                 };
                 ledger.record_fresh_agent_binding(&w)?;
                 if let Some(p) = upsert.resolves_pending.as_deref() {
@@ -194,6 +195,7 @@ impl PaneIdentitySink for TestLedgerSink {
             permission_mode: row.permission_mode,
             effort: row.effort,
             cwd: row.cwd,
+            plugins: row.plugins,
         })
     }
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {

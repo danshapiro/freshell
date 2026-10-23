@@ -1335,6 +1335,7 @@ mod tests {
 
                 authoritative: false,
                 now_ms: now_ms(),
+                plugins: None,
             })
             .expect("seed fresh-agent ledger row");
 

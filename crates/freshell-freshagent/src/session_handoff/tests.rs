@@ -6276,6 +6276,7 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
             permission_mode: Some("plan".into()),
             effort: Some("high".into()),
             cwd: None,
+            plugins: None,
         },
     );
 

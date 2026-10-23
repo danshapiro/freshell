@@ -832,6 +832,7 @@ impl PaneIdentitySink for TestLedgerSink {
                     observed_generation: upsert.observed_generation,
                     authoritative: upsert.authoritative,
                     now_ms: now,
+                    plugins: upsert.settings.plugins.as_deref(),
                 };
                 ledger.record_fresh_agent_binding(&w)?;
                 // kata 1wxv Task 4 (claude adoption): the rollback row re-keys
@@ -882,6 +883,7 @@ impl PaneIdentitySink for TestLedgerSink {
             permission_mode: row.permission_mode,
             effort: row.effort,
             cwd: row.cwd,
+            plugins: row.plugins,
         };
         if s == FreshAgentSettings::default() {
             return None;
@@ -4005,6 +4007,7 @@ async fn an_ordinary_codex_cold_resume_with_recovered_settings_lands_end_to_end(
             observed_generation: None,
             authoritative: false,
             now_ms: 1_000,
+            plugins: None,
         })
         .expect("the recovered row seeds");
     let row_before = pane_ledger

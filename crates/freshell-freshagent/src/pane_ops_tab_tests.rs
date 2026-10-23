@@ -1135,6 +1135,7 @@ async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route(
             permission_mode: None,
             effort: Some("high".to_string()),
             cwd: Some("/real/project".to_string()),
+            plugins: None,
         },
     );
     sink.recorded
@@ -1682,6 +1683,7 @@ async fn rest_resume_body_model_and_effort_beat_the_ledger_record() {
             permission_mode: None,
             effort: Some("high".to_string()),
             cwd: None,
+            plugins: None,
         },
     );
     sink.recorded

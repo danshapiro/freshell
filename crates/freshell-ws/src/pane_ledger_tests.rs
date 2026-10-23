@@ -299,6 +299,7 @@ fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAge
 
         authoritative: false,
         now_ms,
+        plugins: None,
     }
 }
 
@@ -327,6 +328,7 @@ fn fa_write_fenced<'a>(
 
         authoritative: false,
         now_ms,
+        plugins: None,
     }
 }
 
@@ -357,6 +359,7 @@ fn fa_write_target<'a>(
         observed_generation: Some(generation),
         authoritative: true,
         now_ms,
+        plugins: None,
     }
 }
 
@@ -2970,6 +2973,7 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
 
             authoritative: false,
             now_ms: 1,
+            plugins: None,
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
     ledger
@@ -4093,6 +4097,76 @@ fn old_rows_and_markers_without_the_lineage_fields_still_deserialize() {
 }
 
 #[test]
+fn a_fresh_agent_binding_keeps_the_panes_plugins_across_a_restart() {
+    // G15: a claude pane's plugins are part of its resume record, so every
+    // later launch of the session (attach-resume, handoff resume, rollback)
+    // can hand them to the sidecar again.
+    let root = temp_root("fa-plugins-round-trip");
+    let plugins = vec![
+        "/workspace/.claude/plugins/local".to_string(),
+        "/opt/plugins/review".to_string(),
+    ];
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            plugins: Some(&plugins),
+            ..fa_write("claude", "s-plugins", 1_000)
+        })
+        .unwrap();
+    assert_eq!(
+        ledger.load_binding("claude", "s-plugins").unwrap().plugins,
+        Some(plugins.clone())
+    );
+
+    // A new ledger over the same root (a server restart) reads them back.
+    let reloaded = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        reloaded
+            .load_binding("claude", "s-plugins")
+            .unwrap()
+            .plugins,
+        Some(plugins.clone())
+    );
+
+    // Plugins alone are a settings record: the resume has something to restore.
+    reloaded
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            cwd: None,
+            plugins: Some(&plugins),
+            ..fa_write("claude", "s-plugins-only", 2_000)
+        })
+        .unwrap();
+    assert!(reloaded.fresh_agent_settings_recorded("claude", "s-plugins-only"));
+
+    // A row written before plugins were recorded parses with none.
+    let ledger_dir = root.join("bindings").join("claude");
+    std::fs::write(
+        ledger_dir.join("s-legacy.json"),
+        serde_json::json!({
+            "ledgerVersion": LEDGER_VERSION,
+            "provider": "claude",
+            "sessionId": "s-legacy",
+            "mode": "freshclaude",
+            "cwd": "/w",
+            "createdAt": 1_000i64,
+            "updatedAt": 1_000i64,
+            "lastObservedAt": 1_000i64,
+            "state": "bound",
+            "paneKind": "fresh-agent",
+            "model": "opus",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let legacy = PaneLedger::new(Some(root.clone()))
+        .load_binding("claude", "s-legacy")
+        .expect("a legacy row parses");
+    assert_eq!(legacy.plugins, None);
+    assert_eq!(legacy.model.as_deref(), Some("opus"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn stamped_marker_retention_keys_on_creation_time_never_assertion_time() {
     // The stamps are payload, not lifetime: retention reads only
     // `spawned_at` — the marker's ACTUAL creation time (focused-ep4-r3
@@ -4556,6 +4630,7 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             device_id: None,
             tab_key: None,
             last_attributed_at: None,
+            plugins: None,
         };
         write_row_atomic(
             &root
@@ -4675,6 +4750,7 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
 
             authoritative: false,
             now_ms: 1_000,
+            plugins: None,
         })
         .unwrap();
     let row = ledger.load_binding("codex", "thread-1").expect("row");
@@ -4709,6 +4785,7 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
 
         authoritative: false,
         now_ms: 1_000,
+        plugins: None,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
     ledger
@@ -4758,6 +4835,7 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
 
         authoritative: false,
         now_ms: 1_000,
+        plugins: None,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
     ledger
@@ -4823,6 +4901,7 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
 
         authoritative: false,
         now_ms: 1_000,
+        plugins: None,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
     ledger
@@ -4871,6 +4950,7 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
 
         authoritative: false,
         now_ms: 1_000,
+        plugins: None,
     };
     // A cwd-only snapshot counts as settings-bearing (real creates always
     // carry at least cwd).
@@ -4921,6 +5001,7 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
 
             authoritative: false,
             now_ms: 1_000,
+            plugins: None,
         })
         .expect("missing old row is a silent no-op, not an error");
     assert!(ledger.load_binding("codex", "never-existed").is_none());
@@ -8201,6 +8282,7 @@ fn close_record_covers_row_is_the_shared_recovery_predicate() {
             device_id: None,
             tab_key: None,
             last_attributed_at: None,
+            plugins: None,
         }
     }
     let crid = |id: &str| id == "req-closed";

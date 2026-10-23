@@ -1726,6 +1726,7 @@ impl FreshCodexState {
             permission_mode: permission_mode.map(Into::into),
             effort: effort.map(Into::into),
             cwd: cwd.map(Into::into),
+            plugins: None,
         };
         // No-laundering guard (V7/A10): never persist an all-blank snapshot --
         // it would mask a genuine record miss forever. Real creates always carry
@@ -18551,6 +18552,7 @@ pub(crate) mod tests {
                 permission_mode: None,
                 effort: None,
                 cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                plugins: None,
             },
         })
         .await
@@ -18654,6 +18656,7 @@ pub(crate) mod tests {
                 permission_mode: None,
                 effort: None,
                 cwd: Some("/w".into()),
+                plugins: None,
             },
         })
         .await
@@ -22616,6 +22619,7 @@ pub(crate) mod tests {
                 permission_mode: Some("on-request".into()),
                 effort: Some("high".into()),
                 cwd: Some("/w".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());

@@ -340,6 +340,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     sandbox: upsert.settings.sandbox.as_deref(),
                     permission_mode: upsert.settings.permission_mode.as_deref(),
                     effort: upsert.settings.effort.as_deref(),
+                    plugins: upsert.settings.plugins.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
                     provenance,
                     // b8ke ext r22 F2: the upsert's observed (epoch,
@@ -417,6 +418,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
             permission_mode: row.permission_mode,
             effort: row.effort,
             cwd: row.cwd,
+            plugins: row.plugins,
         };
         // A fully blank snapshot (a lineage-only row, Task 3) is "nothing
         // recoverable". Under the Task 3 `was_recorded` rekeying such a row
@@ -779,6 +781,7 @@ mod tests {
                 permission_mode: Some("on-request".into()),
                 effort: None,
                 cwd: Some("/w".into()),
+                plugins: None,
             },
         })
         .await
@@ -793,6 +796,59 @@ mod tests {
         assert!(!sink.was_recorded("codex", "nope"));
         let row = ledger.load_binding("codex", "t1").unwrap();
         assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    }
+
+    /// G15: the claude pane's plugins are part of the resume record — written
+    /// with the binding and served back by `load_settings`, also after a
+    /// restart, so a resume can hand them to the sidecar again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugins_write_through_and_read_back_after_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let plugins = vec!["/workspace/.claude/plugins/local".to_string()];
+        let sink = LedgerIdentitySink::new(ledger, None);
+        sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
+            provider: "claude".into(),
+            session_id: "s1".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            settings: FreshAgentSettings {
+                plugins: Some(plugins.clone()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        assert_eq!(
+            sink.load_settings("claude", "s1")
+                .expect("a plugins-only row is a settings record")
+                .plugins,
+            Some(plugins.clone())
+        );
+        assert!(sink.was_recorded("claude", "s1"));
+
+        let restarted = LedgerIdentitySink::new(
+            Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                tmp.path().to_path_buf(),
+            ))),
+            None,
+        );
+        assert_eq!(
+            restarted
+                .load_settings("claude", "s1")
+                .expect("the row survives the restart")
+                .plugins,
+            Some(plugins)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -908,6 +964,7 @@ mod tests {
             permission_mode: None,
             effort: None,
             cwd: Some("/w".into()),
+            plugins: None,
         };
         sink.record_binding(FreshAgentBindingUpsert {
             name_transition: None,

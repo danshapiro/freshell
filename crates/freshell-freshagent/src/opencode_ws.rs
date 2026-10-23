@@ -1797,6 +1797,7 @@ impl FreshOpencodeState {
                     permission_mode: None,
                     effort: session.effort.clone(),
                     cwd: session.cwd.clone(),
+                    plugins: None,
                 },
             )
         };
@@ -1960,6 +1961,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort,
                         cwd,
+                        plugins: None,
                     },
                 })
                 .await;
@@ -2576,6 +2578,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort: session.effort.clone(),
                         cwd: session.cwd.clone(),
+                        plugins: None,
                     },
                 })
                 .await
@@ -2706,6 +2709,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort: session.effort.clone(),
                         cwd: session.cwd.clone(),
+                        plugins: None,
                     },
                 })
                 .await;
@@ -3180,6 +3184,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort: effort.clone(),
                         cwd,
+                        plugins: None,
                     },
                 })
                 .await;
@@ -6018,6 +6023,7 @@ impl FreshOpencodeState {
                     permission_mode: None,
                     effort,
                     cwd: child_cwd.clone(),
+                    plugins: None,
                 },
             })
             .await
@@ -7588,6 +7594,7 @@ impl FreshOpencodeState {
                     permission_mode: None,
                     effort: rec.effort.clone(),
                     cwd,
+                    plugins: None,
                 }
             } else {
                 crate::identity_sink::FreshAgentSettings::default()
@@ -13900,6 +13907,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake);
@@ -13942,6 +13950,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());
@@ -14404,6 +14413,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake);
@@ -14478,6 +14488,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());
@@ -15005,6 +15016,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());
@@ -15211,6 +15223,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         })
         .await
@@ -15312,6 +15325,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         })
         .await

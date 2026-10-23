@@ -134,6 +134,7 @@ fn binding_row_at(
         // Delta-r4 Finding 1: unattributed fixture rows are legacy-shaped
         // (no attribution-time key); `with_attribution` stamps one.
         last_attributed_at: None,
+        plugins: None,
     }
 }
 
@@ -3133,6 +3134,7 @@ fn fresh_agent_create_completed_after_the_pane_closed_is_never_offered() {
             observed_generation: None,
 
             authoritative: false,
+            plugins: None,
         })
         .expect("late landing binding write");
     let row = ledger.load_binding("opencode", "S1").expect("row written");
@@ -3196,6 +3198,7 @@ fn fresh_agent_create_asserted_inside_the_kill_window_stays_offered_despite_a_la
             observed_generation: None,
 
             authoritative: false,
+            plugins: None,
         })
         .expect("late landing binding write");
     let row = ledger.load_binding("opencode", "S1").expect("row written");
@@ -3327,6 +3330,7 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
             observed_generation: None,
 
             authoritative: false,
+            plugins: None,
         })
         .expect("fork child binding write");
     let child = ledger.load_binding("codex", "child-id").expect("child row");

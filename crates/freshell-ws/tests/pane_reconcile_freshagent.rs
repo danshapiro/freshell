@@ -730,6 +730,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
 
             authoritative: false,
             now_ms: now,
+            plugins: None,
         })
         .unwrap();
     server
@@ -751,6 +752,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
 
             authoritative: false,
             now_ms: now + 1,
+            plugins: None,
         })
         .unwrap();
     let (mut ws, _ready) = connect(&server.url, true, true).await;

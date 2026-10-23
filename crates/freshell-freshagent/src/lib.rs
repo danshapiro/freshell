@@ -5540,6 +5540,7 @@ async fn resume_session_ref_tab(
                     permission_mode: None,
                     effort: effort.clone(),
                     cwd: cwd.clone(),
+                    plugins: None,
                 },
             })
             .await
@@ -6608,6 +6609,7 @@ async fn send_keys(
                         permission_mode: None,
                         effort: pane.effort.clone(),
                         cwd: pane.cwd.clone(),
+                        plugins: None,
                     },
                 })
                 .await

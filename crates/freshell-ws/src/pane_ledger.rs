@@ -868,6 +868,12 @@ pub struct BindingRow {
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// G15: the claude pane's local plugin directories, which every launch of
+    /// the session hands to the sidecar again. Serde-optional under
+    /// LEDGER_VERSION 1: older rows parse to `None` (the resume then has
+    /// only the request's plugins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<String>>,
     /// D8 (restore-open-sessions-only) provenance: the browser client + tab
     /// this binding was created from. What a write DOES with them is the
     /// tri-state [`ProvenancePolicy`] on the write structs (delta-r2 Finding
@@ -1291,6 +1297,9 @@ pub struct FreshAgentBindingWrite<'a> {
     pub sandbox: Option<&'a str>,
     pub permission_mode: Option<&'a str>,
     pub effort: Option<&'a str>,
+    /// G15: the claude pane's plugin directories (part of the settings
+    /// snapshot this write records).
+    pub plugins: Option<&'a [String]>,
     /// G3 supersession (V8/A14): the OLD session id this binding replaces
     /// (codex crash-respawn). When `Some`, the old `(provider, supersedes)`
     /// row is retired and linked AFTER the new row persists.
@@ -2236,6 +2245,7 @@ impl PaneLedger {
             sandbox: None,
             permission_mode: None,
             effort: None,
+            plugins: None,
             client_instance_id,
             device_id,
             tab_key,
@@ -2758,6 +2768,7 @@ impl PaneLedger {
             sandbox: w.sandbox.map(str::to_string),
             permission_mode: w.permission_mode.map(str::to_string),
             effort: w.effort.map(str::to_string),
+            plugins: w.plugins.map(<[String]>::to_vec),
             client_instance_id,
             device_id,
             tab_key,
@@ -4529,7 +4540,7 @@ impl PaneLedger {
 
     /// Fresh-agent Task 3 (`was_recorded` rekeying): true iff a FRESH-AGENT
     /// binding row carrying a SETTINGS-BEARING snapshot exists for this key —
-    /// at least one of model/sandbox/permission_mode/effort/cwd set (the exact
+    /// at least one of model/sandbox/permission_mode/effort/cwd/plugins set (the exact
     /// complement of the identity sink's `load_settings` blank guard, so the
     /// two predicates can never disagree). A lineage-only row (every settings
     /// column blank) answers false: unconditional lineage recording can never
@@ -4545,7 +4556,8 @@ impl PaneLedger {
                         || r.sandbox.is_some()
                         || r.permission_mode.is_some()
                         || r.effort.is_some()
-                        || r.cwd.is_some())
+                        || r.cwd.is_some()
+                        || r.plugins.is_some())
             })
             .unwrap_or(false)
     }

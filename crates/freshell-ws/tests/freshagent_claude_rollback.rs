@@ -257,6 +257,7 @@ impl PaneIdentitySink for TestLedgerSink {
                     observed_generation: None,
                     authoritative: upsert.authoritative,
                     now_ms: now,
+                    plugins: upsert.settings.plugins.as_deref(),
                 };
                 ledger.record_fresh_agent_binding(&w)?;
                 // kata 1wxv Task 4 (claude adoption): the rollback row re-keys
