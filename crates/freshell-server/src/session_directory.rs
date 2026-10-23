@@ -2400,6 +2400,14 @@ mod tests {
         home
     }
 
+    /// The Claude root of a synthetic test home, pinned explicitly. Tests
+    /// never resolve it through [`claude_home`]: that reader lets a
+    /// process-wide `CLAUDE_HOME` win, and other tests in this binary set
+    /// `CLAUDE_HOME` to their own homes while these run.
+    fn fixture_claude_root(home: &Path) -> PathBuf {
+        home.join(".claude")
+    }
+
     fn default_query() -> DirQuery {
         DirQuery::default()
     }
@@ -2583,16 +2591,14 @@ mod tests {
 
     #[test]
     fn invalid_utf8_transcript_is_indexed_lossily_like_node() {
-        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
-        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
-        // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // Regression (bug #7 class, found by the 007 seeded-home differential):
         // Node reads transcripts with `fs.readFile(file,'utf8')` -> invalid
         // bytes become U+FFFD and the session IS indexed; `read_to_string`
         // silently dropped the whole file (and skewed page `revision`).
         let home = claude_home_with(&[]);
-        let project = claude_home(&home).join("projects").join("-home-dan-proj");
+        let project = fixture_claude_root(&home)
+            .join("projects")
+            .join("-home-dan-proj");
         std::fs::create_dir_all(&project).unwrap();
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(br#"{"parentUuid":null,"cwd":"/home/dan/proj","sessionId":"cccc1111-2222-4333-8444-555566667777","type":"user","message":{"role":"user","content":"bad "#);
@@ -2605,7 +2611,7 @@ mod tests {
         )
         .unwrap();
 
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         assert_eq!(
             items.len(),
             1,
@@ -2625,16 +2631,12 @@ mod tests {
 
     #[test]
     fn default_query_hides_non_interactive_fixtures() {
-        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
-        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
-        // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // `real-corrupted.jsonl` has a `cwd` and parses as non-interactive → the
         // default History browse (no includeNonInteractive) hides it → empty
         // page. `healthy.jsonl` has NO `cwd` anywhere → excluded entirely at
         // discovery (R10b), never reaching the item list at all.
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         assert_eq!(
             items.len(),
             1,
@@ -2650,12 +2652,8 @@ mod tests {
 
     #[test]
     fn include_non_interactive_surfaces_titled_session() {
-        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
-        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
-        // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         let q = DirQuery {
             include_non_interactive: true,
             ..DirQuery::default()
@@ -2672,17 +2670,13 @@ mod tests {
 
     #[test]
     fn include_empty_surfaces_untitled_sessions_sorted_desc() {
-        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
-        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
-        // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // `healthy.jsonl` has no `cwd` → excluded at discovery (R10b) even with
         // every include flag set; only the cwd-bearing `real-corrupted.jsonl`
         // (itself untitled-if-you-squint but DOES have a title) surfaces here.
         // (See `r10b_cwdless_repair_fixture_never_surfaces_under_any_flags`
         // below for the dedicated pin of the never-surfaces behavior.)
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         let q = DirQuery {
             include_non_interactive: true,
             include_empty: true,
@@ -2900,10 +2894,6 @@ mod tests {
 
     #[test]
     fn r10b_cwdless_repair_fixture_never_surfaces_under_any_flags() {
-        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
-        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
-        // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // Byte-matched against a live probe of the ORIGINAL: seeding
         // `healthy.jsonl` (renamed to a canonical UUID filename, exactly as
         // `port/oracle/rest-parity/sweep.mjs#seedClaudeSessions` does) and
@@ -2924,7 +2914,7 @@ mod tests {
         )
         .unwrap();
 
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         assert!(items.is_empty(), "a cwd-less session must never be indexed");
 
         let q = DirQuery {
@@ -2941,12 +2931,8 @@ mod tests {
 
     #[test]
     fn title_search_matches_and_annotates() {
-        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
-        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
-        // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = claude_home_with(&["real-corrupted.jsonl"]);
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         let q = DirQuery {
             include_non_interactive: true,
             query: Some("session 1".into()),
@@ -2959,7 +2945,7 @@ mod tests {
         assert_eq!(arr[0]["snippet"], json!("Test Session 1"));
 
         // A non-matching query → empty.
-        let items2 = list_claude_sessions(&claude_home(&home));
+        let items2 = list_claude_sessions(&fixture_claude_root(&home));
         let q2 = DirQuery {
             include_non_interactive: true,
             query: Some("zzz-not-present".into()),
@@ -5064,11 +5050,11 @@ mod tests {
     #[test]
     fn b_t1_claude_source_matches_list_claude_sessions_reference_scan() {
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
-        let mut reference: Vec<Comparable> = list_claude_sessions(&claude_home(&home))
+        let mut reference: Vec<Comparable> = list_claude_sessions(&fixture_claude_root(&home))
             .iter()
             .map(Comparable::from)
             .collect();
-        let mut production: Vec<Comparable> = ClaudeSource::new(claude_home(&home))
+        let mut production: Vec<Comparable> = ClaudeSource::new(fixture_claude_root(&home))
             .scan()
             .iter()
             .map(Comparable::from)
@@ -5102,7 +5088,7 @@ mod tests {
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
             std::sync::Arc::new(test_session_index(vec![
-                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                std::sync::Arc::new(ClaudeSource::new(fixture_claude_root(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
         let state = SessionDirectoryState {
@@ -5835,7 +5821,7 @@ mod tests {
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
             std::sync::Arc::new(test_session_index(vec![
-                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                std::sync::Arc::new(ClaudeSource::new(fixture_claude_root(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
         let state = SessionDirectoryState {
@@ -5916,7 +5902,7 @@ mod tests {
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
             std::sync::Arc::new(test_session_index(vec![
-                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                std::sync::Arc::new(ClaudeSource::new(fixture_claude_root(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
         let state = SessionDirectoryState {
@@ -5977,7 +5963,7 @@ mod tests {
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
         let session_index =
             std::sync::Arc::new(test_session_index(vec![
-                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                std::sync::Arc::new(ClaudeSource::new(fixture_claude_root(&home)))
                     as std::sync::Arc<dyn SessionSource>,
             ]));
         let state = SessionDirectoryState {
@@ -6100,7 +6086,7 @@ mod tests {
         let discover_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let parse_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let source = CountingClaudeSource {
-            inner: ClaudeSource::new(claude_home(&home)),
+            inner: ClaudeSource::new(fixture_claude_root(&home)),
             discover_calls: std::sync::Arc::clone(&discover_calls),
             parse_calls: std::sync::Arc::clone(&parse_calls),
         };
@@ -6698,7 +6684,7 @@ mod tests {
             "unique-search-term-alpha",
             "unique-search-term-alpha-assistant-only",
         );
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         assert_eq!(items.len(), 1);
         assert!(
             !items[0].source_files.is_empty(),
@@ -6741,7 +6727,7 @@ mod tests {
             "hello there",
             "unique-fulltext-only-phrase",
         );
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         let q = DirQuery {
             include_non_interactive: true,
             tier: Tier::FullText,
@@ -6762,7 +6748,7 @@ mod tests {
             "MixedCase NeedleValue Here",
             "irrelevant",
         );
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         let q = DirQuery {
             include_non_interactive: true,
             tier: Tier::UserMessages,
@@ -6781,7 +6767,7 @@ mod tests {
             "nothing relevant here at all",
             "still nothing relevant",
         );
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         let q = DirQuery {
             include_non_interactive: true,
             tier: Tier::FullText,
@@ -6834,7 +6820,7 @@ mod tests {
         let mut seen: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..3 {
-            let items = list_claude_sessions(&claude_home(&home));
+            let items = list_claude_sessions(&fixture_claude_root(&home));
             let q = DirQuery {
                 include_non_interactive: true,
                 tier: Tier::UserMessages,
@@ -6883,7 +6869,7 @@ mod tests {
             std::fs::write(project.join(format!("{sid}.jsonl")), content).unwrap();
         }
 
-        let items = list_claude_sessions(&claude_home(&home));
+        let items = list_claude_sessions(&fixture_claude_root(&home));
         assert_eq!(items.len(), 11);
         let q = DirQuery {
             include_non_interactive: true,
