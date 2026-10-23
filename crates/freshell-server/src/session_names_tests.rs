@@ -102,6 +102,22 @@ async fn rename_automatic(
         .await
 }
 
+/// A pure-read TRANSACTION for `target`: unlike `get`, which answers from
+/// the adopted view without queuing (name-reliability Task 11), it takes
+/// this store's local turn and then the document lock, like every other
+/// transaction. The local-serialization tests use it as the queued
+/// same-process caller.
+async fn read_through_transaction(
+    store: &Arc<SessionNames>,
+    target: &SessionNameRef,
+) -> Result<SessionNameUpdate, NameError> {
+    let updates = store.refresh_current().await?;
+    Ok(updates
+        .into_iter()
+        .find(|update| &update.record.name_ref == target)
+        .expect("the transaction answers the target's record"))
+}
+
 async fn get_one(store: &Arc<SessionNames>, target: SessionNameRef) -> Option<SessionNameUpdate> {
     let updates = store.get(vec![target]).await.expect("get succeeds");
     updates.into_iter().next()
@@ -1291,9 +1307,11 @@ async fn a_child_forked_while_the_worker_lock_is_held_does_not_keep_it() {
 /// Local serialization (plan Task 1, item 5): the bounded one-second retry
 /// budget is for contention with ANOTHER process. A transaction of this same
 /// process that holds the document lock longer than that (a durable write
-/// stalled by a busy disk) makes the next same-process caller wait its turn,
-/// never fail with `LockUnavailable`. A wait that long is still diagnosable:
-/// it logs one structured `session_names.local_turn_slow` warning.
+/// stalled by a busy disk) makes the next same-process transaction wait its
+/// turn, never fail with `LockUnavailable`. A wait that long is still
+/// diagnosable: it logs one structured `session_names.local_turn_slow`
+/// warning. (A plain `get` never queues at all: it answers from the adopted
+/// view, `session_name_store_view`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_local_transaction_queues_same_process_callers_instead_of_failing_them() {
     let events = crate::test_trace_capture::captured_trace_events();
@@ -1317,13 +1335,12 @@ async fn a_slow_local_transaction_queues_same_process_callers_instead_of_failing
     });
     wait_for_lock_held_sentinel(dir.path()).await;
 
-    let read = store
-        .get(vec![target.clone()])
+    let read = read_through_transaction(&store, &target)
         .await
-        .expect("a same-process read waits for the local holder instead of failing");
+        .expect("a same-process transaction waits for the local holder instead of failing");
     assert_eq!(
-        read[0].record.name, "Slow writer",
-        "the queued read runs after the slow writer commits"
+        read.record.name, "Slow writer",
+        "the queued transaction runs after the slow writer commits"
     );
     let committed = slow_writer
         .await
@@ -1345,7 +1362,7 @@ async fn a_slow_local_transaction_queues_same_process_callers_instead_of_failing
     assert_eq!(
         slow_turns.len(),
         1,
-        "exactly the queued read logs a slow local turn: {slow_turns:?}"
+        "exactly the queued transaction logs a slow local turn: {slow_turns:?}"
     );
     assert!(
         slow_turns[0]
@@ -1411,7 +1428,7 @@ async fn a_stalled_local_turn_is_reported_while_the_caller_is_still_queued() {
     let queued_read = tokio::spawn({
         let store = Arc::clone(&store);
         let target = target.clone();
-        async move { store.get(vec![target]).await }
+        async move { read_through_transaction(&store, &target).await }
     });
 
     // The holder never finishes on its own: the warning must arrive while
@@ -1452,7 +1469,7 @@ async fn a_stalled_local_turn_is_reported_while_the_caller_is_still_queued() {
         .await
         .expect("queued read joins")
         .expect("the queued read is served once the stalled turn ends");
-    assert_eq!(read[0].record.name, "Stalled writer");
+    assert_eq!(read.record.name, "Stalled writer");
     stalled_writer
         .await
         .expect("stalled writer joins")
@@ -1520,12 +1537,11 @@ async fn same_process_callers_are_served_in_arrival_order_between_back_to_back_t
     });
     wait_for_lock_held_sentinel(dir.path()).await;
 
-    let read = store
-        .get(vec![target.clone()])
+    let read = read_through_transaction(&store, &target)
         .await
         .expect("a caller arriving between back-to-back local transactions is served in turn");
     assert_eq!(
-        read[0].record.name, "First",
+        read.record.name, "First",
         "served right after the transaction running when it arrived, ahead of later ones"
     );
     back_to_back.await.expect("background loop joins");
