@@ -6040,6 +6040,14 @@ pub(crate) fn effective_pane_name_resolution(
     body: &Value,
 ) -> Option<PaneNameResolution> {
     let capture = scoped_capture_of(body);
+    if let Some(target) =
+        scoped_name_rename::legacy_prebind_target(state, pane_id, capture.as_ref())
+    {
+        return Some(PaneNameResolution {
+            scoped: true,
+            target: Some(target),
+        });
+    }
     match resolve_pane_name_target(state, pane_id) {
         Some(resolution) if resolution.scoped => Some(PaneNameResolution {
             scoped: true,

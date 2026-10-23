@@ -34,6 +34,8 @@ use crate::session_names::SessionNames;
 
 #[path = "session_name_known_target_tests.rs"]
 mod known_target_tests;
+#[path = "session_name_prebind_route_tests.rs"]
+mod prebind_route_tests;
 
 /// Same fake transport as `sessions_tests`'s: the wired-in result IS the
 /// Gemini reply. NO live Gemini calls in tests, ever.
