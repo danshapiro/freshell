@@ -36,6 +36,9 @@
 //! [`FreshAgentState::shutdown`] (SIGTERM + the `/proc` ownership sweep) and, as a
 //! backstop, by the harness sentinel sweep — no orphans.
 
+/// The per-session attention clock and edge builders shared by the fresh-agent
+/// lanes (design 2026-10-22 §3.2, §5.5).
+pub(crate) mod attention;
 pub mod claude;
 pub(crate) mod claude_dead_sessions;
 pub(crate) mod claude_handshake;
@@ -64,6 +67,9 @@ mod pane_resize;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/process_probe.rs"]
 mod process_probe;
+/// The wedged-runtime quiet deadman shared by the fresh-agent lanes (design
+/// 2026-10-22 §3.2, §5.6).
+pub(crate) mod quiet_deadman;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;

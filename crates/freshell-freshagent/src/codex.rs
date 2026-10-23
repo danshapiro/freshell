@@ -62,11 +62,11 @@ use freshell_codex::launch_lifecycle::{
 use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    mint_ownership_id, next_monotonic_turn_complete_at, normalize_codex_thread_status,
-    normalize_freshcodex_effort, normalize_freshcodex_model, read_rollout_history_mode,
-    to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
-    CodexNotification, CodexStatus, CodexSubscription, HistoryMode, StartThreadParams,
-    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
+    normalize_freshcodex_model, read_rollout_history_mode, to_codex_reasoning_effort,
+    CodexAdapterEvent, CodexAppServerClient, CodexAppServerError, CodexNotification, CodexStatus,
+    CodexSubscription, HistoryMode, StartThreadParams, StartTurnParams, ThreadForkParams,
+    CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
@@ -302,11 +302,10 @@ struct CodexConsumerRuntime {
 /// Seed the quiet window from `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (positive integer
 /// milliseconds; missing or unparseable falls back to [`DEFAULT_CODEX_QUIET_WINDOW_MS`]).
 fn codex_quiet_window_ms_from_env() -> u64 {
-    std::env::var("FRESHELL_FRESHCODEX_QUIET_WINDOW_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .unwrap_or(DEFAULT_CODEX_QUIET_WINDOW_MS)
+    crate::quiet_deadman::window_from_env(
+        "FRESHELL_FRESHCODEX_QUIET_WINDOW_MS",
+        DEFAULT_CODEX_QUIET_WINDOW_MS,
+    )
 }
 
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
@@ -674,46 +673,23 @@ enum CodexTeardownSettlement {
     PlatformLimited,
 }
 
-/// Per-session state of the wedged-sidecar quiet deadman: while a turn is in flight
-/// (the turn-in-flight latch armed), a window is armed; if no lane-visible push
-/// notification feeds it before the deadline elapses, the pane is flagged `stuck`
-/// (via a `freshAgent.status` broadcast) AND the unified `freshAgent.turn.complete`
-/// attention edge rings on the session's shared clock — a wedged turn ENDED as far
-/// as the user can tell, the same binary "needs attention" signal as any other
-/// unwitnessed turn end. Any feed resets the window (generation bump) and resolves a
-/// flagged state; every mutation bumps `generation`, so a stale waiter task observes
-/// the mismatch and exits without firing.
+/// The wedged-sidecar quiet deadman (the shared [`crate::quiet_deadman`]
+/// state machine). While a turn is in flight (the turn-in-flight latch
+/// armed), a window is armed; if no lane-visible push notification feeds it
+/// before the deadline elapses, the pane is flagged `stuck` (via a
+/// `freshAgent.status` broadcast) AND the unified `freshAgent.turn.complete`
+/// attention edge rings on the session's shared clock — a wedged turn ENDED as
+/// far as the user can tell, the same binary "needs attention" signal as any
+/// other unwitnessed turn end.
 ///
-/// LOCK DISCIPLINE: this is a plain `std::sync::Mutex` that is only ever held briefly --
-/// never across an `.await`, never while broadcasting. When it is nested with the
-/// session's `active_turn` mutex (the U-1 mid-flight seed), `quiet_deadman` is ALWAYS
-/// the outer lock and `active_turn` the inner one (the file-wide order).
+/// LOCK DISCIPLINE (codex): when the deadman's lock is nested with the
+/// session's `active_turn` mutex (the U-1 mid-flight seed), `quiet_deadman` is
+/// ALWAYS the outer lock and `active_turn` the inner one (the file-wide order).
 ///
-/// `pub(crate)` only because the `pub(crate)` [`spawn_exit_watcher`] names it in its
-/// signature (its cross-module callers construct a deadman with
-/// [`QuietDeadman::new_shared`]); no field is ever exposed.
-pub(crate) struct QuietDeadman {
-    /// Bumped on EVERY state mutation (arm, feed/reset, disarm, resolve). A waiter
-    /// fires only when the generation it was armed under is still current.
-    generation: u64,
-    /// The armed deadline; `Some` only while a turn is in flight (or was when the
-    /// epoch fired -- firing leaves it set so snapshot polls never re-arm a flagged
-    /// epoch).
-    deadline: Option<tokio::time::Instant>,
-    /// When the deadman fired (the pane is flagged `stuck`); `None` while quiet.
-    stuck_since: Option<Instant>,
-}
-
-impl QuietDeadman {
-    /// A fresh, disarmed deadman behind its shared lock (the `active_turn` field pattern).
-    pub(crate) fn new_shared() -> Arc<StdMutex<Self>> {
-        Arc::new(StdMutex::new(Self {
-            generation: 0,
-            deadline: None,
-            stuck_since: None,
-        }))
-    }
-}
+/// Re-exported `pub(crate)` because the `pub(crate)` [`spawn_exit_watcher`]
+/// names it in its signature (its cross-module callers construct a deadman
+/// with [`QuietDeadman::new_shared`]).
+pub(crate) use crate::quiet_deadman::QuietDeadman;
 
 /// The result of [`FreshCodexState::ensure_session_alive`].
 #[derive(Debug, PartialEq)]
@@ -7773,14 +7749,12 @@ impl FreshCodexState {
     /// after it seeds an observed mid-flight turn (the U-1 repair).
     fn arm_codex_quiet_if_absent(&self, thread_id: &str, quiet: &Arc<StdMutex<QuietDeadman>>) {
         let window_ms = self.codex_quiet_window_ms();
-        let generation = {
-            let mut q = quiet.lock().expect("quiet deadman lock");
-            if q.deadline.is_some() || q.stuck_since.is_some() {
-                return;
-            }
-            q.generation += 1;
-            q.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(window_ms));
-            q.generation
+        let Some(generation) = quiet
+            .lock()
+            .expect("quiet deadman lock")
+            .arm_if_absent(Duration::from_millis(window_ms))
+        else {
+            return;
         };
         tracing::info!(provider = PROVIDER, session_id = %thread_id, phase = "armed", quiet_window_ms = window_ms, "freshagent.codex.quiet_deadman");
         tokio::spawn(
@@ -7789,7 +7763,8 @@ impl FreshCodexState {
         );
     }
 
-    /// One quiet-window waiter for one armed deadman epoch. Sleeps until the armed
+    /// One quiet-window waiter for one armed deadman epoch (the shared
+    /// [`crate::quiet_deadman::wait_for_quiet_deadline`]). Sleeps until the armed
     /// deadline, then fires ONLY if nothing changed since its arming (generation and
     /// deadline still current, turn still in flight, not already flagged) — a stale
     /// waiter (generation mismatch) or a disarmed/untracked session exits without any
@@ -7803,34 +7778,19 @@ impl FreshCodexState {
     /// orphaned waiter on stale per-session Arcs would broadcast a phantom stuck
     /// status AND a phantom attention edge after the deadline.
     async fn watch_codex_quiet_deadline(self, thread_id: String, generation: u64) {
-        // Snapshot the per-session handles + the armed deadline WITHOUT holding the
-        // sessions lock across the sleep (it is never held across an await).
+        // Snapshot the per-session handles WITHOUT holding the sessions lock across
+        // the sleep (it is never held across an await).
         let Some((_active_turn, quiet, turn_in_flight, last_turn_complete_at, _retired_turn_id)) =
             self.quiet_handles(&thread_id).await
         else {
             return;
         };
-        let Some(deadline) = quiet.lock().expect("quiet deadman lock").deadline else {
-            return;
-        };
-        tokio::time::sleep_until(deadline).await;
-        // Fire iff NOTHING changed since the arm: same generation, same armed deadline,
-        // turn still in flight (the dispatch-time latch — the lane's turn-in-flight
-        // authority), not already flagged.
-        let fired = {
-            let mut q = quiet.lock().expect("quiet deadman lock");
-            let has_turn = turn_in_flight.load(Ordering::SeqCst);
-            if has_turn
-                && q.generation == generation
-                && q.deadline == Some(deadline)
-                && q.stuck_since.is_none()
-            {
-                q.stuck_since = Some(Instant::now());
-                true
-            } else {
-                false
-            }
-        };
+        // "Turn still in flight" reads the dispatch-time latch — the lane's
+        // turn-in-flight authority — at the deadline.
+        let fired = crate::quiet_deadman::wait_for_quiet_deadline(&quiet, generation, || {
+            turn_in_flight.load(Ordering::SeqCst)
+        })
+        .await;
         if !fired {
             return;
         }
@@ -7973,11 +7933,7 @@ impl FreshCodexState {
         // The snapshot overlay mirrors the wire contract: `stuck` while the deadman
         // has flagged the session and the fresh read still shows it running.
         let stuck = handles.as_ref().is_some_and(|(_, quiet, _, _, _)| {
-            quiet
-                .lock()
-                .expect("quiet deadman lock")
-                .stuck_since
-                .is_some()
+            quiet.lock().expect("quiet deadman lock").is_stuck()
         });
         // Kata 1wxv Task 5: the capability stamp is SESSION-SCOPED by the
         // recorded DURABLE history mode (correction item 1, r3 — never live-probed
@@ -10476,35 +10432,23 @@ fn note_codex_activity(
 ) {
     let window_ms = state.codex_quiet_window_ms();
     let window = Duration::from_millis(window_ms);
-    let (was_stuck, arm) = {
+    let feed = {
         let mut q = quiet.lock().expect("quiet deadman lock");
-        let was_stuck = q.stuck_since.take().is_some();
-        let has_turn = turn_in_flight.load(Ordering::SeqCst);
-        let arm = if has_turn {
-            // A reset of an already-armed window is NOT a fresh arming; `armed` logs
-            // only on the disarmed→armed transition (no per-feed log spam).
-            let fresh_arm = q.deadline.is_none() && !was_stuck;
-            q.generation += 1;
-            q.deadline = Some(tokio::time::Instant::now() + window);
-            Some((q.generation, fresh_arm))
-        } else {
-            q.generation += 1;
-            q.deadline = None;
-            None
-        };
-        (was_stuck, arm)
+        q.feed(turn_in_flight.load(Ordering::SeqCst), window)
     };
-    if was_stuck {
+    if feed.resolved {
         tracing::info!(provider = PROVIDER, session_id = %thread_id, phase = "resolved", "freshagent.codex.quiet_deadman");
     }
-    if let Some((generation, fresh_arm)) = arm {
-        if fresh_arm {
+    if let Some(armed) = feed.armed {
+        // A reset of an already-armed window is NOT a fresh arming; `armed` logs
+        // only on the disarmed→armed transition (no per-feed log spam).
+        if armed.fresh {
             tracing::info!(provider = PROVIDER, session_id = %thread_id, phase = "armed", quiet_window_ms = window_ms, "freshagent.codex.quiet_deadman");
         }
         tokio::spawn(
             state
                 .clone()
-                .watch_codex_quiet_deadline(thread_id.to_string(), generation),
+                .watch_codex_quiet_deadline(thread_id.to_string(), armed.generation),
         );
     }
 }
@@ -10521,12 +10465,7 @@ fn disarm_codex_quiet(
     thread_id: &str,
     resolution: &'static str,
 ) {
-    let was_stuck = {
-        let mut q = quiet.lock().expect("quiet deadman lock");
-        q.generation += 1;
-        q.deadline = None;
-        q.stuck_since.take().is_some()
-    };
+    let was_stuck = quiet.lock().expect("quiet deadman lock").disarm();
     if was_stuck {
         tracing::info!(provider = PROVIDER, session_id = %thread_id, phase = "resolved", resolution, "freshagent.codex.quiet_deadman");
     }
@@ -11137,11 +11076,9 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
             }
             Value::Object(map)
         }
-        CodexAdapterEvent::TurnComplete { session_id, at } => json!({
-            "type": "freshAgent.turn.complete",
-            "sessionId": session_id,
-            "at": at,
-        }),
+        CodexAdapterEvent::TurnComplete { session_id, at } => {
+            crate::attention::turn_complete_event(session_id, *at)
+        }
         CodexAdapterEvent::Status { session_id, status } => json!({
             "type": "freshAgent.status",
             "sessionId": session_id,
@@ -11162,26 +11099,19 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
 /// sidecar that died with a turn in flight) and the quiet-deadman fire (a
 /// wedged turn the user can only read as ended). The `at` comes from the
 /// session's ONE shared turn-complete clock (the same `Arc` the consumer's
-/// [`CodexSubscription`] mints on), so synthesized and ordinary edges share a
-/// single strictly-monotonic timeline per session and can never collide or
-/// regress.
+/// [`CodexSubscription`] mints on, adopted as a shared
+/// [`crate::attention::AttentionClock`]), so synthesized and ordinary edges
+/// share a single strictly-monotonic timeline per session and can never
+/// collide or regress. The shared minter logs the edge (DIAG-01: session_id,
+/// source and `at`, never the turn's text/response content).
 fn mint_synthesized_attention_edge(
     last_turn_complete_at: &Arc<StdMutex<Option<i64>>>,
     thread_id: &str,
     broadcast_tx: &tokio::sync::broadcast::Sender<String>,
     source: &'static str,
 ) {
-    let at = {
-        let mut guard = last_turn_complete_at
-            .lock()
-            .expect("last_turn_complete_at mutex");
-        let at = next_monotonic_turn_complete_at(*guard, now_ms());
-        *guard = Some(at);
-        at
-    };
-    // DIAG-01: the attention edge only -- session_id + source, never the
-    // turn's text/response content.
-    tracing::info!(provider = PROVIDER, session_id = %thread_id, source, "freshagent.turn.complete");
+    let clock = crate::attention::AttentionClock::from(Arc::clone(last_turn_complete_at));
+    let at = crate::attention::mint_synthesized_edge(&clock, PROVIDER, thread_id, source);
     let event = CodexAdapterEvent::TurnComplete {
         session_id: thread_id.to_string(),
         at,

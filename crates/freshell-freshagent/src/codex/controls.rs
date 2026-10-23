@@ -9,7 +9,9 @@ pub(super) type ControlRegistry =
 #[derive(Default)]
 pub(super) struct PendingControls {
     requests: Vec<PendingRequest>,
-    last_waiting_at: Option<i64>,
+    /// The session's waiting-edge clock: each 0→≥1 pending transition rings
+    /// `freshAgent.turn.waiting` at a strictly-monotonic `at`.
+    waiting_clock: crate::attention::AttentionClock,
 }
 
 struct PendingRequest {
@@ -189,11 +191,7 @@ impl FreshCodexState {
                 pending.requests.push(request);
                 self.control_event(session_id, event);
                 if was_empty {
-                    let at = freshell_codex::next_monotonic_turn_complete_at(
-                        pending.last_waiting_at,
-                        now_ms(),
-                    );
-                    pending.last_waiting_at = Some(at);
+                    let at = pending.waiting_clock.mint();
                     self.control_event(session_id, json!({ "type": "freshAgent.turn.waiting", "sessionId": session_id, "at": at }));
                 }
                 tracing::info!(
