@@ -6761,11 +6761,33 @@ impl FreshClaudeState {
                     // mode). The sidecar already runs in it; the session's
                     // settings take it too, so a later configure stating the
                     // same mode applies nothing and the snapshot states it.
+                    // The binding row takes it the way a configure's settings
+                    // do (client-alerts G20), so a resume after a restart
+                    // boots the conversation in the mode the CLI is in.
                     Some("sdk.session.metadata") => {
                         if let Some(mode) = value.get("permissionMode").and_then(Value::as_str) {
-                            if let Some(session) = sessions.lock().await.get_mut(&session_id) {
-                                session.configuration.settings.permission_mode =
-                                    Some(mode.to_string());
+                            let adopted =
+                                sessions.lock().await.get_mut(&session_id).map(|session| {
+                                    session.configuration.settings.permission_mode =
+                                        Some(mode.to_string());
+                                    (
+                                        session.cli_session_id.clone(),
+                                        session.configuration.settings.clone(),
+                                    )
+                                });
+                            if let Some((Some(durable), settings)) = adopted {
+                                state
+                                    .adopt_session_init(
+                                        &durable,
+                                        &session_id,
+                                        &session_type,
+                                        Some(&settings),
+                                        identity_sink.clone(),
+                                        // Conn-less, like a settings apply: the
+                                        // ledger merge keeps the row's stamps.
+                                        None,
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -17930,8 +17952,7 @@ rl.on('line', (line) => {
     /// before anything reaches the sidecar, and the request stays pending; a retry
     /// with well-formed updates is written VERBATIM and resolves it.
     #[tokio::test]
-    async fn approval_respond_with_malformed_updated_permissions_is_refused_and_a_valid_retry_lands()
-    {
+    async fn approval_respond_refuses_malformed_updated_permissions_until_a_valid_retry() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
@@ -17986,7 +18007,10 @@ rl.on('line', (line) => {
             .expect("the valid retry reaches the sidecar");
         assert_eq!(respond["decision"], decision, "forwarded verbatim");
         let (permissions, _) = pending_request_ids(&st, &session_id).await;
-        assert!(permissions.is_empty(), "the valid retry resolves the request");
+        assert!(
+            permissions.is_empty(),
+            "the valid retry resolves the request"
+        );
         drop(env);
     }
 

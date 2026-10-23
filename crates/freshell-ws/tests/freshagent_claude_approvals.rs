@@ -178,3 +178,46 @@ async fn a_remembered_approval_sends_the_clis_suggestions_and_a_malformed_list_i
     .await;
     conn.kill(&pane).await;
 }
+
+/// The mode the CLI moved to by itself is saved with the session: after a
+/// server restart the pane's attach resumes the conversation in that mode,
+/// not in the mode the pane created it with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mode_the_cli_moved_to_is_the_mode_a_resume_boots_in() {
+    let mut rig = approvals_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, durable, request_id) = raise_approval(&mut conn).await;
+    conn.send(respond(
+        &pane,
+        &request_id,
+        json!({ "behavior": "allow", "updatedPermissions": normalized_suggestions() }),
+    ))
+    .await;
+    conn.wait_for("the CLI's own mode change", |frame| {
+        frame["sessionId"] == pane.as_str()
+            && frame["event"]["type"] == "freshAgent.session.metadata"
+            && frame["event"]["permissionMode"] == "acceptEdits"
+    })
+    .await;
+    conn.wait_for_event("freshAgent.result").await;
+    rig.wait_for_transcript(&durable).await;
+    drop(conn);
+
+    rig.restart().await;
+    let mut conn = rig.connect().await;
+    conn.attach(&durable).await;
+    let boots: Vec<Value> = rig
+        .ledger_rows("query")
+        .into_iter()
+        .map(|row| row["options"].clone())
+        .collect();
+    assert_eq!(
+        boots.len(),
+        2,
+        "the create's boot and the resume's: {boots:?}"
+    );
+    assert_eq!(boots[0]["permissionMode"], "default", "{:?}", boots[0]);
+    assert_eq!(boots[1]["resume"], durable.as_str(), "{:?}", boots[1]);
+    assert_eq!(boots[1]["permissionMode"], "acceptEdits", "{:?}", boots[1]);
+    conn.kill(&durable).await;
+}
