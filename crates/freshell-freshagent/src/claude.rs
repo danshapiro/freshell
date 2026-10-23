@@ -148,6 +148,7 @@ pub struct FreshClaudeState {
     /// handoff resume's RAII drop-guard must be able to remove its flag from
     /// a synchronous Drop (an aborted resume future — round-3 review I-1).
     resuming: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    resuming_changed: Arc<tokio::sync::Notify>,
     /// Test seam (Task 6 round-3 review I-1): park `kill_for_handoff` with
     /// the kill ISSUED (retained stamp taken) but nothing else disturbed —
     /// the prior-reap-window abort test's deterministic hold. `None` in
@@ -709,15 +710,20 @@ impl ClaudeSession {
 /// goes through Drop).
 struct ResumingFlagGuard {
     resuming: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    changed: Arc<tokio::sync::Notify>,
     session_id: String,
 }
 
 impl Drop for ResumingFlagGuard {
     fn drop(&mut self) {
-        self.resuming
+        let removed = self
+            .resuming
             .lock()
             .expect("resuming lock")
             .remove(&self.session_id);
+        if removed {
+            self.changed.notify_waiters();
+        }
     }
 }
 
@@ -761,6 +767,7 @@ impl FreshClaudeState {
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             resuming: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            resuming_changed: Arc::new(tokio::sync::Notify::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             ownership: None,
@@ -1434,18 +1441,11 @@ impl FreshClaudeState {
         // and a leaked flag would refuse every later retry with "another
         // resume is in flight" forever. The guard removes it on every exit
         // path, drop included.
-        let _resuming_flag = {
-            let mut resuming = self.resuming.lock().expect("resuming lock");
-            if !resuming.insert(session_id.to_string()) {
-                return Err((
-                    "another resume is in flight for this session".to_string(),
-                    session_id.to_string(),
-                ));
-            }
-            ResumingFlagGuard {
-                resuming: Arc::clone(&self.resuming),
-                session_id: session_id.to_string(),
-            }
+        let Some(_resuming_flag) = self.try_resume_flight(session_id) else {
+            return Err((
+                "another resume is in flight for this session".to_string(),
+                session_id.to_string(),
+            ));
         };
         // D8 same-kind lease claim (the provider backstop — the coordinator
         // claim is the runner's, under-ticket).
@@ -1489,7 +1489,10 @@ impl FreshClaudeState {
         let outcome = self
             .resume_for_attach(
                 &msg,
-                session_id,
+                DurableClaim {
+                    durable: session_id.to_string(),
+                    dead_state: self.claim_dead_state_snapshot(session_id),
+                },
                 &mut lease_guard,
                 &mut own_ticket,
                 // b8ke focused episode-2 round-2 F2: the RUNNER's handoff op
@@ -4179,15 +4182,33 @@ impl FreshClaudeState {
                 Err(err) => return self.refuse_send(&request_id, err.code(), err.message()),
             };
 
-        // Task 10b: a durable claude UUID resolves through `cli_index` to the live
-        // session -- no more SESSION_NOT_FOUND for a durable id the index maps.
-        // An undo or redo never hides the session from this resolution (C13:
-        // the replacement registers, and the original's ids alias it, in one
-        // step under the map locks), so a miss is a session that is gone.
+        let resolved = match self
+            .ensure_runtime(
+                &session_id,
+                msg.session_type,
+                msg.cwd.as_deref(),
+                send_fence,
+            )
+            .await
+        {
+            Ok(key) => key,
+            Err(error) => {
+                return self.refuse_runtime_resume(
+                    &request_id,
+                    &session_id,
+                    msg.session_type,
+                    error,
+                )
+            }
+        };
         let Some((map_key, turn_lock, ledger, durable_before_wait)) =
-            self.turn_locked_handles(&session_id).await
+            self.turn_locked_handles(&resolved).await
         else {
-            return self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
+            return self.refuse_send_after_runtime_stopped(
+                &request_id,
+                &session_id,
+                msg.session_type,
+            );
         };
         // r2 serialization discipline: hold the session turn lock across the
         // busy-set AND the sidecar write — the check-then-set window vs
@@ -4209,7 +4230,11 @@ impl FreshClaudeState {
             )
             .await
         else {
-            return self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
+            return self.refuse_send_after_runtime_stopped(
+                &request_id,
+                &session_id,
+                msg.session_type,
+            );
         };
         // Arm the coordinator guard only after the send has waited behind any
         // earlier turn. A lifecycle transition during that wait advances the
@@ -4313,7 +4338,7 @@ impl FreshClaudeState {
                 }),
                 None => {
                     drop(guard);
-                    return self.refuse_send_to_missing_session(
+                    return self.refuse_send_after_runtime_stopped(
                         &request_id,
                         &session_id,
                         msg.session_type,
@@ -4354,7 +4379,11 @@ impl FreshClaudeState {
         let Some(session) = guard.get(&map_key) else {
             drop(guard);
             self.take_back_unwritten_send(&ledger, &stamp, session_type, &submitted_turn_id);
-            return self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
+            return self.refuse_send_after_runtime_stopped(
+                &request_id,
+                &session_id,
+                msg.session_type,
+            );
         };
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
@@ -4408,7 +4437,7 @@ impl FreshClaudeState {
                 .sessions
                 .lock()
                 .await
-                .get(&session_id)
+                .get(&map_key)
                 .and_then(|s| s.cli_session_id.clone());
             stashed_handle
                 .map(
@@ -4478,29 +4507,16 @@ impl FreshClaudeState {
         session_type: &str,
     ) -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4().to_string();
-        let (response, next, writer, frame) = {
+        let (response, next, writer, frame, ownership_id) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(map_key)
                 .ok_or("Claude session is no longer available.")?;
-            let mut next = session.configuration.settings.clone();
-            if let Some(value) = &requested.model {
-                if next.model.as_ref() != Some(value) && requested.effort.is_none() {
-                    next.effort = None;
-                }
-                next.model = Some(value.clone());
-            }
-            if let Some(value) = &requested.effort {
-                next.effort = Some(value.clone());
-            }
-            if let Some(value) = &requested.permission_mode {
-                next.permission_mode = Some(value.clone());
-            }
-            if let Some(value) = &requested.cwd {
-                if next.cwd.is_some() || session.configuration.runtime_cwd.as_ref() != Some(value) {
-                    next.cwd = Some(value.clone());
-                }
-            }
+            let next = recovery::updated_settings(
+                &session.configuration.settings,
+                requested,
+                session.configuration.runtime_cwd.as_deref(),
+            );
             if next == session.configuration.settings && !session.configuration.needs_configure {
                 return Ok(());
             }
@@ -4518,7 +4534,13 @@ impl FreshClaudeState {
                     "permissionMode": next.permission_mode, "cwd": next.cwd,
                 },
             });
-            (rx, next, session.stdin.clone(), frame)
+            (
+                rx,
+                next,
+                session.stdin.clone(),
+                frame,
+                session.ownership_id.clone(),
+            )
         };
         if let Err(err) = writer.write(&frame).await {
             if let Some(session) = self.sessions.lock().await.get_mut(map_key) {
@@ -4548,6 +4570,12 @@ impl FreshClaudeState {
             let session = sessions
                 .get_mut(map_key)
                 .ok_or("Claude session is no longer available.")?;
+            if session.ownership_id != ownership_id {
+                return Err(
+                    "Claude changed while applying settings. Your message was not sent; try again."
+                        .into(),
+                );
+            }
             session.configuration.pending = None;
             session.configuration.needs_configure = applied.is_err();
             if applied.is_ok() {
@@ -4583,10 +4611,34 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = msg.request_id.clone();
 
+        // kata z7j7: sandbox has NO claude-side concept — log observably
+        // (id + boolean flag only), mirroring the send path's arm.
+        if msg.settings.sandbox.is_some() {
+            tracing::info!(
+                session_id = %session_id,
+                has_sandbox = true,
+                "freshagent.claude.configure-unsupported-settings-ignored"
+            );
+        }
+
+        let resolved = match self.configure_without_runtime(&msg).await {
+            Ok(recovery::ConfigurationTarget::Stored) => return,
+            Ok(recovery::ConfigurationTarget::Live(key)) => key,
+            Err(error) => {
+                self.emit_resume_control_error(&session_id, msg.session_type, &request_id, error);
+                return;
+            }
+        };
         let Some((map_key, turn_lock, _, durable_before_wait)) =
-            self.turn_locked_handles(&session_id).await
+            self.turn_locked_handles(&resolved).await
         else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &request_id,
+                "CLAUDE_SETTINGS_FAILED",
+                "Claude stopped before applying settings. Try again.",
+            );
             return;
         };
         let _turn = turn_lock.lock().await;
@@ -4603,7 +4655,13 @@ impl FreshClaudeState {
             )
             .await
         else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &request_id,
+                "CLAUDE_SETTINGS_FAILED",
+                "Claude stopped before applying settings. Try again.",
+            );
             return;
         };
         // The pane follows a replacement through its `materialized` re-key, so
@@ -4615,16 +4673,6 @@ impl FreshClaudeState {
         };
         let map_key = live_key;
 
-        // kata z7j7: sandbox has NO claude-side concept — log observably
-        // (id + boolean flag only), mirroring the send path's arm.
-        if msg.settings.sandbox.is_some() {
-            tracing::info!(
-                session_id = %session_id,
-                has_sandbox = true,
-                "freshagent.claude.configure-unsupported-settings-ignored"
-            );
-        }
-
         let before = self.stated_settings(&map_key).await;
         if let Err(err) = self
             .configure_for_send(&map_key, &msg.settings, session_type)
@@ -4632,7 +4680,13 @@ impl FreshClaudeState {
         {
             // The refusal/failure is user-facing session state (busy turn,
             // sidecar death): the pane banner is the surface, on every device.
-            self.emit_fresh_agent_error(&session_id, session_type, "CLAUDE_SETTINGS_FAILED", &err);
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &request_id,
+                "CLAUDE_SETTINGS_FAILED",
+                &err,
+            );
             return;
         }
         let after = self.stated_settings(&map_key).await;
@@ -4872,11 +4926,45 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
-        // The `handle_send` resolve discipline: a miss is a session that is gone.
+        let fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    self.emit_control_error(
+                        &session_id,
+                        msg.session_type,
+                        &msg.request_id,
+                        error.code(),
+                        error.message(),
+                    );
+                    return;
+                }
+            };
+        let resolved = match self
+            .ensure_runtime(&session_id, msg.session_type, msg.cwd.as_deref(), fence)
+            .await
+        {
+            Ok(key) => key,
+            Err(error) => {
+                self.emit_resume_control_error(
+                    &session_id,
+                    msg.session_type,
+                    &msg.request_id,
+                    error,
+                );
+                return;
+            }
+        };
         let Some((map_key, turn_lock, ledger, durable_before_wait)) =
-            self.turn_locked_handles(&session_id).await
+            self.turn_locked_handles(&resolved).await
         else {
-            self.broadcast(&lost_session_frame(&session_id, msg.session_type));
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &msg.request_id,
+                "CLAUDE_COMPACT_FAILED",
+                "Claude stopped before compaction. Try again.",
+            );
             return;
         };
         // Held across the busy-set AND the sidecar write (the handle_send r2
@@ -4896,7 +4984,13 @@ impl FreshClaudeState {
             )
             .await
         else {
-            self.broadcast(&lost_session_frame(&session_id, msg.session_type));
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &msg.request_id,
+                "CLAUDE_COMPACT_FAILED",
+                "Claude stopped before compaction. Try again.",
+            );
             return;
         };
         let session_id = if live_key == map_key {
@@ -4905,6 +4999,32 @@ impl FreshClaudeState {
             live_key.clone()
         };
         let map_key = live_key;
+        let _ownership_guard = if fence.is_some() && self.ownership.is_some() {
+            let owner_key = self.send_owner_key(&map_key, &session_id, fence).await;
+            match crate::ownership_lane::arm_reclaimless_op_guard(
+                &self.ownership,
+                PROVIDER,
+                owner_key.as_deref().unwrap_or(&map_key),
+                &format!("compact-{}", uuid::Uuid::new_v4()),
+                fence,
+                "freshclaude/compact",
+            ) {
+                crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneOpGuard::Unwired => None,
+                crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
+                    self.emit_control_error(
+                        &session_id,
+                        msg.session_type,
+                        &msg.request_id,
+                        "SESSION_RESERVED",
+                        &message,
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // Arm before the write (as a send does): the compact is owed from now on.
         let uuid = crate::claude_turns::mint_send_uuid();
         let stamp = self.envelope_stamp(&map_key).await;
@@ -4918,7 +5038,13 @@ impl FreshClaudeState {
         let Some(session) = guard.get(&map_key) else {
             drop(guard);
             self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
-            self.broadcast(&lost_session_frame(&session_id, msg.session_type));
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &msg.request_id,
+                "CLAUDE_COMPACT_FAILED",
+                "Claude stopped before compaction. Try again.",
+            );
             return;
         };
         let text = match msg.instructions.as_deref().map(str::trim) {
@@ -4941,7 +5067,13 @@ impl FreshClaudeState {
         if let Err(err) = writer.write(&send_req).await {
             // The write never went out: take back exactly this compact.
             self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
-            self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &msg.request_id,
+                "CLAUDE_COMPACT_FAILED",
+                &err,
+            );
         }
     }
 
@@ -5079,37 +5211,21 @@ impl FreshClaudeState {
         self.sessions.lock().await.contains_key(&key)
     }
 
-    /// A send whose session is not live (C09, G05). A send to a dead session is
-    /// refused visibly: the lost-session frame for the id the pane sent (the
-    /// client starts its recovery from it) and a request error that hands the
-    /// message back to the composer. Until the transparent resume (C20) it is
-    /// never accepted. Any other id keeps the `SESSION_NOT_FOUND` request error.
-    fn refuse_send_to_missing_session(
+    /// A runtime that disappears after a successful resolution is a transient
+    /// failure. Only a clean transcript/genesis lookup can prove a conversation
+    /// missing, so keep the user's prompt and allow another recovery attempt.
+    fn refuse_send_after_runtime_stopped(
         &self,
         request_id: &Option<String>,
         session_id: &str,
         session_type: SessionType,
     ) -> ClaudeSendOutcome {
-        let Some(dead) = self.dead_sessions.find(session_id) else {
-            return self.refuse_send(request_id, "SESSION_NOT_FOUND", "claude session not found");
-        };
-        tracing::warn!(target: "freshell_freshagent::claude",
-            provider = PROVIDER, session_id = %session_id,
-            session_type = session_type_str(session_type), request_id = ?request_id,
-            reason = %dead.reason, died_at_ms = dead.at_ms,
-            "freshagent.claude.send_to_dead_session");
-        self.broadcast(&lost_session_frame(session_id, session_type));
-        self.send_request_error(
-            request_id,
-            ErrorCode::InvalidSessionId,
-            crate::claude_dead_sessions::SEND_TO_DEAD_SESSION_MESSAGE,
-        );
-        ClaudeSendOutcome::Refused {
-            code: "INVALID_SESSION_ID".to_string(),
-            message: crate::claude_dead_sessions::SEND_TO_DEAD_SESSION_MESSAGE.to_string(),
-            retryable: None,
-            owner: None,
-        }
+        self.refuse_runtime_resume(request_id, session_id, session_type,
+            recovery::RuntimeResumeError::Unavailable {
+                code: "CLAUDE_RUNTIME_UNAVAILABLE",
+                message: "Claude stopped before accepting your message. Your message was not sent; try again.".into(),
+                owner: None,
+            })
     }
 
     pub(crate) async fn local_snapshot_owner(
@@ -5384,154 +5500,28 @@ impl FreshClaudeState {
                 return;
             }
         }
-        {
-            let mut resuming = self.resuming.lock().expect("resuming lock");
-            if !resuming.insert(durable.clone()) {
-                return; // a concurrent attach is resuming this exact durable id
-            }
-        }
-        // Task 13: the attach-resume path SPAWNS, so it claims the D8 lease first (the
-        // in-process `resuming` single-flight above stays -- it is cheap and covers the
-        // attach-vs-attach window; the lease serializes against CREATE-path holders).
-        // Losers get `freshAgent.error { code: "SESSION_RESERVED" }` -- the established
-        // non-lost error channel (never INVALID_SESSION_ID, which would kill the pane).
-        //
-        // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, durable)`
-        // is the one writer on that JSONL -- refuse the attach-resume the same way.
-        if (self.terminal_liveness)(PROVIDER, &durable) {
-            tracing::warn!(target: "freshell_freshagent::claude", session_id = %durable,
-                "fresh_agent_attach_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-            self.resuming
-                .lock()
-                .expect("resuming lock")
-                .remove(&durable);
-            self.emit_fresh_agent_error(
-                &msg.session_id,
-                session_type_str(msg.session_type),
-                "SESSION_RESERVED",
-                "Another resume for this session is in flight",
-            );
+        let Some(_flight) = self.try_resume_flight(&durable) else {
             return;
-        }
-        // kata b8ke Task 3: the coordinator claim comes FIRST — before the
-        // provider lease — with the attach's delayed-request fence (round-2
-        // lifecycle audit: attach can cold-resume an untracked session,
-        // registering a runtime). AdoptLive converges via the same rebind
-        // arm the lease's BoundLive uses.
-        // b8ke delta round-2 F2: the attach-start's watchdog machinery
-        // (cancellation + settle) is registered inside
-        // `resume_for_attach` — the function that owns the spawn and the
-        // registration window (and the under-ticket handoff-resume caller
-        // passes no ticket, so the registration no-ops there).
-        let mut own_ticket = match self.begin_lane_claim_at(
-            &durable,
-            &format!("attach-{}", uuid::Uuid::new_v4()),
-            attach_fence,
-            "freshclaude/attach",
-        ) {
-            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            crate::ownership_lane::LaneClaim::Unwired => None,
-            crate::ownership_lane::LaneClaim::Adopt => {
-                self.resuming
-                    .lock()
-                    .expect("resuming lock")
-                    .remove(&durable);
-                if !self
-                    .try_rebind_to_live(&durable, session_type_str(msg.session_type))
-                    .await
-                {
-                    self.emit_fresh_agent_error(
-                        &msg.session_id,
-                        session_type_str(msg.session_type),
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    );
-                }
-                return;
-            }
-            crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %durable, outcome = ?outcome,
-                    "fresh_agent_attach_refused: the ownership coordinator refused the \
-                     claim (kata b8ke cross-kind authority)"
-                );
-                self.resuming
-                    .lock()
-                    .expect("resuming lock")
-                    .remove(&durable);
-                self.emit_fresh_agent_error(
-                    &msg.session_id,
-                    session_type_str(msg.session_type),
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                );
-                return;
-            }
         };
-        let attach_request_id = format!("attach-{}", uuid::Uuid::new_v4());
-        let lease = self.claim_launch_lease(&durable, &attach_request_id).await;
-        let mut lease_guard = match lease {
-            LaunchLease::Acquired(guard) => Some(guard),
-            refused => {
-                self.resuming
-                    .lock()
-                    .expect("resuming lock")
-                    .remove(&durable);
-                // The winner completed while we contended: converge via the
-                // same rebind + ack the cli_index arm performs; if the binding
-                // is stale (session just died), or another launch holds the
-                // lease, answer RESERVED -- the client re-drive converges on
-                // the reopened key.
-                let rebound = matches!(refused, LaunchLease::BoundLive { .. })
-                    && self
-                        .try_rebind_to_live(&durable, session_type_str(msg.session_type))
-                        .await;
-                if !rebound {
-                    self.emit_fresh_agent_error(
-                        &msg.session_id,
-                        session_type_str(msg.session_type),
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    );
-                }
-                return;
-            }
-        };
-        // b8ke focused episode-2 round-2 F2: the attach's OWN claim owns
-        // the transition while it is in flight — recorded for the
-        // session-init adoption's Blocked correlation.
-        let attach_owning_operation = own_ticket.as_ref().map(|t| t.operation_id().to_string());
-        let outcome = self
-            .resume_for_attach(
-                &msg,
-                &durable,
-                &mut lease_guard,
-                &mut own_ticket,
-                attach_owning_operation,
-                // b8ke ext r27 F2: the attach path holds its OWN ticket —
-                // no handoff generation to thread.
-                None,
-            )
-            .await;
-        self.resuming
-            .lock()
-            .expect("resuming lock")
-            .remove(&durable);
-        // Any leftover armed guard means the resume ended WITHOUT registering a session
-        // (its own teardown already ran on every error path) -- release the key.
-        if let Some(mut g) = lease_guard.take() {
-            g.fail();
-        }
-        // kata b8ke Task 3: same for the coordinator ticket — a leftover
-        // (uncommitted) claim drops here (RAII typed fail reopens the key).
-        drop(own_ticket);
-        match outcome {
+        match self
+            .resume_untracked(&msg, &durable, attach_fence, true)
+            .await
+        {
             Ok(()) => {}
-            Err(ResumeClaudeError::NotFound) => {
+            Err(recovery::RuntimeResumeError::Lost | recovery::RuntimeResumeError::Closed) => {
                 self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
             }
-            Err(ResumeClaudeError::Transient(err)) => {
-                self.send_error(&None, "CLAUDE_ATTACH_RESUME_FAILED", &err);
+            Err(recovery::RuntimeResumeError::Unavailable { code, message, .. }) => {
+                if code == "SESSION_RESERVED" {
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        code,
+                        &message,
+                    );
+                } else {
+                    self.send_error(&None, code, &message);
+                }
             }
         }
     }
@@ -5588,7 +5578,7 @@ impl FreshClaudeState {
     async fn resume_for_attach(
         &self,
         msg: &FreshAgentAttach,
-        durable: &str,
+        claim: DurableClaim,
         lease_guard: &mut Option<crate::FreshSessionLeaseGuard>,
         // kata b8ke Task 3: the attach's coordinator claim ticket — committed
         // at the registration tail below; every error return leaves it armed
@@ -5613,6 +5603,8 @@ impl FreshClaudeState {
         // generation instead of preserving the prior one.
         handoff_generation: Option<u64>,
     ) -> Result<(), ResumeClaudeError> {
+        let durable = claim.durable.as_str();
+        let claim_dead_state = claim.dead_state;
         // b8ke delta round-2 F2: the attach-start's REAL watchdog machinery
         // — the sidecar pid slot (the registered cancellation SIGTERMs the
         // spawned child; the resume's own gates then tear down and unwind)
@@ -5638,10 +5630,10 @@ impl FreshClaudeState {
         let sink = self.identity_sink();
         let (boot, transcript_cwd, minted_id) = self.decide_attach_boot(durable, sink.as_ref())?;
         // The genesis the boot was decided from, for its one typed retry (§4.2).
-        let recorded_genesis = sink
-            .as_ref()
-            .and_then(|sink| sink.load_genesis(PROVIDER, durable))
+        let recorded_genesis = self
+            .recovery_genesis(durable, sink.as_ref())
             .map(|recorded| recorded.genesis);
+        let dead = self.dead_sessions.find(durable);
         // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
         // resume-in-place does not silently revert model/permissionMode/effort (or,
         // G15, drop its plugins). V7/A10 alarm gate: alarm ONLY when the ledger
@@ -5650,7 +5642,8 @@ impl FreshClaudeState {
         // resume_for_attach exists FOR them) stay silent.
         let recovered = sink
             .as_ref()
-            .and_then(|s| s.load_settings("claude", durable));
+            .and_then(|s| s.load_settings("claude", durable))
+            .or_else(|| dead.as_ref().map(|dead| dead.settings.clone()));
         if recovered.is_none()
             && sink
                 .as_ref()
@@ -5678,8 +5671,11 @@ impl FreshClaudeState {
         // so a kill landing while this resume is in flight advances the durable
         // tombstone past it and the commit REFUSES instead of undoing the newer
         // close.
-        let claim_dead_state = self.claim_dead_state_snapshot(durable);
         let session_type = session_type_str(msg.session_type);
+        let launch_genesis = minted_id
+            .is_some()
+            .then(|| recorded_genesis.clone())
+            .flatten();
         let spec = ClaudeLaunchSpec::new(
             format!("attach-resume-{}", uuid::Uuid::new_v4()),
             session_type,
@@ -5693,7 +5689,8 @@ impl FreshClaudeState {
             crate::claude_freshell_mcp::ClaudeFreshellContext::from_ids(
                 msg.tab_id.as_deref(),
                 msg.pane_id.as_deref(),
-            ),
+            )
+            .or_else(|| dead.as_ref().and_then(|dead| dead.freshell_context.clone())),
         );
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
@@ -5724,8 +5721,12 @@ impl FreshClaudeState {
                 naming: None,
                 partial_runtime_key: Some(durable.to_string()),
                 start_pid_slot: &start_pid_slot,
-                inherit: None,
-                genesis: None,
+                inherit: dead.map(|dead| InheritedRuntime {
+                    turn_lock: dead.turn_lock,
+                    clock: dead.clock,
+                    ledger: crate::claude_turns::SharedLedger::default(),
+                }),
+                genesis: launch_genesis,
                 retry: Some(BootRetry {
                     durable: durable.to_string(),
                     genesis: recorded_genesis,
@@ -6609,6 +6610,7 @@ impl FreshClaudeState {
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
         session_id: String,
+        ownership_id: String,
         session_type: String,
         sidecar_session_id: String,
         settings: Option<crate::identity_sink::FreshAgentSettings>,
@@ -6806,7 +6808,7 @@ impl FreshClaudeState {
                         // Core design §4.1: a session booted from its genesis
                         // writes its transcript around its first result; clear
                         // the genesis once the transcript is on disk.
-                        state.spawn_genesis_clear_after_result(&session_id);
+                        state.spawn_genesis_clear_after_result(&session_id, &ownership_id);
                     }
                     // A protocol fake that predates C18 still sends its own
                     // edges: the server mints every edge itself, so they are
@@ -7024,6 +7026,10 @@ impl FreshClaudeState {
                         durables: &removed_durables,
                         cli_session_id: evicted.cli_session_id.as_deref(),
                         settings: &evicted.configuration.settings,
+                        ownership_id: &evicted.ownership_id,
+                        launch_genesis: evicted.launch_genesis.as_ref(),
+                        turn_lock: &evicted.turn_lock,
+                        freshell_context: evicted.configuration.freshell_context.as_ref(),
                         commands: evicted.configuration.commands.as_ref(),
                         reason,
                         clock: &clock,
@@ -8212,6 +8218,7 @@ fn log_claude_teardown(
 
 mod create_binding;
 mod create_outcome;
+mod recovery;
 pub use create_outcome::ClaudeCreateOutcome;
 
 mod send_outcome;
@@ -8229,7 +8236,8 @@ mod sidecar_writer;
 mod stop;
 mod turn_status;
 use establish::{
-    BootRetry, DurableClaim, EstablishLane, EstablishPlan, LaunchLease, RegisterUnder,
+    BootRetry, DurableClaim, EstablishLane, EstablishPlan, InheritedRuntime, LaunchLease,
+    RegisterUnder,
 };
 
 #[cfg(test)]
@@ -8273,6 +8281,7 @@ pub(crate) mod tests {
     use crate::naming::SessionNaming as _;
 
     mod create_binding_tests;
+    mod recovery_tests;
     mod refusal_tests;
 
     fn state() -> FreshClaudeState {
@@ -17897,6 +17906,7 @@ rl.on('line', (line) => {
         let consumer = st.spawn_consumer(
             reader,
             "fold-session".to_string(),
+            "test-fold-session".to_string(),
             "freshclaude".to_string(),
             "fold-session".to_string(),
             None,
@@ -19250,9 +19260,9 @@ rl.on('line', (line) => {
         assert_ne!(st.live_snapshot_overlay(&pane_id).await["status"], "exited");
     }
 
-    /// C09: closing an ended session forgets it: its snapshot no longer says
-    /// `exited`, and a later send is an ordinary unknown-session refusal, not the
-    /// ended session's lost frame.
+    /// Closing an ended session forgets its process state. With neither a
+    /// transcript nor a retained genesis, a later send is visibly lost and must
+    /// never recreate it as a new conversation.
     #[tokio::test(flavor = "multi_thread")]
     async fn closing_a_dead_session_forgets_it() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -19275,16 +19285,16 @@ rl.on('line', (line) => {
         assert!(
             frames
                 .iter()
-                .all(|frame| frame["event"]["code"] != "INVALID_SESSION_ID"),
-            "no lost frame for a closed session: {frames:?}"
+                .any(|frame| frame["event"]["code"] == "INVALID_SESSION_ID"),
+            "a cleanly missing closed conversation is lost: {frames:?}"
         );
         assert!(
             frames.iter().any(|frame| frame["type"] == "error"
                 && frame["requestId"] == "send-after-close"
                 && frame["message"]
                     .as_str()
-                    .is_some_and(|m| m.starts_with("SESSION_NOT_FOUND"))),
-            "the send is refused as unknown: {frames:?}"
+                    .is_some_and(|m| m.contains("could not be found"))),
+            "the unsent prompt is returned with the missing conversation: {frames:?}"
         );
     }
 
@@ -19436,6 +19446,7 @@ rl.on('line', (line) => {
         let consumer = st.spawn_consumer(
             reader,
             map_key.to_string(),
+            format!("test-{map_key}"),
             "freshclaude".to_string(),
             map_key.to_string(),
             None,

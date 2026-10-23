@@ -68,6 +68,16 @@ pub(crate) async fn clear_genesis_once_observed(
     attempts: u32,
     interval: Duration,
 ) -> GenesisClear {
+    observe_and_clear_genesis(Some(sink), roots, session_id, attempts, interval).await
+}
+
+async fn observe_and_clear_genesis(
+    sink: Option<&crate::identity_sink::SharedPaneIdentitySink>,
+    roots: Vec<PathBuf>,
+    session_id: &str,
+    attempts: u32,
+    interval: Duration,
+) -> GenesisClear {
     for attempt in 1..=attempts {
         let (store, id) = (roots.clone(), session_id.to_string());
         let found = tokio::task::spawn_blocking(move || {
@@ -79,9 +89,12 @@ pub(crate) async fn clear_genesis_once_observed(
         .await
         .unwrap_or(false);
         if found {
-            return match sink.clear_genesis(PROVIDER, session_id).await {
-                Ok(()) => GenesisClear::Cleared { attempt },
-                Err(error) => GenesisClear::Failed(error.to_string()),
+            return match sink {
+                Some(sink) => match sink.clear_genesis(PROVIDER, session_id).await {
+                    Ok(()) => GenesisClear::Cleared { attempt },
+                    Err(error) => GenesisClear::Failed(error.to_string()),
+                },
+                None => GenesisClear::Cleared { attempt },
             };
         }
         if attempt < attempts {
@@ -154,12 +167,20 @@ impl FreshClaudeState {
         {
             return Some(recorded);
         }
-        let key = self.resolve_session_key(any_id).await?;
-        self.sessions
-            .lock()
-            .await
-            .get(&key)
-            .and_then(|session| session.launch_genesis.clone())
+        let live = match self.resolve_session_key(any_id).await {
+            Some(key) => self
+                .sessions
+                .lock()
+                .await
+                .get(&key)
+                .and_then(|session| session.launch_genesis.clone()),
+            None => None,
+        };
+        live.or_else(|| {
+            self.dead_sessions
+                .find(any_id)
+                .and_then(|dead| dead.launch_genesis)
+        })
     }
 
     /// The session's snapshot from disk, read from this lane's transcript store:
@@ -188,12 +209,26 @@ impl FreshClaudeState {
     /// or forked boot writes under. A found transcript whose row still records a
     /// genesis clears it (the transcript is observed). Lost and unreadable map to
     /// the attach's errors (unreadable is logged and never lost).
+    pub(super) fn recovery_genesis(
+        &self,
+        durable: &str,
+        sink: Option<&crate::identity_sink::SharedPaneIdentitySink>,
+    ) -> Option<RecordedGenesis> {
+        match sink {
+            Some(sink) => sink.load_genesis(PROVIDER, durable),
+            None => self
+                .dead_sessions
+                .find(durable)
+                .and_then(|dead| dead.launch_genesis),
+        }
+    }
+
     pub(super) fn decide_attach_boot(
         &self,
         durable: &str,
         sink: Option<&crate::identity_sink::SharedPaneIdentitySink>,
     ) -> Result<(ClaudeBoot, Option<String>, Option<String>), ResumeClaudeError> {
-        let recorded = sink.and_then(|sink| sink.load_genesis(PROVIDER, durable));
+        let recorded = self.recovery_genesis(durable, sink);
         self.decide_recorded_boot("attach_resume", durable, sink, recorded.as_ref())
     }
 
@@ -215,10 +250,7 @@ impl FreshClaudeState {
         durable: &str,
     ) -> Result<Option<GenesisAwareBoot>, ResumeClaudeError> {
         let sink = self.identity_sink();
-        let Some(recorded) = sink
-            .as_ref()
-            .and_then(|sink| sink.load_genesis(PROVIDER, durable))
-        else {
+        let Some(recorded) = self.recovery_genesis(durable, sink.as_ref()) else {
             return Ok(None);
         };
         let (boot, cwd, session_id) =
@@ -258,9 +290,17 @@ impl FreshClaudeState {
                 cwd,
                 session_id,
             } => {
-                if let (Some(recorded), Some(sink)) = (recorded, sink) {
+                if found {
+                    // A transcript is positive evidence, including for lanes
+                    // without a persistent identity sink. Never retain Fresh
+                    // as a fallback after this conversation has been observed.
+                    self.dead_sessions.clear_genesis(durable, None);
+                }
+                if let Some(recorded) = recorded {
                     if found {
-                        self.clear_found_genesis(sink, durable, recorded);
+                        if let Some(sink) = sink {
+                            self.clear_found_genesis(sink, durable, recorded);
+                        }
                     } else {
                         tracing::info!(
                             component = "freshagent.claude",
@@ -316,24 +356,71 @@ impl FreshClaudeState {
     /// reader) entirely: resolving the durable id takes the session locks, which
     /// the reader must never wait on. A session with no genesis costs one memory
     /// read.
-    pub(super) fn spawn_genesis_clear_after_result(&self, session_key: &str) {
-        let Some(sink) = self.identity_sink() else {
-            return;
-        };
-        let (state, session_key) = (self.clone(), session_key.to_string());
+    pub(super) fn spawn_genesis_clear_after_result(&self, session_key: &str, ownership_id: &str) {
+        let sink = self.identity_sink();
+        let (state, session_key, ownership_id) = (
+            self.clone(),
+            session_key.to_string(),
+            ownership_id.to_string(),
+        );
         tokio::spawn(async move {
-            let durable = state.durable_session_id(&session_key).await;
-            let Some(recorded) = sink.load_genesis(PROVIDER, &durable) else {
+            let captured = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(&session_key)
+                    .filter(|session| session.ownership_id == ownership_id)
+                    .map(|session| {
+                        (
+                            session
+                                .cli_session_id
+                                .clone()
+                                .unwrap_or_else(|| session_key.clone()),
+                            session.launch_genesis.clone(),
+                        )
+                    })
+            }
+            .or_else(|| {
+                state
+                    .dead_sessions
+                    .find(&session_key)
+                    .filter(|dead| dead.ownership_id == ownership_id)
+                    .map(|dead| {
+                        (
+                            dead.cli_session_id.unwrap_or_else(|| session_key.clone()),
+                            dead.launch_genesis,
+                        )
+                    })
+            });
+            let Some((durable, runtime_genesis)) = captured else {
                 return;
             };
-            let outcome = clear_genesis_once_observed(
-                &sink,
+            let Some(recorded) = sink
+                .as_ref()
+                .and_then(|sink| sink.load_genesis(PROVIDER, &durable))
+                .or(runtime_genesis)
+            else {
+                return;
+            };
+            let outcome = observe_and_clear_genesis(
+                sink.as_ref(),
                 state.transcript_roots(),
                 &durable,
                 GENESIS_CLEAR_ATTEMPTS,
                 GENESIS_CLEAR_INTERVAL,
             )
             .await;
+            if matches!(outcome, GenesisClear::Cleared { .. }) {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&session_key).filter(|session| {
+                    session.ownership_id == ownership_id
+                        && session.cli_session_id.as_deref().unwrap_or(&session_key) == durable
+                }) {
+                    session.launch_genesis = None;
+                }
+                state
+                    .dead_sessions
+                    .clear_genesis(&durable, Some(&ownership_id));
+            }
             log_genesis_clear(&durable, recorded.genesis.kind(), "result", &outcome);
         });
     }
