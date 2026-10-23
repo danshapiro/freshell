@@ -25,6 +25,12 @@
 //   exit_plan        { plan? }                      ExitPlanMode through canUseTool
 //   completion       { subtype?, text?, errors? }   end the turn with this result subtype
 //   api_error        { status?, message? }          the model request fails
+//   api_retry        { status?, attempts? }         the model request fails `attempts` times
+//                                                   (default 1) with `status` (default 529)
+//                                                   and the CLI retries: one system/api_retry
+//                                                   per failure, after its backoff the next step
+//   replay           { recording, holdBeforeMs?, pace? }   the model's side of a turn the
+//                                                   pinned CLI really ran (replay.mjs)
 //   hang             {}                             the model request never completes
 //   crash            { signal? | code? }            the CLI process dies (default SIGKILL);
 //                                                   with code 0 the stream ends with no error
@@ -50,7 +56,7 @@ export const PROGRAM_ALIAS_ENV = 'FRESHELL_CLAUDE_SDK_SCRIPT'
 
 export const EMISSION_KINDS = new Set([
   'text', 'activity', 'tool', 'approval', 'question', 'exit_plan', 'completion',
-  'api_error', 'hang', 'crash', 'stall_stdin', 'cli_turn', 'marker',
+  'api_error', 'api_retry', 'replay', 'hang', 'crash', 'stall_stdin', 'cli_turn', 'marker',
 ])
 
 function parseProgram(text, source) {

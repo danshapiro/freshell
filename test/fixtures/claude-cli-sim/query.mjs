@@ -24,10 +24,12 @@
 //
 // The model's side of each turn comes from prompt markers
 // (prompt-markers.mjs, shared with the real-CLI loopback provider) or from a
-// scenario program (program.mjs). Layout: this module owns the session (boot,
+// scenario program (program.mjs). A program can also retry failed API
+// requests (api_retry, F11) and replay the model's side of a turn the pinned
+// CLI really ran, with its transcript and subagent files (replay.mjs). Layout: this module owns the session (boot,
 // input, the command queue, turns, interrupts, results); tools.mjs runs tool
-// calls; local-commands.mjs runs slash commands; transcript.mjs persists the
-// JSONL; sdk-shapes.mjs holds the recorded catalog and fixed shapes.
+// calls; local-commands.mjs runs slash commands; replay.mjs plays recorded
+// turns; transcript.mjs persists the JSONL; sdk-shapes.mjs holds the recorded catalog and fixed shapes.
 //
 // Knobs (read from options.env, then process.env):
 //   FRESHELL_CLAUDE_SIM_TIME_SCALE      multiply every simulated delay (default 1);
@@ -64,6 +66,7 @@ import { fileURLToPath } from 'node:url'
 import { HANG_MCP_QUALIFIED_TOOL, parsePromptMarkers, PLAN_TEXT, SLOW_DELAY_MS } from './prompt-markers.mjs'
 import { loadProgram, ProgramEngine } from './program.mjs'
 import { runLocalCommand } from './local-commands.mjs'
+import { replayTurn } from './replay.mjs'
 import {
   CATALOG,
   CAVEAT,
@@ -101,6 +104,15 @@ let queryCount = 0
 function parseSlash(text) {
   const match = /^\/([A-Za-z][\w:-]*)(?:\s+([\s\S]*))?$/.exec(String(text).trim())
   return match ? { name: match[1], args: (match[2] ?? '').trim() } : null
+}
+
+/** The SDK's error kind for a failed API request's HTTP status (null: no response). */
+function apiErrorKind(status) {
+  if (status === 529) return 'overloaded'
+  if (status === 429) return 'rate_limit'
+  if (status === 401) return 'authentication_failed'
+  if (status !== null && status >= 500) return 'server_error'
+  return 'unknown'
 }
 
 /** The model steps a prompt's markers ask for (see prompt-markers.mjs). */
@@ -627,6 +639,12 @@ class SimulatedCli {
           return this.finishTurn(turn, { subtype: step.data.subtype ?? 'success', text: step.data.text, errors: step.data.errors })
         case 'api_error':
           return this.apiError(turn, step.data)
+        case 'api_retry':
+          if (await this.apiRetries(turn, step.data)) return this.abortBeforeContent(turn)
+          break
+        case 'replay':
+          if (await replayTurn(this, turn, step.data) === 'dead') return undefined
+          break
         case 'hang':
           this.emitStream(this.messageStart())
           await this.wait(Number.POSITIVE_INFINITY, turn)
@@ -775,6 +793,24 @@ class SimulatedCli {
     this.emit(message)
     this.transcript.append({ type: 'assistant', uuid, requestId: message.request_id, error: 'unknown', isApiErrorMessage: true, apiErrorStatus: status, message: message.message })
     return this.finishTurn(turn, { subtype: 'success', isError: true, terminalReason: 'api_error', stopReason: 'stop_sequence', text, apiErrorStatus: status, lifecycle: 'cancelled' })
+  }
+
+  /**
+   * The model request fails `attempts` times with `status` and the CLI
+   * retries each (F11; live only, never in the transcript): a
+   * system/api_retry, then the CLI's backoff. Returns true when the turn was
+   * aborted meanwhile.
+   */
+  async apiRetries(turn, data) {
+    const status = data.status === null ? null : Number(data.status ?? 529)
+    const attempts = Math.max(1, Number(data.attempts ?? 1))
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const delay = Math.min(500 * 2 ** (attempt - 1), 32_000)
+      this.emit({ type: 'system', subtype: 'api_retry', attempt, max_retries: 10, retry_delay_ms: delay, error_status: status, error: apiErrorKind(status) })
+      if (await this.wait(delay, turn)) return true
+      turn.requests += 1
+    }
+    return false
   }
 
   async abortBeforeContent(turn) {

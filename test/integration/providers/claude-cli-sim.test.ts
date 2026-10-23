@@ -385,6 +385,134 @@ describe('Claude CLI simulator programs', () => {
   })
 })
 
+describe('Claude CLI simulator api_retry steps', () => {
+  it('each failed attempt is one system/api_retry with the SDK\'s fields, before the reply streams; the turn then succeeds', async () => {
+    const s = await open({ includePartialMessages: true }, program([{ on: 'msg:prompt', emit: [{ kind: 'api_retry', data: { status: 529, attempts: 2 } }, { kind: 'text', data: { text: 'recovered' } }] }]))
+    s.prompt.push('try')
+    await s.until(() => results(s.messages).length === 1)
+    const retries = s.messages.filter((m) => m.type === 'system' && m.subtype === 'api_retry')
+    // SDKAPIRetryMessage (sdk.d.ts) and F11: attempt, max_retries, retry_delay_ms, error_status, error.
+    expect(retries.map((m) => Object.keys(m).sort())).toEqual(Array(2).fill(['attempt', 'error', 'error_status', 'max_retries', 'retry_delay_ms', 'session_id', 'subtype', 'type', 'uuid']))
+    expect(retries.map((m) => [m.attempt, m.max_retries, m.error_status, m.error])).toEqual([[1, 10, 529, 'overloaded'], [2, 10, 529, 'overloaded']])
+    expect(retries[1].retry_delay_ms).toBeGreaterThan(retries[0].retry_delay_ms)
+    const firstStream = s.messages.findIndex((m) => m.type === 'stream_event')
+    expect(s.messages.indexOf(retries[1])).toBeLessThan(firstStream)
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'success', is_error: false, result: 'recovered' })
+  })
+})
+
+const TOOLS_SYNC = path.join(REPO_ROOT, 'test/fixtures/fresh-agent/claude/real-cli-2.1.237/tools-sync')
+const UUID_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g
+
+const jsonlFile = async (file: string) => (await fs.readFile(file, 'utf8')).split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line))
+
+/** A recorded or replayed value with its ids and the session's paths masked, for comparison. */
+function masked(value: unknown, home?: { cwd: string, env: { CLAUDE_CONFIG_DIR: string } }): unknown {
+  let text = JSON.stringify(value)
+  if (home) {
+    const inJson = (p: string) => JSON.stringify(p).slice(1, -1)
+    text = text.split(inJson(home.env.CLAUDE_CONFIG_DIR)).join('/fixture/home/.claude').split(inJson(home.cwd)).join('/fixture/ws')
+      // The CLI's project slug of the workspace (transcript.mjs projectSlug).
+      .split(home.cwd.replace(/[^A-Za-z0-9]/g, '-')).join('-fixture-ws')
+  }
+  return JSON.parse(text
+    .replace(UUID_TEXT, 'UUID')
+    .replace(/\b(toolu|msg)_[A-Za-z0-9]+/g, '$1_ID')
+    .replace(/\ba[0-9a-f]{16}\b/g, 'AGENT_ID'))
+}
+
+/** The model's side of the first turn: the messages after its prompt replay, up to its result. */
+function modelSide(messages: any[]) {
+  const prompt = messages.findIndex((m) => m.type === 'user' && m.isReplay === true && !m.parent_tool_use_id)
+  const result = messages.findIndex((m, index) => index > prompt && m.type === 'result')
+  return messages.slice(prompt + 1, result)
+}
+
+async function transcriptOf(home: { env: { CLAUDE_CONFIG_DIR: string } }) {
+  const tree = await snapshotTree(path.join(home.env.CLAUDE_CONFIG_DIR, 'projects'))
+  const main = Object.keys(tree).find((file) => file.endsWith('.jsonl') && !file.includes('/subagents/'))
+  return { tree, main }
+}
+
+describe('Claude CLI simulator replay of a recorded real-CLI turn', () => {
+  it('replays the recording\'s messages, transcript lines and subagent files, under fresh ids and the session\'s paths', async () => {
+    const recorded = (await jsonlFile(path.join(TOOLS_SYNC, 'sdk.jsonl'))).map((row) => row.msg)
+    const s = await open({ includePartialMessages: true }, program([{ on: 'msg:prompt', emit: [{ kind: 'replay', data: { recording: 'tools-sync' } }] }]))
+    s.prompt.push('GO write then edit then delegate')
+    await s.until(() => results(s.messages).length === 1)
+
+    const replayed = modelSide(s.messages)
+    expect(replayed.map((m) => masked(m, s.home))).toEqual(modelSide(recorded).map((m) => masked(m)))
+    // Fresh ids: none of the recording's, and as many distinct ones.
+    const uuidsOf = (value: unknown) => new Set(JSON.stringify(value).match(UUID_TEXT))
+    const recordedUuids = uuidsOf(modelSide(recorded))
+    const replayedUuids = uuidsOf(replayed)
+    expect([...replayedUuids].filter((id) => recordedUuids.has(id))).toEqual([])
+    expect(replayedUuids.size).toBe(recordedUuids.size)
+    expect(replayed.every((m) => m.session_id === s.messages[0].session_id)).toBe(true)
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'success', result: 'All done.' })
+
+    // Every persisted message's line lands in the session's transcript, in the
+    // recorded order, after the simulator's own prompt lines.
+    const persisted = replayed.filter((m) => m.uuid && m.type !== 'stream_event' && (m.type === 'assistant' || m.type === 'user'))
+    let tree: Record<string, string> = {}
+    let main: string | undefined
+    for (let i = 0; i < 100; i += 1) {
+      ({ tree, main } = await transcriptOf(s.home))
+      const text = main ? tree[main] : ''
+      if (persisted.filter((m) => !m.parent_tool_use_id).every((m) => text.includes(m.uuid))) break
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    const lines = tree[main!].split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const firstReplayed = lines.findIndex((line) => line.uuid === persisted[0].uuid)
+    expect(firstReplayed).toBeGreaterThan(0)
+    const recordedLines = (await jsonlFile(path.join(TOOLS_SYNC, 'session.jsonl')))
+    const recordedFirst = recordedLines.findIndex((line) => line.uuid && modelSide(recorded).some((m) => m.uuid === line.uuid))
+    expect(lines.slice(firstReplayed).map((line) => masked(line, s.home)))
+      .toEqual(recordedLines.slice(recordedFirst).filter((line) => line.type !== 'last-prompt').map((line) => masked(line)))
+    // The replayed lines continue the session's own chain.
+    expect(lines[firstReplayed].parentUuid).toBe(lines.slice(0, firstReplayed).filter((line) => line.uuid).at(-1).uuid)
+
+    // The subagent's transcript and meta file, next to the session's transcript.
+    const sessionDir = main!.replace(/\.jsonl$/, '')
+    const subagentFiles = Object.keys(tree).filter((file) => file.startsWith(`${sessionDir}/subagents/`)).sort()
+    expect(subagentFiles.map((file) => path.basename(file).replace(/a[0-9a-f]{16}/, 'AGENT_ID'))).toEqual(['agent-AGENT_ID.jsonl', 'agent-AGENT_ID.meta.json'])
+    const agentCall = replayed.flatMap((m) => (m.type === 'assistant' ? m.message.content : [])).find((block: any) => block.type === 'tool_use' && block.name === 'Agent')
+    const meta = JSON.parse(tree[subagentFiles[1]])
+    expect(meta.toolUseId).toBe(agentCall.id)
+    const recordedSubagent = path.join(TOOLS_SYNC, 'session/subagents/agent-a2645ac0e225b257e')
+    expect(masked(meta)).toEqual(masked(JSON.parse(await fs.readFile(`${recordedSubagent}.meta.json`, 'utf8'))))
+    expect(tree[subagentFiles[0]].split('\n').filter(Boolean).map((line) => masked(JSON.parse(line), s.home)))
+      .toEqual((await jsonlFile(`${recordedSubagent}.jsonl`)).map((line) => masked(line)))
+  })
+
+  it('a hold keeps the turn before that recorded message: the subagent\'s tool call is on disk and still running', async () => {
+    const SUBAGENT_TOOL_RESULT = '1ee90712-3476-4188-b310-22a881bf6e20'
+    const s = await open({ includePartialMessages: true }, { ...program([{ on: 'msg:prompt', emit: [{ kind: 'replay', data: { recording: 'tools-sync', holdBeforeMs: { [SUBAGENT_TOOL_RESULT]: 3000 } } }] }]), FRESHELL_CLAUDE_SIM_TIME_SCALE: '1' })
+    s.prompt.push('GO')
+    const subagentToolCall = () => s.messages.find((m) => m.type === 'assistant' && m.parent_tool_use_id && m.message.content.some((b: any) => b.type === 'tool_use'))
+    await s.until(() => Boolean(subagentToolCall()))
+    const subagentFile = async () => {
+      const { tree } = await transcriptOf(s.home)
+      const file = Object.keys(tree).find((name) => name.includes('/subagents/') && name.endsWith('.jsonl'))
+      return file ? tree[file].split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []
+    }
+    let lines: any[] = []
+    for (let i = 0; i < 100 && !lines.some((line) => line.uuid === subagentToolCall().uuid); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      lines = await subagentFile()
+    }
+    expect(lines.some((line) => line.uuid === subagentToolCall().uuid)).toBe(true)
+    const isToolResult = (line: any) => Array.isArray(line.message?.content) && line.message.content.some((b: any) => b.type === 'tool_result')
+    expect(lines.filter(isToolResult)).toEqual([])
+    expect(results(s.messages)).toEqual([])
+
+    await s.until(() => results(s.messages).length === 1, 10_000)
+    for (let i = 0; i < 100 && !(await subagentFile()).some(isToolResult); i += 1) await new Promise((resolve) => setTimeout(resolve, 20))
+    expect((await subagentFile()).filter(isToolResult)).toHaveLength(1)
+  })
+})
+
 describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)', () => {
   const children: ChildProcess[] = []
   afterEach(() => {
