@@ -151,7 +151,7 @@ test.describe('AI naming pauses on refused credentials', () => {
           tabId, paneId, content: {
             kind: 'fresh-agent', provider: 'claude', sessionType: 'freshclaude',
             sessionId, resumeSessionId: sessionId, sessionRef: { provider: 'claude', sessionId },
-            cwd, status: 'idle',
+            initialCwd: cwd, status: 'idle',
           },
         } })
       }, { tabId, paneId, sessionId, cwd: path.join(journey.server.info.homeDir, 'work', 'historical-sardines') })
