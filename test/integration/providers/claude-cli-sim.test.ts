@@ -190,6 +190,18 @@ describe('Claude CLI simulator programs', () => {
     expect(exited.ended).toEqual({ error: 'Claude Code process exited with code 3' })
   })
 
+  it('a CLI that exits with code 0 mid-turn ends the stream cleanly, with no error and no result', async () => {
+    // The SDK reports no error for exit code 0 (sdk.mjs getProcessExitError),
+    // so its message iterator simply ends: the natural end of stream that the
+    // sidecar must treat as a session end (G23).
+    const s = await open({}, program([{ on: 'msg:prompt', emit: [{ kind: 'text', data: { text: 'partial' } }, { kind: 'crash', data: { code: 0 } }] }]))
+    s.prompt.push('go')
+    await s.until(() => s.ended !== null)
+    expect(s.ended).toEqual({})
+    expect(s.messages.some((m) => m.type === 'assistant')).toBe(true)
+    expect(results(s.messages)).toEqual([])
+  })
+
   it('a hang rule keeps the turn open until an interrupt aborts it', async () => {
     const s = await open({}, program([{ on: 'msg:prompt', emit: [{ kind: 'hang' }] }]))
     s.prompt.push('wait forever', '22222222-2222-4222-8222-222222222222')
@@ -200,6 +212,22 @@ describe('Claude CLI simulator programs', () => {
     await s.until(() => results(s.messages).length === 1)
     expect(results(s.messages)[0]).toMatchObject({ subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
     await s.until(() => s.messages.some((m) => m.type === 'command_lifecycle' && m.state === 'cancelled'))
+  })
+
+  it('a /compact whose summary request hangs (HANG in its instructions) stays compacting with no result', async () => {
+    // The marker reaches the compaction's summary request the way APIERR does
+    // on the real CLI (T15 scenario `compact`), so the local provider's HANG
+    // mode would leave the real CLI compacting too. Only a CLI death ends it.
+    const s = await open({}, { FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    s.prompt.push('something to compact')
+    await s.until(() => results(s.messages).length === 1)
+    s.prompt.push('/compact HANG', '33333333-3333-4333-8333-333333333333')
+    await s.until(() => s.messages.some((m) => m.type === 'system' && m.subtype === 'status' && m.status === 'compacting'))
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const statuses = s.messages.filter((m) => m.type === 'system' && m.subtype === 'status').map((m) => m.status)
+    expect(statuses.at(-1), 'the compaction is still in progress').toBe('compacting')
+    expect(results(s.messages), 'the hung compaction has no result').toHaveLength(1)
+    expect(s.ended).toBeNull()
   })
 
   it('a start rule can schedule a CLI-initiated turn: init and a result with no lifecycle, bracketed by running and idle', async () => {
@@ -356,9 +384,9 @@ describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
     return { home, frames, until, send }
   }
 
-  it('creates a session, runs a turn and reports its result through the unchanged sidecar protocol', async () => {
+  it('creates a session, runs a turn and reports its result through the sidecar protocol', async () => {
     const { home, frames, until, send } = await startSidecar()
-    send({ type: 'create', requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+    send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
     expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
     const sessionId = frames.find((f) => f.type === 'created').sessionId
     send({ type: 'send', sessionId, text: 'hello' })
@@ -371,11 +399,13 @@ describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
   it('FRESHELL_CLAUDE_SIM_STALL_STDIN makes the sidecar stop reading its stdin once the CLI has booted', async () => {
     for (const [stall, readsLaterLines] of [[undefined, true], ['boot', false]] as const) {
       const { home, frames, until, send } = await startSidecar(stall ? { FRESHELL_CLAUDE_SIM_STALL_STDIN: stall } : {})
-      send({ type: 'create', requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+      send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
       expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 300))
-      send({ type: 'create', requestId: 'r2', cwd: home.cwd, permissionMode: 'bypassPermissions' })
-      expect(await until(() => frames.some((f) => f.type === 'created' && f.requestId === 'r2'), 1500), `stall=${stall}`).toBe(readsLaterLines)
+      send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r2', cwd: home.cwd, permissionMode: 'bypassPermissions' })
+      // One sidecar hosts one session, so a reading sidecar refuses the second
+      // create; any answer at all shows it read the line.
+      expect(await until(() => frames.some((f) => (f.type === 'created' || f.type === 'create.failed') && f.requestId === 'r2'), 1500), `stall=${stall}`).toBe(readsLaterLines)
     }
   })
 })

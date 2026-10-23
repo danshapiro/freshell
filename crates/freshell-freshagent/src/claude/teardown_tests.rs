@@ -113,7 +113,6 @@ async fn fake_session(
         pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
         in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-        result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
         turn_lock: Arc::new(TokioMutex::new(())),
         rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -368,4 +367,100 @@ async fn spawn_sidecar_runs_the_sidecar_inside_its_own_process_group() {
         tree_guard.terminate(&mut child).await,
         crate::claude_spawn::TreeConfirmation::Confirmed
     );
+}
+
+/// The captured records whose message starts with `prefix`.
+fn records_starting(
+    events: &Arc<StdMutex<Vec<(tracing::Level, capture::Fields)>>>,
+    prefix: &str,
+) -> Vec<(tracing::Level, capture::Fields)> {
+    events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .filter(|(_, fields)| {
+            fields
+                .get("message")
+                .is_some_and(|message| message.starts_with(prefix))
+        })
+        .cloned()
+        .collect()
+}
+
+/// A kill-and-confirm window that confirms the tree dead on its
+/// `dies_on`-th run, recording when each run started.
+struct ScriptedWindow {
+    runs: Vec<std::time::Instant>,
+    dies_on: usize,
+}
+
+impl TreeDeathWindow for ScriptedWindow {
+    async fn confirm_dead(&mut self) -> bool {
+        self.runs.push(std::time::Instant::now());
+        self.runs.len() >= self.dies_on
+    }
+
+    fn lingering(&self) -> usize {
+        1
+    }
+}
+
+/// A tree that outlives a whole window survived SIGKILL: it is stuck in the
+/// kernel. The detached escalation keeps going until it is dead (the kill's
+/// deferred stop commit waits on that), but it backs off between windows
+/// instead of rescanning `/proc` every 25 ms and warning every 0.6 s for
+/// the rest of the server's life, and it says when the tree finally died.
+#[tokio::test]
+async fn the_detached_escalation_backs_off_between_windows_until_the_tree_dies() {
+    let (events, _guard) = capture::install();
+    let mut window = ScriptedWindow {
+        runs: Vec::new(),
+        dies_on: 4,
+    };
+
+    assert!(escalate_until_dead(&mut window, "backoff").await);
+
+    assert_eq!(window.runs.len(), 4, "it ran until the tree died");
+    let gaps: Vec<Duration> = window.runs.windows(2).map(|w| w[1] - w[0]).collect();
+    for (gap, floor) in gaps.iter().zip([500, 1_000, 2_000]) {
+        assert!(
+            *gap >= Duration::from_millis(floor),
+            "the pause doubles from half a second: {gaps:?}"
+        );
+    }
+    let continues = records_starting(&events, "freshagent.claude.teardown_escalation_continues");
+    assert_eq!(
+        continues
+            .iter()
+            .map(|(level, fields)| (
+                *level,
+                fields.get("windows").cloned(),
+                fields.get("next_window_in_ms").cloned()
+            ))
+            .collect::<Vec<_>>(),
+        [("1", "500"), ("2", "1000"), ("3", "2000")]
+            .map(|(windows, pause)| (
+                tracing::Level::WARN,
+                Some(windows.to_string()),
+                Some(pause.to_string())
+            ))
+            .to_vec(),
+        "one warning per unconfirmed window, naming the next pause"
+    );
+    let confirmed = records_starting(&events, "freshagent.claude.teardown_escalation_confirmed");
+    assert_eq!(confirmed.len(), 1, "{confirmed:?}");
+    assert_eq!(confirmed[0].0, tracing::Level::INFO);
+    assert_eq!(confirmed[0].1.get("windows").map(String::as_str), Some("4"));
+}
+
+/// Once backed off, an unkillable tree costs one window (24 rounds of 25 ms)
+/// and one warning a minute.
+#[test]
+fn the_pause_between_escalation_windows_doubles_up_to_a_minute() {
+    assert_eq!(escalation_pause(1), Duration::from_millis(500));
+    assert_eq!(escalation_pause(2), Duration::from_secs(1));
+    assert_eq!(escalation_pause(3), Duration::from_secs(2));
+    assert_eq!(escalation_pause(7), Duration::from_secs(32));
+    assert_eq!(escalation_pause(8), Duration::from_secs(60));
+    assert_eq!(escalation_pause(u32::MAX), Duration::from_secs(60));
 }

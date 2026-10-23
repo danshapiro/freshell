@@ -26,7 +26,8 @@
 //   completion       { subtype?, text?, errors? }   end the turn with this result subtype
 //   api_error        { status?, message? }          the model request fails
 //   hang             {}                             the model request never completes
-//   crash            { signal? | code? }            the CLI process dies (default SIGKILL)
+//   crash            { signal? | code? }            the CLI process dies (default SIGKILL);
+//                                                   with code 0 the stream ends with no error
 //   stall_stdin      {}                             the host process stops reading stdin
 //   cli_turn         { afterMs? }                   a background task finishes later and
 //                                                   starts a CLI-initiated turn

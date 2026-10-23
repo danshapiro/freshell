@@ -45,9 +45,10 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// the raw parentUuid chain) as the child's file — the source file is NEVER
 /// touched (Stage-2-proven SDK invariant: the original's JSONL is hash-identical
 /// after a fork). A `<n>`-th `send` appends a uuid-chained u<n>/a<n> pair (the
-/// user line carries the verbatim prompt text) and answers `sdk.status idle`
-/// (the in_turn clear edge) — NEVER a result frame, so no completion chime can
-/// leak into the rollback capture.
+/// user line carries the verbatim prompt text) and answers with the turn's
+/// `sdk.result` (the in_turn clear edge, as the real sidecar ends a turn) — and
+/// NEVER a `sdk.turn.complete`, so no completion chime can leak into the rollback
+/// capture.
 const FAKE_ROLLBACK_SIDECAR_SOURCE: &str = r#"
 import fs from 'node:fs'
 import path from 'node:path'
@@ -104,11 +105,11 @@ rl.on('line', (line) => {
     placeholderCounter += 1
     const sessionId = `fake-sidecar-${process.pid}-${placeholderCounter}`
     fs.mkdirSync(projDir, { recursive: true })
-    if (msg.forkSession === true) {
+    if (msg.boot?.kind === 'fork') {
       // Fork-at-point: NEW durable id, child file = the parent transcript's prefix.
-      const src = msg.resumeSessionId
+      const src = msg.boot?.resume
       let lines = readLines(src)
-      if (msg.resumeSessionAt) lines = prefixThrough(lines, msg.resumeSessionAt)
+      if (msg.boot?.resumeSessionAt) lines = prefixThrough(lines, msg.boot?.resumeSessionAt)
       cliId = mintCliId()
       turnCount = 0
       fs.writeFileSync(transcriptPath(cliId), lines.length ? `${lines.join('\n')}\n` : '')
@@ -117,7 +118,7 @@ rl.on('line', (line) => {
       turnCount = 0
       fs.writeFileSync(transcriptPath(cliId), '')
     }
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId: cliId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'send') {
@@ -131,9 +132,10 @@ rl.on('line', (line) => {
     const user = { type: 'user', uuid: u, parentUuid: parent, timestamp: `t${turnCount}a`, cwd: '/tmp', message: { role: 'user', content: [{ type: 'text', text: msg.text }] } }
     const assistant = { type: 'assistant', uuid: a, parentUuid: u, timestamp: `t${turnCount}b`, message: { role: 'assistant', content: [{ type: 'text', text: `answer ${turnCount}` }] } }
     fs.appendFileSync(transcriptPath(cliId), `${JSON.stringify(user)}\n${JSON.stringify(assistant)}\n`)
-    // The rollback capture surface must NEVER see a completion chime; idle is the
-    // busy-clear edge.
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }) + '\n')
+    // The rollback capture surface must NEVER see a completion chime; the
+    // turn's result is the busy-clear edge (no per-turn idle, like the real
+    // sidecar).
+    process.stdout.write(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: {} }) + '\n')
   } else if (msg.type === 'rollback.quiesce') {
     // ep4-r3 wire parity: rollback's pre-teardown probe — this fake never has
     // an inflight turn at that point (its sends settle their statuses
@@ -812,12 +814,11 @@ async fn drive_conversation(
                 && v["requestId"] == json!(format!("send-{i}"))
         })
         .await;
-        // The fake appends the u<n>/a<n> pair BEFORE answering idle, so this waits
-        // out both the transcript append AND the busy-clear edge.
+        // The fake appends the u<n>/a<n> pair BEFORE answering with the result,
+        // so this waits out both the transcript append AND the busy-clear edge.
         await_frame_into(&mut ws, &mut frames, 15, |v| {
             v["type"] == json!("freshAgent.event")
-                && v["event"]["type"] == json!("freshAgent.status")
-                && v["event"]["status"] == json!("idle")
+                && v["event"]["type"] == json!("freshAgent.result")
         })
         .await;
     }
@@ -920,16 +921,16 @@ async fn setup_and_undo_two_turn_conversation() -> (
     let creates = rig.create_lines();
     let fork_create = creates
         .iter()
-        .find(|l| l["forkSession"] == json!(true))
+        .find(|l| l["boot"]["kind"] == json!("fork"))
         .expect("fork create observed");
-    assert_eq!(fork_create["resumeSessionId"], json!(original));
+    assert_eq!(fork_create["boot"]["resume"], json!(original));
     assert_eq!(
-        fork_create["resumeSessionAt"],
+        fork_create["boot"]["resumeSessionAt"],
         json!("a1"),
         "keep prefix through a1"
     );
     assert_eq!(
-        fork_create["resumeDropsTurn"],
+        fork_create["boot"]["dropsTurn"],
         json!("u2"),
         "the guard is the first-to-discard turn's prompt uuid"
     );
@@ -1029,15 +1030,15 @@ async fn claude_redo_reforks_from_the_original_at_a_later_point() {
     let creates = rig.create_lines();
     let fork_creates: Vec<&Value> = creates
         .iter()
-        .filter(|l| l["forkSession"] == json!(true))
+        .filter(|l| l["boot"]["kind"] == json!("fork"))
         .collect();
     assert_eq!(fork_creates.len(), 2, "{creates:?}");
     let redo_create = fork_creates[1];
-    assert_eq!(redo_create["resumeSessionId"], json!(original));
-    assert_eq!(redo_create["resumeSessionAt"], json!("a2"));
-    assert_eq!(redo_create["forkSession"], json!(true));
+    assert_eq!(redo_create["boot"]["resume"], json!(original));
+    assert_eq!(redo_create["boot"]["resumeSessionAt"], json!("a2"));
+    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
     assert!(
-        redo_create.get("resumeDropsTurn").is_none(),
+        redo_create["boot"].get("dropsTurn").is_none(),
         "the guard is omitted when the discard range is empty (redo to the tip)"
     );
 
@@ -1107,17 +1108,11 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
         "the initial create + the rollback's FRESH create: {creates:?}"
     );
     let fresh_create = &creates[1];
-    for key in [
-        "resumeSessionId",
-        "resumeSessionAt",
-        "forkSession",
-        "resumeDropsTurn",
-    ] {
-        assert!(
-            fresh_create.get(key).is_none(),
-            "the fresh-conversation leg carries NO resume/fork keys ({key} absent): {fresh_create}"
-        );
-    }
+    assert_eq!(
+        fresh_create["boot"],
+        json!({ "kind": "fresh" }),
+        "the fresh-conversation leg boots a new conversation, with NO resume/fork keys: {fresh_create}"
+    );
 
     // The record retained the discarded session as the redo source.
     let rows = rollback_rows(&rig.ledger_dir());
@@ -1159,10 +1154,10 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
     let creates = rig.create_lines();
     assert_eq!(creates.len(), 3, "{creates:?}");
     let redo_create = &creates[2];
-    assert_eq!(redo_create["forkSession"], json!(true));
-    assert_eq!(redo_create["resumeSessionId"], json!(original));
+    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
+    assert_eq!(redo_create["boot"]["resume"], json!(original));
     assert_eq!(
-        redo_create["resumeSessionAt"],
+        redo_create["boot"]["resumeSessionAt"],
         json!("a1"),
         "the r3 boundary rule — resume at a1, NOT u1"
     );
@@ -1259,11 +1254,17 @@ async fn claude_undo_with_an_unreadable_store_is_internal_error_not_nothing_to_u
         json!("INTERNAL_ERROR"),
         "an unreadable store is a retryable failure, not an empty conversation: {refusal}"
     );
+    // The create log holds protocol-2 creates, whose boot names the kind: a
+    // fork is `boot.kind == "fork"` (a v1 `forkSession` key is never written,
+    // so reading it would pass whatever ran).
+    let creates = rig.create_lines();
     assert!(
-        rig.create_lines()
-            .iter()
-            .all(|l| l["forkSession"] != json!(true)),
-        "no fork may run against an unchecked store"
+        !creates.is_empty() && creates.iter().all(|l| l["boot"]["kind"].is_string()),
+        "every logged create names its boot kind: {creates:?}"
+    );
+    assert!(
+        creates.iter().all(|l| l["boot"]["kind"] != json!("fork")),
+        "no fork may run against an unchecked store: {creates:?}"
     );
     assert!(
         rollback_rows(&rig.ledger_dir()).is_empty(),
@@ -1376,7 +1377,7 @@ async fn claude_undo_forks_from_the_transcript_it_located_even_if_the_store_stop
     wait_until(15, "the fork create", || {
         rig.create_lines()
             .iter()
-            .any(|l| l["forkSession"] == json!(true))
+            .any(|l| l["boot"]["kind"] == json!("fork"))
     })
     .await;
     drop(locked);
@@ -1384,10 +1385,10 @@ async fn claude_undo_forks_from_the_transcript_it_located_even_if_the_store_stop
     let creates = rig.create_lines();
     let fork_create = creates
         .iter()
-        .find(|l| l["forkSession"] == json!(true))
+        .find(|l| l["boot"]["kind"] == json!("fork"))
         .expect("fork create observed");
-    assert_eq!(fork_create["resumeSessionId"], json!(original));
-    assert_eq!(fork_create["resumeSessionAt"], json!("a1"));
+    assert_eq!(fork_create["boot"]["resume"], json!(original));
+    assert_eq!(fork_create["boot"]["resumeSessionAt"], json!("a1"));
     assert_eq!(
         fork_create["cwd"],
         json!("/tmp"),

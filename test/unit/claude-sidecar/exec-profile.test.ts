@@ -24,7 +24,7 @@ async function consume(model: string) {
   child.stderr!.on('data', chunk => { stderr += chunk.toString() })
   const lines = createInterface({ input: child.stdout! })
   lines.on('line', line => frames.push(JSON.parse(line)))
-  child.stdin!.write(`${JSON.stringify({ type: 'create', requestId: 'exec-profile', model, cwd })}\n`)
+  child.stdin!.write(`${JSON.stringify({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'exec-profile', model, cwd })}\n`)
   try {
     const deadline = Date.now() + 5_000
     while (!frames.some(frame => ['create.failed', 'sdk.assistant', 'sdk.error'].includes(frame.type)) && Date.now() < deadline) {

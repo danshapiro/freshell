@@ -878,7 +878,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
   let msg
   try { msg = JSON.parse(line) } catch { return }
   if (msg.type === 'create') {
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId: 'teardownConfirmSession01' }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId: 'teardownConfirmSession01', protocol: 2 }) + '\n')
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
