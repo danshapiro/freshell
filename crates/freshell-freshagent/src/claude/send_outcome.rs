@@ -24,6 +24,9 @@ pub enum ClaudeSendOutcome {
         session_key: String,
         /// The uuid the message runs under: the turn id its user line lands with.
         submitted_turn_id: String,
+        /// The exact runtime that accepted this send; an old end after recovery
+        /// must never settle a send belonging to its replacement.
+        ownership_id: String,
     },
     /// The message was not sent; the sender got a request error with this code.
     Refused { code: String, message: String },

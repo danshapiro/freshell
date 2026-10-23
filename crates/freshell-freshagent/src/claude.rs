@@ -4380,6 +4380,7 @@ impl FreshClaudeState {
             "text": msg.text,
         });
         let writer = session.stdin.clone();
+        let ownership_id = session.ownership_id.clone();
         drop(guard);
         if let Some(attempt) = checkpoint_attempt_for_send(&msg) {
             send_req["checkpointAttempt"] = attempt;
@@ -4479,6 +4480,7 @@ impl FreshClaudeState {
         ClaudeSendOutcome::Accepted {
             session_key: map_key,
             submitted_turn_id,
+            ownership_id,
         }
     }
 
@@ -6988,6 +6990,7 @@ impl FreshClaudeState {
                 // bounded confirmation window, confirmed gone before the exit
                 // report offers Resume, and no zombie is left behind. It is not
                 // this consumer's to abort: the consumer is this task.
+                let ownership_id = evicted.ownership_id.clone();
                 let processes = SidecarProcesses {
                     child: evicted.child,
                     stdin: evicted.stdin,
@@ -7086,6 +7089,7 @@ impl FreshClaudeState {
                     },
                     rings,
                     cause.reason(),
+                    &ownership_id,
                 );
             }
         })
@@ -17572,6 +17576,7 @@ rl.on('line', (line) => {
                 ClaudeSendOutcome::Accepted {
                     session_key: session_id.clone(),
                     submitted_turn_id: uuid.clone(),
+                    ownership_id: st.sessions.lock().await[&session_id].ownership_id.clone(),
                 }
             );
         }
