@@ -551,6 +551,20 @@ describe('fresh-agent-ws', () => {
       expect(store.getState().freshAgent.sessions[key]).toMatchObject({ status: 'idle', streamingActive: false })
     })
 
+    it('ignores a subagent\'s stream events: no live block and no streaming mark', () => {
+      vi.useFakeTimers()
+      const store = createFreshAgentStore()
+      const subagent = (event: Record<string, unknown>) => frame({
+        type: 'freshAgent.stream', messageId: 'msg_sub', parentToolUseId: 'toolu_agent', event,
+      })
+      handleFreshAgentMessage(store.dispatch, subagent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      handleFreshAgentMessage(store.dispatch, subagent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'subagent words' } }))
+      vi.advanceTimersByTime(LIVE_STREAM_FLUSH_MS)
+
+      expect(store.getState().freshAgentLive.bySession).toEqual({})
+      expect(store.getState().freshAgent.sessions[key]?.streamingActive ?? false).toBe(false)
+    })
+
     it('marks the session streaming again when the next turn opens a block', () => {
       const store = createFreshAgentStore()
       handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
