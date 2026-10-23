@@ -17,15 +17,10 @@ impl FreshClaudeState {
         if old == new {
             return Ok(old.into());
         }
-        let turn_lock = {
-            let sessions = self.sessions.lock().await;
-            let session = sessions
-                .get(old)
-                .filter(|session| Arc::ptr_eq(&session.pending, expected_pending))
-                .ok_or_else(|| "the conversation runtime was replaced".to_string())?;
-            Arc::clone(&session.turn_lock)
-        };
-        let _turn = turn_lock.lock().await;
+        // This is a fact from the consumer. A handler can hold turn_lock
+        // while awaiting this consumer's next receipt, so taking that lock
+        // here would stop both tasks. The incarnation check and map/owner
+        // guards below protect the move while its turn state stays intact.
         let guard_at = self.ownership.as_ref().map(|registry| {
             let observed = registry.observe(PROVIDER, old);
             freshell_ownership::ObservedFence {

@@ -12287,6 +12287,38 @@ rl.on('line', (line) => {
         assert_eq!(frame["sessionId"], "unknown-session");
     }
 
+    /// A configure handler can hold the turn lock while awaiting a receipt
+    /// from this same consumer. Native rekey must let that consumer advance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conversation_rekey_does_not_wait_on_a_handler_awaiting_its_receipt() {
+        let (st, _rx) = state_with_bus();
+        let old = uuid::Uuid::new_v4().to_string();
+        let new = uuid::Uuid::new_v4().to_string();
+        insert_fake_claude_session(&st, &old).await;
+        let (turn, pending) = {
+            let sessions = st.sessions.lock().await;
+            let session = &sessions[&old];
+            (session.turn_lock.clone(), session.pending.clone())
+        };
+        let held = turn.lock().await;
+        let moved = tokio::time::timeout(
+            Duration::from_millis(500),
+            st.rekey_conversation(&old, &new, "freshclaude", &pending, "test-configure"),
+        )
+        .await;
+        assert!(
+            moved.is_ok(),
+            "the consumer cannot wait on a handler that needs its next receipt"
+        );
+        assert_eq!(moved.unwrap().unwrap(), new);
+        assert!(Arc::ptr_eq(
+            &st.sessions.lock().await[&new].turn_lock,
+            &turn
+        ));
+        drop(held);
+        st.shutdown().await;
+    }
+
     /// A kill can resolve the old key just before `/clear` rekeys the same
     /// live runtime. Its close gate must re-resolve the wire id while holding
     /// the alias index and session map together, including in hosted states
