@@ -4795,6 +4795,30 @@ impl FreshClaudeState {
             );
             return;
         }
+        // Client-alerts G20: the decision's `updatedPermissions` (the CLI's own
+        // suggestions the user accepted) reaches the CLI verbatim, so a malformed
+        // one would fail or misapply the user's choice there. Refuse it with the
+        // same discipline as above: nothing forwarded, the request stays pending.
+        if let Err(reason) = crate::claude_permission_update::validate_decision(&msg.decision) {
+            drop(session);
+            tracing::warn!(
+                target: "freshell_freshagent::claude",
+                event = "freshagent.claude.approval_decision_refused",
+                provider = PROVIDER,
+                session_id = %session_id,
+                session_type,
+                request_id = %request_id,
+                reason = %reason,
+                "a claude approval decision carried malformed permission updates; nothing was sent"
+            );
+            self.emit_fresh_agent_error(
+                &session_id,
+                session_type,
+                "INVALID_APPROVAL_DECISION",
+                &format!("Claude approval {request_id} was not sent: {reason}"),
+            );
+            return;
+        }
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
         let respond_req = json!({
@@ -17898,6 +17922,71 @@ rl.on('line', (line) => {
             env.respond_log_frames(0).await.is_empty(),
             "a refused non-object decision is never forwarded to the sidecar"
         );
+        drop(env);
+    }
+
+    /// Client-alerts G20 (D4): a decision whose `updatedPermissions` is not a list of
+    /// well-formed permission updates is refused with `INVALID_APPROVAL_DECISION`
+    /// before anything reaches the sidecar, and the request stays pending; a retry
+    /// with well-formed updates is written VERBATIM and resolves it.
+    #[tokio::test]
+    async fn approval_respond_with_malformed_updated_permissions_is_refused_and_a_valid_retry_lands()
+    {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-bad-updates"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-bad-updates").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            json!({ "behavior": "allow", "updatedPermissions": [
+                { "type": "grantEverything", "destination": "session" },
+            ] }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_APPROVAL_DECISION");
+        assert_eq!(frame["sessionId"], json!(session_id));
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert_eq!(
+            permissions,
+            vec!["req-1".to_string()],
+            "a refused decision leaves the request pending"
+        );
+        assert!(
+            env.respond_log_frames(0).await.is_empty(),
+            "a refused decision never reaches the sidecar"
+        );
+
+        let decision = json!({ "behavior": "allow", "updatedPermissions": [
+            { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "npm test *" }],
+              "behavior": "allow", "destination": "localSettings" },
+            { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+        ] });
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            decision.clone(),
+        ))
+        .await;
+        let frames = env.respond_log_frames(1).await;
+        let respond = frames
+            .iter()
+            .find(|f| f["type"] == "permission.respond")
+            .expect("the valid retry reaches the sidecar");
+        assert_eq!(respond["decision"], decision, "forwarded verbatim");
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert!(permissions.is_empty(), "the valid retry resolves the request");
         drop(env);
     }
 
