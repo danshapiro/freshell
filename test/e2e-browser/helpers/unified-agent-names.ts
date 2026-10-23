@@ -1221,9 +1221,18 @@ async function commitPaneRenameEditor(page: Page, name: string): Promise<void> {
   // set aria-invalid), letting the in-flight window elapse first.
   for (const backoff of RENAME_RESUBMIT_BACKOFFS) {
     await page.waitForTimeout(backoff)
-    if (!(await input.isVisible().catch(() => false))) break
-    const errored = await input.getAttribute('aria-invalid').catch(() => null)
-    if (errored !== 'true') continue
+    // Read visibility and error together without waiting for an editor that
+    // a successful commit may already have removed.
+    const editor = await input.evaluateAll((elements) => {
+      const element = elements[0]
+      if (!element) return { visible: false, errored: false }
+      return {
+        visible: window.getComputedStyle(element).visibility === 'visible' && element.getClientRects().length > 0,
+        errored: element.getAttribute('aria-invalid') === 'true',
+      }
+    })
+    if (!editor.visible) break
+    if (!editor.errored) continue
     try {
       await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
       await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
