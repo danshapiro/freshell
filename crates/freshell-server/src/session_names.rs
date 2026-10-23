@@ -45,9 +45,15 @@
 //! `session_name_store_view`): they answer from the adopted view after a
 //! stat of the document against the stamp the view was adopted from; only
 //! a changed stamp (or an elapsed 30 s full-check window) runs the locked
-//! full-read adoption above, and a lock still busy after the read's short
-//! wait (10 ms, which outlasts a descriptor inherited by a forked child)
-//! answers from the adopted view instead of queueing behind a commit.
+//! full-read adoption above, and a read never queues behind a commit. It
+//! takes this store's local turn only if the turn is free (a turn held by
+//! one of this process's own transactions means that transaction is about
+//! to adopt or replace the document and update the view itself), then
+//! tries the document lock for at most 10 ms, which rides out a momentary
+//! hold by another participant. When either is busy it answers from the
+//! adopted view (`class` `local_turn_busy` or `lock_busy`), and a later
+//! read or the 2 s tick adopts the change; the tick's full read queues for
+//! the local turn like every transaction.
 //!
 //! Task 2 constructs this store in `main.rs`; Tasks 3–4 consume
 //! [`SessionNames::try_background_guard`] for the serial worker.
