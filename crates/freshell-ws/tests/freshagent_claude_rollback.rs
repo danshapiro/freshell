@@ -879,3 +879,118 @@ async fn an_undo_forks_from_the_transcript_it_located_even_if_the_store_stops_li
     let ack = rollback_answer(&mut conn, "undo-1").await;
     assert_eq!(ack["type"], "freshAgent.rolledBack", "{ack}");
 }
+
+// ── §4.2/§4.3: a dead pending session resumes through the create lane ─────────
+
+/// SIGKILL the sidecar of the runtime that booted `session_id`, then wait for
+/// the pane's `SIDECAR_EXITED` (the pane then shows "Resume session").
+async fn kill_sidecar_of(rig: &ClaudeRig, conn: &mut RigConnection, session_id: &str) {
+    let sidecar = runtime_pids(rig, session_id)[0];
+    // SAFETY: a plain signal to a sidecar process this rig's server spawned.
+    assert_eq!(unsafe { libc::kill(sidecar as i32, libc::SIGKILL) }, 0);
+    conn.wait_for("the sidecar's exit", |v| {
+        v["type"] == "freshAgent.event"
+            && v["event"]["type"] == "freshAgent.error"
+            && v["event"]["code"] == "SIDECAR_EXITED"
+    })
+    .await;
+}
+
+/// The create the pane's Resume sends for a dead claude session
+/// (`FreshAgentView.triggerRecovery`, then `buildCreateMessage`): a new request
+/// carrying the session as its `sessionRef`. Returns the `freshAgent.created`
+/// frame.
+async fn resume_through_create(conn: &mut RigConnection, session_id: &str) -> Value {
+    let created = conn
+        .request_create(
+            &format!("resume-{session_id}"),
+            json!({ "sessionRef": { "provider": "claude", "sessionId": session_id } }),
+        )
+        .await;
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    assert_eq!(
+        created["sessionRef"],
+        json!({ "provider": "claude", "sessionId": session_id }),
+        "{created}"
+    );
+    created
+}
+
+/// Every recorded `query()` boot under `session_id`, in order.
+fn boots_under(rig: &ClaudeRig, session_id: &str) -> Vec<Value> {
+    queries(rig)
+        .into_iter()
+        .filter(|o| o["sessionId"] == session_id)
+        .collect()
+}
+
+/// §4.3 (sidecar crash row): the replacement an undo booted has no transcript
+/// until its first send. When its sidecar dies before then, the pane's Resume
+/// (a create resuming C) boots C from the genesis its binding row records, the
+/// same guarded fork of A under C (a plain resume of C is refused by the CLI,
+/// T5), and the next send writes C with A's kept prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undos_replacement_whose_sidecar_died_resumes_through_the_create() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let (_, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    materialized_from(&mut conn, &pane).await;
+    let fork = boot_of(&rig, &c);
+    kill_sidecar_of(&rig, &mut conn, &c).await;
+
+    let created = resume_through_create(&mut conn, &c).await;
+    let boots = boots_under(&rig, &c);
+    assert_eq!(boots.len(), 2, "the fork booted again under C: {boots:?}");
+    for key in [
+        "resume",
+        "forkSession",
+        "resumeSessionAt",
+        "resumeDropsTurn",
+    ] {
+        assert_eq!(boots[1][key], fork[key], "{key}: {:?}", boots[1]);
+    }
+    assert_eq!(boots[1]["resume"], a.as_str());
+
+    let resumed = created["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+    converse(&rig, &mut conn, &resumed, &["after the crash"]).await;
+    assert_eq!(conn.init_session_id(&resumed), c, "the CLI ran under C");
+    let c_lines = chain_lines(&rig.wait_for_transcript(&c).await);
+    let prompts: Vec<&str> = c_lines
+        .iter()
+        .filter(|line| line["type"] == "user")
+        .filter_map(|line| line["message"]["content"][0]["text"].as_str())
+        .collect();
+    assert_eq!(prompts, ["first prompt", "after the crash"]);
+}
+
+/// §4.3: a first-turn undo's replacement (genesis `Fresh`) whose sidecar died
+/// before its first send comes back through the create as a fresh boot under
+/// C, never a resume of a conversation that was never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_replacement_whose_sidecar_died_resumes_through_the_create() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    converse(&rig, &mut conn, &pane, &["only prompt"]).await;
+    let a = conn.init_session_id(&pane);
+    let (_, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
+    materialized_from(&mut conn, &pane).await;
+    kill_sidecar_of(&rig, &mut conn, &c).await;
+
+    let created = resume_through_create(&mut conn, &c).await;
+    let boots = boots_under(&rig, &c);
+    assert_eq!(boots.len(), 2, "C booted fresh again: {boots:?}");
+    assert_eq!(boots[1].get("resume"), None, "{:?}", boots[1]);
+    assert_eq!(boots[1].get("forkSession"), None, "{:?}", boots[1]);
+
+    let resumed = created["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+    converse(&rig, &mut conn, &resumed, &["a new first prompt"]).await;
+    assert_eq!(conn.init_session_id(&resumed), c, "the CLI ran under C");
+}

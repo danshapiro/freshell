@@ -195,3 +195,30 @@ async fn a_pending_fork_reboots_the_same_fork_and_keeps_its_turn_ids() {
     );
     rig.wait_for_genesis_cleared(&child).await;
 }
+
+/// §4.2 on the create lane: a create resuming a pending fork whose parent's
+/// transcript is gone has nothing to boot. It is refused
+/// `CONVERSATION_NOT_FOUND`, the CLI's own answer for a missing conversation,
+/// and no sidecar is spawned for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_resuming_a_pending_fork_of_a_gone_parent_is_refused_without_a_boot() {
+    let (rig, _ledger) = ledger_rig().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let parent = uuid::Uuid::new_v4().to_string();
+    rig.seed_pending_session(&id, &json!({ "kind": "fork", "parent": parent }));
+    let mut conn = rig.connect().await;
+
+    let refused = conn
+        .request_create(
+            "resume-1",
+            json!({ "sessionRef": { "provider": "claude", "sessionId": id } }),
+        )
+        .await;
+    assert_eq!(refused["type"], "freshAgent.create.failed", "{refused}");
+    assert_eq!(refused["code"], "CONVERSATION_NOT_FOUND", "{refused}");
+    assert!(
+        rig.ledger_rows("query").is_empty(),
+        "nothing was booted: {:?}",
+        rig.ledger_rows("query")
+    );
+}

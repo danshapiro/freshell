@@ -40,6 +40,21 @@ pub(crate) enum GenesisClear {
     Failed(String),
 }
 
+/// A boot decided from a session's recorded genesis
+/// ([`FreshClaudeState::decide_create_resume_boot`]).
+#[derive(Debug)]
+pub(super) struct GenesisAwareBoot {
+    pub(super) boot: ClaudeBoot,
+    /// The directory the conversation (or a fork's parent) was recorded in,
+    /// when it still exists.
+    pub(super) cwd: Option<String>,
+    /// The id a fresh or forked boot writes under (the session's own).
+    pub(super) session_id: Option<String>,
+    /// The genesis the boot follows; `None` when the transcript is on disk and
+    /// the boot resumes it.
+    pub(super) genesis: Option<crate::claude_launch::ClaudeGenesis>,
+}
+
 /// Clear `session_id`'s genesis once its transcript is on disk in `roots`:
 /// look up to `attempts` times, `interval` apart, and clear at the first find.
 /// A store that cannot be read is not a find.
@@ -176,12 +191,61 @@ impl FreshClaudeState {
         sink: Option<&crate::identity_sink::SharedPaneIdentitySink>,
     ) -> Result<(ClaudeBoot, Option<String>, Option<String>), ResumeClaudeError> {
         let recorded = sink.and_then(|sink| sink.load_genesis(PROVIDER, durable));
+        self.decide_recorded_boot("attach_resume", durable, sink, recorded.as_ref())
+    }
+
+    /// Which conversation a create that resumes `durable` boots (design §4.2,
+    /// the boot decision every launch makes; §4.3's crash row). A session whose
+    /// binding row records a genesis (a zero-turn session, an undo's replacement
+    /// or a fork's child before its first send) is decided exactly like an
+    /// attach: from its genesis while it has no transcript, as a resume once it
+    /// has one. So the pane's Resume after such a session's sidecar died boots
+    /// the same conversation again instead of a resume the CLI refuses (T5).
+    ///
+    /// `None` for a session with no genesis: the create resumes it as it always
+    /// did. Its only possible boot is that resume, and the CLI, which reads the
+    /// store from its own environment, refuses a conversation it does not hold
+    /// with the typed `CONVERSATION_NOT_FOUND` (T5), the same answer a lost
+    /// decision gives.
+    pub(super) fn decide_create_resume_boot(
+        &self,
+        durable: &str,
+    ) -> Result<Option<GenesisAwareBoot>, ResumeClaudeError> {
+        let sink = self.identity_sink();
+        let Some(recorded) = sink
+            .as_ref()
+            .and_then(|sink| sink.load_genesis(PROVIDER, durable))
+        else {
+            return Ok(None);
+        };
+        let (boot, cwd, session_id) =
+            self.decide_recorded_boot("create_resume", durable, sink.as_ref(), Some(&recorded))?;
+        // A boot under the session's own id is a boot from its genesis; a
+        // resume (the transcript is on disk) boots nothing from it.
+        let genesis = session_id.is_some().then_some(recorded.genesis);
+        Ok(Some(GenesisAwareBoot {
+            boot,
+            cwd,
+            session_id,
+            genesis,
+        }))
+    }
+
+    /// [`decide_boot`] for `durable`, whose binding row records `recorded`, on
+    /// behalf of the launch `lane` (it names the log lines).
+    fn decide_recorded_boot(
+        &self,
+        lane: &'static str,
+        durable: &str,
+        sink: Option<&crate::identity_sink::SharedPaneIdentitySink>,
+        recorded: Option<&RecordedGenesis>,
+    ) -> Result<(ClaudeBoot, Option<String>, Option<String>), ResumeClaudeError> {
         let location = self.locate_transcript(durable);
         let found = matches!(location, TranscriptLocation::Found(_));
         let decision = decide_boot(
             durable,
             location,
-            recorded.as_ref().map(|recorded| &recorded.genesis),
+            recorded.map(|recorded| &recorded.genesis),
             |id| self.locate_transcript(id),
         );
         match decision {
@@ -190,7 +254,7 @@ impl FreshClaudeState {
                 cwd,
                 session_id,
             } => {
-                if let (Some(recorded), Some(sink)) = (recorded.as_ref(), sink) {
+                if let (Some(recorded), Some(sink)) = (recorded, sink) {
                     if found {
                         self.clear_found_genesis(sink, durable, recorded);
                     } else {
@@ -198,6 +262,7 @@ impl FreshClaudeState {
                             component = "freshagent.claude",
                             event = "freshagent.claude.genesis_boot",
                             session_id = %durable,
+                            lane,
                             genesis = recorded.genesis.kind(),
                             boot = boot.kind(),
                             "the session has no transcript yet; it boots from its genesis"
@@ -206,9 +271,19 @@ impl FreshClaudeState {
                 }
                 Ok((boot, cwd, session_id))
             }
-            BootDecision::Lost => Err(ResumeClaudeError::NotFound),
+            BootDecision::Lost => {
+                tracing::info!(
+                    component = "freshagent.claude",
+                    event = "freshagent.claude.boot_lost",
+                    session_id = %durable,
+                    lane,
+                    genesis = recorded.map(|recorded| recorded.genesis.kind()),
+                    "the session has no transcript and nothing to boot it from; it is gone"
+                );
+                Err(ResumeClaudeError::NotFound)
+            }
             BootDecision::Transient(error) => {
-                crate::claude_snapshot::log_transcript_unreadable("attach_resume", durable, &error);
+                crate::claude_snapshot::log_transcript_unreadable(lane, durable, &error);
                 Err(ResumeClaudeError::Transient(error.to_string()))
             }
         }

@@ -2416,6 +2416,51 @@ impl FreshClaudeState {
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
 
+        // Which conversation the resume boots (design §4.2, §4.3): a session
+        // that has no transcript yet boots from the genesis its binding row
+        // records (an undo's replacement or a fork's child whose sidecar died
+        // before its first send), never as a resume the CLI refuses (T5).
+        let genesis_boot = match resume_sid.as_deref() {
+            Some(sid) => match self.decide_create_resume_boot(sid) {
+                Ok(decided) => decided,
+                Err(ResumeClaudeError::NotFound) => {
+                    return self.fail_create(
+                        &request_id,
+                        "CONVERSATION_NOT_FOUND",
+                        &format!("No conversation found with session ID: {sid}"),
+                    );
+                }
+                Err(ResumeClaudeError::Transient(detail)) => {
+                    return self.answer_create_failure(
+                        &request_id,
+                        ClaudeCreateOutcome::Failed {
+                            code: crate::claude_handshake::CREATE_FAILED_CODE.to_string(),
+                            message: format!(
+                                "The Claude transcript store could not be read: {detail}"
+                            ),
+                            retryable: Some(true),
+                            owner: None,
+                        },
+                    );
+                }
+            },
+            None => None,
+        };
+        let (boot, boot_cwd, boot_session_id, boot_genesis) = match genesis_boot {
+            Some(decided) => (
+                decided.boot,
+                decided.cwd.or_else(|| msg.cwd.clone()),
+                decided.session_id,
+                decided.genesis,
+            ),
+            None => (
+                ClaudeBoot::resume_or_fresh(resume_sid.as_deref()),
+                msg.cwd.clone(),
+                None,
+                None,
+            ),
+        };
+
         // P1.13: the FULL settings snapshot the session records at
         // `sdk.session.init` (claude has no sandbox concept: always `None`), and
         // the launch is built from the same values (G15: the plugins too).
@@ -2431,11 +2476,12 @@ impl FreshClaudeState {
         let spec = ClaudeLaunchSpec::new(
             request_id.clone(),
             session_type,
-            ClaudeBoot::resume_or_fresh(resume_sid.as_deref()),
-            msg.cwd.clone(),
+            boot,
+            boot_cwd,
             &settings,
             self.hosted_mcp,
         )
+        .with_session_id(boot_session_id)
         .with_model_selection(serde_json::to_value(&msg.model_selection).ok());
         // b8ke focused episode-2 round-2 F2: the create's claim owns this
         // runtime's coordinator transition (the session-init adoption's Blocked
@@ -2460,7 +2506,7 @@ impl FreshClaudeState {
                     partial_runtime_key: resume_sid.clone().or_else(|| fresh_claim_key.clone()),
                     start_pid_slot: &start_pid_slot,
                     inherit: None,
-                    genesis: None,
+                    genesis: boot_genesis,
                 },
                 &mut lease_guard,
                 &mut own_ticket,

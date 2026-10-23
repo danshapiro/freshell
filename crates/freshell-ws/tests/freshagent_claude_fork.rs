@@ -478,3 +478,62 @@ async fn a_fork_at_a_turn_the_conversation_does_not_hold_is_refused() {
     assert_eq!(queries(&rig).len(), boots, "nothing was booted");
     assert!(rig.fresh_claude.has_live_session(&a).await);
 }
+
+/// §4.3: a fork's child has no transcript until its first send. When its
+/// sidecar dies before then, the pane's Resume (a create carrying the child's
+/// `sessionRef`, `FreshAgentView.triggerRecovery`) boots the child from the
+/// genesis its binding row records, the same lazy fork of the parent under C
+/// (a plain resume of C is refused by the CLI, T5), and the next send writes C
+/// with the parent's prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_whose_sidecar_died_before_its_first_send_resumes_through_the_create() {
+    let rig = fork_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, a_path) = two_turns(&rig, &mut conn).await;
+    let u1 = prompt_uuid(&chain_lines(&a_path), "first prompt");
+    let (_, c) = fork_ok(&mut conn, &pane, &a, "fork-1", Some(&u1)).await;
+    conn.kill(&pane).await;
+    let fork = boot_of(&rig, &c);
+    let sidecar = rig
+        .ledger_rows("boot")
+        .into_iter()
+        .find(|row| row["sessionId"] == c.as_str())
+        .and_then(|row| row["pid"].as_i64())
+        .expect("the child's sidecar pid");
+    // SAFETY: a plain signal to a sidecar process this rig's server spawned.
+    assert_eq!(unsafe { libc::kill(sidecar as i32, libc::SIGKILL) }, 0);
+    conn.wait_for("the child's sidecar exit", |v| {
+        v["type"] == "freshAgent.event"
+            && v["event"]["type"] == "freshAgent.error"
+            && v["event"]["code"] == "SIDECAR_EXITED"
+    })
+    .await;
+
+    let created = conn
+        .request_create(
+            "resume-child",
+            json!({ "sessionRef": { "provider": "claude", "sessionId": c } }),
+        )
+        .await;
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    let boots: Vec<Value> = queries(&rig)
+        .into_iter()
+        .filter(|o| o["sessionId"] == c.as_str())
+        .collect();
+    assert_eq!(boots.len(), 2, "the fork booted again under C: {boots:?}");
+    for key in ["resume", "forkSession", "resumeSessionAt"] {
+        assert_eq!(boots[1][key], fork[key], "{key}: {:?}", boots[1]);
+    }
+
+    let resumed = created["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+    converse(&rig, &mut conn, &resumed, &["a different second prompt"]).await;
+    assert_eq!(conn.init_session_id(&resumed), c, "the CLI ran under C");
+    let c_lines = chain_lines(&rig.wait_for_transcript(&c).await);
+    assert_eq!(c_lines[0]["uuid"], chain_lines(&a_path)[0]["uuid"]);
+    assert!(!c_lines
+        .iter()
+        .any(|line| line["message"]["content"][0]["text"] == "second prompt"));
+}
