@@ -109,6 +109,8 @@ mod tests {
             ),
             registry: freshell_terminal::TerminalRegistry::new(),
             ai_key: crate::ai_title::AiKeyCell::default(),
+            log_secrets: Default::default(),
+            naming_generation: None,
         };
         (router(state), store)
     }

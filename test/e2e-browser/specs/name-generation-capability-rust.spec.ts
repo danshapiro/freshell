@@ -119,6 +119,40 @@ async function saveKeyInSettings(page: Page, key: string): Promise<void> {
 }
 
 test.describe('AI naming pauses on refused credentials', () => {
+  test('a later fresh-agent message does not replace the first naming input while paused', async ({ browser }) => {
+    const proxy = await startFakeOneCliGeminiProxy(AI_NAME, FIRST_MESSAGE, { mode: 'access_restricted' })
+    const journey = await bootJourney('freshclaude', {
+      oneCliGeminiProxy: proxy,
+      env: { FRESHELL_NAMING_CAPABILITY_REPROBE_MS: '2000' },
+    })
+    try {
+      const { page, harness, context } = await connect(journey, browser)
+      let handle = await createNamedAgent(harness, 'freshclaude', { entry: 'ui', page, server: journey.server })
+      await sendFirstMessage(page, harness, handle, 'freshclaude', FIRST_MESSAGE)
+      handle = await refreshHandle(harness, handle, 'freshclaude')
+      const sessionId = await resolveSessionId(journey, handle)
+      const ref: SessionNameRef = { kind: 'session', provider: 'claude', sessionId }
+      await expect.poll(() => capabilityCodes(journey), { timeout: 30_000 }).toEqual(['access_restricted'])
+
+      const pane = page.locator(`[data-pane-id="${handle.paneId}"] [data-context="fresh-agent"], [data-pane-id="${handle.paneId}"][data-context="fresh-agent"]`).first()
+      await expect(pane.getByRole('button', { name: 'Send', exact: true })).toBeEnabled({ timeout: 15_000 })
+      await sendFirstMessage(page, harness, handle, 'freshclaude', 'continue')
+      await expect(pane.getByRole('button', { name: 'Send', exact: true })).toBeEnabled({ timeout: 15_000 })
+      const probesBeforeRecovery = proxy.requests.length
+      await expect.poll(() => proxy.requests.length, { timeout: 10_000 }).toBeGreaterThan(probesBeforeRecovery)
+      expect(proxy.requests.every((request) => request.promptContainsExpectedFirstMessage)).toBe(true)
+      expect(await readName(journey, ref)).toEqual({ name: FIRST_MESSAGE, source: 'first_message' })
+
+      proxy.mode = 'ok'
+      await expect.poll(() => readName(journey, ref), { timeout: 15_000 }).toEqual({ name: AI_NAME, source: 'freshell_ai' })
+      expect(proxy.requests.every((request) => request.promptContainsExpectedFirstMessage)).toBe(true)
+      await expect(page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`)).toContainText(AI_NAME)
+      await context.close()
+    } finally {
+      await journey.cleanup()
+    }
+  })
+
   test('pauses naming on access_restricted and recovers when access is granted', async ({ browser }) => {
     const proxy = await startFakeOneCliGeminiProxy(AI_NAME, FIRST_MESSAGE, { mode: 'access_restricted' })
     // No key: the server borrows the inherited OneCLI identity, which the
