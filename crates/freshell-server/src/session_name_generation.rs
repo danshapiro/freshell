@@ -44,7 +44,10 @@
 //! Jobs capture the target, series id and input fingerprint; before folding
 //! a completion the store compares the captured fingerprint against the
 //! persisted series (a re-armed series keeps its series id, so a late answer
-//! generated from older input must not be accepted). Only the committed
+//! generated from older input must not be accepted, though the start it was
+//! charged still settles — refunded, or counted toward exhaustion). A key
+//! change starts a new pause epoch, so a refusal of the old key that lands
+//! afterwards is refunded without pausing naming. Only the committed
 //! winner publishes; the structured start/retry/exhausted/stale/paused/
 //! accepted decisions log severity, operation, name reference, series,
 //! attempt and failure class — never prompts, credentials, or payloads.
@@ -60,7 +63,7 @@ use freshell_protocol::session_names::SessionNameRef;
 use crate::ai_title::{self, GeminiSessionNameAuth};
 use crate::gemini_failure::{GeminiFailure, GeminiFailureClass};
 use crate::session_name_capability::{
-    CapabilityLatch, LatchTransition, LatchWindows, NamingRoute, SessionNameTransport,
+    CapabilityLatch, LatchEpoch, LatchTransition, LatchWindows, NamingRoute, SessionNameTransport,
 };
 use crate::session_names::{SessionNames, MAX_GENERATION_STARTS};
 use crate::settings_store::SettingsStore;
@@ -366,12 +369,15 @@ impl SessionNameGenerator {
             GenerationOutcome::Empty
         } else {
             let custom_prompt = self.settings.get().await.ai.title_prompt;
+            // Read before the transport picks the key: a key saved while
+            // this request is in flight makes its outcome stale.
+            let began = self.latch.epoch();
             let call =
                 generate_session_name(self.transport.as_ref(), &excerpt, custom_prompt.as_deref());
             let result = tokio::time::timeout(GENERATION_REQUEST_TIMEOUT, call)
                 .await
                 .unwrap_or_else(|_| Err(GeminiFailure::request_timed_out()));
-            self.attempt_outcome(claim, result)
+            self.attempt_outcome(claim, began, result)
         };
         let refunded = matches!(
             outcome,
@@ -433,16 +439,20 @@ impl SessionNameGenerator {
 
     /// Map one finished request to the outcome the store folds, recording it
     /// on the naming pause and logging what a reader needs once: a pause
-    /// transition (WARN), a restore (INFO), or a consumed failure (WARN
-    /// with its status and provider code). Never a key, URL or prompt.
+    /// transition (WARN), a restore (INFO), an outcome the pause ignores
+    /// because the key changed after the request began (INFO), or a
+    /// consumed failure (WARN with its status and provider code). `began` is
+    /// the latch epoch read before the request was built. Never a key, URL
+    /// or prompt.
     fn attempt_outcome(
         &self,
         claim: &GenerationClaim,
+        began: LatchEpoch,
         result: Result<Option<String>, GeminiFailure>,
     ) -> GenerationOutcome {
         let failure = match result {
             Ok(answer) => {
-                self.log_latch_transition(&self.latch.record_reachable(), None);
+                self.log_latch_transition(&self.latch.record_reachable(began), None);
                 return match answer {
                     Some(title) => GenerationOutcome::Answer(title),
                     None => GenerationOutcome::Empty,
@@ -452,7 +462,7 @@ impl SessionNameGenerator {
         };
         let transition = self
             .latch
-            .record_failure(&failure, tokio::time::Instant::now());
+            .record_failure(&failure, tokio::time::Instant::now(), began);
         self.log_latch_transition(&transition, Some(&failure));
         let attempt_id = claim.attempt_id.clone();
         if failure.pauses_naming() {
@@ -464,7 +474,11 @@ impl SessionNameGenerator {
                 attempt = %claim.attempt_id,
                 code = %failure.code(),
                 status = failure.status,
-                class = "paused",
+                class = if transition == LatchTransition::Superseded {
+                    "superseded"
+                } else {
+                    "paused"
+                },
                 "session_names.generation_paused: {failure}; the attempt is refunded"
             );
             return if failure.class == GeminiFailureClass::Throttled {
@@ -491,6 +505,16 @@ impl SessionNameGenerator {
     fn log_latch_transition(&self, transition: &LatchTransition, failure: Option<&GeminiFailure>) {
         match transition {
             LatchTransition::Unchanged => {}
+            LatchTransition::Superseded => {
+                tracing::info!(
+                    target: "freshell_server::session_name_generation",
+                    op = "generation_capability",
+                    code = failure.map(GeminiFailure::code).as_deref(),
+                    status = failure.and_then(|failure| failure.status),
+                    route = self.auth.route().as_str(),
+                    "session_names.generation_outcome_superseded: this attempt began before the Gemini key changed, so its result does not pause or restore AI naming"
+                );
+            }
             LatchTransition::Paused { kind, code } => {
                 tracing::warn!(
                     target: "freshell_server::session_name_generation",

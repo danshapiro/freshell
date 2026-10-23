@@ -3501,9 +3501,20 @@ fn fold_generation_outcome_decision(
         return Ok(Decision::Read(read_update(document, &key)));
     }
     // The input-fingerprint guard: a re-armed series keeps its series id, so
-    // a late answer generated from older input must not be accepted.
+    // a late answer generated from older input must not be accepted — but
+    // the start it was charged still settles (name-reliability Task 6).
     if series.input_fingerprint.as_deref() != Some(input_fingerprint) {
-        return Ok(Decision::Read(read_update(document, &key)));
+        return Ok(
+            if session_name_generation_series::settle_superseded_start(
+                series,
+                &outcome,
+                meta.now_ms,
+            ) {
+                commit_decision(document, &key, false)
+            } else {
+                Decision::Read(read_update(document, &key))
+            },
+        );
     }
     // A protected winner (manual, migration-protected, accepted Freshell AI)
     // rejects late output — and stops the series for good.
