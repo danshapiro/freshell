@@ -22,6 +22,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { AppStore } from '@/store/store'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
+import { adoptAuthoritativeConversationNameRef } from '@/lib/terminal-naming-rebind'
 import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
@@ -2945,6 +2946,7 @@ export function FreshAgentView({
           resumeSessionId: message.sessionId,
           restoreError: undefined,
         }
+        adoptAuthoritativeConversationNameRef(nextContent, sessionRef, message.nameRef)
         const conversationSessionKey = freshAgentCheckpointConversationKeyForContent(nextContent)
         const checkpointOutcomes = conversationSessionKey
           ? current.checkpointOutcomes?.map((outcome) => (
