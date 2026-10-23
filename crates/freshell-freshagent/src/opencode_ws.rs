@@ -7233,6 +7233,23 @@ impl FreshOpencodeState {
         // claim and its own commit (under-ticket mode).
         handoff: Option<(&str, u64)>,
     ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
+        // A `freshopencode-*` placeholder is minted by Freshell for a pane
+        // that has not materialized yet. Opencode has never seen it, so no
+        // daemon can resume it: answer NotFound before ANY side effect — no
+        // coordinator claim, no lease, no daemon start. Pre-fix the claim
+        // below held the placeholder's key across the shared daemon's cold
+        // start (`get_session` starts the serve only to 404). After a server
+        // restart the reconnect attach did exactly that, and the pane's own
+        // first send inside that window had its materialize claim refused
+        // (SESSION_RESERVED), which lost the message.
+        if session_id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX) {
+            tracing::info!(target: "freshell_freshagent::opencode",
+                session_id = %session_id,
+                "freshagent.opencode.resume_placeholder_not_found: a placeholder id has no \
+                 durable session to resume; nothing is claimed or started"
+            );
+            return Err(ResumeOpencodeError::NotFound);
+        }
         // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
         // HOLLOW `Some` (a partially initialized client's hello) behaves like
         // `None` on every decision below: the park falls through to the
@@ -12888,6 +12905,159 @@ mod tests {
             resume_session_id: None,
             session_ref: None,
         }
+    }
+
+    /// A [`RealisticServeHttp`] whose `/global/health` probe parks until the
+    /// test opens `latch`: the shared daemon's COLD START held open (the serve
+    /// process spawned but not yet answering). Each probe reports its arrival.
+    struct ColdStartGatedHttp {
+        inner: RealisticServeHttp,
+        health_arrived: tokio::sync::mpsc::UnboundedSender<()>,
+        latch: Arc<tokio::sync::Semaphore>,
+    }
+    impl ServeHttp for ColdStartGatedHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            if req.url.contains("/global/health") {
+                let arrived = self.health_arrived.clone();
+                let latch = Arc::clone(&self.latch);
+                return Box::pin(async move {
+                    let _ = arrived.send(());
+                    let _open = latch.acquire().await.expect("the cold-start latch opens");
+                    Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                });
+            }
+            self.inner.request(req)
+        }
+    }
+
+    /// The zero-turn restart race behind the `[freshopencode] pending rename
+    /// survives a zero-turn restart` e2e flake. After a server restart the
+    /// client's reconnect attach names the pane's never-materialized
+    /// `freshopencode-*` placeholder, which the new process has never seen.
+    /// Freshell mints placeholders; opencode never knows them, so no daemon
+    /// can resume one. The attach nevertheless claimed the placeholder's
+    /// coordinator key and held that claim across the shared daemon's cold
+    /// start (`get_session` → `ensure_started`). The reconcile's re-create and
+    /// the user's first send landed inside that window: the send's
+    /// materialize claim on the same key was refused Blocked and answered
+    /// SESSION_RESERVED, the client's reservation re-drive re-sent the
+    /// attach (not the message), and the pane never materialized.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_untracked_placeholder_attach_never_holds_the_key_across_a_daemon_cold_start() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(256);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_ownership(Arc::clone(&registry));
+        let (health_tx, mut health_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let latch = Arc::new(tokio::sync::Semaphore::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(ColdStartGatedHttp {
+                inner: RealisticServeHttp::new(),
+                health_arrived: health_tx,
+                latch: Arc::clone(&latch),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        // NOT started: the daemon is cold, exactly as right after a restart.
+        fresh_agent
+            .set_manager_for_test(OpencodeServeManager::new(deps, ServeConfig::default()))
+            .await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let placeholder = "freshopencode-restart-race";
+
+        // The reconnect attach. Either it settles at once, or it parks in the
+        // daemon's cold start (the defect) — in which case the next steps
+        // run inside that window.
+        let st_attach = st.clone();
+        let mut attach =
+            tokio::spawn(async move { st_attach.handle_attach(attach_msg(placeholder)).await });
+        tokio::select! {
+            joined = &mut attach => joined.expect("the attach task joins"),
+            arrived = health_rx.recv() => {
+                arrived.expect("the attach parked in the daemon's cold start");
+            }
+        }
+
+        // The reconcile's re-create (same createRequestId) and the user's
+        // first send, while the daemon is still cold.
+        st.handle_create(create_msg("restart-race"), None).await;
+        let st_send = st.clone();
+        let send = tokio::spawn(async move {
+            st_send
+                .handle_send(send_msg(placeholder, "Materialize after the restart"))
+                .await
+        });
+        // Open the cold start only once the send has either given up or holds
+        // its own materialize claim on the placeholder.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let send_claims = matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Starting { ref operation_id, .. }
+                    if operation_id.starts_with("send-materialize-")
+            );
+            if send.is_finished() || send_claims {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the send neither finished nor claimed the placeholder"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        latch.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+        tokio::time::timeout(Duration::from_secs(15), send)
+            .await
+            .expect("the send settles once the daemon is up")
+            .expect("the send task joins");
+        if !attach.is_finished() {
+            tokio::time::timeout(Duration::from_secs(15), attach)
+                .await
+                .expect("the attach settles once the daemon is up")
+                .expect("the attach task joins");
+        }
+
+        let mut frames = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&raw).expect("JSON frame"));
+        }
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["sessionId"] == placeholder
+                && f["event"]["code"] == "SESSION_RESERVED"),
+            "the first send after the restart must not be refused SESSION_RESERVED: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["sessionId"] == placeholder
+                && f["event"]["code"] == "INVALID_SESSION_ID"),
+            "the untracked placeholder attach answers lost: {frames:?}"
+        );
+        let session = st
+            .sessions
+            .lock()
+            .await
+            .get(placeholder)
+            .cloned()
+            .expect("the re-created placeholder session is tracked");
+        assert_eq!(
+            session.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "the first send after the restart materializes the durable session"
+        );
     }
 
     /// Decision-table row: NOT tracked locally + serve genuinely has no record of the id
