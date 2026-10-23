@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { authorizeFreshAgentParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes, readProviderParitySource, type ProviderParitySource } from '../../helpers/provider-parity-broker.js'
-import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots } from '../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, supervisorRegistrySecretScan } from '../../helpers/provider-parity-environment.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
@@ -318,12 +318,7 @@ describe('hosted fresh-agent provider inputs', () => {
     const evidenceDir = process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR
     if (evidenceDir) {
       const sentinel = 'fixture-secret-byte'
-      // SQLite may delete its -wal or -journal file between the listing and
-      // the read (after a checkpoint, its bytes are in the main file). A file
-      // that vanishes restarts the whole scan, so every byte is still read.
-      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
-        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(let attempt=0;;attempt++){try{for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){if(fs.readFileSync(p+'/'+f).includes('${sentinel}'))process.exit(4)}break}catch(error){if(error.code!=='ENOENT'||attempt>=20)throw error}}`,
-      ])
+      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, supervisorRegistrySecretScan([sentinel]))
       for (const material of [
         JSON.stringify(rig.runtime.inspectContainer(view.containerId!)),
         rig.runtime.containerLogs(view.containerId!),
