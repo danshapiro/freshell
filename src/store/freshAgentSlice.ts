@@ -85,6 +85,19 @@ function writeSessionStatus(session: FreshAgentSessionState, status: FreshAgentS
   session.statusVersion = (session.statusVersion ?? 0) + 1
 }
 
+/** Statuses of a session that is ready and not in a turn. */
+const TURN_READY_STATUSES: ReadonlySet<FreshAgentSessionStatus> = new Set<FreshAgentSessionStatus>(['idle', 'connected'])
+
+/**
+ * Evidence that a turn is in flight (a stream opened, or a request is being
+ * retried): a ready session is running now. A just-created session is
+ * 'connected', not 'idle', until its first turn. Any other status is left
+ * alone, so a running session is not written again (transcript-live P3).
+ */
+function markTurnRunning(session: FreshAgentSessionState): void {
+  if (TURN_READY_STATUSES.has(session.status)) writeSessionStatus(session, 'running')
+}
+
 function ensureSession(
   state: FreshAgentState,
   locator: FreshAgentSessionPayload,
@@ -576,7 +589,7 @@ const freshAgentSlice = createSlice({
       const session = resolveOrEnsureSession(state, action.payload, 'running')
       if (!session) return
       if (!session.streamingActive) session.streamingActive = true
-      if (session.status === 'idle') writeSessionStatus(session, 'running')
+      markTurnRunning(session)
     },
     /**
      * The CLI is retrying an API request (live only, transcript-live F11):
@@ -587,8 +600,7 @@ const freshAgentSlice = createSlice({
      */
     turnRequestRetried(state, action: PayloadAction<SessionMutationPayload>) {
       const session = resolveOrEnsureSession(state, action.payload, 'running')
-      if (!session) return
-      if (session.status === 'idle') writeSessionStatus(session, 'running')
+      if (session) markTurnRunning(session)
     },
     clearPendingCreateFailureForSession() {},
     sessionExited(state, action: PayloadAction<SessionMutationPayload>) {

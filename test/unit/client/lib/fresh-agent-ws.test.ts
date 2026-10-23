@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
+import freshAgentReducer, { materializeSession, sessionCreated } from '@/store/freshAgentSlice'
 import freshAgentLiveReducer, { liveTailViewerAdded } from '@/store/freshAgentLiveSlice'
 import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
@@ -565,6 +565,14 @@ describe('fresh-agent-ws', () => {
 
       expect(store.getState().freshAgentLive.bySession).toEqual({})
       expect(store.getState().freshAgent.sessions[key]?.streamingActive ?? false).toBe(false)
+    })
+
+    it('marks a just-created session running when its first block opens', () => {
+      const store = createFreshAgentStore()
+      store.dispatch(sessionCreated({ requestId: 'req-d1', sessionId, sessionType: 'freshclaude', provider: 'claude' }))
+      expect(store.getState().freshAgent.sessions[key].status).toBe('connected')
+      handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+      expect(store.getState().freshAgent.sessions[key]).toMatchObject({ status: 'running', streamingActive: true })
     })
 
     it('marks the session streaming again when the next turn opens a block', () => {

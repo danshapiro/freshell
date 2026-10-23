@@ -8,6 +8,7 @@ import { setStatus } from '@/store/connectionSlice'
 import { useAppSelector } from '@/store/hooks'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { LANDING_RECHECK_MAX } from '@/components/fresh-agent/useTranscriptLandings'
+import { sessionCreated } from '@/store/freshAgentSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
 import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
@@ -556,7 +557,10 @@ describe('an API retry before anything streams (the session\'s first request)', 
     // answered, so no snapshot says the turn is running: the retry does.
     serve(() => claudeSnapshot([]))
     const store = createStore()
+    // A just-created session: ready ('connected'), no turn yet.
+    store.dispatch(sessionCreated({ requestId: 'req-live-tail', ...locator }))
     await mount(store)
+    expect(store.getState().freshAgent.sessions[KEY].status).toBe('connected')
     expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
 
     deliver(store, { type: 'freshAgent.retry', attempt: 1, maxRetries: 10, delayMs: 500, errorStatus: 529, error: 'overloaded' })
