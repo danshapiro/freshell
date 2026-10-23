@@ -72,6 +72,30 @@ describe('Claude message content', () => {
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } },
     ])
   })
+
+  it('accepts every image type Claude reads, sent as data (the server never names a kind) or by URL', () => {
+    for (const mediaType of ['image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+      expect(userMessageContent('x', [{ mediaType, data: 'YWJj' }])[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: mediaType, data: 'YWJj' } })
+    }
+    expect(userMessageContent('x', [{ kind: 'url', url: 'https://example.test/cat.png' }])[1])
+      .toEqual({ type: 'image', source: { type: 'url', url: 'https://example.test/cat.png' } })
+  })
+
+  // A bad image is refused before it reaches the CLI: the send is rejected
+  // with INVALID_IMAGE (the sidecar answers sdk.send.rejected and lives on).
+  it.each([
+    { what: 'a type Claude cannot read', image: { mediaType: 'image/svg+xml', data: 'YWJj' }, message: /image\/svg\+xml/ },
+    { what: 'something that is not an image', image: { mediaType: 'application/pdf', data: 'YWJj' }, message: /application\/pdf/ },
+    { what: 'no data', image: { mediaType: 'image/png', data: '' }, message: /cannot be read/ },
+    { what: 'data that is not base64', image: { mediaType: 'image/png', data: 'not base64!' }, message: /cannot be read/ },
+    { what: 'an unknown kind', image: { kind: 'file', path: '/tmp/cat.png' }, message: /cannot be read/ },
+    { what: 'a URL that is not web', image: { kind: 'url', url: 'file:///etc/passwd' }, message: /cannot be read/ },
+  ])('refuses $what as INVALID_IMAGE', ({ image, message }) => {
+    let refusal: { code?: string; message?: string } | undefined
+    try { userMessageContent('Describe it', [image]) } catch (error) { refusal = error as typeof refusal }
+    expect(refusal?.code).toBe('INVALID_IMAGE')
+    expect(refusal?.message).toMatch(message)
+  })
 })
 
 // The process-level cases run the real index.mjs over the CLI simulator

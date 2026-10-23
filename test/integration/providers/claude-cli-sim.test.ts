@@ -8,7 +8,7 @@
 // claude-cli-conformance.ts.
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -420,7 +420,7 @@ describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
     send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
     expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
     const sessionId = frames.find((f) => f.type === 'created').sessionId
-    send({ type: 'send', sessionId, text: 'hello' })
+    send({ type: 'send', sessionId, uuid: randomUUID(), text: 'hello' })
     expect(await until(() => frames.some((f) => f.type === 'sdk.turn.complete'))).toBe(true)
     expect(frames.find((f) => f.type === 'sdk.session.init')).toMatchObject({ sessionId, cliSessionId: expect.stringMatching(/^[0-9a-f-]{36}$/) })
     expect(frames.find((f) => f.type === 'sdk.result')).toMatchObject({ sessionId, result: 'success' })

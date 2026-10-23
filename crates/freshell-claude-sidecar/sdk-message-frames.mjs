@@ -29,18 +29,27 @@ export function isAbortedResult(result) {
 }
 
 /**
+ * The CLI's own error text for a result, one error per line, without its
+ * internal `[ede_diagnostic]` lines; undefined when none is left.
+ */
+export function resultErrors(result) {
+  const errors = Array.isArray(result.errors) ? result.errors : []
+  const messages = errors
+    .filter((message) => typeof message === 'string')
+    .map((message) => message.trim())
+    .filter((message) => message && !message.startsWith(DIAGNOSTIC_PREFIX))
+  return messages.length ? messages.join('\n') : undefined
+}
+
+/**
  * The text a failed turn shows the user, or undefined for a successful result.
  * The CLI's internal `[ede_diagnostic]` lines are never shown; when nothing
  * else is left, the text explains the result kind in plain words.
  */
 export function resultErrorText(result) {
   if (result.subtype === 'success') return undefined
-  const errors = Array.isArray(result.errors) ? result.errors : []
-  const messages = errors
-    .filter((message) => typeof message === 'string')
-    .map((message) => message.trim())
-    .filter((message) => message && !message.startsWith(DIAGNOSTIC_PREFIX))
-  if (messages.length) return messages.join('\n')
+  const errors = resultErrors(result)
+  if (errors) return errors
   if (isAbortedResult(result)) return ABORTED_COPY
   return SUBTYPE_COPY[result.subtype] ?? DEFAULT_COPY
 }
@@ -60,12 +69,23 @@ function resultUsage(usage) {
  * `sdk.error{turnFailure}` the client shows as its "Agent error" banner.
  * `userStopped` is the turn gate's verdict that this result is the user's own
  * Stop: that is not a failure, so it carries no error frame (G03).
+ *
+ * `sdk.result` carries the facts the server's verdict reads (design §5.3):
+ * `subtype` (also as the older `result`), `isError`, `terminalReason` and
+ * `numTurns` when the CLI reports them, and `errorText`, the CLI's own error
+ * text without diagnostics (resultErrors).
  */
 export function resultFrames(sessionId, result, { userStopped }) {
+  const errorText = resultErrors(result)
   const frames = [{
     type: 'sdk.result',
     sessionId,
     result: result.subtype,
+    subtype: result.subtype,
+    isError: typeof result.is_error === 'boolean' ? result.is_error : result.subtype !== 'success',
+    ...(typeof result.terminal_reason === 'string' ? { terminalReason: result.terminal_reason } : {}),
+    ...(Number.isInteger(result.num_turns) ? { numTurns: result.num_turns } : {}),
+    ...(errorText !== undefined ? { errorText } : {}),
     durationMs: result.duration_ms,
     costUsd: result.total_cost_usd,
     usage: resultUsage(result.usage),

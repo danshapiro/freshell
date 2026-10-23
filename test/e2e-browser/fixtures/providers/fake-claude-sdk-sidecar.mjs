@@ -171,10 +171,15 @@ function transcriptPath(cliSessionId, cwd) {
 // uuid + parentUuid backbone, chained per cliSessionId (the real CLI's shape).
 const lastUuidBySession = new Map()
 
-/** Append one transcript line in parse_transcript_turns' accepted shape. */
-function appendTranscript(cliSessionId, cwd, role, text, transcriptOverride) {
+/**
+ * Append one transcript line in parse_transcript_turns' accepted shape. A
+ * user line takes the send's own uuid when the server gave one: the real CLI
+ * writes the prompt under the uuid of its SDKUserMessage, which is the turn
+ * id the server announced as submittedTurnId.
+ */
+function appendTranscript(cliSessionId, cwd, role, text, transcriptOverride, lineUuid) {
   const parentUuid = lastUuidBySession.get(cliSessionId) ?? null
-  const uuid = randomUUID()
+  const uuid = typeof lineUuid === 'string' && lineUuid ? lineUuid : randomUUID()
   lastUuidBySession.set(cliSessionId, uuid)
   const line = {
     type: role,
@@ -498,7 +503,7 @@ async function handleInput(line) {
   } else if (msg.type === 'send') {
     activeSessionId = msg.sessionId ?? activeSessionId
     const st = sessions.get(msg.sessionId)
-    if (st) appendTranscript(st.cliSessionId, st.cwd, 'user', msg.text, st.transcriptOverride)
+    if (st) appendTranscript(st.cliSessionId, st.cwd, 'user', msg.text, st.transcriptOverride, msg.uuid)
     if (st) {
       // Unified attention bookkeeping (mirrors the real sidecar): the send is
       // ACCEPTED (pendingResults += 1) and a turn is open until its terminal

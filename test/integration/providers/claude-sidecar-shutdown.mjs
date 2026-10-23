@@ -132,7 +132,7 @@ try {
   if (created.type !== 'created') throw new Error('the sidecar refused the create')
 
   failureStage = 'mid-turn'
-  write({ type: 'send', sessionId: created.sessionId, text: 'hello' })
+  write({ type: 'send', sessionId: created.sessionId, uuid: randomUUID(), text: 'hello' })
   await withTimeout(streaming, 45_000, 'the provider to receive the turn')
   await waitFor(frame => frame.type === 'sdk.stream' && frame.event?.type === 'content_block_delta', 30_000, 'the streamed delta')
   cliPid = Number(execFileSync('pgrep', ['-P', String(sidecar.pid)]).toString().trim().split('\n')[0])

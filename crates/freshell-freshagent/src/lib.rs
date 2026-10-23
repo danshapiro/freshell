@@ -49,6 +49,7 @@ pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
 pub mod claude_spawn;
 pub(crate) mod claude_test_holds;
+pub(crate) mod claude_turns;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
 pub(crate) mod delegation;
@@ -82,7 +83,7 @@ pub mod terminal_tabs;
 #[cfg(test)]
 mod test_environment;
 
-pub use claude::{ClaudeCreateOutcome, FreshClaudeState};
+pub use claude::{ClaudeCreateOutcome, ClaudeSendOutcome, FreshClaudeState};
 // Kata 09v1 + SYNC-06 + G28: the claude_snapshot items visible outside this
 // crate — the ONE shared claude store-root rule (`claude_home_candidates`,
 // also read by freshell-ws's PTY truth probe), the three-state transcript

@@ -80,9 +80,13 @@ function transcriptPath(cliSessionId) {
 // Claude-code transcript line shape (what the Rust snapshot adapter parses).
 // `cwd` is load-bearing: the attach arm resumes with the transcript's ORIGINAL
 // cwd (ledger A15 -- real lines carry cwd on 100% of user/assistant lines).
-function appendTranscript(cliSessionId, role, text, cwd) {
+// A user line takes the send's own uuid when the server gave one, as the real
+// CLI writes the prompt under its SDKUserMessage's uuid (the server's
+// submittedTurnId).
+function appendTranscript(cliSessionId, role, text, cwd, uuid) {
   const line = {
     type: role,
+    ...(typeof uuid === 'string' && uuid ? { uuid } : {}),
     timestamp: new Date().toISOString(),
     cwd: cwd ?? process.cwd(),
     message: { role, content: [{ type: 'text', text }] },
@@ -143,7 +147,7 @@ rl.on('line', (line) => {
     const { cliSessionId, cwd, model, effort, permissionMode } = sessions.get(msg.sessionId) ?? { cliSessionId: CLI_SESSION_ID }
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'running' })
     if (INIT_AT_TURN) emitSessionInit(msg.sessionId, { cliSessionId, cwd, model })
-    appendTranscript(cliSessionId, 'user', msg.text, cwd)
+    appendTranscript(cliSessionId, 'user', msg.text, cwd, msg.uuid)
     const holdOnce = HOLD_ONCE_MARKER && !fs.existsSync(HOLD_ONCE_MARKER)
     if (holdOnce) {
       fs.mkdirSync(path.dirname(HOLD_ONCE_MARKER), { recursive: true })

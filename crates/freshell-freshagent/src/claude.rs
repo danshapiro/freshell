@@ -83,13 +83,15 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 pub(crate) const PROVIDER: &str = "claude";
 
 /// Build the sidecar-only correlation record for one checkpointed Claude
-/// send. The UUID is supplied on SDKUserMessage and later accepted only when
-/// the SDK replays the persisted user row carrying that same UUID.
+/// send. The send's UUID is supplied on SDKUserMessage and the attempt is
+/// later accepted only when the SDK replays the persisted user row carrying
+/// that same UUID.
 fn checkpoint_attempt_for_send(msg: &FreshAgentSend) -> Option<Value> {
     let intent = msg.checkpoint_intent.as_ref()?;
     let request_id = msg.request_id.as_deref().filter(|id| !id.is_empty())?;
+    // The attempt binds under the send's own uuid (the send line's `uuid`, C16),
+    // which is also the turn id the send is accepted with.
     Some(json!({
-        "uuid": uuid::Uuid::new_v4().to_string(),
         "logicalAttemptId": intent.logical_attempt_id,
         "requestId": request_id,
     }))
@@ -4192,8 +4194,16 @@ impl FreshClaudeState {
     /// input stream, then broadcast `freshAgent.send.accepted`. The stdout consumer surfaces
     /// the unified attention edge (sidecar `sdk.turn.complete` — minted for EVERY result
     /// subtype except a user-interrupted turn's own → `freshAgent.turn.complete`).
-    /// Claude's send returns void, so NO `submittedTurnId` and NO materialization.
-    pub async fn handle_send(&self, msg: FreshAgentSend) {
+    ///
+    /// C16: the send carries a uuid minted here. The sidecar puts it on the SDK user
+    /// message, so the CLI writes the user line with it: it is the `submittedTurnId` of
+    /// `freshAgent.send.accepted` and the `turnId` the snapshot shows for the message
+    /// (a send absorbed into a running tool call has no user line of its own, T10).
+    /// The answer is also returned ([`ClaudeSendOutcome`], design §9.3 I2): `Accepted`
+    /// once the sidecar has the send, `Refused` with the request error's code otherwise.
+    /// A send the sidecar refuses later (a bad image) is taken back by the stdout
+    /// consumer ([`Self::take_back_rejected_send`]).
+    pub async fn handle_send(&self, msg: FreshAgentSend) -> ClaudeSendOutcome {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
@@ -4205,10 +4215,7 @@ impl FreshClaudeState {
         let send_fence =
             match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
                 Ok(fence) => fence,
-                Err(err) => {
-                    self.send_error(&request_id, err.code(), err.message());
-                    return;
-                }
+                Err(err) => return self.refuse_send(&request_id, err.code(), err.message()),
             };
 
         // Task 10b: a durable claude UUID resolves through `cli_index` to the live
@@ -4219,8 +4226,7 @@ impl FreshClaudeState {
         let Some((map_key, turn_lock, in_turn, turn_tracker, durable_before_wait)) =
             self.turn_locked_handles(&session_id).await
         else {
-            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
-            return;
+            return self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
         };
         // r2 serialization discipline: hold the session turn lock across the
         // busy-set AND the sidecar write — the check-then-set window vs
@@ -4242,8 +4248,7 @@ impl FreshClaudeState {
             )
             .await
         else {
-            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
-            return;
+            return self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
         };
         // Arm the coordinator guard only after the send has waited behind any
         // earlier turn. A lifecycle transition during that wait advances the
@@ -4276,8 +4281,7 @@ impl FreshClaudeState {
                         session_id = %session_id, owner_key = %owner_key,
                         request_id = ?request_id,
                         "fresh_agent_send_refused: ownership guard refused");
-                        self.send_error(&request_id, "SESSION_RESERVED", &message);
-                        return;
+                        return self.refuse_send(&request_id, "SESSION_RESERVED", &message);
                     }
                 }
             } else {
@@ -4325,8 +4329,7 @@ impl FreshClaudeState {
                 .configure_for_send(&map_key, settings, session_type)
                 .await
             {
-                self.send_error(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
-                return;
+                return self.refuse_send(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
             }
             let settings_after = {
                 let guard = self.sessions.lock().await;
@@ -4368,8 +4371,11 @@ impl FreshClaudeState {
                 }),
                 None => {
                     drop(guard);
-                    self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
-                    return;
+                    return self.refuse_send_to_missing_session(
+                        &request_id,
+                        &session_id,
+                        msg.session_type,
+                    );
                 }
             }
         };
@@ -4398,20 +4404,32 @@ impl FreshClaudeState {
         // compact, so a send acceptance proves nothing about queue drainage
         // (the disarm set lives in the in-stream edge fold: observed-compacting
         // terminal edge, the drop peel, sdk.error/EOF).
+        let submitted_turn_id = crate::claude_turns::mint_send_uuid();
         let send_was_busy = arm_turn_op(&in_turn, &turn_tracker, TrackedOp::Turn);
+        remember_send(
+            &turn_tracker,
+            crate::claude_turns::SentCommand {
+                uuid: submitted_turn_id.clone(),
+                request_id: request_id.clone(),
+                kind: crate::claude_turns::SendKind::Turn,
+            },
+        );
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
             undo_turn_op_arm(&in_turn, &turn_tracker, send_was_busy);
-            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
-            return;
+            forget_send(&turn_tracker, &submitted_turn_id);
+            return self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
         };
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
-        let checkpoint_attempt = checkpoint_attempt_for_send(&msg);
-        let mut send_req =
-            json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
-        if let Some(attempt) = checkpoint_attempt {
+        let mut send_req = json!({
+            "type": "send",
+            "sessionId": session.sidecar_session_id,
+            "uuid": submitted_turn_id,
+            "text": msg.text,
+        });
+        if let Some(attempt) = checkpoint_attempt_for_send(&msg) {
             send_req["checkpointAttempt"] = attempt;
         }
         if let Some(images) = msg.images {
@@ -4424,8 +4442,8 @@ impl FreshClaudeState {
             // op keeps the busy truth instead of a blanket clear wedging or
             // falsely freeing the gate).
             undo_turn_op_arm(&in_turn, &turn_tracker, send_was_busy);
-            self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
-            return;
+            forget_send(&turn_tracker, &submitted_turn_id);
+            return self.refuse_send(&request_id, "CLAUDE_SEND_FAILED", &err);
         }
         drop(guard);
         drop(ownership_guard);
@@ -4508,9 +4526,13 @@ impl FreshClaudeState {
                 session_id,
                 session_type: session_type.to_string(),
                 cwd: msg.cwd,
-                submitted_turn_id: None,
+                submitted_turn_id: Some(submitted_turn_id.clone()),
             },
         ));
+        ClaudeSendOutcome::Accepted {
+            session_key: map_key,
+            submitted_turn_id,
+        }
     }
 
     /// The caller owns the session turn lock. Apply changed settings before any
@@ -4940,7 +4962,16 @@ impl FreshClaudeState {
         // distinct FIFO entry — N queued compacts are N entries retiring at their
         // own observed terminal edges (ep1-r5 F1), and a compact queued BEHIND a
         // garlanded send survives that send's drop peel (ep2-r2 F1).
+        let uuid = crate::claude_turns::mint_send_uuid();
         let was_busy = arm_turn_op(&in_turn, &turn_tracker, TrackedOp::Compact);
+        remember_send(
+            &turn_tracker,
+            crate::claude_turns::SentCommand {
+                uuid: uuid.clone(),
+                request_id: None,
+                kind: crate::claude_turns::SendKind::Compact,
+            },
+        );
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
@@ -4948,6 +4979,7 @@ impl FreshClaudeState {
             // truth must never wedge; a prior turn's truth is not ours to
             // clear).
             undo_turn_op_arm(&in_turn, &turn_tracker, was_busy);
+            forget_send(&turn_tracker, &uuid);
             self.broadcast(&lost_session_frame(&session_id, msg.session_type));
             return;
         };
@@ -4958,9 +4990,14 @@ impl FreshClaudeState {
             _ => "/compact".to_string(),
         };
         // Address the sidecar by ITS id for this session (== the map key for created
-        // sessions; differs for resumed-on-attach sessions, Task 6).
-        let send_req =
-            json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": text });
+        // sessions; differs for resumed-on-attach sessions, Task 6). A compact is a
+        // command like any send: it carries its own uuid (C16).
+        let send_req = json!({
+            "type": "send",
+            "sessionId": session.sidecar_session_id,
+            "uuid": uuid,
+            "text": text,
+        });
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
             // The write never went out — no turn was submitted: SYNCHRONOUSLY
@@ -4968,6 +5005,7 @@ impl FreshClaudeState {
             // to the tracker; the failure path never holds the blocked
             // sidecar's pane busy over a compact it never received).
             undo_turn_op_arm(&in_turn, &turn_tracker, was_busy);
+            forget_send(&turn_tracker, &uuid);
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
         }
         // The compact write was ACCEPTED; its tracker entry (armed pre-write
@@ -5125,10 +5163,9 @@ impl FreshClaudeState {
         request_id: &Option<String>,
         session_id: &str,
         session_type: SessionType,
-    ) {
+    ) -> ClaudeSendOutcome {
         let Some(dead) = self.dead_sessions.find(session_id) else {
-            self.send_error(request_id, "SESSION_NOT_FOUND", "claude session not found");
-            return;
+            return self.refuse_send(request_id, "SESSION_NOT_FOUND", "claude session not found");
         };
         tracing::warn!(target: "freshell_freshagent::claude",
             provider = PROVIDER, session_id = %session_id,
@@ -5141,6 +5178,10 @@ impl FreshClaudeState {
             ErrorCode::InvalidSessionId,
             crate::claude_dead_sessions::SEND_TO_DEAD_SESSION_MESSAGE,
         );
+        ClaudeSendOutcome::Refused {
+            code: "INVALID_SESSION_ID".to_string(),
+            message: crate::claude_dead_sessions::SEND_TO_DEAD_SESSION_MESSAGE.to_string(),
+        }
     }
 
     pub(crate) async fn local_snapshot_owner(
@@ -6688,6 +6729,26 @@ impl FreshClaudeState {
                     stream_ended = Some(ended);
                     continue;
                 }
+                // C16: the lifecycle facts the sidecar forwards for turn
+                // accounting (a command's lifecycle, the session state, a status
+                // end or a model request, heartbeats) are never client content:
+                // logged, never broadcast, never folded into the tracked status.
+                // A send the sidecar refused is taken back.
+                if let Some(fact) = crate::claude_turns::SidecarFact::from_line(&value) {
+                    let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                    match fact {
+                        crate::claude_turns::SidecarFact::SendRejected(rejection) => state
+                            .take_back_rejected_send(
+                                &in_turn,
+                                &turn_tracker,
+                                &stamp,
+                                &session_type,
+                                &rejection,
+                            ),
+                        fact => fact.log(&stamp, &session_type),
+                    }
+                    continue;
+                }
                 // kata 1wxv Task 4 busy-truth clear edges — IN-STREAM arms (a) and
                 // (b): `sdk.result` with ANY subtype ends the turn (r2: the earlier
                 // success-only wording is void), and `sdk.status:idle`. NO other
@@ -7276,11 +7337,16 @@ enum TrackedOp {
 /// std Mutex with no awaits inside any critical section; every
 /// mutation recomputes the derived `in_turn` busy cache (`busy()`) in the same
 /// critical section, so the rollback gate never reads a torn pair.
+///
+/// `sends` (C16) remembers each send's uuid with the op it armed, so a send
+/// the sidecar refuses before the CLI sees it (`sdk.send.rejected`) retires
+/// its op ([`retire_rejected_send`]) instead of holding the gate forever.
 #[derive(Default)]
 struct TurnTracker {
     running: Option<TrackedOp>,
     queued: std::collections::VecDeque<TrackedOp>,
     compact_candidate: bool,
+    sends: crate::claude_turns::RecentSends,
 }
 
 impl TurnTracker {
@@ -7334,6 +7400,61 @@ fn undo_turn_op_arm(
         tracker.running = None;
     }
     in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// C16: remember the send a handler is about to write, with the op it armed,
+/// BEFORE the write (the sidecar answers a send it refuses at once, and the
+/// stdout consumer may read that answer before the handler runs again).
+fn remember_send(
+    turn_tracker: &std::sync::Mutex<TurnTracker>,
+    send: crate::claude_turns::SentCommand,
+) {
+    turn_tracker
+        .lock()
+        .expect("turn tracker lock")
+        .sends
+        .record(send);
+}
+
+/// C16: forget a send whose write never happened (its arm is undone by
+/// [`undo_turn_op_arm`]).
+fn forget_send(turn_tracker: &std::sync::Mutex<TurnTracker>, uuid: &str) {
+    turn_tracker
+        .lock()
+        .expect("turn tracker lock")
+        .sends
+        .forget(uuid);
+}
+
+/// C16: the sidecar refused the send `uuid` before the CLI saw it
+/// (`sdk.send.rejected`: a bad image), so no terminal edge will ever retire the
+/// op it armed. Retire one op of its kind and recompute the busy truth; the
+/// send is returned so the caller can answer its request. An unknown uuid
+/// changes nothing.
+///
+/// The tracker's ops carry no ids, so the op retired is the NEWEST of the
+/// send's kind (the queue's back, else `running`): the refusal comes back as
+/// soon as the sidecar reads the send, so the refused send is almost always
+/// the last op armed, and ops of one kind are interchangeable for the count
+/// the gate reads. C17's per-command ledger removes the command by its uuid.
+fn retire_rejected_send(
+    in_turn: &std::sync::atomic::AtomicBool,
+    turn_tracker: &std::sync::Mutex<TurnTracker>,
+    uuid: &str,
+) -> Option<crate::claude_turns::SentCommand> {
+    let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    let send = tracker.sends.take(uuid)?;
+    let op = match send.kind {
+        crate::claude_turns::SendKind::Turn => TrackedOp::Turn,
+        crate::claude_turns::SendKind::Compact => TrackedOp::Compact,
+    };
+    if let Some(at) = tracker.queued.iter().rposition(|queued| *queued == op) {
+        tracker.queued.remove(at);
+    } else if tracker.running == Some(op) {
+        tracker.running = None;
+    }
+    in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
+    Some(send)
 }
 
 /// One OBSERVED `sdk.status:compacting`: a compaction is running NOW — the
@@ -8571,6 +8692,9 @@ fn log_claude_teardown(
 
 mod create_outcome;
 pub use create_outcome::ClaudeCreateOutcome;
+
+mod send_outcome;
+pub use send_outcome::ClaudeSendOutcome;
 
 mod establish;
 mod fork;
@@ -10347,7 +10471,7 @@ rl.on('line', (line) => {
     }
 
     #[test]
-    fn checkpoint_turn_identity_claude_send_carries_valid_uuid_and_attempt_correlation() {
+    fn checkpoint_turn_identity_claude_send_carries_the_attempt_correlation() {
         let mut msg = send_msg("claude-placeholder", "same prompt");
         msg.request_id = Some("request-7".to_string());
         msg.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
@@ -10355,16 +10479,13 @@ rl.on('line', (line) => {
             workspace: None,
         });
 
-        let attempt = checkpoint_attempt_for_send(&msg).expect("checkpoint attempt");
-        let uuid = uuid::Uuid::parse_str(attempt["uuid"].as_str().expect("UUID string"))
-            .expect("valid UUID");
+        // C16: the attempt binds under the send's own uuid (the send line's
+        // `uuid`, `a_send_line_carries_its_uuid_and_the_acceptance_names_it`),
+        // so the correlation record carries no uuid of its own.
         assert_eq!(
-            uuid.get_version_num(),
-            4,
-            "the SDK input uses a fresh v4 UUID"
+            checkpoint_attempt_for_send(&msg).expect("checkpoint attempt"),
+            json!({ "requestId": "request-7", "logicalAttemptId": "attempt-7" })
         );
-        assert_eq!(attempt["requestId"], "request-7");
-        assert_eq!(attempt["logicalAttemptId"], "attempt-7");
         assert!(checkpoint_attempt_for_send(&send_msg("legacy", "prompt")).is_none());
     }
 
@@ -17958,6 +18079,88 @@ rl.on('line', (line) => {
         drop(env);
     }
 
+    /// C16: every send line carries a uuid minted for it: v4, different per send,
+    /// with a checkpointed send's attempt correlation beside it (the attempt
+    /// binds under that uuid). `freshAgent.send.accepted.submittedTurnId` is that
+    /// uuid, and so is the turn id the caller gets back.
+    #[tokio::test]
+    async fn a_send_line_carries_its_uuid_and_the_acceptance_names_it() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-uuid"), None).await;
+        let created = await_claude_created(&mut rx, "req-uuid").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let mut checkpointed = send_msg(&session_id, "first");
+        checkpointed.request_id = Some("send-1".to_string());
+        checkpointed.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "attempt-1".to_string(),
+            workspace: None,
+        });
+        let first = st.handle_send(checkpointed).await;
+        let mut plain = send_msg(&session_id, "second");
+        plain.request_id = Some("send-2".to_string());
+        let second = st.handle_send(plain).await;
+
+        let sends: Vec<Value> = env
+            .respond_log_frames(2)
+            .await
+            .into_iter()
+            .filter(|frame| frame["type"] == "send")
+            .collect();
+        assert_eq!(sends.len(), 2, "{sends:?}");
+        let uuids: Vec<String> = sends
+            .iter()
+            .map(|send| {
+                send["uuid"]
+                    .as_str()
+                    .expect("the send carries a uuid")
+                    .to_string()
+            })
+            .collect();
+        for uuid in &uuids {
+            let parsed = uuid::Uuid::parse_str(uuid).expect("a uuid");
+            assert_eq!(parsed.get_version_num(), 4);
+        }
+        assert_ne!(uuids[0], uuids[1], "each send has its own uuid");
+        assert_eq!(
+            sends[0]["checkpointAttempt"],
+            json!({ "requestId": "send-1", "logicalAttemptId": "attempt-1" })
+        );
+        assert!(sends[1].get("checkpointAttempt").is_none());
+
+        for (outcome, uuid) in [(first, &uuids[0]), (second, &uuids[1])] {
+            assert_eq!(
+                outcome,
+                ClaudeSendOutcome::Accepted {
+                    session_key: session_id.clone(),
+                    submitted_turn_id: uuid.clone(),
+                }
+            );
+        }
+        let mut accepted = Vec::new();
+        while accepted.len() < 2 {
+            let frame: Value = serde_json::from_str(
+                &tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                    .await
+                    .expect("send.accepted in time")
+                    .expect("bus open"),
+            )
+            .unwrap();
+            if frame["type"] == "freshAgent.send.accepted" {
+                accepted.push(
+                    frame["submittedTurnId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(accepted, uuids);
+        drop(env);
+    }
+
     /// Task 2 (d): compact forwards to the sidecar as a plain `send` of `/compact`
     /// (empty/absent instructions) or `/compact <instructions trimmed>` — the legacy
     /// adapter's shape (`adapter.ts:168-174`) — with NO send.accepted ack frame.
@@ -22233,8 +22436,17 @@ rl.on('line', (line) => {
                 .success()
         );
         let received = std::fs::read_to_string(stdin_log).unwrap();
+        let mut request = serde_json::from_str::<Value>(received.trim_start_matches('x')).unwrap();
+        let uuid = request
+            .as_object_mut()
+            .and_then(|request| request.remove("uuid"))
+            .expect("a compact is a command with its own uuid (C16)");
+        assert!(
+            uuid::Uuid::parse_str(uuid.as_str().unwrap_or_default()).is_ok(),
+            "{uuid}"
+        );
         assert_eq!(
-            serde_json::from_str::<Value>(received.trim_start_matches('x')).unwrap(),
+            request,
             json!({ "type": "send", "sessionId": "rb-small-pipe", "text": "/compact" }),
             "the reader receives exactly one complete compact request after the fill bytes"
         );

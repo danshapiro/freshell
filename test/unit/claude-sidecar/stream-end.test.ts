@@ -18,6 +18,21 @@ import { startRealSidecar, type RealSidecar, type SidecarFrame } from './harness
 
 const ALERT_FRAMES = new Set(['sdk.stream.ended', 'sdk.turn.complete', 'sdk.error', 'sdk.status'])
 
+/**
+ * A frame that reports an end or a status the client shows. A model request
+ * (`sdk.status requesting`) and the end of a status (`null`) are lifecycle
+ * facts for the server's turn accounting (lifecycle-frames.mjs), not alerts.
+ */
+function isAlertFrame(frame: SidecarFrame): boolean {
+  if (frame.type === 'sdk.status' && (frame.status === 'requesting' || frame.status === null)) return false
+  return ALERT_FRAMES.has(frame.type)
+}
+
+/** The statuses the client is shown, in order. */
+function shownStatuses(sidecar: RealSidecar): unknown[] {
+  return framesOf(sidecar, 'sdk.status').filter(isAlertFrame).map((frame) => frame.status)
+}
+
 /** A session whose simulated CLI has booted, with nothing in flight. */
 async function bootedSession(sidecar: RealSidecar) {
   const sessionId = await sidecar.create()
@@ -86,14 +101,15 @@ describe('the sidecar exits when its SDK stream ends', () => {
     sidecar.send({ type: 'send', sessionId, text: 'something to compact' })
     await sidecar.waitFor('sdk.turn.complete')
     sidecar.send({ type: 'send', sessionId, text: '/compact HANG' })
-    await sidecar.waitFor('sdk.status')
-    expect(framesOf(sidecar, 'sdk.status').at(-1)).toMatchObject({ status: 'compacting' })
+    await sidecar.waitFor((frame) => frame.type === 'sdk.status' && frame.status === 'compacting', 'compacting')
     // Kill the (stand-in) CLI, not the sidecar.
     process.kill((await sidecar.waitForBoot()).cliPid, 'SIGKILL')
 
     expect(await sidecar.waitExit()).toEqual({ code: STREAM_ENDED_EXIT_CODE, signal: null })
     expect(sidecar.frames.at(-1)).toMatchObject({ type: 'sdk.stream.ended', sessionId, reason: 'cli_exited' })
-    expect(framesOf(sidecar, 'sdk.status').map((frame) => frame.status)).toEqual(['compacting'])
+    expect(shownStatuses(sidecar)).toEqual(['compacting'])
+    // Nothing reports a status after compacting: no idle, and no end of the compaction.
+    expect(framesOf(sidecar, 'sdk.status').at(-1)).toMatchObject({ status: 'compacting' })
   })
 
   it('a natural end of stream mid-turn (the CLI exits 0): sdk.stream.ended (stream_eof) and exit code 3', async () => {
@@ -143,7 +159,7 @@ describe('the sidecar exits when its SDK stream ends', () => {
     sidecar.send({ type: 'shutdown' })
 
     expect(await sidecar.waitExit()).toEqual({ code: 0, signal: null })
-    expect(sidecar.frames.filter((frame) => ALERT_FRAMES.has(frame.type))).toEqual([])
+    expect(sidecar.frames.filter(isAlertFrame)).toEqual([])
   })
 
   it('stdin closing (the server let go of the sidecar) exits 0 and reports nothing alert-related', async () => {
@@ -154,6 +170,6 @@ describe('the sidecar exits when its SDK stream ends', () => {
     sidecar.child.stdin!.end()
 
     expect(await sidecar.waitExit()).toEqual({ code: 0, signal: null })
-    expect(sidecar.frames.filter((frame) => ALERT_FRAMES.has(frame.type))).toEqual([])
+    expect(sidecar.frames.filter(isAlertFrame)).toEqual([])
   })
 })

@@ -19,7 +19,11 @@
 //                                    a fresh or forked boot, when it minted one. One sidecar hosts
 //                                    one session: a second create is refused.
 //     { type:'configure',          sessionId, requestId, settings }
-//     { type:'send',               sessionId, text, images? }
+//     { type:'send',               sessionId, uuid, text, images?, checkpointAttempt?:{logicalAttemptId, requestId} }
+//                                  — `uuid` is the id the server minted for this send (required): the
+//                                    SDKUserMessage carries it, so the CLI reports the command's lifecycle
+//                                    under it and writes the user line with it; a checkpoint attempt binds
+//                                    under the same uuid (checkpoint-identity.mjs)
 //     { type:'interrupt',          sessionId }
 //     { type:'permission.respond', sessionId, requestId, decision }   // decision forwarded VERBATIM
 //     { type:'question.respond',   sessionId, requestId, answers }
@@ -63,6 +67,23 @@
 //     { type:'sdk.question.request',    sessionId, requestId, questions }
 //     { type:'sdk.permission.cancelled', sessionId, requestId }
 //     { type:'sdk.question.cancelled',  sessionId, requestId }
+//     { type:'sdk.interrupt_settled',   sessionId, ok, stillQueued?, message? }
+//                                  — the interrupt() receipt: `stillQueued` lists the sent commands the CLI
+//                                    says will still run (T12, T13; absent when the CLI sends no receipt)
+//     { type:'sdk.send.rejected',       sessionId, uuid, code:'INVALID_IMAGE'|'INVALID_SEND', message }
+//                                  — the send never reached the CLI (a bad image, no valid uuid); the
+//                                    session lives on
+//   Lifecycle facts for the server's turn accounting (lifecycle-frames.mjs, never client content):
+//     { type:'sdk.command',             sessionId, uuid, state }          // a sent command's lifecycle (T8):
+//                                  queued | started | completed | cancelled | discarded, or replayed (its first replay)
+//     { type:'sdk.session.state',       sessionId, state }                // running | idle | requires_action (T9;
+//                                  the sidecar sets CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1 for the CLI)
+//     { type:'sdk.status',              sessionId, status:null, compactResult?, compactError?, permissionMode? }
+//                                  — a status ended (T15); { status:'requesting' } is a model request
+//     { type:'sdk.heartbeat',           sessionId, kind:'tool'|'task'|'retry', toolUseId?, elapsedMs? }
+//                                  — liveness only (T17), at most one per kind every 5 s
+//   `sdk.result` also carries subtype, isError, terminalReason?, numTurns? and errorText? (the CLI's own
+//   error text without diagnostics), the facts the server's result verdict reads.
 //
 //   sidecar → Rust (stderr): log records only, one JSON object per line
 //     ({ severity, component, event, ...ids }, log.mjs). Rust re-emits each
@@ -105,7 +126,7 @@ import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent } from './session-settings.mjs'
 import { resultFrames } from './sdk-message-frames.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
-import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
+import { checkpointAttemptOf, isUuid, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
@@ -114,6 +135,7 @@ import { isHostedSidecar } from './hosted.mjs'
 import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
 import { BOOT_FAILED_EXIT_CODE, bootOptions, classifyBootError, SIDECAR_PROTOCOL } from './boot.mjs'
 import { usableCommands } from './terminal-commands.mjs'
+import { createLifecycleState, lifecycleFrames, rememberSend, stillQueuedOf } from './lifecycle-frames.mjs'
 import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 import {
   canUseTool as routeCanUseTool,
@@ -272,6 +294,10 @@ function handleSdkMessage(sessionId, msg) {
     if (msg.type === 'result' && Array.isArray(msg.errors)) st.bootEvidence.resultErrors.push(...msg.errors)
     return
   }
+  // The lifecycle facts this message carries, for the server's turn
+  // accounting (lifecycle-frames.mjs): command lifecycles, session state,
+  // status ends, heartbeats.
+  for (const frame of lifecycleFrames(sessionId, msg, st.lifecycle)) emit(frame)
 
   // ep4-r6 quiesce bookkeeping (fail-closed approximations; the discharge rule
   // is tight per ep4-r5 F1):
@@ -498,6 +524,8 @@ function handleCreate(req) {
     // bootEvidence collects what a refusal is named from (boot.mjs).
     booted: false,
     bootEvidence: { resultErrors: [], stderr: '', streamEnded: undefined },
+    // The commands this session sent and its heartbeat allowance (lifecycle-frames.mjs).
+    lifecycle: createLifecycleState(),
     turnOpen: false,
     handedCompactLikely: false,
     // Unified attention bookkeeping: the gate suppresses exactly the
@@ -551,7 +579,9 @@ function handleCreate(req) {
         // sidecar, so checkpoint identity must remain unbound.
         extraArgs: { 'replay-user-messages': null },
         abortController: abort,
-        env: createClaudeSdkCleanEnv(process.env),
+        // The CLI reports when the session starts and stops working (T9):
+        // the server's turn accounting reads it (sdk.session.state).
+        env: { ...createClaudeSdkCleanEnv(process.env), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' },
         settingSources: ['user', 'project', 'local'],
         spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
         stderr: sdkStderr,
@@ -627,25 +657,53 @@ async function bootSession({ req, sessionId, state, sdkQuery, streamDone }) {
   }
 }
 
+/** Why a malformed send is refused (the server mints a uuid for every send, and sends text). */
+const SEND_WITHOUT_UUID = 'This message has no valid message id, so it was not given to Claude.'
+const SEND_WITHOUT_TEXT = 'This message has no text, so it was not given to Claude.'
+
+/**
+ * Refuse a send before it reaches the CLI. Nothing was queued, so the session
+ * goes on as it was; the server takes the send back (sdk.send.rejected).
+ */
+function rejectSend(req, code, message) {
+  const uuid = req.uuid ?? null
+  log('warn', 'send.rejected', { sessionId: req.sessionId, uuid, code, error: message })
+  emit({ type: 'sdk.send.rejected', sessionId: req.sessionId, uuid, code, message })
+}
+
 function handleSend(req) {
   const st = sessions.get(req.sessionId)
   // ep3-r2 F2: the signed frame — when the JS session is gone but stdout stays
   // open (consumeStream deleted it), NO terminal edge or EOF follows; the Rust
   // busy tracker must fold this specific failure as provider-session death.
   if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
+  // Every send carries the uuid the server minted for it. The SDKUserMessage
+  // carries it, so the CLI reports the command's lifecycle under it (T8) and
+  // writes the user line with it: it is the turn id the server announced.
+  if (!isUuid(req.uuid)) { rejectSend(req, 'INVALID_SEND', SEND_WITHOUT_UUID); return }
+  if (typeof req.text !== 'string') { rejectSend(req, 'INVALID_SEND', SEND_WITHOUT_TEXT); return }
+  let content
+  try {
+    content = userMessageContent(req.text, req.images)
+  } catch (error) {
+    rejectSend(req, error?.code ?? 'INVALID_SEND', errorText(error))
+    return
+  }
   // ep4-r3: /compact is the only dispatch rollback ever absorbs; mark it so
   // the quiesce handler can drain never-handed compacts from the input queue
   // and so a same-tick handoff arms the BUSY-forcing handed flag.
-  const isCompact = /^\s*\/compact(\s|$)/.test(String(req.text ?? ''))
-  const checkpointAttempt = checkpointAttemptOf(req.checkpointAttempt)
+  const isCompact = /^\s*\/compact(\s|$)/.test(req.text)
+  // A checkpoint attempt binds under the send's own uuid.
+  const checkpointAttempt = checkpointAttemptOf(req.checkpointAttempt && { ...req.checkpointAttempt, uuid: req.uuid })
   const userMessage = {
-      type: 'user',
-      message: { role: 'user', content: userMessageContent(req.text, req.images) },
-      parent_tool_use_id: null,
-      session_id: st.cliSessionId || 'default',
-      ...(checkpointAttempt ? { uuid: checkpointAttempt.uuid } : {}),
-    }
+    type: 'user',
+    message: { role: 'user', content },
+    parent_tool_use_id: null,
+    session_id: st.cliSessionId || 'default',
+    uuid: req.uuid,
+  }
   if (checkpointAttempt) rememberCheckpointAttempt(st.pendingCheckpointAttempts, checkpointAttempt)
+  rememberSend(st.lifecycle, req.uuid)
   st.inputStream.push(userMessage, isCompact)
   // Unified attention bookkeeping: this send is now ACCEPTED (the input-stream
   // push succeeded) and awaits exactly one terminal frame — a COUNTER, not a
@@ -736,9 +794,12 @@ function handleInterrupt(req) {
   // mark is a no-op.
   if (st.pendingResults > 0) st.turnCompleteGate.noteInterruptRequest()
   st.query.interrupt()
-    .then(() => {
+    .then((receipt) => {
       st.turnCompleteGate.noteInterruptSettled(true)
-      emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: true })
+      // The receipt names the sent commands that survive the Stop and will
+      // still run (T12; a cold Stop may list the command it missed, T13).
+      const stillQueued = stillQueuedOf(receipt, st.lifecycle)
+      emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: true, ...(stillQueued ? { stillQueued } : {}) })
     })
     .catch((err) => {
       st.turnCompleteGate.noteInterruptSettled(false)

@@ -2000,7 +2000,10 @@ async fn handle_client_text(
                         }
                         freshell_protocol::AgentProvider::Claude => {
                             let fresh_claude = state.fresh_claude.clone();
-                            Box::pin(async move { fresh_claude.handle_send(send).await })
+                            // The WS lane answers on the bus; the outcome is for in-process callers.
+                            Box::pin(async move {
+                                fresh_claude.handle_send(send).await;
+                            })
                         }
                         freshell_protocol::AgentProvider::Opencode => {
                             let fresh_opencode = state.fresh_opencode.clone();
