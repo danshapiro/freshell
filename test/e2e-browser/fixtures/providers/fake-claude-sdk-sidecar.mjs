@@ -8,18 +8,19 @@
 //
 // Wire protocol (mirrors crates/freshell-claude-sidecar/index.mjs and the
 // realism notes in fixtures/fake-claude-sidecar.mjs):
-//   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId,
-//         resumeSessionAt,forkSession,resumeDropsTurn}
-//        (kata 1wxv fork-at-point: forkSession:true + resumeSessionId + resumeSessionAt
+//   in : {"type":"create",protocol:2,requestId,cwd,model,permissionMode,effort,
+//         boot:{kind:'fresh'}|{kind:'resume',resume}|{kind:'fork',resume,resumeSessionAt?,dropsTurn?}}
+//        (protocol v2, crates/freshell-claude-sidecar/boot.mjs; kata 1wxv fork-at-point:
+//        a fork boot of `resume` at resumeSessionAt
 //        mints a NEW durable cliSessionId and writes the parent's transcript PREFIX
-//        through the addressed uuid verbatim; a resumeDropsTurn guard that is NOT the
+//        through the addressed uuid verbatim; a dropsTurn guard that is NOT the
 //        raw-chain successor of the resume point refuses with the SDK-documented
 //        "Resume rejected by --resume-drops-turn:" prefix — NO init, NO durable session;
 //        plain resume keeps the same-id behavior)
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
 //        {"type":"permission.respond",sessionId,requestId,decision}
 //        {"type":"question.respond",sessionId,requestId,answers}
-//        out: {"type":"created",requestId,sessionId} FIRST (claude.rs read_created
+//        out: {"type":"created",requestId,sessionId,protocol:2} FIRST (claude_handshake.rs
 //        discards any earlier line), then sdk.* frames:
 //        sdk.session.init {cliSessionId: CANONICAL UUID}, sdk.status,
 //        sdk.assistant (content MUST be an ARRAY), sdk.result {result} on EVERY
@@ -36,8 +37,10 @@
 // Turn semantics: `send` ALWAYS opens with sdk.status running (bookkeeping the
 // real bridge performs unconditionally); a matching program rule then owns
 // the turn; when no rule emitted completion/crash — AND no approval/question
-// parked the turn — the canned assistant+turn.complete+idle success turn
-// closes it. A turn that raised an approval/question PARKS: it stays open
+// parked the turn — the canned assistant+result+turn.complete success turn
+// closes it. Like the real sidecar, a turn ends with its result alone: there
+// is no per-turn idle (the real sidecar sends no idle at all).
+// A turn that raised an approval/question PARKS: it stays open
 // until a matching permission.respond/question.respond (or interrupt) arrives,
 // exactly like the real sidecar's parked canUseTool promise.
 //
@@ -62,9 +65,8 @@
 // (sdk.d.ts:2384-2394; the real sidecar's ok:false 'no in-flight SDK query'
 // shape fires only when the SDK surface lacks the interrupt method entirely)
 // — and NOTHING arms, so no stray mark survives to eat the NEXT unrelated
-// turn's ring. Either way the turn ends with sdk.status idle — NEVER an
-// sdk.exit (the real sidecar keeps the session alive across interrupt;
-// AGENT-03's interrupt/kill separation).
+// turn's ring. Either way it is NEVER an sdk.exit (the real sidecar keeps the
+// session alive across interrupt; AGENT-03's interrupt/kill separation).
 //
 // Raw-stdin audit (AGENT-05/06 e2e): when FRESHELL_FAKE_STDIN=<path> is set,
 // EVERY raw stdin line is appended there as a JSONL row {t, pid, line} —
@@ -78,10 +80,14 @@
 // subtype — success, error, max-turns, denied — EXCEPT the stopped turn's own
 // aborted result under a pending accepted user-interrupt mark (the user's own
 // interrupt never rings).
-// The `stream-error` lane models the real consumeStream catch+finally for a
-// mid-turn stream exception: sdk.error + the finally-minted edge + session
-// teardown WITHOUT exiting the process; the `crash` lane stays as-is (a real
-// crash screams no protocol frame and exits — the Rust unrequested-death
+// The `stream-error` lane models the real sidecar's end of stream (its
+// consumeStream finally): cancel the parked cards, the finally-minted edge for
+// a turn that ends with no result, then
+// `sdk.stream.ended {reason, message}` as the LAST line and exit code 3 (each
+// sidecar hosts one session, so its stream's end is the sidecar's end). The
+// Rust server reports the exit (SIDECAR_EXITED) and, because the end was
+// reported, does not ring again. The `crash` lane stays as-is (a real Node
+// death screams no protocol frame and exits — the Rust unrequested-death
 // synthesis rings for it, and an edge from the crash lane would double-ring).
 //
 // Wire audit (D1-F2): every OUTBOUND frame is ALSO recorded into the
@@ -107,7 +113,7 @@
 // Rust server uses; the sidecar inherits the harness's isolated HOME.
 //
 // The process stays alive until `shutdown` (exit 0), a scripted `crash`
-// (exit code), or kill — an early exit would stop the server-side consumer.
+// (exit code), a `stream-error` (exit 3), or kill.
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -118,6 +124,10 @@ import { createTurnCompleteGate } from '../../../../crates/freshell-claude-sidec
 import { nextMonotonic } from '../../../../crates/freshell-claude-sidecar/monotonic-clock.mjs'
 
 const provider = process.env.FRESHELL_FAKE_PROVIDER ?? 'kilroy'
+/** The real sidecar's exit code after its SDK stream ends (stream-end.mjs). */
+const STREAM_ENDED_EXIT_CODE = 3
+/** Set by the stream-error lane: the fake is exiting and reads no more requests. */
+let exiting = false
 /** The SDK result the pinned CLI reports for a turn a Stop landed on (T11). */
 const STOPPED_RESULT = Object.freeze({ type: 'result', subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
 const env = process.env
@@ -298,19 +308,16 @@ async function render(event) {
         emit({ type: 'sdk.turn.complete', sessionId, at })
       }
       st.turnOpen = false
-      emit({ type: 'sdk.status', sessionId, status: 'idle' })
       break
     }
     case 'stream-error': {
-      // The real consumeStream catch+finally for a mid-turn stream exception:
-      // the catch arm's sdk.error, then the finally's teardown — cancel every
-      // parked entry, mint the unified attention edge (a turn ended with NO
-      // result frame: pendingResults > 0, not aborted; a pending Stop mark
-      // never silences a result-less end), idle
-      // status — and the session is deleted WITHOUT exiting the process (a
-      // later create on the same live process works). The separate `crash`
-      // lane deliberately stays different: no protocol frame + process exit.
-      emit({ type: 'sdk.error', sessionId, message: data.message ?? 'SDK error: fixture stream error' })
+      // The real sidecar's end of stream (index.mjs consumeStream finally):
+      // cancel every parked entry, mint the unified attention edge (a turn
+      // ended with NO result frame: pendingResults > 0; a pending Stop mark
+      // never silences a result-less end), then sdk.stream.ended as the LAST
+      // line and exit code 3 (no stream-end status: the server reports the
+      // ended session as exited). The separate
+      // `crash` lane deliberately stays different: no protocol frame + exit.
       const st = sessions.get(sessionId)
       if (st) {
         for (const entry of st.pendingEntries.splice(0)) {
@@ -327,8 +334,15 @@ async function render(event) {
           emit({ type: 'sdk.turn.complete', sessionId, at })
         }
       }
-      emit({ type: 'sdk.status', sessionId, status: 'idle' })
       if (st) sessions.delete(sessionId)
+      emit({
+        type: 'sdk.stream.ended',
+        sessionId,
+        reason: data.reason ?? 'stream_error',
+        message: data.message ?? 'Fixture stream error',
+      })
+      exiting = true
+      process.stdout.write('', () => process.exit(STREAM_ENDED_EXIT_CODE))
       break
     }
     case 'marker':
@@ -355,6 +369,8 @@ const engine = new FixtureEngine({
 const rl = readline.createInterface({ input: process.stdin })
 rl.on('line', (line) => {
   appendJsonl(STDIN_LOG, { t: Date.now(), pid: process.pid, line })
+  // Like the real sidecar: once its stream ended, sdk.stream.ended stays the last line.
+  if (exiting) return
   void handleInput(line).catch((err) => {
     emit({ type: 'sdk.error', sessionId: activeSessionId, message: String(err?.message ?? err) })
   })
@@ -379,8 +395,12 @@ async function handleInput(line) {
     // the transcript file to CONTINUE — the session's durable id stays the
     // file's stem, and every record lands in THAT file (never a
     // path-flattened `<...>.jsonl.jsonl` phantom).
-    const forking = msg.forkSession === true
-    const resumeRaw = typeof msg.resumeSessionId === 'string' ? msg.resumeSessionId : null
+    // Protocol v2 (crates/freshell-claude-sidecar/boot.mjs): the boot names
+    // the conversation to start.
+    const boot = msg.boot ?? {}
+    const resumeSessionId = typeof boot.resume === 'string' ? boot.resume : undefined
+    const forking = boot.kind === 'fork'
+    const resumeRaw = resumeSessionId ?? null
     const resumeIsPath = resumeRaw !== null
       && (resumeRaw.includes('/') || resumeRaw.endsWith('.jsonl'))
     const resumePath = !forking && resumeIsPath ? resumeRaw : null
@@ -405,28 +425,28 @@ async function handleInput(line) {
     // A path-resumed session's transcript IS the named file.
     const transcript = resumePath ?? transcriptPath(cliSessionId, cwd)
     fs.mkdirSync(path.dirname(transcript), { recursive: true })
-    if (forking && msg.resumeSessionId) {
+    if (forking && resumeSessionId) {
       // created FIRST — a real consumer discards anything earlier. The
       // resumeDropsTurn refusal watch runs BEFORE any durable state moves:
       // the guard must name the RAW-chain successor of the resume point (the
       // SDK-armed discard guard); anything else refuses with the SDK's
       // documented prefix and NO sdk.session.init / durable session is ever
       // minted (freshell retries ONCE with the guard omitted).
-      emit({ type: 'created', requestId: msg.requestId, sessionId })
-      const parentPath = transcriptPath(msg.resumeSessionId, cwd)
+      emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
+      const parentPath = transcriptPath(resumeSessionId, cwd)
       const parentLines = fs.existsSync(parentPath)
         ? fs.readFileSync(parentPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
         : []
-      const cut = typeof msg.resumeSessionAt === 'string'
-        ? parentLines.findIndex((l) => l.uuid === msg.resumeSessionAt)
+      const cut = typeof boot.resumeSessionAt === 'string'
+        ? parentLines.findIndex((l) => l.uuid === boot.resumeSessionAt)
         : parentLines.length - 1
-      if (typeof msg.resumeDropsTurn === 'string') {
+      if (typeof boot.dropsTurn === 'string') {
         const successor = cut >= 0 ? (parentLines[cut + 1]?.uuid ?? null) : null
-        if (msg.resumeDropsTurn !== successor) {
+        if (boot.dropsTurn !== successor) {
           emit({
             type: 'sdk.error',
             sessionId,
-            message: `Resume rejected by --resume-drops-turn: ${msg.resumeDropsTurn} is not the raw-chain successor of the resume point (drop-guard mismatch)`,
+            message: `Resume rejected by --resume-drops-turn: ${boot.dropsTurn} is not the raw-chain successor of the resume point (drop-guard mismatch)`,
           })
           return
         }
@@ -442,10 +462,10 @@ async function handleInput(line) {
     } else {
       fs.closeSync(fs.openSync(transcript, 'a'))
       // created FIRST — a real consumer discards anything earlier.
-      emit({ type: 'created', requestId: msg.requestId, sessionId })
+      emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
       // A plain resume CONTINUES the parent's chain: seed the uuid cursor from
       // the transcript tail so the next appended line's parentUuid is right.
-      if (typeof msg.resumeSessionId === 'string' && fs.existsSync(transcript)) {
+      if (typeof resumeSessionId === 'string' && fs.existsSync(transcript)) {
         const lines = fs.readFileSync(transcript, 'utf8').split('\n').filter(Boolean)
         const last = lines.length > 0 ? JSON.parse(lines[lines.length - 1]) : null
         if (typeof last?.uuid === 'string') lastUuidBySession.set(cliSessionId, last.uuid)
@@ -460,7 +480,7 @@ async function handleInput(line) {
         'msg:create:default',
       )
     }
-    if (msg.resumeSessionId) {
+    if (resumeSessionId) {
       await engine.emitResume(cliSessionId)
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })
@@ -562,7 +582,7 @@ async function handleInput(line) {
       if (st.sendInFlight) return
       // Parked/plain in-flight turn: nothing else will end it, so synthesize
       // the interrupted turn's own non-success terminal result — the armed
-      // gate consumes its ring — then idle. Still NEVER an sdk.exit. The
+      // gate consumes its ring. Still NEVER an sdk.exit. The
       // counter goes to ZERO, not minus one: the fake models ONE in-flight
       // turn, so the interrupt ends everything pending — a stale-positive
       // counter here would let a later stream-error lane mint a phantom ring
@@ -572,7 +592,6 @@ async function handleInput(line) {
       st.turnCompleteGate.resultEmitsAttention(STOPPED_RESULT)
       st.turnOpen = false
       st.interrupted = false
-      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
       return
     }
     // No turn awaits a terminal frame — real-sidecar parity: the SDK RESOLVES

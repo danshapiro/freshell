@@ -301,7 +301,6 @@ test.describe('harness-06 misc fixtures smoke', () => {
       expect(assistant.content[0].text).toContain('kilroy smoke turn')
       await rt.nextEvent('sdk.result', (e) => (e as { result?: string }).result === 'success')
       await rt.nextEvent('sdk.turn.complete')
-      await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
 
       // "Records Kilroy invocations": the JSONL ledger carries both requests.
       const ledger = await readKilroyLedger(logPath)

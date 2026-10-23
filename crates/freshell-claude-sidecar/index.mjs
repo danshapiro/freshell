@@ -6,16 +6,18 @@
 // harness (crates/freshell-freshagent, claude WS slice) speaks newline-delimited
 // JSON to this process:
 //
-//   Rust → sidecar (stdin, one JSON per line):
-//     { type:'create',             requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId?,
-//                                    resumeSessionAt?, forkSession?, resumeDropsTurn? }
-//                                  — kata 1wxv Task 4 fork-at-point keys ride the SDK query() options
-//                                    verbatim (resumeSessionAt keeps through-AND-including the named
-//                                    uuid over the raw parentUuid chain; forkSession mints a NEW
-//                                    durable session id and never rewrites the original's JSONL;
-//                                    resumeDropsTurn arms the fork-time discard-guard). Covered by
-//                                    crates/freshell-ws/tests/freshagent_claude_rollback.rs + the
-//                                    rust-chromium e2e rollback spec.
+//   Rust → sidecar (stdin, one JSON per line), protocol v2 (boot.mjs):
+//     { type:'create',             protocol:2, requestId, sessionType?, sessionId?,
+//                                    boot:{kind:'fresh'} | {kind:'resume', resume}
+//                                         | {kind:'fork', resume, resumeSessionAt?, dropsTurn?},
+//                                    cwd?, model?, permissionMode?, effort?, plugins?, hostedMcp? }
+//                                  — `boot` picks the conversation the CLI boots (bootOptions): a
+//                                    fork keeps the parent through-AND-including resumeSessionAt
+//                                    over the raw parentUuid chain, writes a NEW conversation and
+//                                    never rewrites the parent's JSONL; dropsTurn arms the SDK's
+//                                    fork-time discard guard. `sessionId` is the id Rust minted for
+//                                    a fresh or forked boot, when it minted one. One sidecar hosts
+//                                    one session: a second create is refused.
 //     { type:'configure',          sessionId, requestId, settings }
 //     { type:'send',               sessionId, text, images? }
 //     { type:'interrupt',          sessionId }
@@ -24,8 +26,15 @@
 //     { type:'shutdown' }
 //
 //   sidecar → Rust (stdout, one JSON per line):
-//     { type:'created',                 requestId, sessionId }            // the SDK bridge's BARE nanoid placeholder
-//     { type:'create.failed',           requestId, message }
+//     { type:'created',                 requestId, sessionId, protocol:2, cliPid }
+//                                  — sent only once the CLI booted (initializationResult() resolved,
+//                                    T2); sessionId is the SDK bridge's BARE nanoid placeholder and
+//                                    cliPid the CLI's pid. The command catalog follows it.
+//     { type:'create.failed',           requestId, code, message }
+//                                  — the CLI refused the boot (boot.mjs names the codes) or the
+//                                    request is not protocol v2. Nothing from the refused boot is
+//                                    forwarded (its error result is the refusal's evidence, not a
+//                                    turn), and the sidecar then exits with code 2.
 //     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
 //     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
 //     { type:'sdk.assistant',           sessionId, content, model }
@@ -34,14 +43,22 @@
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
 //                                  the stopped turn's own aborted result (an accepted user interrupt's mark
 //                                  silences only that — turn-complete-gate.mjs); also minted from consumeStream's finally
-//                                  when a turn ends with NO result frame (stream exception or natural EOF
+//                                  when a turn ends with NO result frame (the CLI died or the stream ended
 //                                  with a send still pending) — the abort/sdk.exit requested-teardown path
 //                                  stays silent
 //     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
-//     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
+//     { type:'sdk.session.changed',     sessionId, reason:'session-commands', commands }
+//                                  — the command catalog without the terminal-only commands (the pinned
+//                                    CLI's until a turn's init names its own): from the boot, then
+//                                    whenever a turn's init or commands_changed changes it
+//     { type:'sdk.status',              sessionId, status }               // compacting (an ended stream sends
+//                                  no status: the server reports the session as exited)
 //     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
 //                                  (sanitized text, no [ede_diagnostic] lines); never for the user's own Stop
-//     { type:'sdk.exit',                sessionId }
+//     { type:'sdk.stream.ended',        sessionId, reason, message }      // the session's SDK stream ended
+//                                  unrequested (reason cli_exited | stream_error | stream_eof, stream-end.mjs):
+//                                  always the LAST line; the sidecar then exits with code 3 (G02)
+//     { type:'sdk.exit',                sessionId }                       // a requested teardown (abort)
 //     { type:'sdk.permission.request',  sessionId, requestId, subtype:'can_use_tool', tool:{name,input}, toolUseID, suggestions, blockedPath, decisionReason }
 //     { type:'sdk.question.request',    sessionId, requestId, questions }
 //     { type:'sdk.permission.cancelled', sessionId, requestId }
@@ -60,11 +77,16 @@
 // from this process's own stdout: `sdk.turn.complete` rides every SDK
 // `result` (the unified needs-attention edge — only the stopped turn's own
 // aborted result is silenced, by the accepted-interrupt mark) plus the
-// consumeStream finally mint for a result-less turn end (stream exception or
-// natural EOF with a send pending; never the aborted/sdk.exit teardown). If
-// the PROCESS dies mid-turn, stdout simply ends and no completion is ever
-// written — that unrequested death is what the Rust-side death synthesis
-// (ADR Decision 2.1) rings for.
+// consumeStream finally mint for a result-less turn end (the CLI died or the
+// stream ended with a send pending; never the aborted/sdk.exit teardown).
+//
+// Process lifetime: one sidecar hosts one session. A boot the CLI refused ends
+// the sidecar with `create.failed` and exit code 2. When the session's SDK
+// stream ends without a request, the sidecar writes `sdk.stream.ended` last
+// and exits with code 3, so the Rust end-of-output path ends the session. A
+// requested teardown (shutdown, SIGTERM, stdin closing) exits 0 and reports
+// nothing. If the PROCESS itself dies mid-turn, stdout simply ends with no
+// `sdk.stream.ended` — the one end the Rust side rings for itself.
 //
 // Scope discipline (ADR "keep it minimal — only what the claude T2 invariant set
 // needs"): the freshell MCP-server injection (createClaudeSdkMcpServers) is
@@ -89,6 +111,9 @@ import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
 import { cliStderrLogger, errorText, log } from './log.mjs'
 import { isHostedSidecar } from './hosted.mjs'
+import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
+import { BOOT_FAILED_EXIT_CODE, bootOptions, classifyBootError, SIDECAR_PROTOCOL } from './boot.mjs'
+import { usableCommands } from './terminal-commands.mjs'
 import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 import {
   canUseTool as routeCanUseTool,
@@ -107,6 +132,20 @@ const { query } = sdkModule
 function emit(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`)
 }
+
+/** Set once the sidecar is exiting on its own (a refused boot, or an unrequested stream end). */
+let exiting = false
+/** How long an exiting sidecar waits for stdout and stderr to flush. */
+const EXIT_FLUSH_BUDGET_MS = 2000
+/** Set by the first `create`: one sidecar hosts one session. */
+let createReceived = false
+/** The most CLI stderr kept while the CLI boots (a refusal may be named there, T4). */
+const BOOT_STDERR_MAX_CHARS = 8192
+/**
+ * After initializationResult() rejected: how long the refusal waits for the
+ * SDK stream to end, so the CLI's last stderr line is part of its evidence.
+ */
+const BOOT_FAILURE_SETTLE_MS = 2000
 
 // ── nanoid()-compatible bare id: 21 url-safe chars ([A-Za-z0-9_-]) ───────────
 // Faithful shape of server/sdk-bridge.ts's `const sessionId = nanoid()` (the
@@ -206,10 +245,20 @@ function normalizeCommands(rows, strict = false) {
   return result
 }
 
-function publishCommands(sessionId, state) {
-  if (!state.commandsInitSeen || state.commandCatalog === undefined) return
-  const terminal = new Set(state.terminalCommandNames ?? [])
-  const commands = state.commandCatalog.filter((row) => !terminal.has(row.name))
+/**
+ * Publish the session's command catalog when it differs from the last one
+ * published. The catalog comes from the boot (initializationResult().commands)
+ * and from commands_changed, and leaves out the CLI's terminal-only commands:
+ * the ones each turn's init names, or the pinned CLI's before the first init
+ * (terminal-commands.mjs). Every init repeats the same lists, so an unchanged
+ * catalog is never sent again.
+ */
+function publishCommandsIfChanged(sessionId, state) {
+  if (!state.booted || state.commandCatalog === undefined) return
+  const commands = usableCommands(state.commandCatalog, state.terminalCommandNames)
+  const published = JSON.stringify(commands)
+  if (published === state.publishedCommands) return
+  state.publishedCommands = published
   emit({ type: 'sdk.session.changed', sessionId, reason: 'session-commands', commands })
 }
 
@@ -217,6 +266,12 @@ function publishCommands(sessionId, state) {
 function handleSdkMessage(sessionId, msg) {
   const st = sessions.get(sessionId)
   if (!st) return
+  // Until `created` is sent nothing reaches Rust: a refused boot's
+  // error_during_execution result (T5) is the refusal's evidence, not a turn.
+  if (!st.booted) {
+    if (msg.type === 'result' && Array.isArray(msg.errors)) st.bootEvidence.resultErrors.push(...msg.errors)
+    return
+  }
 
   // ep4-r6 quiesce bookkeeping (fail-closed approximations; the discharge rule
   // is tight per ep4-r5 F1):
@@ -252,7 +307,6 @@ function handleSdkMessage(sessionId, msg) {
       if (msg.subtype === 'init') {
         st.cliSessionId = msg.session_id
         st.settings.cwd ??= msg.cwd
-        st.commandsInitSeen = true
         st.terminalCommandNames = Array.isArray(msg.terminal_slash_commands) ? msg.terminal_slash_commands : []
         emit({
           type: 'sdk.session.init',
@@ -262,13 +316,12 @@ function handleSdkMessage(sessionId, msg) {
           cwd: msg.cwd,
           tools: Array.isArray(msg.tools) ? msg.tools.map((t) => ({ name: t })) : undefined,
         })
-        publishCommands(sessionId, st)
+        publishCommandsIfChanged(sessionId, st)
       } else if (msg.subtype === 'commands_changed') {
         const commands = normalizeCommands(msg.commands, true)
         if (commands !== undefined) {
           st.commandCatalog = commands
-          st.commandsChangedSeen = true
-          publishCommands(sessionId, st)
+          publishCommandsIfChanged(sessionId, st)
         }
       } else if (msg.subtype === 'status' && msg.status === 'compacting') {
         emit({ type: 'sdk.status', sessionId, status: 'compacting' })
@@ -331,93 +384,156 @@ async function consumeStream(sessionId, sdkQuery) {
   let failure
   try {
     for await (const msg of sdkQuery) handleSdkMessage(sessionId, msg)
-  } catch (err) {
-    failure = err
-    emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
+  } catch (error) {
+    failure = { error }
   } finally {
-    // A requested teardown (abort) is routine; any other error end is the CLI
-    // dying or failing under the session.
-    if (st?.abort.signal.aborted) log('info', 'stream.ended', { sessionId, reason: 'aborted' })
-    else if (failure) log('warn', 'stream.ended', { sessionId, reason: 'stream_error', error: errorText(failure) })
-    else log('info', 'stream.ended', { sessionId, reason: 'stream_eof' })
-    // Stream ended (natural end, error, or abort). The transport is closing:
-    // clear any parked cards WITHOUT resolving their promises (LB-04: a late
-    // resolve lands inside the SDK's floating promise chain → unhandled
-    // rejection → crash under Node 22 throw-mode).
-    if (st) {
-      cancelPending(st, emit, sessionId, { resolveDeny: false })
+    // A stream that ends before the CLI booted is a refused boot: bootSession
+    // reports it (create.failed) with this end as part of its evidence.
+    if (st && !st.booted) {
+      st.bootEvidence.streamEnded = failure ?? {}
+      return
     }
-    // A turn that ends with NO result frame — stream exception OR natural
-    // EOF with a result still pending — IS a turn end the user didn't
-    // witness: ring the unified edge (the abort/sdk.exit path is a
-    // REQUESTED teardown and deliberately stays silent). pendingResults
-    // covers the accept→first-message window turnOpen cannot see, and
-    // counts queued sends a boolean would lose. A pending Stop mark does not
-    // silence it: only an aborted result is the stopped turn's own
-    // (turn-complete-gate.mjs), and this end has no result.
-    if (st && st.pendingResults > 0 && !st.abort.signal.aborted) {
-      const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
-      st.lastTurnCompleteAt = at
-      emit({ type: 'sdk.turn.complete', sessionId, at })
-    }
-    // Mirror SdkBridge: an aborted session surfaces sdk.exit; a natural end
-    // surfaces an idle status. NEITHER is a completion chime, so a mid-turn
-    // death cannot fake a turn.complete.
-    if (st?.abort.signal.aborted) emit({ type: 'sdk.exit', sessionId })
-    else emit({ type: 'sdk.status', sessionId, status: 'idle' })
+    // An abort is a requested teardown (shutdown); any other end is the CLI
+    // dying under the session or ending it.
+    const requested = st?.abort.signal.aborted === true
+    const ended = requested ? undefined : streamEnd(failure)
+    if (requested) log('info', 'stream.ended', { sessionId, reason: 'aborted' })
+    else log(failure ? 'warn' : 'info', 'stream.ended', { sessionId, reason: ended.reason, ...(failure ? { error: ended.message } : {}) })
+    // The transport is closing: clear any parked cards WITHOUT resolving their
+    // promises (LB-04: a late resolve lands inside the SDK's floating promise
+    // chain → unhandled rejection → crash under Node 22 throw-mode).
+    if (st) cancelPending(st, emit, sessionId, { resolveDeny: false })
     sessions.delete(sessionId)
+    if (requested) {
+      emit({ type: 'sdk.exit', sessionId })
+    } else {
+      // Interim, until Rust mints every edge (C18): a turn that ends with NO
+      // result frame — the CLI died, or the stream ended, with a result still
+      // pending — is a turn end the user didn't witness, so it rings here.
+      // pendingResults covers the accept→first-message window and counts
+      // queued sends. A pending Stop mark does not silence it: only an aborted
+      // result is the stopped turn's own (turn-complete-gate.mjs). Rust rings
+      // only for a death that reports no stream end, so this edge is the one.
+      if (st && st.pendingResults > 0) {
+        const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+        st.lastTurnCompleteAt = at
+        emit({ type: 'sdk.turn.complete', sessionId, at })
+      }
+      // The end of the stream is the end of this sidecar (G02): report how
+      // the stream ended, last, and exit, so the server's end-of-output path
+      // ends the session instead of keeping a sidecar with no session.
+      emit({ type: 'sdk.stream.ended', sessionId, ...ended })
+      exitWithoutSession(st?.query, STREAM_ENDED_EXIT_CODE)
+    }
   }
 }
 
+/**
+ * The sidecar has no session left (a refused boot, or an unrequested stream
+ * end): read no more requests (the frame just written stays the last line),
+ * make sure the CLI is gone, and exit with `code` once stdout and stderr have
+ * flushed.
+ */
+function exitWithoutSession(sdkQuery, code) {
+  if (exiting) return
+  exiting = true
+  try { sdkQuery?.close?.() } catch (error) { log('warn', 'stream.close_failed', { error: errorText(error) }) }
+  let unflushed = 2
+  const flushed = () => { if (--unflushed === 0) process.exit(code) }
+  process.stdout.write('', flushed)
+  process.stderr.write('', flushed)
+  // A pipe that never drains must not keep a sidecar with no session alive.
+  setTimeout(() => process.exit(code), EXIT_FLUSH_BUDGET_MS)
+}
+
 // ── request handlers ─────────────────────────────────────────────────────────
+
+/**
+ * A boot that did not happen: answer `create.failed` (the last line this
+ * sidecar writes) and exit with BOOT_FAILED_EXIT_CODE.
+ */
+function failBoot(requestId, { code, message }, fields = {}, sdkQuery = undefined) {
+  log('warn', 'boot.failed', { requestId, code, error: message, ...fields })
+  emit({ type: 'create.failed', requestId, code, message })
+  exitWithoutSession(sdkQuery, BOOT_FAILED_EXIT_CODE)
+}
+
 function handleCreate(req) {
   const requestId = req.requestId
-  let sessionId
-  try {
-    sessionId = nanoid()
-    const abort = new AbortController()
-    // ep4-r3/ep4-r4 quiesce state (declared first so the stream can arm it):
-    // turnOpen — an SDK turn is mid-flight (cleared at its result);
-    // handedCompactLikely — a compact crossed the un-cancellable SDK handoff
-    // (same-tick push OR queued pull — either path); cleared at the next
-    // result or observed status frame (its evidence has by then reached Rust).
-    const state = {
-      abort,
-      permissionMode: req.permissionMode,
-      settings: { model: req.model, effort: req.effort, permissionMode: req.permissionMode, cwd: req.cwd },
-      turnOpen: false,
-      handedCompactLikely: false,
-      // Unified attention bookkeeping: the gate suppresses exactly the
-      // interrupted turn's own result (ordering-scoped, NO reset-at-send —
-      // see turn-complete-gate.mjs); pendingResults counts ACCEPTED sends
-      // still awaiting their terminal result frame, so consumeStream's
-      // finally can mint the edge for a result-less turn end.
-      turnCompleteGate: createTurnCompleteGate(),
-      pendingResults: 0,
-      pendingCheckpointAttempts: new Map(),
-    }
-    const { iterable, handle } = createInputStream((isCompact) => {
-      if (isCompact) state.handedCompactLikely = true
+  if (createReceived) {
+    log('warn', 'create.refused', { requestId, reason: 'second_create' })
+    emit({ type: 'create.failed', requestId, code: 'BOOT_FAILED', message: 'This Claude sidecar already hosts a session.' })
+    return
+  }
+  createReceived = true
+  // A server and sidecar from different builds would misread each other:
+  // fail before anything is launched.
+  if (req.protocol !== SIDECAR_PROTOCOL) {
+    failBoot(requestId, {
+      code: 'SIDECAR_PROTOCOL_MISMATCH',
+      message: `The server sent sidecar protocol ${req.protocol ?? 1}; this Claude sidecar speaks protocol ${SIDECAR_PROTOCOL}.`,
     })
-    state.inputStream = handle
-    // Liveness IS session-map membership: consumeStream's finally removes the
-    // session synchronously after cancelPending (LB-04 — a parked canUseTool
-    // promise must never be resolved after transport close), and stdin line
-    // events (macrotasks) cannot interleave inside that finally.
-    sessions.set(sessionId, state)
+    return
+  }
+  let launch
+  try {
+    launch = bootOptions(req.boot, req.sessionId)
+  } catch (error) {
+    failBoot(requestId, { code: error?.code ?? 'BOOT_FAILED', message: errorText(error) })
+    return
+  }
 
-    const sdkStderr = cliStderrLogger(log, { hosted: isHostedSidecar(), fields: { sessionId } })
-    const sdkQuery = query({
+  const sessionId = nanoid()
+  const abort = new AbortController()
+  // ep4-r3/ep4-r4 quiesce state (declared first so the stream can arm it):
+  // turnOpen — an SDK turn is mid-flight (cleared at its result);
+  // handedCompactLikely — a compact crossed the un-cancellable SDK handoff
+  // (same-tick push OR queued pull — either path); cleared at the next
+  // result or observed status frame (its evidence has by then reached Rust).
+  const state = {
+    abort,
+    permissionMode: req.permissionMode,
+    settings: { model: req.model, effort: req.effort, permissionMode: req.permissionMode, cwd: req.cwd },
+    // False until `created` is sent; until then nothing reaches Rust and
+    // bootEvidence collects what a refusal is named from (boot.mjs).
+    booted: false,
+    bootEvidence: { resultErrors: [], stderr: '', streamEnded: undefined },
+    turnOpen: false,
+    handedCompactLikely: false,
+    // Unified attention bookkeeping: the gate suppresses exactly the
+    // interrupted turn's own result (ordering-scoped, NO reset-at-send —
+    // see turn-complete-gate.mjs); pendingResults counts ACCEPTED sends
+    // still awaiting their terminal result frame, so consumeStream's
+    // finally can mint the edge for a result-less turn end.
+    turnCompleteGate: createTurnCompleteGate(),
+    pendingResults: 0,
+    pendingCheckpointAttempts: new Map(),
+  }
+  const { iterable, handle } = createInputStream((isCompact) => {
+    if (isCompact) state.handedCompactLikely = true
+  })
+  state.inputStream = handle
+  // Liveness IS session-map membership: consumeStream's finally removes the
+  // session synchronously after cancelPending (LB-04 — a parked canUseTool
+  // promise must never be resolved after transport close), and stdin line
+  // events (macrotasks) cannot interleave inside that finally.
+  sessions.set(sessionId, state)
+
+  const logCliStderr = cliStderrLogger(log, { hosted: isHostedSidecar(), fields: { sessionId } })
+  const sdkStderr = (data) => {
+    if (!state.booted) state.bootEvidence.stderr = (state.bootEvidence.stderr + String(data)).slice(-BOOT_STDERR_MAX_CHARS)
+    logCliStderr(data)
+  }
+  let sdkQuery
+  try {
+    sdkQuery = query({
       prompt: iterable,
       options: {
         cwd: req.cwd || undefined,
-        resume: req.resumeSessionId,
-        // kata 1wxv Task 4 (fork-at-point emulation): the ONLY sanctioned lane is
-        // the query() options triple — NEVER the standalone forkSession() fn (it
-        // remaps every uuid).
-        resumeSessionAt: req.resumeSessionAt || undefined,
-        forkSession: req.forkSession === true || undefined,
-        resumeDropsTurn: req.resumeDropsTurn || undefined,
+        // Which conversation the CLI boots: fresh, resumed or forked (boot.mjs).
+        // A fork rides the query() options — NEVER the standalone forkSession()
+        // fn (it remaps every uuid).
+        ...launch,
         model: req.model,
         permissionMode: req.permissionMode,
         // Enables the user's in-session permission selector; the selected mode
@@ -449,25 +565,65 @@ function handleCreate(req) {
         },
       },
     })
-    state.query = sdkQuery
-    state.commandsChangedSeen = false
-    if (typeof sdkQuery.supportedCommands === 'function') {
-      Promise.resolve().then(() => sdkQuery.supportedCommands()).then((rows) => {
-        if (state.query !== sdkQuery || state.commandsChangedSeen) return
-        const commands = normalizeCommands(rows)
-        if (commands === undefined) return
-        state.commandCatalog = commands
-        publishCommands(sessionId, state)
-      }).catch((error) => log('warn', 'commands.unavailable', { sessionId, error: errorText(error) }))
-    }
+  } catch (error) {
+    sessions.delete(sessionId)
+    failBoot(requestId, classifyBootError({ error }), { sessionId })
+    return
+  }
+  state.query = sdkQuery
+  const streamDone = consumeStream(sessionId, sdkQuery)
+  streamDone.catch((err) => log('error', 'stream.consume_failed', { sessionId, error: errorText(err) }))
+  bootSession({ req, sessionId, state, sdkQuery, streamDone })
+    .catch((err) => log('error', 'boot.handler_failed', { requestId, sessionId, error: errorText(err) }))
+}
 
-    // Return the placeholder before the native system/init identity arrives.
-    emit({ type: 'created', requestId, sessionId })
-    consumeStream(sessionId, sdkQuery).catch((err) => log('error', 'stream.consume_failed', { sessionId, error: errorText(err) }))
-  } catch (err) {
-    if (sessionId) sessions.delete(sessionId)
-    log('warn', 'create.failed', { requestId, error: errorText(err) })
-    emit({ type: 'create.failed', requestId, message: err?.message || String(err) })
+/**
+ * Wait for the CLI to boot (initializationResult(), T2: no prompt needed),
+ * then answer `created` and publish the command catalog from the boot. A
+ * refused boot (T4, T5) is answered `create.failed` with its typed code.
+ */
+async function bootSession({ req, sessionId, state, sdkQuery, streamDone }) {
+  const requestId = req.requestId
+  const startedAt = Date.now()
+  const fields = () => ({ sessionId, sessionType: req.sessionType, boot: req.boot?.kind, ms: Date.now() - startedAt })
+  // A stream that ends first ends the boot too, whatever initializationResult() does.
+  const streamEndedFirst = streamDone.then(() => {
+    throw state.bootEvidence?.streamEnded?.error ?? new Error('The Claude CLI ended the session while it started.')
+  })
+  // Once the boot is settled a later stream end is the stream's own business (consumeStream).
+  streamEndedFirst.catch(() => {})
+  let init
+  let error
+  try {
+    if (typeof sdkQuery.initializationResult !== 'function') throw new Error('The Claude SDK cannot report its boot (no initializationResult).')
+    init = await Promise.race([sdkQuery.initializationResult(), streamEndedFirst])
+  } catch (rejection) {
+    error = rejection
+  }
+  // A CLI that died right after it booted did not boot.
+  if (error === undefined && state.bootEvidence.streamEnded) {
+    error = state.bootEvidence.streamEnded.error ?? new Error('The Claude CLI ended the session while it started.')
+  }
+  if (error !== undefined) {
+    // The CLI writes its refusal before it exits, and the stream ends after
+    // the exit: wait for that end (bounded) so all the evidence is in.
+    await Promise.race([streamDone, new Promise((resolve) => setTimeout(resolve, BOOT_FAILURE_SETTLE_MS))])
+    const { resultErrors, stderr } = state.bootEvidence
+    sessions.delete(sessionId)
+    failBoot(requestId, classifyBootError({ error, resultErrors, stderr }), fields(), sdkQuery)
+    return
+  }
+  // A shutdown or stdin close while the CLI booted: the sidecar is going away.
+  if (!sessions.has(sessionId)) return
+  state.booted = true
+  state.bootEvidence = undefined
+  const cliPid = Number.isInteger(init?.pid) ? init.pid : undefined
+  emit({ type: 'created', requestId, sessionId, protocol: SIDECAR_PROTOCOL, ...(cliPid !== undefined ? { cliPid } : {}) })
+  log('info', 'boot.ok', { requestId, cliPid, ...fields() })
+  const commands = normalizeCommands(init?.commands)
+  if (commands !== undefined) {
+    state.commandCatalog = commands
+    publishCommandsIfChanged(sessionId, state)
   }
 }
 
@@ -604,6 +760,8 @@ function shutdown() {
 // ── stdin dispatch loop (newline-JSON) ───────────────────────────────────────
 const rl = createInterface({ input: process.stdin })
 rl.on('line', (line) => {
+  // An exiting sidecar has no session left: sdk.stream.ended stays its last line.
+  if (exiting) return
   const trimmed = line.trim()
   if (!trimmed) return
   let req
@@ -653,14 +811,18 @@ rl.on('line', (line) => {
 })
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
 // grandchild is left mid-stream.
-rl.on('close', () => { shutdown(); process.exit(0) })
+rl.on('close', () => { if (!exiting) { shutdown(); process.exit(0) } })
 // stdout lost (Rust dropped our reader, e.g. a kill aborted its consumer before
 // it wrote the shutdown line): nobody hears us any more, the same request as
 // stdin EOF. Unhandled, the next emit's EPIPE kills node with exit 1 before
 // the SDK query is aborted, and nothing stops the claude CLI: it runs on until
-// it next writes into its own closed pipe or Rust kills the process tree.
+// it next writes into its own closed pipe or Rust kills the process tree. A
+// sidecar already exiting on its own (a refused boot, an unrequested stream
+// end) has closed its query and keeps its own exit code: its flush wait
+// (exitWithoutSession) still ends the process.
 process.stdout.on('error', (err) => {
   log('warn', 'stdout.closed', { code: err?.code ?? null, error: errorText(err) })
+  if (exiting) return
   shutdown()
   process.exit(0)
 })

@@ -32,3 +32,6 @@ tempfile = "3"
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
+# The claude tests run the real sidecar over the CLI simulator through the
+# sidecar-environment seam (FreshClaudeState::with_sidecar_environment).
+freshell-freshagent = { path = "../freshell-freshagent", features = ["test-support"] }

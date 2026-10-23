@@ -67,6 +67,9 @@ pub struct ClaudeRig {
     pub claude_config_dir: PathBuf,
     /// The simulator's ledger (JSONL; written by [`RigKind::Sim`] only).
     pub ledger: PathBuf,
+    /// The rig server's claude lane, for the server-side truths a test checks
+    /// (for example `has_live_session`).
+    pub fresh_claude: freshell_freshagent::FreshClaudeState,
     /// The local fake Anthropic endpoint ([`RigKind::Cli`] only), killed on drop.
     _provider: Option<tokio::process::Child>,
     _root: tempfile::TempDir,
@@ -159,7 +162,7 @@ impl ClaudeRig {
             environment.push(((*key).into(), (*value).into()));
         }
 
-        let url = spawn_rig_server(environment).await;
+        let (url, fresh_claude) = spawn_rig_server(environment).await;
         eprintln!(
             "{}",
             json!({
@@ -173,6 +176,7 @@ impl ClaudeRig {
             workspace,
             claude_config_dir,
             ledger,
+            fresh_claude,
             _provider: provider,
             _root: root,
         }
@@ -300,27 +304,36 @@ impl RigConnection {
         }
     }
 
-    /// `freshAgent.create` for a freshclaude session in the rig's workspace; returns
-    /// the session id from `freshAgent.created`.
-    pub async fn create(&mut self, request_id: &str) -> String {
+    /// `freshAgent.create` for a freshclaude session in the rig's workspace, with
+    /// `extra` fields merged in (a resume, say); returns the answer:
+    /// `freshAgent.created`, `freshAgent.create.failed` or a request `error`.
+    pub async fn request_create(&mut self, request_id: &str, extra: Value) -> Value {
         let cwd = path_string(&self.workspace);
-        self.send(json!({
+        let mut frame = json!({
             "type": "freshAgent.create",
             "requestId": request_id,
             "provider": "claude",
             "sessionType": "freshclaude",
             "cwd": cwd,
-        }))
-        .await;
-        let answer = self
-            .wait_for(&format!("the answer to create {request_id}"), |v| {
-                v["requestId"] == request_id
-                    && matches!(
-                        v["type"].as_str(),
-                        Some("freshAgent.created" | "freshAgent.create.failed" | "error")
-                    )
-            })
-            .await;
+        });
+        if let (Some(frame), Value::Object(extra)) = (frame.as_object_mut(), extra) {
+            frame.extend(extra);
+        }
+        self.send(frame).await;
+        self.wait_for(&format!("the answer to create {request_id}"), |v| {
+            v["requestId"] == request_id
+                && matches!(
+                    v["type"].as_str(),
+                    Some("freshAgent.created" | "freshAgent.create.failed" | "error")
+                )
+        })
+        .await
+    }
+
+    /// `freshAgent.create` for a freshclaude session in the rig's workspace; returns
+    /// the session id from `freshAgent.created`.
+    pub async fn create(&mut self, request_id: &str) -> String {
+        let answer = self.request_create(request_id, json!({})).await;
         assert_eq!(
             answer["type"], "freshAgent.created",
             "create failed: {answer}"
@@ -390,6 +403,23 @@ impl RigConnection {
             .filter(|v| v["type"] == "error" && v["requestId"] == request_id)
             .cloned()
             .collect()
+    }
+
+    /// Keep reading frames for `quiet` and keep them in [`Self::frames`]: a bounded
+    /// window for asserting that nothing more arrives (a second edge, say).
+    pub async fn read_for(&mut self, quiet: Duration) {
+        let deadline = tokio::time::Instant::now() + quiet;
+        loop {
+            match tokio::time::timeout_at(deadline, self.ws.next()).await {
+                Ok(Some(Ok(WsMessage::Text(text)))) => {
+                    self.frames
+                        .push(serde_json::from_str(&text).expect("json frame"));
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => panic!("ws error while reading: {error}"),
+                Ok(None) | Err(_) => return,
+            }
+        }
     }
 
     /// The first `freshAgent.event` whose inner event has this type.
@@ -508,7 +538,9 @@ async fn start_local_provider() -> (tokio::process::Child, String) {
 
 /// A freshell-ws server on an ephemeral loopback port (never 3001/3002) with fresh
 /// agents enabled and a claude state whose sidecars get exactly `environment`.
-async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
+async fn spawn_rig_server(
+    environment: Vec<(String, String)>,
+) -> (String, freshell_freshagent::FreshClaudeState) {
     let mut settings_value = test_settings_value();
     settings_value["freshAgent"]["enabled"] = json!(true);
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
@@ -525,6 +557,7 @@ async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
         .with_sidecar_environment(environment);
     fresh_claude.set_ownership(Arc::clone(&ownership));
+    let lane = fresh_claude.clone();
 
     let state = WsState {
         layout: Default::default(),
@@ -588,5 +621,5 @@ async fn spawn_rig_server(environment: Vec<(String, String)>) -> String {
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    format!("ws://{addr}/ws")
+    (format!("ws://{addr}/ws"), lane)
 }

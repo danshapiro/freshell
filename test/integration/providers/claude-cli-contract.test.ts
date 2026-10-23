@@ -29,6 +29,8 @@ import {
 } from './claude-cli-trace'
 import { PINNED_CLI_VERSION, PINNED_SDK_VERSION, resolvePinnedClaude } from './claude-local-provider.mjs'
 import { describeSimulatorConformance } from './claude-cli-conformance'
+// @ts-expect-error JavaScript sidecar module has no declaration file.
+import { PINNED_TERMINAL_COMMANDS } from '../../../crates/freshell-claude-sidecar/terminal-commands.mjs'
 
 const real = scenarioCache('real', { heartbeat: { timeoutMs: 150_000 } })
 const SCENARIO_TIMEOUT = 120_000
@@ -105,6 +107,20 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(summary).toMatchObject({ pidIsCli: true, current_permission_mode: 'bypassPermissions' })
     expect(summary.commands).toBeGreaterThan(0)
     expect(summary.models).toBeGreaterThan(0)
+  }, SCENARIO_TIMEOUT)
+
+  it('T2: the boot names no terminal-only commands; every init lists them, exactly as the sidecar pins them', async () => {
+    const r = await real('boot')
+    const events = eventsOf(r, 'S')
+    // The boot's catalog lists terminal-only commands with the rest, so the
+    // sidecar's boot catalog leaves out its pinned list (terminal-commands.mjs).
+    const summary = events[at(events, (e) => e.k === 'init-resolved')].result
+    expect(summary.keys).not.toContain('terminal_slash_commands')
+    const inits = messagesOf(r, 'S').filter(isInit)
+    expect(inits.length).toBeGreaterThan(0)
+    for (const init of inits) {
+      expect([...init.terminal_slash_commands].sort()).toEqual([...PINNED_TERMINAL_COMMANDS].sort())
+    }
   }, SCENARIO_TIMEOUT)
 
   it('T3: a fresh boot honors sessionId X, writes nothing before the first prompt, and the transcript appears around the first result', async () => {
