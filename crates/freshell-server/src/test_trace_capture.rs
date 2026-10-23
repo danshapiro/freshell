@@ -213,3 +213,55 @@ where
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const PROBE_TARGET: &str = "freshell_server::test_trace_capture::scoped_probe";
+
+    /// The callsite under test: one `warn!` that two threads fire.
+    fn fire_probe() {
+        tracing::warn!(target: PROBE_TARGET, "scoped capture probe");
+    }
+
+    struct CountProbe(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountProbe {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == PROBE_TARGET {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A test's scoped subscriber receives a callsite's event even though
+    /// another thread, outside any scoped subscriber, fired that callsite
+    /// first while the scoped subscriber was registered. Without a
+    /// process-wide subscriber in place, that first firing caches the
+    /// callsite as uninterested for the whole process and the scoped
+    /// subscriber never sees it (`review_r6_automatic_checkpoint_cooldown_is_logged`
+    /// captured nothing this way).
+    #[test]
+    fn a_scoped_subscriber_sees_a_callsite_another_thread_fired_first() {
+        use tracing_subscriber::prelude::*;
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let scoped =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(CountProbe(seen.clone())));
+        std::thread::spawn(fire_probe)
+            .join()
+            .expect("the unscoped thread fires the callsite first");
+        tracing::dispatcher::with_default(&scoped, fire_probe);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the scoped subscriber receives the event fired under it"
+        );
+    }
+}
