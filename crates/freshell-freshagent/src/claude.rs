@@ -205,6 +205,11 @@ pub struct FreshClaudeState {
     /// the released take must be Option-tolerant, never a panic).
     #[cfg(test)]
     kill_stop_take_pause: Option<std::sync::Arc<AdoptionTestPause>>,
+    /// C24 regression seam: park after the kill's first alias resolution,
+    /// before the close gate's index+sessions critical section. A concurrent
+    /// conversation rekey can then prove the gate recomputes the live map key.
+    #[cfg(test)]
+    kill_after_resolve_pause: Option<std::sync::Arc<AdoptionTestPause>>,
     /// b8ke e3r3 F8 test seam: park in the KILL path's clean-close
     /// FAILURE arm, after the granted take and immediately BEFORE the
     /// atomic verdict+restore — the deterministic exit-after-verdict
@@ -783,6 +788,8 @@ impl FreshClaudeState {
             #[cfg(test)]
             kill_stop_take_pause: None,
             #[cfg(test)]
+            kill_after_resolve_pause: None,
+            #[cfg(test)]
             kill_close_failure_pause: None,
         }
     }
@@ -941,6 +948,15 @@ impl FreshClaudeState {
         pause: Option<std::sync::Arc<AdoptionTestPause>>,
     ) {
         self.kill_stop_take_pause = pause;
+    }
+
+    /// C24 regression seam: park after the kill's initial session-key lookup.
+    #[cfg(test)]
+    pub fn set_kill_after_resolve_test_pause(
+        &mut self,
+        pause: Option<std::sync::Arc<AdoptionTestPause>>,
+    ) {
+        self.kill_after_resolve_pause = pause;
     }
 
     /// b8ke focused episode-2 post-cap F3 test seam installer (the
@@ -2613,10 +2629,17 @@ impl FreshClaudeState {
         // Task 10b: durable ids resolve through `cli_index` (alias, don't move) --
         // a kill addressed by the durable id must tear down the live aliased session.
         // Unresolvable ids keep today's idempotent success path.
-        let map_key = self
+        let mut map_key = self
             .resolve_session_key(&session_id)
             .await
             .unwrap_or_else(|| session_id.clone());
+        #[cfg(test)]
+        if let Some(pause) = &self.kill_after_resolve_pause {
+            pause
+                .reached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = pause.notify.notified().await;
+        }
         // Focused-episode-6 round 4 (Finding F5) — discovery completes
         // BEFORE the one envelope and BEFORE teardown. ONE critical section
         // (cli_index → sessions → alias_tombstones → close_pending — the
@@ -2633,6 +2656,22 @@ impl FreshClaudeState {
             let index = self.cli_index.lock().await;
             let sessions = self.sessions.lock().await;
             let mut tombstones = self.alias_tombstones.lock().expect("alias tombstones lock");
+            // `resolve_session_key` ran before this critical section. A
+            // conversation reset can move the same runtime in between and
+            // leave the addressed id as an alias to its new map key. Refresh
+            // the key against these exact index+map guards so the close gate,
+            // retire set, and eventual teardown all name the same runtime.
+            let current_map_key = if sessions.contains_key(&map_key) {
+                Some(map_key.clone())
+            } else {
+                index
+                    .get(&session_id)
+                    .filter(|mapped| sessions.contains_key(*mapped))
+                    .cloned()
+            };
+            if let Some(current_map_key) = current_map_key {
+                map_key = current_map_key;
+            }
             if sessions.contains_key(&map_key) {
                 let mut gates = self.close_pending.lock().expect("close-pending lock");
                 *gates.entry(map_key.clone()).or_insert(0) += 1;
@@ -12237,6 +12276,70 @@ rl.on('line', (line) => {
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
         assert_eq!(frame["sessionId"], "unknown-session");
+    }
+
+    /// A kill can resolve the old key just before `/clear` rekeys the same
+    /// live runtime. Its close gate must re-resolve the wire id while holding
+    /// the alias index and session map together, including in hosted states
+    /// without an ownership coordinator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_re_resolves_a_conversation_rekey_before_arming_its_close_gate() {
+        let (mut st, mut rx) = state_with_bus();
+        let identity_sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(identity_sink.clone());
+        let old = uuid::Uuid::new_v4().to_string();
+        let new = uuid::Uuid::new_v4().to_string();
+        insert_fake_claude_session(&st, &old).await;
+        {
+            let mut sessions = st.sessions.lock().await;
+            sessions.get_mut(&old).unwrap().cli_session_id = Some(old.clone());
+        }
+        st.cli_index.lock().await.insert(old.clone(), old.clone());
+
+        let pause = std::sync::Arc::new(AdoptionTestPause {
+            notify: tokio::sync::Notify::new(),
+            reached: std::sync::atomic::AtomicBool::new(false),
+        });
+        st.set_kill_after_resolve_test_pause(Some(std::sync::Arc::clone(&pause)));
+        let kill_state = st.clone();
+        let kill_id = old.clone();
+        let kill = tokio::spawn(async move {
+            kill_state.handle_kill(kill_msg(&kill_id)).await;
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !pause.reached.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "kill did not reach the post-resolution pause"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let pending = Arc::clone(&st.sessions.lock().await[&old].pending);
+        assert_eq!(
+            st.rekey_conversation(&old, &new, "freshclaude", &pending, "test")
+                .await
+                .expect("the live conversation rekeys"),
+            new,
+        );
+        pause.notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(15), kill)
+            .await
+            .expect("the kill settles")
+            .expect("the kill task completes");
+
+        assert!(
+            !st.sessions.lock().await.contains_key(&new),
+            "kill(old) must remove the runtime after it was rekeyed to new"
+        );
+        let killed = await_specific_frame(&mut rx, "freshAgent.killed", &old).await;
+        assert_eq!(killed["success"], true, "the kill result is {killed}");
+        let retired = identity_sink.retires.lock().unwrap().clone();
+        assert!(
+            retired.contains(&("claude".to_string(), old.clone()))
+                && retired.contains(&("claude".to_string(), new.clone())),
+            "kill(old) must close both the addressed alias and current identity: {retired:?}"
+        );
     }
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
