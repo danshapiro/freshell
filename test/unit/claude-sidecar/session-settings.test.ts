@@ -72,6 +72,30 @@ describe('Claude message content', () => {
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } },
     ])
   })
+
+  it('accepts every image type Claude reads, sent as data (the server never names a kind) or by URL', () => {
+    for (const mediaType of ['image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+      expect(userMessageContent('x', [{ mediaType, data: 'YWJj' }])[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: mediaType, data: 'YWJj' } })
+    }
+    expect(userMessageContent('x', [{ kind: 'url', url: 'https://example.test/cat.png' }])[1])
+      .toEqual({ type: 'image', source: { type: 'url', url: 'https://example.test/cat.png' } })
+  })
+
+  // A bad image is refused before it reaches the CLI: the send is rejected
+  // with INVALID_IMAGE (the sidecar answers sdk.send.rejected and lives on).
+  it.each([
+    { what: 'a type Claude cannot read', image: { mediaType: 'image/svg+xml', data: 'YWJj' }, message: /image\/svg\+xml/ },
+    { what: 'something that is not an image', image: { mediaType: 'application/pdf', data: 'YWJj' }, message: /application\/pdf/ },
+    { what: 'no data', image: { mediaType: 'image/png', data: '' }, message: /cannot be read/ },
+    { what: 'data that is not base64', image: { mediaType: 'image/png', data: 'not base64!' }, message: /cannot be read/ },
+    { what: 'an unknown kind', image: { kind: 'file', path: '/tmp/cat.png' }, message: /cannot be read/ },
+    { what: 'a URL that is not web', image: { kind: 'url', url: 'file:///etc/passwd' }, message: /cannot be read/ },
+  ])('refuses $what as INVALID_IMAGE', ({ image, message }) => {
+    let refusal: { code?: string; message?: string } | undefined
+    try { userMessageContent('Describe it', [image]) } catch (error) { refusal = error as typeof refusal }
+    expect(refusal?.code).toBe('INVALID_IMAGE')
+    expect(refusal?.message).toMatch(message)
+  })
 })
 
 // The process-level cases run the real index.mjs over the CLI simulator
@@ -95,7 +119,7 @@ async function sidecar(extraEnv: Record<string, string> = {}) {
   const harness = await startRealSidecar({ env: extraEnv, program: FAILING_TURN_PROGRAM })
   const waitFor = (type: string, requestId?: string) =>
     harness.waitFor((frame) => frame.type === type && (!requestId || frame.requestId === requestId), requestId ? `${type} ${requestId}` : type)
-  return { ...harness, waitFor }
+  return { ...harness, waitFor, waitForFrame: harness.waitFor }
 }
 
 /** The query() options the simulated CLI received (the sidecar makes one query per create). */
@@ -213,15 +237,14 @@ describe('Claude sidecar configuration protocol', () => {
     expect(bridge.frames.some((frame) => frame.type === 'sdk.exit')).toBe(false)
   })
 
-  it('surfaces failed turn details and rings the unified attention edge', async () => {
+  it('reports a failed turn\'s own error text on its result, and no banner or edge (the server mints both)', async () => {
     const bridge = await sidecar()
     const sessionId = await bridge.create({ requestId: 'create', model: 'opus' })
     bridge.send({ type: 'send', sessionId, text: '__fail__' })
-    expect(await bridge.waitFor('sdk.error')).toMatchObject({ message: 'Request timed out', turnFailure: true })
-    // Unified needs-attention contract: EVERY result subtype rings — the
-    // failed turn's edge is identical to a success turn's (no outcome rides
-    // the wire); only a result consumed by a pending accepted user-interrupt
-    // mark stays silent (turn-complete-gate.mjs).
-    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
+    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, subtype: 'error_during_execution', isError: true, errorText: 'Request timed out' })
+    await bridge.waitForFrame((frame) => frame.type === 'sdk.session.state' && frame.state === 'idle', 'the CLI goes idle')
+    // C18: the failure banner and the attention edge are the server's
+    // (claude_turns.rs verdict, claude_edges.rs); the sidecar sends neither.
+    expect(bridge.frames.filter((frame) => frame.type === 'sdk.error' || frame.type === 'sdk.turn.complete')).toEqual([])
   })
 })

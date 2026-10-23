@@ -20,28 +20,33 @@ import { startRealSidecar, type SidecarFrame } from './harness'
 
 const UNKNOWN_SLASH_COMMAND = '/no-such-command-xyz'
 
+/** A checkpointed send: the attempt binds under the send's own uuid. */
 interface Attempt { uuid: string; requestId: string; logicalAttemptId: string }
+
+function checkpointedSend(sessionId: string, text: string, { uuid, requestId, logicalAttemptId }: Attempt) {
+  return { type: 'send', sessionId, uuid, text, checkpointAttempt: { requestId, logicalAttemptId } }
+}
 
 const MODES: Record<string, { lines: (sessionId: string, checkpointAttempt: Attempt) => object[]; results: number }> = {
   match: {
-    lines: (sessionId, checkpointAttempt) => [{ type: 'send', sessionId, text: 'same prompt', checkpointAttempt }],
+    lines: (sessionId, checkpointAttempt) => [checkpointedSend(sessionId, 'same prompt', checkpointAttempt)],
     results: 1,
   },
   mismatch: {
     lines: (sessionId, checkpointAttempt) => [
-      { type: 'send', sessionId, text: UNKNOWN_SLASH_COMMAND, checkpointAttempt },
+      checkpointedSend(sessionId, UNKNOWN_SLASH_COMMAND, checkpointAttempt),
       { type: 'configure', sessionId, requestId: 'model-1', settings: { model: 'claude-opus-4-1-20250805' } },
     ],
     results: 1,
   },
   absent: {
-    lines: (sessionId, checkpointAttempt) => [{ type: 'send', sessionId, text: UNKNOWN_SLASH_COMMAND, checkpointAttempt }],
+    lines: (sessionId, checkpointAttempt) => [checkpointedSend(sessionId, UNKNOWN_SLASH_COMMAND, checkpointAttempt)],
     results: 1,
   },
   ordinary: {
     lines: (sessionId, checkpointAttempt) => [
       { type: 'send', sessionId, text: 'TOOL:sleep=0' },
-      { type: 'send', sessionId, text: UNKNOWN_SLASH_COMMAND, checkpointAttempt },
+      checkpointedSend(sessionId, UNKNOWN_SLASH_COMMAND, checkpointAttempt),
     ],
     results: 2,
   },

@@ -369,17 +369,45 @@ impl std::fmt::Display for ClaudeSpawnError {
 /// tree at once. Never fails: every step is best-effort and the returned
 /// [`SidecarExit`] says what actually happened.
 pub async fn graceful_then_kill(
-    mut child: Child,
+    child: Child,
     stdin: ChildStdin,
-    mut guard: SidecarTreeGuard,
+    guard: SidecarTreeGuard,
     grace: Duration,
 ) -> SidecarExit {
+    stop_with_shutdown(child, guard, grace, |deadline| {
+        request_shutdown(stdin, deadline)
+    })
+    .await
+}
+
+pub(crate) async fn graceful_then_kill_with_writer(
+    child: Child,
+    stdin: crate::claude_sidecar_io::SidecarWriter,
+    guard: SidecarTreeGuard,
+    grace: Duration,
+) -> SidecarExit {
+    stop_with_shutdown(child, guard, grace, |deadline| async move {
+        stdin.shutdown(deadline).await;
+    })
+    .await
+}
+
+async fn stop_with_shutdown<F, R>(
+    mut child: Child,
+    mut guard: SidecarTreeGuard,
+    grace: Duration,
+    shutdown: F,
+) -> SidecarExit
+where
+    F: FnOnce(Instant) -> R,
+    R: std::future::Future<Output = ()>,
+{
     let started = Instant::now();
     let deadline = started + grace;
     // Before anything can end a member (node's exit can: on Windows node
     // keeps the children it spawns in a kill-on-close job of its own).
     guard.watch_members();
-    request_shutdown(stdin, deadline).await;
+    shutdown(deadline).await;
     if let Ok(Ok(status)) = tokio::time::timeout_at(deadline, child.wait()).await {
         let (stop, drain) = if status.success() {
             (

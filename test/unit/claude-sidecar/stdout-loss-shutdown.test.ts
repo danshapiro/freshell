@@ -10,6 +10,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -53,7 +54,7 @@ describe('Claude sidecar with a lost stdout reader', () => {
     send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'create', model: 'opus' })
     await expect.poll(() => frames.find((frame) => frame.type === 'created'), { timeout: 5_000 }).toBeTruthy()
     const { sessionId } = frames.find((frame) => frame.type === 'created')!
-    send({ type: 'send', sessionId, text: 'stream until stopped' })
+    send({ type: 'send', sessionId, uuid: randomUUID(), text: 'stream until stopped' })
     await expect.poll(() => frames.filter((frame) => frame.type === 'sdk.stream').length, { timeout: 5_000 }).toBeGreaterThan(2)
 
     child.stdout!.destroy()

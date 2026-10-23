@@ -1,18 +1,30 @@
 // @vitest-environment node
 
-// Real-sidecar behavioral pin for the unified attention gate's ARM condition
-// (task-004 review F-I1), driven through the production index.mjs process
-// over the CLI simulator (harness.ts): the interrupt mark is armed ONLY while
-// a turn is plausibly awaiting a terminal frame (pendingResults > 0). The SDK
-// contract documents RESOLUTION — not rejection — for interrupting with
-// nothing in flight (sdk.d.ts:2384-2394), so an idle-session interrupt (a
-// late Stop click racing the busy-clear, or a double-click second Stop) must
-// arm NOTHING: the settle lands ok:true with no result to consume, and the
-// NEXT unrelated turn ring survives. An interrupt while a turn IS pending
-// still suppresses exactly the interrupted turn own result.
+// The sidecar mints no attention edge (core-runtime design §5.1, §5.5; C18):
+// the server owns turn accounting and every `freshAgent.turn.complete` /
+// `freshAgent.turn.waiting`, from the facts this sidecar forwards. Driven
+// through the production index.mjs process over the CLI simulator
+// (harness.ts): whatever a turn does - finish, fail, stop, wait on an
+// approval or a question, end with the CLI's death - the sidecar writes no
+// `sdk.turn.complete`, no `sdk.turn.waiting`, no `sdk.exit` and no failure
+// banner (`sdk.error{turnFailure}`). What it does write is the facts: the
+// enriched result, and the interrupt's receipt echoing the Stop's id.
+//
+// The interrupt gate this file used to pin (arm only while a result is owed,
+// silence only the stopped turn's aborted result, a stale mark never
+// swallows a bell) is the server's Stop latch now:
+// crates/freshell-freshagent/src/claude_turns_stop_tests.rs and
+// crates/freshell-ws/tests/freshagent_claude_turns.rs.
 
 import { describe, expect, it } from 'vitest'
-import { startRealSidecar, type RealSidecar } from './harness'
+import { startRealSidecar, type RealSidecar, type SidecarFrame } from './harness'
+
+/** Frames only the server may originate now. */
+const EDGE_TYPES = new Set(['sdk.turn.complete', 'sdk.turn.waiting', 'sdk.exit'])
+
+function edgesAndBanners(bridge: RealSidecar): SidecarFrame[] {
+  return bridge.frames.filter((frame) => EDGE_TYPES.has(frame.type) || (frame.type === 'sdk.error' && frame.turnFailure !== undefined))
+}
 
 /** A booted session with nothing in flight (the CLI reports no init until a prompt, T1). */
 async function createSession(bridge: RealSidecar) {
@@ -21,132 +33,100 @@ async function createSession(bridge: RealSidecar) {
   return sessionId
 }
 
-describe('Claude sidecar interrupt gate arming (unified attention edge)', () => {
-  it('an interrupt on an idle session settles ok:true and the next unrelated turn ring survives', async () => {
-    const bridge = await startRealSidecar()
+const isToolUse = (frame: SidecarFrame) => frame.type === 'sdk.assistant' && frame.content?.some((block: { type: string }) => block.type === 'tool_use')
+
+describe('the Claude sidecar mints no attention edge', () => {
+  it('a finished turn, a failed one and an API error each end with their result and nothing else', async () => {
+    const bridge = await startRealSidecar({
+      program: { rules: [{ on: 'msg:prompt', match: { text: 'max turns' }, emit: [{ kind: 'completion', data: { subtype: 'error_max_turns' } }] }] },
+      timeScale: 0.1,
+    })
     const sessionId = await createSession(bridge)
-
-    // Idle-session interrupt: nothing awaits a terminal frame. The CLI
-    // RESOLVES interrupt() (the documented nothing-in-flight contract), so
-    // the settle lands ok:true — and NO mark may be armed. Pre-fix, the
-    // unconditional arm here left a stray mark that consumed exactly the
-    // next result ring, silently suppressing an attention edge the user
-    // never witnessed.
-    bridge.send({ type: 'interrupt', sessionId })
-    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
-
-    // The NEXT unrelated turn result must still ring.
-    bridge.send({ type: 'send', sessionId, text: 'next unrelated turn' })
-    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, result: 'success' })
-    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
+    for (const [n, text] of ['hello', 'max turns', 'APIERR:500'].entries()) {
+      bridge.send({ type: 'send', sessionId, text })
+      await bridge.waitFor(() => bridge.frames.filter((frame) => frame.type === 'sdk.result').length === n + 1, `result ${n + 1}`)
+    }
+    await bridge.waitFor((frame) => frame.type === 'sdk.session.state' && frame.state === 'idle', 'the CLI goes idle')
+    const results = bridge.frames.filter((frame) => frame.type === 'sdk.result')
+    expect(results.map((result) => [result.subtype, result.isError, result.terminalReason])).toEqual([
+      ['success', false, 'completed'],
+      ['error_max_turns', true, undefined],
+      ['success', true, 'api_error'],
+    ])
+    expect(edgesAndBanners(bridge)).toEqual([])
   })
 
-  it('an interrupt while a turn is pending suppresses exactly that turn result; the next turn rings again', async () => {
-    const bridge = await startRealSidecar()
-    const sessionId = await createSession(bridge)
-
-    // A turn whose model request never completes (HANG) until the interrupt
-    // aborts it: the interrupted turn's own terminal frame lands AFTER the
-    // settle receipt (the SDK ordering the gate depends on, sdk.d.ts:3765;
-    // T11). The interrupt goes out once the turn has started (its init, T1),
-    // so it is a warm Stop, not a cold one racing the CLI's boot (T13).
-    bridge.send({ type: 'send', sessionId, text: 'HANG' })
-    await bridge.waitFor('sdk.session.init')
-    bridge.send({ type: 'interrupt', sessionId })
-    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
-    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, result: 'error_during_execution' })
-
-    // The next turn rings again — and by then exactly ONE edge has landed:
-    // the interrupted turn own ring was consumed by the armed mark.
-    bridge.send({ type: 'send', sessionId, text: 'after interrupt' })
-    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
-    expect(bridge.frames.filter((frame) => frame.type === 'sdk.turn.complete')).toHaveLength(1)
-  })
-
-  // G03: the CLI ends a stopped turn with error_during_execution and an
-  // `[ede_diagnostic]` error (T11). That is the user's own Stop, not a
-  // failure, so no error frame (the client's "Agent error" banner) follows.
   it.each([
-    { stage: 'streamed text', prompt: 'HANG', started: (frame: Record<string, any>) => frame.type === 'sdk.session.init' },
-    {
-      stage: 'a tool call',
-      prompt: 'TOOL:sleep=30',
-      started: (frame: Record<string, any>) => frame.type === 'sdk.assistant' && frame.content?.some((block: { type: string }) => block.type === 'tool_use'),
-    },
-  ])('a Stop during $stage ends the turn silently and with no error', async ({ prompt, started }) => {
+    { stage: 'streamed text', prompt: 'HANG', started: (frame: SidecarFrame) => frame.type === 'sdk.session.init' },
+    { stage: 'a tool call', prompt: 'TOOL:sleep=30', started: isToolUse },
+  ])('a Stop during $stage: the receipt echoes its stopId, the aborted result carries its facts, and no edge or banner follows', async ({ prompt, started }) => {
     const bridge = await startRealSidecar()
     const sessionId = await createSession(bridge)
 
     bridge.send({ type: 'send', sessionId, text: prompt })
     await bridge.waitFor(started, `${prompt} under way`)
-    bridge.send({ type: 'interrupt', sessionId })
-    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
-    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, result: 'error_during_execution' })
+    bridge.send({ type: 'interrupt', sessionId, stopId: 'stop-1' })
+    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, stopId: 'stop-1', ok: true, stillQueued: [] })
+    const result = await bridge.waitFor('sdk.result')
+    expect(result).toMatchObject({ sessionId, subtype: 'error_during_execution', isError: true })
+    expect(result.terminalReason).toMatch(/^aborted_/)
+    expect(result.errorText, 'diagnostics never reach the server').toBeUndefined()
 
-    // Everything the stopped turn produces has arrived once the next turn has
-    // rung: it is still exactly one edge, and no error frame at all.
     bridge.send({ type: 'send', sessionId, text: 'after the stop' })
-    await bridge.waitFor((frame) => frame.type === 'sdk.result' && frame.result === 'success', 'the next turn result')
-    await bridge.waitFor('sdk.turn.complete')
-    expect(bridge.frames.filter((frame) => frame.type === 'sdk.turn.complete')).toHaveLength(1)
-    expect(bridge.frames.filter((frame) => frame.type === 'sdk.error')).toEqual([])
+    await bridge.waitFor((frame) => frame.type === 'sdk.result' && frame.subtype === 'success', 'the next turn result')
+    expect(edgesAndBanners(bridge)).toEqual([])
   })
 
-  // G06: a Stop can miss the turn it was meant to stop. When the Stop reaches
-  // the CLI before the send it follows (both arrive in one stdin chunk, and
-  // the CLI takes the Stop first), the receipt comes back ok with nothing
-  // stopped and the turn then runs to success/completed. Only an aborted
-  // result is the stopped turn's own, so this one rings: the user believes
-  // the turn stopped, and it did not. (Since the sidecar answers `created`
-  // only once the CLI booted, a Stop can no longer race the boot itself, T13;
-  // and a boot the CLI refuses never becomes a session: boot-handshake.test.ts.)
-  it('a Stop that overtakes the send it meant to stop: the turn completes and rings', async () => {
-    const bridge = await startRealSidecar()
-    const sessionId = await bridge.create({ requestId: 'create', model: 'opus' })
-    expect(bridge.ledger().filter((row) => row.kind === 'boot')).toHaveLength(1)
-    bridge.sendLines([{ type: 'send', sessionId, text: 'hello' }, { type: 'interrupt', sessionId }])
-    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
-    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, result: 'success' })
-    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
-  })
-
-  it('a stale Stop mark never swallows the next turn\'s bell', async () => {
+  it('an interrupt with nothing running settles ok:true with its stopId (the CLI resolves it) and nothing else', async () => {
     const bridge = await startRealSidecar()
     const sessionId = await createSession(bridge)
-
-    // A send pushed during a tool call is absorbed into that turn (T10): two
-    // sends, one result. The sidecar still counts the absorbed send as owed.
-    bridge.send({ type: 'send', sessionId, text: 'TOOL:sleep=1' })
-    await bridge.waitFor((frame) => frame.type === 'sdk.assistant' && frame.content?.some((block: { type: string }) => block.type === 'tool_use'), 'the tool call')
-    bridge.send({ type: 'send', sessionId, text: 'absorbed into the tool turn' })
-    await bridge.waitForPrompt(2)
-    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, result: 'success' })
-    await bridge.waitFor('sdk.turn.complete')
-
-    // A Stop now finds the CLI idle, but the owed absorbed send arms a mark,
-    // and nothing the Stop could abort follows it.
-    bridge.send({ type: 'interrupt', sessionId })
-    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
-
-    // The next turn completes normally: it rings.
-    bridge.send({ type: 'send', sessionId, text: 'the next turn' })
-    await bridge.waitFor(() => bridge.frames.filter((frame) => frame.type === 'sdk.result').length === 2, 'the next turn result')
-    await bridge.waitFor(() => bridge.frames.filter((frame) => frame.type === 'sdk.turn.complete').length === 2, 'the next turn rings')
-    expect(bridge.frames.filter((frame) => frame.type === 'sdk.result').map((frame) => frame.result)).toEqual(['success', 'success'])
+    bridge.send({ type: 'interrupt', sessionId, stopId: 'stop-idle' })
+    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, stopId: 'stop-idle', ok: true })
+    bridge.send({ type: 'send', sessionId, text: 'next turn' })
+    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, subtype: 'success' })
+    expect(edgesAndBanners(bridge)).toEqual([])
   })
 
-  it('a Stop that missed the turn does not silence a turn that then ends with no result', async () => {
+  it('an approval and a question are forwarded as requests with no waiting edge', async () => {
+    const bridge = await startRealSidecar({
+      program: {
+        rules: [
+          { on: 'msg:prompt', match: { text: 'ask approval' }, emit: [{ kind: 'approval', data: { tool: 'Bash', input: { command: 'ls' } } }] },
+          { on: 'msg:prompt', match: { text: 'ask question' }, emit: [{ kind: 'question', data: { questions: [{ question: 'Pick', header: 'Q', options: [{ label: 'A', description: 'a' }], multiSelect: false }] } }] },
+        ],
+      },
+    })
+    const sessionId = await bridge.create({ requestId: 'create', model: 'opus', permissionMode: 'default' })
+    await bridge.waitForBoot()
+    bridge.send({ type: 'send', sessionId, text: 'ask approval' })
+    const approval = await bridge.waitFor('sdk.permission.request')
+    bridge.send({ type: 'permission.respond', sessionId, requestId: approval.requestId, decision: { behavior: 'allow', updatedInput: { command: 'ls' } } })
+    await bridge.waitFor('sdk.result')
+    bridge.send({ type: 'send', sessionId, text: 'ask question' })
+    const question = await bridge.waitFor('sdk.question.request')
+    bridge.send({ type: 'question.respond', sessionId, requestId: question.requestId, answers: { Pick: 'A' } })
+    await bridge.waitFor(() => bridge.frames.filter((frame) => frame.type === 'sdk.result').length === 2, 'the second result')
+    expect(edgesAndBanners(bridge)).toEqual([])
+  })
+
+  it('a turn the CLI dies under ends with the stream end alone', async () => {
     const bridge = await startRealSidecar({
       program: { rules: [{ on: 'msg:prompt', match: { text: 'CRASH_SOON' }, emit: [{ kind: 'crash', delayMs: 300 }] }] },
     })
-    const sessionId = await bridge.create({ requestId: 'create', model: 'opus' })
-    // The Stop overtakes the send, so the turn runs; then the CLI dies
-    // mid-turn and the stream ends with no result (T14).
-    bridge.sendLines([{ type: 'send', sessionId, text: 'CRASH_SOON' }, { type: 'interrupt', sessionId }])
-    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId, ok: true })
-    await bridge.waitForPrompt(1)
+    const sessionId = await createSession(bridge)
+    bridge.send({ type: 'send', sessionId, text: 'CRASH_SOON' })
     expect(await bridge.waitFor('sdk.stream.ended')).toMatchObject({ sessionId, reason: 'cli_exited' })
-    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
     expect(bridge.frames.filter((frame) => frame.type === 'sdk.result')).toEqual([])
+    expect(edgesAndBanners(bridge)).toEqual([])
+  })
+
+  it('a request for a session this sidecar does not host is refused: a send is rejected, an interrupt settles ok:false', async () => {
+    const bridge = await startRealSidecar()
+    await createSession(bridge)
+    bridge.send({ type: 'send', sessionId: 'not-hosted', uuid: '88888888-8888-4888-8888-888888888888', text: 'hello' })
+    expect(await bridge.waitFor('sdk.send.rejected')).toMatchObject({ sessionId: 'not-hosted', uuid: '88888888-8888-4888-8888-888888888888', code: 'SESSION_NOT_FOUND' })
+    bridge.send({ type: 'interrupt', sessionId: 'not-hosted', stopId: 'stop-x' })
+    expect(await bridge.waitFor('sdk.interrupt_settled')).toMatchObject({ sessionId: 'not-hosted', stopId: 'stop-x', ok: false })
+    expect(bridge.frames.filter((frame) => frame.type === 'sdk.error')).toEqual([])
   })
 })

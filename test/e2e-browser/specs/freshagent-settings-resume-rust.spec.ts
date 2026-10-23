@@ -551,7 +551,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       const durable = init.event.cliSessionId as string
       expect(durable).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
 
-      // One turn (fixture completes it with sdk.turn.complete).
+      // One turn (the fixture ends it with its result; the server rings it).
       ws.send({
         type: 'freshAgent.send',
         provider: 'claude',

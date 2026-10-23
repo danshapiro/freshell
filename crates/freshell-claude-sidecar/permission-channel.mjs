@@ -6,23 +6,15 @@
 // respondPermission :771-783; pending map shapes sdk-bridge-types.ts:113-126).
 //
 // Pure-ish: state lives on the per-session record; every function takes
-// explicit dependencies (emit / nanoid / nextMonotonic) so the module never
-// imports index.mjs's sessions Map or module state.
+// explicit dependencies (emit / nanoid) so the module never imports index.mjs's
+// sessions Map or module state. The waiting edge (0 -> >=1 pending) is the
+// server's: it folds the request frames and mints the edge itself (C18).
 
 // Lazily attach the two pending maps (sdk-bridge-types.ts:113-126 shapes).
 export function ensurePending(session) {
   if (!session.pendingPermissions) session.pendingPermissions = new Map()
   if (!session.pendingQuestions) session.pendingQuestions = new Map()
   return session
-}
-
-// Server-authoritative 0 -> >=1 pending edge (SdkBridge.emitWaitingEdge :515-519).
-// Monotonic per session via the injected nextMonotonic, independent clock from
-// the turn-complete edge.
-function emitWaitingEdge({ session, emit, nextMonotonic, sessionId }) {
-  const at = nextMonotonic(session.lastWaitingAt, Date.now())
-  session.lastWaitingAt = at
-  emit({ type: 'sdk.turn.waiting', sessionId, at })
 }
 
 // Provider-originated cancellation (options.signal; fresh-eyes round-2 F1): on
@@ -34,14 +26,13 @@ function subscribeSignal({ signal, clear }) {
   if (signal && !signal.aborted) signal.addEventListener('abort', clear, { once: true })
 }
 
-export function raisePermissionRequest({ session, emit, nanoid, nextMonotonic, sessionId, toolName, input, options }) {
+export function raisePermissionRequest({ session, emit, nanoid, sessionId, toolName, input, options }) {
   // Already-aborted provider: nothing to park, no card to raise — deny at once.
   if (options?.signal?.aborted) {
     return Promise.resolve({ behavior: 'deny', message: 'Aborted by provider' })
   }
   ensurePending(session)
   const requestId = nanoid()
-  const wasIdle = session.pendingPermissions.size === 0 && session.pendingQuestions.size === 0
   return new Promise((resolve) => {
     session.pendingPermissions.set(requestId, {
       toolName,
@@ -71,11 +62,10 @@ export function raisePermissionRequest({ session, emit, nanoid, nextMonotonic, s
       blockedPath: options?.blockedPath,
       decisionReason: options?.decisionReason,
     })
-    if (wasIdle) emitWaitingEdge({ session, emit, nextMonotonic, sessionId })
   })
 }
 
-export function raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, sessionId, input, signal }) {
+export function raiseQuestionRequest({ session, emit, nanoid, sessionId, input, signal }) {
   ensurePending(session)
   const rawQuestions = input?.questions
   if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
@@ -108,7 +98,6 @@ export function raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, ses
     return Promise.resolve({ behavior: 'deny', message: 'Aborted by provider' })
   }
   const requestId = nanoid()
-  const wasIdle = session.pendingPermissions.size === 0 && session.pendingQuestions.size === 0
   return new Promise((resolve) => {
     session.pendingQuestions.set(requestId, { originalInput: input, questions, resolve })
     subscribeSignal({
@@ -120,7 +109,6 @@ export function raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, ses
       },
     })
     emit({ type: 'sdk.question.request', sessionId, requestId, questions })
-    if (wasIdle) emitWaitingEdge({ session, emit, nextMonotonic, sessionId })
   })
 }
 
@@ -174,12 +162,12 @@ export function cancelPending(session, emit, sessionId, { resolveDeny }) {
 // canUseTool-shaped adapter (legacy ordering, sdk-bridge.ts:203-214): the
 // AskUserQuestion route precedes the bypass fast-path, so a bypass session
 // still answers interactive questions.
-export function canUseTool({ session, emit, nanoid, nextMonotonic, sessionId, toolName, input, options }) {
+export function canUseTool({ session, emit, nanoid, sessionId, toolName, input, options }) {
   if (toolName === 'AskUserQuestion') {
-    return raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, sessionId, input, signal: options?.signal })
+    return raiseQuestionRequest({ session, emit, nanoid, sessionId, input, signal: options?.signal })
   }
   if (session.permissionMode === 'bypassPermissions') {
     return { behavior: 'allow', updatedInput: input }
   }
-  return raisePermissionRequest({ session, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })
+  return raisePermissionRequest({ session, emit, nanoid, sessionId, toolName, input, options })
 }

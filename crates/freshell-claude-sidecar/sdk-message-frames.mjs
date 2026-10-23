@@ -1,7 +1,6 @@
 // The pure mapping from an SDK message to the sidecar's stdout frames
 // (docs/plans/2026-10-22-freshclaude-core-runtime.md §3.2 and §9.1 N6). One
-// function per SDK message kind; index.mjs keeps the side effects (the turn
-// gate, pendingResults, the attention clock, emit). The core runtime owns the
+// function per SDK message kind; index.mjs keeps the side effects (emit). The
 // `result` mapping below; the transcript work owns the content kinds
 // (framesForSdkMessage and the functions it dispatches to, at the end).
 //
@@ -9,41 +8,23 @@
 // claude-cli-contract.test.ts): a Stop ends the turn with
 // `error_during_execution`, `terminal_reason: aborted_streaming|aborted_tools`
 // and an `[ede_diagnostic] …` error (T11); an API error is a `success` with
-// `is_error` (T18), which the transcript shows, so it gets no failure text.
-
-/** terminal_reason values of a turn that was aborted (a Stop landed on it). */
-export const ABORTED_TERMINAL_REASONS = new Set(['aborted_streaming', 'aborted_tools'])
+// `is_error` (T18). The server reads these facts for its verdict (design §5.3):
+// whether the turn rings, and the failure banner it shows (C18). The sidecar
+// decides neither.
 
 const DIAGNOSTIC_PREFIX = '[ede_diagnostic]'
 
-const ABORTED_COPY = 'Claude stopped the turn before it finished.'
-const SUBTYPE_COPY = {
-  error_max_turns: 'Claude reached its turn limit. Send a message to continue.',
-  error_max_budget_usd: 'Claude reached the configured spending limit.',
-  error_max_structured_output_retries: 'Claude could not produce the requested response format.',
-}
-const DEFAULT_COPY = 'Claude could not complete this turn. Try sending your message again.'
-
-/** The CLI ended this turn because it was aborted (its terminal_reason says so). */
-export function isAbortedResult(result) {
-  return ABORTED_TERMINAL_REASONS.has(result?.terminal_reason)
-}
-
 /**
- * The text a failed turn shows the user, or undefined for a successful result.
- * The CLI's internal `[ede_diagnostic]` lines are never shown; when nothing
- * else is left, the text explains the result kind in plain words.
+ * The CLI's own error text for a result, one error per line, without its
+ * internal `[ede_diagnostic]` lines; undefined when none is left.
  */
-export function resultErrorText(result) {
-  if (result.subtype === 'success') return undefined
+export function resultErrors(result) {
   const errors = Array.isArray(result.errors) ? result.errors : []
   const messages = errors
     .filter((message) => typeof message === 'string')
     .map((message) => message.trim())
     .filter((message) => message && !message.startsWith(DIAGNOSTIC_PREFIX))
-  if (messages.length) return messages.join('\n')
-  if (isAbortedResult(result)) return ABORTED_COPY
-  return SUBTYPE_COPY[result.subtype] ?? DEFAULT_COPY
+  return messages.length ? messages.join('\n') : undefined
 }
 
 function resultUsage(usage) {
@@ -57,23 +38,27 @@ function resultUsage(usage) {
 }
 
 /**
- * The frames for an SDK `result`: `sdk.result`, then, for a failed turn, the
- * `sdk.error{turnFailure}` the client shows as its "Agent error" banner.
- * `userStopped` is the turn gate's verdict that this result is the user's own
- * Stop: that is not a failure, so it carries no error frame (G03).
+ * The frames for an SDK `result`: one `sdk.result` carrying the facts the
+ * server's verdict reads (design §5.3): `subtype` (also as the older
+ * `result`), `isError`, `terminalReason` and `numTurns` when the CLI reports
+ * them, and `errorText`, the CLI's own error text without diagnostics
+ * (resultErrors).
  */
-export function resultFrames(sessionId, result, { userStopped }) {
-  const frames = [{
+export function resultFrames(sessionId, result) {
+  const errorText = resultErrors(result)
+  return [{
     type: 'sdk.result',
     sessionId,
     result: result.subtype,
+    subtype: result.subtype,
+    isError: typeof result.is_error === 'boolean' ? result.is_error : result.subtype !== 'success',
+    ...(typeof result.terminal_reason === 'string' ? { terminalReason: result.terminal_reason } : {}),
+    ...(Number.isInteger(result.num_turns) ? { numTurns: result.num_turns } : {}),
+    ...(errorText !== undefined ? { errorText } : {}),
     durationMs: result.duration_ms,
     costUsd: result.total_cost_usd,
     usage: resultUsage(result.usage),
   }]
-  const failure = userStopped ? undefined : resultErrorText(result)
-  if (failure) frames.push({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
-  return frames
 }
 
 // ── content kinds (docs/plans/2026-10-22-freshclaude-transcript-live.md §4.2) ──
@@ -106,9 +91,8 @@ export function createFrameState() {
 /**
  * The frames for one SDK message of a content kind (none for any other kind).
  * `session` is what the sidecar knows about the session when the message
- * arrives: `{ stream, permissionMode, turnPending }` — the session's
- * createFrameState(), the permission mode it believes the CLI is in, and
- * whether a send still waits for its result.
+ * arrives: `{ stream, permissionMode }` — the session's createFrameState()
+ * and the permission mode it believes the CLI is in.
  */
 export function framesForSdkMessage(sessionId, msg, session) {
   switch (msg?.type) {
@@ -209,17 +193,16 @@ const COMPACTION_FAILED_COPY = 'Claude could not compact the conversation.'
  * is a notice with the CLI's reason (the transcript keeps the same reason as
  * a command error); it never ends the turn. Either way, while a send still
  * waits for its result the session is running again, not compacting.
- * (Interim: core's turn ledger will compute this itself, docs/plans/
- * 2026-10-22-freshclaude-core-runtime.md §9.1 N2.)
+ * The server's turn ledger computes whether the session remains busy from
+ * the raw status:null fact (lifecycle-frames.mjs).
  */
-export function compactionOutcomeFrames(sessionId, msg, { turnPending }) {
+export function compactionOutcomeFrames(sessionId, msg) {
   if (msg.status !== null || msg.compact_result === undefined) return []
   const frames = []
   if (msg.compact_result === 'failed') {
     const reason = typeof msg.compact_error === 'string' ? msg.compact_error.trim() : ''
     frames.push({ type: 'sdk.notice', sessionId, level: 'error', code: 'COMPACTION_FAILED', message: reason || COMPACTION_FAILED_COPY })
   }
-  if (turnPending) frames.push({ type: 'sdk.status', sessionId, status: 'running' })
   return frames
 }
 

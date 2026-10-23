@@ -43,7 +43,7 @@ describe('a live turn\'s frames', () => {
     const sidecar = await startRealSidecar()
     const sessionId = await sidecar.create()
     const checkpointAttempt = { uuid: '0b8e1f4c-6a55-4f4e-9d0a-3c2b1a090807', requestId: 'send-1', logicalAttemptId: 'attempt-1' }
-    sidecar.send({ type: 'send', sessionId, text: 'TOOL:sleep=0', checkpointAttempt })
+    sidecar.send({ type: 'send', sessionId, uuid: checkpointAttempt.uuid, text: 'TOOL:sleep=0', checkpointAttempt })
     await sidecar.waitFor('sdk.result', 'the turn result')
     const { cliSessionId } = await sidecar.waitFor('sdk.session.init')
 
@@ -103,7 +103,7 @@ describe('a live turn\'s frames', () => {
 describe('what a compaction and a permission mode change send', () => {
   const resultsOf = (sidecar: RealSidecar) => sidecar.frames.filter((frame) => frame.type === 'sdk.result')
 
-  it('a failed /compact: a COMPACTION_FAILED notice, then running until its result, and no error frame', async () => {
+  it('a failed /compact reports its status end and COMPACTION_FAILED reason before its result', async () => {
     const sidecar = await startRealSidecar({ timeScale: 0.1 })
     const sessionId = await sidecar.create()
     sidecar.send({ type: 'send', sessionId, text: '/compact APIERR:400' })
@@ -111,11 +111,13 @@ describe('what a compaction and a permission mode change send', () => {
     const types = sidecar.frames.map((frame) => frame.type)
     const compacting = sidecar.frames.findIndex((frame) => frame.type === 'sdk.status' && frame.status === 'compacting')
     const notice = sidecar.frames.findIndex((frame) => frame.type === 'sdk.notice')
-    const running = sidecar.frames.findIndex((frame) => frame.type === 'sdk.status' && frame.status === 'running')
+    const ended = sidecar.frames.findIndex((frame) => frame.type === 'sdk.status' && frame.status === null)
     expect(compacting).toBeGreaterThanOrEqual(0)
     expect(notice).toBeGreaterThan(compacting)
-    expect(running).toBeGreaterThan(notice)
-    expect(types.indexOf('sdk.result')).toBeGreaterThan(running)
+    expect(ended).toBeGreaterThan(compacting)
+    expect(notice).toBeGreaterThan(ended)
+    expect(types.indexOf('sdk.result')).toBeGreaterThan(notice)
+    expect(sidecar.frames.some((frame) => frame.type === 'sdk.status' && frame.status === 'running')).toBe(false)
     expect(sidecar.frames[notice]).toEqual({
       type: 'sdk.notice',
       sessionId,
@@ -129,15 +131,15 @@ describe('what a compaction and a permission mode change send', () => {
       .toMatchObject({ severity: 'error', event: 'notice', sessionId, error: 'Error during compaction: API Error: 400 local provider error' })
   })
 
-  it('a successful /compact: running again once compacting ends, then its result, and no notice', async () => {
+  it('a successful /compact reports its status end before its result, with no notice', async () => {
     const sidecar = await startRealSidecar({ timeScale: 0.1 })
     const sessionId = await sidecar.create()
     sidecar.send({ type: 'send', sessionId, text: 'something to compact' })
     await sidecar.waitFor('sdk.result')
     sidecar.send({ type: 'send', sessionId, text: '/compact' })
     await sidecar.waitFor(() => resultsOf(sidecar).length === 2, 'the compaction result')
-    const statuses = sidecar.frames.filter((frame) => frame.type === 'sdk.status' || frame.type === 'sdk.result').map((frame) => frame.status ?? frame.type)
-    expect(statuses).toEqual(['sdk.result', 'compacting', 'running', 'sdk.result'])
+    const statuses = sidecar.frames.filter((frame) => frame.type === 'sdk.status' || frame.type === 'sdk.result').map((frame) => frame.type === 'sdk.status' ? frame.status : frame.type)
+    expect(statuses).toEqual(['requesting', 'sdk.result', 'compacting', null, 'sdk.result'])
     expect(sidecar.frames.some((frame) => frame.type === 'sdk.notice')).toBe(false)
   })
 

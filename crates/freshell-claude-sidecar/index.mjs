@@ -22,8 +22,13 @@
 //                                    `freshellContext` names the pane the CLI's environment carries.
 //                                    One sidecar hosts one session: a second create is refused.
 //     { type:'configure',          sessionId, requestId, settings }
-//     { type:'send',               sessionId, text, images? }
-//     { type:'interrupt',          sessionId }
+//     { type:'send',               sessionId, uuid, text, images?, checkpointAttempt?:{logicalAttemptId, requestId} }
+//                                  — `uuid` is the id the server minted for this send (required): the
+//                                    SDKUserMessage carries it, so the CLI reports the command's lifecycle
+//                                    under it and writes the user line with it; a checkpoint attempt binds
+//                                    under the same uuid (checkpoint-identity.mjs)
+//     { type:'interrupt',          sessionId, stopId }
+//                                  — the user's Stop; `stopId` is echoed on its receipt
 //     { type:'permission.respond', sessionId, requestId, decision }   // decision forwarded VERBATIM
 //     { type:'question.respond',   sessionId, requestId, answers }
 //     { type:'shutdown' }
@@ -39,7 +44,8 @@
 //                                    forwarded (its error result is the refusal's evidence, not a
 //                                    turn), and the sidecar then exits with code 2.
 //     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
-//     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
+//     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools, capabilities? }  // durable Claude UUID;
+//                                  capabilities: the CLI's (msg_lifecycle_v1 says it reports every sent command's lifecycle)
 //     { type:'sdk.assistant',           sessionId, content, model, uuid, messageId, parentToolUseId }
 //                                  — one per completed content block (blocks of one API message share
 //                                    messageId); parentToolUseId is set inside a subagent, else null
@@ -58,13 +64,6 @@
 //                                    that stops the turn; its quiet info/notice levels are not sent),
 //                                    COMPACTION_FAILED (the CLI's reason); never a turn end
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
-//     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
-//                                  the stopped turn's own aborted result (an accepted user interrupt's mark
-//                                  silences only that — turn-complete-gate.mjs); also minted from consumeStream's finally
-//                                  when a turn ends with NO result frame (the CLI died or the stream ended
-//                                  with a send still pending) — the abort/sdk.exit requested-teardown path
-//                                  stays silent
-//     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
 //     { type:'sdk.session.changed',     sessionId, reason:'session-commands', commands }
 //                                  — the command catalog without the terminal-only commands (the pinned
 //                                    CLI's until a turn's init names its own): from the boot, then
@@ -74,21 +73,37 @@
 //                                    local command output) to its transcript under `uuid`, about 100 ms
 //                                    later; sent right after the message's own frames
 //                                    (sdk-message-frames.mjs)
-//     { type:'sdk.status',              sessionId, status }               // compacting; running when a
-//                                  compaction ends while a send still waits for its result (interim, core
-//                                  N2); an ended stream sends no status: the server reports it as exited
+//     { type:'sdk.status',              sessionId, status }               // compacting or null; the
+//                                  server's turn ledger owns the effective status
 //     { type:'sdk.session.metadata',    sessionId, permissionMode }       // the CLI changed its own
 //                                  permission mode (an ExitPlanMode approval); the session adopts it first
-//     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
-//                                  (sanitized text, no [ede_diagnostic] lines); never for the user's own Stop
+//     { type:'sdk.error',               sessionId, message }              // a request-level failure only
 //     { type:'sdk.stream.ended',        sessionId, reason, message }      // the session's SDK stream ended
 //                                  unrequested (reason cli_exited | stream_error | stream_eof, stream-end.mjs):
 //                                  always the LAST line; the sidecar then exits with code 3 (G02)
-//     { type:'sdk.exit',                sessionId }                       // a requested teardown (abort)
 //     { type:'sdk.permission.request',  sessionId, requestId, subtype:'can_use_tool', tool:{name,input}, toolUseID, suggestions, blockedPath, decisionReason }
 //     { type:'sdk.question.request',    sessionId, requestId, questions }
 //     { type:'sdk.permission.cancelled', sessionId, requestId }
 //     { type:'sdk.question.cancelled',  sessionId, requestId }
+//     { type:'sdk.interrupt_settled',   sessionId, stopId, ok, stillQueued?, message? }
+//                                  — the interrupt() receipt, echoing the Stop's id: `stillQueued` lists the
+//                                    sent commands the CLI says will still run (T12, T13; absent when the CLI
+//                                    sends no receipt); ok:false when the session is not hosted here or the
+//                                    CLI refused
+//     { type:'sdk.send.rejected',       sessionId, uuid, code:'INVALID_IMAGE'|'INVALID_SEND'|'SESSION_NOT_FOUND', message }
+//                                  — the send never reached the CLI (a bad image, no valid uuid, a session
+//                                    this sidecar does not host); the session lives on
+//   Lifecycle facts for the server's turn accounting (lifecycle-frames.mjs, never client content):
+//     { type:'sdk.command',             sessionId, uuid, state }          // a sent command's lifecycle (T8):
+//                                  queued | started | completed | cancelled | discarded, or replayed (its first replay)
+//     { type:'sdk.session.state',       sessionId, state }                // running | idle | requires_action (T9;
+//                                  the sidecar sets CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1 for the CLI)
+//     { type:'sdk.status',              sessionId, status:null, compactResult?, compactError?, permissionMode? }
+//                                  — a status ended (T15); { status:'requesting' } is a model request
+//     { type:'sdk.heartbeat',           sessionId, kind:'tool'|'task'|'retry', toolUseId?, elapsedMs? }
+//                                  — liveness only (T17), at most one per kind every 5 s
+//   `sdk.result` also carries subtype, isError, terminalReason?, numTurns? and errorText? (the CLI's own
+//   error text without diagnostics), the facts the server's result verdict reads.
 //
 //   sidecar → Rust (stderr): log records only, one JSON object per line
 //     ({ severity, component, event, ...ids }, log.mjs). Rust re-emits each
@@ -99,12 +114,10 @@
 // envelope — so this sidecar is the faithful analog of server/sdk-bridge.ts's
 // SdkBridge (it emits the SAME `sdk.*` shapes SdkBridge broadcasts).
 //
-// A sidecar death mid-turn can therefore NEVER produce a false completion
-// from this process's own stdout: `sdk.turn.complete` rides every SDK
-// `result` (the unified needs-attention edge — only the stopped turn's own
-// aborted result is silenced, by the accepted-interrupt mark) plus the
-// consumeStream finally mint for a result-less turn end (the CLI died or the
-// stream ended with a send pending; never the aborted/sdk.exit teardown).
+// This sidecar makes no turn or attention decision (design §3.1, C18): it
+// forwards facts, and the server owns busy, the user's Stop, and every
+// attention edge (`freshAgent.turn.complete`, `freshAgent.turn.waiting`) and
+// failure banner, minted from those facts. Nothing here mints an edge.
 //
 // Process lifetime: one sidecar hosts one session. A boot the CLI refused ends
 // the sidecar with `create.failed` and exit code 2. When the session's SDK
@@ -112,7 +125,7 @@
 // and exits with code 3, so the Rust end-of-output path ends the session. A
 // requested teardown (shutdown, SIGTERM, stdin closing) exits 0 and reports
 // nothing. If the PROCESS itself dies mid-turn, stdout simply ends with no
-// `sdk.stream.ended` — the one end the Rust side rings for itself.
+// `sdk.stream.ended`; the server's end-of-output path handles both ends.
 //
 // The Freshell MCP server (G19): the create line names the recipe, the hosted
 // one or the ordinary one the Rust server resolved while
@@ -132,9 +145,7 @@ import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent } from './session-settings.mjs'
 import { createFrameState, frameLogRecord, framesForSdkMessage, resultFrames } from './sdk-message-frames.mjs'
-import { createTurnCompleteGate } from './turn-complete-gate.mjs'
-import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
-import { nextMonotonic } from './monotonic-clock.mjs'
+import { checkpointAttemptOf, isUuid, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 import { mcpServersFor, withFreshellContext } from './mcp-servers.mjs'
 import { cliStderrLogger, errorText, log } from './log.mjs'
@@ -142,6 +153,7 @@ import { isHostedSidecar } from './hosted.mjs'
 import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
 import { BOOT_FAILED_EXIT_CODE, bootOptions, classifyBootError, SIDECAR_PROTOCOL } from './boot.mjs'
 import { usableCommands } from './terminal-commands.mjs'
+import { createLifecycleState, lifecycleFrames, rememberSend, stillQueuedOf } from './lifecycle-frames.mjs'
 import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 import {
   canUseTool as routeCanUseTool,
@@ -188,40 +200,18 @@ function nanoid(size = 21) {
 }
 
 // ── streaming input stream (server/sdk-bridge.ts:274-316) ────────────────────
-// `onHandoff(isCompact)` fires on EVERY permanent handoff into the SDK
-// consumer — BOTH the same-tick push-into-a-waiting-consumer path and the
-// later `next()` queue-shift path (ep4-r4: the latter equally crosses the
-// un-cancellable boundary; an absorbed compact pulled mid-window must arm the
-// busy verdict just as the immediate handoff does).
-function createInputStream(onHandoff) {
-  // Items are { msg, isCompact } — the wrapper lets rollback's quiesce drain
-  // never-yet-handed compacts (kata 1wxv ep4-r3: the SDK's queued-input
-  // surface cannot cancel UUID-less items, so cancellation authority lives at
-  // THIS queue, before handoff).
+function createInputStream() {
   const queue = []
   let waiting = null
   let done = false
   const handle = {
-    push: (msg, isCompact = false) => {
+    push: (msg) => {
       if (waiting) {
         const r = waiting; waiting = null;
         r({ value: msg, done: false })
-        // A push into an AWAITING SDK consumer hands the item over in this
-        // same tick — un-cancellable from here (the SDK has it).
-        if (isCompact) onHandoff(true)
       } else {
-        queue.push({ msg, isCompact })
+        queue.push(msg)
       }
-    },
-    // kata 1wxv ep4-r1 F1 → rollback quiesce: every queued compact is
-    // provably never handed to the SDK (the handoffs above/below are the only
-    // pulls) — dropping them here cancels them permanently.
-    drainCompacts: () => {
-      let cancelled = 0
-      for (let i = queue.length - 1; i >= 0; i--) {
-        if (queue[i].isCompact) { queue.splice(i, 1); cancelled += 1 }
-      }
-      return cancelled
     },
     end: () => {
       done = true
@@ -232,13 +222,7 @@ function createInputStream(onHandoff) {
     [Symbol.asyncIterator]() {
       return {
         next() {
-          if (queue.length > 0) {
-            const item = queue.shift()
-            // ep4-r4: a later pull of a QUEUED compact is the same
-            // un-cancellable handoff as the same-tick push — arm it too.
-            if (item.isCompact) onHandoff(true)
-            return Promise.resolve({ value: item.msg, done: false })
-          }
+          if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
           if (done) return Promise.resolve({ value: undefined, done: true })
           return new Promise((resolve) => { waiting = resolve })
         },
@@ -248,11 +232,7 @@ function createInputStream(onHandoff) {
   return { iterable, handle }
 }
 
-// ── per-session monotonic turn-complete/waiting clock ────────────────────────
-// nextMonotonic lives in monotonic-clock.mjs (shared with the e2e fake so the
-// fixture clamps identically — ONE implementation of the clamp).
-
-/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>, turnCompleteGate?:{noteInterruptRequest:Function,noteInterruptSettled:Function,resultEmitsAttention:Function}, pendingResults?:number}>} */
+/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
 const sessions = new Map()
 
 function normalizeCommands(rows, strict = false) {
@@ -300,27 +280,10 @@ function handleSdkMessage(sessionId, msg) {
     if (msg.type === 'result' && Array.isArray(msg.errors)) st.bootEvidence.resultErrors.push(...msg.errors)
     return
   }
-
-  // ep4-r6 quiesce bookkeeping (fail-closed approximations; the discharge rule
-  // is tight per ep4-r5 F1):
-  // - a `result` closes whatever turn was open (`turnOpen`);
-  // - an assistant/system frame marks a TURN boundary (`turnOpen`);
-  // - ONLY a `compacting` status discharges `handedCompactLikely`: the handed
-  //   compact's OWN evidence finally carrying the busy truth (an unrelated
-  //   earlier result — the SDK drains the iterable independently — must never
-  //   drop it, or a rollback probe between that result and the compact's
-  //   status sees a false all-clear; the reviewer repro).
-  if (msg.type === 'result') {
-    st.turnOpen = false
-  } else if (
-    msg.type === 'assistant' ||
-    (msg.type === 'system' && msg.subtype === 'status')
-  ) {
-    st.turnOpen = true
-    if (msg.type === 'system' && msg.subtype === 'status' && msg.status === 'compacting') {
-      st.handedCompactLikely = false
-    }
-  }
+  // The lifecycle facts this message carries, for the server's turn
+  // accounting (lifecycle-frames.mjs): command lifecycles, session state,
+  // status ends, heartbeats.
+  for (const frame of lifecycleFrames(sessionId, msg, st.lifecycle)) emit(frame)
 
   switch (msg.type) {
     case 'user': {
@@ -343,6 +306,8 @@ function handleSdkMessage(sessionId, msg) {
           model: msg.model,
           cwd: msg.cwd,
           tools: Array.isArray(msg.tools) ? msg.tools.map((t) => ({ name: t })) : undefined,
+          // The server's turn ledger reads msg_lifecycle_v1 from them (T8).
+          ...(Array.isArray(msg.capabilities) ? { capabilities: msg.capabilities.filter((cap) => typeof cap === 'string') } : {}),
         })
         publishCommandsIfChanged(sessionId, st)
       } else if (msg.subtype === 'commands_changed') {
@@ -355,21 +320,9 @@ function handleSdkMessage(sessionId, msg) {
       break
     }
     case 'result': {
-      // The awaited turn's terminal frame arrived: drop one pending send
-      // (clamped at 0 — an unsolicited result must not underflow the counter).
-      st.pendingResults = Math.max(0, st.pendingResults - 1)
-      // The gate's verdict comes first: the stopped turn's own (aborted)
-      // result is the user's Stop, so it carries neither a bell nor a failure
-      // banner (G03). Any other turn end rings, including one a Stop missed
-      // (G06); a failed one also reports why. No outcome rides the edge — the
-      // client treats all ends identically.
-      const rings = st.turnCompleteGate.resultEmitsAttention(msg)
-      for (const frame of resultFrames(sessionId, msg, { userStopped: !rings })) emit(frame)
-      if (rings) {
-        const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
-        st.lastTurnCompleteAt = at
-        emit({ type: 'sdk.turn.complete', sessionId, at })
-      }
+      // The facts the server's verdict reads (sdk-message-frames.mjs); the
+      // server decides whether the turn rings and whether it failed.
+      for (const frame of resultFrames(sessionId, msg)) emit(frame)
       break
     }
     default:
@@ -381,7 +334,6 @@ function handleSdkMessage(sessionId, msg) {
   const frames = framesForSdkMessage(sessionId, msg, {
     stream: st.frameState,
     permissionMode: st.settings.permissionMode,
-    turnPending: st.pendingResults > 0,
   })
   for (const frame of frames) {
     // The CLI changed its own permission mode (an ExitPlanMode approval): the
@@ -422,21 +374,7 @@ async function consumeStream(sessionId, sdkQuery) {
     // chain → unhandled rejection → crash under Node 22 throw-mode).
     if (st) cancelPending(st, emit, sessionId, { resolveDeny: false })
     sessions.delete(sessionId)
-    if (requested) {
-      emit({ type: 'sdk.exit', sessionId })
-    } else {
-      // Interim, until Rust mints every edge (C18): a turn that ends with NO
-      // result frame — the CLI died, or the stream ended, with a result still
-      // pending — is a turn end the user didn't witness, so it rings here.
-      // pendingResults covers the accept→first-message window and counts
-      // queued sends. A pending Stop mark does not silence it: only an aborted
-      // result is the stopped turn's own (turn-complete-gate.mjs). Rust rings
-      // only for a death that reports no stream end, so this edge is the one.
-      if (st && st.pendingResults > 0) {
-        const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
-        st.lastTurnCompleteAt = at
-        emit({ type: 'sdk.turn.complete', sessionId, at })
-      }
+    if (!requested) {
       // The end of the stream is the end of this sidecar (G02): report how
       // the stream ended, last, and exit, so the server's end-of-output path
       // ends the session instead of keeping a sidecar with no session.
@@ -503,11 +441,6 @@ function handleCreate(req) {
 
   const sessionId = nanoid()
   const abort = new AbortController()
-  // ep4-r3/ep4-r4 quiesce state (declared first so the stream can arm it):
-  // turnOpen — an SDK turn is mid-flight (cleared at its result);
-  // handedCompactLikely — a compact crossed the un-cancellable SDK handoff
-  // (same-tick push OR queued pull — either path); cleared at the next
-  // result or observed status frame (its evidence has by then reached Rust).
   const state = {
     abort,
     permissionMode: req.permissionMode,
@@ -516,22 +449,13 @@ function handleCreate(req) {
     // bootEvidence collects what a refusal is named from (boot.mjs).
     booted: false,
     bootEvidence: { resultErrors: [], stderr: '', streamEnded: undefined },
-    turnOpen: false,
-    handedCompactLikely: false,
-    // Unified attention bookkeeping: the gate suppresses exactly the
-    // interrupted turn's own result (ordering-scoped, NO reset-at-send —
-    // see turn-complete-gate.mjs); pendingResults counts ACCEPTED sends
-    // still awaiting their terminal result frame, so consumeStream's
-    // finally can mint the edge for a result-less turn end.
-    turnCompleteGate: createTurnCompleteGate(),
-    pendingResults: 0,
+    // The commands this session sent and its heartbeat allowance (lifecycle-frames.mjs).
+    lifecycle: createLifecycleState(),
     pendingCheckpointAttempts: new Map(),
     // The content mapping's own per-session state (sdk-message-frames.mjs).
     frameState: createFrameState(),
   }
-  const { iterable, handle } = createInputStream((isCompact) => {
-    if (isCompact) state.handedCompactLikely = true
-  })
+  const { iterable, handle } = createInputStream()
   state.inputStream = handle
   // Liveness IS session-map membership: consumeStream's finally removes the
   // session synchronously after cancelPending (LB-04 — a parked canUseTool
@@ -571,7 +495,9 @@ function handleCreate(req) {
         // sidecar, so checkpoint identity must remain unbound.
         extraArgs: { 'replay-user-messages': null },
         abortController: abort,
-        env: withFreshellContext(createClaudeSdkCleanEnv(process.env), req.freshellContext),
+        // The CLI reports when the session starts and stops working (T9):
+        // the server's turn accounting reads it (sdk.session.state).
+        env: withFreshellContext({ ...createClaudeSdkCleanEnv(process.env), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }, req.freshellContext),
         settingSources: ['user', 'project', 'local'],
         spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
         stderr: sdkStderr,
@@ -581,7 +507,7 @@ function handleCreate(req) {
           // AskUserQuestion routes first (even under bypassPermissions), then the
           // bypass fast-path, else park-and-surface a pending request — legacy
           // ordering, sdk-bridge.ts:203-214.
-          return routeCanUseTool({ session: s, emit, nanoid, nextMonotonic, sessionId, toolName, input, options })
+          return routeCanUseTool({ session: s, emit, nanoid, sessionId, toolName, input, options })
         },
       },
     })
@@ -647,34 +573,50 @@ async function bootSession({ req, sessionId, state, sdkQuery, streamDone }) {
   }
 }
 
+/** Why a malformed send is refused (the server mints a uuid for every send, and sends text). */
+const SEND_WITHOUT_UUID = 'This message has no valid message id, so it was not given to Claude.'
+const SEND_WITHOUT_TEXT = 'This message has no text, so it was not given to Claude.'
+const SESSION_NOT_HOSTED = 'Claude session is no longer available.'
+
+/**
+ * Refuse a send before it reaches the CLI. Nothing was queued, so the session
+ * goes on as it was; the server takes the send back (sdk.send.rejected).
+ */
+function rejectSend(req, code, message) {
+  const uuid = req.uuid ?? null
+  log('warn', 'send.rejected', { sessionId: req.sessionId, uuid, code, error: message })
+  emit({ type: 'sdk.send.rejected', sessionId: req.sessionId, uuid, code, message })
+}
+
 function handleSend(req) {
   const st = sessions.get(req.sessionId)
-  // ep3-r2 F2: the signed frame — when the JS session is gone but stdout stays
-  // open (consumeStream deleted it), NO terminal edge or EOF follows; the Rust
-  // busy tracker must fold this specific failure as provider-session death.
-  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
-  // ep4-r3: /compact is the only dispatch rollback ever absorbs; mark it so
-  // the quiesce handler can drain never-handed compacts from the input queue
-  // and so a same-tick handoff arms the BUSY-forcing handed flag.
-  const isCompact = /^\s*\/compact(\s|$)/.test(String(req.text ?? ''))
-  const checkpointAttempt = checkpointAttemptOf(req.checkpointAttempt)
+  // Not a session this sidecar hosts: refused like any send the CLI never
+  // saw, so the server takes it back.
+  if (!st) { rejectSend(req, 'SESSION_NOT_FOUND', SESSION_NOT_HOSTED); return }
+  // Every send carries the uuid the server minted for it. The SDKUserMessage
+  // carries it, so the CLI reports the command's lifecycle under it (T8) and
+  // writes the user line with it: it is the turn id the server announced.
+  if (!isUuid(req.uuid)) { rejectSend(req, 'INVALID_SEND', SEND_WITHOUT_UUID); return }
+  if (typeof req.text !== 'string') { rejectSend(req, 'INVALID_SEND', SEND_WITHOUT_TEXT); return }
+  let content
+  try {
+    content = userMessageContent(req.text, req.images)
+  } catch (error) {
+    rejectSend(req, error?.code ?? 'INVALID_SEND', errorText(error))
+    return
+  }
+  // A checkpoint attempt binds under the send's own uuid.
+  const checkpointAttempt = checkpointAttemptOf(req.checkpointAttempt && { ...req.checkpointAttempt, uuid: req.uuid })
   const userMessage = {
-      type: 'user',
-      message: { role: 'user', content: userMessageContent(req.text, req.images) },
-      parent_tool_use_id: null,
-      session_id: st.cliSessionId || 'default',
-      ...(checkpointAttempt ? { uuid: checkpointAttempt.uuid } : {}),
-    }
+    type: 'user',
+    message: { role: 'user', content },
+    parent_tool_use_id: null,
+    session_id: st.cliSessionId || 'default',
+    uuid: req.uuid,
+  }
   if (checkpointAttempt) rememberCheckpointAttempt(st.pendingCheckpointAttempts, checkpointAttempt)
-  st.inputStream.push(userMessage, isCompact)
-  // Unified attention bookkeeping: this send is now ACCEPTED (the input-stream
-  // push succeeded) and awaits exactly one terminal frame — a COUNTER, not a
-  // boolean: two queued sends leave it at 2 and the first result must drop it
-  // to 1, not 0 (a boolean would lose the second queued turn and its
-  // stream-exception ring). Deliberately NOT turnOpen, which only arms after
-  // the first assistant/system frame and cannot see the accept→first-message
-  // window. The gate is NOT reset here — see turn-complete-gate.mjs.
-  st.pendingResults += 1
+  rememberSend(st.lifecycle, req.uuid)
+  st.inputStream.push(userMessage)
 }
 
 async function handleConfigure(req) {
@@ -684,9 +626,9 @@ async function handleConfigure(req) {
     return
   }
   try {
-    const settings = await configureSession(st, req.settings ?? {}, {
-      busy: req.busy === true || st.turnOpen || st.handedCompactLikely,
-    })
+    // The server refuses a settings change while the session is busy (its
+    // turn ledger); a request that says it is busy is refused here too.
+    const settings = await configureSession(st, req.settings ?? {}, { busy: req.busy === true })
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings })
   } catch (err) {
     log('warn', 'configure.failed', { sessionId: req.sessionId, requestId: req.requestId, error: errorText(err) })
@@ -694,76 +636,32 @@ async function handleConfigure(req) {
   }
 }
 
-// kata 1wxv ep4 (rollback quiesce probe): rollback pre-teardown sends this
-// request instead of a bare interrupt — the answer is stream-ordered AFTER
-// every already-emitted frame and carries this sidecar's OWN queue truth:
-// - cancelledQueue: compact items DROPPED from the still-unhanded input
-//   queue (they provably never start — the SDK owns no reference to them);
-// - inFlightTurn / handedCompactLikely: evidence that provider work already
-//   crossed the un-cancellable handoff — rollback must refuse (BUSY).
-// The probeId echos for correlation ONLY: a quiesced frame fires exclusively
-// the rollback probe that registered it (stale/mismatched receipts never
-// close a live probe).
-function handleRollbackQuiesce(req) {
-  const st = sessions.get(req.sessionId)
-  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
-  const cancelledQueue = st.inputStream.drainCompacts()
-  emit({
-    type: 'sdk.rollback.quiesced',
-    sessionId: req.sessionId,
-    probeId: req.probeId ?? null,
-    cancelledQueue,
-    inFlightTurn: st.turnOpen === true,
-    handedCompactLikely: st.handedCompactLikely === true,
-  })
-}
-
-// Faithful port of `server/sdk-bridge.ts:785-793`'s `interrupt(sessionId)`:
-// `sp.query.interrupt().catch((err) => log.warn(...))` -- fire-and-forget, no reply on
-// success (the Rust side mirrors this: no confirmation frame is broadcast either).
+// The user's Stop (design §5.4). The server decides when to send it (never for
+// an idle session) and whether the stopped turn rings; the sidecar calls the
+// SDK's interrupt() and reports its receipt, echoing the Stop's id so the
+// server reads only its own receipt.
 function handleInterrupt(req) {
   const st = sessions.get(req.sessionId)
-  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
+  const settled = (fields) => emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, stopId: req.stopId ?? null, ...fields })
+  if (!st) { settled({ ok: false, message: SESSION_NOT_HOSTED }); return }
   // The transport is still open here (interrupt only signals), so resolving the
   // parked requests with deny is safe — and required so the SDK's canUseTool
   // await settles instead of hanging the interrupted turn.
   cancelPending(st, emit, req.sessionId, { resolveDeny: true })
-  // kata 1wxv focused ep4-r1 F1: a fire-and-forget interrupt() write proved
-  // NOTHING about completion — the gate's retirement at the request site once
-  // admitted rollback while the provider turn still ran (a delayed or REJECTED
-  // interrupt). The retirement evidence must be the SETTLED outcome: await the
-  // SDK call and emit a signed settle event in either case (rejection = the
-  // turn provably still running → the gate stays closed).
   if (!st.query?.interrupt) {
-    emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: 'no in-flight SDK query' })
+    settled({ ok: false, message: 'no in-flight SDK query' })
     return
   }
-  // Unified attention gate: arm the mark BEFORE the interrupt call — and ONLY
-  // while a turn is plausibly awaiting a terminal frame (pendingResults > 0).
-  // The SDK contract documents RESOLUTION — not rejection — for interrupting
-  // with NOTHING in flight (sdk.d.ts:2384-2394: "Interrupt the current query
-  // execution ... Older CLIs resolve to `undefined`"), so an idle-session
-  // interrupt (a late Stop click racing the busy-clear, or a double-click's
-  // second Stop) must arm NOTHING: a stray mark there would survive and eat
-  // the NEXT unrelated turn's result, silently suppressing exactly the ring
-  // this feature exists to produce. While a turn IS pending, the settle
-  // receipt (sdk.d.ts:3765) lands BEFORE the interrupted turn's own result,
-  // so the mark is consumed by exactly that result, and silences it only if
-  // the Stop landed (the result was aborted). A Stop that missed — the CLI was
-  // still starting (T13), or the turn finished first — leaves a result that
-  // rings. A REJECTED interrupt (the turn kept running) clears the mark;
-  // noteInterruptSettled stays in both promise arms — settle(true) without a
-  // mark is a no-op.
-  if (st.pendingResults > 0) st.turnCompleteGate.noteInterruptRequest()
   st.query.interrupt()
-    .then(() => {
-      st.turnCompleteGate.noteInterruptSettled(true)
-      emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: true })
+    .then((receipt) => {
+      // The receipt names the sent commands that survive the Stop and will
+      // still run (T12; a cold Stop may list the command it missed, T13).
+      const stillQueued = stillQueuedOf(receipt, st.lifecycle)
+      settled({ ok: true, ...(stillQueued ? { stillQueued } : {}) })
     })
     .catch((err) => {
-      st.turnCompleteGate.noteInterruptSettled(false)
-      log('warn', 'interrupt.failed', { sessionId: req.sessionId, error: errorText(err) })
-      emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: String(err?.message || err) })
+      log('warn', 'interrupt.failed', { sessionId: req.sessionId, stopId: req.stopId ?? null, error: errorText(err) })
+      settled({ ok: false, message: String(err?.message || err) })
     })
 }
 
@@ -797,7 +695,6 @@ rl.on('line', (line) => {
       break
     }
     case 'interrupt': handleInterrupt(req); break
-    case 'rollback.quiesce': handleRollbackQuiesce(req); break
     case 'permission.respond': {
       const st = sessions.get(req.sessionId)
       if (!st) break

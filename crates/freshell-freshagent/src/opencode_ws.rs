@@ -65,6 +65,11 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex as TokioMutex;
 
 use freshell_codex::next_monotonic_turn_complete_at;
+// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the
+// unified turn-end attention edge — emitted for ANY turn end except a
+// user-initiated interrupt, deliberately diverging from the legacy
+// status-guarded positive-completion chime of adapter.ts:377-381).
+use crate::attention::turn_complete_event;
 use freshell_opencode::{
     normalize_opencode_effort, normalize_opencode_model, ChangedReason, DaemonSignal,
     OpencodeServeManager, SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
@@ -8850,14 +8855,6 @@ pub(crate) fn changed_event(session_id: &str, reason: &str) -> Value {
 /// `session.error` SSE event as this frame IN ADDITION TO flagging `turnErrored`).
 fn error_event(session_id: &str, message: &str) -> Value {
     json!({ "type": "freshAgent.error", "sessionId": session_id, "message": message })
-}
-
-/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the
-/// unified turn-end attention edge — emitted for ANY turn end except a
-/// user-initiated interrupt, deliberately diverging from the legacy
-/// status-guarded positive-completion chime of adapter.ts:377-381).
-fn turn_complete_event(session_id: &str, at: i64) -> Value {
-    json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
 }
 
 /// Stamp the session's strictly-monotonic turn-complete clock and broadcast the

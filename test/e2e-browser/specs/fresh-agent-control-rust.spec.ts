@@ -703,15 +703,13 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         'a deny must never produce a success completion',
       ).toBe(true)
 
-      // D1-F2 WIRE TRUTH, unified contract: the fixture mirrors the real
-      // sidecar's gate — the denied turn's ERRORED result rings the SAME
-      // sdk.turn.complete edge a success would. A deny is an error turn
-      // end; only a user-initiated interrupt stays silent. Race-free: poll
-      // the outbound ledger until the errored result AND the edge that
-      // follows it exist, THEN assert the edge's exact-once shape — fenced
-      // BEFORE the follow-up send below (a LATER, legitimately-completing
-      // turn on the same session). Like the real sidecar, the turn ends with
-      // its result alone: no per-turn idle follows it.
+      // D1-F2 WIRE TRUTH: the fixture mirrors the real sidecar — the denied
+      // turn ends with its ERRORED result alone (no per-turn idle), and the
+      // fixture mints no attention edge: the server rings the result itself
+      // (C18), the SAME edge a success would. A deny is an error turn end;
+      // only a user-initiated interrupt stays silent. Race-free: poll the
+      // outbound ledger until the errored result exists — fenced BEFORE the
+      // follow-up send below (a LATER, legitimately-completing turn).
       const deniedBridgeId = respond.sessionId as string
       const denyWires = () => readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
       const denyResultIndex = (wires: any[]) => wires.findIndex(
@@ -720,34 +718,16 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       )
       await expect
         .poll(
-          () => {
-            const wires = denyWires()
-            const resultIdx = denyResultIndex(wires)
-            if (resultIdx === -1) return false
-            return wires
-              .slice(resultIdx)
-              .some((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId)
-          },
-          { timeout: 15_000, message: 'the errored sdk.result + the unified edge after it for the denied turn' },
+          () => denyResultIndex(denyWires()),
+          { timeout: 15_000, message: 'the errored sdk.result for the denied turn' },
         )
-        .toBe(true)
+        .toBeGreaterThanOrEqual(0)
       const wires = denyWires()
       const denyResultIdx = denyResultIndex(wires)
-      expect(denyResultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
-      const denyEdgeIdx = wires.findIndex(
-        (r, i) => i > denyResultIdx && r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId,
-      )
-      expect(denyEdgeIdx, 'the unified attention edge follows the errored result in stream order').toBeGreaterThan(denyResultIdx)
       expect(
-        Number.isFinite(wires[denyEdgeIdx]?.frame?.at),
-        'the edge carries a finite numeric monotonic at',
-      ).toBe(true)
-      expect(
-        wires
-          .slice(denyResultIdx)
-          .filter((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId),
-        'exactly one unified edge for the denied turn',
-      ).toHaveLength(1)
+        wires.filter((r) => r.frame?.type === 'sdk.turn.complete' || r.frame?.type === 'sdk.turn.waiting'),
+        'the fixture mints no attention edge: the server does',
+      ).toEqual([])
       expect(
         wires
           .slice(denyResultIdx)
@@ -760,7 +740,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         'the denial assistant frame did arrive on the wire',
       ).toBe(true)
 
-      // BROWSER-FACING contract: the deny's edge crossed the Rust rename and
+      // BROWSER-FACING contract: the server's edge for the denied result
       // folded in the browser as EXACTLY ONE new turnCompletion event
       // (seq 1 → 2), recorded under the bare completion namespace (distinct
       // from the waiting edge's `#waiting` bucket). The user is WATCHING

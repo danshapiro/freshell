@@ -64,12 +64,11 @@ pub(super) enum RegisterUnder {
 
 /// The per-session state a replacement runtime takes over from the runtime it
 /// replaces (an undo or redo, design §4.6): the turn lock a parked send waits
-/// on, the busy truth and the attention clock. Only the process changes.
+/// on, the turn ledger and the attention clock. Only the process changes.
 pub(super) struct InheritedRuntime {
     pub(super) turn_lock: Arc<TokioMutex<()>>,
-    pub(super) in_turn: Arc<std::sync::atomic::AtomicBool>,
-    pub(super) turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
-    pub(super) last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
+    pub(super) ledger: crate::claude_turns::SharedLedger,
+    pub(super) clock: crate::attention::AttentionClock,
 }
 
 /// What a launch's claim of the provider lease on a durable id found (design
@@ -700,21 +699,31 @@ impl FreshClaudeState {
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.clone()));
         log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        // A resume after an unrequested death continues the dead session's
+        // attention clock (design §5.5): its edges stay above the death's.
+        let resumed_clock = || {
+            [Some(map_key.as_str()), durable.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|id| self.dead_sessions.find(id))
+                .map(|dead| dead.clock)
+        };
         let InheritedRuntime {
             turn_lock,
-            in_turn,
-            turn_tracker,
-            // Task 5: the session's death-mint clock (see the field doc).
-            last_synthesized_complete_at,
+            ledger,
+            // The session's attention clock (see the field doc).
+            clock,
         } = inherit.unwrap_or_else(|| InheritedRuntime {
             turn_lock: Arc::new(TokioMutex::new(())),
-            in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-            last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+            ledger: crate::claude_turns::SharedLedger::default(),
+            clock: resumed_clock().unwrap_or_default(),
         });
-        // A just-booted session has announced nothing: no turn can be in flight
-        // before the client sends.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let (stdin, fault) = crate::claude_sidecar_io::SidecarWriter::spawn(
+            stdin,
+            log_labels,
+            crate::claude_sidecar_io::write_timeout(self.sidecar_environment.as_deref()),
+        );
+        self.watch_writer_failure(&map_key, &ownership_id, fault);
         {
             let mut sessions = self.sessions.lock().await;
             let consumer = self.spawn_consumer(
@@ -725,10 +734,8 @@ impl FreshClaudeState {
                 recorded_settings,
                 Arc::clone(&broadcast_id),
                 Arc::clone(&pending),
-                Arc::clone(&last_status),
-                Arc::clone(&in_turn),
-                Arc::clone(&turn_tracker),
-                Arc::clone(&last_synthesized_complete_at),
+                Arc::clone(&ledger),
+                clock.clone(),
                 provenance,
             );
             self.test_holds.registration().await;
@@ -756,18 +763,16 @@ impl FreshClaudeState {
                     owning_generation,
                     broadcast_id,
                     pending,
-                    in_turn,
-                    turn_tracker,
-                    last_synthesized_complete_at,
+                    ledger,
+                    clock,
                     turn_lock,
-                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                    last_status,
                     launch_genesis: genesis.map(|genesis| crate::identity_sink::RecordedGenesis {
                         genesis,
                         updated_at_ms: crate::rollback_record::now_ms(),
                     }),
                 },
             );
+            self.edges.registered(&map_key, &spec.session_type);
             // C09: a resumed session is live again, so it is no longer an ended
             // one. Forgotten before the lock is released, so a death of this new
             // incarnation is recorded after it, never forgotten by it.

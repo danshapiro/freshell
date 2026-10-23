@@ -72,8 +72,8 @@ const FAKE_PROGRAM = {
       ],
     },
     {
-      // The approval parks the turn (no completion follows) and the sidecar
-      // emits sdk.turn.waiting on the 0→1 pending transition.
+      // The approval parks the turn (no completion follows) and the server
+      // mints the waiting edge on the 0→1 pending transition.
       on: 'msg:send',
       match: { text: BACKGROUND_APPROVAL },
       emit: [
@@ -232,11 +232,14 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
         endedState.watchedCompletionByTab?.[tabA],
         'the turn ended while the user was in tab B (a watched mark means the tab move was late)',
       ).toBeUndefined()
-      // The mark came from the server's edge for a real turn, not a stand-in.
-      expect(wireFrames(eventsLog, 'sdk.turn.complete'), 'the sidecar ended the turn with the attention edge').toHaveLength(1)
+      // The mark came from the server's edge for a real turn's result, not a
+      // stand-in: the sidecar ended the turn with its result, and the server
+      // rang it (C18: the sidecar mints no edge).
+      expect(wireFrames(eventsLog, 'sdk.result').map((frame) => frame.subtype), 'the sidecar ended the turn with its result').toEqual(['success'])
+      expect(wireFrames(eventsLog, 'sdk.turn.complete'), 'the sidecar mints no edge').toHaveLength(0)
       expect(
         await receivedFreshAgentEvents(harness, 'freshAgent.turn.complete'),
-        'the server forwarded exactly one turn-complete edge to the client',
+        'the server sent exactly one turn-complete edge to the client',
       ).toHaveLength(1)
       await paneStatus().toBe('idle')
 
@@ -287,13 +290,14 @@ test.describe('mobile tab surfaces show needs-attention marks (G17)', () => {
         wireFrames(eventsLog, 'sdk.permission.request').map((frame) => frame.requestId),
         'the sidecar raised the scripted approval',
       ).toEqual([APPROVAL_REQUEST_ID])
-      expect(wireFrames(eventsLog, 'sdk.turn.waiting'), 'the sidecar emitted the waiting edge').toHaveLength(1)
+      expect(wireFrames(eventsLog, 'sdk.turn.waiting'), 'the sidecar mints no waiting edge').toHaveLength(0)
       expect(
         await receivedFreshAgentEvents(harness, 'freshAgent.turn.waiting'),
-        'the server forwarded exactly one waiting edge to the client',
+        'the server sent exactly one waiting edge to the client',
       ).toHaveLength(1)
-      // The approval parks the turn: no second turn-complete edge.
-      expect(wireFrames(eventsLog, 'sdk.turn.complete')).toHaveLength(1)
+      // The approval parks the turn: no second result, no second turn-complete edge.
+      expect(wireFrames(eventsLog, 'sdk.result')).toHaveLength(1)
+      expect(await receivedFreshAgentEvents(harness, 'freshAgent.turn.complete')).toHaveLength(1)
 
       await expect(otherTabsStatus, 'the waiting tab is counted like a finished one').toBeVisible()
       await expect(previousTab).toHaveAccessibleDescription('An earlier tab needs attention')

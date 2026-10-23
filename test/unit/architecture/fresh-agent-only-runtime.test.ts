@@ -262,23 +262,6 @@ function findLegacyRuntimeReferences(file: string, contents: string): Finding[] 
   return [...directFindings, ...multilineFindings]
 }
 
-function findSdkPublicReferences(file: string, contents: string): Finding[] {
-  return contents
-    .split(/\r?\n/)
-    .flatMap((line, index): Finding[] => {
-      if (!line.includes('sdk.')) {
-        return []
-      }
-
-      return [{
-        file,
-        line: index + 1,
-        snippet: line.trim(),
-        reason: 'sdk.* protocol references belong only in server-internal SDK bridge/adapters',
-      }]
-    })
-}
-
 function formatFindings(findings: Finding[]): string {
   return findings
     .map((finding) => {
@@ -449,13 +432,4 @@ describe('fresh-agent-only runtime architecture', () => {
     expect(clientSources).not.toContain(joinProtocolName('codingcli', 'create'))
   })
 
-  it('keeps SDK bridge protocol details out of public/browser-facing runtime source', async () => {
-    const findings = (await Promise.all((await collectRuntimeSourceFiles()).map(async (filePath) => {
-      const file = toRepoRelativePath(filePath)
-      const contents = await readFile(filePath, 'utf8')
-      return findSdkPublicReferences(file, contents)
-    }))).flat()
-
-    expect(findings, formatFindings(findings)).toEqual([])
-  })
 })

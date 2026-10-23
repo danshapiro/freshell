@@ -317,16 +317,15 @@ describe('frameLogRecord', () => {
 describe('framesForSdkMessage: what a status frame reports besides compacting', () => {
   const compactEnd = (scenario: string) => recorded(scenario).find((msg) => msg.type === 'system' && msg.subtype === 'status' && msg.status === null && msg.compact_result)!
 
-  it('a failed compaction is a notice with the CLI\'s reason; the turn that ran it is running again', () => {
+  it('a failed compaction is a notice with the CLI\'s reason; runtime status is computed in Rust', () => {
     expect(framesForSdkMessage('s1', compactEnd('compact-fail'), session(undefined, { turnPending: true }))).toEqual([
       { type: 'sdk.notice', sessionId: 's1', level: 'error', code: 'COMPACTION_FAILED', message: 'Error during compaction: API Error: 400 compaction refused by fake' },
-      { type: 'sdk.status', sessionId: 's1', status: 'running' },
     ])
   })
 
-  it('a finished compaction reports running only while a send is still waiting for its result', () => {
+  it('a finished compaction does not synthesize a runtime status', () => {
     expect(framesForSdkMessage('s1', compactEnd('compact-ok'), session(undefined, { turnPending: true })))
-      .toEqual([{ type: 'sdk.status', sessionId: 's1', status: 'running' }])
+      .toEqual([])
     expect(framesForSdkMessage('s1', compactEnd('compact-ok'), session(undefined, { turnPending: false }))).toEqual([])
     expect(framesForSdkMessage('s1', compactEnd('compact-fail'), session(undefined, { turnPending: false })).map((frame: Msg) => frame.type)).toEqual(['sdk.notice'])
   })

@@ -108,7 +108,9 @@ tracing = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `test-util` unlocks `#[tokio::test(start_paused = true)]`, so the shared quiet
+# deadman's waiter tests drive its window on a paused clock.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 # DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
 # to assert lifecycle events fire, without depending on the global subscriber
