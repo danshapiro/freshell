@@ -711,110 +711,97 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
     }
 }
 
+/// Collect the failure classes of fresh-agent launch errors from every
+/// thread, through the test binary's process-wide capture subscriber (one is
+/// installed before `main`, so this observes rather than installs).
 fn capture_fresh_launch_failure_classes() -> std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> {
-    use tracing_subscriber::prelude::*;
-    #[derive(Clone)]
-    struct FailureLayer(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FailureLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if !event.metadata().target().contains("fresh_agent_proxy")
-                && !event.metadata().target().contains("managed_mcp_capability")
-            {
-                return;
-            }
-            struct Classes(Vec<&'static str>);
-            impl tracing::field::Visit for Classes {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() != "error" {
-                        return;
-                    }
-                    let text = format!("{value:?}");
-                    for label in [
-                        "Claude native source selection changed",
-                        "HostUnreachable",
-                        "InvalidRequest",
-                        "ProviderInputsChanged",
-                        "prepare hosted provider config",
-                        "prepare hosted fresh-agent provider state",
-                        "prepare hosted OneCLI provider files",
-                        "open hosted",
-                        "OneCLI",
-                        "profile",
-                        "credential",
-                        "unsafe or mismatched",
-                        "MCP",
-                        "sidecar",
-                        "source",
-                        "manifest",
-                        "copy",
-                        "Permission",
-                        "unavailable",
-                        "initialization",
-                        "timed out",
-                        "Claude",
-                        "kilroy",
-                        "environment",
-                        "grant",
-                        "provider",
-                        "configuration",
-                        "refresh",
-                        "input bind",
-                        "trusted uid/group",
-                        "provider home",
-                        "resource",
-                        "destination",
-                        "projection",
-                        "stage",
-                        "metadata",
-                        "path",
-                        "readable",
-                        "preparation",
-                        "version",
-                        "changed",
-                        "rootless",
-                        "directory",
-                        "filesystem",
-                        "temporary",
-                        "failed to start",
-                        "failed with status",
-                        "original",
-                        "origins",
-                        "No such file",
-                        "resolve",
-                        "root",
-                        "budget",
-                        "bound",
-                        "pending",
-                        "committed",
-                        "publication",
-                        "source evidence",
-                        "source selection",
-                        "source provenance",
-                    ] {
-                        if text.contains(label) {
-                            self.0.push(label);
-                        }
+    let classes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = classes.clone();
+    crate::test_trace_capture::observe_all_events(move |event| {
+        if !event.metadata().target().contains("fresh_agent_proxy")
+            && !event.metadata().target().contains("managed_mcp_capability")
+        {
+            return;
+        }
+        struct Classes(Vec<&'static str>);
+        impl tracing::field::Visit for Classes {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() != "error" {
+                    return;
+                }
+                let text = format!("{value:?}");
+                for label in [
+                    "Claude native source selection changed",
+                    "HostUnreachable",
+                    "InvalidRequest",
+                    "ProviderInputsChanged",
+                    "prepare hosted provider config",
+                    "prepare hosted fresh-agent provider state",
+                    "prepare hosted OneCLI provider files",
+                    "open hosted",
+                    "OneCLI",
+                    "profile",
+                    "credential",
+                    "unsafe or mismatched",
+                    "MCP",
+                    "sidecar",
+                    "source",
+                    "manifest",
+                    "copy",
+                    "Permission",
+                    "unavailable",
+                    "initialization",
+                    "timed out",
+                    "Claude",
+                    "kilroy",
+                    "environment",
+                    "grant",
+                    "provider",
+                    "configuration",
+                    "refresh",
+                    "input bind",
+                    "trusted uid/group",
+                    "provider home",
+                    "resource",
+                    "destination",
+                    "projection",
+                    "stage",
+                    "metadata",
+                    "path",
+                    "readable",
+                    "preparation",
+                    "version",
+                    "changed",
+                    "rootless",
+                    "directory",
+                    "filesystem",
+                    "temporary",
+                    "failed to start",
+                    "failed with status",
+                    "original",
+                    "origins",
+                    "No such file",
+                    "resolve",
+                    "root",
+                    "budget",
+                    "bound",
+                    "pending",
+                    "committed",
+                    "publication",
+                    "source evidence",
+                    "source selection",
+                    "source provenance",
+                ] {
+                    if text.contains(label) {
+                        self.0.push(label);
                     }
                 }
             }
-            let mut classes = Classes(Vec::new());
-            event.record(&mut classes);
-            self.0.lock().unwrap().extend(classes.0);
         }
-    }
-    let classes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::registry().with(FailureLayer(classes.clone())),
-    )
-    .unwrap();
+        let mut found = Classes(Vec::new());
+        event.record(&mut found);
+        sink.lock().unwrap().extend(found.0);
+    });
     classes
 }
 
