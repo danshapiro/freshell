@@ -9,6 +9,13 @@
 //! - Exit report ([`ClaudeTestHolds::hold_exit_report`]): the end-of-output path
 //!   parks after it recorded the dead session, before it reaps the sidecar and
 //!   reports the exit, so a resume can land while the dead sidecar is reaped.
+//! - Rollback boot ([`ClaudeTestHolds::hold_rollback_boot`]): an undo or redo
+//!   parks after it wrote its durable record, holding the session's turn lock,
+//!   before it boots the replacement runtime, so a test can park a send behind
+//!   it or change the transcript store under it.
+//! - Fork child ([`ClaudeTestHolds::hold_fork_child`]): a fork parks once its
+//!   child runtime is established, before it records the child's binding row,
+//!   so a test can close the parent while the child is still booting.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,28 +26,39 @@ use tokio::sync::Notify;
 #[derive(Default)]
 pub(crate) struct ClaudeTestHolds {
     registration: Mutex<Option<Duration>>,
-    exit_report: Mutex<Option<Arc<ExitReportHold>>>,
+    exit_report: Mutex<Option<Arc<StepHold>>>,
+    rollback_boot: Mutex<Option<Arc<StepHold>>>,
+    fork_child: Mutex<Option<Arc<StepHold>>>,
 }
 
-/// A parked exit report: [`Self::parked`] returns once an end-of-output path
-/// reached the hold, and the report goes on after [`Self::release`].
+/// One parked step: [`Self::parked`] returns once the step reached the hold,
+/// and the step goes on after [`Self::release`].
 #[derive(Default)]
-pub struct ExitReportHold {
+pub struct StepHold {
     parked: Notify,
     release: Notify,
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl ExitReportHold {
-    /// Wait until an end-of-output path is parked at the hold.
+impl StepHold {
+    /// Wait until the step is parked at the hold.
     pub async fn parked(&self) {
         self.parked.notified().await;
     }
 
-    /// Let the parked exit report go on.
+    /// Let the parked step go on.
     pub fn release(&self) {
         // `notify_one` keeps a permit for a waiter that has not arrived yet.
         self.release.notify_one();
+    }
+}
+
+impl StepHold {
+    /// Park here until released (a test's hold).
+    async fn park(&self) {
+        // `notify_one` keeps a permit for a test that is not waiting yet.
+        self.parked.notify_one();
+        self.release.notified().await;
     }
 }
 
@@ -55,9 +73,27 @@ impl ClaudeTestHolds {
     /// Park every later end-of-output path before it reaps the sidecar and
     /// reports the exit, until the returned hold is released.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn hold_exit_report(&self) -> Arc<ExitReportHold> {
-        let hold = Arc::new(ExitReportHold::default());
+    pub(crate) fn hold_exit_report(&self) -> Arc<StepHold> {
+        let hold = Arc::new(StepHold::default());
         *self.exit_report.lock().expect("exit report hold lock") = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Park every later undo or redo before it boots its replacement runtime,
+    /// until the returned hold is released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_rollback_boot(&self) -> Arc<StepHold> {
+        let hold = Arc::new(StepHold::default());
+        *self.rollback_boot.lock().expect("rollback boot hold lock") = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Park every later fork once its child runtime is established, before it
+    /// records the child's binding row, until the returned hold is released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_fork_child(&self) -> Arc<StepHold> {
+        let hold = Arc::new(StepHold::default());
+        *self.fork_child.lock().expect("fork child hold lock") = Some(Arc::clone(&hold));
         hold
     }
 
@@ -77,9 +113,31 @@ impl ClaudeTestHolds {
             .expect("exit report hold lock")
             .clone();
         if let Some(hold) = hold {
-            // `notify_one` keeps a permit for a test that is not waiting yet.
-            hold.parked.notify_one();
-            hold.release.notified().await;
+            hold.park().await;
+        }
+    }
+
+    /// The rollback-boot hold, if a test set one.
+    pub(crate) async fn rollback_boot(&self) {
+        let hold = self
+            .rollback_boot
+            .lock()
+            .expect("rollback boot hold lock")
+            .clone();
+        if let Some(hold) = hold {
+            hold.park().await;
+        }
+    }
+
+    /// The fork-child hold, if a test set one.
+    pub(crate) async fn fork_child(&self) {
+        let hold = self
+            .fork_child
+            .lock()
+            .expect("fork child hold lock")
+            .clone();
+        if let Some(hold) = hold {
+            hold.park().await;
         }
     }
 }

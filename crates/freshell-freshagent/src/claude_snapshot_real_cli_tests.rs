@@ -482,3 +482,164 @@ fn native_history_shows_compaction_command_output_errors_and_image_placeholders(
             .contains("iVBORw0KGgo"));
     }
 }
+
+/// The one chain line (it has a uuid) whose message text starts with `prefix`.
+fn line_starting(transcript: &str, prefix: &str) -> Value {
+    let matches: Vec<Value> = fixture_lines(transcript)
+        .into_iter()
+        .filter(|line| line["uuid"].is_string() && message_text(line).starts_with(prefix))
+        .collect();
+    assert_eq!(matches.len(), 1, "one line starting {prefix:?}");
+    matches.into_iter().next().unwrap()
+}
+
+/// N7 (core design §4.5): a rollback step starts where the pane shows a turn
+/// the user started. On real CLI 2.1.237 lines: a prompt and a slash-command
+/// invocation (`/compact`, `/cost` written as `/usage`, `/context`) anchor a
+/// step; the CLI's caveat (meta), the command's own `<local-command-stdout>`
+/// line, the compaction summary, a task notification and a tool-result
+/// carrier never do.
+#[test]
+fn the_rollback_anchor_is_a_prompt_or_a_slash_command_on_real_cli_lines() {
+    let compact = real_cli_fixture!("compact-ok");
+    for prefix in [
+        "hi there",
+        "after compact",
+        "<command-name>/compact</command-name>",
+        "<command-name>/usage</command-name>",
+        "<command-name>/context</command-name>",
+    ] {
+        assert!(
+            is_rollback_anchor(&line_starting(compact, prefix)),
+            "{prefix:?} anchors a step"
+        );
+    }
+    let caveat = fixture_lines(compact)
+        .into_iter()
+        .find(|line| line["isMeta"] == json!(true))
+        .expect("a caveat line");
+    assert!(!is_rollback_anchor(&caveat), "the caveat (meta)");
+    assert!(!is_rollback_anchor(&line_starting(
+        compact,
+        "<local-command-stdout>Compacted"
+    )));
+    let summary = fixture_lines(compact)
+        .into_iter()
+        .find(|line| line["isCompactSummary"] == json!(true))
+        .expect("the compaction summary");
+    assert!(!is_rollback_anchor(&summary), "the compaction summary");
+    let cost_output = fixture_lines(compact)
+        .into_iter()
+        .find(|line| line["subtype"] == json!("local_command"))
+        .expect("a local command's output");
+    assert!(
+        !is_rollback_anchor(&cost_output),
+        "a local command's output"
+    );
+
+    let agent = real_cli_fixture!("agent-async");
+    assert!(is_rollback_anchor(&line_starting(
+        agent,
+        "GO delegate in the background"
+    )));
+    let notification = fixture_lines(agent)
+        .into_iter()
+        .find(|line| line["origin"]["kind"] == json!("task-notification"))
+        .expect("the task notification");
+    assert!(!is_rollback_anchor(&notification), "a task notification");
+    let carrier = fixture_lines(agent)
+        .into_iter()
+        .find(|line| line["type"] == json!("user") && message_text(line).is_empty())
+        .expect("a tool-result carrier");
+    assert!(!is_rollback_anchor(&carrier), "a tool-result carrier");
+}
+
+/// Undo steps match the turns the pane renders: "undo to" the `/compact`
+/// command's output row undoes the `/compact` step whole (command plus
+/// output), and the composer gets back what the user typed.
+#[test]
+fn undoing_a_slash_command_step_takes_its_output_with_it_on_real_cli_lines() {
+    let transcript = real_cli_fixture!("compact-ok");
+    let command = uuid_of(transcript, |line| {
+        message_text(line).starts_with("<command-name>/compact</command-name>")
+    });
+    let output = uuid_of(transcript, |line| {
+        message_text(line).starts_with("<local-command-stdout>Compacted")
+    });
+    let point = resolve_resume_point(transcript, "s", ResumeTarget::ToTurn(output.clone()))
+        .expect("resolves");
+    let removed: Vec<&str> = point
+        .removed_turns
+        .iter()
+        .filter_map(|turn| turn["turnId"].as_str())
+        .collect();
+    assert_eq!(
+        removed.first().copied(),
+        Some(command.as_str()),
+        "{removed:?}"
+    );
+    assert!(removed.contains(&output.as_str()), "{removed:?}");
+    assert_eq!(point.prompt_text, "/compact keep it short");
+}
+
+/// A task notification starts no step of its own: undoing the last step of a
+/// session whose background agent reported back undoes the prompt that
+/// launched it, notification turn included.
+#[test]
+fn a_task_notification_turn_belongs_to_the_step_before_it_on_real_cli_lines() {
+    let transcript = real_cli_fixture!("agent-async");
+    let point = resolve_resume_point(transcript, "s", ResumeTarget::Step).expect("resolves");
+    assert_eq!(
+        point.resume_at_uuid, None,
+        "the only step is the first prompt"
+    );
+    assert_eq!(point.prompt_text, "GO delegate in the background");
+    let reply = uuid_of(transcript, |line| {
+        message_text(line) == "The background check finished."
+    });
+    assert!(point
+        .removed_turns
+        .iter()
+        .any(|turn| turn["turnId"] == json!(reply)));
+}
+
+/// The `resumeDropsTurn` guard declares ONE turn (the CLI refuses a range
+/// holding a second prompt): it is armed only when the discarded part of the
+/// fork's parent is exactly one prompted turn, and never for a slash
+/// command's step, whose output line the CLI does not attribute to it.
+#[test]
+fn the_drops_turn_guard_is_armed_only_for_one_prompted_turn() {
+    let transcript = real_cli_fixture!("compact-ok");
+    let after_compact = uuid_of(transcript, |line| message_text(line) == "after compact");
+    let reply_four = uuid_of(transcript, |line| message_text(line) == "reply 4");
+    let before_after_compact = fixture_lines(transcript)
+        .into_iter()
+        .find(|line| line["uuid"] == json!(after_compact))
+        .and_then(|line| line["parentUuid"].as_str().map(str::to_string))
+        .expect("a parent");
+    // Keeping everything before "after compact" discards it AND the two
+    // commands after it: more than one turn, so no guard.
+    assert_eq!(
+        drops_turn_guard(transcript, Some(&before_after_compact)),
+        None
+    );
+    // Keeping through reply 4 discards only the `/usage` and `/context`
+    // command steps: commands, so no guard.
+    assert_eq!(drops_turn_guard(transcript, Some(&reply_four)), None);
+    // Undoing the failed `/compact` at the tip of compact-fail discards one
+    // command step: commands are never guarded.
+    let failed = real_cli_fixture!("compact-fail");
+    let point = resolve_resume_point(failed, "s", ResumeTarget::Step).expect("resolves");
+    assert_eq!(point.prompt_text, "/compact");
+    assert_eq!(
+        drops_turn_guard(failed, point.resume_at_uuid.as_deref()),
+        None
+    );
+    // Undoing "third msg" there discards it and the `/compact`: two turns.
+    let third = uuid_of(failed, |line| message_text(line) == "third msg");
+    let point = resolve_resume_point(failed, "s", ResumeTarget::ToTurn(third)).expect("resolves");
+    assert_eq!(
+        drops_turn_guard(failed, point.resume_at_uuid.as_deref()),
+        None
+    );
+}

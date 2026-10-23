@@ -15,6 +15,7 @@ import reducer, {
   sessionSnapshotReceived,
   setSessionStatus,
 } from '@/store/freshAgentSlice'
+import { getCanonicalDurableSessionId } from '@/store/persistControl'
 
 describe('freshAgentSlice busy/streaming clearing', () => {
   const loc = { sessionId: 'abc', sessionType: 'freshclaude' as const, provider: 'claude' as const }
@@ -210,6 +211,51 @@ describe('freshAgentSlice', () => {
     const lostGhost = markSessionLost({ sessionId: 's-ghost', sessionType: 'freshclaude', provider: 'claude' })
     expect(() => reducer(undefined, lostGhost)).not.toThrow()
     expect(reducer(undefined, lostGhost).sessions).toEqual({})
+  })
+})
+
+describe('freshAgentSlice claude rollback re-key', () => {
+  // Core design §4.5 (C13): an undo or redo replaces the pane's session with a
+  // new durable session C, announced by `materialized` (placeholder → C). C
+  // reports no init until its first prompt (T1), so the durable id the pane
+  // resumes by must come from the re-key itself, never stay the replaced
+  // session's (which would point the pane back at the stopped original).
+  it('a claude re-key makes the materialized durable id the session\'s durable id', () => {
+    const A = '00000000-0000-4000-8000-0000000000aa'
+    const C = '00000000-0000-4000-8000-0000000000cc'
+    let state = reducer(undefined, sessionInit({
+      sessionId: 'placeholder-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      cliSessionId: A,
+    }))
+    state = reducer(state, materializeSession({
+      previousSessionId: 'placeholder-1',
+      sessionId: C,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    }))
+    const session = state.sessions[makeFreshAgentSessionKey({ sessionId: C, sessionType: 'freshclaude', provider: 'claude' })]
+    expect(session.cliSessionId).toBe(C)
+    expect(getCanonicalDurableSessionId(session)).toBe(C)
+  })
+
+  it('a re-key to a non-durable id keeps the session\'s durable id', () => {
+    const A = '00000000-0000-4000-8000-0000000000aa'
+    let state = reducer(undefined, sessionInit({
+      sessionId: 'placeholder-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      cliSessionId: A,
+    }))
+    state = reducer(state, materializeSession({
+      previousSessionId: 'placeholder-1',
+      sessionId: 'placeholder-2',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    }))
+    const session = state.sessions[makeFreshAgentSessionKey({ sessionId: 'placeholder-2', sessionType: 'freshclaude', provider: 'claude' })]
+    expect(session.cliSessionId).toBe(A)
   })
 })
 

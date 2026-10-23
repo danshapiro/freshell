@@ -1135,6 +1135,7 @@ async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route(
             permission_mode: None,
             effort: Some("high".to_string()),
             cwd: Some("/real/project".to_string()),
+            plugins: None,
         },
     );
     sink.recorded
@@ -1301,6 +1302,7 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
     // exactly what the unconditional materialization write produces for a
     // default create) still answers `lookup_by_create_request_id`.
     sink.record_binding(FreshAgentBindingUpsert {
+        genesis: crate::identity_sink::GenesisUpdate::Keep,
         name_transition: None,
         provider: "opencode".into(),
         session_id: "ses_placeholder_resumed".into(),
@@ -1682,6 +1684,7 @@ async fn rest_resume_body_model_and_effort_beat_the_ledger_record() {
             permission_mode: None,
             effort: Some("high".to_string()),
             cwd: None,
+            plugins: None,
         },
     );
     sink.recorded

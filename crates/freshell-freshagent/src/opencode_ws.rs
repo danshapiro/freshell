@@ -1797,6 +1797,7 @@ impl FreshOpencodeState {
                     permission_mode: None,
                     effort: session.effort.clone(),
                     cwd: session.cwd.clone(),
+                    plugins: None,
                 },
             )
         };
@@ -1912,6 +1913,7 @@ impl FreshOpencodeState {
             // PRE-PARK capture above — the row's state before this
             // handler's own re-park).
             binding_write_rollback = Some(crate::identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
                 mode: SESSION_TYPE.into(),
@@ -1937,6 +1939,7 @@ impl FreshOpencodeState {
             });
             let _ = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: durable_id.clone(),
                     mode: SESSION_TYPE.into(),
@@ -1960,6 +1963,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort,
                         cwd,
+                        plugins: None,
                     },
                 })
                 .await;
@@ -2526,6 +2530,7 @@ impl FreshOpencodeState {
             // the pane answers the typed recoverable error.
             if let Err(e) = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: durable_id.clone(),
                     mode: SESSION_TYPE.into(),
@@ -2576,6 +2581,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort: session.effort.clone(),
                         cwd: session.cwd.clone(),
+                        plugins: None,
                     },
                 })
                 .await
@@ -2687,6 +2693,7 @@ impl FreshOpencodeState {
             // `Inherit` and the ledger merge preserves them).
             let _ = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: acked_session_id.clone(),
                     mode: SESSION_TYPE.into(),
@@ -2706,6 +2713,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort: session.effort.clone(),
                         cwd: session.cwd.clone(),
+                        plugins: None,
                     },
                 })
                 .await;
@@ -3162,6 +3170,7 @@ impl FreshOpencodeState {
         if let Some(durable_id) = durable_id {
             let _ = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: durable_id,
                     mode: SESSION_TYPE.into(),
@@ -3180,6 +3189,7 @@ impl FreshOpencodeState {
                         permission_mode: None,
                         effort: effort.clone(),
                         cwd,
+                        plugins: None,
                     },
                 })
                 .await;
@@ -5998,6 +6008,7 @@ impl FreshOpencodeState {
         // claim typed.
         if let Err(e) = self
             .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
                 // Unified agent names: no naming fact on this ledger edge
                 // (the fork's naming classification is driven by its
                 // dedicated lane).
@@ -6022,6 +6033,7 @@ impl FreshOpencodeState {
                     permission_mode: None,
                     effort,
                     cwd: child_cwd.clone(),
+                    plugins: None,
                 },
             })
             .await
@@ -7609,6 +7621,7 @@ impl FreshOpencodeState {
                     permission_mode: None,
                     effort: rec.effort.clone(),
                     cwd,
+                    plugins: None,
                 }
             } else {
                 crate::identity_sink::FreshAgentSettings::default()
@@ -7620,6 +7633,7 @@ impl FreshOpencodeState {
             // committed Live.
             if let Err(e) = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: session_id.to_string(),
                     mode: SESSION_TYPE.into(),
@@ -14171,6 +14185,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake);
@@ -14213,6 +14228,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());
@@ -14290,6 +14306,7 @@ mod tests {
         let (state, mut rx) = state_with_durable_serve_session().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
             session_id: DURABLE_ID.into(),
             mode: "freshopencode".into(),
@@ -14351,6 +14368,7 @@ mod tests {
         // The lineage-only seed (blank settings — same construction the Task 3
         // keying test uses).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
             session_id: DURABLE_ID.into(),
             mode: "freshopencode".into(),
@@ -14675,6 +14693,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake);
@@ -14749,6 +14768,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());
@@ -15188,6 +15208,7 @@ mod tests {
         // answers None). Same fixture as
         // `lineage_only_binding_does_not_arm_settings_reset_on_resume`.
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
             session_id: DURABLE_ID.into(),
             mode: "freshopencode".into(),
@@ -15276,6 +15297,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());
@@ -15458,6 +15480,7 @@ mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         // The durable row from the pre-restart connection: settings + stamps.
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
             session_id: DURABLE_ID.into(),
             mode: "freshopencode".into(),
@@ -15482,6 +15505,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         })
         .await
@@ -15564,6 +15588,7 @@ mod tests {
         // A settings-bearing row with NO stamps (an explicit upsert, not the
         // seed helper, so the row unambiguously has them unset).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
             session_id: DURABLE_ID.into(),
             mode: "freshopencode".into(),
@@ -15583,6 +15608,7 @@ mod tests {
                 permission_mode: None,
                 effort: Some("high".into()),
                 cwd: Some("/real/project".into()),
+                plugins: None,
             },
         })
         .await
@@ -15719,6 +15745,7 @@ mod tests {
         // The parent's durable row knows the attribution (lineage-only
         // payload: no settings ride the seed).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
             session_id: DURABLE_ID.into(),
             mode: "freshopencode".into(),
@@ -15808,6 +15835,7 @@ mod tests {
         // A stamped LINEAGE-ONLY row (blank settings): the only gate driver
         // here would be the provenance — exactly Finding 2's shape.
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             provider: "opencode".into(),
             session_id: DURABLE_ID.into(),
             mode: "freshopencode".into(),

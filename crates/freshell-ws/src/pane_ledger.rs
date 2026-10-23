@@ -868,6 +868,23 @@ pub struct BindingRow {
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// G15: the claude pane's local plugin directories, which every launch of
+    /// the session hands to the sidecar again. Serde-optional under
+    /// LEDGER_VERSION 1: older rows parse to `None` (the resume then has
+    /// only the request's plugins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<String>>,
+    /// Claude core design §4.1: how a session that has no transcript yet came
+    /// to be (`{"kind":"fresh"}`, or a lazy fork of a parent at a point). The
+    /// claude lane owns the shape (`freshell_freshagent::ClaudeGenesis`); the
+    /// ledger keeps it opaque, as it keeps the rollback payload. It stays
+    /// until the transcript has been observed on disk: every binding write
+    /// that is not about the genesis keeps it ([`GenesisWrite::Keep`]), so a
+    /// launch before the first transcript flush boots the same conversation
+    /// again and reconcile restarts the session instead of declaring it dead.
+    /// Serde-optional under LEDGER_VERSION 1: older rows parse to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis: Option<serde_json::Value>,
     /// D8 (restore-open-sessions-only) provenance: the browser client + tab
     /// this binding was created from. What a write DOES with them is the
     /// tri-state [`ProvenancePolicy`] on the write structs (delta-r2 Finding
@@ -1277,6 +1294,34 @@ pub struct ReattachWrite<'a> {
     pub now_ms: i64,
 }
 
+/// What a fresh-agent binding write does to the row's genesis
+/// ([`BindingRow::genesis`], claude core design §4.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum GenesisWrite<'a> {
+    /// The row keeps the genesis it has (a new row has none). Every write that
+    /// is not about the genesis: settings, provenance, ownership refreshes.
+    #[default]
+    Keep,
+    /// The row's genesis becomes this value (the write that mints a session
+    /// with no transcript yet).
+    Set(&'a serde_json::Value),
+    /// The row has no genesis: its transcript has been observed on disk.
+    Clear,
+}
+
+impl<'a> GenesisWrite<'a> {
+    /// The write for a lane's genesis update (the identity sink's
+    /// `GenesisUpdate`): `set` is the stored value of a new genesis, `clear` an
+    /// explicit clear; neither keeps the row's genesis.
+    pub fn from_update(set: Option<&'a serde_json::Value>, clear: bool) -> Self {
+        match (set, clear) {
+            (Some(genesis), _) => Self::Set(genesis),
+            (None, true) => Self::Clear,
+            (None, false) => Self::Keep,
+        }
+    }
+}
+
 /// One fresh-agent identity event's worth of binding-row input (P1.13).
 /// Settings are a FULL snapshot: callers always know the current values,
 /// so writes replace rather than merge.
@@ -1291,6 +1336,13 @@ pub struct FreshAgentBindingWrite<'a> {
     pub sandbox: Option<&'a str>,
     pub permission_mode: Option<&'a str>,
     pub effort: Option<&'a str>,
+    /// G15: the claude pane's plugin directories (part of the settings
+    /// snapshot this write records).
+    pub plugins: Option<&'a [String]>,
+    /// What this write does to the row's genesis ([`BindingRow::genesis`]).
+    /// Not part of the settings snapshot: a write that only records settings
+    /// keeps the genesis.
+    pub genesis: GenesisWrite<'a>,
     /// G3 supersession (V8/A14): the OLD session id this binding replaces
     /// (codex crash-respawn). When `Some`, the old `(provider, supersedes)`
     /// row is retired and linked AFTER the new row persists.
@@ -2236,6 +2288,10 @@ impl PaneLedger {
             sandbox: None,
             permission_mode: None,
             effort: None,
+            plugins: None,
+            // A terminal row records no genesis (the terminal CLI writes its
+            // own transcript; reconcile's terminal carve-out covers it).
+            genesis: None,
             client_instance_id,
             device_id,
             tab_key,
@@ -2758,6 +2814,17 @@ impl PaneLedger {
             sandbox: w.sandbox.map(str::to_string),
             permission_mode: w.permission_mode.map(str::to_string),
             effort: w.effort.map(str::to_string),
+            plugins: w.plugins.map(<[String]>::to_vec),
+            // Claude core design §4.1: the genesis is not part of the
+            // settings snapshot. Only the write that mints a pending session
+            // sets it and only the transcript's observation clears it; every
+            // other write keeps the same-key row's (a fork-chain child never
+            // inherits its parent's).
+            genesis: match w.genesis {
+                GenesisWrite::Keep => existing.and_then(|r| r.genesis.clone()),
+                GenesisWrite::Set(genesis) => Some(genesis.clone()),
+                GenesisWrite::Clear => None,
+            },
             client_instance_id,
             device_id,
             tab_key,
@@ -4527,9 +4594,45 @@ impl PaneLedger {
             .cloned()
     }
 
+    /// The row's genesis ([`BindingRow::genesis`]), bound or retired; `None`
+    /// when the row has none or there is no row. Memory-only.
+    pub fn binding_genesis(&self, provider: &str, session_id: &str) -> Option<serde_json::Value> {
+        self.root.as_ref()?;
+        self.guard()
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .and_then(|row| row.genesis.clone())
+    }
+
+    /// Drop the row's genesis: its transcript has been observed on disk
+    /// (claude core design §4.1). Everything else on the row stays. `Ok(false)`
+    /// with no write when there is no row or the row has no genesis.
+    pub fn clear_binding_genesis(
+        &self,
+        provider: &str,
+        session_id: &str,
+        now_ms: i64,
+    ) -> std::io::Result<bool> {
+        let Some(root) = &self.root else {
+            return Ok(false);
+        };
+        let mut index = self.guard();
+        let key = (provider.to_string(), session_id.to_string());
+        let Some(row) = index.bindings.get(&key).filter(|row| row.genesis.is_some()) else {
+            return Ok(false);
+        };
+        let row = BindingRow {
+            genesis: None,
+            updated_at: now_ms,
+            ..row.clone()
+        };
+        self.write_binding(root, &mut index, &row)?;
+        Ok(true)
+    }
+
     /// Fresh-agent Task 3 (`was_recorded` rekeying): true iff a FRESH-AGENT
     /// binding row carrying a SETTINGS-BEARING snapshot exists for this key —
-    /// at least one of model/sandbox/permission_mode/effort/cwd set (the exact
+    /// at least one of model/sandbox/permission_mode/effort/cwd/plugins set (the exact
     /// complement of the identity sink's `load_settings` blank guard, so the
     /// two predicates can never disagree). A lineage-only row (every settings
     /// column blank) answers false: unconditional lineage recording can never
@@ -4545,7 +4648,8 @@ impl PaneLedger {
                         || r.sandbox.is_some()
                         || r.permission_mode.is_some()
                         || r.effort.is_some()
-                        || r.cwd.is_some())
+                        || r.cwd.is_some()
+                        || r.plugins.is_some())
             })
             .unwrap_or(false)
     }

@@ -8225,6 +8225,112 @@ describe('FreshAgentView', () => {
     })
   })
 
+  // C14 (G09): a claude conversation forks (the server stamps capabilities.fork).
+  // Decision 5: the pane opens the forked child as soon as the server reports it,
+  // before anything is sent there, and closes the parent.
+  it.each(['freshclaude', 'kilroy'] as const)('offers fork for a %s conversation and opens the forked child at once', async (sessionType) => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
+    const parent = CLAUDE_THREAD_ID
+    const child = '7c1d0e2f-3a4b-4c5d-8e6f-0a1b2c3d4e5f'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: true },
+      turns: [
+        {
+          id: 'turn-claude-user-1',
+          turnId: 'turn-claude-user-1',
+          role: 'user',
+          summary: 'first prompt',
+          items: [{ id: 'item-claude-user-1', kind: 'text', text: 'first prompt' }],
+        },
+        {
+          id: 'turn-claude-answer-1',
+          turnId: 'turn-claude-answer-1',
+          role: 'assistant',
+          summary: 'first answer',
+          items: [{ id: 'item-claude-answer-1', kind: 'text', text: 'first answer' }],
+        },
+      ],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType,
+        provider: 'claude',
+        createRequestId: 'req-claude-fork',
+        sessionId: parent,
+        sessionRef: { provider: 'claude', sessionId: parent },
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // Both fork affordances are offered: /fork in the slash menu and the
+    // per-turn "Fork conversation from here" action.
+    await screen.findByText('first answer')
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+    const menu = await screen.findByRole('menu', { name: 'Slash commands' })
+    expect(within(menu).getByRole('menuitem', { name: /\/fork/ })).toBeInTheDocument()
+    fireEvent.keyDown(menu, { key: 'Escape' })
+    const forkActions = await screen.findAllByRole('button', { name: 'Fork conversation from here' })
+    wsMock.send.mockClear()
+    fireEvent.click(forkActions[0])
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.fork',
+      requestId: 'req-claude-fork',
+      sessionId: parent,
+      sessionType,
+      provider: 'claude',
+      tabId: 'tab-1',
+      input: { atTurnId: 'turn-claude-user-1' },
+    }))
+
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.forked',
+        requestId: 'req-claude-fork',
+        parentSessionId: parent,
+        sessionId: child,
+        sessionType,
+        provider: 'claude',
+        runtimeProvider: 'claude',
+        sessionRef: { provider: 'claude', sessionId: child },
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('expected fresh-agent pane')
+      expect(layout.content.sessionId).toBe(child)
+      expect(layout.content.sessionRef).toEqual({ provider: 'claude', sessionId: child })
+      expect(layout.content.createRequestId).not.toBe('req-claude-fork')
+    })
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: parent,
+      sessionType,
+      provider: 'claude',
+    }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.send' }))
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, 'claude', child, expect.any(Object))
+    })
+  })
+
   it('does not stop the containing soul when the managed runtime already retired the fork parent', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined

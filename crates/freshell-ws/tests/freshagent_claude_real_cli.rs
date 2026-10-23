@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::claude_rig::{ClaudeRig, RigKind};
+use common::claude_rig::{ClaudeRig, RigKind, RigOptions};
 use common::log_capture::{self, CapturedEvent};
 use serde_json::json;
 use tracing::Level;
@@ -213,8 +213,314 @@ async fn a_forwarded_turn_complete_is_logged(kind: RigKind) {
     assert_eq!(edges.len(), 1, "one logged edge per edge sent: {edges:?}");
 }
 
+/// Design §11.5 item 10, zero-turn restart: a session created and never sent to
+/// has no transcript yet (T3). After a restart its pane's attach boots it again
+/// from the `Fresh` genesis its binding row records, under its own id; its first
+/// turn writes that id's transcript, and the genesis is then cleared (§4.1).
+async fn a_zero_turn_session_restarts_fresh_under_its_own_id(kind: RigKind) {
+    let rig = ClaudeRig::start_with_options(
+        kind,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let id = uuid::Uuid::new_v4().to_string();
+    rig.seed_pending_session(&id, &json!({ "kind": "fresh" }));
+    let mut conn = rig.connect().await;
+
+    conn.attach(&id).await;
+    conn.send_text(&id, "send-1", "hello").await;
+    let result = conn.wait_for_event("freshAgent.result").await;
+    assert_eq!(result["event"]["result"], "success", "{result}");
+    assert_eq!(
+        conn.init_session_id(&id),
+        id,
+        "the CLI ran under the session's id"
+    );
+    rig.wait_for_transcript(&id).await;
+    rig.wait_for_genesis_cleared(&id).await;
+    conn.kill(&id).await;
+}
+
+/// One finished turn (its `freshAgent.result`) for `text` sent to `session_id`,
+/// and its lines on disk: the CLI flushes a transcript line 95-200 ms after its
+/// SDK frame (T3), and an undo reads the transcript.
+async fn turn(
+    rig: &ClaudeRig,
+    conn: &mut common::claude_rig::RigConnection,
+    session_id: &str,
+    request_id: &str,
+    text: &str,
+) {
+    let results = conn.events_seen("freshAgent.result");
+    conn.send_text(session_id, request_id, text).await;
+    let deadline = tokio::time::Instant::now() + common::claude_rig::RIG_FRAME_BUDGET;
+    while conn.events_seen("freshAgent.result") == results {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn {request_id} never finished"
+        );
+        conn.read_for(std::time::Duration::from_millis(50)).await;
+    }
+    let durable = conn.init_session_id(session_id);
+    let path = rig.wait_for_transcript(&durable).await;
+    loop {
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let prompt = lines.iter().rposition(|line| {
+            line["type"] == "user" && line["message"]["content"][0]["text"] == text
+        });
+        if prompt.is_some_and(|at| lines[at..].iter().any(|line| line["type"] == "assistant")) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn {request_id} never reached disk"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// An undo or redo from the pane `pane_id` of the session `durable`, fenced
+/// with the owner pair the client holds; returns the requester's answer.
+async fn rollback(
+    conn: &mut common::claude_rig::RigConnection,
+    kind: &str,
+    pane_id: &str,
+    durable: &str,
+    request_id: &str,
+) -> serde_json::Value {
+    let (epoch, generation) = conn.owner_pair(durable).expect("an owner record");
+    conn.send(json!({
+        "type": format!("freshAgent.{kind}"),
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": pane_id,
+        "requestId": request_id,
+        "mode": "step",
+        "observedEpoch": epoch,
+        "observedGeneration": generation,
+    }))
+    .await;
+    conn.wait_for(&format!("the answer to {request_id}"), |v| {
+        v["type"] == "freshAgent.event"
+            && v["event"]["requestId"] == request_id
+            && matches!(
+                v["event"]["type"].as_str(),
+                Some("freshAgent.rolledBack" | "freshAgent.redone" | "freshAgent.error")
+            )
+    })
+    .await["event"]
+        .clone()
+}
+
+/// The replacement id an undo or redo ack names (and that it succeeded).
+fn replacement(answer: &serde_json::Value, expected: &str) -> String {
+    assert_eq!(answer["type"], expected, "{answer}");
+    answer["newSessionId"]
+        .as_str()
+        .expect("the ack names the replacement")
+        .to_string()
+}
+
+/// The prompts a session's snapshot holds, in order.
+async fn prompts_of(rig: &ClaudeRig, session_id: &str) -> Vec<String> {
+    let snapshot = rig
+        .fresh_claude
+        .get_snapshot(freshell_protocol::SessionType::Freshclaude, session_id)
+        .await
+        .unwrap_or_else(|error| panic!("a snapshot of {session_id}: {error:?}"));
+    snapshot["turns"]
+        .as_array()
+        .expect("turns")
+        .iter()
+        .filter(|turn| turn["role"] == "user")
+        .filter_map(|turn| turn["items"][0]["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Design §11.5 item 5 (C13, G01): undo, send, redo, and two undos with no send
+/// between them, each answered once the CLI booted the replacement (no init is
+/// awaited). A send after an undo runs in the replacement (the CLI reports its
+/// id) and destroys redo; an undo of that conversation and its redo restore the
+/// sent turn; a second undo before any send forks the original again.
+async fn undo_send_redo_and_two_undos_without_a_send(kind: RigKind) {
+    let rig = ClaudeRig::start_with_options(
+        kind,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    turn(&rig, &mut conn, &pane, "send-1", "first prompt").await;
+    turn(&rig, &mut conn, &pane, "send-2", "second prompt").await;
+    turn(&rig, &mut conn, &pane, "send-3", "third prompt").await;
+    let a = conn.init_session_id(&pane);
+
+    let c = replacement(
+        &rollback(&mut conn, "undo", &pane, &a, "undo-1").await,
+        "freshAgent.rolledBack",
+    );
+    assert_eq!(
+        prompts_of(&rig, &c).await,
+        ["first prompt", "second prompt"]
+    );
+    turn(&rig, &mut conn, &c, "send-4", "another third prompt").await;
+    assert_eq!(
+        conn.init_session_id(&c),
+        c,
+        "the send ran in the replacement"
+    );
+    let refused = rollback(&mut conn, "redo", &c, &c, "redo-after-send").await;
+    assert_eq!(
+        refused["code"], "REDO_UNAVAILABLE",
+        "a send destroys redo: {refused}"
+    );
+
+    let d = replacement(
+        &rollback(&mut conn, "undo", &c, &c, "undo-2").await,
+        "freshAgent.rolledBack",
+    );
+    let e = replacement(
+        &rollback(&mut conn, "redo", &d, &d, "redo-1").await,
+        "freshAgent.redone",
+    );
+    assert_eq!(
+        prompts_of(&rig, &e).await,
+        ["first prompt", "second prompt", "another third prompt"]
+    );
+
+    let f1 = replacement(
+        &rollback(&mut conn, "undo", &e, &e, "undo-3").await,
+        "freshAgent.rolledBack",
+    );
+    let f2 = replacement(
+        &rollback(&mut conn, "undo", &f1, &f1, "undo-4").await,
+        "freshAgent.rolledBack",
+    );
+    assert_eq!(prompts_of(&rig, &f2).await, ["first prompt"]);
+    turn(&rig, &mut conn, &f2, "send-5", "after two undos").await;
+    assert_eq!(conn.init_session_id(&f2), f2);
+    assert_eq!(
+        prompts_of(&rig, &f2).await,
+        ["first prompt", "after two undos"]
+    );
+    conn.kill(&f2).await;
+}
+
+/// The snapshot turn id of the user turn `text` starts.
+async fn prompt_turn_id(rig: &ClaudeRig, session_id: &str, text: &str) -> String {
+    let snapshot = rig
+        .fresh_claude
+        .get_snapshot(freshell_protocol::SessionType::Freshclaude, session_id)
+        .await
+        .unwrap_or_else(|error| panic!("a snapshot of {session_id}: {error:?}"));
+    snapshot["turns"]
+        .as_array()
+        .expect("turns")
+        .iter()
+        .find(|turn| turn["role"] == "user" && turn["items"][0]["text"] == text)
+        .and_then(|turn| turn["turnId"].as_str())
+        .unwrap_or_else(|| panic!("no turn for {text:?}: {snapshot}"))
+        .to_string()
+}
+
+/// Design §11.5 item 6 (C14, G09): fork at a turn, then send. The fork answers
+/// once the CLI booted the child (no init is awaited), on the requesting
+/// connection, naming a new child that holds the parent's conversation through
+/// that turn. After the pane closes the parent (as the client does), the child's
+/// first send runs under the child's own id (the CLI reports it) and the parent's
+/// transcript is untouched.
+async fn fork_at_a_turn_then_send(kind: RigKind) {
+    let rig = ClaudeRig::start_with_options(
+        kind,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
+    let mut conn = rig.connect().await;
+    let pane = conn.create("create-1").await;
+    turn(&rig, &mut conn, &pane, "send-1", "first prompt").await;
+    turn(&rig, &mut conn, &pane, "send-2", "second prompt").await;
+    let a = conn.init_session_id(&pane);
+    let a_path = rig.wait_for_transcript(&a).await;
+    let a_before = std::fs::read_to_string(&a_path).expect("read the parent's transcript");
+    let at = prompt_turn_id(&rig, &a, "first prompt").await;
+
+    let (epoch, generation) = conn.owner_pair(&a).expect("an owner record");
+    conn.send(json!({
+        "type": "freshAgent.fork",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": pane,
+        "requestId": "fork-1",
+        "input": { "atTurnId": at },
+        "observedEpoch": epoch,
+        "observedGeneration": generation,
+    }))
+    .await;
+    let forked = conn
+        .wait_for("the answer to fork-1", |v| {
+            (v["type"] == "freshAgent.forked" && v["requestId"] == "fork-1")
+                || (v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.error")
+        })
+        .await;
+    assert_eq!(forked["type"], "freshAgent.forked", "{forked}");
+    assert_eq!(forked["parentSessionId"], pane.as_str(), "{forked}");
+    let c = forked["sessionId"].as_str().expect("the child").to_string();
+    assert_ne!(c, a);
+    assert_eq!(prompts_of(&rig, &c).await, ["first prompt"]);
+    assert_eq!(
+        std::fs::read_to_string(&a_path).expect("read the parent's transcript"),
+        a_before,
+        "the fork wrote nothing to the parent's transcript"
+    );
+
+    // The pane closes the parent. The real CLI then records its own `last-prompt`
+    // bookkeeping line in the parent's transcript as it shuts down, so the
+    // parent's file is compared from here on.
+    conn.kill(&pane).await;
+    let a_closed = std::fs::read_to_string(&a_path).expect("read the parent's transcript");
+    turn(&rig, &mut conn, &c, "send-3", "a different second prompt").await;
+    assert_eq!(conn.init_session_id(&c), c, "the send ran under the child");
+    assert_eq!(
+        prompts_of(&rig, &c).await,
+        ["first prompt", "a different second prompt"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&a_path).expect("read the parent's transcript"),
+        a_closed,
+        "the child's turn wrote nothing to the parent's transcript"
+    );
+}
+
 mod sim {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_at_a_turn_then_send() {
+        super::fork_at_a_turn_then_send(RigKind::Sim).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undo_send_redo_and_two_undos_without_a_send() {
+        super::undo_send_redo_and_two_undos_without_a_send(RigKind::Sim).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_turn_session_restarts_fresh_under_its_own_id() {
+        super::a_zero_turn_session_restarts_fresh_under_its_own_id(RigKind::Sim).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sidecar_log_records_reach_the_server_log() {
@@ -278,6 +584,21 @@ mod sim {
 
 mod cli {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_at_a_turn_then_send() {
+        super::fork_at_a_turn_then_send(RigKind::Cli).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undo_send_redo_and_two_undos_without_a_send() {
+        super::undo_send_redo_and_two_undos_without_a_send(RigKind::Cli).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_turn_session_restarts_fresh_under_its_own_id() {
+        super::a_zero_turn_session_restarts_fresh_under_its_own_id(RigKind::Cli).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sidecar_log_records_reach_the_server_log() {

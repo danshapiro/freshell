@@ -11,7 +11,7 @@
     "interrupt": true,
     "approvals": false,
     "questions": false,
-    "fork": false,
+    "fork": true,
     "diffs": false,
     "undo": true,
     "redo": true,
