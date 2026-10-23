@@ -6593,6 +6593,7 @@ impl FreshClaudeState {
         let identity_sink = self.identity_sink();
         let state = self.clone();
         tokio::spawn(async move {
+            let mut session_id = session_id;
             // The sidecar's report of its SDK stream's end (its last line before it
             // exits), read by the end-of-output path below.
             let mut stream_ended: Option<crate::claude_sidecar_exit::StreamEnded> = None;
@@ -6606,6 +6607,27 @@ impl FreshClaudeState {
                 };
                 if let Some(ended) = crate::claude_sidecar_exit::StreamEnded::from_line(&value) {
                     stream_ended = Some(ended);
+                    continue;
+                }
+                if value["type"] == "sdk.session.rekeyed" {
+                    if let Some(new) = value["newSessionId"].as_str() {
+                        match state
+                            .rekey_conversation(
+                                &session_id,
+                                new,
+                                &session_type,
+                                &pending,
+                                "conversation_reset",
+                            )
+                            .await
+                        {
+                            Ok(new) => session_id = new,
+                            Err(cause) => tracing::error!(target: "freshell_freshagent::claude",
+                                event = "freshagent.claude.rekey_refused", provider = PROVIDER,
+                                session_id = %session_id, requested_session_id = new, cause,
+                                "the conversation identity could not follow its reset"),
+                        }
+                    }
                     continue;
                 }
                 // C17: fold the line into the session's turn ledger (design
@@ -6807,6 +6829,29 @@ impl FreshClaudeState {
                             state
                                 .bind_naming_handle_at_init(cli_id, &session_id, &session_type)
                                 .await;
+                        } else if create_binding_expected {
+                            tracing::error!(target: "freshell_freshagent::claude",
+                                event = "freshagent.claude.unannounced_rekey", provider = PROVIDER,
+                                session_id = %session_id, requested_session_id = cli_id,
+                                "the CLI changed conversation without a reset announcement");
+                            match state
+                                .rekey_conversation(
+                                    &session_id,
+                                    cli_id,
+                                    &session_type,
+                                    &pending,
+                                    "unannounced",
+                                )
+                                .await
+                            {
+                                Ok(new) => session_id = new,
+                                Err(cause) => {
+                                    tracing::error!(target: "freshell_freshagent::claude",
+                                    event = "freshagent.claude.rekey_refused", provider = PROVIDER,
+                                    session_id = %session_id, requested_session_id = cli_id, cause,
+                                    "the unannounced conversation identity could not be followed")
+                                }
+                            }
                         } else {
                             state
                                 .adopt_session_init(
@@ -8138,6 +8183,7 @@ mod fork;
 mod genesis;
 mod history;
 mod pending_runtime;
+mod rekey;
 use pending_runtime::{is_pending_frame, PendingResponse};
 mod rollback;
 mod sidecar_writer;
