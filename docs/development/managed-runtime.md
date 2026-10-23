@@ -160,10 +160,14 @@ Recovery also calls back to the web server to prepare the replacement's
 provider inputs. That callback waits 35s for the web server's own work; a
 Claude recovery's callback waits 105s, because before it answers the web
 server observes the current Claude sources and then the candidate projection,
-back to back, through the supervisor, and each observation is bounded at 35s
-(the fixed reader's 25s operation plus 5s cleanup). The recovery scope those
-nested lookups present lives exactly as long as the callback wait, so an
-observation that finishes inside its own bound never finds its scope expired.
+back to back, through the supervisor. The wait covers two observations whose
+reader succeeds on its first attempt (35s each: the reader's 25s attempt, its
+5s cleanup and 5s of reply slack). The recovery scope those nested lookups
+present lives exactly as long as the callback wait, and the supervisor ends
+every recovery observation, its cleanup included, 5s before that scope does:
+an observation never finds its scope expired, and a reader that needs a retry
+uses only what is left of the scope. Outside a recovery an observation waits
+up to 95s (the reader's bounded retry, 90s, plus the reply slack).
 
 A launch or recovery holds the soul's lifecycle lock for its whole
 activation, callback and grant included, and `stop` takes the same lock
@@ -187,6 +191,60 @@ The session host itself keeps a worker-thread floor
 `available_parallelism()` routinely reports 1, and a single-worker runtime
 makes the control plane share one thread with every workload task — a long
 synchronous step then looks indistinguishable from a dead host.
+
+### Short-lived helper containers
+
+The Claude source readers (`freshell-claude-source-*`,
+`freshell-claude-candidate-reader-*` with its `freshell-claude-candidate-*`
+scratch volume) and the provider mountpoint helper (`freshell-mountpoints-*`)
+are one-shot containers the supervisor creates, runs and removes.
+
+A Docker container create can take tens of seconds on a busy host. Docker
+mounts and unmounts the new container's overlay root filesystem, and the
+kernel flushes the whole filesystem under Docker's data root when that mount
+goes away, so the create waits for every unwritten change on that disk (on
+the development host: about 0.1s idle, 4.5s with 1 GB unwritten, 16.7s with
+3 GB; up to 48s during the provider parity runs, which build Rust release
+binaries while up to 8 GB sits unwritten). The create right after it is fast
+again, which is why managed-session creates stay quick while the helper
+created just before them is slow. A host whose load far exceeds its cores
+slows every Docker step the same way, exits and removals included.
+
+- A helper create keeps running when its caller stops waiting, and cleanup
+  waits for Docker's answer before it removes the helper by exact name. The
+  supervisor owns a helper until its absence is confirmed. A removal gets 5s,
+  or, inside a retried read, all the time the read still has reserved. A
+  create Docker answers only after the caller's window has passed, or a
+  removal that runs past its window or fails, goes to a background reaper. The reaper removes
+  the helper (and, for a candidate read, the scratch volume after it), retrying
+  with a growing wait for up to 120s; every try re-checks ownership. A create
+  Docker answers after 5s or more is logged as `supervisor.helper.create_slow`
+  (warn) with its latency. Lifecycle events: `supervisor.helper.cleanup.deferred`
+  (warn, with `reason` `create_unanswered` or `removal_unconfirmed`), then
+  `supervisor.helper.cleanup.removed` (info) or
+  `supervisor.helper.cleanup.unconfirmed` (error).
+- The Claude source reader retries a run that timed out, or whose create or
+  start Docker refused with a server error or left unanswered. A timeout is
+  retried whichever step it hit: the same flush that stalls a create also
+  stalls a start, the reader's own writes and Docker's report of its exit (a
+  candidate read whose create and start answered at once timed out while 2 GB
+  of unwritten data drained, and its retry succeeded). Each attempt
+  keeps the reader's 25s bound; the whole read gets up to 90s, three attempt
+  lengths with their 5s cleanup: the attempt a stall times out, up to one
+  more attempt length for Docker to answer that create, and one full retry;
+  a third attempt fits only after a fast refusal. Inside a recovery the read
+  also ends 5s before the recovery scope does (see above). Waits are 1s,
+  then 2s, and a retry starts only after the previous attempt's helpers were
+  removed, so retries never pile creates onto a stalled daemon. Every other failure (a client
+  error, changed ownership or topology, a reader that exited without
+  evidence, an unconfirmed cleanup) is final, as before. Events:
+  `supervisor.helper.retry` (warn, per retry), `supervisor.helper.recovered`
+  (info) and `supervisor.helper.retry_exhausted` (error). Their `step` names
+  where a timed-out attempt's deadline hit: `prepare`, `create`, `start`,
+  `read` (the reader's own work, until it replies), `exit` (Docker reporting
+  its exit) or `verify`; a candidate read adds `scratch_create` and its
+  mountpoint helper's `mountpoints_*` steps. A reader that hangs in `read`
+  while Docker answers promptly is therefore visible as such.
 
 ## Launch transaction
 
