@@ -1,4 +1,4 @@
-import type { Page, WebSocketRoute } from '@playwright/test'
+import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import {
@@ -9,6 +9,7 @@ import {
   type NamedAgentHandle,
 } from '../helpers/unified-agent-names.js'
 import { bootJourney, type Journey } from '../helpers/unified-agent-names-modes.js'
+import { withholdSavedNames } from '../helpers/withhold-saved-names.js'
 import { clickFirstVisibleShellOption } from '../helpers/pane-picker.js'
 
 // NAME RELIABILITY (plan Task 7, RC2) — a Claude/Codex/OpenCode tab's stored
@@ -43,7 +44,6 @@ import { clickFirstVisibleShellOption } from '../helpers/pane-picker.js'
 test.setTimeout(300_000)
 
 const SAVED_NAME = 'LotL'
-const NAME_READ_PATH = '/api/session-names/read'
 
 async function bootForbiddenGeminiJourney(): Promise<Journey> {
   const gemini = await startFakeGemini('unused', {
@@ -55,9 +55,9 @@ async function bootForbiddenGeminiJourney(): Promise<Journey> {
 
 /** Create a Claude CLI tab through the picker (a session-owned tab) and give
  * it a saved name through the tab's inline rename editor. */
-async function createRenamedClaudeTab(page: Page, harness: TestHarness, journey: Journey): Promise<NamedAgentHandle> {
+async function createRenamedClaudeTab(page: Page, harness: TestHarness, journey: Journey, savedName = SAVED_NAME): Promise<NamedAgentHandle> {
   const handle = await createNamedAgent(harness, 'claude', { entry: 'ui', page, server: journey.server })
-  await renameThroughTabEdit(page, handle.tabId, SAVED_NAME)
+  await renameThroughTabEdit(page, handle.tabId, savedName)
   return handle
 }
 
@@ -81,91 +81,6 @@ async function serverTabTitle(journey: Journey, tabId: string): Promise<string |
   const payload = await response.json() as { data?: { tabs?: Array<{ id: string; title?: string }> }; tabs?: Array<{ id: string; title?: string }> }
   const tabs = payload.data?.tabs ?? payload.tabs ?? []
   return tabs.find((tab) => tab.id === tabId)?.title ?? null
-}
-
-/** Remove every `sessionName` key (a saved-name record projection) from a
- * decoded JSON value; returns how many were removed. */
-function stripSessionNames(value: unknown): number {
-  if (!value || typeof value !== 'object') return 0
-  let removed = 0
-  if (Array.isArray(value)) {
-    for (const entry of value) removed += stripSessionNames(entry)
-    return removed
-  }
-  const record = value as Record<string, unknown>
-  if ('sessionName' in record) {
-    delete record.sessionName
-    removed += 1
-  }
-  for (const entry of Object.values(record)) removed += stripSessionNames(entry)
-  return removed
-}
-
-/** From the page's next navigation on, withhold every saved name from it
- * (see the file comment). Returns a live count of what was withheld. */
-async function withholdSavedNames(page: Page): Promise<{ readonly withheld: number }> {
-  let withheld = 0
-  await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
-    const { pathname } = new URL(route.request().url())
-    if (pathname === NAME_READ_PATH) {
-      withheld += 1
-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ names: [] }) })
-      return
-    }
-    const response = await route.fetch()
-    const contentType = response.headers()['content-type'] ?? ''
-    if (!contentType.includes('application/json')) {
-      await route.fulfill({ response })
-      return
-    }
-    const text = await response.text()
-    let body: unknown
-    try {
-      body = JSON.parse(text)
-    } catch {
-      await route.fulfill({ response })
-      return
-    }
-    const removed = stripSessionNames(body)
-    if (removed === 0) {
-      await route.fulfill({ response })
-      return
-    }
-    withheld += removed
-    // The rewritten body has its own length; the fetched body is already
-    // decoded.
-    const headers = { ...response.headers() }
-    delete headers['content-length']
-    delete headers['content-encoding']
-    await route.fulfill({ status: response.status(), headers, body: JSON.stringify(body) })
-  })
-  await page.routeWebSocket((url) => url.pathname === '/ws', (client: WebSocketRoute) => {
-    const server = client.connectToServer()
-    client.onMessage((raw) => server.send(raw))
-    server.onMessage((raw) => {
-      if (typeof raw !== 'string') {
-        client.send(raw)
-        return
-      }
-      let message: unknown
-      try {
-        message = JSON.parse(raw)
-      } catch {
-        client.send(raw)
-        return
-      }
-      if ((message as { type?: unknown } | null)?.type === 'session.name.updated') {
-        withheld += 1
-        return
-      }
-      const removed = stripSessionNames(message)
-      withheld += removed
-      client.send(removed > 0 ? JSON.stringify(message) : raw)
-    })
-    client.onClose((code, reason) => void server.close({ code, reason }).catch(() => {}))
-    server.onClose((code, reason) => void client.close({ code, reason }).catch(() => {}))
-  })
-  return { get withheld() { return withheld } }
 }
 
 async function reloadAndConnect(page: Page): Promise<TestHarness> {
@@ -196,36 +111,40 @@ type MirrorState = {
 }
 
 test.describe('session tab title mirror', () => {
-  test('a reload with names unavailable still shows the saved name', async ({ browser }) => {
-    const journey = await bootForbiddenGeminiJourney()
-    try {
-      const { context, page, harness } = await connectUnifiedPage({ browser, info: journey.server.info })
-      const handle = await createRenamedClaudeTab(page, harness, journey)
+  for (const savedName of [SAVED_NAME, 'Gemini']) {
+    test(`a reload with names unavailable still shows the saved name ${savedName}`, async ({ browser }) => {
+      const journey = await bootForbiddenGeminiJourney()
+      try {
+        const { context, page, harness } = await connectUnifiedPage({ browser, info: journey.server.info })
+        const handle = await createRenamedClaudeTab(page, harness, journey, savedName)
 
-      // The window's persisted layout carries the saved name as the tab's
-      // stored title (before the fix: the create-time label).
-      await expect.poll(() => persistedTabTitle(page, handle.tabId), { timeout: 30_000 }).toBe(SAVED_NAME)
+        // The window's persisted layout carries the saved name as the tab's
+        // stored title (before the fix: the create-time label).
+        await expect.poll(() => persistedTabTitle(page, handle.tabId), { timeout: 30_000 }).toBe(savedName)
 
-      const withholding = await withholdSavedNames(page)
-      const reloaded = await reloadAndConnect(page)
-      // Let the boot-time name reads, inventory frames and broadcasts land.
-      await page.waitForTimeout(3_000)
+        const withholding = await withholdSavedNames(page)
+        const reloaded = await reloadAndConnect(page)
+        // Let the boot-time name reads, inventory frames and broadcasts land.
+        await page.waitForTimeout(3_000)
 
-      await expect(tabLabel(page, handle.tabId)).toContainText(SAVED_NAME, { timeout: 30_000 })
-      const state = await reloaded.getState() as {
-        sessionNames?: { records?: Record<string, unknown> }
-        tabs?: { tabs?: Array<{ id: string; title?: string }> }
+        await expect(tabLabel(page, handle.tabId)).toContainText(savedName, { timeout: 30_000 })
+        const state = await reloaded.getState() as {
+          sessionNames?: { records?: Record<string, unknown> }
+          tabs?: { tabs?: Array<{ id: string; title?: string }> }
+        }
+        // The label came from the stored title alone: the page's name cache
+        // never received a record.
+        expect(Object.keys(state.sessionNames?.records ?? {})).toEqual([])
+        expect(state.tabs?.tabs?.find((tab) => tab.id === handle.tabId)?.title).toBe(savedName)
+        await expect.poll(() => persistedTabTitle(page, handle.tabId), { timeout: 30_000 }).toBe(savedName)
+        await expect.poll(() => serverTabTitle(journey, handle.tabId), { timeout: 30_000 }).toBe(savedName)
+        console.log(`[session-tab-title-mirror] withheld ${withholding.withheld} saved-name projections`)
+        await context.close()
+      } finally {
+        await journey.cleanup()
       }
-      // The label came from the stored title alone: the page's name cache
-      // never received a record.
-      expect(Object.keys(state.sessionNames?.records ?? {})).toEqual([])
-      expect(state.tabs?.tabs?.find((tab) => tab.id === handle.tabId)?.title).toBe(SAVED_NAME)
-      console.log(`[session-tab-title-mirror] withheld ${withholding.withheld} saved-name projections`)
-      await context.close()
-    } finally {
-      await journey.cleanup()
-    }
-  })
+    })
+  }
 
   test('the server layout mirror carries the saved name', async ({ browser }) => {
     const journey = await bootForbiddenGeminiJourney()
@@ -252,6 +171,12 @@ test.describe('session tab title mirror', () => {
       // [Claude | shell], then close the Claude pane from its header.
       await splitWithShell(page)
       await expect(page.locator('.xterm:visible')).toHaveCount(2, { timeout: 30_000 })
+      await expect.poll(() => persistedTabTitle(page, handle.tabId), { timeout: 30_000 }).toBe(SAVED_NAME)
+      // The next window has the stored session name but no cached record or
+      // middleware memory. Closing the source still releases its title.
+      await withholdSavedNames(page)
+      const reloaded = await reloadAndConnect(page)
+      await expect(tabLabel(page, handle.tabId)).toContainText(SAVED_NAME, { timeout: 30_000 })
       await page
         .locator(`[data-context="pane-header"][data-pane-id="${handle.paneId}"]`)
         .getByRole('button', { name: 'Close pane' })
@@ -260,7 +185,7 @@ test.describe('session tab title mirror', () => {
       // Only the shell is left, so the tab no longer takes its name from the
       // Claude session.
       await expect.poll(async () => {
-        const state = await harness.getState() as MirrorState
+        const state = await reloaded.getState() as MirrorState
         const tab = state.tabs?.tabs?.find((candidate) => candidate.id === handle.tabId)
         const layout = state.panes?.layouts?.[handle.tabId]
         return { nameSource: tab?.nameSource?.kind, layout: layout?.type, mode: layout?.content?.mode }
@@ -270,7 +195,7 @@ test.describe('session tab title mirror', () => {
       // stored title, the persisted layout and the server's layout mirror.
       await expect(tabLabel(page, handle.tabId)).not.toContainText(SAVED_NAME, { timeout: 30_000 })
       const storedTitle = async () => {
-        const state = await harness.getState() as MirrorState
+        const state = await reloaded.getState() as MirrorState
         return state.tabs?.tabs?.find((candidate) => candidate.id === handle.tabId)?.title ?? null
       }
       await expect.poll(storedTitle, { timeout: 30_000 }).not.toBe(SAVED_NAME)

@@ -672,6 +672,18 @@ export async function manualNameSurvivesLateGenerationAndSwitch(mode: UnifiedAge
           await expect(
             page.locator('[data-context="pane-header"]:visible').first(),
           ).not.toContainText(manualName, { timeout: 30_000 })
+          await expect(
+            page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`),
+          ).not.toContainText(manualName, { timeout: 30_000 })
+          await expect.poll(async () => {
+            const state = await harness.getState() as { tabs: { tabs: Array<{ id: string; title: string }> } }
+            return state.tabs.tabs.find((candidate) => candidate.id === handle.tabId)?.title
+          }, { timeout: 30_000 }).not.toBe(manualName)
+          const nextHandle = await refreshHandle(harness, handle, mode)
+          await sendFirstMessage(page, harness, nextHandle, mode, 'Billing bug in invoices')
+          await expect(
+            page.locator(`[data-context="tab"][data-tab-id="${handle.tabId}"]`),
+          ).toContainText(AI_NAME, { timeout: 90_000 })
         } else {
           const second = await createNamedAgent(harness, mode, { entry: 'ui', page, server: journey.server })
           await sendFirstMessage(page, harness, second, mode, 'A second conversation')
