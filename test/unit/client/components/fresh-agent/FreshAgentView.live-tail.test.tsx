@@ -319,11 +319,20 @@ describe('FreshAgentView live transcript (transcript-live D5)', () => {
     const store = createStore()
     await mount(store)
     deliver(store, { type: 'freshAgent.status', status: 'running' })
-    await advance(0)
+    // Let every refresh the status change causes settle: the tail must take
+    // over on its own, not ride on an unrelated re-render.
+    await settleRefetches(3)
     // Busy with no live content: the last durable activity line is the live one.
     expect(screen.getAllByLabelText('running')).toHaveLength(1)
 
+    // The block opens empty (nothing live to show yet); the session record's
+    // streaming flag changes with it, so let that settle too.
     deliver(store, stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }))
+    await settleRefetches(3)
+    expect(screen.getAllByLabelText('running')).toHaveLength(1)
+    expect(screen.queryByRole('article', { name: /live response/ })).not.toBeInTheDocument()
+
+    // Its first text arrives: the tail takes over the live reel.
     deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'next step' } }))
     await advance(LIVE_STREAM_FLUSH_MS)
 
