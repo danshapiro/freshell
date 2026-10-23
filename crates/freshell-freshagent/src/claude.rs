@@ -9113,8 +9113,17 @@ impl FreshClaudeState {
                 }
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                 // G05 (C09): the ended session stays known as ended — its ids
-                // resolve to a dead record, not to nothing. Recorded before the
-                // reap's wait, so a resume that lands meanwhile forgets it.
+                // resolve to a dead record, not to nothing. It is recorded
+                // before the stop on purpose: a resume (an attach, which is a
+                // recovery verb, or a create that resumes) can land while the
+                // stop runs and forgets the record, which is how the report
+                // below knows to stay away from a session that is live again.
+                // So for as long as the stop runs, a snapshot already reads
+                // `exited` and a send already gets the lost-session frame.
+                // That is short: node has usually exited by now (it ended its
+                // stream, or it died), so the stop is the tree guard's kill and
+                // the confirmation; only a node that closed its output and kept
+                // running is given the whole grace period before it is killed.
                 let reason = stream_ended
                     .as_ref()
                     .map_or(crate::claude_sidecar_exit::PROCESS_ENDED_REASON, |ended| {
@@ -9136,9 +9145,10 @@ impl FreshClaudeState {
                 // Stop the ended sidecar through the one sidecar stop every
                 // teardown uses (G31): node is reaped for its exit status (the
                 // cause of a death that reported no stream end), whatever is
-                // left of its tree (the CLI) is killed and confirmed gone BEFORE
-                // the exit report offers Resume, and no zombie is left behind.
-                // It is not this consumer's to abort: the consumer is this task.
+                // left of its tree (the CLI) is killed and, within the stop's
+                // bounded confirmation window, confirmed gone before the exit
+                // report offers Resume, and no zombie is left behind. It is not
+                // this consumer's to abort: the consumer is this task.
                 let processes = SidecarProcesses {
                     child: evicted.child,
                     stdin: evicted.stdin,
@@ -9155,7 +9165,14 @@ impl FreshClaudeState {
                     )
                     .await;
                 let confirmed = confirmation.label();
-                // An unconfirmed tree keeps escalating detached (logged there).
+                // A tree the window could not confirm gone keeps being killed in
+                // the background (logged there), and the report does not wait
+                // for it. On Linux such a member has outlived SIGKILL: it runs
+                // no more code and is only slow to finish dying (or stuck in
+                // the kernel), so a resume cannot race it, while holding the
+                // report back would leave the pane busy for as long as the
+                // kernel keeps it. Off Linux an unconfirmed tree is the guard's
+                // typed platform limitation, logged by the stop.
                 let _ = escalate_unconfirmed_teardown(confirmation, stamp.clone());
                 // A node that outlived the grace period was killed by the stop:
                 // the signal it died of is ours, not the cause.
@@ -9189,7 +9206,7 @@ impl FreshClaudeState {
                 // running pane stops being busy and offers Resume — and why
                 // (SIDECAR_EXITED, which also drops the pane to idle). The report
                 // belongs to the dead incarnation: a resume that registered the
-                // session again during the reap (an attach under the same pane
+                // session again during the stop (an attach under the same pane
                 // id) or a close forgot the dead record, and then neither frame
                 // may reach the id, which names a live session or nothing now.
                 if state.dead_sessions.find(&stamp).is_some() {
@@ -9216,7 +9233,7 @@ impl FreshClaudeState {
                 }
                 // Task 5 (unified needs-attention signal): an UNREQUESTED end of a
                 // running turn is a turn end the user did not witness, even when a
-                // resume brought the session back during the reap. Interim
+                // resume brought the session back during the stop. Interim
                 // rule (design §5.7, until C18): a sidecar that reported its
                 // stream's end already rang a result-less turn end itself, so the
                 // server rings only for a death that reported nothing (a Node

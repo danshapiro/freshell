@@ -9,6 +9,9 @@
 //!   learns it may resume. The cause is the stream end the sidecar reported, or
 //!   node's own exit status; a signal the stop itself sent is not the cause.
 //! * A requested stop (here `handle_kill`) reports nothing about the end.
+//! * A tree that outlives the stop's bounded confirmation window does not hold
+//!   the report back: the report goes out, and the kill keeps going in the
+//!   background until the tree is dead.
 //!
 //! The sidecar is a small Node fake started through the production create
 //! (`handle_create`), so its consumer, eviction and stop are the real ones. It
@@ -79,6 +82,17 @@ impl Captured {
 
     fn alive(&self) -> bool {
         crate::session_lease::proc_starttime(self.pid) == Some(self.start)
+    }
+
+    async fn dies_within(&self, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        while self.alive() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
     }
 }
 
@@ -306,7 +320,7 @@ fn is_turn_complete(frame: &Value) -> bool {
     frame["event"]["type"] == "freshAgent.turn.complete"
 }
 
-/// The captured records whose message is `message`.
+/// The captured records whose message starts with `message`, in order.
 fn records(
     events: &Arc<std::sync::Mutex<Vec<(tracing::Level, capture::Fields)>>>,
     message: &str,
@@ -315,9 +329,29 @@ fn records(
         .lock()
         .expect("capture lock")
         .iter()
-        .filter(|(_, fields)| fields.get("message").map(String::as_str) == Some(message))
+        .filter(|(_, fields)| {
+            fields
+                .get("message")
+                .is_some_and(|logged| logged.starts_with(message))
+        })
         .map(|(_, fields)| fields.clone())
         .collect()
+}
+
+/// Where the first record whose message starts with `message` was logged.
+fn logged_at(
+    events: &Arc<std::sync::Mutex<Vec<(tracing::Level, capture::Fields)>>>,
+    message: &str,
+) -> Option<usize> {
+    events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .position(|(_, fields)| {
+            fields
+                .get("message")
+                .is_some_and(|logged| logged.starts_with(message))
+        })
 }
 
 fn field<'a>(fields: &'a capture::Fields, name: &str) -> Option<&'a str> {
@@ -515,4 +549,56 @@ async fn a_requested_stop_kills_the_same_tree_and_reports_nothing() {
     let teardowns = capture::teardown_events(&events);
     assert_eq!(teardowns.len(), 1, "{teardowns:?}");
     assert_eq!(field(&teardowns[0].1, "confirmation"), Some("confirmed"));
+}
+
+/// G31: a tree the stop cannot confirm gone within its bounded window (here a
+/// window of no rounds, which the stand-in that left node's group outlives)
+/// does not hold the report back. The pane hears `exited` and SIDECAR_EXITED
+/// once each, and the detached escalation keeps killing the tree until it is
+/// dead. The report is logged before the escalation confirms that death, so
+/// the report did not wait for it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_tree_the_stop_cannot_confirm_gone_is_reported_and_killed_in_the_background() {
+    let (events, _log) = capture::install();
+    let mut session = EndingSession::start("stream-ends", Some(0)).await;
+
+    session
+        .st
+        .handle_send(send_msg(&session.pane, "a turn whose stream ends"))
+        .await;
+    session
+        .await_frame("SIDECAR_EXITED", is_sidecar_exited)
+        .await;
+
+    assert!(
+        !session.in_group.alive(),
+        "the process-tree guard killed node's group before the report"
+    );
+    assert!(
+        session
+            .left_group
+            .dies_within(Duration::from_secs(10))
+            .await,
+        "the background escalation kills the stand-in that left the group"
+    );
+    session.drain(Duration::from_millis(300)).await;
+    assert_eq!(session.count(is_exited_status), 1, "{:?}", session.frames);
+    assert_eq!(session.count(is_sidecar_exited), 1, "{:?}", session.frames);
+
+    let logged = records(&events, "freshagent.claude.sidecar_exit");
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(field(&logged[0], "confirmation"), Some("not_confirmed"));
+    assert_eq!(
+        records(&events, "freshagent.claude.teardown_unconfirmed").len(),
+        1,
+        "the unconfirmed stop is an error record"
+    );
+    let reported = logged_at(&events, "freshagent.claude.sidecar_exit").expect("reported");
+    let confirmed = logged_at(&events, "freshagent.claude.teardown_escalation_confirmed")
+        .expect("the escalation confirms the tree's death");
+    assert!(
+        reported < confirmed,
+        "the report went out before the background kill finished"
+    );
 }
