@@ -13951,17 +13951,14 @@ rl.on('line', (line) => {
     }
 
     /// Wait until the fresh create's adoption has COMMITTED ownership under
-    /// `durable_id`. The adoption writes the identity binding BEFORE its
-    /// commit (ext r27 F4: a failed binding abandons it pre-commit), and the
-    /// commit-to-Live plus the retained release stamp are one critical
-    /// section under the stamps lock (ext r30 F1) — so `was_recorded` alone
-    /// can be observed while the stamp is still absent. The stamp is the
-    /// real condition; the binding-first order is then pinned.
-    async fn await_create_adoption_committed(
-        st: &FreshClaudeState,
-        sink: &crate::identity_sink::FakeIdentitySink,
-        durable_id: &str,
-    ) {
+    /// `durable_id`. The adoption publishes the `cli_index` alias and then
+    /// writes the identity binding BEFORE its commit (ext r27 F4: a failed
+    /// binding abandons it pre-commit), and the commit-to-Live plus the
+    /// retained release stamp are one critical section under the stamps
+    /// lock (ext r30 F1) — so neither the alias nor `was_recorded` proves
+    /// the commit: both can be observed while the claim is still Starting
+    /// and the stamp is absent. The stamp is the real condition.
+    async fn await_create_ownership_committed(st: &FreshClaudeState, durable_id: &str) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         while crate::ownership_lane::peek_retained_stamp(&st.ownership_stamps, durable_id).is_none()
         {
@@ -13971,6 +13968,16 @@ rl.on('line', (line) => {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// [`await_create_ownership_committed`] for a create with a RECORDABLE
+    /// binding, then pins the binding-first order.
+    async fn await_create_adoption_committed(
+        st: &FreshClaudeState,
+        sink: &crate::identity_sink::FakeIdentitySink,
+        durable_id: &str,
+    ) {
+        await_create_ownership_committed(st, durable_id).await;
         assert!(
             sink.was_recorded("claude", durable_id),
             "the adoption records the binding before it commits ownership"
@@ -14078,20 +14085,7 @@ rl.on('line', (line) => {
             .await;
         let created = await_claude_created(&mut rx, "req-e3r1-f1").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while st
-            .cli_index
-            .lock()
-            .await
-            .get(FRESH_CREATE_DURABLE_ID)
-            .is_none()
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the create's adoption never published"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        await_create_ownership_committed(&st, FRESH_CREATE_DURABLE_ID).await;
 
         // THE COMPLETED HANDOFF (simulated at the coordinator level): the
         // stamp is consumed and a TERMINAL owner is committed under the
@@ -14683,20 +14677,7 @@ rl.on('line', (line) => {
             .await;
         let created = await_claude_created(&mut rx, "req-e3r1-f3").await;
         let _placeholder = created["sessionId"].as_str().unwrap().to_string();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while st
-            .cli_index
-            .lock()
-            .await
-            .get(FRESH_CREATE_DURABLE_ID)
-            .is_none()
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the create's adoption never published"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        await_create_ownership_committed(&st, FRESH_CREATE_DURABLE_ID).await;
 
         // THE UNOWNED-LIVE shape: the coordinator key goes Vacant (a
         // confirmed-kill release) while the lane map still holds the live
@@ -16691,6 +16672,10 @@ rl.on('line', (line) => {
             .await;
         let created = await_claude_created(&mut rx, "req-postcap-f3").await;
         let _placeholder = created["sessionId"].as_str().unwrap().to_string();
+        // The first create's adoption must COMMIT before the pre-commit
+        // park arms — otherwise it parks there too, and both the `reached`
+        // flag and the stale-start recovery below see the WRONG claim.
+        await_create_ownership_committed(&st, FRESH_CREATE_DURABLE_ID).await;
 
         // The pre-commit park: a SECOND session (fresh map key — the
         // ordinary-create shape, no prior durable id) whose adoption
