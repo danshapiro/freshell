@@ -154,6 +154,29 @@ impl EchoSession {
     }
 }
 
+impl Drop for EchoSession {
+    fn drop(&mut self) {
+        // The script and store die with `_dir`: no later test in this binary
+        // may inherit paths to them (the env lock is still held here).
+        remove_claude_env();
+    }
+}
+
+/// Removes the process-wide variables these tests point at their tempdirs.
+fn remove_claude_env() {
+    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+}
+
+/// Calls [`remove_claude_env`] when dropped, so a failed assertion cannot leak them.
+struct ClaudeEnvReset;
+
+impl Drop for ClaudeEnvReset {
+    fn drop(&mut self) {
+        remove_claude_env();
+    }
+}
+
 fn create_msg(request_id: &str) -> FreshAgentCreate {
     FreshAgentCreate {
         naming_handle: None,
@@ -464,6 +487,7 @@ async fn a_send_that_changes_the_permission_mode_broadcasts_metadata_stating_it(
 #[tokio::test]
 async fn snapshots_read_the_store_the_lanes_sidecars_write() {
     let _env = super::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _reset = ClaudeEnvReset;
     let process_store = tempfile::tempdir().expect("this process's store");
     std::env::set_var("CLAUDE_CONFIG_DIR", process_store.path());
     let sidecar_store = tempfile::tempdir().expect("the sidecars' store");
@@ -494,9 +518,18 @@ async fn snapshots_read_the_store_the_lanes_sidecars_write() {
         .get_snapshot(SessionType::Freshclaude, thread)
         .await
         .expect("the snapshot reads the sidecars' store");
-    std::env::remove_var("CLAUDE_CONFIG_DIR");
     assert_eq!(
         snapshot["turns"][0]["items"][0]["text"], "hello",
         "{snapshot}"
     );
+}
+
+#[tokio::test]
+async fn an_echo_session_leaves_the_process_environment_as_it_found_it() {
+    // The fake's script and store live in a tempdir that dies with the session:
+    // a later test in this binary must not inherit paths to them.
+    drop(EchoSession::start(None).await);
+    let _env = super::tests::CLAUDE_ENV_LOCK.lock().await;
+    assert_eq!(std::env::var_os("FRESHELL_CLAUDE_SIDECAR"), None);
+    assert_eq!(std::env::var_os("CLAUDE_CONFIG_DIR"), None);
 }
