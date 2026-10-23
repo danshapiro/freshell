@@ -123,7 +123,7 @@ mod session_name_store_view;
 #[path = "session_name_events.rs"]
 mod session_name_events;
 use session_name_apply::{indexed_key, replace_automatic, wire_source, with_outcome};
-use session_name_events::{ExternalChanges, NameChangeCause, NameChangeEvent};
+use session_name_events::{AdoptedChanges, NameChangeCause, NameChangeEvent, UncertainCommits};
 use session_name_first_message::{first_message_fallback, RefusalSite, SeriesPlan};
 use session_name_store_view::{DocumentStamp, FullCheck};
 use session_name_sweep_batch::StagedNativeBaselines;
@@ -632,6 +632,10 @@ struct NamesCore {
     /// Name-reliability Task 4: native baselines observed but not yet
     /// persisted (the sweep maintenance batch persists them).
     staged_baselines: Arc<StagedNativeBaselines>,
+    /// This store's last commit whose durable replace ended uncertain, so
+    /// the transaction that confirms it logs its name changes with their own
+    /// causes (`session_name_events`).
+    uncertain_commits: UncertainCommits,
 }
 
 /// Proof that the holder owns this store's local transaction turn; the strict
@@ -753,6 +757,7 @@ impl SessionNames {
             full_check: FullCheck::default(),
             tx,
             staged_baselines: Arc::new(StagedNativeBaselines::default()),
+            uncertain_commits: UncertainCommits::default(),
         });
         // Reconcile/initialize the current document before success — the same
         // strict path every transaction takes (this is a blocking boot call).
@@ -1793,12 +1798,17 @@ where
             reconcile_durability(&core.doc_path, &core.data_dir)?;
         }
     }
-    // Another participant's commits since the adopted view, captured before
-    // this decision mutates the document (name-reliability Task 12).
-    let external = if first_init {
-        ExternalChanges::default()
+    // The name changes since the adopted view — another participant's
+    // commits, and this store's own uncertain one — captured before this
+    // decision mutates the document (name-reliability Task 12).
+    let adopted = if first_init {
+        AdoptedChanges::default()
     } else {
-        ExternalChanges::between(&core.current_view().document, &document)
+        core.uncertain_commits.adopted_changes(
+            &core.current_view().document,
+            &document,
+            &raw_digest,
+        )
     };
 
     let meta = TxnMeta {
@@ -1823,7 +1833,7 @@ where
             // whose record is gone) is no longer pending work.
             core.staged_baselines.prune_persisted(&document);
             if adopt_if_newer(core, document, raw_digest, raw_stamp, true) {
-                external.log();
+                core.uncertain_commits.log_adopted(adopted);
             } else {
                 // The file still holds the adopted generation.
                 session_name_store_view::confirm_view(core, raw_stamp);
@@ -1834,10 +1844,22 @@ where
             document.document_generation += 1;
             let bytes = serialize_document(&document)?;
             let digest = digest_bytes(&bytes);
-            write_durable(core, &document, &bytes, digest)?;
+            if let Err(error) = write_durable(core, &document, &bytes, digest) {
+                if matches!(error, NameError::CommitUncertain(_)) {
+                    // The replacement landed but is unconfirmed: its name
+                    // changes are logged by the transaction that confirms it.
+                    core.uncertain_commits.remember(
+                        adopted,
+                        document,
+                        digest,
+                        publish.iter().filter_map(PublishSpec::change_entry),
+                    );
+                }
+                return Err(error);
+            }
             core.staged_baselines.prune_persisted(&document);
             // Committed: log the adopted and the own name changes.
-            external.log();
+            core.uncertain_commits.log_adopted(adopted);
             session_name_events::log_name_changes(
                 &document,
                 publish.iter().filter_map(PublishSpec::change_entry),

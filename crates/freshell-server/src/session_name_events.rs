@@ -10,8 +10,13 @@
 //! or source differs from before. A failed commit logs nothing; a decision
 //! that changes only bookkeeping (a generation advance, a native status)
 //! attaches no event. Changes another process committed are logged once
-//! when this store adopts them ([`ExternalChanges`], cause
+//! when this store adopts them ([`AdoptedChanges`], cause
 //! `adopted_external`) — never for the document this store loads at open.
+//! A commit whose durable replace ends uncertain (the replacement landed,
+//! its durability is unproven) logs nothing when it is made; the next
+//! transaction that reconciles and adopts or commits over that document
+//! logs its changes with their own causes ([`UncertainCommits`]), so this
+//! store's own change is never reported as another process's.
 //!
 //! The line carries the record key (`name_ref`), the old and new name,
 //! source and revision (the old ones are absent when the record is new),
@@ -38,7 +43,9 @@
 //! so the same before/after pair always logs the same flag. Renames, AI
 //! answers, imports and adopted external changes are always `false`.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard};
 
 use freshell_protocol::session_names::{NameRevision, NameSource, SessionNameRecord};
 
@@ -225,6 +232,10 @@ impl NameChangeEvent {
     }
 }
 
+/// One `session_names.name_changed` line waiting to be written: the record
+/// key, the change, and the saved name it ends at.
+type PendingLine = (String, NameChangeEvent, NameState);
+
 /// Log the changes a committed transaction made. A record changed by more
 /// than one decision in the transaction (an import with several winning
 /// candidates for one session) logs once: the last change measured from
@@ -235,6 +246,16 @@ pub(super) fn log_name_changes<'a>(
     document: &StoredDocument,
     changes: impl IntoIterator<Item = (&'a str, &'a NameChangeEvent)>,
 ) {
+    for (key, event, new) in &change_lines(document, changes) {
+        emit(key, event, new);
+    }
+}
+
+/// The lines [`log_name_changes`] writes, one per changed record.
+fn change_lines<'a>(
+    document: &StoredDocument,
+    changes: impl IntoIterator<Item = (&'a str, &'a NameChangeEvent)>,
+) -> Vec<PendingLine> {
     let mut order: Vec<&str> = Vec::new();
     let mut merged: BTreeMap<&str, NameChangeEvent> = BTreeMap::new();
     for (key, event) in changes {
@@ -244,54 +265,146 @@ pub(super) fn log_name_changes<'a>(
         }
         merged.insert(key, event.clone().after(earlier));
     }
-    for key in order {
-        let Some(record) = document.record_at(key) else {
-            continue;
-        };
-        emit(key, &merged[key], &NameState::of(record));
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let record = document.record_at(key)?;
+            let event = merged.remove(key)?;
+            Some((key.to_string(), event, NameState::of(record)))
+        })
+        .collect()
+}
+
+/// The visible record changes between `adopted` and a newer document
+/// another participant committed. Nothing when `adopted` is the pre-load
+/// placeholder (generation 0: opening a store loads the document, it adopts
+/// no change) or `next` is not newer.
+fn adopted_external(adopted: &StoredDocument, next: &StoredDocument) -> Vec<PendingLine> {
+    if adopted.document_generation == 0 || next.document_generation <= adopted.document_generation {
+        return Vec::new();
     }
-}
-
-/// The visible record changes between this store's adopted view and a
-/// newer document another participant committed, captured when the
-/// transaction read the newer document and logged once it is adopted (or
-/// committed over).
-#[derive(Debug, Default)]
-pub(super) struct ExternalChanges {
-    changes: Vec<(String, NameChangeEvent, NameState)>,
-}
-
-impl ExternalChanges {
-    /// What changed from `adopted` to `next`. Nothing when `adopted` is the
-    /// pre-load placeholder (generation 0: opening a store loads the
-    /// document, it adopts no change) or `next` is not newer.
-    pub(super) fn between(adopted: &StoredDocument, next: &StoredDocument) -> Self {
-        if adopted.document_generation == 0
-            || next.document_generation <= adopted.document_generation
-        {
-            return Self::default();
-        }
-        let changes = next
-            .records
-            .iter()
-            .filter_map(|(key, record)| {
-                let old = adopted.records.get(key);
-                let visible =
-                    old.is_none_or(|old| old.name != record.name || old.source != record.source);
-                visible.then(|| {
-                    (
-                        key.clone(),
-                        NameChangeEvent::new(NameChangeCause::AdoptedExternal, old, None),
-                        NameState::of(record),
-                    )
-                })
+    next.records
+        .iter()
+        .filter_map(|(key, record)| {
+            let old = adopted.records.get(key);
+            let visible =
+                old.is_none_or(|old| old.name != record.name || old.source != record.source);
+            visible.then(|| {
+                (
+                    key.clone(),
+                    NameChangeEvent::new(NameChangeCause::AdoptedExternal, old, None),
+                    NameState::of(record),
+                )
             })
-            .collect();
-        Self { changes }
+        })
+        .collect()
+}
+
+/// The name changes a transaction brings in when it reads a newer document
+/// than this store's adopted view: this store's own commit whose replace
+/// ended uncertain (with its own causes) and other participants' commits
+/// (`adopted_external`). Captured when the transaction reads the document,
+/// before its decision mutates it; written once the transaction adopts or
+/// commits over that document ([`UncertainCommits::log_adopted`]).
+#[derive(Debug, Default)]
+pub(super) struct AdoptedChanges {
+    lines: Vec<PendingLine>,
+}
+
+/// This store's own commit whose durable replace ended uncertain
+/// (`NameError::CommitUncertain`: the replacement landed, its durability is
+/// unproven), with the lines its transaction did not write — what that
+/// transaction adopted, then its own changes.
+#[derive(Debug)]
+struct UncertainCommit {
+    document: StoredDocument,
+    digest: [u8; 32],
+    lines: Vec<PendingLine>,
+}
+
+impl UncertainCommit {
+    /// Whether `next`, read over the view `adopted`, holds this commit: the
+    /// view is still older than it, and `next` is either these exact bytes
+    /// or a later document (only built on top of them — this store held
+    /// the lock when the replacement landed).
+    fn is_held_by(
+        &self,
+        adopted: &StoredDocument,
+        next: &StoredDocument,
+        digest: &[u8; 32],
+    ) -> bool {
+        let generation = self.document.document_generation;
+        adopted.document_generation < generation
+            && match next.document_generation.cmp(&generation) {
+                Ordering::Less => false,
+                Ordering::Equal => *digest == self.digest,
+                Ordering::Greater => true,
+            }
+    }
+}
+
+/// The store's last uncertain commit, kept until a later transaction
+/// confirms the document — reconciles its durability, then adopts or
+/// commits over it — and writes the commit's lines with their own causes.
+/// Only what changed after it counts as another participant's.
+#[derive(Debug, Default)]
+pub(super) struct UncertainCommits(Mutex<Option<UncertainCommit>>);
+
+impl UncertainCommits {
+    fn slot(&self) -> MutexGuard<'_, Option<UncertainCommit>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(super) fn log(&self) {
-        for (key, event, new) in &self.changes {
+    /// What adopting `next` (whose bytes hash to `digest`) over the view
+    /// `adopted` brings in.
+    pub(super) fn adopted_changes(
+        &self,
+        adopted: &StoredDocument,
+        next: &StoredDocument,
+        digest: &[u8; 32],
+    ) -> AdoptedChanges {
+        let slot = self.slot();
+        let lines = match slot
+            .as_ref()
+            .filter(|commit| commit.is_held_by(adopted, next, digest))
+        {
+            Some(commit) => {
+                let mut lines = commit.lines.clone();
+                lines.extend(adopted_external(&commit.document, next));
+                lines
+            }
+            None => adopted_external(adopted, next),
+        };
+        AdoptedChanges { lines }
+    }
+
+    /// Keep this store's commit of `document` (its bytes hash to `digest`),
+    /// whose replace ended uncertain, with the lines its transaction would
+    /// have written: `adopted`, then `changes`.
+    pub(super) fn remember<'a>(
+        &self,
+        adopted: AdoptedChanges,
+        document: StoredDocument,
+        digest: [u8; 32],
+        changes: impl IntoIterator<Item = (&'a str, &'a NameChangeEvent)>,
+    ) {
+        let mut lines = adopted.lines;
+        lines.extend(change_lines(&document, changes));
+        *self.slot() = Some(UncertainCommit {
+            document,
+            digest,
+            lines,
+        });
+    }
+
+    /// The transaction adopted or committed over the document `adopted`
+    /// was read from: write its lines and forget the uncertain commit (the
+    /// view now holds a later document).
+    pub(super) fn log_adopted(&self, adopted: AdoptedChanges) {
+        *self.slot() = None;
+        for (key, event, new) in &adopted.lines {
             emit(key, event, new);
         }
     }

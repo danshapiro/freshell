@@ -1252,3 +1252,7 @@ async fn no_event_when_commit_fails() {
         .unwrap();
     assert_eq!(one_change(since, &target).new, new_of(&saved));
 }
+
+// A commit whose durable replace ends uncertain, logged once confirmed.
+#[path = "session_name_events_uncertain_tests.rs"]
+mod uncertain;
