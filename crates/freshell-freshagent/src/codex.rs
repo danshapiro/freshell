@@ -3702,6 +3702,7 @@ impl FreshCodexState {
                 &session_id,
                 Some(model.as_str()),
                 effort.as_deref(),
+                None,
             ));
         }
 
@@ -4035,6 +4036,7 @@ impl FreshCodexState {
             &session_id,
             Some(model.as_str()),
             effort.as_deref(),
+            None,
         ));
     }
 

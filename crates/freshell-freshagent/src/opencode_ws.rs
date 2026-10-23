@@ -2721,6 +2721,7 @@ impl FreshOpencodeState {
                 &busy_session_id,
                 model.as_deref(),
                 effort.as_deref(),
+                None,
             ));
         }
 
@@ -3193,6 +3194,7 @@ impl FreshOpencodeState {
             &session_id,
             model.as_deref(),
             effort.as_deref(),
+            None,
         ));
     }
 

@@ -729,6 +729,15 @@ struct QuiesceVerdict {
     handed_compact_likely: bool,
 }
 
+/// What a claude `freshAgent.session.metadata` frame states (see
+/// [`FreshClaudeState::stated_settings`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StatedSettings {
+    model: Option<String>,
+    effort: Option<String>,
+    permission_mode: Option<String>,
+}
+
 #[derive(Default)]
 struct ClaudeConfiguration {
     settings: crate::identity_sink::FreshAgentSettings,
@@ -4626,15 +4635,7 @@ impl FreshClaudeState {
             // whose settings CHANGED the live session can converge every
             // device's model surfaces — the same frame `handle_configure`
             // emits (a device that missed the configure still lands here).
-            let settings_before = {
-                let guard = self.sessions.lock().await;
-                guard.get(&map_key).map(|s| {
-                    (
-                        s.configuration.settings.model.clone(),
-                        s.configuration.settings.effort.clone(),
-                    )
-                })
-            };
+            let settings_before = self.stated_settings(&map_key).await;
             if let Err(err) = self
                 .configure_for_send(&map_key, settings, session_type)
                 .await
@@ -4642,24 +4643,13 @@ impl FreshClaudeState {
                 self.send_error(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
                 return;
             }
-            let settings_after = {
-                let guard = self.sessions.lock().await;
-                guard.get(&map_key).map(|s| {
-                    (
-                        s.configuration.settings.model.clone(),
-                        s.configuration.settings.effort.clone(),
-                    )
-                })
-            };
+            let settings_after = self.stated_settings(&map_key).await;
             if settings_before != settings_after {
-                let (model, effort) = settings_after.unwrap_or((None, None));
-                self.broadcast(&crate::session_metadata::session_metadata_frame(
-                    PROVIDER,
+                self.broadcast_stated_settings(
                     session_type,
                     &session_id,
-                    model.as_deref(),
-                    effort.as_deref(),
-                ));
+                    settings_after.unwrap_or_default(),
+                );
             }
         }
         // Task 4 review (C1b): the destroy target comes from POST-lock session
@@ -4962,15 +4952,7 @@ impl FreshClaudeState {
             );
         }
 
-        let before = {
-            let guard = self.sessions.lock().await;
-            guard.get(&map_key).map(|s| {
-                (
-                    s.configuration.settings.model.clone(),
-                    s.configuration.settings.effort.clone(),
-                )
-            })
-        };
+        let before = self.stated_settings(&map_key).await;
         if let Err(err) = self
             .configure_for_send(&map_key, &msg.settings, session_type)
             .await
@@ -4980,28 +4962,46 @@ impl FreshClaudeState {
             self.emit_fresh_agent_error(&session_id, session_type, "CLAUDE_SETTINGS_FAILED", &err);
             return;
         }
-        let after = {
-            let guard = self.sessions.lock().await;
-            guard.get(&map_key).map(|s| {
-                (
-                    s.configuration.settings.model.clone(),
-                    s.configuration.settings.effort.clone(),
-                )
-            })
-        };
+        let after = self.stated_settings(&map_key).await;
         if before == after {
             // Idempotent configure: nothing to converge.
             return;
         }
-        let (model, effort) = after.unwrap_or((None, None));
         // Broadcast keyed at the CLIENT-ADDRESSED id (the id the configure
         // named): the client's fold resolves the sessions-map entry by it.
+        self.broadcast_stated_settings(session_type, &session_id, after.unwrap_or_default());
+    }
+
+    /// The settings a `freshAgent.session.metadata` frame states for the
+    /// session under `map_key` (`None` when it is gone): model, effort and
+    /// permission mode. The configure and send paths diff these around an
+    /// apply and broadcast only a change.
+    async fn stated_settings(&self, map_key: &str) -> Option<StatedSettings> {
+        let guard = self.sessions.lock().await;
+        guard.get(map_key).map(|session| {
+            let settings = &session.configuration.settings;
+            StatedSettings {
+                model: settings.model.clone(),
+                effort: settings.effort.clone(),
+                permission_mode: settings.permission_mode.clone(),
+            }
+        })
+    }
+
+    /// Converge every device's settings surfaces on `stated`.
+    fn broadcast_stated_settings(
+        &self,
+        session_type: &str,
+        session_id: &str,
+        stated: StatedSettings,
+    ) {
         self.broadcast(&crate::session_metadata::session_metadata_frame(
             PROVIDER,
             session_type,
-            &session_id,
-            model.as_deref(),
-            effort.as_deref(),
+            session_id,
+            stated.model.as_deref(),
+            stated.effort.as_deref(),
+            stated.permission_mode.as_deref(),
         ));
     }
 

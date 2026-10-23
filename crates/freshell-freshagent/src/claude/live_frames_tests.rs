@@ -417,3 +417,43 @@ async fn the_clis_own_permission_mode_change_becomes_the_sessions_setting() {
     assert_eq!(configures.len(), 1, "{configures:?}");
     assert_eq!(configures[0]["settings"]["permissionMode"], "plan");
 }
+
+/// A configure that changes only the permission mode converges every
+/// device: the metadata broadcast states the new mode (with the unchanged
+/// model and effort pair, as every metadata frame does).
+#[tokio::test]
+async fn a_configure_that_changes_the_permission_mode_broadcasts_metadata_stating_it() {
+    let mut session = EchoSession::start(None).await;
+    session
+        .st
+        .handle_configure(configure_msg(&session.pane, "plan"))
+        .await;
+    assert_eq!(session.configures().len(), 1);
+
+    let metadata = session.await_event("freshAgent.session.metadata").await;
+    assert_eq!(metadata["sessionId"], json!(session.pane), "{metadata}");
+    assert_eq!(metadata["event"]["permissionMode"], "plan");
+    assert_eq!(metadata["event"]["model"], Value::Null);
+    assert_eq!(metadata["event"]["effort"], Value::Null);
+}
+
+/// The same convergence for a send whose settings change the mode (a device
+/// that missed the configure still lands here).
+#[tokio::test]
+async fn a_send_that_changes_the_permission_mode_broadcasts_metadata_stating_it() {
+    let mut session = EchoSession::start(Some("plan")).await;
+    let mut send = send_msg(&session.pane, "[]");
+    send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+        cwd: None,
+        model: None,
+        permission_mode: Some("acceptEdits".to_string()),
+        sandbox: None,
+        effort: None,
+    });
+    session.st.handle_send(send).await;
+    assert_eq!(session.configures().len(), 1);
+
+    let metadata = session.await_event("freshAgent.session.metadata").await;
+    assert_eq!(metadata["sessionId"], json!(session.pane), "{metadata}");
+    assert_eq!(metadata["event"]["permissionMode"], "acceptEdits");
+}
