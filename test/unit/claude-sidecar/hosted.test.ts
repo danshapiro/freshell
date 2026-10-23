@@ -3,11 +3,10 @@
 // One place decides whether the claude sidecar is hosted (hosted.mjs). The
 // session host sets FRESHELL_HOSTED_FRESH_AGENT to the provider it hosts:
 // `claude` for freshclaude, `kilroy` for kilroy. Every hosted sidecar logs CLI
-// output by size only. The managed spawn check and the fixed hosted MCP recipe
-// apply to hosted claude alone today; extending them to hosted kilroy is an
-// explicit item of the api-hosted-ops workstream
-// (docs/plans/2026-10-22-freshclaude-api-hosted-ops.md §2.4), not a silent
-// side effect of sharing the predicate.
+// output by size only, and every hosted sidecar runs the Claude CLI inside the
+// managed enclosure, so the managed spawn check and the fixed hosted MCP recipe
+// apply to hosted kilroy as they do to hosted claude
+// (docs/plans/2026-10-22-freshclaude-api-hosted-ops.md §2.4).
 
 import { describe, expect, it } from 'vitest'
 // @ts-expect-error JavaScript sidecar module has no declaration file.
@@ -34,18 +33,21 @@ describe('Claude sidecar hosted mode', () => {
     expect(isHostedSidecar(env())).toBe(false)
   })
 
-  it('gives the managed spawn check and the fixed MCP recipe to hosted claude only', () => {
+  it('gives the managed spawn check and the fixed MCP recipe to hosted claude and hosted kilroy alike', () => {
     expect(usesHostedClaudeRuntime(env('claude'))).toBe(true)
-    expect(usesHostedClaudeRuntime(env('kilroy'))).toBe(false)
+    expect(usesHostedClaudeRuntime(env('kilroy'))).toBe(true)
+    expect(usesHostedClaudeRuntime(env(''))).toBe(false)
     expect(usesHostedClaudeRuntime(env())).toBe(false)
 
-    expect(hostedMcpServers(true, env('claude'))).toEqual({ freshell: { command: 'node', args: ['/opt/freshell-mcp/server.js'] } })
-    expect(hostedMcpServers(true, env('kilroy'))).toBeUndefined()
+    const fixedRecipe = { freshell: { command: 'node', args: ['/opt/freshell-mcp/server.js'] } }
+    expect(hostedMcpServers(true, env('claude'))).toEqual(fixedRecipe)
+    expect(hostedMcpServers(true, env('kilroy'))).toEqual(fixedRecipe)
     expect(hostedMcpServers(true, env())).toBeUndefined()
 
     // The managed spawn is Linux-only by design.
-    expect(typeof managedSdkSpawn(() => {}, env('claude'))).toBe(process.platform === 'linux' ? 'function' : 'undefined')
-    expect(managedSdkSpawn(() => {}, env('kilroy'))).toBeUndefined()
+    const spawnKind = process.platform === 'linux' ? 'function' : 'undefined'
+    expect(typeof managedSdkSpawn(() => {}, env('claude'))).toBe(spawnKind)
+    expect(typeof managedSdkSpawn(() => {}, env('kilroy'))).toBe(spawnKind)
     expect(managedSdkSpawn(() => {}, env())).toBeUndefined()
   })
 })
