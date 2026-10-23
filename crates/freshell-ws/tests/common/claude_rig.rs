@@ -13,7 +13,8 @@
 //!   key. It never contacts the real API.
 //!
 //! Each rig's server is wired like production: one ownership coordinator shared by
-//! the WS state and the claude lane (main.rs does the same).
+//! the WS state and the claude lane (main.rs does the same), and the fresh-agent
+//! snapshot REST route ([`ClaudeRig::snapshot`]) beside the WS endpoint.
 //!
 //! Each rig gets a throwaway HOME / CLAUDE_CONFIG_DIR / workspace, and its server's
 //! [`freshell_freshagent::FreshClaudeState`] gives every sidecar exactly the rig's
@@ -31,7 +32,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -61,6 +62,8 @@ pub struct ClaudeRig {
     pub kind: RigKind,
     /// `ws://127.0.0.1:<port>/ws` of the rig's server (an ephemeral loopback port).
     pub url: String,
+    /// The same server's HTTP address (the snapshot REST route).
+    pub http: std::net::SocketAddr,
     /// The isolated workspace every session of this rig runs in.
     pub workspace: PathBuf,
     /// CLAUDE_CONFIG_DIR of the CLI (simulated or real): its transcripts land here.
@@ -162,7 +165,7 @@ impl ClaudeRig {
             environment.push(((*key).into(), (*value).into()));
         }
 
-        let (url, fresh_claude) = spawn_rig_server(environment).await;
+        let (url, http, fresh_claude) = spawn_rig_server(environment).await;
         eprintln!(
             "{}",
             json!({
@@ -173,6 +176,7 @@ impl ClaudeRig {
         Self {
             kind,
             url,
+            http,
             workspace,
             claude_config_dir,
             ledger,
@@ -242,6 +246,40 @@ impl ClaudeRig {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// `GET /api/fresh-agent/threads/freshclaude/claude/<thread_id>` (the route the
+    /// browser's pane fetches its transcript from): the status and the JSON body.
+    pub async fn snapshot(&self, thread_id: &str) -> (u16, Value) {
+        let mut stream = tokio::net::TcpStream::connect(self.http)
+            .await
+            .expect("connect to the rig's HTTP address");
+        let request = format!(
+            "GET /api/fresh-agent/threads/freshclaude/claude/{thread_id} HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\nx-auth-token: {AUTH_TOKEN}\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the snapshot request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read the snapshot response");
+        let text = String::from_utf8(response).expect("a utf-8 response");
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .expect("an HTTP response with a body");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("an HTTP status code");
+        (
+            status,
+            serde_json::from_str(body.trim()).unwrap_or(Value::Null),
+        )
     }
 
     /// The simulator's ledger rows of one kind (`query`, `boot`, `prompt`,
@@ -540,7 +578,11 @@ async fn start_local_provider() -> (tokio::process::Child, String) {
 /// agents enabled and a claude state whose sidecars get exactly `environment`.
 async fn spawn_rig_server(
     environment: Vec<(String, String)>,
-) -> (String, freshell_freshagent::FreshClaudeState) {
+) -> (
+    String,
+    std::net::SocketAddr,
+    freshell_freshagent::FreshClaudeState,
+) {
     let mut settings_value = test_settings_value();
     settings_value["freshAgent"]["enabled"] = json!(true);
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
@@ -613,7 +655,16 @@ async fn spawn_rig_server(
         ownership: Some(ownership),
     };
 
-    let router = freshell_ws::router(state);
+    let snapshots = freshell_freshagent::SnapshotState::new(
+        Arc::clone(&auth_token),
+        state.fresh_codex.clone(),
+        freshell_freshagent::FreshAgentState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+        ),
+        lane.clone(),
+    );
+    let router = freshell_ws::router(state).merge(freshell_freshagent::snapshot::router(snapshots));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind an ephemeral loopback port");
@@ -621,5 +672,5 @@ async fn spawn_rig_server(
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    (format!("ws://{addr}/ws"), lane)
+    (format!("ws://{addr}/ws"), addr, lane)
 }
