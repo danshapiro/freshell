@@ -11,9 +11,10 @@
 //! controller owns its own accept loop per listener. Retiring a listener uses
 //! `Notify::notify_one()` (permit-storing: the wakeup cannot be lost, unlike
 //! `notify_waiters`) and then AWAITS the old accept-loop `JoinHandle`, which
-//! first hands off queued connections and then drops its listener — a
-//! deterministic "old socket closed" barrier, so callers may respond/probe
-//! immediately after `serve_on` returns. In-flight connections (incl.
+//! first hands off queued connections, then shuts the listening socket down
+//! (so a duplicate held by a concurrently forked child process cannot keep
+//! it listening) and drops it — a deterministic "old socket closed" barrier,
+//! so callers may respond/probe immediately after `serve_on` returns. In-flight connections (incl.
 //! WebSockets) drain in their own spawned tasks — no mass 4009 on rebind.
 //!
 //! Trade-off: SO_REUSEPORT lets another process of the same effective UID bind
@@ -63,6 +64,28 @@ pub fn bind_reusable(addr: SocketAddr, reuse_port: bool) -> std::io::Result<StdT
     let std_listener: StdTcpListener = socket.into();
     std_listener.set_nonblocking(true)?;
     Ok(std_listener)
+}
+
+/// Stop `listener` listening for EVERY descriptor that shares its socket.
+///
+/// Closing this process's descriptors alone does not close a listening
+/// socket while a child process forked by another thread (a PTY, sidecar or
+/// Git spawn) still holds a duplicate from before its exec: the socket keeps
+/// listening, the kernel keeps queueing new connections on it — preferring
+/// it over a wildcard listener for its own address — and resets them all
+/// when the child's copy finally closes. A shutdown acts on the socket
+/// itself, so it stops listening at once.
+fn stop_listening(listener: &StdTcpListener) {
+    match socket2::SockRef::from(listener).shutdown(std::net::Shutdown::Both) {
+        Ok(()) => {}
+        // Platforms that do not shut down a listening socket report it as
+        // not connected; closing the descriptors is all they offer.
+        Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {}
+        Err(err) => tracing::warn!(
+            error = %err,
+            "retired listener shutdown failed; it stops listening once every inherited descriptor closes"
+        ),
+    }
 }
 
 /// One live listener: its shutdown signal and accept-loop task handle. The
@@ -178,6 +201,9 @@ impl RebindController {
                                 }
                             }
                         }
+                        // Dropping the handles below would not close the
+                        // socket while a forked child still holds a copy.
+                        stop_listening(&drain_listener);
                         break;
                     },
                     res = listener.accept() => {
@@ -196,8 +222,9 @@ impl RebindController {
                     }
                 }
             }
-            // `listener` is dropped HERE, before the task completes: awaiting
-            // this JoinHandle is a true "old listener closed" barrier.
+            // `listener` is stopped above and dropped HERE, before the task
+            // completes: awaiting this JoinHandle is a true "old listener
+            // closed" barrier, even against copies held by forked children.
         });
         let mut cur = self.current.lock().await;
         *self.current_addr.lock().expect("current_addr lock") = Some(bound_addr);
@@ -239,10 +266,30 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     // Keep this listener until the controller's initial bind succeeds, then
-    // drop it before sending traffic so only the controller accepts requests.
-    fn reusable_loopback_listener() -> StdTcpListener {
-        bind_reusable(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), true)
+    // retire it before sending traffic so only the controller accepts requests.
+    //
+    // It binds the WILDCARD address: these tests later rebind the controller
+    // to 0.0.0.0, which needs the port free on every address. A loopback-only
+    // `bind(127.0.0.1:0)` lets the kernel hand out a port that another socket
+    // on this host is already using on a different address (a busy machine's
+    // outgoing connection, say), and the later wildcard rebind then fails
+    // with AddrInUse. A wildcard `bind(0.0.0.0:0)` only picks a port that is
+    // free everywhere, and from then on some socket of this test holds it.
+    fn reusable_port_owner() -> StdTcpListener {
+        bind_reusable(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), true)
             .expect("own an OS-assigned reusable listener")
+    }
+
+    // The port owner shares the controller's SO_REUSEPORT port. Dropping it
+    // is not enough: a child process forked meanwhile by another test holds
+    // a duplicate until it execs, and while it does the owner keeps
+    // listening — the kernel can then hand this test's connection to the
+    // owner's queue, which nobody serves, and reset it once the child's copy
+    // closes. Stop it listening first, as the controller does with a
+    // retired listener.
+    fn retire_port_owner(port_owner: StdTcpListener) {
+        stop_listening(&port_owner);
+        drop(port_owner);
     }
 
     #[test]
@@ -257,7 +304,7 @@ mod tests {
 
     #[test]
     fn two_reuseport_binds_on_same_addr_both_succeed() {
-        let a = reusable_loopback_listener();
+        let a = reusable_port_owner();
         let addr = a.local_addr().expect("first listener address");
         let b = bind_reusable(addr, true).expect("second reuseport bind must also succeed");
         drop((a, b));
@@ -279,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn serve_on_proves_bind_before_swapping_and_serves_traffic() {
         use axum::{routing::get, Router};
-        let port_owner = reusable_loopback_listener();
+        let port_owner = reusable_port_owner();
         let port = port_owner
             .local_addr()
             .expect("initial listener address")
@@ -295,7 +342,7 @@ mod tests {
         ctl.serve_on(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .await
             .expect("initial serve");
-        drop(port_owner);
+        retire_port_owner(port_owner);
         let body = reqwest::get(format!("http://127.0.0.1:{port}/ping"))
             .await
             .unwrap()
@@ -322,7 +369,7 @@ mod tests {
         // reports/V1.md): with notify_waiters and no barrier, 42-99/100 of
         // these iterations fail. Do NOT weaken this test.
         use axum::{routing::get, Router};
-        let port_owner = reusable_loopback_listener();
+        let port_owner = reusable_port_owner();
         let port = port_owner
             .local_addr()
             .expect("initial listener address")
@@ -333,7 +380,7 @@ mod tests {
         let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let wildcard = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         ctl.serve_on(localhost).await.expect("initial serve");
-        drop(port_owner);
+        retire_port_owner(port_owner);
         for i in 0..100 {
             let target = if i % 2 == 0 { wildcard } else { localhost };
             ctl.serve_on(target).await.expect("swap");
@@ -360,7 +407,7 @@ mod tests {
         use std::io::Write;
         use tokio::io::AsyncReadExt;
 
-        let port_owner = reusable_loopback_listener();
+        let port_owner = reusable_port_owner();
         let port = port_owner
             .local_addr()
             .expect("initial listener address")
@@ -371,7 +418,7 @@ mod tests {
         ctl.serve_on(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .await
             .expect("initial serve");
-        drop(port_owner);
+        retire_port_owner(port_owner);
 
         // A current-thread runtime has not polled the accept loop yet. The
         // handshake and request reach the old socket before its shutdown.
@@ -400,6 +447,50 @@ mod tests {
         ctl.shutdown_all().await;
     }
 
+    /// A retired listener stops listening even while a child process forked
+    /// before the rebind still holds a duplicate of it (every PTY, sidecar or
+    /// Git spawn on another thread opens that window until its exec). Merely
+    /// closing the server's descriptors would leave it LISTENING: a new
+    /// connection to its specific address would land in a queue nobody
+    /// serves — ahead of the new wildcard listener — and be reset when the
+    /// child's copy finally closes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retired_listener_held_by_a_forked_child_stops_accepting() {
+        use axum::{routing::get, Router};
+        let port_owner = reusable_port_owner();
+        let port = port_owner
+            .local_addr()
+            .expect("initial listener address")
+            .port();
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let ctl = RebindController::new(port, true);
+        ctl.set_app(app);
+        ctl.serve_on(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .expect("initial serve");
+        retire_port_owner(port_owner);
+
+        // Fork while the loopback listener is open, then retire it.
+        let child = crate::test_parked_child::ParkedChild::fork_now();
+        ctl.serve_on(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .await
+            .expect("rebind serve");
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            reqwest::get(format!("http://127.0.0.1:{port}/ping"))
+                .await?
+                .text()
+                .await
+        })
+        .await;
+        child.release();
+        let body = probe
+            .expect("the new listener answers; the retired one must not swallow the probe")
+            .expect("the probe is not reset");
+        assert_eq!(body, "pong");
+        ctl.shutdown_all().await;
+    }
+
     /// Pins the DEV-0013 drain property: a connection accepted by the OLD
     /// listener keeps working across a rebind (drains gracefully in its
     /// detached per-connection task) while the NEW listener serves new
@@ -415,7 +506,7 @@ mod tests {
         use tokio::sync::{mpsc, watch};
         use tokio::time::timeout;
 
-        let port_owner = reusable_loopback_listener();
+        let port_owner = reusable_port_owner();
         let port = port_owner
             .local_addr()
             .expect("initial listener address")
@@ -446,7 +537,7 @@ mod tests {
         ctl.set_app(app);
         let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
         ctl.serve_on(localhost).await.expect("initial serve");
-        drop(port_owner);
+        retire_port_owner(port_owner);
 
         // Start a request that will still be in flight when we swap. Only the
         // OLD listener exists at this point, so it owns the connection.
