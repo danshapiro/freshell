@@ -212,6 +212,7 @@ impl FreshClaudeState {
             turn_lock,
             session_type,
             last_synthesized_complete_at,
+            live_settings,
         ) = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
@@ -226,6 +227,9 @@ impl FreshClaudeState {
                     // the same logical session lifetime, so a death-mint
                     // after the fork can never regress past one before it).
                     s.last_synthesized_complete_at.clone(),
+                    // The settings the session runs with (G15): the
+                    // replacement launches with them, on every lane.
+                    s.configuration.settings.clone(),
                 ),
                 None => {
                     reply_sink(rollback_error_frame(
@@ -1060,16 +1064,15 @@ impl FreshClaudeState {
         self.emit_pending_cancellations(&map_key, &op.session_id, session_type)
             .await;
 
-        // The replacement's launch: the original's recorded settings (plugins
-        // included, G15) and the lane's hosted MCP selection; a fork resumes
-        // its source by id under the source's ORIGINAL cwd while that cwd
-        // exists (ledger A15 slug scoping), else by the transcript PATH (the
-        // verified cli.js escape hatch). The path is the one the reads above
-        // located (G28: never a second scan that a store turning unreadable
-        // could miss).
-        let recovered = self
-            .identity_sink()
-            .and_then(|s| s.load_settings(PROVIDER, &durable_id));
+        // The replacement's launch: the settings the original runs with
+        // (model, effort, permission mode and the plugins, G15; the same source
+        // a fork's child launches from, and the only one a lane with no ledger
+        // has, such as the hosted session host) and the lane's hosted MCP
+        // selection; a fork resumes its source by id under the source's
+        // ORIGINAL cwd while that cwd exists (ledger A15 slug scoping), else by
+        // the transcript PATH (the verified cli.js escape hatch). The path is
+        // the one the reads above located (G28: never a second scan that a
+        // store turning unreadable could miss).
         let located = source_path
             .as_deref()
             .map(|path| crate::claude_launch::resume_target(&source, path));
@@ -1077,7 +1080,7 @@ impl FreshClaudeState {
             .as_ref()
             .and_then(|(_, cwd)| cwd.clone())
             .or_else(|| op.cwd.clone())
-            .or_else(|| recovered.as_ref().and_then(|r| r.cwd.clone()));
+            .or_else(|| live_settings.cwd.clone());
         let boot = match &genesis {
             ClaudeGenesis::Fresh => ClaudeBoot::Fresh,
             ClaudeGenesis::Fork { at, drops_turn, .. } => ClaudeBoot::Fork {
@@ -1089,7 +1092,7 @@ impl FreshClaudeState {
                 drops_turn: drops_turn.clone(),
             },
         };
-        let mut launch_settings = recovered.clone().unwrap_or_default();
+        let mut launch_settings = live_settings;
         if spawn_cwd.is_some() {
             launch_settings.cwd = spawn_cwd.clone();
         }

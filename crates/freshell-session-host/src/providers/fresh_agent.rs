@@ -1822,6 +1822,57 @@ lines.on('line', line=>{
         Arc::clone(&claude.transport).stop().await.unwrap();
     }
 
+    /// G15 on the hosted lane: every start carries the pane's plugins, and an
+    /// undo starts a replacement CLI. The hosted session host keeps no pane
+    /// ledger, so the replacement must take the live session's settings
+    /// (plugins, model, effort), not the ledger's (nothing), or the replacement
+    /// and every later turn run without the pane's plugins (a boot-only
+    /// option). (Redo needs the durable rollback record, which only a lane with
+    /// a ledger keeps.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hosted_claude_undo_keeps_the_panes_plugins_and_model() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let conversation = "6d1f0a2b-3c4d-4e5f-8a6b-7c8d9e0f1a2b";
+        let claude = SimulatedClaude::start(&[conversation]).await;
+        let plugin = claude.root.path().join("workspace/.claude/plugins/review");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let plugin = plugin.to_string_lossy().to_string();
+        let mut profile = claude.profile(Some(conversation));
+        profile.plugins = Some(vec![plugin.clone()]);
+        profile.model = Some("opus".into());
+        profile.effort = Some("high".into());
+        tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+            .await
+            .expect("the resume start answers")
+            .expect("the resume start succeeds");
+        let plugins = json!([{ "type": "local", "path": plugin }]);
+        let start = claude.ledger_rows("query")[0]["options"].clone();
+        assert_eq!(start["plugins"], plugins, "{start}");
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            claude.transport.dispatch_operation(
+                &RequestId::parse("undo-1").unwrap(),
+                &FreshAgentOperation::Rollback {
+                    direction: FreshAgentRollbackDirection::Undo,
+                    mode: FreshAgentRollbackMode::Step,
+                    turn_id: None,
+                    cwd: None,
+                },
+            ),
+        )
+        .await
+        .expect("the undo answers")
+        .expect("the undo succeeds");
+        let rows = claude.ledger_rows("query");
+        assert_eq!(rows.len(), 2, "the undo booted one replacement");
+        let replacement = rows[1]["options"].clone();
+        assert_eq!(replacement["plugins"], plugins, "{replacement}");
+        assert_eq!(replacement["model"], "opus", "{replacement}");
+        assert_eq!(replacement["effort"], "high", "{replacement}");
+        Arc::clone(&claude.transport).stop().await.unwrap();
+    }
+
     /// C14 (G09): a hosted claude fork routes to `FreshClaudeState::handle_fork`. The
     /// transition arrives once the CLI booted the child as a lazy fork of the parent
     /// (no prompt), keyed by the native ids the actor holds; the runtime retires the
