@@ -26,6 +26,12 @@
 //! tell, to be reaped. That never hides a process left running: nothing ends
 //! one in the meantime, so it is still running when the allowance ends.
 //!
+//! On Windows it answers at once. The tree guard confirms a tree only once
+//! every member's process handle is signaled, so a member must have exited
+//! by then. A wait would also be unsound there: dropping the guard closes
+//! its kill-on-close job, which would end a process the guard had wrongly
+//! reported gone while the probe was still waiting.
+//!
 //! Shared by the `claude_sidecar_teardown` integration test and the crate's
 //! unit tests (`lib.rs` includes this file under `cfg(all(test, unix))`).
 #![allow(dead_code)] // each including test crate uses a different subset

@@ -534,6 +534,68 @@ async fn an_abnormal_exit_is_not_graceful_and_the_tree_is_killed_at_once() {
     assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
 }
 
+/// [`FAKE_CRASHES_LEAVING_GRANDCHILD`] with a grandchild that holds 512 MB it
+/// has written to, so once it is killed, finishing its exit (releasing that
+/// memory) takes tens of milliseconds. The readiness line comes once the
+/// grandchild holds the memory.
+///
+/// That gap is what these tests are about on Windows: a job stops counting a
+/// process as active the moment it starts to exit, but Windows signals the
+/// process (it has exited) only once the exit is done. On windows-2022 that
+/// came about 4 ms after the count for an idle node and 25-30 ms after it
+/// for one holding 768 MB, every time.
+const FAKE_CRASHES_LEAVING_A_SLOW_EXITING_GRANDCHILD: &str = r#"
+const { spawn } = require('child_process')
+const grandchild = spawn(process.execPath, ['-e', "const held = Buffer.alloc(512 * 1024 * 1024, 1); setInterval(() => held[0]++, 1000); console.log('holding')"], { stdio: ['ignore', 'pipe', 'ignore'] })
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') process.exit(1)
+})
+setInterval(() => {}, 1000)
+grandchild.stdout.once('data', () => process.stdout.write(`ready ${grandchild.pid}\n`))
+"#;
+
+/// The guard confirms the tree gone only once every process in it has
+/// exited, not as soon as the last one has started to: a grandchild still
+/// finishing its exit at that moment is not gone yet. On Windows a crashed
+/// node's own exit is what kills this grandchild (node keeps the children it
+/// spawns in a kill-on-close job of its own), so the guard must already be
+/// watching it when node goes.
+#[tokio::test]
+async fn an_abnormal_exit_is_confirmed_only_once_a_slow_exiting_grandchild_has_exited() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let fake = spawn_fake(FAKE_CRASHES_LEAVING_A_SLOW_EXITING_GRANDCHILD, &record).await;
+    let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
+    assert!(grandchild.running());
+
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, SIDECAR_GRACEFUL_EXIT).await;
+
+    assert_eq!(exit.stop, SidecarStop::AbnormalExit, "{exit:?}");
+    assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
+    assert!(
+        grandchild.exited().await,
+        "the grandchild had exited when the tree was confirmed gone: {exit:?}"
+    );
+}
+
+/// As above, for a tree the guard itself kills while all of it runs.
+#[tokio::test]
+async fn terminating_the_guard_is_confirmed_only_once_a_slow_exiting_grandchild_has_exited() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let mut fake = spawn_fake(FAKE_CRASHES_LEAVING_A_SLOW_EXITING_GRANDCHILD, &record).await;
+    let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
+    assert!(grandchild.running());
+
+    let confirmation = fake.guard.terminate(&mut fake.child).await;
+
+    assert_eq!(confirmation, TreeConfirmation::Confirmed);
+    assert!(
+        grandchild.exited().await,
+        "the grandchild had exited when the tree was confirmed gone"
+    );
+}
+
 /// Windows: the guard's job holds node and every descendant; terminating it
 /// empties the job.
 #[cfg(windows)]
