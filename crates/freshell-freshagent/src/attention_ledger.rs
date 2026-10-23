@@ -172,13 +172,15 @@ impl AttentionLedger {
 
     fn trim(inner: &mut Inner, capacity: usize) {
         while inner.entries.len() > capacity {
-            let oldest = inner
+            let oldest_group = inner
                 .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.touched)
-                .map(|(id, _)| id.clone())
+                .values()
+                .min_by_key(|entry| entry.touched)
+                .map(|entry| entry.group)
                 .expect("non-empty ledger");
-            inner.entries.remove(&oldest);
+            // An alias must not outlive the id used by a requested close.
+            // Removing the whole group keeps forget/rekey coherent at capacity.
+            inner.entries.retain(|_, entry| entry.group != oldest_group);
         }
     }
 }
@@ -275,6 +277,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "c"]
         );
+    }
+
+    #[test]
+    fn eviction_keeps_alias_groups_consistent_for_a_later_requested_close() {
+        let ledger = AttentionLedger::with_capacity(3);
+        ledger.record_turn_complete("z-legacy", "freshclaude", 100);
+        ledger.alias("z-legacy", "a-durable");
+        ledger.observe("other-1", "freshclaude");
+        ledger.observe("other-2", "freshclaude");
+        // The canonical id sorts first among equally old aliases. Evicting
+        // just that entry would leave a legacy mark which forget cannot find.
+        ledger.forget("a-durable");
+        let remaining: Vec<String> = ledger
+            .snapshot()
+            .into_iter()
+            .map(|mark| mark.session_id)
+            .collect();
+        assert_eq!(remaining, vec!["other-1", "other-2"]);
     }
 
     #[test]
