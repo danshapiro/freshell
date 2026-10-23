@@ -4798,7 +4798,9 @@ impl FreshClaudeState {
         // suggestions the user accepted) reaches the CLI verbatim, so a malformed
         // one would fail or misapply the user's choice there. Refuse it with the
         // same discipline as above: nothing forwarded, the request stays pending.
-        if let Err(reason) = crate::claude_permission_update::validate_decision(&msg.decision) {
+        // The refusal names the failing update by position and variant only, so
+        // neither the log nor the error frame carries a rule's content.
+        if let Err(refusal) = crate::claude_permission_update::validate_decision(&msg.decision) {
             drop(session);
             tracing::warn!(
                 target: "freshell_freshagent::claude",
@@ -4807,14 +4809,15 @@ impl FreshClaudeState {
                 session_id = %session_id,
                 session_type,
                 request_id = %request_id,
-                reason = %reason,
+                update_index = refusal.update_index(),
+                update_type = refusal.update_type(),
                 "a claude approval decision carried malformed permission updates; nothing was sent"
             );
             self.emit_fresh_agent_error(
                 &session_id,
                 session_type,
                 "INVALID_APPROVAL_DECISION",
-                &format!("Claude approval {request_id} was not sent: {reason}"),
+                &format!("Claude approval {request_id} was not sent: {refusal}"),
             );
             return;
         }
@@ -18011,6 +18014,74 @@ rl.on('line', (line) => {
             permissions.is_empty(),
             "the valid retry resolves the request"
         );
+        drop(env);
+    }
+
+    /// Client-alerts G20 (D4): the refusal of a malformed `updatedPermissions` is
+    /// logged and reported by the failing update's position and variant only. A
+    /// rule's content (a Bash command, a path) is user content, which claude logs
+    /// never carry, and the refused update is never echoed back.
+    #[tokio::test]
+    async fn a_refused_decision_names_the_update_by_position_and_variant_never_its_content() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        // Another test reaches the same `warn!` (under this lock), and tracing
+        // caches a callsite's interest from the first thread that reaches it, so
+        // that thread (no capture) can leave it cached as "never". Rebuild the
+        // cache once this thread's capture is installed.
+        let (events, _capture_guard) = info_capture_for_test::capture();
+        tracing::callsite::rebuild_interest_cache();
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-refusal-log"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-refusal-log").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        const SECRET: &str = "deploy --token s3cr3t-value";
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            json!({ "behavior": "allow", "updatedPermissions": [
+                { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+                { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": SECRET }],
+                  "behavior": "allow", "destination": "session", "extra": 1 },
+            ] }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_APPROVAL_DECISION");
+        assert!(
+            !frame.to_string().contains("s3cr3t"),
+            "the error frame never echoes the refused update: {frame}"
+        );
+        let events = events.lock().expect("capture lock");
+        // The capture records every field through `Debug`, so a string field
+        // keeps its quotes.
+        let field = |fields: &std::collections::BTreeMap<String, String>, key: &str| {
+            fields
+                .get(key)
+                .map(|value| value.trim_matches('"').to_string())
+        };
+        let (_, fields) = events
+            .iter()
+            .find(|(_, fields)| {
+                field(fields, "event").as_deref()
+                    == Some("freshagent.claude.approval_decision_refused")
+            })
+            .expect("the refusal is logged");
+        assert_eq!(field(fields, "update_index").as_deref(), Some("1"));
+        assert_eq!(field(fields, "update_type").as_deref(), Some("addRules"));
+        for (key, value) in fields {
+            assert!(
+                !value.contains("s3cr3t"),
+                "the refusal log never carries rule content (`{key}` = {value})"
+            );
+        }
         drop(env);
     }
 

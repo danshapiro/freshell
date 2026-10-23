@@ -13,7 +13,11 @@
 //! [`validate_decision`] refuses an approval decision whose
 //! `updatedPermissions` is not such a list: the sidecar resolves a decision
 //! verbatim, and a malformed update reaching the CLI would fail or misapply
-//! the user's choice.
+//! the user's choice. The [`DecisionRefusal`] names the failing update by its
+//! position and variant only: a rule's content (a Bash command, a path) is
+//! user content, which claude logs never carry.
+
+use std::fmt;
 
 use serde_json::{Map, Value};
 
@@ -24,6 +28,15 @@ const DESTINATIONS: [&str; 5] = [
     "localSettings",
     "session",
     "cliArg",
+];
+/// The SDK's `PermissionUpdate` variants (its `type`).
+const KINDS: [&str; 6] = [
+    "addRules",
+    "replaceRules",
+    "removeRules",
+    "setMode",
+    "addDirectories",
+    "removeDirectories",
 ];
 /// The SDK's `PermissionBehavior`.
 const BEHAVIORS: [&str; 3] = ["allow", "deny", "ask"];
@@ -51,24 +64,76 @@ pub(crate) fn normalize_permission_updates(value: Option<&Value>) -> Option<Vec<
     (!updates.is_empty()).then_some(updates)
 }
 
+/// Why [`validate_decision`] refused a decision, without any of its content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionRefusal {
+    /// `updatedPermissions` is present but not a list.
+    NotAList,
+    /// The update at `index` is not a well-formed update. `kind` is its
+    /// variant when Claude defines one, else `"unknown"` (a client-chosen
+    /// `type` is never echoed).
+    MalformedUpdate { index: usize, kind: &'static str },
+}
+
+impl DecisionRefusal {
+    /// The failing update's position, when one update failed.
+    pub(crate) fn update_index(self) -> Option<usize> {
+        match self {
+            Self::NotAList => None,
+            Self::MalformedUpdate { index, .. } => Some(index),
+        }
+    }
+
+    /// The failing update's variant, when one update failed.
+    pub(crate) fn update_type(self) -> Option<&'static str> {
+        match self {
+            Self::NotAList => None,
+            Self::MalformedUpdate { kind, .. } => Some(kind),
+        }
+    }
+}
+
+impl fmt::Display for DecisionRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAList => {
+                f.write_str("updatedPermissions must be a list of permission updates")
+            }
+            Self::MalformedUpdate { index, kind } => write!(
+                f,
+                "updatedPermissions[{index}] ({kind}) is not a permission update Claude accepts"
+            ),
+        }
+    }
+}
+
 /// Check an approval decision's `updatedPermissions`: absent is fine;
 /// present, it must be a list every member of which is already a
 /// well-formed update (it normalizes to itself).
-pub(crate) fn validate_decision(decision: &Value) -> Result<(), String> {
+pub(crate) fn validate_decision(decision: &Value) -> Result<(), DecisionRefusal> {
     let Some(updates) = decision.get("updatedPermissions") else {
         return Ok(());
     };
-    let Some(list) = updates.as_array() else {
-        return Err("updatedPermissions must be a list of permission updates".to_string());
-    };
-    for update in list {
-        if normalize_permission_update(update).as_ref() != Some(update) {
-            return Err(format!(
-                "updatedPermissions holds an update Claude does not accept: {update}"
-            ));
-        }
+    let list = updates.as_array().ok_or(DecisionRefusal::NotAList)?;
+    match list
+        .iter()
+        .position(|update| normalize_permission_update(update).as_ref() != Some(update))
+    {
+        Some(index) => Err(DecisionRefusal::MalformedUpdate {
+            index,
+            kind: kind_of(&list[index]),
+        }),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// An update's variant as Claude names it, or `"unknown"`.
+fn kind_of(update: &Value) -> &'static str {
+    let kind = update.get("type").and_then(Value::as_str);
+    KINDS
+        .into_iter()
+        .find(|known| Some(*known) == kind)
+        .unwrap_or("unknown")
 }
 
 /// One update, rebuilt with exactly the keys of its variant, or `None`.
@@ -282,5 +347,50 @@ mod tests {
             let decision = json!({ "behavior": "allow", "updatedPermissions": bad });
             assert!(validate_decision(&decision).is_err(), "accepted {decision}");
         }
+    }
+
+    #[test]
+    fn a_refusal_names_the_update_by_position_and_variant_never_by_its_content() {
+        let decision = json!({ "behavior": "allow", "updatedPermissions": [
+            { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+            { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "deploy --token s3cr3t" }],
+              "behavior": "allow", "destination": "session", "extra": 1 },
+        ] });
+        let refusal = validate_decision(&decision).unwrap_err();
+        assert_eq!(
+            refusal,
+            DecisionRefusal::MalformedUpdate {
+                index: 1,
+                kind: "addRules"
+            }
+        );
+        let text = refusal.to_string();
+        assert!(
+            !text.contains("s3cr3t"),
+            "the refusal echoes content: {text}"
+        );
+        assert!(text.contains("updatedPermissions[1]"), "{text}");
+        assert!(text.contains("addRules"), "{text}");
+    }
+
+    #[test]
+    fn a_refusal_never_echoes_a_variant_name_claude_does_not_define() {
+        let decision = json!({ "behavior": "allow", "updatedPermissions": [
+            { "type": "grant everything in /home/me/s3cr3t", "destination": "session" },
+        ] });
+        let refusal = validate_decision(&decision).unwrap_err();
+        assert_eq!(
+            refusal,
+            DecisionRefusal::MalformedUpdate {
+                index: 0,
+                kind: "unknown"
+            }
+        );
+        let text = refusal.to_string();
+        assert!(
+            !text.contains("s3cr3t"),
+            "the refusal echoes content: {text}"
+        );
+        assert!(text.contains("updatedPermissions[0]"), "{text}");
     }
 }
