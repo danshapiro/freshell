@@ -1,4 +1,5 @@
 import { getWsClient } from '@/lib/ws-client'
+import { buildAllowDecision } from '@/lib/fresh-agent-permission-updates'
 import { activateTabFromSurface } from '@/store/turnCompletionAttention'
 import { sendTerminalInterrupt } from '@/lib/terminal-interrupt'
 import type { AppDispatch, RootState } from '@/store/store'
@@ -20,8 +21,9 @@ export function sendDeckApproval(target: ApproveTarget): void {
     // freshopencode auth keys embed cwd server-side; cwd-less durable-opencode frames die UNAUTHORIZED.
     // The selector (Task 3) sets target.cwd only for freshopencode; claude/codex/kilroy stay cwd-less.
     ...(target.cwd ? { cwd: target.cwd } : {}),
-    // A defined updatedInput (even {}) wholesale replaces the tool input. Omit it.
-    decision: { behavior: 'allow' },
+    // The shared builder: a plain allow, never an updatedInput (one, even {},
+    // wholesale replaces the tool input).
+    decision: buildAllowDecision(),
   })
 }
 

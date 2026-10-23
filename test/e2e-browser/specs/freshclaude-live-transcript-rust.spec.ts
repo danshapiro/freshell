@@ -86,7 +86,7 @@ const liveResponse = (pane: ClaudeSimPane) => pane.paneRoot.getByRole('article',
 const transcriptTurns = (pane: ClaudeSimPane, role: RegExp = /transcript turn$/) => pane.paneRoot.getByRole('article', { name: role })
 /** The turns the agent (not the user) wrote, durable ones only. */
 const agentTurns = (pane: ClaudeSimPane) => transcriptTurns(pane, /^(?!You ).*transcript turn$/)
-const stopButton = (pane: ClaudeSimPane) => pane.paneRoot.getByRole('button', { name: 'Stop' })
+const stopButton = (pane: ClaudeSimPane) => pane.paneRoot.getByRole('button', { name: 'Stop', exact: true })
 
 /** The prompts the simulated CLI started, with the permission mode each ran under. */
 function startedPrompts(lane: ClaudeSimLane) {
@@ -311,11 +311,13 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
       }
       expect(await permissionMode(), 'the pane starts in plan mode').toBe('plan')
 
-      // The model asks to leave plan mode (ExitPlanMode); the user allows it.
+      // The model asks to leave plan mode (ExitPlanMode); the user approves
+      // the plan on the plan card.
       await lane.send(pane, 'PLAN:exit')
-      await expect(page.getByRole('button', { name: 'Allow tool use' })).toBeVisible({ timeout: 30_000 })
+      const approvePlan = page.getByRole('alert', { name: 'Plan approval request' }).getByRole('button', { name: 'Approve plan' })
+      await expect(approvePlan).toBeVisible({ timeout: 30_000 })
       expect(startedPrompts(lane)).toEqual([{ text: 'PLAN:exit', permissionMode: 'plan' }])
-      await page.getByRole('button', { name: 'Allow tool use' }).click()
+      await approvePlan.click()
       await lane.waitForIdle(pane)
 
       await expect.poll(permissionMode, { timeout: 30_000, message: 'the gear follows the mode the CLI left plan mode for' }).toBe('default')

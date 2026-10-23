@@ -126,6 +126,7 @@ import { useTranscriptLandings } from './useTranscriptLandings'
 import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
 import { withSharedTurns } from '@/lib/fresh-agent-turn-sharing'
 import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
+import { buildAllowDecision, type FreshAgentApprovalDecision } from '@/lib/fresh-agent-permission-updates'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
@@ -1585,7 +1586,9 @@ export function FreshAgentView({
   // RebindQueue). Jobs check this ref so a pane closed while its create job
   // was queued does not spawn a server session no pane owns.
   const isMountedRef = useRef(true)
-  // Session-scoped "always allow" tool names; reset with the pane, never persisted.
+  // The pane-scoped "Always allow <Tool> in this pane" tool names (codex and
+  // opencode only: a claude pane answers through Claude's own suggestions and
+  // is never auto-answered here). Reset with the pane, never persisted.
   const alwaysAllowToolsRef = useRef<Set<string>>(new Set())
   // Auto-title state tracks four things:
   // 1. whether this mounted pane has already consumed first-message auto-title,
@@ -4211,13 +4214,13 @@ export function FreshAgentView({
     setQueuedMessages((queue) => queue.slice(1))
   }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, outgoingTurnVersion, ownerDivergence, queuedMessages, sendUserText])
 
-  // Session-scoped auto-approval: any pending approval whose tool the user
-  // marked "always allow" is answered immediately.
+  // Pane-scoped auto-approval (not claude): any pending approval whose tool
+  // the user marked "Always allow <Tool> in this pane" is answered at once.
   const pendingApprovalsFromSnapshot = snapshot?.pendingApprovals
   useEffect(() => {
     if (!pendingApprovalsFromSnapshot || pendingApprovalsFromSnapshot.length === 0) return
     const current = paneContentRef.current
-    if (!current.sessionId) return
+    if (!current.sessionId || current.provider === 'claude') return
     const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     for (const approval of pendingApprovalsFromSnapshot) {
       if (approval.toolName && alwaysAllowToolsRef.current.has(approval.toolName)) {
@@ -4228,9 +4231,7 @@ export function FreshAgentView({
           provider: current.provider,
           ...(cwd ? { cwd } : {}),
           requestId: approval.requestId,
-          // A defined updatedInput (even {}) wholesale REPLACES the tool input server-side
-          // (sdk-bridge resolves the decision verbatim). Omit the key entirely.
-          decision: { behavior: 'allow' },
+          decision: buildAllowDecision(),
         })
       }
     }
@@ -4469,7 +4470,7 @@ export function FreshAgentView({
         ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
       })
     }
-    const respondToApproval = (requestId: string | number, allow: boolean) => {
+    const respondToApproval = (requestId: string | number, decision: FreshAgentApprovalDecision) => {
       dispatch(dismissTabGreen(tabId))
       if (!paneContent.sessionId) return
       sendFreshAgentMessage({
@@ -4479,9 +4480,7 @@ export function FreshAgentView({
         provider: paneContent.provider,
         ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
         requestId,
-        decision: allow
-          ? { behavior: 'allow' }
-          : { behavior: 'deny', message: 'Denied by user', interrupt: false },
+        decision,
       })
     }
 
@@ -4729,12 +4728,11 @@ export function FreshAgentView({
                   key={String(approval.requestId)}
                   approval={approval}
                   disabled={!paneContent.sessionId}
-                  onAllow={() => respondToApproval(approval.requestId, true)}
-                  onAlwaysAllow={(toolName) => {
+                  onRespond={(decision) => respondToApproval(approval.requestId, decision)}
+                  onAlwaysAllow={paneContent.provider === 'claude' ? undefined : (toolName) => {
                     alwaysAllowToolsRef.current.add(toolName)
-                    respondToApproval(approval.requestId, true)
+                    respondToApproval(approval.requestId, buildAllowDecision())
                   }}
-                  onDeny={() => respondToApproval(approval.requestId, false)}
                 />
               ))}
               {pendingQuestions.map((question) => (

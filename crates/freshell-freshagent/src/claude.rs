@@ -520,12 +520,17 @@ struct PendingApprovalEntry {
     blocked_path: Option<String>,
     decision_reason: Option<String>,
     input: Option<Value>,
+    /// The CLI's own suggestions (what "Allow and don't ask again" sends back),
+    /// normalized to the strict contract shape on entry
+    /// ([`crate::claude_permission_update::normalize_permission_updates`]); `None`
+    /// when the request offered none that survive.
+    suggestions: Option<Vec<Value>>,
 }
 
 impl PendingApprovalEntry {
     /// The `.strict()` contract shape the Task 3 snapshot overlay serializes
-    /// (`{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?}` —
-    /// keys omitted when absent, never null).
+    /// (`{requestId, toolName?, toolUseID?, blockedPath?, decisionReason?, input?,
+    /// suggestions?}` — keys omitted when absent, never null).
     fn to_json(&self) -> Value {
         let mut obj = Map::new();
         obj.insert("requestId".to_string(), json!(self.request_id));
@@ -543,6 +548,9 @@ impl PendingApprovalEntry {
         }
         if let Some(input) = &self.input {
             obj.insert("input".to_string(), input.clone());
+        }
+        if let Some(suggestions) = &self.suggestions {
+            obj.insert("suggestions".to_string(), Value::Array(suggestions.clone()));
         }
         Value::Object(obj)
     }
@@ -578,11 +586,10 @@ struct ClaudeSession {
     /// `handle_interrupt` MUST address the sidecar with this id, never the map key.
     sidecar_session_id: String,
     /// Best-effort copy of the durable Claude UUID, recorded from `sdk.session.init`
-    /// by the stdout consumer. Nothing in production reads it: attach/eviction resolve
-    /// durable ids through [`FreshClaudeState::cli_index`], and the snapshot adapter
-    /// is disk-only. Currently read only by in-crate tests; kept as a diagnostic/
-    /// forward slot.
-    #[allow(dead_code)]
+    /// by the stdout consumer. Attach/eviction resolve durable ids through
+    /// [`FreshClaudeState::cli_index`], and the snapshot adapter is disk-only; the
+    /// settings paths (a settings apply, the CLI's own permission-mode change) read
+    /// it to write the session's binding row once the session has one.
     cli_session_id: Option<String>,
     /// b8ke focused episode-2 round-2 F2: the operation id of the lifecycle
     /// op that OWNS this runtime's coordinator claim — the create-resume
@@ -4787,6 +4794,33 @@ impl FreshClaudeState {
             );
             return;
         }
+        // Client-alerts G20: the decision's `updatedPermissions` (the CLI's own
+        // suggestions the user accepted) reaches the CLI verbatim, so a malformed
+        // one would fail or misapply the user's choice there. Refuse it with the
+        // same discipline as above: nothing forwarded, the request stays pending.
+        // The refusal names the failing update by position and variant only, so
+        // neither the log nor the error frame carries a rule's content.
+        if let Err(refusal) = crate::claude_permission_update::validate_decision(&msg.decision) {
+            drop(session);
+            tracing::warn!(
+                target: "freshell_freshagent::claude",
+                event = "freshagent.claude.approval_decision_refused",
+                provider = PROVIDER,
+                session_id = %session_id,
+                session_type,
+                request_id = %request_id,
+                update_index = refusal.update_index(),
+                update_type = refusal.update_type(),
+                "a claude approval decision carried malformed permission updates; nothing was sent"
+            );
+            self.emit_fresh_agent_error(
+                &session_id,
+                session_type,
+                "INVALID_APPROVAL_DECISION",
+                &format!("Claude approval {request_id} was not sent: {refusal}"),
+            );
+            return;
+        }
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
         let respond_req = json!({
@@ -4977,9 +5011,10 @@ impl FreshClaudeState {
     /// The session's live pending approvals + questions as overlay JSON (approvals,
     /// questions) — Task 3's snapshot route consumes this. Entry keys are exactly the
     /// `.strict()` contract shape (`{requestId, toolName?, toolUseID?, blockedPath?,
-    /// decisionReason?, input?}` / `{requestId, questions}`, no extra keys, absent keys
-    /// omitted). `any_id` resolves like every handler here: the map key OR the durable
-    /// Claude UUID via `cli_index`. An untracked id yields two empty vecs.
+    /// decisionReason?, input?, suggestions?}` / `{requestId, questions}`, no extra
+    /// keys, absent keys omitted). `any_id` resolves like every handler here: the map
+    /// key OR the durable Claude UUID via `cli_index`. An untracked id yields two empty
+    /// vecs.
     pub(crate) async fn snapshot_pending_overlay(&self, any_id: &str) -> (Vec<Value>, Vec<Value>) {
         let Some(map_key) = self.resolve_session_key(any_id).await else {
             return (Vec::new(), Vec::new());
@@ -6729,11 +6764,33 @@ impl FreshClaudeState {
                     // mode). The sidecar already runs in it; the session's
                     // settings take it too, so a later configure stating the
                     // same mode applies nothing and the snapshot states it.
+                    // The binding row takes it the way a configure's settings
+                    // do (client-alerts G20), so a resume after a restart
+                    // boots the conversation in the mode the CLI is in.
                     Some("sdk.session.metadata") => {
                         if let Some(mode) = value.get("permissionMode").and_then(Value::as_str) {
-                            if let Some(session) = sessions.lock().await.get_mut(&session_id) {
-                                session.configuration.settings.permission_mode =
-                                    Some(mode.to_string());
+                            let adopted =
+                                sessions.lock().await.get_mut(&session_id).map(|session| {
+                                    session.configuration.settings.permission_mode =
+                                        Some(mode.to_string());
+                                    (
+                                        session.cli_session_id.clone(),
+                                        session.configuration.settings.clone(),
+                                    )
+                                });
+                            if let Some((Some(durable), settings)) = adopted {
+                                state
+                                    .adopt_session_init(
+                                        &durable,
+                                        &session_id,
+                                        &session_type,
+                                        Some(&settings),
+                                        identity_sink.clone(),
+                                        // Conn-less, like a settings apply: the
+                                        // ledger merge keeps the row's stamps.
+                                        None,
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -7554,6 +7611,11 @@ fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) 
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 input: value.get("tool").and_then(|t| t.get("input")).cloned(),
+                // Normalized like the questions below: the snapshot's strict
+                // parse must never see an unknown variant or key (AGENT-06).
+                suggestions: crate::claude_permission_update::normalize_permission_updates(
+                    value.get("suggestions"),
+                ),
             };
             let mut p = pending.lock().expect("pending lock");
             p.permissions.retain(|e| e.request_id != entry.request_id);
@@ -17816,6 +17878,7 @@ rl.on('line', (line) => {
                 blocked_path: None,
                 decision_reason: None,
                 input: None,
+                suggestions: None,
             }],
             questions: Vec::new(),
         };
@@ -17884,6 +17947,141 @@ rl.on('line', (line) => {
             env.respond_log_frames(0).await.is_empty(),
             "a refused non-object decision is never forwarded to the sidecar"
         );
+        drop(env);
+    }
+
+    /// Client-alerts G20 (D4): a decision whose `updatedPermissions` is not a list of
+    /// well-formed permission updates is refused with `INVALID_APPROVAL_DECISION`
+    /// before anything reaches the sidecar, and the request stays pending; a retry
+    /// with well-formed updates is written VERBATIM and resolves it.
+    #[tokio::test]
+    async fn approval_respond_refuses_malformed_updated_permissions_until_a_valid_retry() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-bad-updates"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-bad-updates").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            json!({ "behavior": "allow", "updatedPermissions": [
+                { "type": "grantEverything", "destination": "session" },
+            ] }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_APPROVAL_DECISION");
+        assert_eq!(frame["sessionId"], json!(session_id));
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert_eq!(
+            permissions,
+            vec!["req-1".to_string()],
+            "a refused decision leaves the request pending"
+        );
+        assert!(
+            env.respond_log_frames(0).await.is_empty(),
+            "a refused decision never reaches the sidecar"
+        );
+
+        let decision = json!({ "behavior": "allow", "updatedPermissions": [
+            { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "npm test *" }],
+              "behavior": "allow", "destination": "localSettings" },
+            { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+        ] });
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            decision.clone(),
+        ))
+        .await;
+        let frames = env.respond_log_frames(1).await;
+        let respond = frames
+            .iter()
+            .find(|f| f["type"] == "permission.respond")
+            .expect("the valid retry reaches the sidecar");
+        assert_eq!(respond["decision"], decision, "forwarded verbatim");
+        let (permissions, _) = pending_request_ids(&st, &session_id).await;
+        assert!(
+            permissions.is_empty(),
+            "the valid retry resolves the request"
+        );
+        drop(env);
+    }
+
+    /// Client-alerts G20 (D4): the refusal of a malformed `updatedPermissions` is
+    /// logged and reported by the failing update's position and variant only. A
+    /// rule's content (a Bash command, a path) is user content, which claude logs
+    /// never carry, and the refused update is never echoed back.
+    #[tokio::test]
+    async fn a_refused_decision_names_the_update_by_position_and_variant_never_its_content() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        // Another test reaches the same `warn!` (under this lock), and tracing
+        // caches a callsite's interest from the first thread that reaches it, so
+        // that thread (no capture) can leave it cached as "never". Rebuild the
+        // cache once this thread's capture is installed.
+        let (events, _capture_guard) = info_capture_for_test::capture();
+        tracing::callsite::rebuild_interest_cache();
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-approval-refusal-log"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-approval-refusal-log").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.handle_send(send_msg(&session_id, "__raise_permission__"))
+            .await;
+        await_pending_permission(&st, &session_id, "req-1").await;
+
+        const SECRET: &str = "deploy --token s3cr3t-value";
+        st.handle_approval_respond(approval_respond_msg(
+            &session_id,
+            SessionType::Freshclaude,
+            "req-1",
+            json!({ "behavior": "allow", "updatedPermissions": [
+                { "type": "setMode", "mode": "acceptEdits", "destination": "session" },
+                { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": SECRET }],
+                  "behavior": "allow", "destination": "session", "extra": 1 },
+            ] }),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_APPROVAL_DECISION");
+        assert!(
+            !frame.to_string().contains("s3cr3t"),
+            "the error frame never echoes the refused update: {frame}"
+        );
+        let events = events.lock().expect("capture lock");
+        // The capture records every field through `Debug`, so a string field
+        // keeps its quotes.
+        let field = |fields: &std::collections::BTreeMap<String, String>, key: &str| {
+            fields
+                .get(key)
+                .map(|value| value.trim_matches('"').to_string())
+        };
+        let (_, fields) = events
+            .iter()
+            .find(|(_, fields)| {
+                field(fields, "event").as_deref()
+                    == Some("freshagent.claude.approval_decision_refused")
+            })
+            .expect("the refusal is logged");
+        assert_eq!(field(fields, "update_index").as_deref(), Some("1"));
+        assert_eq!(field(fields, "update_type").as_deref(), Some("addRules"));
+        for (key, value) in fields {
+            assert!(
+                !value.contains("s3cr3t"),
+                "the refusal log never carries rule content (`{key}` = {value})"
+            );
+        }
         drop(env);
     }
 

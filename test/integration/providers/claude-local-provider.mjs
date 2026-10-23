@@ -14,6 +14,8 @@
 //     committed fixtures' paths depend on)
 //   - claude-live-frames.mjs (the real sidecar's live frames; it brings its
 //     own model through the `respond` hook)
+//   - claude-permission-contract.mjs (permission suggestions and plan
+//     approvals through the real sidecar; its own model, the `respond` hook)
 //
 // The model's behavior is chosen by prompt markers (see
 // test/fixtures/claude-cli-sim/prompt-markers.mjs), the same language the CLI

@@ -890,6 +890,70 @@ mod tests {
         assert_eq!(value["capabilities"]["questions"], json!(true));
     }
 
+    /// Client-alerts G20 (D3): a pending approval carries the CLI's own suggestions
+    /// (the updates "Allow and don't ask again" sends back), normalized at fold time
+    /// to the strict `FreshAgentPermissionUpdateSchema` shape: well-formed updates
+    /// keep exactly their documented keys, anything else is dropped, and an approval
+    /// with none left has no `suggestions` key at all.
+    #[tokio::test]
+    async fn claude_pending_approvals_carry_the_clis_suggestions_normalized() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let durable = "82828282-8282-4828-8828-828282828282";
+        let (_home, _content) = stage_transcript(durable);
+        let claude = claude_state();
+        crate::claude::tests::insert_fake_claude_session_with_pending(
+            &claude,
+            "client-nanoid-suggest",
+            Some(durable),
+            &[
+                json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-npm",
+                        "subtype": "can_use_tool",
+                        "tool": { "name": "Bash", "input": { "command": "cat /srv/notes && npm test" } },
+                        "suggestions": [
+                            { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "npm test *", "source": "cli" }],
+                              "behavior": "allow", "destination": "localSettings" },
+                            { "type": "addRules", "rules": [{ "toolName": "Read", "ruleContent": "//srv/**" }],
+                              "behavior": "allow", "destination": "session" },
+                            { "type": "grantEverything", "destination": "session" },
+                        ] }),
+                json!({ "type": "sdk.permission.request", "sessionId": "s", "requestId": "req-root",
+                        "subtype": "can_use_tool",
+                        "tool": { "name": "Bash", "input": { "command": "ls /" } },
+                        "suggestions": [], "blockedPath": "/" }),
+            ],
+        )
+        .await;
+
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude,
+        );
+        let (status, value) = get_json_with_state(state, "freshclaude", durable).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            value["pendingApprovals"],
+            json!([
+                {
+                    "requestId": "req-npm", "toolName": "Bash",
+                    "input": { "command": "cat /srv/notes && npm test" },
+                    "suggestions": [
+                        { "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "npm test *" }],
+                          "behavior": "allow", "destination": "localSettings" },
+                        { "type": "addRules", "rules": [{ "toolName": "Read", "ruleContent": "//srv/**" }],
+                          "behavior": "allow", "destination": "session" },
+                    ],
+                },
+                {
+                    "requestId": "req-root", "toolName": "Bash", "blockedPath": "/",
+                    "input": { "command": "ls /" },
+                },
+            ])
+        );
+    }
+
     /// Delta-review round 5 (AGENT-06): an SDK-valid question whose options carry the
     /// documented `preview` field (plus other extras the sidecar preserves verbatim via
     /// `permission-channel.mjs`'s `...o`) must still produce a snapshot whose

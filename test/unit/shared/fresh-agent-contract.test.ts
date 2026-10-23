@@ -38,6 +38,33 @@ describe('fresh-agent shared contract schemas', () => {
     expect(FreshAgentSnapshotSchema.parse(codexContractSnapshot).turns[0].summaryKind).toBe('echo')
   })
 
+  it('a claude pending approval carries the CLI\'s permission suggestions, and one malformed suggestion fails the strict parse', () => {
+    const suggestions = [
+      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test *' }], behavior: 'allow', destination: 'localSettings' },
+      { type: 'replaceRules', rules: [{ toolName: 'Read' }], behavior: 'deny', destination: 'projectSettings' },
+      { type: 'removeRules', rules: [{ toolName: 'Edit', ruleContent: 'src/**' }], behavior: 'ask', destination: 'userSettings' },
+      { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
+      { type: 'setMode', mode: 'dontAsk', destination: 'cliArg' },
+      { type: 'addDirectories', directories: ['/srv/data'], destination: 'session' },
+      { type: 'removeDirectories', directories: ['/srv/old'], destination: 'localSettings' },
+    ]
+    const withSuggestions = (list: unknown[]) => ({
+      ...claudeContractSnapshot,
+      pendingApprovals: [{ requestId: 'req-1', toolName: 'Bash', input: { command: 'npm test' }, suggestions: list }],
+    })
+    expect(FreshAgentSnapshotSchema.parse(withSuggestions(suggestions)).pendingApprovals[0].suggestions).toEqual(suggestions)
+    for (const bad of [
+      { type: 'grantEverything', destination: 'session' },
+      { type: 'setMode', mode: 'yolo', destination: 'session' },
+      { type: 'addRules', rules: [{ toolName: 'Bash' }], behavior: 'allow', destination: 'everywhere' },
+      { type: 'addRules', rules: [{ toolName: 'Bash', note: 'x' }], behavior: 'allow', destination: 'session' },
+      { type: 'setMode', mode: 'plan', destination: 'session', reason: 'extra key' },
+      { type: 'addDirectories', directories: [], destination: 'session' },
+    ]) {
+      expect(FreshAgentSnapshotSchema.safeParse(withSuggestions([suggestions[0], bad])).success, JSON.stringify(bad)).toBe(false)
+    }
+  })
+
   it('parses turn pages and turn bodies with the full session locator', () => {
     expect(FreshAgentTurnPageSchema.parse(claudeContractTurnPage).provider).toBe('claude')
     expect(FreshAgentTurnPageSchema.parse(codexContractTurnPage).provider).toBe('codex')
