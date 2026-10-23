@@ -992,6 +992,24 @@ describe('name reliability (Task 9): recovery restores legacy names and user fla
     expect(plan.paneTitleSetByUser).toEqual({})
   })
 
+  it('a recorded user flag with no title is not restored (it would freeze the derived label)', () => {
+    const inventory = inv([
+      shellPane('p-flag-only', { titleSetByUser: true }),
+      shellPane('p-flag-empty', { title: '', titleSetByUser: true }),
+      shellPane('p-named', { title: 'Named pane', titleSetByUser: true }),
+    ])
+    inventory.device!.tabs[0].tabKey = 'd:tab-flag-only'
+
+    const [plan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    expect(plan.paneTitles).toEqual({ 'p-named': 'Named pane' })
+    expect(plan.paneTitleSetByUser).toEqual({ 'p-named': true })
+
+    // Same through the cross-device remap.
+    const [remintedPlan] = buildRecoveryPlan(inventory)
+    const [, , namedLeaf] = leavesOf(remintedPlan.layout)
+    expect(remintedPlan.paneTitleSetByUser).toEqual({ [namedLeaf.id]: true })
+  })
+
   it('buildRecoveryPlan never restores titles for scoped agent panes', () => {
     // A session-owned tab: the Claude pane names the tab; a shell pane split
     // beside it keeps its own (legacy) name.
