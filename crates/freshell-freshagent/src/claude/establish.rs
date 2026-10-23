@@ -746,22 +746,27 @@ impl FreshClaudeState {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         // A resume after an unrequested death continues the dead session's
         // attention clock (design §5.5): its edges stay above the death's.
-        let resumed_clock = || {
+        let resumed_runtime = || {
             [Some(map_key.as_str()), durable.as_deref()]
                 .into_iter()
                 .flatten()
                 .find_map(|id| self.dead_sessions.find(id))
-                .map(|dead| dead.clock)
         };
         let InheritedRuntime {
             turn_lock,
             ledger,
             // The session's attention clock (see the field doc).
             clock,
-        } = inherit.unwrap_or_else(|| InheritedRuntime {
-            turn_lock: Arc::new(TokioMutex::new(())),
-            ledger: crate::claude_turns::SharedLedger::default(),
-            clock: resumed_clock().unwrap_or_default(),
+        } = inherit.unwrap_or_else(|| {
+            let dead = resumed_runtime();
+            InheritedRuntime {
+                turn_lock: dead
+                    .as_ref()
+                    .map(|dead| dead.turn_lock.clone())
+                    .unwrap_or_else(|| Arc::new(TokioMutex::new(()))),
+                ledger: crate::claude_turns::SharedLedger::default(),
+                clock: dead.map(|dead| dead.clock).unwrap_or_default(),
+            }
         });
         let (stdin, fault) = crate::claude_sidecar_io::SidecarWriter::spawn(
             stdin,
@@ -774,6 +779,7 @@ impl FreshClaudeState {
             let consumer = self.spawn_consumer(
                 reader,
                 map_key.clone(),
+                ownership_id.clone(),
                 spec.session_type.clone(),
                 minted.clone(),
                 recorded_settings,
