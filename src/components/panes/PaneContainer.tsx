@@ -13,8 +13,8 @@ import HostStatsPane from './HostStatsPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
-import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
-import { normalizeFreshAgentEffort, resolveFreshAgentPaneCreateEffort, resolveFreshAgentPaneModelDefaults, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
+import { normalizeFreshAgentEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { renamePaneAfterMirrorReady } from '@/lib/pane-rename'
@@ -38,14 +38,13 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { FreshAgentPendingCreate, FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
-import { normalizeFreshAgentEffortOverride, normalizeFreshAgentModelSelection } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import {
   clearPendingCreate as clearFreshAgentPendingCreate,
   removeSession as removeFreshAgentSession,
   sessionError as freshAgentSessionError,
 } from '@/store/freshAgentSlice'
-import { DEFAULT_FRESH_AGENT_STYLE } from '@shared/settings'
+import { buildFreshAgentPaneContent } from '@/lib/fresh-agent-create-content'
 import { cancelCreate } from '@/lib/create-cancellation'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
@@ -705,52 +704,14 @@ function PickerWrapper({
 
     const freshAgentType = resolveFreshAgentType(type)
     if (freshAgentType) {
-      const providerConfig = freshAgentType.runtimeProvider === 'claude' && isFreshAgentProviderName(type)
-        ? getFreshAgentProviderConfig(type)
-        : undefined
-      const providerSettings = freshAgentSettings?.providers?.[type]
-      const { model, persistModel: shouldPersistPaneModel, modelEffortLevels } = resolveFreshAgentPaneModelDefaults({
+      return buildFreshAgentPaneContent({
         entry: freshAgentType,
-        providerSettings,
-        runtimeProviderModel: settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model,
-      })
-      const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
-        ? undefined
-        : providerSettings?.defaultPermissionMode
-          ?? (freshAgentType.runtimeProvider === 'codex'
-            ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.permissionMode
-            : undefined)
-          ?? providerConfig?.defaultPermissionMode
-          ?? freshAgentType.defaultPermissionMode
-      const createEffort = resolveFreshAgentPaneCreateEffort({
-        sessionType: freshAgentType.sessionType,
-        provider: freshAgentType.runtimeProvider,
-        model,
-        providerEffort: normalizeFreshAgentEffortOverride(providerSettings?.effort),
-        fallbackEffort: freshAgentType.defaultEffort,
-        modelEffortLevels,
-      })
-      return {
-        kind: 'fresh-agent',
-        sessionType: freshAgentType.sessionType,
-        provider: freshAgentType.runtimeProvider,
+        freshAgentSettings,
+        codingCliSettings: settings?.codingCli,
         createRequestId: nanoid(),
-        status: 'creating',
-        modelSelection: normalizeFreshAgentModelSelection(providerSettings?.modelSelection),
-        ...(shouldPersistPaneModel ? { model } : {}),
-        ...(modelEffortLevels ? { modelEffortLevels } : {}),
-        ...(permissionMode ? { permissionMode } : {}),
-        sandbox: freshAgentType.runtimeProvider === 'codex'
-          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox
-          : undefined,
-        // Undefined effort is meaningful for opencode live-catalog models:
-        // the Default row (no variant) persists as the provider default.
-        ...(createEffort ? { effort: createEffort } : {}),
-        plugins: freshAgentType.runtimeProvider === 'claude' ? freshAgentSettings?.defaultPlugins : undefined,
-        style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,
-        ...(cwd ? { initialCwd: cwd } : {}),
-        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
-      }
+        cwd,
+        checkpointWorkspace,
+      })
     }
 
     if (isCodingCliProviderName(type, extensionEntries)) {

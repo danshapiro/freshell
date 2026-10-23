@@ -37,6 +37,7 @@
 //! backstop, by the harness sentinel sweep — no orphans.
 
 pub mod claude;
+pub mod claude_create_defaults;
 pub(crate) mod claude_dead_sessions;
 pub mod claude_freshell_mcp;
 pub(crate) mod claude_handshake;
