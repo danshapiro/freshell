@@ -5188,10 +5188,10 @@ fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<Pane
         && current.session_type == SESSION_TYPE
         && cached.provider == PROVIDER
         && cached.session_type == SESSION_TYPE
-        && current.placeholder_id == cached.placeholder_id
-        && (current.durable_id.as_ref() == Some(&current.placeholder_id)
-            || current.durable_id == cached.durable_id))
-        .then_some(cached)
+        && (current.durable_id == cached.durable_id
+            || (current.placeholder_id == cached.placeholder_id
+                && current.durable_id.as_ref() == Some(&current.placeholder_id))))
+    .then_some(cached)
 }
 
 fn pane_entry_from_content(content: &Value) -> Option<PaneEntry> {

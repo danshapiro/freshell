@@ -603,6 +603,12 @@ async fn the_existing_local_opencode_pane_keeps_its_cached_materialization() {
     let (status, text) = capture_response(router.clone(), pane).await;
     assert_eq!(status, StatusCode::OK, "{text}");
     assert!(text.is_empty());
+    state.layout.attach_pane_content(tab, pane, json!({
+        "kind":"fresh-agent", "provider":"opencode", "sessionType":"freshopencode",
+        "sessionId":"ses_materialized", "sessionRef":{"provider":"opencode", "sessionId":"ses_materialized"},
+    }));
+    let (status, text) = capture_response(router.clone(), pane).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
     state.layout.attach_pane_content(
         tab,
         pane,
