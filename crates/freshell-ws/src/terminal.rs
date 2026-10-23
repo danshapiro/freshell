@@ -1582,6 +1582,7 @@ async fn handle_client_text(
                         freshell_ownership::AttachGuardOutcome::StaleGeneration {
                             current_epoch,
                             current_generation,
+                            ..
                         } => {
                             tracing::warn!(target: "freshell_ws::terminal",
                                 terminal_id = %attach.terminal_id,
@@ -5284,6 +5285,7 @@ pub(crate) async fn handle_create(
                         freshell_ownership::AttachGuardOutcome::StaleGeneration {
                             current_epoch,
                             current_generation,
+                            ..
                         } => {
                             tracing::warn!(
                                 target: "freshell_ws::terminal",

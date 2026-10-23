@@ -37,8 +37,8 @@ type Launched = {
   stop: () => Promise<void>
 }
 
-function launch(program: unknown, extraEnv: Record<string, string> = {}): Launched {
-  const proc = spawn(process.execPath, [FIXTURE], {
+function launch(program: unknown, extraEnv: Record<string, string> = {}, fixture = FIXTURE): Launched {
+  const proc = spawn(process.execPath, [fixture], {
     env: {
       ...process.env,
       HOME: tmp,
@@ -585,5 +585,25 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
     } finally {
       await fx.stop()
     }
+  })
+})
+
+describe('create-time UUID contract shared by browser Claude fixtures', () => {
+  it.each([
+    ['SDK fixture', FIXTURE],
+    ['simple fixture', path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')],
+  ])('%s keeps the requested UUID on created, init, and its transcript', async (_name, fixture) => {
+    const sessionId = '11111111-1111-4111-8111-111111111111'
+    const config = path.join(tmp, 'claude')
+    const fx = launch({}, { CLAUDE_CONFIG_DIR: config }, fixture)
+    try {
+      fx.send({ type: 'create', protocol: 2, sessionId, requestId: 'uuid-create', cwd: tmp, boot: { kind: 'fresh' } })
+      expect(await fx.waitLine((frame) => frame.type === 'created', 'created')).toMatchObject({ sessionId })
+      expect(await fx.waitLine((frame) => frame.type === 'sdk.session.init', 'init')).toMatchObject({ sessionId, cliSessionId: sessionId })
+      fx.send({ type: 'send', sessionId, uuid: '22222222-2222-4222-8222-222222222222', text: 'hello' })
+      await fx.waitLine((frame) => frame.type === 'sdk.result', 'result')
+      const files = fs.readdirSync(config, { recursive: true }).map(String)
+      expect(files.some((file) => file.endsWith(`${sessionId}.jsonl`))).toBe(true)
+    } finally { await fx.stop() }
   })
 })
