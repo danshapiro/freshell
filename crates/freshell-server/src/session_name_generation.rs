@@ -21,10 +21,11 @@
 //!
 //! Name-reliability Task 6: a credential, permission, proxy or quota failure
 //! is not a consumed attempt. The fold REFUNDS it (the series keeps its
-//! allowance and its naming input) and the in-memory pause
-//! ([`crate::session_name_capability::CapabilityLatch`]) stops claims until a
-//! re-probe time or a key change; exhaustion moved from the claim to the
-//! fold, so a refunded third start keeps the series.
+//! allowance and its naming input, and waits behind the series already
+//! due, so the probe after the pause tries another session first) and the
+//! in-memory pause ([`crate::session_name_capability::CapabilityLatch`])
+//! stops claims until a re-probe time or a key change; exhaustion moved
+//! from the claim to the fold, so a refunded third start keeps the series.
 //!
 //! The [`SessionNameGenerator`] supplies generation EXECUTION to the Task 3
 //! native worker's ONE owned serial loop ([`crate::session_name_native::

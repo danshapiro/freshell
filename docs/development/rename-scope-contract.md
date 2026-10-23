@@ -100,7 +100,10 @@ proxy (a connection that is refused, or not made within 10 seconds, as
 when a firewall drops it): AI naming pauses for every session — 15
 minutes, or for a quota answer a re-probe that starts at 60 s and doubles
 up to 15 minutes — and resumes after the pause or as soon as the Gemini
-key changes. While paused, no AI naming request starts; the pause is logged
+key changes. The first request after a pause is for a session that has
+waited longer than the refused one, so a refusal of one session's request
+does not stop naming for the others. While paused, no AI naming request
+starts; the pause is logged
 (`session_names.generation_capability_unavailable`, then
 `session_names.generation_capability_restored`) and is not shown in the
 UI. A configured Gemini key (`GOOGLE_GENERATIVE_AI_API_KEY` at boot, else
