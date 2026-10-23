@@ -1905,11 +1905,11 @@ Task 13 roll-up.
 
 **Intent:** (a) a tab whose stored title is a provider/runtime label an
 earlier managed-runtime merge wrote ("Shell agent", "OpenCode agent",
-"Recovered <X> agent", or any other label the shared classifier recognizes
-as default/derived for that tab's mode and folder) stops showing it: such a
-stored title is not a name. (b) Opening a tabs-registry record from the Tabs
-view keeps pane names and their rename protection, exactly as the Task 9
-new-window rebuild does.
+"Recovered <X> agent", or any other provider/mode label, provider
+placeholder or wrapper text the shared classifier recognizes for that tab's
+mode and provider) stops showing it: such a stored title is not a name.
+(b) Opening a tabs-registry record from the Tabs view keeps pane names and
+their rename protection, exactly as the Task 9 new-window rebuild does.
 
 **Decisions:**
 - **One heal point.** A store middleware,
@@ -1928,12 +1928,21 @@ new-window rebuild does.
   never fight); the title differs from the tab's derived label
   (`deriveTabName`; a create-time label equal to it is already no title to
   every display and stays); and
-  `isDefaultOrDerivedName(title, { cwd, mode, provider })` holds with the
-  tab's folder (`tab.initialCwd`, else its naming pane's `initialCwd`), mode
-  and provider. It heals to `unnamedTabTitle(position)` ("Tab N", the
+  `isDefaultOrDerivedName(title, { mode, provider })` holds with the tab's
+  mode and provider. It heals to `unnamedTabTitle(position)` ("Tab N", the
   placeholder `addTab` and the mirror's reset already store): the title
-  only, no `updatedAt` bump, no flag. A real OSC title, session title or
-  rename is never classified default, so it is never healed and still wins.
+  only, no `updatedAt` bump, no flag. A session title, a rename and any
+  window title the classifier does not recognize are never healed and still
+  win. **Changed after the Task 14 review:** the classifier is not given the
+  tab's folder, so its folder-name rule never heals a tab title. The tab's
+  folder (`tab.initialCwd`, else its naming pane's) need not be the folder
+  `deriveTabName` uses (it prefers a coding CLI, fresh agent or browser pane
+  over the first shell), so with the folder a shell prompt that titled a
+  split tab's window with its own folder name was erased. The old merge
+  never stored a folder name, and a folder-name title that differs from the
+  derived label is a live title or a create-time label, both of which stay.
+  A live window title that is itself a provider label still heals
+  (Residual 25).
 - **Classifier.** It already recognizes every form the old code wrote
   (`"{Label} agent"` with the server's label or the raw mode string,
   `"Recovered {label} agent"`, and `Recovered`, the rebuild's fallback). The
@@ -1953,7 +1962,7 @@ new-window rebuild does.
 **Files:**
 - Create: `src/store/storedTabTitleHeal.ts` (middleware + store-creation pass); `src/lib/restored-tab-names.ts` (the Task 9 helper, moved)
 - Modify (wiring): `src/store/tabsSlice.ts` (reducer `healStoredTabTitles(record<tabId,title>)`: title only, never a user-renamed tab); `src/store/store.ts` (register the middleware after the mirror; run the creation pass)
-- Modify: `src/lib/recovery/build-recovery-plan.ts` (import the moved helper); `src/lib/tab-registry-open.ts` (both opens restore names); `src/lib/recovery/managed-runtime-recovery.ts` and `src/lib/tab-name-source.ts` (refactor: the naming-pane lookup moves to `tab-name-source.ts` for both users)
+- Modify: `src/lib/recovery/build-recovery-plan.ts` (import the moved helper); `src/lib/tab-registry-open.ts` (both opens restore names); `src/lib/recovery/managed-runtime-recovery.ts` and `src/lib/tab-name-source.ts` (refactor: the naming-pane lookup moves to `tab-name-source.ts`; after the Task 14 review the heal reads no folder, so the managed merge is its one user)
 - Modify: `test/fixtures/name-evidence/cases.json` (old-merge label rows)
 - Tests: create `test/unit/client/store/storedTabTitleHeal.test.ts`; extend `test/unit/client/lib/tab-registry-open.test.ts`; replace the Task 8 pinning test in `test/unit/lib/managed-runtime-recovery.test.ts`
 - E2e: create `test/e2e-browser/specs/stored-tab-title-heal-rust.spec.ts` and `test/e2e-browser/specs/tabs-view-name-restore-rust.spec.ts` (cloud-legal: plain shells only); create `test/e2e-browser/helpers/stored-names.ts` (stored-state reads, the persisted-registry wait and the OSC title command, shared with `new-window-name-restore-rust.spec.ts`, which moves onto it)
@@ -2001,8 +2010,8 @@ new-window rebuild does.
   `managed-runtime-title-merge.spec.ts`, `new-window-name-restore-rust.spec.ts`,
   `session-tab-title-mirror-rust.spec.ts`, `sidebar-registry-sync-rust.spec.ts`.
 - [ ] **Step 5: Refactor.** One naming-pane lookup (`tab-name-source.ts`)
-  for the managed merge and the heal; the moved helper is the only place the
-  restore rules live.
+  for the managed merge (and, until the Task 14 review dropped the folder,
+  the heal); the moved helper is the only place the restore rules live.
 - [ ] **Step 6: Commit** `fix(names): heal stored provider-label tab titles; registry opens keep pane names`.
 
 ## E2e coverage by root cause
@@ -2140,7 +2149,32 @@ and must be red before Task 2's implementation.
     a write replaces it. Task 14 took the stored-state route instead of
     that display-only one: one store middleware heals the stored title, so
     the display, the persisted layout, `GET /api/tabs` and the registry
-    agree.
+    agree for every open tab. What it leaves: Residuals 24 and 25.
+24. **Old closed-tab and other-device registry records keep their stored
+    label** (Task 14 receipt, open concern 1). The heal runs on the tabs
+    open in a window. A closed-tab record, or another device's record,
+    written before the deploy keeps its old `tabName` ("Shell agent") in
+    the Tabs view list and in the server's saved tabs registry, so the
+    registry agrees with the display only for open tabs. Opening such a
+    record from the Tabs view makes a new tab, which heals at once (it
+    passes the heal); the old closed record keeps its label. Another
+    device's open tabs heal when that device loads the new client. Nothing
+    rewrites a record that stays closed; it drops out of the Tabs view after
+    the closed-tab retention period (30 days at most). A possible
+    client-only follow-up: have the Tabs view show a record's `tabName`
+    through the same classifier.
+25. **A live window title that is itself a provider label heals too**
+    (Task 14 review). A tab title's writer is not recorded, so on a tab
+    without a rename the heal cannot tell a stored "Shell agent" from a
+    window title a program set to the same kind of label (a program in a
+    shell titling the window "opencode", "claude" or "Shell agent"). Such a
+    title becomes "Tab N". A single-pane tab still shows it, through the
+    pane title the same window-title write stores; a split tab shows its
+    derived label until the program sets a different title. Any other
+    window title is never healed. A possible follow-up: write the pane
+    title before the tab title in the window-title handler
+    (`TerminalView.tsx`) and exempt a tab title equal to one of its own
+    terminal panes' stored titles (the old merge wrote tab titles only).
 
 ### Out-of-scope finding for Dan (pre-existing, not fixed here)
 **A managed shell is not re-adopted after a web-server restart on `main`
