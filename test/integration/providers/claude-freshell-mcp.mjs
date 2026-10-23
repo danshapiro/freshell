@@ -121,20 +121,30 @@ try {
   receipt.toolNames = (init.tools ?? []).map(tool => (typeof tool === 'string' ? tool : tool?.name)).filter(name => String(name).startsWith('mcp__'))
   receipt.probeToolListed = receipt.toolNames.includes(PROBE_TOOL)
   await waitFor(frame => frame.type === 'sdk.result', 45_000, 'the turn result')
-  // The CLI's tool result for the probe call (the user message carrying the tool_result
-  // block reaches the sidecar as a transcript announcement only, so read the transcript).
-  const transcripts = await fixture.transcripts()
-  for (const relative of transcripts) {
-    const text = await fs.readFile(path.join(fixture.home, '.claude', relative), 'utf8')
-    for (const line of text.split('\n').filter(Boolean)) {
-      const row = JSON.parse(line)
-      const blocks = Array.isArray(row.message?.content) ? row.message.content : []
-      for (const block of blocks) {
-        if (block?.type !== 'tool_result') continue
-        const body = Array.isArray(block.content) ? block.content.map(part => part?.text ?? '').join('') : String(block.content ?? '')
-        try { receipt.toolResultReport = JSON.parse(body) } catch { receipt.toolResultReport = { unparsed: body.slice(0, 200) } }
+  // The CLI's tool result for the probe call: the user message carrying the
+  // tool_result block reaches the sidecar as a transcript announcement only,
+  // and the CLI flushes the line about 100 ms after the frame, so poll the
+  // transcript for it.
+  failureStage = 'tool result'
+  const toolResultReport = async () => {
+    for (const relative of await fixture.transcripts()) {
+      const text = await fs.readFile(path.join(fixture.home, '.claude', relative), 'utf8')
+      for (const line of text.split('\n').filter(Boolean)) {
+        let row
+        try { row = JSON.parse(line) } catch { continue }
+        const blocks = Array.isArray(row.message?.content) ? row.message.content : []
+        for (const block of blocks) {
+          if (block?.type !== 'tool_result') continue
+          const body = Array.isArray(block.content) ? block.content.map(part => part?.text ?? '').join('') : String(block.content ?? '')
+          try { return JSON.parse(body) } catch { return { unparsed: body.slice(0, 200) } }
+        }
       }
     }
+    return null
+  }
+  for (let waited = 0; waited < 10_000 && receipt.toolResultReport === null; waited += 50) {
+    receipt.toolResultReport = await toolResultReport()
+    if (receipt.toolResultReport === null) await sleep(50)
   }
 
   failureStage = 'probe report'
