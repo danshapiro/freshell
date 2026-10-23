@@ -1,0 +1,251 @@
+import { Profiler } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, render } from '@testing-library/react'
+import { Provider } from 'react-redux'
+import { configureStore } from '@reduxjs/toolkit'
+import { appReducers } from '@/store/appReducers'
+import { initLayout } from '@/store/panesSlice'
+import { setStatus } from '@/store/connectionSlice'
+import { useAppSelector } from '@/store/hooks'
+import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
+import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
+import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
+import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
+
+// Transcript-live plan D9: one freshclaude turn end to end in the DOM — the
+// app's real store and reducers, the real websocket handler (with its stream
+// batcher) and the real pane, with only the snapshot API mocked. Streamed
+// text appears, the snapshot holding its line commits, the turn ends; across
+// every React commit in between, the text is on screen exactly once: never
+// twice (tail and transcript together) and never zero times (a gap between
+// the tail letting go and the transcript taking over).
+
+const wsMock = vi.hoisted(() => ({
+  handlers: new Set<(message: unknown) => void>(),
+  send: vi.fn(),
+}))
+
+const apiMock = vi.hoisted(() => ({
+  getFreshAgentThreadSnapshot: vi.fn(),
+}))
+
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({
+    send: wsMock.send,
+    onMessage: (handler: (message: unknown) => void) => {
+      wsMock.handlers.add(handler)
+      return () => { wsMock.handlers.delete(handler) }
+    },
+    onReconnect: () => () => {},
+  }),
+}))
+
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      get: vi.fn().mockRejectedValue(new Error('no server in tests')),
+      post: vi.fn().mockRejectedValue(new Error('no server in tests')),
+    },
+    getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
+    getFreshAgentCheckpointOutcomePage: vi.fn().mockResolvedValue({ outcomes: [], nextCursor: null }),
+    getFreshAgentModelCapabilities: vi.fn().mockRejectedValue(new Error('no server in tests')),
+    setSessionMetadata: vi.fn().mockResolvedValue(undefined),
+  }
+})
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => ({ type: 'settings/saveServerSettingsPatch', payload: patch }),
+}))
+
+// Synchronous markdown (the transcript tests' established mock), so a frame
+// never holds both the renderer's Suspense fallback and its content.
+vi.mock('@/components/markdown/LazyMarkdown', async () => {
+  const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
+  return {
+    LazyMarkdown: ({ content }: { content: string }) => <MarkdownRenderer content={content} />,
+  }
+})
+
+const SESSION_ID = '550e8400-e29b-41d4-a716-44665544d009'
+const locator = { sessionId: SESSION_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+const ANSWER = 'Kittens are small cats that love yarn.'
+const ANSWER_CHUNKS = ['Kittens are ', 'small cats ', 'that love ', 'yarn.']
+
+type Turn = { id: string; turnId: string; messageId?: string; role: 'user' | 'assistant'; summary: string; items: unknown[] }
+
+const question: Turn = { id: 'u-question', turnId: 'u-question', role: 'user', summary: 'Tell me about kittens', items: [{ id: 'q', kind: 'text', text: 'Tell me about kittens' }] }
+// As the server projects it: keyed by its line uuid, carrying its API message id.
+const answer: Turn = { id: 'u-answer', turnId: 'u-answer', messageId: 'msg_kittens', role: 'assistant', summary: ANSWER, items: [{ id: 'a', kind: 'text', text: ANSWER }] }
+
+function claudeSnapshot(turns: Turn[]) {
+  return {
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    threadId: SESSION_ID,
+    sessionId: SESSION_ID,
+    revision: 1,
+    latestTurnId: turns.at(-1)?.turnId ?? null,
+    status: 'idle',
+    summary: '',
+    capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+    tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    pendingApprovals: [],
+    pendingQuestions: [],
+    worktrees: [],
+    diffs: [],
+    childThreads: [],
+    turns,
+    extensions: { claude: { transcriptLineUuids: turns.map((turn) => turn.turnId) } },
+  }
+}
+
+/** The transcript as the server would serve it next; a new object per read, as parsed JSON is. */
+let served: Turn[] = []
+
+function createStore() {
+  const store = configureStore({
+    reducer: appReducers,
+    middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }),
+  })
+  store.dispatch(setStatus('ready'))
+  store.dispatch(initLayout({
+    tabId: 'tab-1',
+    paneId: 'pane-1',
+    content: { kind: 'fresh-agent', ...locator, createRequestId: 'req-live-flow', status: 'idle' },
+  }))
+  return store
+}
+
+type Store = ReturnType<typeof createStore>
+
+function StoreBackedView() {
+  const content = useAppSelector((state) => {
+    const layout = state.panes.layouts['tab-1']
+    if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('missing pane')
+    return layout.content
+  })
+  return <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+}
+
+/** How many times the answer is on screen, counted after every React commit. */
+function countOnScreen(text: string): number {
+  return (document.body.textContent ?? '').split(text).length - 1
+}
+
+function renderFlow(store: Store) {
+  const frames: number[] = []
+  render(
+    <Profiler id="freshclaude-flow" onRender={() => { frames.push(countOnScreen(ANSWER)) }}>
+      <Provider store={store}>
+        <StoreBackedView />
+      </Provider>
+    </Profiler>,
+  )
+  return frames
+}
+
+function deliver(store: Store, event: Record<string, unknown>) {
+  const message = { type: 'freshAgent.event', ...locator, event: { sessionId: SESSION_ID, ...event } }
+  act(() => {
+    handleFreshAgentMessage(store.dispatch, message)
+    for (const handler of [...wsMock.handlers]) handler(message)
+  })
+}
+
+const stream = (event: Record<string, unknown>) => ({
+  type: 'freshAgent.stream', messageId: 'msg_kittens', parentToolUseId: null, event,
+})
+
+async function advance(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms)
+  })
+}
+
+async function settleRefetches(rounds: number) {
+  for (let i = 0; i < rounds; i += 1) await advance(SNAPSHOT_DEBOUNCE_MS)
+}
+
+/** The model streams the answer, then the CLI sends the block's message and announces its line. */
+async function streamAnswer(store: Store) {
+  deliver(store, { type: 'freshAgent.status', status: 'running' })
+  deliver(store, stream({ type: 'message_start', message: { id: 'msg_kittens' } }))
+  deliver(store, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+  for (const chunk of ANSWER_CHUNKS) {
+    deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: chunk } }))
+    await advance(LIVE_STREAM_FLUSH_MS)
+  }
+  deliver(store, stream({ type: 'content_block_stop', index: 0 }))
+  deliver(store, {
+    type: 'freshAgent.assistant', content: [{ type: 'text', text: ANSWER }], uuid: 'u-answer', messageId: 'msg_kittens', parentToolUseId: null,
+  })
+  deliver(store, { type: 'freshAgent.session.changed', reason: 'transcript', uuid: 'u-answer', parentToolUseId: null })
+}
+
+/** Every frame from the first one showing the answer: the answer is there exactly once. */
+function framesSinceFirstShown(frames: number[]): number[] {
+  const first = frames.findIndex((count) => count > 0)
+  expect(first).toBeGreaterThanOrEqual(0)
+  return frames.slice(first)
+}
+
+beforeEach(() => {
+  vi.useFakeTimers()
+  resetSnapshotSchedulerForTests()
+  wsMock.handlers.clear()
+  wsMock.send.mockReset()
+  served = [question]
+  apiMock.getFreshAgentThreadSnapshot.mockReset()
+  apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => claudeSnapshot(served))
+})
+
+afterEach(() => {
+  cleanup()
+  resetSnapshotSchedulerForTests()
+  vi.useRealTimers()
+})
+
+describe('freshclaude live rendering flow (transcript-live D9)', () => {
+  it('shows a streamed answer exactly once from its first token through the landed transcript and the turn\'s end', async () => {
+    const store = createStore()
+    const frames = renderFlow(store)
+    await settleRefetches(2)
+    expect(countOnScreen(ANSWER)).toBe(0)
+
+    served = [question, answer]
+    await streamAnswer(store)
+    await settleRefetches(3)
+    deliver(store, { type: 'freshAgent.result', costUsd: 0.01 })
+    deliver(store, { type: 'freshAgent.turn.complete', at: Date.now() })
+    await settleRefetches(4)
+
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(document.querySelector('[data-turn-source="live"]')).toBeNull()
+    const shown = framesSinceFirstShown(frames)
+    expect(shown.length).toBeGreaterThan(3)
+    expect(shown.filter((count) => count !== 1)).toEqual([])
+  })
+
+  it('keeps the answer on screen exactly once when its line lands only after the turn ended', async () => {
+    const store = createStore()
+    const frames = renderFlow(store)
+    await settleRefetches(2)
+
+    // The CLI is slow to write the line: the refetches around the result miss it.
+    await streamAnswer(store)
+    deliver(store, { type: 'freshAgent.result', costUsd: 0.01 })
+    await settleRefetches(2)
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(document.querySelector('[data-turn-source="live"]')).not.toBeNull()
+
+    served = [question, answer]
+    await settleRefetches(4)
+
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(document.querySelector('[data-turn-source="live"]')).toBeNull()
+    expect(framesSinceFirstShown(frames).filter((count) => count !== 1)).toEqual([])
+  })
+})
