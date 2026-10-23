@@ -7,11 +7,12 @@ import {
 import { bootCapturedAtMs } from '@/lib/recovery/boot-state'
 import { buildRecoveryPlan } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
-import { addTerminalRestoreRequestId, armRecoveredLiveTerminalTarget } from '@/lib/terminal-restore'
+import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { applyRecoveryTabPlan } from '@/lib/recovery/apply-recovery-plan'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { clearTabRegistryLocalClosed } from '@/store/tabRegistrySlice'
-import { clearTabsForMachine, addTab, setActiveTab } from '@/store/tabsSlice'
-import { clearPanesForMachine, restoreLayout, setPaneCrashTrace } from '@/store/panesSlice'
+import { clearTabsForMachine, setActiveTab } from '@/store/tabsSlice'
+import { clearPanesForMachine, setPaneCrashTrace } from '@/store/panesSlice'
 import type { CrashTrace, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 
@@ -186,29 +187,9 @@ export async function restoreMachineWorkspace(
   store.dispatch(clearTabRegistryLocalClosed())
 
   for (const plan of plans) {
-    store.dispatch(addTab({
-      id: plan.tabId,
-      title: plan.title,
-      // Unified agent names (Task 6): the recovered tab keeps its stable
-      // naming-source relationship (the plan remapped it through the
-      // old→new pane-id map; machine bootstrap preserves ids verbatim).
-      ...(plan.nameSource ? { nameSource: plan.nameSource } : {}),
-      // Name reliability (Task 9): a tab a person renamed stays protected.
-      ...(plan.titleSetByUser ? { titleSetByUser: true } : {}),
-    }))
-    store.dispatch(restoreLayout({
-      tabId: plan.tabId,
-      layout: plan.layout,
-      paneTitles: plan.paneTitles,
-      paneTitleSetByUser: plan.paneTitleSetByUser,
-      // The inventory is scoped to this selected machine and the plan already
-      // chose only valid snapshot IDs. Preserve that durable pane identity;
-      // ordinary and cross-device restore callers intentionally omit this.
-      preserveCreateRequestIds: true,
-    }))
-    for (const target of plan.liveTerminalReattach ?? []) {
-      armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)
-    }
+    // The inventory is scoped to this selected machine and the plan already
+    // chose only valid snapshot IDs: preserve that durable pane identity.
+    applyRecoveryTabPlan(store.dispatch, plan, { preserveCreateRequestIds: true })
   }
   // A local trace follows only the exact same terminal identity on this
   // machine. In particular, a new create request or a different terminal mode

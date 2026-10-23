@@ -395,13 +395,15 @@ function remapPaneKeyedMap<T>(
  * session-owned (its owner is the recorded pointer, or the rebuilt layout's
  * first leaf when the record predates it).
  */
-function restoredTabNames(
-  tab: RecoveryTab,
-  restoredPanes: RecoveryPane[],
-  layout: PaneNode,
-  paneIdMap: ReadonlyMap<string, string>,
-  nameSource: TabNameSource | undefined,
-): Pick<RecoveryTabPlan, 'titleSetByUser' | 'paneTitles' | 'paneTitleSetByUser'> {
+function restoredTabNames(input: {
+  tab: RecoveryTab
+  tabId: string
+  restoredPanes: RecoveryPane[]
+  layout: PaneNode
+  paneIdMap: ReadonlyMap<string, string>
+  nameSource: TabNameSource | undefined
+}): Pick<RecoveryTabPlan, 'titleSetByUser' | 'paneTitles' | 'paneTitleSetByUser'> {
+  const { tab, tabId, restoredPanes, layout, paneIdMap, nameSource } = input
   const recordedTitles: Record<string, string> = {}
   const recordedFlags: Record<string, boolean> = {}
   for (const p of restoredPanes) {
@@ -409,28 +411,25 @@ function restoredTabNames(
     if (p.titleSetByUser === true) recordedFlags[p.paneId] = true
   }
   const remappedTitles = remapPaneKeyedMap(recordedTitles, paneIdMap)
-  const remappedFlags = remapPaneKeyedMap(recordedFlags, paneIdMap)
-  const KEY = 'tab'
   const sanitized = stripScopedPaneTitleMetadata(
-    { [KEY]: layout },
-    { [KEY]: remappedTitles },
-    { [KEY]: remappedFlags },
+    { [tabId]: layout },
+    { [tabId]: remappedTitles },
+    { [tabId]: remapPaneKeyedMap(recordedFlags, paneIdMap) },
   )
-  const paneTitles = sanitized.paneTitles[KEY] ?? {}
-  const paneTitleSetByUser = sanitized.paneTitleSetByUser[KEY] ?? {}
-  const owner = nameSource ?? resolveInitialTabNameSource(layout)
-  const sessionOwned = owner?.kind === 'session'
-  const titleSetByUser = tab.titleSetByUser === true && !sessionOwned
-  const droppedScopedTitles = Object.keys(remappedTitles).length - Object.keys(paneTitles).length
-  if (droppedScopedTitles > 0 || (tab.titleSetByUser === true && sessionOwned)) {
+  const paneTitles = sanitized.paneTitles[tabId] ?? {}
+  const paneTitleSetByUser = sanitized.paneTitleSetByUser[tabId] ?? {}
+  const sessionOwned = (nameSource ?? resolveInitialTabNameSource(layout))?.kind === 'session'
+  const droppedTabUserFlag = tab.titleSetByUser === true && sessionOwned
+  const droppedScopedPaneTitles = Object.keys(remappedTitles).length - Object.keys(paneTitles).length
+  if (droppedScopedPaneTitles > 0 || droppedTabUserFlag) {
     log.debug('recovery plan dropped names owned by saved session records', {
       tabKey: tab.tabKey,
-      droppedScopedPaneTitles: droppedScopedTitles,
-      droppedTabUserFlag: tab.titleSetByUser === true && sessionOwned,
+      droppedScopedPaneTitles,
+      droppedTabUserFlag,
     })
   }
   return {
-    ...(titleSetByUser ? { titleSetByUser: true } : {}),
+    ...(tab.titleSetByUser === true && !sessionOwned ? { titleSetByUser: true } : {}),
     paneTitles,
     paneTitleSetByUser,
   }
@@ -498,6 +497,9 @@ export function buildRecoveryPlan(
     })
     .filter(({ leaves }) => leaves.length > 0)
     .map(({ tab: t, leaves, liveTerminalReattach, paneIdMap, restoredPanes }) => {
+      const tabId = options.preserveIdsForMachine
+        ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
+        : nanoid()
       const layout = chain(leaves)
       // Unified agent names (Task 6): remap the recorded pointer through the
       // explicit old→new pane-id map; an unresolvable pointer (its pane was
@@ -507,14 +509,12 @@ export function buildRecoveryPlan(
         ? remapTabNameSource(t.nameSource, paneIdMap) ?? resolveInitialTabNameSource(layout)
         : undefined
       return {
-        tabId: options.preserveIdsForMachine
-          ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
-          : nanoid(),
+        tabId,
         title: t.tabName || 'Recovered',
         sourceTabKey: t.tabKey,
         ...(nameSource ? { nameSource } : {}),
         layout,
-        ...restoredTabNames(t, restoredPanes, layout, paneIdMap, nameSource),
+        ...restoredTabNames({ tab: t, tabId, restoredPanes, layout, paneIdMap, nameSource }),
         ...(liveTerminalReattach.length ? { liveTerminalReattach } : {}),
       }
     })
