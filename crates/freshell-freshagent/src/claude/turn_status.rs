@@ -28,7 +28,10 @@ pub(super) enum LedgerStep {
     /// interrupt again (§5.4).
     Reissue(StopReissue),
     /// The CLI refused the latched Stop's interrupt; the turn keeps running.
-    StopRefused { stop_id: String },
+    StopRefused {
+        stop_id: String,
+        request_id: Option<String>,
+    },
 }
 
 /// One settled turn, as the consumer reports it.
@@ -151,7 +154,13 @@ impl FreshClaudeState {
                 LedgerStep::Nothing
             }
             Folded::Reissue(reissue) => LedgerStep::Reissue(reissue),
-            Folded::StopRefused { stop_id } => LedgerStep::StopRefused { stop_id },
+            Folded::StopRefused {
+                stop_id,
+                request_id,
+            } => LedgerStep::StopRefused {
+                stop_id,
+                request_id,
+            },
             Folded::Settled(settlement) => {
                 let command_ids: Vec<String> = settlement
                     .retired

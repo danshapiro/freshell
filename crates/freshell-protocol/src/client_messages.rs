@@ -1011,6 +1011,8 @@ pub struct FreshAgentSend {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentInterrupt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,

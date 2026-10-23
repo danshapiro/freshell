@@ -79,7 +79,7 @@ impl Run {
         match self.ledger.fold(&fact) {
             Folded::Settled(settlement) => self.verdicts.push(settlement.verdict),
             Folded::Reissue(reissue) => self.reissues.push(reissue),
-            Folded::StopRefused { stop_id } => self.refusals.push(stop_id),
+            Folded::StopRefused { stop_id, .. } => self.refusals.push(stop_id),
             Folded::Applied | Folded::UnknownCommand => {}
         }
         self
@@ -93,7 +93,7 @@ impl Run {
     }
 
     fn stop(&mut self, stop_id: &str) -> Option<StopArmed> {
-        self.ledger.stop(stop_id.to_string())
+        self.ledger.stop(stop_id.to_string(), None)
     }
 
     fn running(&mut self, uuid: &str) -> &mut Self {
@@ -682,4 +682,34 @@ fn a_second_stop_keeps_the_first_ones_targets() {
     assert_eq!(second.commands, vec!["a".to_string(), "b".to_string()]);
     run.feed_all([receipt("stop-1", &[]), receipt("stop-2", &[]), aborted()]);
     assert_eq!(run.verdicts, vec![ResultVerdict::Silent]);
+}
+
+#[test]
+fn a_refused_reissue_keeps_the_users_request_id_and_releases_the_turn_to_ring() {
+    let mut run = Run::default();
+    run.arm("queued");
+    run.ledger
+        .stop("stop-request".into(), Some("user-stop-request".into()))
+        .unwrap();
+    run.feed(receipt("stop-request", &["queued"]));
+    run.feed(command("queued", "started"));
+    let reissue = run
+        .reissues
+        .last()
+        .expect("the initial Stop missed the queued command");
+    assert_eq!(reissue.request_id.as_deref(), Some("user-stop-request"));
+    let failed = run
+        .ledger
+        .fold(&TurnFact::from_line(&refused(&reissue.reissue_id)).unwrap());
+    assert_eq!(
+        failed,
+        Folded::StopRefused {
+            stop_id: "stop-request".into(),
+            request_id: Some("user-stop-request".into()),
+        }
+    );
+    assert!(!run.ledger.stop_latched());
+    assert!(run.ledger.busy());
+    run.feed(success());
+    assert!(run.verdicts.last().unwrap().rings());
 }

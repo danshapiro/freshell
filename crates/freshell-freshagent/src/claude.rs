@@ -4061,21 +4061,37 @@ impl FreshClaudeState {
     /// and the interrupt is written with the latch's `stopId`. The stopped turn's
     /// own result is then silent; every other turn end rings. A Stop that missed
     /// a command the CLI was still starting is sent again by the stdout consumer
-    /// ([`Self::reissue_stop`]). Success broadcasts nothing. A missing session
-    /// mirrors the `SESSION_NOT_FOUND` convention [`Self::handle_send`] uses.
+    /// ([`Self::reissue_stop`]). Success broadcasts nothing. A dead session
+    /// repeats its exited status; an unknown one reports a nested session error.
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_id = msg.session_id.clone();
-
-        // Task 10b: durable ids resolve through `cli_index` (same aliasing as send).
-        let Some(map_key) = self.resolve_session_key(&session_id).await else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
-            return;
-        };
-        if !self
-            .stop_live_session(&map_key, session_type_str(msg.session_type))
-            .await
-        {
-            self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
+        if let Some(map_key) = self.resolve_session_key(&session_id).await {
+            if self
+                .stop_live_session(
+                    &map_key,
+                    session_type_str(msg.session_type),
+                    &msg.request_id,
+                )
+                .await
+            {
+                return;
+            }
+        }
+        if self.dead_sessions.find(&session_id).is_some() {
+            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                provider: PROVIDER.into(),
+                session_id: session_id.clone(),
+                session_type: session_type_str(msg.session_type).into(),
+                event: crate::claude_dead_sessions::exited_status_event(&session_id),
+            }));
+        } else {
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &msg.request_id,
+                "INVALID_SESSION_ID",
+                "The Claude conversation for this session could not be found.",
+            );
         }
     }
 
@@ -6418,16 +6434,27 @@ impl FreshClaudeState {
                         state
                             .reissue_stop(
                                 &session_id,
-                                &sidecar_session_id,
+                                &ownership_id,
                                 &stamp,
                                 &session_type,
                                 reissue,
                             )
                             .await;
                     }
-                    LedgerStep::StopRefused { stop_id } => {
+                    LedgerStep::StopRefused {
+                        stop_id,
+                        request_id,
+                    } => {
                         let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                        state.log_stop_refused(&stamp, &session_type, stop_id);
+                        state.report_stop_refused(
+                            &stamp,
+                            &session_type,
+                            stop_id,
+                            request_id,
+                            value["message"]
+                                .as_str()
+                                .unwrap_or("Claude could not stop the current turn. Try again."),
+                        );
                     }
                     LedgerStep::Nothing | LedgerStep::Settled(_) => {}
                 }
@@ -8017,6 +8044,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::naming::SessionNaming as _;
 
+    mod control_tests;
     mod create_binding_tests;
     mod recovery_tests;
     mod refusal_tests;
@@ -18605,15 +18633,15 @@ rl.on('line', (line) => {
 
     // ── freshAgent.interrupt (parity gap fix -- see terminal.rs's dispatch arm) ────
 
-    /// A missing session mirrors the `SESSION_NOT_FOUND` convention already
-    /// established by [`FreshClaudeState::handle_send`] (and codex/opencode's own
-    /// `handle_interrupt`): an `error` frame, never a silent drop.
+    /// An unknown interrupt is a visible session error, including for an
+    /// older client that supplies no request id.
     #[tokio::test]
     async fn handle_interrupt_errors_for_unknown_session() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "does-not-exist".to_string(),
             session_type: SessionType::Freshclaude,
@@ -18622,14 +18650,8 @@ rl.on('line', (line) => {
         .await;
 
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "error");
-        assert!(
-            frame["message"]
-                .as_str()
-                .unwrap()
-                .contains("claude session not found"),
-            "{frame}"
-        );
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID", "{frame}");
     }
 
     /// A known session's interrupt is forwarded to the sidecar (the Rust-side half of
@@ -18656,6 +18678,7 @@ rl.on('line', (line) => {
         await_ledger_busy(&st, &session_id, true).await;
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.clone(),
             session_type: SessionType::Freshclaude,
@@ -18721,6 +18744,7 @@ rl.on('line', (line) => {
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.clone(),
             session_type: SessionType::Freshclaude,
