@@ -1029,6 +1029,7 @@ async fn qualify_candidate_helper_transport(
         "wrong-resource-subpath",
         "late-mountpoints-create",
         "slow-reader-delete",
+        "late-scratch-create",
     ];
     if matches!(owner, ClaudeSourceOwner::Retained { .. }) {
         modes.extend([
@@ -1088,6 +1089,9 @@ async fn qualify_candidate_helper_transport(
         let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
         let (seen, bodies, backing) = (calls.clone(), containers.clone(), volume.clone());
+        // Docker has made the scratch volume whose create it answers late.
+        let scratch_made = Arc::new(tokio::sync::Notify::new());
+        let made = scratch_made.clone();
         let expected_scratch = format!(
             "freshell-claude-candidate-{}",
             request.observation_request.request_id
@@ -1102,7 +1106,7 @@ async fn qualify_candidate_helper_transport(
                     _=&mut stopped=>break,
                     accepted=listener.accept()=>{
                         let (mut stream,_)=accepted.unwrap();
-                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone());
+                        let (seen,bodies,backing,daemon,private_jobs,expected_scratch,retained_name,made)=(seen.clone(),bodies.clone(),backing.clone(),daemon.clone(),private_jobs.clone(),expected_scratch.clone(),retained_name.clone(),made.clone());
                         jobs.spawn(async move {
                             let mut header=Vec::new();let mut byte=[0];
                             // A caller may abandon a request it no longer waits for.
@@ -1117,7 +1121,10 @@ async fn qualify_candidate_helper_transport(
                             else if line.starts_with("POST") && line.contains("/volumes/create "){
                                 assert_eq!(body["Name"],expected_scratch,"private candidate request must identify its exact scratch backing before creation");
                                 if serde_json::from_value::<BTreeMap<String,String>>(body["Labels"].clone()).is_err() { (400,json!({"message":"volume labels require string metadata"})) }
-                                else { let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());(201,actual) }
+                                else {
+                                    // A stalled daemon makes the volume only after the reader's deadline.
+                                    if mode=="late-scratch-create" {tokio::time::sleep(Duration::from_millis(900)).await;}
+                                    let actual=json!({"Name":body["Name"],"Driver":"local","Options":{},"Labels":body["Labels"],"Mountpoint":"/synthetic/ordinary-volume"});*backing.lock().unwrap()=Some(actual.clone());made.notify_one();(201,actual) }
                             }
                             else if line.starts_with("GET") && line.contains("/volumes/"){if retained_name.as_ref().is_some_and(|name|line.contains(name)) {(200,json!({"Name":retained_name,"Driver":"local","Options":{},"Mountpoint":"/synthetic/retained-home"}))} else {match backing.lock().unwrap().clone(){Some(v) if line.contains(v["Name"].as_str().unwrap())=>(200,v),_=>(404,json!({}))}}}
                             else if line.starts_with("DELETE") && line.contains("/volumes/"){assert!(bodies.lock().unwrap().is_empty(),"candidate helpers must be gone before volume deletion");if mode!="volume-still-present" {*backing.lock().unwrap()=None;}(204,json!({}))}
@@ -1206,7 +1213,10 @@ async fn qualify_candidate_helper_transport(
             }
         });
         let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
-        let budget = if matches!(mode, "projection-timeout" | "late-mountpoints-create") {
+        let budget = if matches!(
+            mode,
+            "projection-timeout" | "late-mountpoints-create" | "late-scratch-create"
+        ) {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(3)
@@ -1221,6 +1231,17 @@ async fn qualify_candidate_helper_transport(
                 retained_name.as_ref().map(|_| prior_stage.as_path()),
             )
             .await;
+        if mode == "late-scratch-create" {
+            // Let Docker finish the volume the read gave up on, then give a
+            // cleanup that settled the create time to remove it.
+            tokio::time::timeout(Duration::from_secs(10), scratch_made.notified())
+                .await
+                .expect("the synthetic daemon makes the late scratch volume");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while volume.lock().unwrap().is_some() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
         if mode == "slow-reader-delete" {
             // The reader's removal outlived the cleanup window, so the
             // attempt failed; what it still owned is removed in the
