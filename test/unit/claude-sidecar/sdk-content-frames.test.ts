@@ -135,10 +135,63 @@ describe('framesForSdkMessage over the pinned CLI\'s recorded sequences', () => 
     }
   })
 
-  it.each(SCENARIOS)('%s: each stream event is forwarded as sdk.stream with its event and parent tool use id', (scenario) => {
+  it.each(SCENARIOS)('%s: only the main thread\'s message and block starts, text and thinking deltas and block stops are streamed', (scenario) => {
     for (const { msg, frames } of mapRecording(scenario).filter(({ msg }) => msg.type === 'stream_event')) {
-      expect(frames).toEqual([{ type: 'sdk.stream', sessionId: 's1', event: msg.event, parentToolUseId: msg.parent_tool_use_id }])
+      const event = msg.event
+      const streamed = msg.parent_tool_use_id == null && (
+        ['message_start', 'content_block_start', 'content_block_stop'].includes(event.type)
+        || (event.type === 'content_block_delta' && ['text_delta', 'thinking_delta'].includes(event.delta?.type))
+      )
+      if (streamed) expect(frames).toEqual([{ type: 'sdk.stream', sessionId: 's1', event, parentToolUseId: null, messageId: expect.any(String) }])
+      else expect(frames, JSON.stringify(event)).toEqual([])
     }
+  })
+
+  it('drops the events nothing renders: tool input JSON, signatures, message deltas and stops', () => {
+    const dropped = mapRecording('tools-sync')
+      .filter(({ msg }) => msg.type === 'stream_event')
+      .filter(({ frames }) => frames.length === 0)
+      .map(({ msg }) => msg.event.delta?.type ?? msg.event.type)
+    expect(new Set(dropped)).toEqual(new Set(['input_json_delta', 'signature_delta', 'message_delta', 'message_stop']))
+  })
+
+  it.each(SCENARIOS)('%s: each streamed block carries the API message id of the sdk.assistant it becomes, and its deltas add up to that block', (scenario) => {
+    const frames = mapRecording(scenario).flatMap((entry) => entry.frames)
+    let open: { messageId: string; index: number; kind: string; text: string } | undefined
+    const finished: Array<{ messageId: string; kind: string; text: string }> = []
+    for (const frame of frames.filter((f: Msg) => f.type === 'sdk.stream')) {
+      const event = frame.event
+      if (event.type === 'content_block_start') open = { messageId: frame.messageId, index: event.index, kind: event.content_block.type, text: '' }
+      if (event.type === 'content_block_delta') {
+        expect(open).toMatchObject({ messageId: frame.messageId, index: event.index })
+        open!.text += event.delta.text ?? event.delta.thinking
+      }
+      if (event.type === 'content_block_stop') {
+        expect(open).toMatchObject({ messageId: frame.messageId, index: event.index })
+        finished.push({ messageId: open!.messageId, kind: open!.kind, text: open!.text })
+        open = undefined
+      }
+    }
+    // The main thread's assistant messages, block by block, in the same order.
+    const blocks = frames
+      .filter((f: Msg) => f.type === 'sdk.assistant' && f.parentToolUseId === null && f.model !== '<synthetic>')
+      .map((f: Msg) => ({ messageId: f.messageId, kind: f.content[0].type, text: f.content[0].text ?? f.content[0].thinking ?? '' }))
+    expect(finished).toEqual(blocks)
+  })
+
+  it('a subagent\'s stream does not touch the main thread\'s message id', () => {
+    const state = createFrameState()
+    const start = (id: string, parent: string | null) => ({ type: 'stream_event', event: { type: 'message_start', message: { id, content: [] } }, parent_tool_use_id: parent, uuid: `u-${id}` })
+    const delta = { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } }, parent_tool_use_id: null, uuid: 'u-d' }
+    expect(framesForSdkMessage('s1', start('msg_main', null), session(state))).toHaveLength(1)
+    expect(framesForSdkMessage('s1', start('msg_sub', 'toolu_agent1'), session(state))).toEqual([])
+    expect(framesForSdkMessage('s1', delta, session(state))).toEqual([
+      { type: 'sdk.stream', sessionId: 's1', event: delta.event, parentToolUseId: null, messageId: 'msg_main' },
+    ])
+    // Each session keeps its own stream state.
+    const other = createFrameState()
+    framesForSdkMessage('s2', start('msg_other', null), session(other))
+    expect(framesForSdkMessage('s1', delta, session(state))[0].messageId).toBe('msg_main')
   })
 
   it('projects each content block the way the server reads it (a thinking block loses its signature)', () => {

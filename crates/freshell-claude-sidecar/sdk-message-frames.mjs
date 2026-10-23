@@ -93,10 +93,11 @@ export function resultFrames(sessionId, result, { userStopped }) {
 
 /**
  * The per-session state of the content mapping. index.mjs keeps one per
- * session and passes it in as `session.stream`.
+ * session and passes it in as `session.stream`. `messageId` is the API
+ * message id of the main thread's message being streamed (its message_start).
  */
 export function createFrameState() {
-  return {}
+  return { messageId: null }
 }
 
 /**
@@ -164,9 +165,24 @@ export function assistantFrames(sessionId, msg) {
   ]
 }
 
-/** A streaming event: `sdk.stream`. */
-export function streamEventFrames(sessionId, msg, _stream) {
-  return [{ type: 'sdk.stream', sessionId, event: msg.event, parentToolUseId: msg.parent_tool_use_id }]
+/** The stream events a live pane renders (a block's start and stop, and its text or thinking). */
+const STREAMED_EVENTS = new Set(['message_start', 'content_block_start', 'content_block_stop'])
+const STREAMED_DELTAS = new Set(['text_delta', 'thinking_delta'])
+
+/**
+ * A streaming event of the main thread: `sdk.stream`, stamped with the API
+ * message id it belongs to (the one each of its blocks' sdk.assistant then
+ * carries). Only what a live pane renders is streamed: a subagent's events,
+ * tool input JSON, signatures and the message's own delta and stop are not.
+ */
+export function streamEventFrames(sessionId, msg, stream) {
+  if (parentToolUseIdOf(msg) !== null) return []
+  const event = msg.event
+  if (event?.type === 'message_start') stream.messageId = event.message?.id ?? null
+  const streamed = STREAMED_EVENTS.has(event?.type)
+    || (event?.type === 'content_block_delta' && STREAMED_DELTAS.has(event.delta?.type))
+  if (!streamed) return []
+  return [{ type: 'sdk.stream', sessionId, event, parentToolUseId: null, messageId: stream.messageId }]
 }
 
 /** A status frame: the CLI started compacting. */

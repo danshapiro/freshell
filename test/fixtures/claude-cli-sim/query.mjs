@@ -645,18 +645,25 @@ class SimulatedCli {
     return this.finishTurn(turn, { subtype: 'success' })
   }
 
+  /**
+   * The start of one model response. Its id is the API message id every
+   * content block of that response carries on its assistant message (F2).
+   */
   messageStart() {
+    this.streamedMessageId = `msg_${randomUUID().replaceAll('-', '')}`
     return {
       type: 'message_start',
-      message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+      message: { id: this.streamedMessageId, type: 'message', role: 'assistant', model: FAKE_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
     }
   }
 
+  /** One completed content block of the main thread's current response (or of a subagent's, with parent_tool_use_id). */
   assistant(content, extra = {}) {
     const uuid = randomUUID()
+    const id = !extra.parent_tool_use_id && this.streamedMessageId ? this.streamedMessageId : `msg_${randomUUID().replaceAll('-', '')}`
     const message = {
       type: 'assistant',
-      message: { id: `msg_${randomUUID().replaceAll('-', '')}`, type: 'message', role: 'assistant', model: FAKE_MODEL, content, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, context_management: null },
+      message: { id, type: 'message', role: 'assistant', model: FAKE_MODEL, content, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, context_management: null },
       parent_tool_use_id: null,
       uuid,
       timestamp: new Date().toISOString(),

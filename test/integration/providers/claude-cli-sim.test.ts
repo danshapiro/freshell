@@ -110,6 +110,26 @@ async function snapshotTree(root: string): Promise<Record<string, string>> {
 const program = (rules: unknown[]) => ({ FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify({ rules }), FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
 const results = (messages: any[]) => messages.filter((m) => m.type === 'result')
 
+describe('Claude CLI simulator ids a normalized trace cannot see', () => {
+  it('each assistant message carries the API message id of the message_start it was streamed under, as on the real CLI (F2)', async () => {
+    const s = await open({ includePartialMessages: true }, { FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    s.prompt.push('TOOL:sleep=0')
+    await s.until(() => results(s.messages).length === 1)
+    s.prompt.push('SLOW')
+    await s.until(() => results(s.messages).length === 2)
+    const pairs: Array<[string, string]> = []
+    let streaming: string | undefined
+    for (const m of s.messages) {
+      if (m.type === 'stream_event' && m.event.type === 'message_start') streaming = m.event.message.id
+      if (m.type === 'assistant' && m.parent_tool_use_id === null) pairs.push([streaming!, m.message.id])
+    }
+    // The tool call, its follow-up reply and the slow reply: three messages, three ids.
+    expect(pairs).toHaveLength(3)
+    for (const [started, assistant] of pairs) expect(assistant).toBe(started)
+    expect(new Set(pairs.map(([id]) => id)).size).toBe(3)
+  })
+})
+
 describe('Claude CLI simulator programs', () => {
   it('a matching prompt rule replaces the marker behavior: a question goes through canUseTool and the answer ends the turn', async () => {
     const calls: any[] = []

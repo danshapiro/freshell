@@ -64,4 +64,31 @@ describe('a live turn\'s frames', () => {
       return announcements.filter((frame) => !written.has(frame.uuid)).map((frame) => frame.uuid)
     }, { timeout: 2_000 }).toEqual([])
   })
+
+  it('streams text and block starts stamped with the message id of the sdk.assistant they become, and nothing a pane does not render', async () => {
+    const sidecar = await startRealSidecar({ timeScale: 0.1 })
+    const sessionId = await sidecar.create()
+    sidecar.send({ type: 'send', sessionId, text: 'SLOW reply in chunks' })
+    await sidecar.waitFor('sdk.result', 'the slow turn result')
+    sidecar.send({ type: 'send', sessionId, text: 'TOOL:sleep=0' })
+    await sidecar.waitFor((frame) => frame.type === 'sdk.result' && sidecar.frames.filter((f) => f.type === 'sdk.result').length === 2, 'the tool turn result')
+
+    const streams = sidecar.frames.filter((frame) => frame.type === 'sdk.stream')
+    expect(streams.length).toBeGreaterThan(0)
+    for (const frame of streams) {
+      expect(frame).toMatchObject({ sessionId, parentToolUseId: null, messageId: expect.any(String) })
+      expect(['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop']).toContain(frame.event.type)
+      if (frame.event.type === 'content_block_delta') expect(['text_delta', 'thinking_delta']).toContain(frame.event.delta.type)
+    }
+    // Every streamed block start names the message of the assistant block that follows it.
+    for (const start of streams.filter((frame) => frame.event.type === 'content_block_start')) {
+      const assistant = sidecar.frames.slice(sidecar.frames.indexOf(start)).find((frame) => frame.type === 'sdk.assistant')
+      expect(assistant?.messageId).toBe(start.messageId)
+    }
+    // The slow reply's deltas add up to its text.
+    const slowId = streams.find((frame) => frame.event.type === 'content_block_start' && frame.event.content_block.type === 'text')!.messageId
+    const streamed = streams.filter((frame) => frame.messageId === slowId && frame.event.type === 'content_block_delta').map((frame) => frame.event.delta.text).join('')
+    const reply = sidecar.frames.find((frame) => frame.type === 'sdk.assistant' && frame.messageId === slowId)
+    expect(streamed).toBe(reply?.content[0].text)
+  })
 })

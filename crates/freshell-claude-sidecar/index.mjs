@@ -40,7 +40,11 @@
 //     { type:'sdk.assistant',           sessionId, content, model, uuid, messageId, parentToolUseId }
 //                                  — one per completed content block (blocks of one API message share
 //                                    messageId); parentToolUseId is set inside a subagent, else null
-//     { type:'sdk.stream',              sessionId, event, parentToolUseId }
+//     { type:'sdk.stream',              sessionId, event, parentToolUseId:null, messageId }
+//                                  — the main thread's message_start, content_block_start/stop and
+//                                    text/thinking deltas only, stamped with the API message id of the
+//                                    message being streamed (a subagent's events, tool input JSON,
+//                                    signatures, message_delta and message_stop are not sent)
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
 //                                  the stopped turn's own aborted result (an accepted user interrupt's mark
