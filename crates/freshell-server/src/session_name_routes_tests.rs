@@ -570,6 +570,10 @@ async fn automation_rename_outcome_reaches_every_route_response() {
             body["data"]["sessionName"]["outcome"], refused,
             "{label}: {body}"
         );
+        assert_eq!(
+            body["message"], "session name not applied: protected_name",
+            "{label}: the message never claims a refused rename happened: {body}"
+        );
     }
     let still = names.get(vec![protected.clone()]).await.unwrap();
     assert_eq!(still[0].record.name, "LotL", "no surface changed the name");
@@ -623,11 +627,95 @@ async fn automation_rename_outcome_reaches_every_route_response() {
         json!({ "applied": false, "reason": "default_label" }),
         "pane folder rule: {body}"
     );
+    assert_eq!(
+        body["message"], "session name not applied: default_label",
+        "pane folder rule: {body}"
+    );
     let folder_record = names.get(vec![folder_target]).await.unwrap();
     assert_eq!(
         folder_record[0].record.name, "w",
         "the folder name never applied"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The pane route's pre-bind retry (a pane whose prospective sessionRef has
+/// no record yet renames through its pending handle) answers the same
+/// outcome-derived message: a refused automation rename says it was not
+/// applied, an applied one that the session was renamed.
+#[tokio::test]
+async fn a_pending_retry_rename_message_follows_its_outcome() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let names = state.names.clone();
+    admit_pending(
+        &names,
+        "handle-zero-turn",
+        NamedProvider::Claude,
+        Some("/w"),
+    )
+    .await;
+    let pending = SessionNameRef::Pending {
+        id: "handle-zero-turn".to_string(),
+    };
+    names
+        .rename(RenameNameInput {
+            target: pending.clone(),
+            name: "Billing".into(),
+            intent: NameIntent::User,
+            if_revision: None,
+            cwd: None,
+        })
+        .await
+        .expect("the user names the zero-turn pane");
+    admit_pending(&names, "handle-fresh", NamedProvider::Claude, Some("/w")).await;
+    let zero_turn_pane = |handle: &str, session_id: &str| {
+        let mut content = scoped_pane_content("claude", "claude", session_id);
+        content["namingHandle"] = json!(handle);
+        content
+    };
+
+    let (status, body) = patch(
+        fresh_router(
+            &names,
+            zero_turn_pane("handle-zero-turn", "aaaa1111-0000-4000-8000-00000000000a"),
+        ),
+        "/api/panes/p1",
+        json!({ "name": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["nameRef"],
+        serde_json::to_value(&pending).unwrap(),
+        "the rename went through the pending handle: {body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["outcome"],
+        json!({ "applied": false, "reason": "protected_name" }),
+        "{body}"
+    );
+    assert_eq!(
+        body["message"], "session name not applied: protected_name",
+        "{body}"
+    );
+
+    let (status, body) = patch(
+        fresh_router(
+            &names,
+            zero_turn_pane("handle-fresh", "bbbb2222-0000-4000-8000-00000000000b"),
+        ),
+        "/api/panes/p1",
+        json!({ "name": "Agent suggestion" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["sessionName"]["outcome"]["applied"],
+        json!(true),
+        "{body}"
+    );
+    assert_eq!(body["message"], "session renamed", "{body}");
     std::fs::remove_dir_all(&home).ok();
 }
 
