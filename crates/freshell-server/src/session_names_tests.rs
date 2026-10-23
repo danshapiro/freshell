@@ -107,6 +107,19 @@ async fn get_one(store: &Arc<SessionNames>, target: SessionNameRef) -> Option<Se
     updates.into_iter().next()
 }
 
+/// `get_one` for a read that must see a change another writer just made
+/// (`session_name_store_view::get_settled_for_test`: a read answered from
+/// the view only because the lock was still busy is repeated).
+async fn get_one_settled(
+    store: &Arc<SessionNames>,
+    target: SessionNameRef,
+) -> Option<SessionNameUpdate> {
+    let updates = session_name_store_view::get_settled_for_test(store, vec![target])
+        .await
+        .expect("get succeeds");
+    updates.into_iter().next()
+}
+
 async fn activity(
     store: &Arc<SessionNames>,
     target: SessionNameRef,
@@ -612,7 +625,8 @@ async fn post_replace_error_fences_until_reconciled() {
     // The writer self-heals on its next transaction via reconciliation; a
     // forced reconciliation failure keeps the fence up.
     set_test_hooks(dir.path(), vec![TestHook::FailReconcile]);
-    let still_fenced = store.get(vec![target.clone()]).await;
+    let still_fenced =
+        session_name_store_view::get_settled_for_test(&store, vec![target.clone()]).await;
     assert!(
         matches!(still_fenced, Err(NameError::CommitUncertain(_))),
         "adoption stays fenced until durability reconciliation succeeds"
@@ -624,7 +638,7 @@ async fn post_replace_error_fences_until_reconciled() {
     );
 
     clear_test_hooks(dir.path());
-    let adopted = get_one(&store, target.clone())
+    let adopted = get_one_settled(&store, target.clone())
         .await
         .expect("reconciliation succeeds on the next transaction");
     assert_eq!(adopted.record.name, "Uncertain name");
@@ -662,7 +676,7 @@ async fn vanished_document_fences_established_store() {
     std::fs::remove_file(&doc_path).expect("document vanishes");
 
     // The next operation fences instead of silently reinitializing.
-    let fenced = store.get(vec![target.clone()]).await;
+    let fenced = session_name_store_view::get_settled_for_test(&store, vec![target.clone()]).await;
     assert!(
         matches!(fenced, Err(NameError::Persistence(ref message)) if message.contains("vanished")),
         "a vanished document is an error, not reinitialization: {fenced:?}"
@@ -1582,7 +1596,8 @@ async fn decreasing_and_equal_generation_corruption_are_errors() {
     let mut older = read_raw_document(dir.path());
     older.document_generation = 1;
     write_raw_document(dir.path(), &older);
-    let decreased = store.get(vec![target.clone()]).await;
+    let decreased =
+        session_name_store_view::get_settled_for_test(&store, vec![target.clone()]).await;
     assert!(
         matches!(decreased, Err(NameError::Persistence(_))),
         "decreasing generations are errors"
@@ -1594,7 +1609,7 @@ async fn decreasing_and_equal_generation_corruption_are_errors() {
     let key = name_ref_key(&target);
     tampered.records.get_mut(&key).expect("tamper target").name = "Tampered".to_string();
     write_raw_document(dir.path(), &tampered);
-    let equal = store.get(vec![target.clone()]).await;
+    let equal = session_name_store_view::get_settled_for_test(&store, vec![target.clone()]).await;
     assert!(
         matches!(equal, Err(NameError::Persistence(_))),
         "equal generation with different content is an error"
@@ -1604,7 +1619,7 @@ async fn decreasing_and_equal_generation_corruption_are_errors() {
     let mut newer = read_raw_document(dir.path());
     newer.document_generation = established_generation + 1;
     write_raw_document(dir.path(), &newer);
-    let recovered = get_one(&store, target.clone())
+    let recovered = get_one_settled(&store, target.clone())
         .await
         .expect("newer generation adopted after corruption");
     assert_eq!(recovered.record.name, "Tampered");

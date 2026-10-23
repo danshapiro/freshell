@@ -76,6 +76,7 @@ mod session_name_generation;
 mod session_name_migration;
 mod session_name_native;
 mod session_name_routes;
+mod session_name_tick;
 mod session_names;
 mod sessions;
 mod settings;
@@ -1391,56 +1392,16 @@ async fn main() -> ExitCode {
         fresh_codex_state.set_session_naming(names.clone());
         fresh_opencode_state.set_session_naming(names.clone());
 
-        // The 2s adoption/reconcile tick: (1) adopt a same-home cooperating
-        // process's committed generation — a stat of the document against
-        // the adopted stamp, and the strict locked full read only when the
-        // stamp changed or its 30 s full-check window elapsed
-        // (name-reliability Task 11); (2) bind still-pending handles whose
-        // durability has since become verifiable. Claude: the transcript
-        // locator (the signal-first and zero-turn create lanes bind as soon
-        // as the transcript exists). Codex/opencode: their runtime edges
-        // (the rollout walk / the DB row) own the verified binds — the tick
-        // never fabricates one.
-        {
-            let names = names.clone();
-            let identity = terminal_identity.clone();
-            let registry = registry.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    if let Err(error) = names.adopt_external_if_changed().await {
-                        tracing::warn!(
-                            target: "freshell_server::session_names",
-                            op = "adopt_external_if_changed",
-                            name_ref = "-",
-                            revision = 0,
-                            class = %error.code(),
-                            "session_names.operation_failed: {error}"
-                        );
-                    }
-                    for (terminal_id, provider, session_id, _handle) in
-                        identity.pending_naming_binds()
-                    {
-                        if provider != "claude" {
-                            continue;
-                        }
-                        // One bounded locate + bind per still-pending claude
-                        // row; a miss or failure keeps the row pending for
-                        // the next tick's visible retry (the helper logs its
-                        // own failure classes).
-                        let _ = freshell_ws::identity::bind_pending_claude_transcript(
-                            &identity,
-                            &registry,
-                            &terminal_id,
-                            &session_id,
-                        )
-                        .await;
-                    }
-                }
-            });
-        }
+        // The 2s adoption/reconcile tick (`session_name_tick`): adopt a
+        // same-home cooperating process's committed generation through the
+        // cheap stamp peek, then bind still-pending claude handles whose
+        // transcripts now exist.
+        tokio::spawn(session_name_tick::run_naming_tick(
+            names.clone(),
+            terminal_identity.clone(),
+            registry.clone(),
+            session_name_tick::NAMING_TICK_PERIOD,
+        ));
 
         // The naming publisher: every committed update (this process's own
         // writes and adopted external ones) reaches WS clients as the

@@ -45,7 +45,9 @@
 //! `session_name_store_view`): they answer from the adopted view after a
 //! stat of the document against the stamp the view was adopted from; only
 //! a changed stamp (or an elapsed 30 s full-check window) runs the locked
-//! full-read adoption above, and a busy lock never makes a read wait.
+//! full-read adoption above, and a lock still busy after the read's short
+//! wait (10 ms, which outlasts a descriptor inherited by a forked child)
+//! answers from the adopted view instead of queueing behind a commit.
 //!
 //! Task 2 constructs this store in `main.rs`; Tasks 3–4 consume
 //! [`SessionNames::try_background_guard`] for the serial worker.
@@ -1711,7 +1713,7 @@ where
 }
 
 /// The transaction body, run while `_guard` holds the document lock (the
-/// reads' single-attempt adoption acquires its own guard,
+/// reads' short-wait adoption acquires its own guard,
 /// `session_name_store_view`).
 fn run_txn_locked<T, F>(core: &NamesCore, _guard: std::fs::File, f: F) -> Result<T, NameError>
 where
@@ -2144,6 +2146,10 @@ pub(crate) enum TestHook {
     /// periodic full-check interval for the data dir. Persists until
     /// cleared, like the clock offset.
     FullCheckIntervalMs(u64),
+    /// Name-reliability Task 11: lengthen (or shorten) how long a name read
+    /// waits for a busy document lock before answering from the adopted
+    /// view. Persists until cleared, like the clock offset.
+    ReadLockWaitMs(u64),
 }
 
 /// Readiness sentinel written by `HoldLock` hooks while the document lock is

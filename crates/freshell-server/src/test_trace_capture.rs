@@ -287,6 +287,17 @@ pub(crate) fn scoped_trace_capture(
 ) -> (tracing::subscriber::DefaultGuard, CapturedTraceEvents) {
     use tracing_subscriber::prelude::*;
 
+    // While exactly one dispatcher is registered, tracing-core decides a
+    // call site's interest from the CALLING thread's default dispatcher
+    // (its "just one" shortcut). So when this capture is the only
+    // dispatcher, a call site first reached on another test's thread (which
+    // has no subscriber) caches "never", and this capture silently misses
+    // that site's events for the rest of the run. A second dispatcher that
+    // is never dropped (and is interested in nothing) keeps tracing-core on
+    // the path that asks every live dispatcher.
+    static ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
     let events = CapturedTraceEvents::default();
     let subscriber = tracing_subscriber::registry().with(ScopedCaptureLayer {
         target_prefix,
