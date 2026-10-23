@@ -72,6 +72,23 @@ export function buildLiveTailTurn(
   return { id: LIVE_TURN_ID, turnId: LIVE_TURN_ID, role: 'assistant', source: 'live', summary: '', items }
 }
 
+/**
+ * Whether the tail renders anything: an unlanded block with visible content
+ * (a tool shows from its start; text and thinking once they have text) or a
+ * retry. A cheap store-selector predicate — it avoids building the layout.
+ */
+export function liveTailShowsContent(
+  tail: FreshAgentLiveSession | undefined,
+  landedTurnIds: ReadonlySet<string>,
+): boolean {
+  if (!tail) return false
+  if (tail.retry) return true
+  return tail.blocks.some((block) => (
+    (block.uuid === undefined || !landedTurnIds.has(block.uuid))
+    && (block.kind === 'tool_use' || block.text.trim().length > 0)
+  ))
+}
+
 /** A cheap fingerprint of what the tail shows: it changes whenever the tail grows. */
 function tailSignature(turn: FreshAgentTurn | null): string {
   if (!turn) return ''

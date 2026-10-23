@@ -121,6 +121,8 @@ import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
 import { FreshAgentOpenSessionContext } from './FreshAgentItemCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
+import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
+import { presentTranscriptLineIds, useTranscriptLandings } from './useTranscriptLandings'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
@@ -3942,6 +3944,34 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // The live tail (transcript-live plan §4.4): what the running turn shows
+  // before its transcript lines land. This view never subscribes to the
+  // tail's text — only to whether it shows anything, so the transcript's own
+  // live strip yields to it and one live reel shows.
+  const liveSessionKey = paneContent.sessionId
+    ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
+    : undefined
+  const landedTurnIds = useMemo<ReadonlySet<string>>(
+    () => new Set(snapshot ? presentTranscriptLineIds(snapshot) : []),
+    [snapshot],
+  )
+  const liveTailActive = useAppSelector((state) => (
+    liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTurnIds) : false
+  ))
+  const isLiveSessionBusyNow = useCallback(() => {
+    const status = liveSessionKey ? appStore.getState().freshAgent.sessions[liveSessionKey]?.status : undefined
+    return BUSY_STATES.has(status ?? paneContentRef.current.status)
+  }, [appStore, liveSessionKey])
+  const requestLandingRecheck = useCallback(() => {
+    if (!hiddenRef.current) requestSnapshotRefresh('event')
+  }, [requestSnapshotRefresh])
+  useTranscriptLandings({
+    sessionKey: liveSessionKey,
+    snapshot,
+    busy: isBusy,
+    isBusyNow: isLiveSessionBusyNow,
+    requestRefresh: requestLandingRecheck,
+  })
   // The durable conversation an ended session's Resume reopens (triggerRecovery
   // resolves the same id): codex threads, and claude/kilroy sessions whose
   // sidecar died (G05).
@@ -4735,7 +4765,16 @@ export function FreshAgentView({
                     expandTools={globalExpandTools}
                     showTimecodes={effectiveShowTimecodes}
                     showTranscriptMinimap={showTranscriptMinimap}
-                    isStreaming={isBusy}
+                    isStreaming={isBusy && !liveTailActive}
+                    tail={liveSessionKey ? (
+                      <FreshAgentLiveTail
+                        sessionKey={liveSessionKey}
+                        landedTurnIds={landedTurnIds}
+                        agentLabel={descriptor?.label}
+                        expandThinking={globalExpandThinking}
+                        expandTools={globalExpandTools}
+                      />
+                    ) : undefined}
                     onForkFromTurn={(turnId) => sendFork(turnId)}
                     getRewindAvailability={getRewindAvailability}
                     onRollbackToTurn={(turnId) => {
