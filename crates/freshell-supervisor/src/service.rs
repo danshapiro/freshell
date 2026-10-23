@@ -84,6 +84,9 @@ mod claude_source_observation;
 #[path = "native_auth_lookup_tests.rs"]
 mod native_auth_lookup_tests;
 #[cfg(test)]
+#[path = "provider_callback_budget_tests.rs"]
+mod provider_callback_budget_tests;
+#[cfg(test)]
 #[path = "provider_preparation_tests.rs"]
 mod provider_preparation_tests;
 impl Drop for AuthLookupScope {
@@ -117,6 +120,9 @@ pub struct Supervisor {
     pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
     provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
+    /// Reply budgets for supervisor→session-host commands, read once.
+    pub(crate) host_command_budgets: HostCommandBudgets,
+    pub(crate) provider_callback_budgets: ProviderCallbackBudgets,
 }
 
 impl Supervisor {
@@ -166,6 +172,8 @@ impl Supervisor {
             live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
+            host_command_budgets: HostCommandBudgets::from_env(),
+            provider_callback_budgets: ProviderCallbackBudgets::default(),
         })
     }
 
@@ -542,6 +550,15 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
             }
+            AdminCommand::FreshAgentConfigure(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_configure(envelope.request_id, request.soul_id, request.settings)
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
             AdminCommand::FreshAgentRollback(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -670,7 +687,14 @@ impl Supervisor {
         }
     }
 
-    fn auth_lookup_scope(&self, start: &crate::registry::RecoveryStart) -> AuthLookupScope {
+    /// Register a recovery scope for nested lookups made inside one
+    /// provider-preparation callback. It lives as long as the supervisor waits
+    /// for that callback (`lifetime`) and is removed when the callback ends.
+    fn auth_lookup_scope(
+        &self,
+        start: &crate::registry::RecoveryStart,
+        lifetime: Duration,
+    ) -> AuthLookupScope {
         let key = uuid::Uuid::new_v4().to_string();
         let mut authorities = self
             .auth_lookup_authorities
@@ -681,7 +705,7 @@ impl Supervisor {
             key.clone(),
             AuthLookupAuthority {
                 start: start.clone(),
-                expires: Instant::now() + Duration::from_secs(30),
+                expires: Instant::now() + lifetime,
             },
         );
         AuthLookupScope {
@@ -1713,6 +1737,62 @@ impl Supervisor {
         }
     }
 
+    /// Persists the settings as the soul's recovery profile, then asks the
+    /// owning host to persist and apply them live, so a recovered incarnation
+    /// launches with exactly the profile the host actor holds. The host is
+    /// authenticated first: a host that is already gone never saves the
+    /// configure, so the recovery profile must not save it either.
+    async fn fresh_agent_configure(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        settings: freshell_runtime_protocol::FreshAgentTurnSettings,
+    ) -> Result<CommandState, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if handle.fresh_agent().is_none() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        self.registry
+            .configure_fresh_agent_settings(
+                soul_id,
+                handle.incarnation_id().clone(),
+                settings.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
+                    settings,
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentCommand { state, .. } => Ok(state),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent configure reply",
+            )),
+        }
+    }
+
     async fn fresh_agent_rollback(
         &self,
         request_id: RequestId,
@@ -2447,10 +2527,13 @@ impl Supervisor {
             }
             _ => None,
         };
-        let scope = self.auth_lookup_scope(start);
-        let claude_recovery_source = if provider == "claude"
-            && matches!(start.context.provider.as_str(), "claude" | "kilroy")
-        {
+        let claude_recovery =
+            provider == "claude" && matches!(start.context.provider.as_str(), "claude" | "kilroy");
+        let scope = self.auth_lookup_scope(
+            start,
+            self.provider_callback_budgets.for_callback(claude_recovery),
+        );
+        let claude_recovery_source = if claude_recovery {
             Some(self.claude_recovery_source_binding(start, &scope.key, context)?)
         } else {
             None
@@ -2537,12 +2620,18 @@ impl Supervisor {
             }
             Ok::<_, std::io::Error>(response)
         };
-        let response = tokio::time::timeout(Duration::from_secs(35), exchange)
+        let budget = self
+            .provider_callback_budgets
+            .for_callback(request.claude_recovery_source.is_some());
+        let response = tokio::time::timeout(budget, exchange)
             .await
             .map_err(|_| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
-                    "capability_pending: server callback timed out",
+                    format!(
+                        "capability_pending: server callback timed out after {}ms",
+                        budget.as_millis()
+                    ),
                 )
             })?
             .map_err(|error| {
@@ -2730,7 +2819,7 @@ impl Supervisor {
         // yet. Once connected, the reply itself is bounded by the same budget
         // every other host command uses: a host that accepts and then goes
         // silent is HostUnreachable, never an unbounded wait.
-        let budget = host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref());
+        let budget = self.host_command_budgets.control;
         loop {
             match UnixStream::connect(&socket).await {
                 Ok(mut stream) => {
@@ -2819,6 +2908,7 @@ impl Supervisor {
             terminal: workload.terminal.clone().map(Box::new),
             fresh_agent: workload.fresh_agent.clone().map(Box::new),
             resume_spec: workload.resume_spec.clone().map(Box::new),
+            dispatch_budget_ms: None,
         };
         match self
             .send_authenticated_host_command(incarnation_id, handle.runtime_dir(), host, command)
@@ -2917,16 +3007,8 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, RuntimeError> {
-        let is_slow_fresh_agent_command = matches!(
-            &command,
-            HostCommand::FreshAgentSend { .. }
-                | HostCommand::FreshAgentCompact { .. }
-                | HostCommand::FreshAgentRollback { .. }
-                | HostCommand::GrantExecution {
-                    fresh_agent: Some(_),
-                    ..
-                }
-        );
+        let budget = self.host_command_budgets.for_command(&command);
+        let command = with_host_dispatch_budget(command, budget);
         let mut envelope = Envelope::new(RequestId::new(), ControlRole::Supervisor, command);
         envelope.auth = Some(host_proof(
             &host.secret,
@@ -2934,15 +3016,6 @@ impl Supervisor {
             &host.host_boot_id,
             &incarnation_id,
         ));
-        let budget = if is_slow_fresh_agent_command {
-            fresh_agent_command_budget(
-                std::env::var(FRESH_AGENT_COMMAND_TIMEOUT_ENV)
-                    .ok()
-                    .as_deref(),
-            )
-        } else {
-            host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref())
-        };
         let reply = request_host_reply(&runtime_dir.join("host.sock"), &envelope, budget).await?;
         reply.result
     }
@@ -3122,6 +3195,26 @@ pub(crate) const DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const FRESH_AGENT_COMMAND_TIMEOUT_ENV: &str =
     "FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS";
 
+/// Default wait for a terminal execution grant's reply.
+///
+/// A terminal grant is not a control round trip: it is the native dispatch
+/// boundary. Before the host can reply it projects the selected provider
+/// inputs and starts the provider, and some of those steps have long bounds of
+/// their own. One Codex app-server start may take up to 45 s
+/// (`freshell_codex::launch_lifecycle::SIDECAR_START_BUDGET`) and a terminal
+/// start retries it up to five times (about 251 s worst case); an exact
+/// resume first runs the provider-owned config refresh (25 s, plus up to 32 s
+/// of projection recovery). No fixed wait covers every such sum, so this is a
+/// policy bound on one dispatch, roughly ten times a healthy one (4-6 s
+/// measured with a 4,200-file selected plugin). The host is told its share of
+/// it with the grant ([`host_dispatch_budget`]) and stops there itself,
+/// refusing typed and naming the stage it was in, so the supervisor never
+/// abandons a dispatch the host is still working on; the recovery policy then
+/// decides whether a fresh incarnation tries again.
+pub(crate) const DEFAULT_TERMINAL_DISPATCH_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const TERMINAL_DISPATCH_TIMEOUT_ENV: &str =
+    "FRESHELL_RUNTIME_TERMINAL_DISPATCH_TIMEOUT_MS";
+
 /// Resolve the round-trip budget. Absent, unparseable, or zero configuration
 /// falls back to the default: the failure direction is always a bounded wait,
 /// never an unbounded one.
@@ -3141,6 +3234,133 @@ pub(crate) fn fresh_agent_command_budget(configured: Option<&str>) -> Duration {
         .unwrap_or(Duration::from_millis(
             DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS,
         ))
+}
+
+pub(crate) fn terminal_dispatch_budget(configured: Option<&str>) -> Duration {
+    configured
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(DEFAULT_TERMINAL_DISPATCH_TIMEOUT_MS))
+}
+
+/// The part of an execution grant's wait the supervisor reserves for the
+/// reply itself: the frame round trip, plus a synchronous host stage (the
+/// provider projection, the provider-owned refresh) that cannot be cut at the
+/// deadline and is only noticed when it returns.
+pub(crate) const GRANT_REPLY_ALLOWANCE: Duration = Duration::from_secs(5);
+
+/// How long the host may spend dispatching a grant the supervisor waits
+/// `wait` for: the wait less [`GRANT_REPLY_ALLOWANCE`], and never less than
+/// half of it, so a short configured wait still leaves the host time to work.
+pub(crate) fn host_dispatch_budget(wait: Duration) -> Duration {
+    wait.saturating_sub(GRANT_REPLY_ALLOWANCE).max(wait / 2)
+}
+
+/// Tell the host the dispatch budget of a grant from the wait that bounds its
+/// reply, so the host refuses typed before the supervisor gives up on it.
+fn with_host_dispatch_budget(mut command: HostCommand, wait: Duration) -> HostCommand {
+    if let HostCommand::GrantExecution {
+        dispatch_budget_ms, ..
+    } = &mut command
+    {
+        *dispatch_budget_ms =
+            Some(u64::try_from(host_dispatch_budget(wait).as_millis()).unwrap_or(u64::MAX));
+    }
+    command
+}
+
+/// How long the supervisor waits for a session host's reply, by what
+/// answering the command makes the host do. Resolved once from the
+/// environment when the supervisor starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostCommandBudgets {
+    /// One control round trip: hello, status, stop, terminal I/O, probes.
+    pub(crate) control: Duration,
+    /// A terminal execution grant: provider preparation plus native dispatch.
+    pub(crate) terminal_dispatch: Duration,
+    /// A fresh-agent execution grant or turn operation.
+    pub(crate) fresh_agent: Duration,
+}
+
+impl HostCommandBudgets {
+    pub(crate) fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub(crate) fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            control: host_command_budget(lookup(HOST_COMMAND_TIMEOUT_ENV).as_deref()),
+            terminal_dispatch: terminal_dispatch_budget(
+                lookup(TERMINAL_DISPATCH_TIMEOUT_ENV).as_deref(),
+            ),
+            fresh_agent: fresh_agent_command_budget(
+                lookup(FRESH_AGENT_COMMAND_TIMEOUT_ENV).as_deref(),
+            ),
+        }
+    }
+
+    pub(crate) fn for_command(&self, command: &HostCommand) -> Duration {
+        if uses_fresh_agent_command_budget(command) {
+            self.fresh_agent
+        } else if matches!(
+            command,
+            HostCommand::GrantExecution {
+                terminal: Some(_),
+                ..
+            }
+        ) {
+            self.terminal_dispatch
+        } else {
+            self.control
+        }
+    }
+}
+
+/// Bound on one Claude source observation: the fixed reader's 25-second
+/// operation and 5-second owned cleanup, with slack for the reply.
+pub(crate) const CLAUDE_SOURCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(35);
+
+/// Wait for one provider-preparation callback to the web server, covering the
+/// web server's own work for it (selecting and copying the provider's inputs).
+pub(crate) const PROVIDER_CALLBACK_BUDGET: Duration = Duration::from_secs(35);
+
+/// Wait for a Claude recovery's `issue` callback. Before it answers, the web
+/// server observes the current Claude sources and then the candidate
+/// projection, back to back, each through this supervisor and each bounded by
+/// [`CLAUDE_SOURCE_OBSERVATION_BUDGET`]. The callback's wait covers its own
+/// work plus both observations, so an observation that finishes inside its
+/// own bound is never cut off by the callback around it.
+pub(crate) const CLAUDE_RECOVERY_CALLBACK_BUDGET: Duration = Duration::from_secs(
+    PROVIDER_CALLBACK_BUDGET.as_secs() + 2 * CLAUDE_SOURCE_OBSERVATION_BUDGET.as_secs(),
+);
+
+/// How long the supervisor waits for a provider-preparation callback. The
+/// recovery scope a callback carries lives exactly as long, so a nested
+/// lookup made inside the callback's wait never finds its scope expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderCallbackBudgets {
+    pub(crate) ordinary: Duration,
+    pub(crate) claude_recovery: Duration,
+}
+
+impl Default for ProviderCallbackBudgets {
+    fn default() -> Self {
+        Self {
+            ordinary: PROVIDER_CALLBACK_BUDGET,
+            claude_recovery: CLAUDE_RECOVERY_CALLBACK_BUDGET,
+        }
+    }
+}
+
+impl ProviderCallbackBudgets {
+    pub(crate) fn for_callback(&self, claude_recovery: bool) -> Duration {
+        if claude_recovery {
+            self.claude_recovery
+        } else {
+            self.ordinary
+        }
+    }
 }
 
 /// One bounded framed request/reply against a session host's control socket.
@@ -3277,6 +3497,27 @@ fn release_qualified_workload(
         || (has_terminal && freshell_agent_runtime::managed_provider_enabled(provider))
 }
 
+/// Host commands that wait on a provider (a turn, a compaction, a settings
+/// apply, a rollback, a launch) get the long fresh-agent budget instead of
+/// the control budget.
+pub(crate) fn uses_fresh_agent_command_budget(command: &HostCommand) -> bool {
+    matches!(
+        command,
+        HostCommand::FreshAgentSend { .. }
+            | HostCommand::FreshAgentCompact { .. }
+            | HostCommand::FreshAgentConfigure { .. }
+            | HostCommand::FreshAgentRollback { .. }
+            | HostCommand::GrantExecution {
+                fresh_agent: Some(_),
+                ..
+            }
+    )
+}
+
+#[cfg(test)]
+#[path = "fresh_agent_configure_tests.rs"]
+mod fresh_agent_configure_tests;
+
 #[cfg(test)]
 mod host_actor_storage_tests {
     use super::ensure_host_actor_state_dir;
@@ -3337,7 +3578,8 @@ mod host_actor_storage_tests {
 mod host_ipc_timeout_tests {
     use super::{
         fresh_agent_command_budget, host_command_budget, request_host_reply,
-        DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS, DEFAULT_HOST_COMMAND_TIMEOUT_MS,
+        terminal_dispatch_budget, DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS,
+        DEFAULT_HOST_COMMAND_TIMEOUT_MS, DEFAULT_TERMINAL_DISPATCH_TIMEOUT_MS,
     };
     use freshell_runtime_protocol::{
         ControlRole, Envelope, HostCommand, IncarnationId, RequestId, RuntimeErrorCode,
@@ -3460,6 +3702,354 @@ mod host_ipc_timeout_tests {
         assert_eq!(
             fresh_agent_command_budget(Some("750")),
             Duration::from_millis(750)
+        );
+        assert_eq!(
+            terminal_dispatch_budget(None),
+            Duration::from_millis(DEFAULT_TERMINAL_DISPATCH_TIMEOUT_MS)
+        );
+        assert_eq!(
+            terminal_dispatch_budget(Some("0")),
+            Duration::from_millis(DEFAULT_TERMINAL_DISPATCH_TIMEOUT_MS)
+        );
+        assert_eq!(
+            terminal_dispatch_budget(Some("900")),
+            Duration::from_millis(900)
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_command_budget_tests {
+    use super::{
+        default_backend, host_dispatch_budget, AuthenticatedHost, HostCommandBudgets, Supervisor,
+        SupervisorConfig, FRESH_AGENT_COMMAND_TIMEOUT_ENV, HOST_COMMAND_TIMEOUT_ENV,
+        TERMINAL_DISPATCH_TIMEOUT_ENV,
+    };
+    use crate::registry::Registry;
+    use freshell_runtime_protocol::{
+        read_frame, write_frame, Envelope, GrantId, HostBootId, HostCommand, HostReply, HostResult,
+        IncarnationId, RequestId, RuntimeErrorCode, RuntimeLimits, SoulId, TerminalLaunchSpec,
+    };
+    use std::path::Path;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::{Duration, Instant};
+    use tokio::net::UnixListener;
+
+    fn limits() -> RuntimeLimits {
+        RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        }
+    }
+
+    /// Distinct budgets per command class, so a test can tell which one a
+    /// command was held to.
+    fn budgets(
+        control_ms: &'static str,
+        terminal_ms: &'static str,
+        fresh_ms: &'static str,
+    ) -> HostCommandBudgets {
+        HostCommandBudgets::from_lookup(move |name| {
+            match name {
+                HOST_COMMAND_TIMEOUT_ENV => Some(control_ms),
+                TERMINAL_DISPATCH_TIMEOUT_ENV => Some(terminal_ms),
+                FRESH_AGENT_COMMAND_TIMEOUT_ENV => Some(fresh_ms),
+                _ => None,
+            }
+            .map(str::to_string)
+        })
+    }
+
+    fn supervisor(root: &Path, budgets: HostCommandBudgets) -> Supervisor {
+        let registry = Registry::open(root.join("registry"), None).unwrap();
+        let host_binary_path = root.join("synthetic-host");
+        std::fs::write(&host_binary_path, "synthetic-host-artifact").unwrap();
+        let mut supervisor = Supervisor::new(
+            registry,
+            default_backend(root.join("absent-docker.sock")),
+            SupervisorConfig {
+                runtime_root: root.join("runtime"),
+                control_socket_path: root.join("control.sock"),
+                host_binary_path,
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "host-command-budgets".into(),
+                control_secret: "synthetic-control-secret".into(),
+                lifecycle_log: root.join("lifecycle.jsonl"),
+                admission: crate::admission::AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        supervisor.host_command_budgets = budgets;
+        supervisor
+    }
+
+    fn terminal_grant(incarnation_id: &IncarnationId, root: &Path) -> HostCommand {
+        let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal-dispatch-budget","streamId":"stream-dispatch-budget",
+            "mode":"codex","program":"codex","args":[],"env":{"HOME":"/home/freshell/provider"},
+            "cwd":root,"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,
+            "projectKey":"project-dispatch-budget","workspacePath":root,
+        }))
+        .unwrap();
+        HostCommand::GrantExecution {
+            incarnation_id: incarnation_id.clone(),
+            soul_id: SoulId::new(),
+            host_boot_id: HostBootId::new(),
+            control_epoch: 1,
+            execution_generation: 1,
+            grant_id: GrantId::new(),
+            fixture: None,
+            provider_path_inputs: Default::default(),
+            terminal: Some(Box::new(terminal)),
+            fresh_agent: None,
+            resume_spec: None,
+            dispatch_budget_ms: None,
+        }
+    }
+
+    type Received = Arc<StdMutex<Vec<HostCommand>>>;
+
+    /// A synthetic host that answers every command after `delay` (or never),
+    /// recording each command it received.
+    fn slow_host(
+        runtime_dir: &Path,
+        delay: Option<Duration>,
+    ) -> (tokio::task::JoinHandle<()>, Received) {
+        let listener = UnixListener::bind(runtime_dir.join("host.sock")).unwrap();
+        let received = Received::default();
+        let record = received.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let envelope: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+                    record.lock().unwrap().push(envelope.body.clone());
+                    let Some(delay) = delay else {
+                        tokio::time::sleep(Duration::from_secs(3_600)).await;
+                        return;
+                    };
+                    tokio::time::sleep(delay).await;
+                    let result = match envelope.body {
+                        HostCommand::GrantExecution { host_boot_id, .. } => {
+                            HostResult::GrantAccepted {
+                                host_boot_id,
+                                worker_pid: 4321,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                native_session_id: None,
+                            }
+                        }
+                        _ => HostResult::Stopped,
+                    };
+                    let _ = write_frame(
+                        &mut stream,
+                        &HostReply {
+                            request_id: envelope.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await;
+                });
+            }
+        });
+        (task, received)
+    }
+
+    fn authenticated() -> AuthenticatedHost {
+        AuthenticatedHost {
+            host_boot_id: HostBootId::new(),
+            secret: b"synthetic-host-secret".to_vec(),
+            effective_limits: limits(),
+        }
+    }
+
+    /// A terminal grant is the native dispatch boundary: the host prepares
+    /// provider inputs and starts the provider (Codex's app-server alone may
+    /// take up to its 45-second start budget) before it can reply. The
+    /// supervisor must not abandon that dispatch at the short control
+    /// round-trip bound, while ordinary control commands keep that bound.
+    #[tokio::test]
+    async fn terminal_grant_waits_for_dispatch_while_control_commands_stay_short() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("incarnation");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let supervisor = supervisor(root.path(), budgets("200", "5000", "9000"));
+        let (host, _) = slow_host(&runtime_dir, Some(Duration::from_millis(700)));
+        let incarnation_id = IncarnationId::new();
+
+        let granted = supervisor
+            .send_authenticated_host_command(
+                incarnation_id.clone(),
+                &runtime_dir,
+                &authenticated(),
+                terminal_grant(&incarnation_id, root.path()),
+            )
+            .await;
+        assert!(
+            matches!(granted, Ok(HostResult::GrantAccepted { .. })),
+            "a terminal dispatch slower than one control round trip must be accepted: {granted:?}"
+        );
+
+        let status = supervisor
+            .send_authenticated_host_command(
+                incarnation_id.clone(),
+                &runtime_dir,
+                &authenticated(),
+                HostCommand::Status {
+                    incarnation_id: incarnation_id.clone(),
+                },
+            )
+            .await
+            .expect_err("a control round trip keeps its short bound");
+        assert_eq!(status.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            status.message.contains("timed out after 200ms"),
+            "{}",
+            status.message
+        );
+        host.abort();
+    }
+
+    /// The longer dispatch bound is still a bound: a host that accepts a
+    /// terminal grant and goes silent cannot hold the activation open.
+    #[tokio::test]
+    async fn silent_host_cannot_hold_a_terminal_grant_past_its_dispatch_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("incarnation");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let supervisor = supervisor(root.path(), budgets("100", "400", "9000"));
+        let (host, _) = slow_host(&runtime_dir, None);
+        let incarnation_id = IncarnationId::new();
+        let started = Instant::now();
+        let error = supervisor
+            .send_authenticated_host_command(
+                incarnation_id.clone(),
+                &runtime_dir,
+                &authenticated(),
+                terminal_grant(&incarnation_id, root.path()),
+            )
+            .await
+            .expect_err("a silent host must not hold a terminal grant forever");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error.message.contains("timed out after 400ms"),
+            "{}",
+            error.message
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        host.abort();
+    }
+
+    /// Terminal grants, fresh-agent operations, and control round trips are
+    /// each held to their own configured budget: none borrows another's.
+    #[tokio::test]
+    async fn each_command_class_is_held_to_its_own_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("incarnation");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let supervisor = supervisor(root.path(), budgets("100", "300", "700"));
+        let (host, _) = slow_host(&runtime_dir, None);
+        let incarnation_id = IncarnationId::new();
+        let host_auth = authenticated();
+        let send = |command| {
+            supervisor.send_authenticated_host_command(
+                incarnation_id.clone(),
+                &runtime_dir,
+                &host_auth,
+                command,
+            )
+        };
+
+        let terminal = send(terminal_grant(&incarnation_id, root.path()))
+            .await
+            .expect_err("a silent host times out");
+        let fresh_agent = send(HostCommand::FreshAgentSend {
+            incarnation_id: incarnation_id.clone(),
+            request_id: RequestId::new(),
+            text: "synthetic turn".into(),
+            settings: None,
+            checkpoint_logical_attempt_id: None,
+        })
+        .await
+        .expect_err("a silent host times out");
+        let control = send(HostCommand::Status {
+            incarnation_id: incarnation_id.clone(),
+        })
+        .await
+        .expect_err("a silent host times out");
+
+        for (error, budget) in [(&terminal, 300), (&fresh_agent, 700), (&control, 100)] {
+            assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+            assert!(
+                error
+                    .message
+                    .contains(&format!("timed out after {budget}ms")),
+                "{}",
+                error.message
+            );
+        }
+        host.abort();
+    }
+
+    /// A grant tells the host how long it has to dispatch, derived from the
+    /// wait that bounds its reply, so the host refuses before the supervisor
+    /// gives up on it.
+    #[tokio::test]
+    async fn terminal_grant_tells_the_host_its_dispatch_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("incarnation");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let supervisor = supervisor(root.path(), budgets("100", "300", "700"));
+        let (host, received) = slow_host(&runtime_dir, Some(Duration::from_millis(10)));
+        let incarnation_id = IncarnationId::new();
+
+        supervisor
+            .send_authenticated_host_command(
+                incarnation_id.clone(),
+                &runtime_dir,
+                &authenticated(),
+                terminal_grant(&incarnation_id, root.path()),
+            )
+            .await
+            .expect("the grant is accepted");
+
+        let granted_budget = received
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|command| match command {
+                HostCommand::GrantExecution {
+                    dispatch_budget_ms, ..
+                } => Some(*dispatch_budget_ms),
+                _ => None,
+            })
+            .expect("the host received the grant");
+        assert_eq!(
+            granted_budget,
+            Some(150),
+            "the host is told the terminal wait less its reply allowance"
+        );
+        host.abort();
+    }
+
+    /// The host's dispatch budget leaves the supervisor a reply allowance of
+    /// five seconds, never more than half of the wait.
+    #[test]
+    fn host_dispatch_budget_leaves_a_reply_allowance() {
+        assert_eq!(
+            host_dispatch_budget(Duration::from_secs(60)),
+            Duration::from_secs(55)
+        );
+        assert_eq!(
+            host_dispatch_budget(Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            host_dispatch_budget(Duration::from_millis(400)),
+            Duration::from_millis(200)
         );
     }
 }

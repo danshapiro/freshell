@@ -1,6 +1,7 @@
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { FreshAgentModelSelection } from '@shared/fresh-agent-model-capabilities'
 import type { FreshAgentSessionType } from '@shared/fresh-agent'
+import type { FreshAgentModelEffortLevels } from '@shared/settings'
 
 export type FreshAgentProviderName = Extract<FreshAgentSessionType, 'freshclaude' | 'kilroy'>
 
@@ -8,6 +9,7 @@ export type FreshAgentProviderSettings = {
   modelSelection?: FreshAgentModelSelection
   defaultPermissionMode?: string
   effort?: string
+  modelEffortLevels?: FreshAgentModelEffortLevels
 }
 
 export interface FreshAgentProviderConfig {

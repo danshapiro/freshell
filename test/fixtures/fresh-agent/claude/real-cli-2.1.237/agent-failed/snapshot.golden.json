@@ -1,0 +1,114 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "e1cb710e-e306-4032-b99b-6e044ef84ad6",
+  "sessionId": "e1cb710e-e306-4032-b99b-6e044ef84ad6",
+  "revision": 1792656000000,
+  "latestTurnId": "c16b1f43-3669-4b78-aa35-589bc319451a",
+  "status": "idle",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "diffs": false,
+    "undo": true,
+    "redo": true,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 100,
+    "outputTokens": 20,
+    "cachedTokens": 10,
+    "totalTokens": 130,
+    "contextTokens": 130,
+    "compactPercent": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "be51718f-67cd-4368-a2b5-3179a370824b",
+      "turnId": "be51718f-67cd-4368-a2b5-3179a370824b",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:35.529Z",
+      "summary": "delegate to a missing agent",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "be51718f-67cd-4368-a2b5-3179a370824b-i0",
+          "kind": "text",
+          "text": "delegate to a missing agent"
+        }
+      ]
+    },
+    {
+      "id": "5d7e1c53-7ccf-4857-b685-f6089df17742",
+      "turnId": "5d7e1c53-7ccf-4857-b685-f6089df17742",
+      "messageId": "msg_fixture0001",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:35.584Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "No-such-agent-type Task — unknown helper",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "5d7e1c53-7ccf-4857-b685-f6089df17742-i0",
+          "kind": "task_delegation",
+          "status": "failed",
+          "title": "No-such-agent-type Task — unknown helper",
+          "description": "unknown helper",
+          "subagent": "no-such-agent-type",
+          "background": false,
+          "result": "Agent type 'no-such-agent-type' not found. Available agents: claude, Explore, general-purpose, Plan, statusline-setup"
+        }
+      ]
+    },
+    {
+      "id": "c16b1f43-3669-4b78-aa35-589bc319451a",
+      "turnId": "c16b1f43-3669-4b78-aa35-589bc319451a",
+      "messageId": "msg_fixture0002",
+      "ordinal": 2,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:35.613Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "The delegation failed.",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "c16b1f43-3669-4b78-aa35-589bc319451a-i0",
+          "kind": "text",
+          "text": "The delegation failed."
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "transcriptLineUuids": [
+        "be51718f-67cd-4368-a2b5-3179a370824b",
+        "ac23f4c4-1180-4d75-88a5-92f7be46a2f5",
+        "186d9d3a-0332-4f2b-b43e-b05f1f9e18c6",
+        "3cd839b3-85e6-4cf2-b8fc-f5da8f27ffb5",
+        "5d7e1c53-7ccf-4857-b685-f6089df17742",
+        "93375453-8f2d-48dc-9db0-253458c123d3",
+        "e01c82c3-d945-405e-8eee-3998c4505b56",
+        "c16b1f43-3669-4b78-aa35-589bc319451a"
+      ]
+    }
+  }
+}

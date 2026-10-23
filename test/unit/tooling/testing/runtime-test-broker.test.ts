@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 
 import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
-import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
+import { authorizeFreshAgentParityRequest, authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../helpers/provider-parity-broker.js'
 import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../helpers/provider-parity-environment.js'
 
 it('executes file and package TUI entrypoints while observing the selected project settings', async () => {
@@ -1120,7 +1120,7 @@ function publisherBody(input:PreparedInputAuthorization):any {
 
 async function publishControllerPreparation(directory: string, input: Pick<PreparedInputAuthorization,
   'soulId' | 'generationId' | 'stageRoot' | 'configurationBinds' | 'resourceMounts' | 'indexedFiles'>,
-  reservationId: string, provider: 'claude' | 'codex') {
+  reservationId: string | null, provider: 'claude' | 'codex') {
   const metadata = path.join(input.stageRoot, '.freshell')
   await fs.mkdir(metadata, { recursive: true })
   const manifest = Buffer.from(JSON.stringify({ version: 1, sources: [], aliases: [], recipes: [] }))
@@ -1324,6 +1324,77 @@ describe('fixed indexed publisher broker',()=>{
       expect(forwarded.every(operation => operation.method === 'GET')).toBe(true)
     }, undefined, true)
   })
+  it('probes candidate absence for a recovery publication only against its frozen retained generation', async () => {
+    await withHttpBroker(async ({ directory, request, forwarded, broker: instance }) => {
+      const prior = candidateAuthorization()
+      const binary = Buffer.from('recovery candidate host artifact')
+      prior.hostBinaryPath = path.join(directory, 'freshell-session-host')
+      await fs.writeFile(prior.hostBinaryPath, binary)
+      prior.binarySha256 = createHash('sha256').update(binary).digest('hex')
+      prior.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', prior.generationId)
+      instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: prior.hostBinaryPath, binarySha256: prior.binarySha256 })
+      await publishControllerPreparation(directory, prior, prior.reservationId, 'claude')
+      const capabilities = path.join(directory, 'scenarios/scenario/control/mcp-capabilities')
+      await fs.writeFile(path.join(capabilities, `${prior.generationId}.json`), JSON.stringify({
+        endpoint: 'http://127.0.0.1:1/api/managed-mcp', scope: 'synthetic-controller-scope', soulId: prior.soulId,
+        incarnationId: 'incarnation-initial', expiresAt: Date.now() + 60_000, preparation: { phase: 'committed', priorGrantIds: [] },
+      }))
+      const attemptId = 'recovery-77777777-7777-4777-8777-777777777777'
+      const candidate: ClaudeCandidateAuthorization = { ...prior,
+        generationId: 'grant-55555555-5555-4555-8555-555555555555',
+        requestId: '66666666-6666-4666-8666-666666666666',
+        retained: { attemptId, generationId: prior.generationId, stageRoot: prior.stageRoot,
+          configurationBinds: prior.configurationBinds, resourceMounts: prior.resourceMounts } }
+      candidate.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', candidate.generationId)
+      const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, candidate, null, 'claude')
+      const pending = { endpoint: 'http://127.0.0.1:1/api/managed-mcp', scope: 'synthetic-controller-scope', soulId: candidate.soulId,
+        incarnationId: null, expiresAt: Date.now() + 60_000, preparation: { phase: 'pending', priorGrantIds: [prior.generationId] } }
+      const capability = path.join(capabilities, `${candidate.generationId}.json`)
+      await fs.writeFile(capability, JSON.stringify(pending))
+      const binding = { version: 1, provider: 'claude', soulId: candidate.soulId, generationId: candidate.generationId,
+        initialReservationId: null, intentRevision: 1, registryAttemptId: attemptId, priorGenerationId: prior.generationId,
+        authoritySha256: 'b'.repeat(64), workspacePath: candidate.workspacePath, cwd: candidate.cwd, gitCommonDir: null,
+        manifestSha256: context.preparedInputs.manifest.sha256,
+        preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
+        preparedResultSha256: createHash('sha256').update(resultBytes).digest('hex') }
+      const publication = path.join(metadata, 'claude-candidate-binding.json')
+      const url = `/v1.47/volumes/freshell-claude-candidate-${candidate.requestId}`
+      const refused = async (mutated: Record<string, unknown>, phase: string) => {
+        await fs.writeFile(publication, JSON.stringify(mutated))
+        expect((await request('GET', url)).status).toBe(403)
+        expect(instance.eventsSnapshot().at(-1)).toMatchObject({
+          reason: `candidate absence qualification unavailable at ${phase}`,
+        })
+      }
+      await refused({ ...binding, registryAttemptId: 'recovery-not-a-uuid' }, 'owner_capability')
+      await refused({ ...binding, priorGenerationId: candidate.generationId }, 'owner_capability')
+      await refused({ ...binding, initialReservationId: prior.reservationId }, 'owner_capability')
+      await fs.writeFile(capability, JSON.stringify({ ...pending, preparation: { phase: 'pending', priorGrantIds: [] } }))
+      await refused(binding, 'owner_capability')
+      await fs.writeFile(capability, JSON.stringify({ ...pending, incarnationId: 'incarnation-replacement' }))
+      await refused(binding, 'owner_capability')
+      await fs.writeFile(capability, JSON.stringify(pending))
+      await refused({ ...binding, preparedResultSha256: 'f'.repeat(64) }, 'prepared_metadata')
+      await refused({ ...binding, authoritySha256: 'not-a-digest' }, 'authority_binding')
+      const priorContext = path.join(prior.stageRoot, '.freshell/prepared-context.json')
+      const priorBytes = await fs.readFile(priorContext)
+      const unrecorded = JSON.parse(priorBytes.toString())
+      unrecorded.preparedInputs.initialAuthReservation = null
+      await fs.writeFile(priorContext, JSON.stringify(unrecorded))
+      await refused(binding, 'retained_generation')
+      await fs.writeFile(priorContext, priorBytes)
+      expect(forwarded).toHaveLength(0)
+
+      await fs.writeFile(publication, JSON.stringify(binding))
+      expect((await request('GET', url)).status).toBe(404)
+      const create = { Name: `freshell-claude-candidate-${candidate.requestId}`, Driver: 'local', DriverOpts: {},
+        Labels: candidateLabels(candidate) }
+      expect((await request('POST', '/v1.47/volumes/create', create)).status).toBe(201)
+      expect(forwarded.map(operation => `${operation.method} ${operation.url}`)).toEqual([
+        `GET ${url}`, 'POST /v1.47/volumes/create',
+      ])
+    }, undefined, true)
+  })
   it('cleans the exact registered failed-launch volume and retains changed or attached ownership', async () => {
     await withHttpBroker(async ({ directory }) => {
       const binary = Buffer.from('registered failed-launch artifact')
@@ -1379,7 +1450,8 @@ describe('fixed indexed publisher broker',()=>{
       const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
       await fs.writeFile(path.join(metadata, 'claude-candidate-binding.json'), JSON.stringify({
         version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
-        initialReservationId: input.reservationId, intentRevision: 1,
+        initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
+        authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'),
         workspacePath: input.workspacePath, cwd: input.cwd, gitCommonDir: null,
         manifestSha256: context.preparedInputs.manifest.sha256,
         preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
@@ -1551,6 +1623,21 @@ describe('fixed indexed publisher broker',()=>{
       expect(() => instance.authorizeInitialProviderVolume({ ...owner, soulId: 'foreign' })).toThrow()
       expect(() => instance.authorizeInitialProviderVolume({ ...owner, daemonId: 'foreign' })).toThrow()
       expect(() => instance.authorizeInitialProviderVolume({ ...owner, binarySha256: 'b'.repeat(64) })).toThrow()
+    })
+  })
+  it('registers a fresh-agent parity request under its fresh soul, distinct from a terminal soul for the same request', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const { soulId: _soulId, providerVolumeName: _volume, ...source } = sourceAuthorization()
+      const requestId = 'fresh-parity-claude-exact-request'
+      const fresh = authorizeFreshAgentParityRequest(instance, source, 'claude', requestId)
+      const terminal = authorizeProviderParityRequest(instance, source, requestId)
+      expect(fresh.soulId).toMatch(/^soul-fresh-claude-[a-f0-9]{32}$/)
+      expect(fresh.soulId.slice(-32)).toBe(terminal.soulId.slice(-32))
+      expect(fresh.providerVolumeName).not.toBe(terminal.providerVolumeName)
+      expect(instance.receipts()).toEqual([])
+      expect((await request('GET', `/v1.47/volumes/${fresh.providerVolumeName}`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/volumes/${terminal.providerVolumeName}`)).status).toBe(200)
+      expect(forwarded).toHaveLength(2)
     })
   })
   it('observes and creates only the explicitly reserved initial soul volume before any workload receipt',async()=>{

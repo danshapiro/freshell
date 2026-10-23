@@ -1,0 +1,200 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "627a49f0-d2b4-460c-9fa6-a89494d516a2",
+  "sessionId": "627a49f0-d2b4-460c-9fa6-a89494d516a2",
+  "revision": 1792656000000,
+  "latestTurnId": "add7fabf-5bd7-4261-b278-af20e29e9814",
+  "status": "idle",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "diffs": false,
+    "undo": true,
+    "redo": true,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 5000,
+    "outputTokens": 30,
+    "cachedTokens": 10,
+    "totalTokens": 5040,
+    "contextTokens": 5040,
+    "compactPercent": 3
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "b27f1fdd-9061-4d19-b6f5-73088d4ae787",
+      "turnId": "b27f1fdd-9061-4d19-b6f5-73088d4ae787",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:40.329Z",
+      "summary": "hi there",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "b27f1fdd-9061-4d19-b6f5-73088d4ae787-i0",
+          "kind": "text",
+          "text": "hi there"
+        }
+      ]
+    },
+    {
+      "id": "5b0e1ff3-4577-4141-9852-d5000867da98",
+      "turnId": "5b0e1ff3-4577-4141-9852-d5000867da98",
+      "messageId": "msg_fixture0001",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:40.385Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "reply 1",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "5b0e1ff3-4577-4141-9852-d5000867da98-i0",
+          "kind": "text",
+          "text": "reply 1"
+        }
+      ]
+    },
+    {
+      "id": "46b8d80f-6f30-42bd-b07d-bad94018fed5",
+      "turnId": "46b8d80f-6f30-42bd-b07d-bad94018fed5",
+      "ordinal": 2,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:40.401Z",
+      "summary": "second msg",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "46b8d80f-6f30-42bd-b07d-bad94018fed5-i0",
+          "kind": "text",
+          "text": "second msg"
+        }
+      ]
+    },
+    {
+      "id": "d3ddfc19-4dd5-48fe-8bf8-8e5ebc4bad56",
+      "turnId": "d3ddfc19-4dd5-48fe-8bf8-8e5ebc4bad56",
+      "messageId": "msg_fixture0002",
+      "ordinal": 3,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:40.415Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "reply 2",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "d3ddfc19-4dd5-48fe-8bf8-8e5ebc4bad56-i0",
+          "kind": "text",
+          "text": "reply 2"
+        }
+      ]
+    },
+    {
+      "id": "82f56edb-c0d0-4654-8a0b-ac7ec17b29f9",
+      "turnId": "82f56edb-c0d0-4654-8a0b-ac7ec17b29f9",
+      "ordinal": 4,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:40.421Z",
+      "summary": "third msg",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "82f56edb-c0d0-4654-8a0b-ac7ec17b29f9-i0",
+          "kind": "text",
+          "text": "third msg"
+        }
+      ]
+    },
+    {
+      "id": "eb04f0d0-2ebe-43af-8af5-85e2338df7a7",
+      "turnId": "eb04f0d0-2ebe-43af-8af5-85e2338df7a7",
+      "messageId": "msg_fixture0003",
+      "ordinal": 5,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:40.433Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "reply 3",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "eb04f0d0-2ebe-43af-8af5-85e2338df7a7-i0",
+          "kind": "text",
+          "text": "reply 3"
+        }
+      ]
+    },
+    {
+      "id": "132250dc-c56f-44ac-9a28-bb69126ea6c4",
+      "turnId": "132250dc-c56f-44ac-9a28-bb69126ea6c4",
+      "ordinal": 6,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:40.439Z",
+      "summary": "/compact",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "132250dc-c56f-44ac-9a28-bb69126ea6c4-i0",
+          "kind": "text",
+          "text": "/compact"
+        }
+      ]
+    },
+    {
+      "id": "add7fabf-5bd7-4261-b278-af20e29e9814",
+      "turnId": "add7fabf-5bd7-4261-b278-af20e29e9814",
+      "ordinal": 7,
+      "source": "durable",
+      "role": "system",
+      "timestamp": "2026-10-22T09:09:40.472Z",
+      "error": {
+        "name": "CommandError",
+        "message": "Error during compaction: API Error: 400 compaction refused by fake"
+      },
+      "summary": "",
+      "summaryKind": "echo",
+      "items": []
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "transcriptLineUuids": [
+        "b27f1fdd-9061-4d19-b6f5-73088d4ae787",
+        "423fb8ec-288a-46d9-b360-77d2afc0c2e7",
+        "c6574df5-122c-4de4-b013-6092a8e79975",
+        "bab4ac8e-7aa7-4c77-a036-16053b3cb983",
+        "5b0e1ff3-4577-4141-9852-d5000867da98",
+        "46b8d80f-6f30-42bd-b07d-bad94018fed5",
+        "b8e6cb5d-1e0c-49f3-afa9-3378d3ca6a13",
+        "d3ddfc19-4dd5-48fe-8bf8-8e5ebc4bad56",
+        "82f56edb-c0d0-4654-8a0b-ac7ec17b29f9",
+        "0c39ba39-02dc-49fe-a4be-56df26efaa55",
+        "eb04f0d0-2ebe-43af-8af5-85e2338df7a7",
+        "403e1fdb-0a88-4360-8f88-0a28f6e5cf58",
+        "132250dc-c56f-44ac-9a28-bb69126ea6c4",
+        "add7fabf-5bd7-4261-b278-af20e29e9814"
+      ]
+    }
+  }
+}

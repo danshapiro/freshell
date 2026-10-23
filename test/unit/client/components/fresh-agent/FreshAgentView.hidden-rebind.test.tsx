@@ -398,6 +398,130 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     expect(screen.getByText('caught up transcript')).toBeInTheDocument()
     expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
   })
+
+  describe('hidden approvals and questions owe a non-blocking surface refresh (G26)', () => {
+    const SESS_SURFACE = '550e8400-e29b-41d4-a716-446655440105'
+    const bashApproval = {
+      requestId: 'perm-1',
+      toolName: 'Bash',
+      input: { command: 'npm test' },
+    }
+    const question = {
+      requestId: 'question-1',
+      questions: [{
+        question: 'Which branch should I use?',
+        header: 'Branch',
+        options: [{ label: 'main', description: 'The default branch' }],
+      }],
+    }
+
+    function surfaceSnapshot(extra: Record<string, unknown> = {}) {
+      return { ...snapshotWithText('current transcript', 5), ...extra }
+    }
+
+    function emitSurfaceEvent(type: string, extra: Record<string, unknown> = {}) {
+      emitWsMessage({
+        type: 'freshAgent.event',
+        sessionId: SESS_SURFACE,
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        event: { type, sessionId: SESS_SURFACE, ...extra },
+      })
+    }
+
+    async function mountHiddenSurfacePane(initialSnapshot: Record<string, unknown>) {
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(initialSnapshot)
+      const paneContent = { ...basePaneContent, sessionId: SESS_SURFACE, status: 'idle' as const }
+      const view = renderView({ paneContent, hidden: true })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      return { ...view, paneContent }
+    }
+
+    it('reveals a permission request raised while hidden with one fetch and no blocking overlay', async () => {
+      const { rerender, paneContent } = await mountHiddenSurfacePane(surfaceSnapshot())
+      const callsBeforeRequest = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      expect(screen.queryByRole('alert', { name: 'Permission request for Bash' })).not.toBeInTheDocument()
+
+      emitSurfaceEvent('freshAgent.permission.request', { requestId: 'perm-1', toolName: 'Bash' })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest)
+
+      // Same transcript revision: the approval did not touch the transcript.
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(surfaceSnapshot({ pendingApprovals: [bashApproval] }))
+      rerenderView(rerender, { paneContent, hidden: false })
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest + 1)
+      expect(screen.getByRole('alert', { name: 'Permission request for Bash' })).toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+      expect(screen.queryByTestId('fresh-agent-stale-transcript')).not.toBeInTheDocument()
+
+      // The owed refresh is consumed: hiding and revealing again fetches nothing.
+      rerenderView(rerender, { paneContent, hidden: true })
+      rerenderView(rerender, { paneContent, hidden: false })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest + 1)
+    })
+
+    it('reveals a question raised while hidden with one fetch and no blocking overlay', async () => {
+      const { rerender, paneContent } = await mountHiddenSurfacePane(surfaceSnapshot())
+      const callsBeforeRequest = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+
+      emitSurfaceEvent('freshAgent.question.request', { requestId: 'question-1' })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest)
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(surfaceSnapshot({ pendingQuestions: [question] }))
+      rerenderView(rerender, { paneContent, hidden: false })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeRequest + 1)
+      expect(screen.getByRole('region', { name: /^Question from / })).toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+    })
+
+    it('clears a visible approval card that was cancelled while the pane was hidden', async () => {
+      const { rerender, paneContent } = await mountHiddenSurfacePane(surfaceSnapshot({ pendingApprovals: [bashApproval] }))
+      expect(screen.getByRole('alert', { name: 'Permission request for Bash' })).toBeInTheDocument()
+      const callsBeforeCancel = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+
+      emitSurfaceEvent('freshAgent.permission.cancelled', { requestId: 'perm-1' })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeCancel)
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(surfaceSnapshot())
+      rerenderView(rerender, { paneContent, hidden: false })
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeCancel + 1)
+      expect(screen.queryByRole('alert', { name: 'Permission request for Bash' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+    })
+
+    it('lets the blocking reveal refresh cover an owed surface refresh when the transcript also changed', async () => {
+      const { rerender, paneContent } = await mountHiddenSurfacePane(surfaceSnapshot())
+      const callsBeforeEvents = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+
+      emitSurfaceEvent('freshAgent.permission.request', { requestId: 'perm-1', toolName: 'Bash' })
+      emitSurfaceEvent('freshAgent.session.changed')
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeEvents)
+
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+        ...snapshotWithText('new transcript', 6),
+        pendingApprovals: [bashApproval],
+      })
+      rerenderView(rerender, { paneContent, hidden: false })
+      expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBe(callsBeforeEvents + 1)
+      expect(screen.getByText('new transcript')).toBeInTheDocument()
+      expect(screen.getByRole('alert', { name: 'Permission request for Bash' })).toBeInTheDocument()
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+    })
+  })
 })
 
 describe('FreshAgentView hidden-pane create rebind (F8)', () => {

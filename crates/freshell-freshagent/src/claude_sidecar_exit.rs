@@ -5,19 +5,16 @@
 //! reports how in `sdk.stream.ended {reason, message}` (its last stdout line) and
 //! exits with code 3 (`crates/freshell-claude-sidecar/stream-end.mjs`). If the Node
 //! process itself dies, stdout just ends and only its exit status tells why. Either
-//! way the consumer's end-of-output path ends the session: it reports the
+//! way the consumer's end-of-output path ends the session: it stops the ended
+//! sidecar through the same process-tree stop every teardown uses (`claude.rs`
+//! `SidecarProcesses::stop`, which reaps node's exit status), reports the
 //! [`SidecarExitCause`] to the user in `freshAgent.error{SIDECAR_EXITED}`, logs it
 //! as `freshagent.claude.sidecar_exit`, and decides whether the lost turn rings
 //! ([`death_rings`]).
 
 use std::process::ExitStatus;
-use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-
-/// How long the end-of-output path waits for an ended sidecar's exit status. Its
-/// stdout has closed, so the process is exiting or gone.
-const EXIT_STATUS_BUDGET: Duration = Duration::from_secs(2);
 
 /// The sidecar's last line when its SDK stream ended unrequested.
 pub(crate) const STREAM_ENDED_TYPE: &str = "sdk.stream.ended";
@@ -57,7 +54,8 @@ pub(crate) enum SidecarExitCause {
     /// The sidecar reported its SDK stream's end, then exited.
     StreamEnded(StreamEnded),
     /// The sidecar process ended without reporting a stream end (Node itself died).
-    /// `None` when its exit status could not be read.
+    /// `None` when its exit status could not be read, or when node outlived the
+    /// stop's grace period and the stop killed it (that signal is not the cause).
     ProcessEnded(Option<ExitStatus>),
 }
 
@@ -115,25 +113,6 @@ impl SidecarExitCause {
             }
         }
         Value::Object(cause)
-    }
-}
-
-/// Reap an ended sidecar: its exit status, or `None` if it cannot be read within
-/// [`EXIT_STATUS_BUDGET`]. Waiting also leaves no zombie behind.
-pub(crate) async fn reap(child: &mut tokio::process::Child) -> Option<ExitStatus> {
-    match tokio::time::timeout(EXIT_STATUS_BUDGET, child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(error)) => {
-            tracing::warn!(target: "freshell_freshagent::claude", provider = "claude",
-                error = %error, "freshagent.claude.sidecar_exit_status_unreadable");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(target: "freshell_freshagent::claude", provider = "claude",
-                budget_ms = EXIT_STATUS_BUDGET.as_millis() as u64,
-                "freshagent.claude.sidecar_exit_status_timeout");
-            None
-        }
     }
 }
 

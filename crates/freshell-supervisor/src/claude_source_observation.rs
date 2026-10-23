@@ -4,23 +4,79 @@ use super::*;
 use crate::backend::ClaudeSourceOwner;
 use freshell_runtime_protocol::{ClaudeSourceAuthority, ObserveClaudeSourcesRequest};
 
+/// A refused or failed observation with the exact check that stopped it. The
+/// web caller receives only the fixed, sanitized `RuntimeError`; the reason is
+/// recorded in the supervisor lifecycle log so a blocked Claude creation or
+/// recovery names its cause.
+struct ObservationFailure {
+    error: RuntimeError,
+    reason: String,
+}
+
+impl From<RuntimeError> for ObservationFailure {
+    fn from(error: RuntimeError) -> Self {
+        Self {
+            reason: error.message.clone(),
+            error,
+        }
+    }
+}
+
 impl Supervisor {
     pub(super) async fn observe_claude_sources(
         &self,
         request: ObserveClaudeSourcesRequest,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, RuntimeError> {
+        let soul_id = request.soul_id.clone();
+        let provider = request.provider.clone();
+        let candidate = request.candidate.is_some();
+        let authority = match &request.authority {
+            ClaudeSourceAuthority::InitialReservation { .. } => "initial_reservation",
+            ClaudeSourceAuthority::RecoveryAttempt { .. } => "recovery_attempt",
+        };
+        self.observe_claude_sources_checked(request)
+            .await
+            .map_err(|failure| {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.claude_source_observation.failed",
+                    serde_json::json!({
+                        "severity": "warn",
+                        "soulId": soul_id,
+                        "provider": provider,
+                        "authority": authority,
+                        "candidate": candidate,
+                        "errorCode": failure.error.code,
+                        "reason": failure.reason,
+                    }),
+                );
+                failure.error
+            })
+    }
+
+    async fn observe_claude_sources_checked(
+        &self,
+        request: ObserveClaudeSourcesRequest,
+    ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, ObservationFailure>
+    {
         request.validate()?;
-        let denied = || {
-            RuntimeError::new(
+        let denied = |reason: &str| {
+            ObservationFailure {
+            error: RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 "Claude source observation requires its current creation or recovery attempt; retain inputs and reprepare",
-            )
+            ),
+            reason: reason.to_string(),
+        }
         };
-        let unavailable = || {
-            RuntimeError::new(
+        let unavailable = |reason: String| {
+            ObservationFailure {
+            error: RuntimeError::new(
                 RuntimeErrorCode::HostUnreachable,
                 "Claude native source evidence is unavailable; retain inputs and repair the source before dispatch",
-            )
+            ),
+            reason,
+        }
         };
         let mut recovery = None;
         let owner = match &request.authority {
@@ -30,22 +86,26 @@ impl Supervisor {
                     .initial_input_reservation(request.soul_id.clone(), reservation_id.clone())
                     .await
                     .map_err(map_registry)?
-                    .ok_or_else(denied)?;
+                    .ok_or_else(|| denied("initial input reservation is not recorded"))?;
                 if reservation.provider != request.provider
                     || reservation.image_ref != self.config.image_ref
                     || reservation.binary != self.config.host_binary_path
                 {
-                    return Err(denied());
+                    return Err(denied(
+                        "initial input reservation belongs to another provider or artifact",
+                    ));
                 }
                 let observation = tokio::time::timeout(
                     Duration::from_secs(10),
                     self.backend.observe_initial_auth_volume(&reservation),
                 )
                 .await
-                .map_err(|_| unavailable())?
-                .map_err(|_| unavailable())?;
+                .map_err(|_| unavailable("initial auth volume observation timed out".into()))?
+                .map_err(|error| {
+                    unavailable(format!("initial auth volume observation failed: {error}"))
+                })?;
                 if observation != expected {
-                    return Err(denied());
+                    return Err(denied("initial auth volume observation changed"));
                 }
                 ClaudeSourceOwner::Initial {
                     reservation,
@@ -64,7 +124,7 @@ impl Supervisor {
                         .get(attempt_id)
                         .filter(|authority| authority.expires > Instant::now())
                         .cloned()
-                        .ok_or_else(denied)?
+                        .ok_or_else(|| denied("recovery attempt scope is absent or expired"))?
                 };
                 if authority.start.context.soul_id != request.soul_id
                     || authority.start.context.provider != request.provider
@@ -77,7 +137,7 @@ impl Supervisor {
                         .await
                         .map_err(map_registry)?
                 {
-                    return Err(denied());
+                    return Err(denied("recovery attempt is no longer current"));
                 }
                 let handle = authority.start.context.prior_handle.clone();
                 let recovery_source = if request.candidate.is_some() {
@@ -89,7 +149,7 @@ impl Supervisor {
                                 .fresh_agent()
                                 .and_then(|spec| spec.provider_launch_context.as_ref())
                         })
-                        .ok_or_else(denied)?;
+                        .ok_or_else(|| denied("retained owner has no provider launch context"))?;
                     Some(self.claude_recovery_source_binding(
                         &authority.start,
                         attempt_id,
@@ -109,24 +169,26 @@ impl Supervisor {
             &request.observation_request,
             freshell_platform::claude_inputs::observation::MAX_REQUEST_BYTES,
         )
-        .map_err(|_| denied())?;
+        .map_err(|_| denied("observation request exceeds its metadata profile"))?;
         let digest = format!("{:x}", Sha256::digest(&raw));
         // The backend owns a 25-second operation and five-second finite cleanup.
         // This outer deadline permits that cleanup to finish before returning.
         let reply = tokio::time::timeout(
-            Duration::from_secs(35),
+            CLAUDE_SOURCE_OBSERVATION_BUDGET,
             self.backend
                 .observe_claude_sources(&owner, &request, &self.config.test_run_id),
         )
         .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())?;
+        .map_err(|_| unavailable("source reader timed out".into()))?
+        .map_err(|error| unavailable(format!("source reader failed: {error}")))?;
         reply
             .validate_for_request(&request.observation_request, &digest)
-            .map_err(|_| unavailable())?;
+            .map_err(|_| unavailable("source reader reply does not answer this request".into()))?;
         let observed = &reply.observation;
         if (observed.uid, observed.euid, observed.gid, observed.egid) != (65534, 65534, 0, 0) {
-            return Err(unavailable());
+            return Err(unavailable(
+                "source reader ran under another identity".into(),
+            ));
         }
         match &request.authority {
             ClaudeSourceAuthority::InitialReservation { reservation_id } => {
@@ -135,21 +197,25 @@ impl Supervisor {
                     .initial_input_reservation(request.soul_id.clone(), reservation_id.clone())
                     .await
                     .map_err(map_registry)?
-                    .ok_or_else(denied)?;
+                    .ok_or_else(|| {
+                        denied("initial input reservation disappeared during observation")
+                    })?;
                 let ClaudeSourceOwner::Initial {
                     reservation,
                     observation,
                 } = &owner
                 else {
-                    return Err(denied());
+                    return Err(denied("observation owner changed kind"));
                 };
                 if current.0.binary_sha256 != reservation.binary_sha256 || &current.1 != observation
                 {
-                    return Err(denied());
+                    return Err(denied(
+                        "initial input reservation changed during observation",
+                    ));
                 }
             }
             ClaudeSourceAuthority::RecoveryAttempt { attempt_id } => {
-                let start = recovery.ok_or_else(denied)?;
+                let start = recovery.ok_or_else(|| denied("observation owner changed kind"))?;
                 let live_scope = {
                     let authorities = self
                         .auth_lookup_authorities
@@ -168,7 +234,7 @@ impl Supervisor {
                         .await
                         .map_err(map_registry)?
                 {
-                    return Err(denied());
+                    return Err(denied("recovery attempt ended during observation"));
                 }
             }
         }
@@ -395,7 +461,7 @@ mod tests {
             .unwrap();
             let lock = supervisor.lifecycle_lock(&soul).await;
             let _held = lock.lock().await;
-            let scope = supervisor.auth_lookup_scope(&start);
+            let scope = supervisor.auth_lookup_scope(&start, CLAUDE_RECOVERY_CALLBACK_BUDGET);
             if matches!(
                 mode,
                 "dropped" | "expired" | "candidate-dropped" | "candidate-expired"
@@ -477,8 +543,32 @@ mod tests {
                 matches!(mode, "live" | "candidate"),
                 "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
+            let failures = std::fs::read_to_string(owned.path().join("lifecycle.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["event"] == "supervisor.claude_source_observation.failed")
+                .map(|event| event["data"].clone())
+                .collect::<Vec<_>>();
             if let Err(error) = result {
                 assert_eq!(error.code, RuntimeErrorCode::InvalidRequest);
+                // The web caller sees only the fixed refusal; the lifecycle log
+                // names the exact check that stopped the observation.
+                let expected_reason = if mode == "candidate-unrecorded-prior" {
+                    "retained owner has no provider launch context"
+                } else {
+                    "recovery attempt ended during observation"
+                };
+                assert_eq!(failures.len(), 1, "{mode}: {failures:?}");
+                assert_eq!(failures[0]["severity"], "warn");
+                assert_eq!(failures[0]["soulId"], serde_json::json!(soul));
+                assert_eq!(failures[0]["authority"], "recovery_attempt");
+                assert_eq!(failures[0]["candidate"], mode.starts_with("candidate"));
+                assert_eq!(failures[0]["errorCode"], "INVALID_REQUEST");
+                assert_eq!(failures[0]["reason"], expected_reason, "{mode}");
+                assert!(!error.message.contains(expected_reason));
+            } else {
+                assert!(failures.is_empty(), "{mode}: {failures:?}");
             }
             assert!(std::fs::read(&prior).unwrap() == b"immutable accepted prior generation");
         }

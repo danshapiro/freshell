@@ -1,0 +1,371 @@
+//! Session teardown and server shutdown go through the graceful sidecar stop
+//! (audit G31): the shutdown request first, escalation only after the grace
+//! period, every stop logged as `freshagent.claude.teardown`, and
+//! `FreshClaudeState::shutdown` stopping sessions concurrently.
+
+use super::*;
+
+use std::collections::BTreeMap;
+use std::sync::Mutex as StdMutex;
+
+use crate::claude_spawn::{SERVER_STOP_GRACE, SIDECAR_GRACEFUL_EXIT};
+
+/// Honors the protocol like `index.mjs`: the shutdown line exits 0.
+const FAKE_HONORS_SHUTDOWN: &str = r#"
+const fs = require('fs')
+const out = process.argv[1]
+process.on('SIGTERM', () => { fs.appendFileSync(out, 'sigterm\n'); process.exit(143) })
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') {
+    fs.appendFileSync(out, 'shutdown-handled\n')
+    // Stopping takes a moment, as the real sidecar's SDK abort does, so a
+    // signal sent right behind the shutdown line reaches the trap above.
+    setTimeout(() => process.exit(0), 200)
+  }
+})
+setInterval(() => {}, 1000)
+process.stdout.write('ready\n')
+"#;
+
+/// Exits 0 on the shutdown line WITHOUT stopping the untagged grandchild it
+/// started (the shape that, off Linux, nothing used to reap). The readiness
+/// line carries the grandchild's pid.
+const FAKE_ORPHANS_GRANDCHILD: &str = r#"
+const { spawn } = require('child_process')
+const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') process.exit(0)
+})
+setInterval(() => {}, 1000)
+grandchild.on('spawn', () => process.stdout.write(`ready ${grandchild.pid}\n`))
+"#;
+
+/// A wedged sidecar: ignores the shutdown line and stdin EOF; exits on SIGTERM.
+const FAKE_IGNORES_SHUTDOWN: &str = r#"
+const fs = require('fs')
+const out = process.argv[1]
+process.on('SIGTERM', () => { fs.appendFileSync(out, 'sigterm\n'); process.exit(143) })
+process.stdin.on('data', () => {})
+process.stdin.on('end', () => {})
+setInterval(() => {}, 1000)
+process.stdout.write('ready\n')
+"#;
+
+/// Crashes (exit 1) on the shutdown line instead of running a shutdown
+/// handler.
+const FAKE_CRASHES_ON_SHUTDOWN: &str = r#"
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') process.exit(1)
+})
+setInterval(() => {}, 1000)
+process.stdout.write('ready\n')
+"#;
+
+fn node() -> String {
+    std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string())
+}
+
+/// A live `ClaudeSession` whose sidecar is a Node fake spawned the way
+/// production spawns the real one (inside its process-tree guard), ready to
+/// tear down. Also returns the fake's readiness line.
+async fn fake_session(
+    script: &str,
+    record: &std::path::Path,
+    session_id: &str,
+) -> (ClaudeSession, String) {
+    let mut command = tokio::process::Command::new(node());
+    command
+        .arg("-e")
+        .arg(script)
+        .arg(record)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let (mut child, tree_guard) =
+        crate::claude_spawn::spawn_guarded(&mut command).expect("spawn the fake sidecar with node");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let ready = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
+        .await
+        .expect("the fake sidecar announces readiness")
+        .expect("read the fake sidecar's stdout")
+        .expect("the fake sidecar wrote a readiness line");
+    assert!(ready.starts_with("ready"), "{ready}");
+    // Keep stdout open for the session's lifetime, as the real consumer does.
+    let consumer = tokio::spawn(async move {
+        let mut lines = lines;
+        while let Ok(Some(_)) = lines.next_line().await {}
+    });
+    let session = ClaudeSession {
+        configuration: ClaudeConfiguration::default(),
+        stdin,
+        child,
+        tree_guard,
+        ownership_id: format!("test-teardown-{session_id}"),
+        consumer,
+        sidecar_session_id: session_id.to_string(),
+        cli_session_id: None,
+        owning_operation: None,
+        owning_generation: None,
+        broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
+        pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
+        in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
+        last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+        turn_lock: Arc::new(TokioMutex::new(())),
+        rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
+        last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+    };
+    (session, ready)
+}
+
+fn record_of(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Thread-local capture of `freshagent.claude.teardown` events. The teardown
+/// runs inline on the test's current-thread runtime, so `set_default` sees it.
+/// Shared with the rollback tests in `claude::tests`.
+pub(super) mod capture {
+    use super::*;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    pub(in crate::claude) type Fields = BTreeMap<String, String>;
+
+    #[derive(Default)]
+    struct Visitor(Fields);
+    impl Visit for Visitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(
+                field.name().to_string(),
+                format!("{value:?}").replace('"', ""),
+            );
+        }
+    }
+
+    struct CaptureLayer(Arc<StdMutex<Vec<(tracing::Level, Fields)>>>);
+    impl<S: Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .expect("capture lock")
+                .push((*event.metadata().level(), visitor.0));
+        }
+    }
+
+    pub(in crate::claude) fn teardown_events(
+        events: &Arc<StdMutex<Vec<(tracing::Level, Fields)>>>,
+    ) -> Vec<(tracing::Level, Fields)> {
+        events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(_, fields)| {
+                fields.get("event").map(String::as_str) == Some("freshagent.claude.teardown")
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(in crate::claude) fn install() -> (
+        Arc<StdMutex<Vec<(tracing::Level, Fields)>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&events)));
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+}
+
+#[tokio::test]
+async fn teardown_lets_a_sidecar_that_honors_shutdown_exit_without_a_signal() {
+    let (events, _guard) = capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let (session, _) = fake_session(FAKE_HONORS_SHUTDOWN, &record, "honors").await;
+
+    let started = std::time::Instant::now();
+    let _ = teardown_removed_session(session, TREE_DEATH_CONFIRM_ROUNDS).await;
+
+    assert!(started.elapsed() < SIDECAR_GRACEFUL_EXIT);
+    assert_eq!(
+        record_of(&record),
+        "shutdown-handled\n",
+        "the sidecar stopped on the shutdown line; no signal raced it"
+    );
+    let logged = capture::teardown_events(&events);
+    assert_eq!(logged.len(), 1, "one teardown event: {logged:?}");
+    let (level, fields) = &logged[0];
+    assert_eq!(*level, tracing::Level::INFO);
+    assert_eq!(fields.get("session_id").map(String::as_str), Some("honors"));
+    assert_eq!(fields.get("graceful").map(String::as_str), Some("true"));
+    assert!(fields.contains_key("elapsed_ms"), "{fields:?}");
+    assert!(fields.contains_key("confirmation"), "{fields:?}");
+}
+
+#[tokio::test]
+async fn teardown_of_a_sidecar_that_ignores_shutdown_escalates_after_grace_and_says_so() {
+    let (events, _guard) = capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let (session, _) = fake_session(FAKE_IGNORES_SHUTDOWN, &record, "ignores").await;
+
+    let started = std::time::Instant::now();
+    let _ = teardown_removed_session(session, TREE_DEATH_CONFIRM_ROUNDS).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= SIDECAR_GRACEFUL_EXIT,
+        "the sidecar got the whole grace period before any signal: {elapsed:?}"
+    );
+    assert!(
+        elapsed < SIDECAR_GRACEFUL_EXIT + Duration::from_secs(3),
+        "{elapsed:?}"
+    );
+    #[cfg(unix)]
+    assert_eq!(record_of(&record), "sigterm\n");
+    let logged = capture::teardown_events(&events);
+    assert_eq!(logged.len(), 1, "one teardown event: {logged:?}");
+    let (level, fields) = &logged[0];
+    assert_eq!(*level, tracing::Level::WARN, "a forced stop is a warning");
+    assert_eq!(fields.get("graceful").map(String::as_str), Some("false"));
+}
+
+#[tokio::test]
+async fn teardown_of_a_sidecar_that_crashes_on_its_way_down_is_logged_as_abnormal() {
+    let (events, _guard) = capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let (session, _) = fake_session(FAKE_CRASHES_ON_SHUTDOWN, &record, "crashes").await;
+
+    let _ = teardown_removed_session(session, TREE_DEATH_CONFIRM_ROUNDS).await;
+
+    let logged = capture::teardown_events(&events);
+    assert_eq!(logged.len(), 1, "one teardown event: {logged:?}");
+    let (level, fields) = &logged[0];
+    assert_eq!(*level, tracing::Level::WARN, "a crash is a warning");
+    assert_eq!(fields.get("graceful").map(String::as_str), Some("false"));
+    assert_eq!(
+        fields.get("stop").map(String::as_str),
+        Some("abnormal_exit"),
+        "{fields:?}"
+    );
+    assert_eq!(fields.get("exit_code").map(String::as_str), Some("1"));
+}
+
+/// The server's whole stop (WS drain, terminals, every provider's sidecars,
+/// the codex launch manager, the layout flush) must finish inside a 5 s hard
+/// ceiling (`SHUTDOWN_HARD_TIMEOUT` in freshell-server), so wedged claude
+/// sidecars may not take a whole session grace period of it.
+#[tokio::test]
+async fn server_shutdown_stops_every_session_concurrently_within_its_share_of_the_stop_budget() {
+    let (events, _guard) = capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+    let state = FreshClaudeState::new(Arc::new(tx));
+    for index in 0..3 {
+        let session_id = format!("wedged-{index}");
+        let record = dir.path().join(format!("{session_id}.txt"));
+        let (session, _) = fake_session(FAKE_IGNORES_SHUTDOWN, &record, &session_id).await;
+        state.sessions.lock().await.insert(session_id, session);
+    }
+
+    let started = std::time::Instant::now();
+    state.shutdown().await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= SERVER_STOP_GRACE,
+        "each sidecar got the server-stop grace period before any signal: {elapsed:?}"
+    );
+    assert!(
+        elapsed < SIDECAR_GRACEFUL_EXIT,
+        "three wedged sidecars cost one server-stop grace period, not three, and less \
+         than a session's: {elapsed:?}"
+    );
+    assert!(state.sessions.lock().await.is_empty());
+    let logged = capture::teardown_events(&events);
+    assert_eq!(
+        logged.len(),
+        3,
+        "one teardown event per session: {logged:?}"
+    );
+    assert!(logged
+        .iter()
+        .all(|(_, fields)| fields.get("graceful").map(String::as_str) == Some("false")));
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// G31: the untagged grandchild a sidecar leaves behind is outside the Linux
+/// `/proc` ownership reap; only the process-tree guard reaches it.
+#[cfg(unix)]
+#[tokio::test]
+async fn teardown_kills_a_grandchild_the_sidecar_left_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let (session, ready) = fake_session(FAKE_ORPHANS_GRANDCHILD, &record, "orphans").await;
+    let grandchild: i32 = ready
+        .strip_prefix("ready ")
+        .and_then(|pid| pid.trim().parse().ok())
+        .expect("the readiness line carries the grandchild pid");
+    assert!(process_exists(grandchild));
+
+    let confirmation = teardown_removed_session(session, TREE_DEATH_CONFIRM_ROUNDS).await;
+
+    assert!(
+        !process_exists(grandchild),
+        "the grandchild did not outlive the teardown"
+    );
+    assert_eq!(confirmation.label(), "confirmed");
+}
+
+/// G31: production sidecars are spawned inside their own process group.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_sidecar_runs_the_sidecar_inside_its_own_process_group() {
+    let _env = super::tests::CLAUDE_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("idle-sidecar.mjs");
+    std::fs::write(&script, "setInterval(() => {}, 1000)\n").unwrap();
+    std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+    let spawned = spawn_sidecar(None, "freshclaude").await;
+    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+
+    let SpawnedSidecar {
+        mut child,
+        stdin,
+        mut tree_guard,
+        ..
+    } = spawned.expect("spawn the sidecar");
+    let pid = child.id().expect("a live sidecar") as i32;
+    assert_eq!(
+        // SAFETY: getpgid only reads the process table.
+        unsafe { libc::getpgid(pid) },
+        pid,
+        "the kernel has the sidecar leading its own process group"
+    );
+    assert_eq!(
+        tree_guard.process_group(),
+        Some(pid),
+        "the guard owns that group"
+    );
+    drop(stdin);
+    assert_eq!(
+        tree_guard.terminate(&mut child).await,
+        crate::claude_spawn::TreeConfirmation::Confirmed
+    );
+}

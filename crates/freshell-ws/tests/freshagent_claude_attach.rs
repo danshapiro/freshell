@@ -380,6 +380,93 @@ async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over
     assert_eq!(frame["event"]["timelineSessionId"], durable);
 }
 
+/// Makes a directory unreadable (mode 000) and restores it on drop -- declared
+/// AFTER the env guard so it drops first and the env guard's `remove_dir_all`
+/// can clean up. `None` when the process bypasses permission bits (root), where
+/// the EACCES under test cannot be produced.
+#[cfg(unix)]
+struct UnreadableDir(std::path::PathBuf);
+#[cfg(unix)]
+impl UnreadableDir {
+    fn make(dir: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let guard = Self(dir.to_path_buf());
+        if std::fs::read_dir(dir).is_ok() {
+            eprintln!("skipping: euid bypasses permission checks");
+            return None;
+        }
+        Some(guard)
+    }
+}
+#[cfg(unix)]
+impl Drop for UnreadableDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// G28: an attach by durable UUID while the transcript store cannot be READ
+/// (EACCES on `projects/`) must not be adjudicated "lost". The server cannot
+/// prove the transcript gone, so it answers the transient
+/// `CLAUDE_ATTACH_RESUME_FAILED` error -- never the `INVALID_SESSION_ID` frame
+/// the client folds into `markSessionLost` and starts a recovery for -- and it
+/// spawns no sidecar against an unchecked store.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_attach_with_an_unreadable_store_is_transient_not_lost() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let durable = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    let env = FakeClaudeResumeEnv::install(durable);
+    let Some(_locked) = UnreadableDir::make(&env.dir.join("claude-store").join("projects")) else {
+        return;
+    };
+
+    let url = spawn_server().await;
+    let mut ws = connect_and_complete_handshake(&url).await;
+
+    send_json(
+        &mut ws,
+        &serde_json::json!({
+            "type": "freshAgent.attach",
+            "provider": "claude",
+            "sessionId": "pane-with-unreadable-store",
+            "sessionType": "freshclaude",
+            "sessionRef": { "provider": "claude", "sessionId": durable },
+        }),
+    )
+    .await;
+
+    // The FIRST answer is decisive: either the lost frame for this pane or the
+    // transient top-level error.
+    let frame = await_frame(&mut ws, Duration::from_secs(15), |v| {
+        (v["type"] == "freshAgent.event" && v["sessionId"] == "pane-with-unreadable-store")
+            || v["type"] == "error"
+    })
+    .await;
+    assert_eq!(
+        frame["type"], "error",
+        "an unreadable store must not mark the session lost: {frame}"
+    );
+    assert!(
+        frame["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("CLAUDE_ATTACH_RESUME_FAILED")),
+        "the attach answers with the transient resume failure: {frame}"
+    );
+
+    let creates = env
+        .request_log_rows()
+        .into_iter()
+        .filter(|r| r["msg"]["type"] == "create")
+        .count();
+    assert_eq!(
+        creates, 0,
+        "no sidecar may spawn against an unchecked store"
+    );
+}
+
 /// Kilroy panes ride the same claude provider arm with `sessionType: "kilroy"`; the
 /// envelope must echo it (through the real serde parse of `ClientMessage`, which the
 /// unit tests bypass) or the client builds the wrong session locator.

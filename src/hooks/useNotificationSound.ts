@@ -1,7 +1,20 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useAppSelector } from '@/store/hooks'
+import { createLogger } from '@/lib/client-logger'
+
+const log = createLogger('useNotificationSound')
 
 const NOTIFICATION_SOUND_SRC = '/your-code-is-ready.mp3'
+
+/**
+ * Per-ring safety backstop. Progression is driven by completion signals
+ * (`ended`, `pause`, the fallback tone's `ended`); this timer only releases a
+ * ring whose completion signal never arrives (e.g. an OS audio interruption
+ * pauses the element without `ended`), so one dead ring can never silence
+ * every later bell for the life of the page. The chime is ~1.03 s and the
+ * fallback tone 0.12 s, so 5 s never cuts an honest ring short.
+ */
+export const RING_WATCHDOG_MS = 5_000
 
 /**
  * Play the built-in fallback tone (the chime file is unusable — a rejected
@@ -57,17 +70,95 @@ function playFallbackTone(ctxRef: { current: AudioContext | null }, onDone: () =
   }
 }
 
+type RingAttempt = {
+  /** Arm the watchdog and play the chime. Call once. */
+  start: () => void
+  /** Silently stop tracking this ring (unmount): clears the watchdog and
+   * guarantees `onDone` never fires. Idempotent. */
+  dispose: () => void
+}
+
+/**
+ * One ring's lifecycle: play a fresh chime, substitute the fallback tone when
+ * the chime cannot play, and call `onDone` exactly once when the ring is over —
+ * on the chime's `ended`/`pause`, on the fallback tone's completion, when no
+ * completion signal can ever fire, or (backstop only) when RING_WATCHDOG_MS
+ * elapses without any of those.
+ */
+function createRingAttempt(ctxRef: { current: AudioContext | null }, onDone: () => void): RingAttempt {
+  let finished = false
+  // Arm the fallback at most once per ring — the chime can fail via the
+  // play() rejection AND a media `error`/`abort` event for the same dead ring.
+  let fallbackArmed = false
+  let watchdog: ReturnType<typeof setTimeout> | null = null
+
+  const settle = (notify: boolean) => {
+    if (finished) return
+    finished = true
+    if (watchdog !== null) {
+      clearTimeout(watchdog)
+      watchdog = null
+    }
+    if (notify) onDone()
+  }
+  const finish = () => settle(true)
+
+  const armFallback = () => {
+    if (fallbackArmed) return
+    fallbackArmed = true
+    // A spurious `error` after a successful `ended` must not play an
+    // audible stray tone for the already-finished ring.
+    if (finished) return
+    if (!playFallbackTone(ctxRef, finish)) finish()
+  }
+
+  const start = () => {
+    watchdog = setTimeout(() => {
+      watchdog = null
+      if (finished) return
+      log.warn({ event: 'notification_ring_watchdog_fired', stage: fallbackArmed ? 'fallback' : 'chime' })
+      finish()
+    }, RING_WATCHDOG_MS)
+
+    try {
+      // A FRESH Audio instance per ring — restarting one shared element would
+      // truncate an in-flight chime.
+      const audio = new Audio(NOTIFICATION_SOUND_SRC)
+      audio.preload = 'auto'
+      audio.volume = 1
+      audio.addEventListener('ended', finish, { once: true })
+      // Per the HTML spec a natural end fires `pause` then `ended`; an external
+      // pause (e.g. an OS audio interruption) fires `pause` alone. Either way
+      // the ring is over — `finish` is idempotent.
+      audio.addEventListener('pause', finish, { once: true })
+      audio.addEventListener('error', armFallback, { once: true })
+      // An aborted fetch never plays the chime: substitute the tone.
+      audio.addEventListener('abort', armFallback, { once: true })
+      const pending = audio.play()
+      if (pending) {
+        pending.catch(armFallback)
+      }
+    } catch {
+      armFallback()
+    }
+  }
+
+  return { start, dispose: () => settle(false) }
+}
+
 export function useNotificationSound() {
   const soundEnabled = useAppSelector((s) => s.settings.settings.notifications?.soundEnabled ?? true)
   const audioContextRef = useRef<AudioContext | null>(null)
   const queueLengthRef = useRef(0)
-  const ringingRef = useRef(false)
+  const activeRingRef = useRef<RingAttempt | null>(null)
   const drainRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     return () => {
       queueLengthRef.current = 0
-      ringingRef.current = false
+      const ring = activeRingRef.current
+      activeRingRef.current = null
+      ring?.dispose()
 
       const ctx = audioContextRef.current
       audioContextRef.current = null
@@ -77,50 +168,19 @@ export function useNotificationSound() {
     }
   }, [])
 
-  const startRing = useCallback(() => {
-    let finished = false
-    const finish = () => {
-      if (finished) return
-      finished = true
-      ringingRef.current = false
-      drainRef.current()
-    }
-    // Arm the fallback at most once per ring — the chime can fail via the
-    // play() rejection AND a media `error` event for the same dead ring.
-    let fallbackArmed = false
-    const armFallback = () => {
-      if (fallbackArmed) return
-      fallbackArmed = true
-      // A spurious `error` after a successful `ended` must not play an
-      // audible stray tone for the already-finished ring.
-      if (finished) return
-      if (!playFallbackTone(audioContextRef, finish)) finish()
-    }
-
-    try {
-      // A FRESH Audio instance per ring — restarting one shared element would
-      // truncate an in-flight chime.
-      const audio = new Audio(NOTIFICATION_SOUND_SRC)
-      audio.preload = 'auto'
-      audio.volume = 1
-      audio.addEventListener('ended', finish, { once: true })
-      audio.addEventListener('error', armFallback, { once: true })
-      const pending = audio.play()
-      if (pending) {
-        pending.catch(armFallback)
-      }
-    } catch {
-      armFallback()
-    }
-  }, [])
-
   const drain = useCallback(() => {
-    if (ringingRef.current) return
+    if (activeRingRef.current) return
     if (queueLengthRef.current <= 0) return
     queueLengthRef.current -= 1
-    ringingRef.current = true
-    startRing()
-  }, [startRing])
+    const ring = createRingAttempt(audioContextRef, () => {
+      if (activeRingRef.current === ring) activeRingRef.current = null
+      drainRef.current()
+    })
+    // Occupy the slot BEFORE starting: a ring that settles synchronously (no
+    // audio machinery) re-enters drain from inside start().
+    activeRingRef.current = ring
+    ring.start()
+  }, [])
 
   useEffect(() => {
     drainRef.current = drain

@@ -24,6 +24,14 @@ describe('Claude model catalog helper', () => {
     expect(close).toHaveBeenCalledTimes(1)
   })
 
+  it('gives the SDK the managed OneCLI key exactly when the session sidecar would', async () => {
+    const query = vi.fn((_input: any) => ({ supportedModels: async () => [], close: vi.fn() }))
+    await probeModelCatalog(query, {
+      env: { ANTHROPIC_API_KEY: 'managed', FRESHELL_CLAUDE_ONECLI_API_KEY: '1', CLAUDECODE: '1', KEEP: 'yes' },
+    })
+    expect(query.mock.calls[0][0].options.env).toEqual({ ANTHROPIC_API_KEY: 'managed', KEEP: 'yes' })
+  })
+
   it('closes a failed query and preserves the failure', async () => {
     const close = vi.fn()
     await expect(probeModelCatalog(() => ({ supportedModels: async () => { throw new Error('login required') }, close }))).rejects.toThrow('login required')

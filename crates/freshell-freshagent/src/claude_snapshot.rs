@@ -8,13 +8,15 @@
 //! snapshot GET, and the legacy Node server already proved direct-read viable
 //! (`server/session-history-loader.ts` -- with real-store parsing fixes, ledger A5).
 //! Store-root resolution is ORDERED CANDIDATES (`CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` >
-//! `$HOME/.claude`) because the real CLI honors CLAUDE_CONFIG_DIR and IGNORES
-//! CLAUDE_HOME (ledger A3) -- reading a single root risks false positive denial.
-//! The transcript store is also the AUTHORITY for lost-vs-alive on attach
-//! ([`crate::FreshClaudeState::handle_attach`]): file present => resumable, file
-//! absent in EVERY candidate root => positively gone (mirrors opencode's 404 rule;
+//! platform home `.claude`, the platform home being `std::env::home_dir()` exactly
+//! like the CLI's `os.homedir()`) because the real CLI honors CLAUDE_CONFIG_DIR and
+//! IGNORES CLAUDE_HOME (ledger A3) -- reading a single root risks false positive
+//! denial. The transcript store is also the AUTHORITY for lost-vs-alive on attach
+//! ([`crate::FreshClaudeState::handle_attach`]): file present => resumable, a CLEAN
+//! miss in EVERY candidate root => positively gone (mirrors opencode's 404 rule;
 //! honest even under claude's 30-day `cleanupPeriodDays` GC -- an expired transcript
-//! is unresumable by the CLI too, ledger A4).
+//! is unresumable by the CLI too, ledger A4), and a store that cannot be read is
+//! "cannot check", never gone ([`TranscriptLocation`], G28).
 
 use std::path::{Path, PathBuf};
 
@@ -22,39 +24,191 @@ use serde_json::{json, Map, Value};
 
 use crate::summary::{truncate_summary, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL};
 
-/// Ordered candidate store roots. The real CLI resolves its store as
-/// `CLAUDE_CONFIG_DIR ?? $HOME/.claude` and IGNORES `CLAUDE_HOME` (verified against
-/// cli.js 2.1.220 -- ledger A3); `CLAUDE_HOME` is freshell's legacy knob
-/// (`server/claude-home.ts`, `session_directory.rs` -- `pub(crate)` to that crate).
-/// We read ALL candidates so a reader/writer root mismatch can never turn a live
-/// session into a false positive denial.
-pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
+/// Ordered candidate store roots -- the ONE store-root rule every claude
+/// transcript caller shares (snapshot, resume-on-attach, rollback, naming,
+/// reconcile existence). The real CLI resolves its store as
+/// `CLAUDE_CONFIG_DIR ?? os.homedir()/.claude` and IGNORES `CLAUDE_HOME`
+/// (verified against cli.js 2.1.220 -- ledger A3); `CLAUDE_HOME` is freshell's
+/// legacy knob (`server/claude-home.ts`, `session_directory.rs`). The platform
+/// home is [`std::env::home_dir`] -- USERPROFILE on Windows (HOME is never read
+/// there), HOME-else-passwd-entry on POSIX -- exactly Node's `os.homedir()`, so
+/// the Windows desktop app (no HOME) and a POSIX service with HOME unset still
+/// find the store the CLI writes. We read ALL candidates so a reader/writer
+/// root mismatch can never turn a live session into a false positive denial.
+pub fn claude_home_candidates() -> Vec<PathBuf> {
+    claude_home_candidates_from(|key| std::env::var(key).ok(), std::env::home_dir())
+}
+
+/// Pure form of [`claude_home_candidates`]: `var` is the environment lookup and
+/// `home` the platform home, both injected so the rule is testable without
+/// mutating process-global env. Empty values never produce a (bogus,
+/// cwd-relative) root; duplicates are scanned once, first position wins.
+pub(crate) fn claude_home_candidates_from(
+    var: impl Fn(&str) -> Option<String>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let explicit = ["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"]
+        .into_iter()
+        .filter_map(|key| var(key).filter(|v| !v.is_empty()).map(PathBuf::from));
+    let platform_default = home
+        .filter(|h| !h.as_os_str().is_empty())
+        .map(|h| h.join(".claude"));
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf| {
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    };
-    if let Ok(v) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !v.is_empty() {
-            push(PathBuf::from(v));
-        }
-    }
-    if let Ok(v) = std::env::var("CLAUDE_HOME") {
-        if !v.is_empty() {
-            push(PathBuf::from(v));
-        }
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            push(PathBuf::from(h).join(".claude"));
+    for root in explicit.chain(platform_default) {
+        if !out.iter().any(|seen| same_store_root(seen, &root)) {
+            out.push(root);
         }
     }
     out
 }
 
-/// `find_transcript` across every candidate root, in resolution order.
-/// Positive denial (attach) and snapshot 404 both require a miss EVERYWHERE.
+/// Two spellings of the same store root are scanned once. Path equality
+/// compares components (separators and a trailing slash never matter); on
+/// Windows each component also compares case-insensitively, the filesystem's
+/// own rule, so `C:/USERS/u/.claude/` and `C:\Users\u\.claude` are one root.
+#[cfg(not(windows))]
+fn same_store_root(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn same_store_root(left: &Path, right: &Path) -> bool {
+    same_windows_path(left, right)
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Component;
+
+    const CSTR_EQUAL: i32 = 2;
+    const TRUE: i32 = 1;
+
+    let components_match = |left: Component<'_>, right: Component<'_>| {
+        let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+        let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+        else {
+            return false;
+        };
+        if left_len == 0 || right_len == 0 {
+            return false;
+        }
+
+        // SAFETY: both buffers remain alive for the call, and each explicit
+        // length is the number of valid UTF-16 code units in that buffer.
+        unsafe {
+            compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, TRUE)
+                == CSTR_EQUAL
+        }
+    };
+
+    let mut left = left.components();
+    let mut right = right.components();
+    loop {
+        match (left.next(), right.next()) {
+            (Some(left), Some(right)) if components_match(left, right) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CompareStringOrdinal"]
+    fn compare_string_ordinal(
+        string1: *const u16,
+        count1: i32,
+        string2: *const u16,
+        count2: i32,
+        ignore_case: i32,
+    ) -> i32;
+}
+
+/// Where a claude transcript stands across the store roots (G28). Only a CLEAN
+/// miss in EVERY candidate root is [`TranscriptLocation::Absent`] -- the positive
+/// "session gone" evidence attach, snapshot and rollback act on. Any IO failure
+/// that could be hiding the file is [`TranscriptLocation::Unreadable`]: the
+/// caller must treat it as "cannot check" (transient / 500 / retryable), never
+/// as lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptLocation {
+    /// The transcript file, found under one of the roots (a hit wins even when
+    /// another root or project dir failed to read).
+    Found(PathBuf),
+    /// Every root was fully readable and none holds the transcript.
+    Absent,
+    /// No hit, and at least one root could not be fully checked (or there is
+    /// no root at all).
+    Unreadable(LocateError),
+}
+
+/// Why the store could not be checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocateError {
+    /// No store root resolves at all (no CLAUDE_CONFIG_DIR / CLAUDE_HOME and
+    /// no platform home).
+    NoStoreRoot,
+    /// The first IO error met while scanning `root` (expected absence --
+    /// `NotFound` / `NotADirectory` -- is a clean miss, never an error).
+    Io {
+        root: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+impl TranscriptLocation {
+    /// The located path, if found. Callers that only DISPLAY (redo
+    /// availability, naming evidence) may collapse Absent and Unreadable;
+    /// callers that DECIDE "lost" must match all three states instead.
+    pub fn found(self) -> Option<PathBuf> {
+        match self {
+            Self::Found(path) => Some(path),
+            Self::Absent | Self::Unreadable(_) => None,
+        }
+    }
+}
+
+impl LocateError {
+    fn io(root: &Path, error: &std::io::Error) -> Self {
+        Self::Io {
+            root: root.to_path_buf(),
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    /// Stable short label (`PermissionDenied`, `no_store_root`) for structured
+    /// logs and user-facing refusals.
+    pub fn kind_label(&self) -> String {
+        match self {
+            Self::NoStoreRoot => "no_store_root".to_string(),
+            Self::Io { kind, .. } => format!("{kind:?}"),
+        }
+    }
+}
+
+impl std::fmt::Display for LocateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoStoreRoot => f.write_str(
+                "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/platform home all unset)",
+            ),
+            Self::Io { root, message, .. } => write!(
+                f,
+                "claude transcript store {} unreadable: {message}",
+                root.display()
+            ),
+        }
+    }
+}
+
+/// [`TranscriptLocation`] for `session_id` across [`claude_home_candidates`],
+/// in resolution order. Positive denial (attach), the snapshot 404 and the
+/// rollback "nothing there" answers all require a CLEAN miss EVERYWHERE.
 /// `pub` + re-exported at the crate root (kata 09v1): `freshell-server`'s
 /// `IndexExistenceProbe` consults this SAME check before finalizing a
 /// warm-index `Absent` for claude — an on-disk transcript can be cwd-less
@@ -62,10 +216,80 @@ pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
 /// fail the index's R10b cwd gate while the attach arm would still attempt
 /// resume on it; the reconcile arm and the attach arm must share one
 /// definition of "the transcript exists".
+pub fn locate_transcript_state(session_id: &str) -> TranscriptLocation {
+    locate_transcript_state_in(&claude_home_candidates(), session_id)
+}
+
+/// [`locate_transcript_state`] over explicit roots: the first hit wins;
+/// otherwise the first root error makes the answer Unreadable; only an
+/// all-clean miss is Absent; no roots at all is `Unreadable(NoStoreRoot)`.
+pub(crate) fn locate_transcript_state_in(
+    roots: &[PathBuf],
+    session_id: &str,
+) -> TranscriptLocation {
+    if roots.is_empty() {
+        return TranscriptLocation::Unreadable(LocateError::NoStoreRoot);
+    }
+    let mut first_error: Option<LocateError> = None;
+    for root in roots {
+        match find_transcript_state(root, session_id) {
+            TranscriptLocation::Found(path) => return TranscriptLocation::Found(path),
+            TranscriptLocation::Absent => {}
+            TranscriptLocation::Unreadable(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(TranscriptLocation::Absent, TranscriptLocation::Unreadable)
+}
+
+/// Found-only view of [`locate_transcript_state`] for DISPLAY callers
+/// (`claude_can_redo_now`: an unreadable original reads as "no redo now").
+/// Anything that decides "this session is gone" must match the three-state
+/// [`locate_transcript_state`] instead.
 pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
-    claude_home_candidates()
-        .iter()
-        .find_map(|root| find_transcript(root, session_id))
+    locate_transcript_state(session_id).found()
+}
+
+/// One structured warn per "cannot check" decision (G28): which caller, the
+/// session, the failing store root and the io error kind -- never transcript
+/// contents. Callers then answer transiently instead of "lost".
+pub(crate) fn log_transcript_unreadable(
+    context: &'static str,
+    session_id: &str,
+    error: &LocateError,
+) {
+    let root = match error {
+        LocateError::NoStoreRoot => None,
+        LocateError::Io { root, .. } => Some(root.display().to_string()),
+    };
+    tracing::warn!(
+        component = "freshagent.claude",
+        event = "freshagent.claude.transcript_unreadable",
+        context,
+        session_id = %session_id,
+        root = ?root,
+        kind = %error.kind_label(),
+        error = %error,
+        "claude transcript store unreadable; answering transiently, never as a lost session"
+    );
+}
+
+/// The rollback refusal for a transcript store that cannot be read (G28): the
+/// retryable `INTERNAL_ERROR` the rollback read-error legs already answer --
+/// never `NOTHING_TO_UNDO` / `REDO_UNAVAILABLE`, which tell the user the
+/// history is gone. Logs the structured unreadable warning.
+pub(crate) fn unreadable_rollback_refusal(
+    op: &crate::rollback_record::RollbackRequest,
+    session_id: &str,
+    error: &LocateError,
+) -> freshell_protocol::ServerMessage {
+    log_transcript_unreadable("rollback", session_id, error);
+    crate::rollback_record::rollback_error_frame(
+        op,
+        "INTERNAL_ERROR",
+        &format!("claude transcript store unreadable: {}", error.kind_label()),
+    )
 }
 
 /// Unified agent names (Task 2): a located transcript PLUS the routing
@@ -89,27 +313,12 @@ pub struct SelectedTranscript {
 /// SELECTED root + original cwd — the exact evidence a verified claude
 /// naming acquisition carries. Uses the same ordered candidates and
 /// traversal as [`locate_transcript`] (one definition of "the transcript
-/// exists"), plus the PLATFORM home fallback: on native Windows a missing
-/// `HOME` still resolves through `%USERPROFILE%\.claude` (the real CLI's
-/// home), so a session created by the Windows CLI is verifiable from the
-/// service host. `None` when the transcript cannot be located anywhere.
+/// exists"); the shared candidates already resolve the platform home the
+/// real CLI uses (`%USERPROFILE%\.claude` on native Windows), so a session
+/// created by the Windows CLI is verifiable from the service host. `None`
+/// when the transcript cannot be located anywhere.
 pub fn locate_transcript_selected(session_id: &str) -> Option<SelectedTranscript> {
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut candidates = claude_home_candidates();
-    // Platform home fallback (native Windows): `HOME` is frequently absent
-    // for a service host; the CLI resolves `~` through USERPROFILE there.
-    #[cfg(windows)]
-    if !candidates.iter().any(|root| root.ends_with(".claude")) {
-        if let Ok(profile) = std::env::var("USERPROFILE") {
-            if !profile.is_empty() {
-                let root = PathBuf::from(profile).join(".claude");
-                if !candidates.contains(&root) {
-                    candidates.push(root);
-                }
-            }
-        }
-    }
-    for root in candidates {
+    for root in claude_home_candidates() {
         if let Some(path) = find_transcript(&root, session_id) {
             let transcript_cwd = transcript_cwd_bounded(&path);
             return Some(SelectedTranscript {
@@ -192,46 +401,130 @@ pub fn transcript_cwd_bounded(path: &Path) -> Option<String> {
 /// Locate `<claude_home>/projects/*/<session_id>.jsonl` (or one subdir deeper, e.g.
 /// `<project>/<session-id-dir>/...` layouts). Filename scan, NEVER slug re-derivation:
 /// the cwd->slug encoding is lossy (`docs/port-plan.md:45`). Sorted dirs for
-/// determinism (mirrors `directory_index.rs::discover_claude_home`).
+/// determinism (mirrors `directory_index.rs::discover_claude_home`). Found-only
+/// projection of [`find_transcript_state`] (one traversal).
 pub(crate) fn find_transcript(claude_home: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty()
-        || session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-    {
-        return None;
+    find_transcript_state(claude_home, session_id).found()
+}
+
+/// The three-state traversal of ONE store root, same layout as
+/// [`find_transcript`] (direct, plus one nested level; only real directories
+/// are descended). Expected absence (`NotFound` / `NotADirectory`) is a clean
+/// miss, and so is an id the OS refuses as a file name (no such transcript can
+/// exist). Any other error is REMEMBERED and the scan keeps going -- a later hit
+/// still wins -- so the root answers Unreadable only when nothing was found
+/// and something could not be checked.
+pub(crate) fn find_transcript_state(claude_home: &Path, session_id: &str) -> TranscriptLocation {
+    if !is_safe_session_id(session_id) {
+        return TranscriptLocation::Absent;
     }
     let filename = format!("{session_id}.jsonl");
-    let projects = claude_home.join("projects");
-    let entries = std::fs::read_dir(&projects).ok()?;
-    let mut dirs: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.path())
-        .collect();
-    dirs.sort();
-    for dir in &dirs {
+    let mut errors = ScanErrors::default();
+    for dir in subdirs_sorted(&claude_home.join("projects"), &mut errors) {
         let direct = dir.join(&filename);
-        if direct.is_file() {
-            return Some(direct);
+        if is_file_or_remember(&direct, &mut errors) {
+            return TranscriptLocation::Found(direct);
         }
-        let Ok(nested) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let mut subdirs: Vec<PathBuf> = nested
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.path())
-            .collect();
-        subdirs.sort();
-        for sub in &subdirs {
-            let candidate = sub.join(&filename);
-            if candidate.is_file() {
-                return Some(candidate);
+        for sub in subdirs_sorted(&dir, &mut errors) {
+            let nested = sub.join(&filename);
+            if is_file_or_remember(&nested, &mut errors) {
+                return TranscriptLocation::Found(nested);
             }
         }
     }
-    None
+    match errors.first() {
+        Some(e) => TranscriptLocation::Unreadable(LocateError::io(claude_home, e)),
+        None => TranscriptLocation::Absent,
+    }
+}
+
+/// The one error sink of a [`find_transcript_state`] scan: every branch
+/// (opening a dir, reading one listed entry, probing a candidate) reports
+/// here, so the expected-absence rule lives in exactly one place. Expected
+/// absence (`NotFound` / `NotADirectory` -- e.g. an entry deleted between
+/// the listing and its type check) is never remembered; the FIRST real
+/// error is kept for the Unreadable answer.
+#[derive(Default)]
+struct ScanErrors(Option<std::io::Error>);
+
+impl ScanErrors {
+    fn remember(&mut self, e: std::io::Error) {
+        if !is_expected_absence(&e) {
+            self.0.get_or_insert(e);
+        }
+    }
+
+    fn first(&self) -> Option<&std::io::Error> {
+        self.0.as_ref()
+    }
+}
+
+/// Sorted child DIRECTORIES of `dir` -- the historic [`find_transcript`]
+/// filter (`DirEntry::file_type`, which does not follow symlinks). Any error
+/// -- opening `dir` or reading one entry -- goes to `errors` (which drops
+/// expected absence) and the readable entries are still returned.
+fn subdirs_sorted(dir: &Path, errors: &mut ScanErrors) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.remember(e);
+            return Vec::new();
+        }
+    };
+    collect_subdirs(
+        entries
+            .map(|entry| entry.and_then(|entry| Ok((entry.file_type()?.is_dir(), entry.path())))),
+        errors,
+    )
+}
+
+/// The per-entry half of [`subdirs_sorted`]: each listed entry is
+/// `(is_dir, path)` or the error reading it. Directories are kept, sorted;
+/// an entry's error goes to `errors` and the fold keeps going, so one bad
+/// entry never hides the readable ones. Split out because the test
+/// filesystems (ext4/tmpfs report `d_type`) cannot make one entry fail.
+fn collect_subdirs(
+    entries: impl IntoIterator<Item = std::io::Result<(bool, PathBuf)>>,
+    errors: &mut ScanErrors,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok((true, path)) => out.push(path),
+            Ok((false, _)) => {}
+            Err(e) => errors.remember(e),
+        }
+    }
+    out.sort();
+    out
+}
+
+/// [`candidate_is_file`] with its error handed to `errors` (a miss for this
+/// candidate; the scan goes on). An error that says the candidate's NAME is
+/// invalid is a plain miss instead: every other component of the path came
+/// from a successful listing, so the rejected name is the id-derived
+/// `<id>.jsonl`, and no transcript can exist under a name the OS refuses --
+/// that is the id's fault, not the store's.
+fn is_file_or_remember(path: &Path, errors: &mut ScanErrors) -> bool {
+    match candidate_is_file(path) {
+        Ok(is_file) => is_file,
+        Err(e) if is_impossible_file_name(&e) => false,
+        Err(e) => {
+            errors.remember(e);
+            false
+        }
+    }
+}
+
+/// The OS refused the path as a name, not as an unreadable place: too long
+/// for one path component (`ENAMETOOLONG`), a reserved character on Windows
+/// (`ERROR_INVALID_NAME`) -- both `InvalidFilename` -- or a NUL byte, which
+/// std rejects as `InvalidInput` before any syscall.
+fn is_impossible_file_name(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidFilename | std::io::ErrorKind::InvalidInput
+    )
 }
 
 /// Error-AWARE variant of [`locate_transcript`] for the resolve endpoint's
@@ -417,31 +710,23 @@ pub(crate) enum ClaudeSnapshotError {
     Io(String),
 }
 
+/// The display turns of a whole transcript: the per-line projection below
+/// ([`parse_transcript_turn_indexed`]) folded by the stateful
+/// [`crate::claude_projection::ClaudeTranscriptProjector`] (delegations absorb
+/// their results and task notifications; re-appended lines project once).
+fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
+    crate::claude_projection::ClaudeTranscriptProjector::project(thread_id, transcript).turns
+}
+
 /// One transcript JSONL line -> zero-or-one snapshot turn. Parsing rules are the
 /// legacy `extractChatMessagesFromJsonl` contract (`server/session-history-loader.ts:36-131`)
 /// PLUS the real-store fixes from the ledger A5 census (23,615 real lines): keep only
-/// type user|assistant; message may be a plain string, `{content: [...]}`, or
+/// type user|assistant (and the visible system lines: compaction markers and local
+/// command output); message may be a plain string, `{content: [...]}`, or
 /// `{content: "<string>"}` (the DOMINANT real prompt shape, which legacy-as-coded
 /// drops); lines flagged isMeta/isSidechain/isCompactSummary/isVisibleInTranscriptOnly
 /// are synthetic/subagent noise and are SKIPPED; malformed lines and unknown block
 /// kinds are skipped, never fatal.
-fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
-    let mut turns: Vec<Value> = Vec::new();
-    for line in transcript.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if let Some(turn) = parse_transcript_turn(&obj, thread_id, turns.len()) {
-            turns.push(turn);
-        }
-    }
-    turns
-}
-
 pub(crate) fn parse_transcript_turn(obj: &Value, thread_id: &str, ordinal: usize) -> Option<Value> {
     parse_transcript_turn_indexed(obj, thread_id, ordinal, None)
 }
@@ -452,12 +737,13 @@ pub(crate) fn parse_transcript_turn_indexed(
     ordinal: usize,
     index_key: Option<&str>,
 ) -> Option<Value> {
-    let role = match obj.get("type").and_then(Value::as_str) {
-        Some("user") => "user",
-        Some("assistant") => "assistant",
-        _ => return None,
-    };
+    let line_type = obj.get("type").and_then(Value::as_str)?;
+    if !matches!(line_type, "user" | "assistant" | "system") {
+        return None;
+    }
     // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
+    // The compact summary (`isCompactSummary`) is the model-facing recap of the
+    // compacted history; the visible marker comes from `system/compact_boundary`.
     if [
         "isMeta",
         "isSidechain",
@@ -467,6 +753,25 @@ pub(crate) fn parse_transcript_turn_indexed(
     .iter()
     .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
     {
+        return None;
+    }
+    let line_uuid = obj
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    // kata 1wxv: real message uuids are the rollback-addressable turn identity;
+    // the synthetic {thread}:{ordinal} stays as the fallback for uuid-less lines.
+    let turn_id = line_uuid
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{thread_id}:{ordinal}"));
+    if line_type == "system" {
+        return system_line_turn(obj, &turn_id, ordinal);
+    }
+    // A background agent's completion arrives as an unsolicited USER line
+    // carrying `<task-notification>` XML (CLI 2.1.237, F6). It is provider
+    // bookkeeping, not something the user typed: the transcript projector folds
+    // it into the owning delegation instead.
+    if is_task_notification_line(obj) {
         return None;
     }
     let msg = obj.get("message");
@@ -479,16 +784,35 @@ pub(crate) fn parse_transcript_turn_indexed(
         },
         _ => return None,
     };
-
-    let line_uuid = obj
-        .get("uuid")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    // kata 1wxv: real message uuids are the rollback-addressable turn identity;
-    // the synthetic {thread}:{ordinal} stays as the fallback for uuid-less lines.
-    let turn_id = line_uuid
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{thread_id}:{ordinal}"));
+    if line_type == "user" {
+        if let Some(turn) = local_command_user_turn(&blocks, &turn_id, ordinal, obj) {
+            return turn;
+        }
+    }
+    let role = if line_type == "user" {
+        "user"
+    } else {
+        "assistant"
+    };
+    // An API failure is persisted as a synthetic assistant line whose text is
+    // the error (`isApiErrorMessage`, F14): the durable error module renders it.
+    if role == "assistant" && obj.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
+        let message = blocks_text(&blocks);
+        let message = if message.trim().is_empty() {
+            "API error".to_string()
+        } else {
+            message
+        };
+        let error = json!({ "name": "ApiError", "message": message });
+        return Some(turn_json(
+            &turn_id,
+            ordinal,
+            role,
+            Vec::new(),
+            Some(error),
+            obj,
+        ));
+    }
     let mut items: Vec<Value> = Vec::new();
     for (j, block) in blocks.iter().enumerate() {
         let j = index_key
@@ -500,8 +824,20 @@ pub(crate) fn parse_transcript_turn_indexed(
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    // A slash command the user ran is persisted as
+                    // `<command-name>/x</command-name>…<command-args>…` (F8/F10):
+                    // show what the user typed.
+                    let text = match role {
+                        "user" => slash_command_text(text).unwrap_or_else(|| text.to_string()),
+                        _ => text.to_string(),
+                    };
                     items.push(json!({ "id": item_id, "kind": "text", "text": text }));
                 }
+            }
+            // Attachments are placeholders only (codex parity, `codex.rs`
+            // userMessage parts): base64 payloads never reach the snapshot.
+            Some("image") => {
+                items.push(json!({ "id": item_id, "kind": "text", "text": IMAGE_PLACEHOLDER }));
             }
             Some("thinking") => {
                 let text = block
@@ -552,8 +888,37 @@ pub(crate) fn parse_transcript_turn_indexed(
     if items.is_empty() {
         return None;
     }
+    Some(turn_json(&turn_id, ordinal, role, items, None, obj))
+}
 
-    let summary = summarize(&items);
+/// Display text for an image attachment or an image tool result.
+const IMAGE_PLACEHOLDER: &str = "[image]";
+
+/// Summary of a compaction-marker turn (the session-host text capture falls
+/// back to the summary for item kinds without text).
+const CONTEXT_COMPACTED_LABEL: &str = "Context compacted";
+
+/// The one turn-JSON builder every projection arm shares. `error` is the
+/// durable error module's `{name, message}`; an error-only turn (no items)
+/// keeps a BLANK summary (LB-4: the client renders a zero-item turn's summary
+/// as its body, which would duplicate the error module). This departs from
+/// transcript-live plan §4.3, which put the error message in the summary for
+/// the session-host text capture; that capture (`render_snapshot_text` in
+/// freshell-session-host) reads an error-only turn's `error.message` instead.
+fn turn_json(
+    turn_id: &str,
+    ordinal: usize,
+    role: &str,
+    items: Vec<Value>,
+    error: Option<Value>,
+    obj: &Value,
+) -> Value {
+    let msg = obj.get("message");
+    let summary = if items.is_empty() {
+        String::new()
+    } else {
+        summarize(&items)
+    };
     let mut turn = Map::new();
     turn.insert("id".into(), json!(turn_id));
     turn.insert("turnId".into(), json!(turn_id));
@@ -573,23 +938,186 @@ pub(crate) fn parse_transcript_turn_indexed(
     if let Some(model) = msg
         .and_then(|m| m.get("model"))
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && *s != SYNTHETIC_MODEL)
     {
         turn.insert("model".into(), json!(model));
+    }
+    if let Some(error) = error {
+        turn.insert("error".into(), error);
     }
     turn.insert("summary".into(), json!(summary));
     turn.insert("summaryKind".into(), json!(SUMMARY_KIND_ECHO));
     turn.insert("items".into(), json!(items));
-    Some(Value::Object(turn))
+    Value::Object(turn)
 }
 
-/// Flatten a tool_result block's content (string, or array of text blocks) to a string.
+/// The model stamp the CLI writes on lines it synthesizes itself (API errors).
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// `system` lines worth showing: the compaction marker and local slash-command
+/// output (`/cost`, `/context`, a failed `/compact`, F8-F10). Every other
+/// system subtype (status, informational noise) stays hidden.
+fn system_line_turn(obj: &Value, turn_id: &str, ordinal: usize) -> Option<Value> {
+    match obj.get("subtype").and_then(Value::as_str) {
+        Some("compact_boundary") => Some(compaction_marker_turn(turn_id, ordinal, obj)),
+        Some("local_command") => {
+            let content = obj.get("content").and_then(Value::as_str)?;
+            let output = LocalCommandOutput::parse(content).unwrap_or_else(|| LocalCommandOutput {
+                stdout: content.trim().to_string(),
+                stderr: String::new(),
+            });
+            output.into_turn(turn_id, ordinal, obj)
+        }
+        _ => None,
+    }
+}
+
+/// The system turn marking a context compaction at `obj`'s position.
+pub(crate) fn compaction_marker_turn(turn_id: &str, ordinal: usize, obj: &Value) -> Value {
+    turn_json(
+        turn_id,
+        ordinal,
+        "system",
+        vec![json!({ "id": format!("{turn_id}-i0"), "kind": "context_compaction" })],
+        None,
+        obj,
+    )
+}
+
+/// A USER line whose whole text is local-command output (`<local-command-
+/// stdout>Compacted </local-command-stdout>` after `/compact`) is the CLI
+/// talking, not the user: project it as a system row. `None` = not such a
+/// line; `Some(None)` = such a line with nothing to show.
+fn local_command_user_turn(
+    blocks: &[Value],
+    turn_id: &str,
+    ordinal: usize,
+    obj: &Value,
+) -> Option<Option<Value>> {
+    let [block] = blocks else {
+        return None;
+    };
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    let output = LocalCommandOutput::parse(block.get("text").and_then(Value::as_str)?)?;
+    Some(output.into_turn(turn_id, ordinal, obj))
+}
+
+/// The stdout/stderr a local slash command wrote, unwrapped from the CLI's
+/// `<local-command-stdout>` / `<local-command-stderr>` envelopes.
+struct LocalCommandOutput {
+    stdout: String,
+    stderr: String,
+}
+
+impl LocalCommandOutput {
+    const STDOUT: (&'static str, &'static str) =
+        ("<local-command-stdout>", "</local-command-stdout>");
+    const STDERR: (&'static str, &'static str) =
+        ("<local-command-stderr>", "</local-command-stderr>");
+
+    /// `Some` only when the text consists of nothing but output envelopes.
+    fn parse(text: &str) -> Option<Self> {
+        let mut rest = text.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        while !rest.is_empty() {
+            let (sink, (open, close)) = if rest.starts_with(Self::STDOUT.0) {
+                (&mut stdout, Self::STDOUT)
+            } else if rest.starts_with(Self::STDERR.0) {
+                (&mut stderr, Self::STDERR)
+            } else {
+                return None;
+            };
+            let end = rest.find(close)?;
+            sink.push(rest[open.len()..end].trim());
+            rest = rest[end + close.len()..].trim_start();
+        }
+        let join = |parts: Vec<&str>| {
+            parts
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Some(Self {
+            stdout: join(stdout),
+            stderr: join(stderr),
+        })
+    }
+
+    /// stdout renders as a markdown system row; stderr as the durable
+    /// `CommandError` module (stdout, when both exist, stays as the row text).
+    fn into_turn(self, turn_id: &str, ordinal: usize, obj: &Value) -> Option<Value> {
+        let items: Vec<Value> = if self.stdout.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "id": format!("{turn_id}-i0"), "kind": "text", "text": self.stdout })]
+        };
+        let error = (!self.stderr.is_empty())
+            .then(|| json!({ "name": "CommandError", "message": self.stderr }));
+        if items.is_empty() && error.is_none() {
+            return None;
+        }
+        Some(turn_json(turn_id, ordinal, "system", items, error, obj))
+    }
+}
+
+/// `/name args` for a persisted slash-command invocation, `None` for any
+/// other text.
+fn slash_command_text(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if !text.starts_with("<command-name>") {
+        return None;
+    }
+    let tag = |name: &str| -> Option<&str> {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let start = text.find(&open)? + open.len();
+        let end = start + text[start..].find(&close)?;
+        Some(text[start..end].trim())
+    };
+    let name = tag("command-name").filter(|name| !name.is_empty())?;
+    let name = if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{name}")
+    };
+    Some(match tag("command-args").filter(|args| !args.is_empty()) {
+        Some(args) => format!("{name} {args}"),
+        None => name,
+    })
+}
+
+/// A background agent's completion notice (`origin.kind: task-notification`).
+pub(crate) fn is_task_notification_line(obj: &Value) -> bool {
+    obj.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+}
+
+/// The text blocks of a message, joined.
+fn blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Flatten a tool_result block's content (string, or array of text/image
+/// parts) to a string; image parts become the `[image]` placeholder.
 fn tool_result_text(block: &Value) -> String {
     match block.get("content") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(parts)) => parts
             .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .filter_map(|p| match p.get("type").and_then(Value::as_str) {
+                Some("image") => Some(IMAGE_PLACEHOLDER),
+                _ => p.get("text").and_then(Value::as_str),
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
@@ -604,7 +1132,7 @@ fn tool_result_text(block: &Value) -> String {
 /// items `[thinking "pondering", text "first answer"]` must summarize to
 /// `"first answer"`). Every claude summary is a mechanical projection of the
 /// turn's own items, so every claude turn tags `summaryKind: "echo"`.
-fn summarize(items: &[Value]) -> String {
+pub(crate) fn summarize(items: &[Value]) -> String {
     let first_text_of = |kind: &str| -> Option<String> {
         items.iter().find_map(|item| {
             if item.get("kind").and_then(Value::as_str) != Some(kind) {
@@ -643,6 +1171,12 @@ fn summarize(items: &[Value]) -> String {
                 }
                 .to_string();
             }
+            Some("task_delegation") => {
+                if let Some(title) = item.get("title").and_then(Value::as_str) {
+                    return truncate_summary(title);
+                }
+            }
+            Some("context_compaction") => return CONTEXT_COMPACTED_LABEL.to_string(),
             _ => {}
         }
     }
@@ -1118,7 +1652,26 @@ pub(crate) fn build_claude_snapshot_json(
     // rolled back through this server's ledger).
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Value {
-    let turns = parse_transcript_turns(thread_id, transcript);
+    let projection =
+        crate::claude_projection::ClaudeTranscriptProjector::project(thread_id, transcript);
+    build_claude_snapshot_from_projection(session_type, thread_id, projection, revision, rollback)
+}
+
+/// [`build_claude_snapshot_json`] over an already-built projection (the served
+/// snapshot projects off the async runtime, with subagent activity).
+pub(crate) fn build_claude_snapshot_from_projection(
+    session_type: &str,
+    thread_id: &str,
+    projection: crate::claude_projection::ClaudeProjection,
+    revision: i64,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+) -> Value {
+    let crate::claude_projection::ClaudeProjection {
+        turns,
+        diffs,
+        token_usage,
+        transcript_line_uuids,
+    } = projection;
     let latest_turn_id = turns
         .last()
         .and_then(|t| t.get("turnId"))
@@ -1142,6 +1695,8 @@ pub(crate) fn build_claude_snapshot_json(
             "approvals": false,
             "questions": false,
             "fork": false,
+            // The changed-files panel shows when the transcript edited files.
+            "diffs": !diffs.is_empty(),
             // Kata 1wxv Task 5: STATIC stamps (freshclaude AND kilroy — no SDK
             // capability query exists); an old-CLI runtime failure classifies to
             // UNSUPPORTED_CAPABILITY refusal at op time, never at stamp time.
@@ -1156,14 +1711,17 @@ pub(crate) fn build_claude_snapshot_json(
                 "sandbox": "unsupported",
             },
         },
-        "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
+        "tokenUsage": token_usage,
         "pendingApprovals": [],
         "pendingQuestions": [],
         "worktrees": [],
-        "diffs": [],
+        "diffs": diffs,
         "childThreads": [],
         "turns": turns,
-        "extensions": {},
+        // The newest transcript line uuids, including lines that produce no
+        // turn (absorbed results, hidden bookkeeping): the live tail's landing
+        // check (transcript-live plan §4.4).
+        "extensions": { "claude": { "transcriptLineUuids": transcript_line_uuids } },
     });
     if let Some(record) = rollback {
         // The marker bucket is LEDGER-SOURCED (r3): the record's entries union —
@@ -1192,25 +1750,51 @@ pub(crate) async fn get_claude_snapshot(
     thread_id: &str,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, ClaudeSnapshotError> {
-    // Cannot check => must not deny (the attach arm in claude.rs treats this exact
-    // state as Transient): with NO resolvable store root we cannot assert the
-    // session is gone, so this is Io (-> 500), never NotFound (-> 404 lost).
-    if claude_home_candidates().is_empty() {
-        return Err(ClaudeSnapshotError::Io(
-            "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/HOME all unset)".into(),
-        ));
-    }
-    // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
-    let path = locate_transcript(thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
-    let mtime_ms = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64);
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
-    let mut snapshot = build_claude_snapshot_json(session_type, thread_id, &content, 0, rollback);
+    get_claude_snapshot_in(&claude_home_candidates(), session_type, thread_id, rollback).await
+}
+
+/// [`get_claude_snapshot`] over explicit store roots (the production caller
+/// passes [`claude_home_candidates`]; tests pass temp roots, no env mutation).
+async fn get_claude_snapshot_in(
+    roots: &[PathBuf],
+    session_type: &str,
+    thread_id: &str,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+) -> Result<Value, ClaudeSnapshotError> {
+    let path = match locate_transcript_state_in(roots, thread_id) {
+        TranscriptLocation::Found(path) => path,
+        // Clean miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
+        TranscriptLocation::Absent => return Err(ClaudeSnapshotError::NotFound),
+        // Cannot check => must not deny (the attach arm in claude.rs treats this
+        // exact state as Transient): no store root, or a store read error, cannot
+        // assert the session is gone, so this is Io (-> 500), never NotFound
+        // (-> 404 lost).
+        TranscriptLocation::Unreadable(error) => {
+            log_transcript_unreadable("snapshot", thread_id, &error);
+            return Err(ClaudeSnapshotError::Io(error.to_string()));
+        }
+    };
+    // Reading the transcript and its subagent files, and projecting them, is
+    // blocking work: keep it off the async runtime.
+    let thread = thread_id.to_string();
+    let (mtime_ms, projection) = tokio::task::spawn_blocking(move || {
+        let mtime_ms = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        let content = std::fs::read_to_string(&path)?;
+        let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
+        let projection = crate::claude_projection::ClaudeTranscriptProjector::project_with(
+            &thread, &content, &subagents,
+        );
+        Ok::<_, std::io::Error>((mtime_ms, projection))
+    })
+    .await
+    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?
+    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
+    let mut snapshot =
+        build_claude_snapshot_from_projection(session_type, thread_id, projection, 0, rollback);
     let turn_count = snapshot["turns"]
         .as_array()
         .map(|a| a.len() as i64)
@@ -1246,7 +1830,7 @@ pub(crate) fn apply_pending_overlay(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1366,6 +1950,373 @@ mod tests {
         assert_eq!(
             transcript_cwd_bounded(&home.path().join("absent.jsonl")),
             None
+        );
+    }
+
+    // -- G28: ONE shared claude store-root rule (pure seam) ------------------
+    //
+    // `claude_home_candidates_from` takes the env lookup AND the platform home
+    // as parameters, so these tests never mutate process-global env. The
+    // platform home is `std::env::home_dir()` in production — USERPROFILE on
+    // Windows, HOME-else-passwd on POSIX — exactly the real CLI's
+    // `os.homedir()`; the raw HOME variable is never consulted here.
+
+    fn env_of(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(&'static str, &'static str)> = pairs.to_vec();
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn store_roots_use_the_platform_home_when_home_is_unset() {
+        // POSIX passwd fallback shape: HOME unset, the platform home still
+        // resolves (here injected as `/h`).
+        assert_eq!(
+            claude_home_candidates_from(env_of(&[]), Some(PathBuf::from("/h"))),
+            vec![PathBuf::from("/h").join(".claude")]
+        );
+    }
+
+    #[test]
+    fn store_roots_follow_the_injected_platform_home_never_the_raw_home_var() {
+        // Windows shape: the CLI resolves `~` through USERPROFILE and never
+        // reads HOME. A stray HOME value must not add (or replace) a root.
+        let profile = PathBuf::from(r"C:\Users\u");
+        assert_eq!(
+            claude_home_candidates_from(env_of(&[]), Some(profile.clone())),
+            vec![profile.join(".claude")]
+        );
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("HOME", "/never-consulted")]),
+                Some(profile.clone())
+            ),
+            vec![profile.join(".claude")],
+            "the raw HOME variable is not a store-root input"
+        );
+    }
+
+    #[test]
+    fn store_roots_are_ordered_config_dir_then_claude_home_then_platform_home_deduped() {
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("CLAUDE_CONFIG_DIR", "/cfg"), ("CLAUDE_HOME", "/ch")]),
+                Some(PathBuf::from("/h")),
+            ),
+            vec![
+                PathBuf::from("/cfg"),
+                PathBuf::from("/ch"),
+                PathBuf::from("/h").join(".claude"),
+            ]
+        );
+        // A CLAUDE_CONFIG_DIR naming the default root is scanned ONCE.
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("CLAUDE_CONFIG_DIR", "/h/.claude"), ("CLAUDE_HOME", "/ch")]),
+                Some(PathBuf::from("/h")),
+            ),
+            vec![PathBuf::from("/h/.claude"), PathBuf::from("/ch")]
+        );
+        // Empty values never produce a bogus relative root.
+        assert_eq!(
+            claude_home_candidates_from(
+                env_of(&[("CLAUDE_CONFIG_DIR", ""), ("CLAUDE_HOME", "")]),
+                Some(PathBuf::new()),
+            ),
+            Vec::<PathBuf>::new()
+        );
+        // Nothing resolvable at all: no roots (the "cannot check" state).
+        assert_eq!(
+            claude_home_candidates_from(env_of(&[]), None),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    // -- G28: three-state transcript locator --------------------------------
+    //
+    // Found / Absent / Unreadable: only a CLEAN miss everywhere is Absent
+    // (the positive "session gone" evidence); an IO failure is Unreadable and
+    // must never read as gone. Hermetic: explicit temp roots, no env.
+
+    const LOCATE_ID: &str = "abcdabcd-abcd-4bcd-8bcd-abcdabcdabcd";
+
+    /// Makes `dir` unreadable (mode 000) and restores it on drop so the
+    /// TempDir cleanup works even if an assertion panics. `None` when the
+    /// process bypasses permission bits (root / CAP_DAC_OVERRIDE): those
+    /// runs cannot produce the EACCES under test, so the caller skips.
+    #[cfg(unix)]
+    pub(crate) struct UnreadableDir(PathBuf);
+    #[cfg(unix)]
+    impl UnreadableDir {
+        pub(crate) fn make(dir: &Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let guard = Self(dir.to_path_buf());
+            if std::fs::read_dir(dir).is_ok() {
+                eprintln!("skipping: euid bypasses permission checks");
+                return None;
+            }
+            Some(guard)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for UnreadableDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn plant(root: &Path, project: &str, id: &str) -> PathBuf {
+        let dir = root.join("projects").join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&file, "{}\n").unwrap();
+        file
+    }
+
+    fn io_kind(location: &TranscriptLocation) -> Option<std::io::ErrorKind> {
+        match location {
+            TranscriptLocation::Unreadable(LocateError::Io { kind, .. }) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn locate_state_reads_a_missing_projects_dir_as_absent() {
+        let home = temp_home(); // no projects/ at all
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Absent
+        );
+        // A store root that does not exist at all is also a clean miss.
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().join("never-created")], LOCATE_ID),
+            TranscriptLocation::Absent
+        );
+    }
+
+    #[test]
+    fn locate_state_with_no_store_root_is_unreadable_never_absent() {
+        assert_eq!(
+            locate_transcript_state_in(&[], LOCATE_ID),
+            TranscriptLocation::Unreadable(LocateError::NoStoreRoot)
+        );
+    }
+
+    #[test]
+    fn locate_state_finds_the_direct_and_the_one_level_nested_layouts() {
+        let home = temp_home();
+        let direct = plant(home.path(), "-repo", LOCATE_ID);
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Found(direct)
+        );
+        let nested_id = "dcbadcba-dcba-4cba-8cba-dcbadcbadcba";
+        let nested_dir = home.path().join("projects").join("-repo").join("sessions");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join(format!("{nested_id}.jsonl"));
+        std::fs::write(&nested, "{}\n").unwrap();
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], nested_id),
+            TranscriptLocation::Found(nested)
+        );
+        // Traversal-shaped ids are a clean miss, never a probe outside the store.
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], "../etc/passwd"),
+            TranscriptLocation::Absent
+        );
+    }
+
+    #[test]
+    fn locate_state_ignores_a_regular_file_in_the_projects_dir() {
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("-not-a-dir"), "i am a file\n").unwrap();
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Absent
+        );
+    }
+
+    /// An id the OS rejects as a file name (too long for one path component,
+    /// or carrying a NUL) cannot name a transcript, so a store that holds
+    /// project dirs answers a clean Absent -- never Unreadable, which would
+    /// blame the store for what is wrong with the id.
+    #[test]
+    fn locate_state_reads_an_id_no_file_can_be_named_as_absent() {
+        let home = temp_home();
+        // Real project dirs, both layouts: every candidate probe runs.
+        plant(home.path(), "-repo", LOCATE_ID);
+        std::fs::create_dir_all(home.path().join("projects").join("-repo").join("nested")).unwrap();
+        let too_long = "a".repeat(300);
+        for id in [too_long.as_str(), "abcd\0efgh"] {
+            assert_eq!(
+                locate_transcript_state_in(&[home.path().to_path_buf()], id),
+                TranscriptLocation::Absent,
+                "id {:?}... names no possible file",
+                &id[..id.len().min(12)]
+            );
+        }
+    }
+
+    /// The one error sink every scan branch reports to (listing a dir, reading
+    /// one listed entry, probing a candidate): expected absence -- including an
+    /// entry deleted between the listing and its type check -- is never an
+    /// error, and the FIRST real error is the one kept.
+    #[test]
+    fn scan_errors_ignore_expected_absence_and_keep_the_first_real_error() {
+        use std::io::{Error, ErrorKind};
+        let mut errors = ScanErrors::default();
+        errors.remember(Error::from(ErrorKind::NotFound));
+        errors.remember(Error::from(ErrorKind::NotADirectory));
+        assert!(errors.first().is_none(), "expected absence is a clean miss");
+        errors.remember(Error::from(ErrorKind::PermissionDenied));
+        errors.remember(Error::from(ErrorKind::NotFound));
+        errors.remember(Error::from(ErrorKind::Other));
+        assert_eq!(
+            errors.first().map(Error::kind),
+            Some(ErrorKind::PermissionDenied)
+        );
+    }
+
+    /// One listed entry failing must not hide the others: an entry that
+    /// vanished before its type check (`NotFound`) is a clean miss, an entry
+    /// that could not be read is remembered, and every readable directory
+    /// after either is still returned for the scan to probe.
+    #[test]
+    fn subdir_listing_keeps_going_past_a_bad_entry_and_skips_a_vanished_one() {
+        use std::io::{Error, ErrorKind};
+        let mut errors = ScanErrors::default();
+        let dirs = collect_subdirs(
+            [
+                Ok((true, PathBuf::from("projects/-b"))),
+                Err(Error::from(ErrorKind::NotFound)),
+                Ok((false, PathBuf::from("projects/stray.txt"))),
+                Err(Error::from(ErrorKind::PermissionDenied)),
+                Ok((true, PathBuf::from("projects/-a"))),
+            ],
+            &mut errors,
+        );
+        assert_eq!(
+            dirs,
+            [PathBuf::from("projects/-a"), PathBuf::from("projects/-b")],
+            "every readable directory survives a bad entry, sorted"
+        );
+        assert_eq!(
+            errors.first().map(Error::kind),
+            Some(ErrorKind::PermissionDenied),
+            "the vanished entry is not an error; the unreadable one is"
+        );
+
+        let mut errors = ScanErrors::default();
+        collect_subdirs(
+            [
+                Ok((true, PathBuf::from("projects/-a"))),
+                Err(Error::from(ErrorKind::NotFound)),
+            ],
+            &mut errors,
+        );
+        assert!(
+            errors.first().is_none(),
+            "a listing whose only failure is a vanished entry is clean"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_reports_an_unreadable_projects_dir_as_unreadable() {
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let Some(_locked) = UnreadableDir::make(&projects) else {
+            return;
+        };
+        let location = locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID);
+        assert_eq!(
+            io_kind(&location),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "an EACCES store is unreadable, never absent: {location:?}"
+        );
+        match location {
+            TranscriptLocation::Unreadable(LocateError::Io { root, .. }) => {
+                assert_eq!(root, home.path(), "the error names the failing store root");
+            }
+            other => panic!("expected Unreadable(Io), got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_finds_a_hit_under_a_later_root_despite_an_unreadable_earlier_root() {
+        let bad = temp_home();
+        let good = temp_home();
+        let bad_projects = bad.path().join("projects");
+        std::fs::create_dir_all(&bad_projects).unwrap();
+        let file = plant(good.path(), "-repo", LOCATE_ID);
+        let Some(_locked) = UnreadableDir::make(&bad_projects) else {
+            return;
+        };
+        assert_eq!(
+            locate_transcript_state_in(
+                &[bad.path().to_path_buf(), good.path().to_path_buf()],
+                LOCATE_ID
+            ),
+            TranscriptLocation::Found(file)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_with_one_unreadable_root_and_one_clean_miss_is_unreadable() {
+        let bad = temp_home();
+        let clean = temp_home();
+        let bad_projects = bad.path().join("projects");
+        std::fs::create_dir_all(&bad_projects).unwrap();
+        std::fs::create_dir_all(clean.path().join("projects").join("-other")).unwrap();
+        let Some(_locked) = UnreadableDir::make(&bad_projects) else {
+            return;
+        };
+        for roots in [
+            vec![bad.path().to_path_buf(), clean.path().to_path_buf()],
+            vec![clean.path().to_path_buf(), bad.path().to_path_buf()],
+        ] {
+            let location = locate_transcript_state_in(&roots, LOCATE_ID);
+            assert_eq!(
+                io_kind(&location),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "a miss that could not check every root is not proof of absence: {location:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_state_keeps_scanning_past_an_unreadable_project_dir() {
+        let home = temp_home();
+        let locked_project = home.path().join("projects").join("-a-locked");
+        std::fs::create_dir_all(&locked_project).unwrap();
+        let Some(_locked) = UnreadableDir::make(&locked_project) else {
+            return;
+        };
+        // No hit anywhere else: the locked project dir could hold the nested
+        // transcript, so the answer is Unreadable.
+        let location = locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID);
+        assert_eq!(
+            io_kind(&location),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "{location:?}"
+        );
+        // A hit in a LATER project dir still wins over the remembered error.
+        let file = plant(home.path(), "-b-open", LOCATE_ID);
+        assert_eq!(
+            locate_transcript_state_in(&[home.path().to_path_buf()], LOCATE_ID),
+            TranscriptLocation::Found(file)
         );
     }
 
@@ -1731,21 +2682,47 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_with_no_resolvable_store_root_is_io_not_notfound() {
-        // Cannot check => must not deny: with every store-root env var unset the
-        // server cannot assert the session is gone, so the error must be Io (-> 500),
-        // never NotFound (-> 404 FRESH_AGENT_LOST_SESSION). Env vars are
-        // process-global -- serialize under the shared claude env lock.
-        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-        let _restore = EnvVarsRestore::remove_all(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "HOME"]);
-        assert!(claude_home_candidates().is_empty());
-        let result =
-            get_claude_snapshot("freshclaude", "55555555-5555-4555-8555-555555555555", None).await;
-        match result {
-            Err(ClaudeSnapshotError::Io(msg)) => {
-                assert!(msg.contains("no claude store root resolvable"), "{msg}");
-            }
-            other => panic!("expected Io (cannot-check must not deny), got {other:?}"),
-        }
+        // Cannot check => must not deny: with no store root at all the server
+        // cannot assert the session is gone, so the error must be Io (-> 500),
+        // never NotFound (-> 404 FRESH_AGENT_LOST_SESSION). Driven through the
+        // roots seam: on POSIX the platform home can no longer be emptied via
+        // env (passwd-entry fallback), so "no roots" is an injected input.
+        let result = get_claude_snapshot_in(
+            &[],
+            "freshclaude",
+            "55555555-5555-4555-8555-555555555555",
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ClaudeSnapshotError::Io(_))),
+            "expected Io (cannot-check must not deny), got {result:?}"
+        );
+    }
+
+    /// G28: an unreadable store (EACCES on `projects/`) cannot prove the
+    /// session gone, so the snapshot is Io (-> 500), never NotFound (-> 404
+    /// FRESH_AGENT_LOST_SESSION, which the client folds into "session lost").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_with_an_unreadable_store_is_io_not_notfound() {
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let Some(_locked) = UnreadableDir::make(&projects) else {
+            return;
+        };
+        let result = get_claude_snapshot_in(
+            &[home.path().to_path_buf()],
+            "freshclaude",
+            "55555555-5555-4555-8555-555555555555",
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ClaudeSnapshotError::Io(_))),
+            "expected Io (cannot-check must not deny), got {result:?}"
+        );
     }
 
     /// Unified agent names (Task 2 review, M3): `locate_transcript_selected`
@@ -2452,3 +3429,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "claude_snapshot_real_cli_tests.rs"]
+pub(crate) mod real_cli_tests;

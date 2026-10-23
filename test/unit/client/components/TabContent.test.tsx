@@ -35,6 +35,7 @@ interface TabConfig {
 
 interface StoreOptions {
   defaultNewPane?: 'ask' | 'shell' | 'browser' | 'editor'
+  freshAgentProviders?: typeof defaultSettings.freshAgent.providers
 }
 
 function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
@@ -44,6 +45,9 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
       ...defaultSettings.panes,
       defaultNewPane: options.defaultNewPane || 'ask',
     },
+    ...(options.freshAgentProviders
+      ? { freshAgent: { ...defaultSettings.freshAgent, providers: options.freshAgentProviders } }
+      : {}),
   }
   return configureStore({
     reducer: {
@@ -188,6 +192,50 @@ describe('TabContent', () => {
               provider: 'claude',
               sessionId: '550e8400-e29b-41d4-a716-446655440000',
             },
+          }),
+        }),
+        expect.anything(),
+      )
+    })
+
+    it('restores a no-layout fresh-agent tab on the saved fresh-pane default model and permission mode', () => {
+      const store = createStore([
+        {
+          id: 'tab-1',
+          mode: 'claude',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: '550e8400-e29b-41d4-a716-446655440000',
+          },
+          sessionMetadataByKey: {
+            'claude:550e8400-e29b-41d4-a716-446655440000': {
+              sessionType: 'freshclaude',
+            },
+          },
+        },
+      ], {
+        freshAgentProviders: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'sonnet' },
+            defaultPermissionMode: 'default',
+          },
+        },
+      })
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="tab-1" />
+        </Provider>
+      )
+
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          defaultContent: expect.objectContaining({
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            model: 'sonnet',
+            modelSelection: { kind: 'exact', modelId: 'sonnet' },
+            permissionMode: 'default',
           }),
         }),
         expect.anything(),

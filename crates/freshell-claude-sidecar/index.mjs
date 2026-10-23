@@ -114,6 +114,7 @@ import { isHostedSidecar } from './hosted.mjs'
 import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
 import { BOOT_FAILED_EXIT_CODE, bootOptions, classifyBootError, SIDECAR_PROTOCOL } from './boot.mjs'
 import { usableCommands } from './terminal-commands.mjs'
+import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -156,13 +157,6 @@ function nanoid(size = 21) {
   let id = ''
   for (let i = 0; i < size; i++) id += NANOID_ALPHABET[bytes[i] & 63]
   return id
-}
-
-// ── clean env (server/sdk-bridge.ts:64-66) ──────────────────────────────────
-function createClaudeSdkCleanEnv(env = process.env) {
-  const { CLAUDECODE: _c, ANTHROPIC_API_KEY: apiKey, FRESHELL_CLAUDE_ONECLI_API_KEY: onecliApiKey, ...cleanEnv } = env
-  if (onecliApiKey === '1' && apiKey) cleanEnv.ANTHROPIC_API_KEY = apiKey
-  return cleanEnv
 }
 
 // ── streaming input stream (server/sdk-bridge.ts:274-316) ────────────────────
@@ -818,6 +812,20 @@ rl.on('line', (line) => {
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
 // grandchild is left mid-stream.
 rl.on('close', () => { if (!exiting) { shutdown(); process.exit(0) } })
+// stdout lost (Rust dropped our reader, e.g. a kill aborted its consumer before
+// it wrote the shutdown line): nobody hears us any more, the same request as
+// stdin EOF. Unhandled, the next emit's EPIPE kills node with exit 1 before
+// the SDK query is aborted, and nothing stops the claude CLI: it runs on until
+// it next writes into its own closed pipe or Rust kills the process tree. A
+// sidecar already exiting on its own (a refused boot, an unrequested stream
+// end) has closed its query and keeps its own exit code: its flush wait
+// (exitWithoutSession) still ends the process.
+process.stdout.on('error', (err) => {
+  log('warn', 'stdout.closed', { code: err?.code ?? null, error: errorText(err) })
+  if (exiting) return
+  shutdown()
+  process.exit(0)
+})
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 process.on('SIGINT', () => { shutdown(); process.exit(0) })
 

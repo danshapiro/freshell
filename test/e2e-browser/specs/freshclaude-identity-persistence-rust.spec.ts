@@ -191,7 +191,12 @@ async function persistedFreshAgentIdentity(page: Page, tabId: string): Promise<s
   }, tabId)
 }
 
-/** Send one chat turn in the last fresh-agent pane and wait for idle. */
+/** Send one chat turn in the last fresh-agent pane and wait for idle. For a
+ * claude pane the idle wait does not prove the turn ran: the client never marks
+ * a claude pane running on send (only opencode), and the composer hands the
+ * message to its send queue, so the wait can return before the message has
+ * left the page. Callers prove the turn ran from the fixture's transcript
+ * (`expectFixtureTranscript`). */
 async function sendFreshAgentTurn(
   page: Page,
   harness: TestHarness,
@@ -221,6 +226,106 @@ async function sendFreshAgentTurn(
       timeout: 30_000,
     })
     .toBe('idle')
+}
+
+/** The fake sidecar's transcript for `durable` (its ground truth for what
+ * reached it): the user texts in order and the number of assistant replies. */
+async function readFixtureTranscript(
+  homeDir: string,
+  durable: string,
+): Promise<{ userTexts: string[]; assistantTurns: number }> {
+  const transcriptFile = path.join(homeDir, '.claude', 'projects', '-fixture', `${durable}.jsonl`)
+  const lines = (await fs.readFile(transcriptFile, 'utf-8'))
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+  return {
+    userTexts: lines
+      .filter((l: any) => l.type === 'user')
+      .map((l: any) => l.message?.content?.[0]?.text),
+    assistantTurns: lines.filter((l: any) => l.type === 'assistant').length,
+  }
+}
+
+/** The page's freshAgent.send frames since the last clear, each with when it
+ * left the page relative to `since` (negative: before), and whether the server
+ * accepted it. */
+async function freshAgentSendsSince(harness: TestHarness, since: number): Promise<unknown[]> {
+  const acceptedRequestIds = new Set(
+    (await harness.getReceivedWsMessages())
+      .filter((m: any) => m?.type === 'freshAgent.send.accepted')
+      .map((m: any) => m.requestId),
+  )
+  return (await harness.getSentWsMessagesWithTimestamps())
+    .filter((m: any) => m?.type === 'freshAgent.send')
+    .map((m: any) => ({
+      requestId: m.requestId,
+      sessionId: m.sessionId,
+      observedEpoch: m.observedEpoch,
+      observedGeneration: m.observedGeneration,
+      text: m.text,
+      sentMsAfterFirstRead: typeof m.__sentAt === 'number' ? m.__sentAt - since : null,
+      accepted: acceptedRequestIds.has(m.requestId),
+    }))
+}
+
+/** Wait until the fixture's transcript holds every one of `userTexts` and at
+ * least `minAssistantTurns` replies. It polls because sendFreshAgentTurn can
+ * return before the message reached the sidecar; a message that never arrives
+ * still fails after the timeout, and the failure carries the page's sends, the
+ * error frames it received, and the server's refusal log lines.
+ *
+ * When the first read misses a message that arrives later, the wait logs a
+ * `freshclaude_identity.transcript_caught_up` line with how long it took and
+ * when the page sent each message relative to that first read. A message sent
+ * after the first read was still in the page when the caller's send helper
+ * returned; one sent before it was on its way through the server. */
+async function expectFixtureTranscript(
+  harness: TestHarness,
+  server: RustServer,
+  homeDir: string,
+  durable: string,
+  expected: { userTexts: string[]; minAssistantTurns?: number },
+): Promise<void> {
+  const minAssistantTurns = expected.minAssistantTurns ?? 0
+  const firstReadAt = Date.now()
+  let firstRead: string[] | undefined
+  try {
+    await expect
+      .poll(async () => {
+        const { userTexts, assistantTurns } = await readFixtureTranscript(homeDir, durable)
+        firstRead ??= userTexts
+        return { userTexts, enoughAssistantTurns: assistantTurns >= minAssistantTurns }
+      }, { timeout: 30_000 })
+      .toEqual({
+        userTexts: expect.arrayContaining(expected.userTexts),
+        enoughAssistantTurns: true,
+      })
+  } catch (error) {
+    const sends = await freshAgentSendsSince(harness, firstReadAt)
+    const errorFrames = (await harness.getReceivedWsMessages()).filter((m: any) => m?.type === 'error')
+    const { stdout, stderr } = server.capturedOutput()
+    const refusals = `${stdout}\n${stderr}`
+      .split('\n')
+      .filter((line) => /send_refused|op_guard\.refused|SESSION_RESERVED/.test(line))
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\n`
+        + `first transcript read: ${JSON.stringify(firstRead)}\n`
+        + `freshAgent.send frames: ${JSON.stringify(sends)}\n`
+        + `error frames received: ${JSON.stringify(errorFrames)}\n`
+        + `server refusal log lines: ${JSON.stringify(refusals.slice(-20))}`,
+    )
+  }
+  if (!expected.userTexts.every((text) => firstRead?.includes(text))) {
+    console.log(JSON.stringify({
+      severity: 'info',
+      event: 'freshclaude_identity.transcript_caught_up',
+      waitedMs: Date.now() - firstReadAt,
+      firstRead,
+      sends: await freshAgentSendsSince(harness, firstReadAt),
+    }))
+  }
 }
 
 // --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
@@ -365,18 +470,10 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // actually received post-restart. Both turns' user text must be
       // present as SEPARATE lines and there must be two assistant replies --
       // this cannot be satisfied by leftover pre-restart DOM state.
-      const transcriptFile = path.join(info.homeDir, '.claude', 'projects', '-fixture', `${originalDurable}.jsonl`)
-      const transcriptLines = (await fs.readFile(transcriptFile, 'utf-8'))
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line))
-      const assistantTurnCount = transcriptLines.filter((l: any) => l.type === 'assistant').length
-      expect(assistantTurnCount, JSON.stringify(transcriptLines)).toBeGreaterThanOrEqual(2)
-      const userTexts = transcriptLines
-        .filter((l: any) => l.type === 'user')
-        .map((l: any) => l.message?.content?.[0]?.text)
-      expect(userTexts).toEqual(expect.arrayContaining(['first turn before reload', 'second turn after restart']))
+      await expectFixtureTranscript(harness, server, info.homeDir, originalDurable, {
+        userTexts: ['first turn before reload', 'second turn after restart'],
+        minAssistantTurns: 2,
+      })
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
@@ -444,16 +541,9 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // Liveness on the naturally-persisted identity: the conversation
       // continues (disk transcript is the fixture's ground truth).
       await sendFreshAgentTurn(page, harness, tabIdAfterReload!, 'no-flush second turn')
-      const transcriptFile = path.join(info.homeDir, '.claude', 'projects', '-fixture', `${originalDurable}.jsonl`)
-      const transcriptLines = (await fs.readFile(transcriptFile, 'utf-8'))
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line))
-      const userTexts = transcriptLines
-        .filter((l: any) => l.type === 'user')
-        .map((l: any) => l.message?.content?.[0]?.text)
-      expect(userTexts).toEqual(expect.arrayContaining(['no-flush first turn', 'no-flush second turn']))
+      await expectFixtureTranscript(harness, server, info.homeDir, originalDurable, {
+        userTexts: ['no-flush first turn', 'no-flush second turn'],
+      })
 
       // No identity-losing re-create anywhere in the reload window.
       const sent = await harness.getSentWsMessages()
@@ -526,16 +616,9 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
 
       // Liveness in the cold context: the SAME conversation continues.
       await sendFreshAgentTurn(coldPage, coldHarness, coldTabId!, 'cold-open second turn')
-      const transcriptFile = path.join(info.homeDir, '.claude', 'projects', '-fixture', `${originalDurable}.jsonl`)
-      const transcriptLines = (await fs.readFile(transcriptFile, 'utf-8'))
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line))
-      const userTexts = transcriptLines
-        .filter((l: any) => l.type === 'user')
-        .map((l: any) => l.message?.content?.[0]?.text)
-      expect(userTexts).toEqual(expect.arrayContaining(['cold-open first turn', 'cold-open second turn']))
+      await expectFixtureTranscript(coldHarness, server, info.homeDir, originalDurable, {
+        userTexts: ['cold-open first turn', 'cold-open second turn'],
+      })
     } finally {
       await coldContext?.close().catch(() => {})
       await server.stop()

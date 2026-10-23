@@ -5080,6 +5080,56 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('creates a Freshclaude pane on a saved catalog-only default with no effort when its saved levels are empty', async () => {
+    const store = createStore()
+    store.dispatch(previewServerSettingsPatch({
+      freshAgent: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'claude-haiku-x' },
+            modelEffortLevels: { modelId: 'claude-haiku-x', levels: [] },
+            effort: 'high',
+          },
+        },
+      },
+    }))
+    // The content PaneContainer seeds from that saved default.
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-catalog-only-claude-default',
+        status: 'creating',
+        modelSelection: { kind: 'exact', modelId: 'claude-haiku-x' },
+        model: 'claude-haiku-x',
+        modelEffortLevels: [],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toContainEqual(expect.objectContaining({
+        type: 'freshAgent.create',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        model: 'claude-haiku-x',
+      }))
+    })
+    const create = sentFreshAgentMessages('freshAgent.create')
+      .find((frame) => frame.requestId === 'req-catalog-only-claude-default')
+    expect(create).toBeDefined()
+    // Never the opus table's 'high': the saved model declares no levels.
+    expect(create?.effort).toBeUndefined()
+  })
+
   it('sends Freshopencode messages with modelSelection when pane model is absent', async () => {
     const store = createStore()
     store.dispatch(initLayout({

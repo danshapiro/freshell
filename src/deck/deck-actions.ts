@@ -1,6 +1,5 @@
 import { getWsClient } from '@/lib/ws-client'
-import { setActiveTab } from '@/store/tabsSlice'
-import { dismissTabGreen } from '@/store/turnCompletionAttention'
+import { activateTabFromSurface } from '@/store/turnCompletionAttention'
 import { sendTerminalInterrupt } from '@/lib/terminal-interrupt'
 import type { AppDispatch, RootState } from '@/store/store'
 import type { ApproveTarget, StopTarget } from './deck-selectors'
@@ -8,10 +7,7 @@ import type { ApproveTarget, StopTarget } from './deck-selectors'
 export type DeckStore = { getState(): RootState; dispatch: AppDispatch }
 
 export function focusTabFromDeck(store: DeckStore, tabId: string): void {
-  if (store.getState().settings.settings.panes.attentionDismiss === 'click') {
-    store.dispatch(dismissTabGreen(tabId))
-  }
-  store.dispatch(setActiveTab(tabId))
+  store.dispatch(activateTabFromSurface(tabId))
 }
 
 export function sendDeckApproval(target: ApproveTarget): void {
