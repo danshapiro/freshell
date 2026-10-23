@@ -167,6 +167,9 @@ function toReconcilePane(tabId: string, paneId: string, content: TerminalPaneCon
     ...(content.serverInstanceId ? { serverInstanceId: content.serverInstanceId } : {}),
     ...(sessionRef ? { sessionRef } : {}),
     ...(content.status ? { status: content.status } : {}),
+    // A restarted server reconstructing a managed soul's row rejoins a
+    // zero-turn pane's name through its persisted pre-durable handle.
+    ...(content.namingHandle ? { namingHandle: content.namingHandle } : {}),
   }
 }
 

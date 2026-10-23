@@ -108,7 +108,10 @@ pub(crate) async fn bind_ws_terminal_naming(
 
 /// Bind a managed facade row the supervisor just handed back (reconcile or
 /// compatibility adoption after a web restart): the soul's native session
-/// is the durable target when it has one.
+/// is the durable target when it has one. A zero-turn soul's native session
+/// may be prospective (Claude's preallocated `--session-id`) with no record
+/// yet; `naming_handle`, the pane's persisted pre-durable handle, then lets
+/// the row rejoin the pending record that holds the pane's name.
 pub(crate) async fn bind_adopted_managed_row(
     state: &WsState,
     descriptor: &freshell_terminal::registry::ManagedTerminalDescriptor,
@@ -137,11 +140,15 @@ pub(crate) fn still_pending_handle(state: &WsState, terminal_id: &str) -> Option
 
 /// The reconcile pre-pass's managed adoption: reconstruct the supervisor's
 /// facade for `terminal_id` (titled by its mode, never "Shell") and bind its
-/// saved name. Answers whether a managed row now exists for the id.
+/// saved name. `naming_handle` is the pane's persisted pre-durable handle
+/// (the reconcile entry's): a zero-turn soul's native session has no record
+/// yet, and its name still lives under that handle. Answers whether a
+/// managed row now exists for the id.
 pub(crate) async fn adopt_managed_row_for_reconcile(
     state: &WsState,
     terminal_id: &str,
     create_request_id: Option<String>,
+    naming_handle: Option<String>,
 ) -> Result<bool, String> {
     let adopted = state
         .registry
@@ -151,7 +158,7 @@ pub(crate) async fn adopt_managed_row_for_reconcile(
         .await?;
     if adopted {
         if let Some(descriptor) = state.registry.managed_descriptor(terminal_id) {
-            bind_adopted_managed_row(state, &descriptor, None).await;
+            bind_adopted_managed_row(state, &descriptor, naming_handle).await;
         }
     }
     Ok(adopted)

@@ -1455,6 +1455,7 @@ mod tests {
             }),
             resume_session_id: None,
             status: None,
+            naming_handle: None,
         };
         let verdicts = derive_verdicts(
             &deps,

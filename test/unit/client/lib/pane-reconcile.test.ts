@@ -233,6 +233,30 @@ describe('buildReconcileRequest', () => {
     expect(pane.resumeSessionId).toBeUndefined()
   })
 
+  it("carries the pane's persisted namingHandle, so a restarted server's managed adoption rejoins a zero-turn name", () => {
+    let state = emptyPanesState()
+    // A zero-turn managed Claude pane renamed before its first message: its
+    // sessionRef is the preallocated (record-less) session, its name lives
+    // under the pending handle.
+    state = addTerminalPane(state, 'tab1', 'zero-turn', {
+      mode: 'claude',
+      terminalId: 't-soul',
+      status: 'running',
+      soulId: 'soul-1',
+      sessionRef: { provider: 'claude', sessionId: 'prealloc-1' },
+      namingHandle: 'nh-zero-turn',
+    } as Partial<TerminalPaneContent>)
+    state = addTerminalPane(state, 'tab2', 'no-handle', { mode: 'claude', terminalId: 't-2' })
+
+    const req = buildReconcileRequest(asRootState(state))!
+    const zeroTurn = req.panes.find((p) => p.paneKey === paneKeyFor('tab1', 'zero-turn'))
+    expect(zeroTurn?.namingHandle).toBe('nh-zero-turn')
+    expect(zeroTurn?.sessionRef).toEqual({ provider: 'claude', sessionId: 'prealloc-1' })
+    const noHandle = req.panes.find((p) => p.paneKey === paneKeyFor('tab2', 'no-handle'))
+    expect(noHandle).toBeDefined()
+    expect(noHandle).not.toHaveProperty('namingHandle')
+  })
+
   it('never promotes a shell-mode legacy resumeSessionId (a stateless shell has no durable identity)', () => {
     let state = emptyPanesState()
     state = addTerminalPane(state, 'tab_1', 'pane_1', {
