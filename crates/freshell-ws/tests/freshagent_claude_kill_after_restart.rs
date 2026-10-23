@@ -50,7 +50,7 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 /// A minimal scripted fake claude sidecar (production wire protocol only):
 /// `create` answers `created` with a fresh placeholder and then emits
-/// `sdk.session.init` echoing `resumeSessionId` as the durable cli id (the
+/// `sdk.session.init` echoing the resume boot's id as the durable cli id (the
 /// resume-continuity shape) so the ADOPTION path runs its real fold —
 /// cli_index insert, binding write, and (round 6) the alias-tombstone mint
 /// write. `shutdown` exits (the kill's graceful teardown drives it).
@@ -72,8 +72,8 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-kar-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
-    const cliSessionId = msg.resumeSessionId || '00000000-0000-4000-8000-0000000000ff'
+    process.stdout.write(JSON.stringify({ type: 'created', sessionId, protocol: 2 }) + '\n')
+    const cliSessionId = msg.boot?.resume || '00000000-0000-4000-8000-0000000000ff'
     console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
     console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
   } else if (msg.type === 'shutdown') {

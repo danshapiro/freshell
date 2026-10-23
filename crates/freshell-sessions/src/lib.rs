@@ -52,7 +52,9 @@ pub use meta::{CodexTaskEventSnapshot, ParsedSessionMeta, TokenSummary};
 pub use name_evidence::{
     is_default_or_derived_name, is_provider_placeholder_title, NameEvidenceContext,
 };
-pub use parse::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
+pub use parse::{
+    parse_codex_session_content, parse_session_content, ClaudeUsageAccumulator, ParseSessionOptions,
+};
 pub use search::{extract_snippet, search_session_file, FileSearchMatch, FileSearchTier};
 
 #[cfg(test)]

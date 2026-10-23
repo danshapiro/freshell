@@ -217,3 +217,33 @@ describe('RustServer stripEnvPrefixes', () => {
     }
   }, 600_000)
 })
+
+describe('RustServer owned-home isolation', () => {
+  // The fixture always runs its server under the owned HOME with provider
+  // homes beneath it (applyIsolatedHomeEnvironment), so an options.env entry
+  // for one of those keys can never take effect. Silently dropping it once
+  // let a spec poll a CODEX_HOME the fake app-server never wrote; start()
+  // must refuse such an override instead, before anything is spawned.
+  it('refuses an options.env provider home the isolation would replace', async () => {
+    const server = new RustServer({ env: { CODEX_HOME: '/tmp/not-the-owned-home/codex-home' } })
+    let spawnedPid: number | undefined
+    try {
+      const outcome = await server.start().then(
+        (info) => {
+          spawnedPid = info.pid
+          return 'started'
+        },
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      )
+      expect(outcome).toMatch(/CODEX_HOME/)
+      expect(outcome).toMatch(/\.codex/)
+      expect(spawnedPid).toBeUndefined()
+      // The refused start leaves nothing behind: the owned HOME it named is gone.
+      const ownedHome = /owned HOME \(([^)]+)\)/.exec(outcome)?.[1]
+      expect(ownedHome).toEqual(expect.any(String))
+      expect(fs.existsSync(ownedHome!)).toBe(false)
+    } finally {
+      await server.stop().catch(() => {})
+    }
+  }, 600_000)
+})

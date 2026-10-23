@@ -9,14 +9,19 @@
 //! mutation — including initialization, bookkeeping and receipts without
 //! visible text changes — advances `documentGeneration`.
 //!
-//! Strict cross-process transaction policy: a stable private sidecar
+//! Strict cross-process transaction policy, under local serialization: this
+//! process's transactions first take a FIFO turn on the store's local queue,
+//! and only the turn holder touches the stable private sidecar
 //! (`.session-names.lock`, opened create+read+write, never replaced or
-//! unlinked) is `try_lock`ed on a fresh private handle per transaction,
+//! unlinked). It is `try_lock`ed on a fresh private handle per transaction,
 //! retrying contention for at most one monotonic second before
-//! [`NameError::LockUnavailable`]. Under that lock the complete current
-//! document is re-read and validated, any newly encountered generation's
-//! durability is reconciled (file + parent sync) before adoption or
-//! mutation, the decision is applied, and the replacement is written with
+//! [`NameError::LockUnavailable`] — so that bounded budget measures only
+//! contention with another participant (normally another process), never a
+//! wait behind this store's own (bounded-IO) transactions. Under that lock
+//! the complete current document is re-read and validated, any newly
+//! encountered generation's durability is reconciled (file + parent sync)
+//! before adoption or mutation, the decision is applied, and the
+//! replacement is written with
 //! `freshell_ws::tabs_persist::atomic_write_durable` (sibling temp, file
 //! sync, rename, Unix parent sync) BEFORE the read model swaps and anything
 //! publishes. Pre-replace failures leave the old state intact
@@ -27,7 +32,9 @@
 //! document fences every operation instead of silently reinitializing over
 //! accepted names. The executing blocking-IO owner retains its guard until
 //! completion even if an outer caller stops waiting (transactions run on
-//! detached `spawn_blocking` tasks).
+//! detached `spawn_blocking` tasks), and releasing the guard unlocks the
+//! sidecar explicitly, so a child process forked mid-transaction (which
+//! holds an inherited descriptor until it execs) never keeps it locked.
 //!
 //! `session.name.updated` publishes only after successful commit/adoption,
 //! in local generation order (publication happens while the lock is held).
@@ -140,7 +147,10 @@ const LOCK_FILE_NAME: &str = ".session-names.lock";
 const WORKER_LOCK_FILE_NAME: &str = ".session-names-worker.lock";
 /// Contention retry cadence for the strict document lock.
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// The bounded monotonic retry budget before `LockUnavailable`.
+/// The bounded monotonic retry budget before `LockUnavailable` — spent only
+/// on contention with another participant (this store's own transactions
+/// queue on its local turn first). A local-turn wait that reaches this long
+/// logs `session_names.local_turn_slow` while the caller is still queued.
 const LOCK_RETRY_BUDGET: Duration = Duration::from_secs(1);
 /// Hard accepted-name cap: 200 Unicode scalar values.
 const MAX_NAME_SCALARS: usize = 200;
@@ -587,6 +597,9 @@ struct NamesCore {
     tmp_path: PathBuf,
     lock_path: PathBuf,
     worker_lock_path: PathBuf,
+    /// Local serialization: every transaction of this store takes a turn
+    /// here (FIFO) before contending for the cross-process sidecar lock.
+    local_turn: Arc<tokio::sync::Mutex<()>>,
     view: RwLock<Arc<Adopted>>,
     /// Name-reliability Task 11: when the view was last confirmed against
     /// the whole document (bounds how long an equal stamp is trusted).
@@ -596,6 +609,10 @@ struct NamesCore {
     /// persisted (the sweep maintenance batch persists them).
     staged_baselines: Arc<StagedNativeBaselines>,
 }
+
+/// Proof that the holder owns this store's local transaction turn; the strict
+/// runner requires it, so no transaction reaches the sidecar lock unqueued.
+type LocalTurn = tokio::sync::OwnedMutexGuard<()>;
 
 impl NamesCore {
     fn current_view(&self) -> Arc<Adopted> {
@@ -634,7 +651,43 @@ pub struct SessionNames {
 // Tasks 3–4 seam: no caller until the background worker lands.
 #[allow(dead_code)]
 pub(crate) struct BackgroundGuard {
-    _file: std::fs::File,
+    _lock: HeldSidecarLock,
+}
+
+/// A held `flock` on one of the store's sidecar lock files.
+///
+/// The lock belongs to the open file description, and every descriptor that
+/// shares that description keeps it alive. A child process forked by ANY
+/// thread of this server (PTYs, provider sidecars, Git) while the lock is
+/// held inherits such a descriptor and keeps it until the child execs, so
+/// closing only this process's descriptor would leave the lock held after
+/// the transaction (or worker hold) has ended — another participant, or
+/// this store's own next transaction, would find it busy. Dropping the
+/// guard therefore unlocks the description explicitly, which releases it
+/// for every descriptor that shares it, and only then closes the handle.
+struct HeldSidecarLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for HeldSidecarLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            // Closing the handle below still releases the lock once every
+            // inherited descriptor is gone; report the slower path.
+            tracing::warn!(
+                target: "freshell_server::session_names",
+                op = "unlock_sidecar",
+                name_ref = "-",
+                revision = 0,
+                class = "sidecar_unlock_failed",
+                lock_path = %self.path.display(),
+                error = %error,
+                "session_names.sidecar_unlock_failed: explicit unlock failed; the lock \
+                 releases when the last inherited descriptor closes"
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for BackgroundGuard {
@@ -667,6 +720,7 @@ impl SessionNames {
             lock_path: canonical.join(LOCK_FILE_NAME),
             worker_lock_path: canonical.join(WORKER_LOCK_FILE_NAME),
             data_dir: canonical,
+            local_turn: Arc::new(tokio::sync::Mutex::new(())),
             view: RwLock::new(Arc::new(Adopted {
                 document: StoredDocument::initial(),
                 digest: [0; 32],
@@ -678,7 +732,11 @@ impl SessionNames {
         });
         // Reconcile/initialize the current document before success — the same
         // strict path every transaction takes (this is a blocking boot call).
-        run_txn_sync(&core, |_doc, _meta| {
+        // The store is not shared yet, so its local turn is free.
+        let turn = Arc::clone(&core.local_turn)
+            .try_lock_owned()
+            .expect("a store under construction has no other local transaction");
+        run_txn_sync(&core, &turn, |_doc, _meta| {
             // Initialization is itself a persisted mutation: an absent
             // document is written at generation 1 (the runner forces the
             // write when the file was missing); an existing document is
@@ -701,7 +759,12 @@ impl SessionNames {
     pub(crate) fn try_background_guard(&self) -> Result<Option<BackgroundGuard>, NameError> {
         let file = open_lock_file(&self.core.worker_lock_path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(BackgroundGuard { _file: file })),
+            Ok(()) => Ok(Some(BackgroundGuard {
+                _lock: HeldSidecarLock {
+                    file,
+                    path: self.core.worker_lock_path.clone(),
+                },
+            })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(e)) => Err(NameError::LockUnavailable(format!(
                 "worker lock error: {e}"
@@ -1575,10 +1638,17 @@ where
     T: Send + 'static,
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError> + Send + 'static,
 {
-    // The blocking-IO owner retains its guard until completion even if
-    // the caller stops waiting: dropping this handle detaches the
+    // Local serialization: wait (FIFO) for this store's turn before touching
+    // the cross-process lock. Turn holders run document IO only (no provider
+    // call happens under a transaction), so the wait normally ends when the
+    // local queue ahead of us drains; the one-second retry budget below is
+    // left for contention with another process. A caller that stops waiting
+    // here simply leaves the queue — nothing has started.
+    let turn = await_local_turn(&core).await;
+    // The blocking-IO owner retains its turn and lock guard until completion
+    // even if the caller stops waiting: dropping this handle detaches the
     // spawn_blocking task, which runs to completion on its own.
-    let handle = tokio::task::spawn_blocking(move || run_txn_sync(&core, f));
+    let handle = tokio::task::spawn_blocking(move || run_txn_sync(&core, &turn, f));
     match handle.await {
         Ok(result) => result,
         Err(join_err) => Err(NameError::Persistence(format!(
@@ -1587,18 +1657,70 @@ where
     }
 }
 
-fn run_txn_sync<T, F>(core: &NamesCore, f: F) -> Result<T, NameError>
+/// Take this store's local turn (FIFO). Nothing bounds this wait — a queued
+/// caller must not fail just because this process's own durable writes are
+/// slow — so a wait that crosses [`LOCK_RETRY_BUDGET`] is reported WHILE it
+/// lasts (`session_names.local_turn_slow`, the caller still queued), and its
+/// end is reported once the turn arrives (`session_names.local_turn_resumed`).
+/// A turn holder that never finishes (a durable write wedged on a stalled
+/// disk) therefore shows up in the log within a second instead of silently
+/// hanging every naming caller.
+async fn await_local_turn(core: &NamesCore) -> LocalTurn {
+    let queued_at = Instant::now();
+    // One pinned acquisition future for the whole wait: re-creating it after
+    // the timeout would give up this caller's place in the FIFO queue.
+    let mut acquire = std::pin::pin!(Arc::clone(&core.local_turn).lock_owned());
+    if let Ok(turn) = tokio::time::timeout(LOCK_RETRY_BUDGET, acquire.as_mut()).await {
+        return turn;
+    }
+    let waited = queued_at.elapsed();
+    tracing::warn!(
+        target: "freshell_server::session_names",
+        op = "local_turn",
+        name_ref = "-",
+        revision = 0,
+        class = "slow_local_turn",
+        queued_ms = waited.as_millis() as u64,
+        data_dir = %core.data_dir.display(),
+        "session_names.local_turn_slow: a naming transaction has waited {} ms behind \
+         this process's own naming transactions and is still queued (a slow or \
+         stalled durable write holds the turn)",
+        waited.as_millis()
+    );
+    let turn = acquire.await;
+    let queued = queued_at.elapsed();
+    tracing::info!(
+        target: "freshell_server::session_names",
+        op = "local_turn",
+        name_ref = "-",
+        revision = 0,
+        class = "slow_local_turn_resumed",
+        queued_ms = queued.as_millis() as u64,
+        data_dir = %core.data_dir.display(),
+        "session_names.local_turn_resumed: a naming transaction got its turn after \
+         waiting {} ms behind this process's own naming transactions",
+        queued.as_millis()
+    );
+    turn
+}
+
+fn run_txn_sync<T, F>(core: &NamesCore, turn: &LocalTurn, f: F) -> Result<T, NameError>
 where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
 {
     let guard = acquire_document_lock(&core.lock_path)?;
-    run_txn_locked(core, guard, f)
+    run_txn_locked(core, turn, guard, f)
 }
 
-/// The transaction body, run while `_guard` holds the document lock (the
-/// reads' short-wait adoption acquires its own guard,
-/// `session_name_store_view`).
-fn run_txn_locked<T, F>(core: &NamesCore, _guard: std::fs::File, f: F) -> Result<T, NameError>
+/// The transaction body, run while the caller holds this store's local turn
+/// and `_guard` holds the document lock (the reads' short-wait adoption
+/// takes both its own way, `session_name_store_view`).
+fn run_txn_locked<T, F>(
+    core: &NamesCore,
+    _turn: &LocalTurn,
+    _guard: HeldSidecarLock,
+    f: F,
+) -> Result<T, NameError>
 where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
 {
@@ -1920,14 +2042,24 @@ fn open_lock_file(path: &Path) -> Result<std::fs::File, NameError> {
 }
 
 /// Acquire the strict document lock: a fresh private handle per transaction,
-/// retrying contention for at most one monotonic second. The sidecar is
-/// never replaced or unlinked — its inode lives as long as the data dir.
-fn acquire_document_lock(path: &Path) -> Result<std::fs::File, NameError> {
+/// retrying contention for at most one monotonic second. Callers hold their
+/// store's [`LocalTurn`], so contention seen here comes from another
+/// participant (another process, or another store opened on the same
+/// directory), never from this store's own queue — nor from a child process
+/// forked during an earlier transaction, because every release unlocks
+/// explicitly ([`HeldSidecarLock`]). The sidecar is never replaced or
+/// unlinked — its inode lives as long as the data dir.
+fn acquire_document_lock(path: &Path) -> Result<HeldSidecarLock, NameError> {
     let file = open_lock_file(path)?;
     let deadline = Instant::now() + LOCK_RETRY_BUDGET;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => {
+                return Ok(HeldSidecarLock {
+                    file,
+                    path: path.to_path_buf(),
+                })
+            }
             Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(NameError::LockUnavailable(
@@ -1998,6 +2130,12 @@ pub(crate) enum TestHook {
     PostReplace,
     FailReconcile,
     HoldLock(u64),
+    /// Hold the document lock (and with it this store's local turn) from
+    /// inside a transaction until the test calls [`release_held_lock`]: a
+    /// stalled durable write whose end the test controls. Fires once, like
+    /// `HoldLock`, and gives up after [`HELD_LOCK_RELEASE_BOUND`] so a test
+    /// that never releases cannot wedge the lane.
+    HoldLockUntilReleased,
     /// Task 3: override the native cycle retry floors (both delays) for the
     /// data dir — the bounded-allowance tests pin exhaustion without
     /// wall-clock waits. Persists until cleared (like the failure injections).
@@ -2024,6 +2162,22 @@ pub(crate) enum TestHook {
 /// ownership instead of a fixed post-spawn delay.
 #[cfg(test)]
 const LOCK_HELD_SENTINEL_NAME: &str = ".session-names-lock-held";
+
+/// Release sentinel for a `HoldLockUntilReleased` hold: the holder polls for
+/// it and returns once it exists.
+#[cfg(test)]
+const LOCK_RELEASE_SENTINEL_NAME: &str = ".session-names-lock-release";
+
+/// The longest a `HoldLockUntilReleased` hold waits for its release.
+#[cfg(test)]
+const HELD_LOCK_RELEASE_BOUND: Duration = Duration::from_secs(30);
+
+/// End a `HoldLockUntilReleased` hold for `data_dir`.
+#[cfg(test)]
+pub(crate) fn release_held_lock(data_dir: &Path) {
+    std::fs::write(data_dir.join(LOCK_RELEASE_SENTINEL_NAME), b"release")
+        .expect("write the session-names lock release sentinel");
+}
 
 #[cfg(test)]
 pub(crate) fn set_test_hooks(data_dir: &Path, hooks: Vec<TestHook>) {
@@ -2060,7 +2214,10 @@ fn take_matching_hook(data_dir: &Path, predicate: impl Fn(&TestHook) -> bool) ->
     let index = hooks.iter().position(predicate)?;
     // HoldLock fires once; failure injections persist until cleared so a
     // whole write window stays broken deterministically.
-    if matches!(hooks[index], TestHook::HoldLock(_)) {
+    if matches!(
+        hooks[index],
+        TestHook::HoldLock(_) | TestHook::HoldLockUntilReleased
+    ) {
         Some(hooks.remove(index))
     } else {
         Some(hooks[index].clone())
@@ -2070,11 +2227,29 @@ fn take_matching_hook(data_dir: &Path, predicate: impl Fn(&TestHook) -> bool) ->
 fn test_hold_once(_data_dir: &Path) {
     #[cfg(test)]
     {
-        if let Some(TestHook::HoldLock(ms)) =
-            take_matching_hook(_data_dir, |h| matches!(h, TestHook::HoldLock(_)))
-        {
-            write_lock_held_sentinel(_data_dir);
-            std::thread::sleep(Duration::from_millis(ms));
+        match take_matching_hook(_data_dir, |h| {
+            matches!(h, TestHook::HoldLock(_) | TestHook::HoldLockUntilReleased)
+        }) {
+            Some(TestHook::HoldLock(ms)) => {
+                write_lock_held_sentinel(_data_dir);
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            Some(TestHook::HoldLockUntilReleased) => {
+                write_lock_held_sentinel(_data_dir);
+                let release = _data_dir.join(LOCK_RELEASE_SENTINEL_NAME);
+                let deadline = Instant::now() + HELD_LOCK_RELEASE_BOUND;
+                while !release.exists() {
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "session-names held lock was never released for {}",
+                            _data_dir.display()
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            _ => {}
         }
     }
 }

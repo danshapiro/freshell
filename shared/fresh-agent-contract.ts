@@ -229,12 +229,14 @@ export const FreshAgentTurnSchema = z.object({
   role: z.enum(['user', 'assistant', 'system', 'tool']).optional(),
   timestamp: z.string().optional(),
   model: z.string().optional(),
-  // OpenCode persists provider/abort errors on the assistant message
-  // (`info.error`, `{name, data}`); the snapshot projects them onto the owning
-  // turn. The message mirrors the CLI's `errorMessage` helper: a string
-  // `data.message` verbatim, else the whole persisted error object as
-  // pretty-printed JSON. Optional and opencode-only: claude, codex, and older
-  // servers omit it.
+  // The durable error module of a turn. OpenCode persists provider/abort
+  // errors on the assistant message (`info.error`, `{name, data}`); the
+  // snapshot projects them onto the owning turn, mirroring the CLI's
+  // `errorMessage` helper (a string `data.message` verbatim, else the whole
+  // persisted error object as pretty-printed JSON). Claude projects its
+  // persisted API-error lines (`ApiError`) and local-command stderr
+  // (`CommandError`, e.g. a failed /compact) as item-less turns carrying only
+  // this error. Optional: codex and older servers omit it.
   error: z.object({
     // OpenCode error class, e.g. 'UnknownError' / 'MessageAbortedError'.
     name: z.string().min(1),

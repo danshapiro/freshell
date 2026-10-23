@@ -449,4 +449,47 @@ describe('settingsThunks', () => {
     expect(store.getState().settings.settings.freshAgent.providers.freshclaude?.effort).toBeUndefined()
     expect('agentChat' in store.getState().settings.settings).toBe(false)
   })
+
+  it('clears saved fresh-pane effort levels with the API clear sentinel', async () => {
+    const store = makeStore()
+    const initialServerSettings = store.getState().settings.serverSettings
+    store.dispatch(setServerSettings({
+      ...initialServerSettings,
+      freshAgent: {
+        ...initialServerSettings.freshAgent,
+        providers: {
+          ...initialServerSettings.freshAgent.providers,
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'sonnet' },
+            modelEffortLevels: { modelId: 'sonnet', levels: ['low', 'medium', 'high'] },
+          },
+        },
+      },
+    }))
+
+    apiPatch.mockResolvedValue({})
+
+    await store.dispatch(saveServerSettingsPatch({
+      freshAgent: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'claude-ghost' },
+            modelEffortLevels: undefined,
+          },
+        },
+      },
+    }))
+
+    expect(apiPatch).toHaveBeenCalledWith('/api/settings', {
+      freshAgent: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'claude-ghost' },
+            modelEffortLevels: null,
+          },
+        },
+      },
+    })
+    expect(store.getState().settings.settings.freshAgent.providers.freshclaude?.modelEffortLevels).toBeUndefined()
+  })
 })

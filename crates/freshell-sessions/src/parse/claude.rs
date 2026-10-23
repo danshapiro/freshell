@@ -265,10 +265,115 @@ fn assistant_usage_dedup_key(obj: &Value, line: &str) -> String {
     format!("line:{line}")
 }
 
+#[derive(Debug, Clone)]
 struct LatestUsage {
     input_tokens: i64,
     output_tokens: i64,
     cached_tokens: i64,
+}
+
+/// The claude token-usage definition, line by line: the LATEST deduplicated
+/// assistant `message.usage` drives the counts, the largest served prompt
+/// elevates the context window (kata 9c92), and the first model seen picks
+/// the mapped window. Shared by [`parse_session_content`] (the session
+/// indexer and its context meter) and the fresh-agent transcript snapshot, so
+/// both report one number.
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeUsageAccumulator {
+    model: Option<String>,
+    usage_seen: HashSet<String>,
+    latest_usage: Option<LatestUsage>,
+    max_prompt_tokens: i64,
+}
+
+impl ClaudeUsageAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one parsed transcript line. `line` is its raw text: the dedupe key
+    /// of last resort for a usage-bearing line with neither uuid nor message id.
+    pub fn push(&mut self, obj: &Value, line: &str) {
+        if self.model.is_none() {
+            for cand in [
+                obj.get("model"),
+                obj.get("message").and_then(|m| m.get("model")),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(s) = as_trimmed_nonempty(cand) {
+                    self.model = Some(s.to_string());
+                    break;
+                }
+            }
+        }
+
+        let is_assistant_entry = obj.get("type").and_then(Value::as_str) == Some("assistant")
+            || obj.get("role").and_then(Value::as_str) == Some("assistant")
+            || obj
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant");
+        if !is_assistant_entry {
+            return;
+        }
+        let Some(usage) = obj
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .filter(|u| u.is_object())
+        else {
+            return;
+        };
+        if !self.usage_seen.insert(assistant_usage_dedup_key(obj, line)) {
+            return;
+        }
+        let field = |key: &str| usage.get(key).and_then(to_finite_number).unwrap_or(0.0);
+        let input = field("input_tokens");
+        let output = field("output_tokens");
+        let cache_read = field("cache_read_input_tokens");
+        let cache_creation = field("cache_creation_input_tokens");
+        self.latest_usage = Some(LatestUsage {
+            input_tokens: input as i64,
+            output_tokens: output as i64,
+            cached_tokens: (cache_read + cache_creation) as i64,
+        });
+        // kata 9c92: largest SERVED prompt (deduped) drives window
+        // elevation when the mapped window is provably too small.
+        let prompt = input + cache_read + cache_creation;
+        if prompt as i64 > self.max_prompt_tokens {
+            self.max_prompt_tokens = prompt as i64;
+        }
+    }
+
+    /// The session's token summary; `None` before any assistant usage.
+    pub fn summary(&self, options: &ParseSessionOptions) -> Option<TokenSummary> {
+        let u = self.latest_usage.as_ref()?;
+        let context_tokens_from_usage = u.input_tokens + u.output_tokens + u.cached_tokens;
+        let context_tokens = options.context_tokens.unwrap_or(context_tokens_from_usage);
+        let model_context_window = elevate_claude_context_window(
+            claude_model_context_window(self.model.as_deref()),
+            self.max_prompt_tokens,
+        );
+        let compact_threshold_tokens = options.compact_threshold_tokens.unwrap_or_else(|| {
+            ((model_context_window * resolve_claude_compact_percent_threshold()) as f64 / 100.0)
+                .round() as i64
+        });
+        Some(TokenSummary {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cached_tokens: u.cached_tokens,
+            total_tokens: context_tokens,
+            context_tokens: Some(context_tokens),
+            model_context_window: Some(model_context_window),
+            compact_threshold_tokens: Some(compact_threshold_tokens),
+            compact_percent: Some(normalize_compact_percent(
+                context_tokens,
+                compact_threshold_tokens,
+            )),
+        })
+    }
 }
 
 /// `parseSessionContent(content, options)`.
@@ -295,11 +400,8 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     let mut first_user_message: Option<String> = None;
     let mut git_branch: Option<String> = None;
     let mut is_dirty: Option<bool> = None;
-    let mut model: Option<String> = None;
     let mut user_message_count: i64 = 0;
-    let mut usage_seen: HashSet<String> = HashSet::new();
-    let mut latest_usage: Option<LatestUsage> = None;
-    let mut max_prompt_tokens: i64 = 0;
+    let mut usage = ClaudeUsageAccumulator::new();
 
     for line in &lines {
         let obj: Value = match serde_json::from_str(line) {
@@ -335,20 +437,7 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
             }
         }
 
-        if model.is_none() {
-            for cand in [
-                obj.get("model"),
-                obj.get("message").and_then(|m| m.get("model")),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Some(s) = as_trimmed_nonempty(cand) {
-                    model = Some(s.to_string());
-                    break;
-                }
-            }
-        }
+        usage.push(&obj, line);
 
         let user_message_text = extract_user_message_text(&obj);
         let user_authored_text = user_message_text
@@ -483,50 +572,6 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
                 }
             }
         }
-
-        let is_assistant_entry = obj.get("type").and_then(Value::as_str) == Some("assistant")
-            || obj.get("role").and_then(Value::as_str) == Some("assistant")
-            || obj
-                .get("message")
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str)
-                == Some("assistant");
-
-        let usage = obj.get("message").and_then(|m| m.get("usage"));
-        if is_assistant_entry {
-            if let Some(usage) = usage.filter(|u| u.is_object()) {
-                let dedup_key = assistant_usage_dedup_key(&obj, line);
-                if usage_seen.insert(dedup_key) {
-                    let input = usage
-                        .get("input_tokens")
-                        .and_then(to_finite_number)
-                        .unwrap_or(0.0);
-                    let output = usage
-                        .get("output_tokens")
-                        .and_then(to_finite_number)
-                        .unwrap_or(0.0);
-                    let cache_read = usage
-                        .get("cache_read_input_tokens")
-                        .and_then(to_finite_number)
-                        .unwrap_or(0.0);
-                    let cache_creation = usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(to_finite_number)
-                        .unwrap_or(0.0);
-                    latest_usage = Some(LatestUsage {
-                        input_tokens: input as i64,
-                        output_tokens: output as i64,
-                        cached_tokens: (cache_read + cache_creation) as i64,
-                    });
-                    // kata 9c92: largest SERVED prompt (deduped) drives window
-                    // elevation when the mapped window is provably too small.
-                    let prompt = input + cache_read + cache_creation;
-                    if prompt as i64 > max_prompt_tokens {
-                        max_prompt_tokens = prompt as i64;
-                    }
-                }
-            }
-        }
     }
 
     let is_non_interactive = if user_message_count <= 1 {
@@ -543,31 +588,7 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         }
     }
 
-    let token_usage = latest_usage.map(|u| {
-        let context_tokens_from_usage = u.input_tokens + u.output_tokens + u.cached_tokens;
-        let context_tokens = options.context_tokens.unwrap_or(context_tokens_from_usage);
-        let model_context_window = elevate_claude_context_window(
-            claude_model_context_window(model.as_deref()),
-            max_prompt_tokens,
-        );
-        let compact_threshold_tokens = options.compact_threshold_tokens.unwrap_or_else(|| {
-            ((model_context_window * resolve_claude_compact_percent_threshold()) as f64 / 100.0)
-                .round() as i64
-        });
-        TokenSummary {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cached_tokens: u.cached_tokens,
-            total_tokens: context_tokens,
-            context_tokens: Some(context_tokens),
-            model_context_window: Some(model_context_window),
-            compact_threshold_tokens: Some(compact_threshold_tokens),
-            compact_percent: Some(normalize_compact_percent(
-                context_tokens,
-                compact_threshold_tokens,
-            )),
-        }
-    });
+    let token_usage = usage.summary(options);
 
     // Node's parse-layer title provenance (`providers/claude.ts:505`):
     // "provider-generated" iff a custom-title / agent-name /

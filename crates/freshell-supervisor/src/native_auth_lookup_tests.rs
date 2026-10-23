@@ -404,6 +404,7 @@ impl RuntimeBackend for AuthBackend {
         owner: &ClaudeSourceOwner,
         _: &ObserveClaudeSourcesRequest,
         _: &str,
+        _: tokio::time::Instant,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
         assert!(matches!(owner, ClaudeSourceOwner::Initial { .. }));
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -548,7 +549,7 @@ async fn provider_native_auth_nested_callback_uses_current_attempt_without_reloc
     .unwrap();
     let lock = supervisor.lifecycle_lock(&soul).await;
     let _held = lock.lock().await;
-    let scope = supervisor.auth_lookup_scope(&start);
+    let scope = supervisor.auth_lookup_scope(&start, PROVIDER_CALLBACK_BUDGET);
     let key = scope.key.clone();
     let request = |soul: SoulId, key: String| {
         let mut envelope = Envelope::new(
@@ -734,7 +735,7 @@ async fn provider_native_auth_nested_callback_uses_current_attempt_without_reloc
         .await
         .result
         .is_err());
-    let scope = supervisor.auth_lookup_scope(&start);
+    let scope = supervisor.auth_lookup_scope(&start, PROVIDER_CALLBACK_BUDGET);
     supervisor
         .registry
         .begin_stop_expected(soul.clone(), None)

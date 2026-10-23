@@ -425,22 +425,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    struct RestoreOnecliEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl Drop for RestoreOnecliEnv {
-        fn drop(&mut self) {
-            for (name, value) in self.0.drain(..) {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-
     #[test]
     fn named_opencode_onecli_references_include_private_environment_auth_and_ca_files() {
-        let _env_lock = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
         let workspace = tempfile::tempdir().unwrap();
         let environment = workspace.path().join("opencode.env");
         let auth = workspace.path().join("opencode-auth.json");
@@ -455,9 +442,8 @@ mod tests {
             "FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE",
             "FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE",
         ];
-        let _restore = RestoreOnecliEnv(keys.map(|key| (key, std::env::var_os(key))).into());
         for (key, file) in keys.into_iter().zip([&environment, &auth, &ca]) {
-            std::env::set_var(key, file);
+            env.set(key, file);
         }
 
         let references = named_provider_onecli_references("opencode").unwrap();

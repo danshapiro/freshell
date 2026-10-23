@@ -378,6 +378,7 @@ async fn dispatch(
                     terminal,
                     fresh_agent,
                     resume_spec,
+                    dispatch_budget_ms,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     if host_boot_id != state.host_boot_id {
@@ -398,6 +399,7 @@ async fn dispatch(
                             terminal: terminal.map(|terminal| *terminal),
                             fresh_agent: fresh_agent.map(|agent| *agent),
                             resume_spec: resume_spec.map(|resume_spec| *resume_spec),
+                            dispatch_budget: dispatch_budget_ms.map(Duration::from_millis),
                         },
                     )
                     .await
@@ -647,6 +649,28 @@ async fn dispatch(
                         native_session_id: actor.profile().await.native_session_id,
                     })
                 }
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id,
+                    request_id,
+                    settings,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    let outcome = actor
+                        .configure(request_id.clone(), settings)
+                        .await
+                        .map_err(map_actor_error);
+                    emit_environment_event(configure_outcome_event(&request_id, &outcome));
+                    Ok(HostResult::FreshAgentCommand {
+                        state: outcome?,
+                        native_session_id: actor.profile().await.native_session_id,
+                    })
+                }
                 HostCommand::FreshAgentRollback {
                     incarnation_id,
                     request_id,
@@ -847,6 +871,33 @@ fn unsupported_fresh_agent() -> RuntimeError {
     )
 }
 
+/// The JSONL event for one hosted configure, named for what happened to the
+/// settings. Every `Ok` state means the actor saved them for the next send;
+/// only `ProviderAcked` means the provider also applied them live.
+fn configure_outcome_event(
+    request_id: &freshell_runtime_protocol::RequestId,
+    outcome: &Result<freshell_runtime_protocol::CommandState, RuntimeError>,
+) -> serde_json::Value {
+    use freshell_runtime_protocol::CommandState;
+    let (severity, event) = match outcome {
+        Ok(CommandState::ProviderAcked) => ("info", "fresh_agent.configure.applied"),
+        Ok(CommandState::Completed) => ("info", "fresh_agent.configure.staged"),
+        Ok(_) => ("warn", "fresh_agent.configure.live_apply_refused"),
+        Err(_) => ("warn", "fresh_agent.configure.failed"),
+    };
+    let mut logged = serde_json::json!({
+        "severity": severity,
+        "event": event,
+        "stage": "session_host",
+        "request_id": request_id.as_str(),
+    });
+    match outcome {
+        Ok(state) => logged["state"] = serde_json::json!(state),
+        Err(error) => logged["code"] = serde_json::json!(error.code),
+    }
+    logged
+}
+
 fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> RuntimeError {
     use freshell_agent_runtime::host_actor::ActorError;
     let code = match error {
@@ -889,11 +940,134 @@ struct GrantExecutionRequest {
     terminal: Option<TerminalLaunchSpec>,
     fresh_agent: Option<FreshAgentLaunchSpec>,
     resume_spec: Option<ResumeSpec>,
+    /// The supervisor's bound on this dispatch; see [`GrantStageTimeline`].
+    dispatch_budget: Option<Duration>,
+}
+
+/// Wall-clock breakdown of one execution grant, and its dispatch budget.
+///
+/// The supervisor sends the budget with the grant and waits a fixed reply
+/// allowance longer than it for the reply. The host, not the supervisor's
+/// wait, therefore ends a dispatch that runs long: every awaited stage runs
+/// inside the budget, the native dispatch boundary is never crossed once the
+/// budget is spent (the grant stays unconsumed), and the refusal names the
+/// stage the budget ran out before. A synchronous stage (the provider
+/// projection, the provider-owned config refresh) cannot be interrupted; the
+/// host notices when it returns, before the next stage starts.
+///
+/// The breakdown names the stage that spent the time, for every outcome, so
+/// a slow dispatch is diagnosable after the container is gone.
+struct GrantStageTimeline {
+    started: std::time::Instant,
+    stage_started: std::time::Instant,
+    stages: Vec<(&'static str, u128)>,
+    budget: Option<Duration>,
+    exhausted_before: Option<&'static str>,
+}
+
+impl GrantStageTimeline {
+    fn start(budget: Option<Duration>) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            stage_started: now,
+            stages: Vec::new(),
+            budget,
+            exhausted_before: None,
+        }
+    }
+
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.budget.map(|budget| self.started + budget)
+    }
+
+    fn budget_exhausted(&mut self, stage: &'static str) -> RuntimeError {
+        self.exhausted_before = Some(stage);
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!(
+                "execution grant spent its {}ms dispatch budget before {stage} completed",
+                self.budget.unwrap_or_default().as_millis()
+            ),
+        )
+    }
+
+    /// Refuse to begin `stage` once the dispatch budget is spent.
+    fn ensure_budget(&mut self, stage: &'static str) -> Result<(), RuntimeError> {
+        match self.deadline() {
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                Err(self.budget_exhausted(stage))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Run one awaited dispatch stage inside the budget and record it.
+    async fn run<T>(
+        &mut self,
+        stage: &'static str,
+        work: impl std::future::Future<Output = Result<T, RuntimeError>>,
+    ) -> Result<T, RuntimeError> {
+        self.ensure_budget(stage)?;
+        let result = match self.deadline() {
+            Some(deadline) => {
+                match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work).await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(self.budget_exhausted(stage)),
+                }
+            }
+            None => work.await,
+        };
+        if result.is_ok() {
+            self.completed(stage);
+        }
+        result
+    }
+
+    fn completed(&mut self, stage: &'static str) {
+        let now = std::time::Instant::now();
+        self.stages
+            .push((stage, now.duration_since(self.stage_started).as_millis()));
+        self.stage_started = now;
+    }
+
+    fn event(&self, grant_id: &GrantId, outcome: Result<(), &RuntimeError>) -> serde_json::Value {
+        serde_json::json!({
+            "severity": if outcome.is_ok() { "info" } else { "warn" },
+            "event": "host.grant_timing",
+            "grantId": grant_id,
+            "outcome": if outcome.is_ok() { "accepted" } else { "refused" },
+            "errorCode": outcome.err().map(|error| error.code),
+            "totalMs": self.started.elapsed().as_millis(),
+            "budgetMs": self.budget.map(|budget| budget.as_millis()),
+            "budgetExhaustedBefore": self.exhausted_before,
+            "stages": self
+                .stages
+                .iter()
+                .map(|(stage, ms)| serde_json::json!({"stage": stage, "ms": ms}))
+                .collect::<Vec<_>>(),
+        })
+    }
 }
 
 async fn grant_execution(
     state: &Arc<HostState>,
     request: GrantExecutionRequest,
+) -> Result<HostResult, RuntimeError> {
+    let grant_id = request.grant_id.clone();
+    let mut timeline = GrantStageTimeline::start(request.dispatch_budget);
+    let result = grant_execution_stages(state, request, &mut timeline).await;
+    let event = timeline.event(&grant_id, result.as_ref().map(|_| ()));
+    emit_environment_event(event.clone());
+    append_event_with_secret(&state.state_dir, &state.secret, "host.grant_timing", event).ok();
+    result
+}
+
+async fn grant_execution_stages(
+    state: &Arc<HostState>,
+    request: GrantExecutionRequest,
+    timeline: &mut GrantStageTimeline,
 ) -> Result<HostResult, RuntimeError> {
     let GrantExecutionRequest {
         soul_id,
@@ -905,6 +1079,7 @@ async fn grant_execution(
         terminal,
         fresh_agent,
         resume_spec,
+        dispatch_budget: _,
     } = request;
     let provider = terminal
         .as_ref()
@@ -959,6 +1134,7 @@ async fn grant_execution(
             "host boot already consumed a different grant",
         ));
     }
+    timeline.completed("admit");
 
     // Resolve every mounted grant once before consuming the execution grant.
     // A changed source selection remains a pre-dispatch preparation failure.
@@ -994,29 +1170,34 @@ async fn grant_execution(
                 format!("resolve managed provider credentials: {error}"),
             )
         })?;
+        timeline.completed("resolve_secrets");
         if matches!(provider, "opencode" | "codex" | "claude" | "amplifier") {
-            let generated = provider_input_preparation::prepare_for_identity(
-                context,
-                &mut secrets,
-                &provider_path_inputs,
-                &state
-                    .provider_config_paths
-                    .private_mount
-                    .join("user-provider"),
-                &state.provider_config_paths.provider_home,
-                identity,
-            )
-            .await
-            .map_err(|error| {
-                RuntimeError::new(
-                    if error.starts_with("configuration reference selection changed") {
-                        RuntimeErrorCode::ProviderInputsChanged
-                    } else {
-                        RuntimeErrorCode::HostUnreachable
-                    },
-                    error,
-                )
-            })?;
+            let generated = timeline
+                .run("prepare_provider_inputs", async {
+                    provider_input_preparation::prepare_for_identity(
+                        context,
+                        &mut secrets,
+                        &provider_path_inputs,
+                        &state
+                            .provider_config_paths
+                            .private_mount
+                            .join("user-provider"),
+                        &state.provider_config_paths.provider_home,
+                        identity,
+                    )
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            if error.starts_with("configuration reference selection changed") {
+                                RuntimeErrorCode::ProviderInputsChanged
+                            } else {
+                                RuntimeErrorCode::HostUnreachable
+                            },
+                            error,
+                        )
+                    })
+                })
+                .await?;
             secrets.environment.extend(generated);
         } else if !provider_path_inputs.is_empty() {
             return Err(RuntimeError::new(
@@ -1080,6 +1261,7 @@ async fn grant_execution(
                         .arg(&resume.provider_session.native_session_id);
                 }
             }
+            timeline.ensure_budget("consume_grant")?;
             consume_grant(&mut persisted)?;
             let child = command.spawn().map_err(|e| {
                 RuntimeError::new(
@@ -1094,6 +1276,7 @@ async fn grant_execution(
                 )
             })?;
             *state.child.lock().await = Some(child);
+            timeline.completed("spawn_worker");
             let evidence = if fixture == FixtureKind::SecurityProbe {
                 security_probe(&state.state_dir)
             } else {
@@ -1152,52 +1335,73 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            let prepared = providers::prepare_terminal(
-                terminal,
-                &resolved_secrets.environment,
-                resolved_secrets.opencode_plan.as_ref(),
-                resolved_secrets.claude_settings_argument.as_deref(),
-            )
-            .await
-            .map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("prepare managed provider: {error}"),
+            timeline.completed("prepare_provider_state");
+            let prepared = timeline
+                .run("prepare_terminal", async {
+                    providers::prepare_terminal(
+                        terminal,
+                        &resolved_secrets.environment,
+                        resolved_secrets.opencode_plan.as_ref(),
+                        resolved_secrets.claude_settings_argument.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            format!("prepare managed provider: {error}"),
+                        )
+                    })
+                })
+                .await?;
+            timeline
+                .run(
+                    "verify_claude_sources",
+                    claude_source_observation::verify_final(
+                        prepared.terminal.provider_launch_context.as_ref(),
+                        &state
+                            .provider_config_paths
+                            .private_mount
+                            .join("user-provider"),
+                        Path::new(&prepared.terminal.cwd),
+                        &state.provider_config_paths.provider_home,
+                        prepared.terminal.run_as_uid,
+                        prepared.terminal.run_as_gid,
+                        freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
+                    ),
                 )
-            })?;
-            claude_source_observation::verify_final(
-                prepared.terminal.provider_launch_context.as_ref(),
-                &state
-                    .provider_config_paths
-                    .private_mount
-                    .join("user-provider"),
-                Path::new(&prepared.terminal.cwd),
-                &state.provider_config_paths.provider_home,
-                prepared.terminal.run_as_uid,
-                prepared.terminal.run_as_gid,
-                freshell_platform::claude_inputs::NativeSourceRuntime::Terminal,
-            )
-            .await?;
+                .await?;
+            timeline.ensure_budget("consume_grant")?;
             consume_grant(&mut persisted)?;
-            let prepared = providers::start_terminal_sidecar(prepared)
-                .await
-                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+            timeline.completed("consume_grant");
+            let prepared = timeline
+                .run("start_sidecar", async {
+                    providers::start_terminal_sidecar(prepared)
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::new(RuntimeErrorCode::HostUnreachable, error)
+                        })
+                })
+                .await?;
             let terminal = prepared.terminal;
-            let hosted = HostedPty::spawn(
-                &state.state_dir,
-                state.incarnation_id.clone(),
-                &terminal,
-                prepared.child_env,
-                prepared.codex,
-                prepared.claude_settings,
-            )
-            .await
-            .map_err(|e| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("spawn managed terminal: {e}"),
-                )
-            })?;
+            let hosted = timeline
+                .run("spawn_worker", async {
+                    HostedPty::spawn(
+                        &state.state_dir,
+                        state.incarnation_id.clone(),
+                        &terminal,
+                        prepared.child_env,
+                        prepared.codex,
+                        prepared.claude_settings,
+                    )
+                    .await
+                    .map_err(|e| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            format!("spawn managed terminal: {e}"),
+                        )
+                    })
+                })
+                .await?;
             let pid = hosted.pid();
             let evidence = serde_json::json!({
                 "workload":"terminal",
@@ -1303,37 +1507,51 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            providers::prepare_fresh_agent_child_environment(
-                &launch,
-                &mut resolved_secrets.environment,
-                resolved_secrets.opencode_plan.as_ref(),
-            )
-            .await
-            .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
-            claude_source_observation::verify_final(
-                launch.provider_launch_context.as_ref(),
-                &state
-                    .provider_config_paths
-                    .private_mount
-                    .join("user-provider"),
-                Path::new(&launch.cwd),
-                &state.provider_config_paths.provider_home,
-                launch.run_as_uid,
-                launch.run_as_gid,
-                freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
-            )
-            .await?;
+            timeline
+                .run("prepare_provider_state", async {
+                    providers::prepare_fresh_agent_child_environment(
+                        &launch,
+                        &mut resolved_secrets.environment,
+                        resolved_secrets.opencode_plan.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))
+                })
+                .await?;
+            timeline
+                .run(
+                    "verify_claude_sources",
+                    claude_source_observation::verify_final(
+                        launch.provider_launch_context.as_ref(),
+                        &state
+                            .provider_config_paths
+                            .private_mount
+                            .join("user-provider"),
+                        Path::new(&launch.cwd),
+                        &state.provider_config_paths.provider_home,
+                        launch.run_as_uid,
+                        launch.run_as_gid,
+                        freshell_platform::claude_inputs::NativeSourceRuntime::Sdk,
+                    ),
+                )
+                .await?;
+            timeline.ensure_budget("consume_grant")?;
             consume_grant(&mut persisted)?;
+            timeline.completed("consume_grant");
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
-            let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::HostUnreachable,
-                        format!("hosted fresh-agent provider failed to start: {error}"),
-                    )
-                })?;
+            let actor = timeline
+                .run("start_fresh_agent", async {
+                    providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::HostUnreachable,
+                                format!("hosted fresh-agent provider failed to start: {error}"),
+                            )
+                        })
+                })
+                .await?;
             let profile = actor.profile().await;
             let native_session_id = profile.native_session_id.clone();
             let evidence = serde_json::json!({
@@ -3179,12 +3397,33 @@ fn sync_provider_projection_directory(path: &Path) -> Result<(), String> {
 }
 
 fn sync_provider_projection_tree(root: &Path) -> Result<(), String> {
-    sync_provider_projection_tree_with(root, &mut |path| std::fs::File::open(path)?.sync_all())
+    sync_provider_projection_tree_with(root, &|path| std::fs::File::open(path)?.sync_all())
 }
 
+/// Concurrent flushes per projection durability barrier. Every flush is one
+/// journal commit when issued alone; overlapping flushes of independent nodes
+/// let the filesystem commit them together, so a selected environment with
+/// thousands of files (an installed plugin's node_modules) costs a handful of
+/// commits instead of one per file. Measured on the qualification host's
+/// ext4 volume, 4,200 files took 13.4 s one at a time and 1.4 s at 16.
+const PROVIDER_PROJECTION_SYNC_WORKERS: usize = 16;
+
+/// Make every node of a staged projection durable before the transaction
+/// advances. Symlinks are never followed. Each node is still flushed exactly
+/// once with a full `fsync`; only their order is relaxed, which the
+/// transaction does not depend on because it waits for the whole barrier.
 fn sync_provider_projection_tree_with(
     root: &Path,
-    sync_node: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    sync_node: &(impl Fn(&Path) -> std::io::Result<()> + Sync),
+) -> Result<(), String> {
+    let mut nodes = Vec::new();
+    collect_provider_projection_sync_nodes(root, &mut nodes)?;
+    flush_provider_projection_nodes(&nodes, sync_node)
+}
+
+fn collect_provider_projection_sync_nodes(
+    root: &Path,
+    nodes: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(root).map_err(|error| {
         format!(
@@ -3202,15 +3441,63 @@ fn sync_provider_projection_tree_with(
             let entry = entry.map_err(|error| {
                 format!("provider projection sync read {}: {error}", root.display())
             })?;
-            sync_provider_projection_tree_with(&entry.path(), sync_node)?;
+            collect_provider_projection_sync_nodes(&entry.path(), nodes)?;
         }
     }
-    sync_node(root).map_err(|error| {
-        format!(
-            "provider projection flush failed for {}: {error}",
-            root.display()
-        )
-    })
+    nodes.push(root.to_path_buf());
+    Ok(())
+}
+
+fn flush_provider_projection_nodes(
+    nodes: &[PathBuf],
+    sync_node: &(impl Fn(&Path) -> std::io::Result<()> + Sync),
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let failure = std::sync::Mutex::new(None::<String>);
+    let flush = || {
+        while !failed.load(Ordering::Acquire) {
+            let Some(path) = nodes.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                return;
+            };
+            if let Err(error) = sync_node(path) {
+                failed.store(true, Ordering::Release);
+                failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(|| {
+                        format!(
+                            "provider projection flush failed for {}: {error}",
+                            path.display()
+                        )
+                    });
+                return;
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        // The calling thread always takes part, so the barrier completes even
+        // when the container's pid budget refuses additional threads.
+        for _ in 1..PROVIDER_PROJECTION_SYNC_WORKERS.min(nodes.len()) {
+            if std::thread::Builder::new()
+                .name("projection-sync".into())
+                .spawn_scoped(scope, flush)
+                .is_err()
+            {
+                break;
+            }
+        }
+        flush();
+    });
+    match failure
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn sync_provider_projection_file(path: &Path) -> Result<(), String> {
@@ -6517,12 +6804,13 @@ mod tests {
         std::fs::write(&outside_file, "outside state").unwrap();
         symlink(&outside_file, nested.join("outside-link.json")).unwrap();
 
-        let mut synced = Vec::new();
-        super::sync_provider_projection_tree_with(tree.path(), &mut |path| {
-            synced.push(path.to_path_buf());
+        let synced = std::sync::Mutex::new(Vec::new());
+        super::sync_provider_projection_tree_with(tree.path(), &|path| {
+            synced.lock().unwrap().push(path.to_path_buf());
             Ok(())
         })
         .unwrap();
+        let synced = synced.into_inner().unwrap();
 
         assert!(synced.contains(&file));
         assert!(synced.contains(&nested));
@@ -6530,6 +6818,77 @@ mod tests {
         assert!(
             !synced.contains(&outside_file),
             "sync traversal must not follow provider-controlled symlinks"
+        );
+    }
+
+    /// A selected provider environment can hold thousands of files (an
+    /// installed plugin's node_modules). Each flush is one journal commit, so
+    /// flushing them one at a time inside the execution grant made a healthy
+    /// 4,200-file projection take 8-13 s and miss the grant reply. Flushes of
+    /// independent nodes must overlap, and every node is still flushed once.
+    #[cfg(unix)]
+    #[test]
+    fn provider_projection_sync_walk_overlaps_flushes_of_independent_nodes() {
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tree = tempfile::tempdir().unwrap();
+        let entries = tree.path().join("node_modules/parity-installed/entries");
+        std::fs::create_dir_all(&entries).unwrap();
+        for index in 0..32 {
+            std::fs::write(
+                entries.join(format!("entry-{index}.cjs")),
+                "module.exports=1\n",
+            )
+            .unwrap();
+        }
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let synced = std::sync::Mutex::new(Vec::new());
+        super::sync_provider_projection_tree_with(tree.path(), &|path| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            synced.lock().unwrap().push(path.to_path_buf());
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+
+        let synced = synced.into_inner().unwrap();
+        let unique = synced.iter().collect::<BTreeSet<_>>();
+        assert_eq!(synced.len(), 32 + 4, "32 files, 3 directories and the root");
+        assert_eq!(
+            unique.len(),
+            synced.len(),
+            "each node is flushed exactly once"
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) > 1,
+            "independent flushes must overlap instead of running one at a time"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_projection_sync_walk_reports_the_node_whose_flush_failed() {
+        let tree = tempfile::tempdir().unwrap();
+        for index in 0..16 {
+            std::fs::write(tree.path().join(format!("file-{index}")), "state").unwrap();
+        }
+        let failing = tree.path().join("file-7");
+        let error = super::sync_provider_projection_tree_with(tree.path(), &|path| {
+            if path == failing {
+                Err(std::io::Error::other("synthetic flush failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(
+            error.contains(&failing.display().to_string())
+                && error.contains("synthetic flush failure"),
+            "{error}"
         );
     }
 
@@ -7130,6 +7489,55 @@ mod tests {
             None => tempfile::tempdir(),
         }
         .expect("owned executable fixture directory")
+    }
+
+    /// Run a fixture executable a test has just written, retrying the
+    /// transient ETXTBSY a concurrently forking test thread can cause (see the
+    /// test below). Every other outcome, and a refusal that outlasts the short
+    /// deadline, is returned as is.
+    fn execute_fixture_with_transient_text_file_busy_retry(
+        path: &Path,
+    ) -> std::io::Result<std::process::Output> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match std::process::Command::new(path).output() {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Another test thread that forks while a fixture is still open for
+    /// writing hands its child a copy of that write descriptor until the child
+    /// execs, and exec of a file open for writing fails with ETXTBSY. Running
+    /// a fixture must outlast that transient refusal.
+    #[test]
+    fn fixture_execution_outlasts_a_transient_text_file_busy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = executable_fixture();
+        let script = root.path().join("run");
+        std::fs::write(&script, "#!/bin/sh\nprintf busy-nonce\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(writer);
+        });
+
+        let output = execute_fixture_with_transient_text_file_busy_retry(&script)
+            .expect("the fixture runs once no write descriptor remains");
+
+        release.join().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"busy-nonce");
     }
     #[test]
     fn provider_config_precreated_home_needs_no_empty_bootstrap_handoff() {
@@ -7867,7 +8275,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn provider_config_two_stage_script_is_runnable() {
-        use std::{os::unix::fs::PermissionsExt, process::Command};
+        use std::os::unix::fs::PermissionsExt;
         let root = executable_fixture();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -7878,8 +8286,7 @@ mod tests {
         let home = root.path().join("home");
         copy_provider_config_entry(&source, &source, &stage, &mut Vec::new(), &mut 0, 0).unwrap();
         copy_provider_config_entry(&stage, &stage, &home, &mut Vec::new(), &mut 0, 0).unwrap();
-        let output = Command::new(home.join("run"))
-            .output()
+        let output = execute_fixture_with_transient_text_file_busy_retry(&home.join("run"))
             .expect("two-stage executable spawn");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"resource-nonce");
@@ -9322,9 +9729,9 @@ mod tests {
                 ".codex/skills/fixture/scripts/run",
                 ".codex/skills/freshell-discovered-agents/fixture/scripts/run",
             ] {
-                let output = std::process::Command::new(home.join(relative))
-                    .output()
-                    .unwrap();
+                let output =
+                    execute_fixture_with_transient_text_file_busy_retry(&home.join(relative))
+                        .unwrap();
                 assert!(output.status.success(), "{output:?}");
                 assert_eq!(output.stdout, b"resource-nonce\n");
             }
@@ -9891,6 +10298,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_fresh_agent_configure_rpc_persists_settings_through_the_host_actor() {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
+            decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("rpc-configure-agent"),
+            FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "fixture-sdk".into(),
+                cwd: "/workspace".into(),
+                model: Some("fixture-model".into()),
+                effort: Some("low".into()),
+                permission_mode: Some("ask".into()),
+                sandbox: None,
+                provider_store_id: "fixture-store".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        *state.fresh_agent.lock().await = Some(Arc::clone(&actor));
+        let configure = || {
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentConfigure {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::parse("rpc-configure-one").unwrap(),
+                    settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                        cwd: None,
+                        model: Some("opus".into()),
+                        effort: Some("high".into()),
+                        permission_mode: None,
+                        sandbox: None,
+                    },
+                },
+            )
+        };
+
+        for _ in 0..2 {
+            let result = dispatch(configure(), &state).await.unwrap();
+            assert!(matches!(
+                result,
+                HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    native_session_id: Some(ref native),
+                } if native == "fixture-native-thread"
+            ));
+        }
+        let profile = actor.profile().await;
+        assert_eq!(profile.model.as_deref(), Some("opus"));
+        assert_eq!(profile.effort.as_deref(), Some("high"));
+        assert_eq!(profile.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(
+            transport.operations.load(Ordering::SeqCst),
+            1,
+            "a retried configure request is applied once"
+        );
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    /// Re-runs one test of this binary in a fresh process (which, like the
+    /// production host, installs no tracing subscriber) and returns the
+    /// JSONL events it wrote to stderr. Lines that are not JSON (a provider
+    /// child's own stderr) are skipped.
+    fn spawned_test_events(test: &str) -> Vec<serde_json::Value> {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    }
+
+    #[test]
+    fn hosted_configure_outcomes_are_logged_as_jsonl_with_severity() {
+        let applied = spawned_test_events(
+            "tests::authenticated_fresh_agent_configure_rpc_persists_settings_through_the_host_actor",
+        );
+        let event = applied
+            .iter()
+            .find(|event| event["event"] == "fresh_agent.configure.applied")
+            .unwrap_or_else(|| panic!("an applied configure is logged: {applied:?}"));
+        assert_eq!(event["severity"], "info");
+        assert_eq!(event["stage"], "session_host");
+        assert_eq!(event["request_id"], "rpc-configure-one");
+
+        let refused = spawned_test_events(
+            "providers::fresh_agent::tests::hosted_claude_configure_refused_live_keeps_the_intent_and_journals_the_refusal",
+        );
+        let event = refused
+            .iter()
+            .find(|event| event["event"] == "fresh_agent.configure.provider_refused")
+            .unwrap_or_else(|| panic!("a refused live apply is logged: {refused:?}"));
+        assert_eq!(event["severity"], "warn");
+        assert_eq!(event["provider"], "claude");
+        assert_eq!(event["request_id"], "hosted-configure-1");
+        assert_eq!(event["code"], "CLAUDE_SETTINGS_FAILED");
+        assert!(
+            refused
+                .iter()
+                .all(|event| event["event"] != "fresh_agent.configure.applied"),
+            "a refused live apply is never logged as applied: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn hosted_configure_outcome_events_name_what_happened_to_the_settings() {
+        use freshell_runtime_protocol::CommandState;
+        let request_id = RequestId::parse("configure-log").unwrap();
+        for (outcome, severity, event) in [
+            (
+                Ok(CommandState::ProviderAcked),
+                "info",
+                "fresh_agent.configure.applied",
+            ),
+            (
+                Ok(CommandState::Completed),
+                "info",
+                "fresh_agent.configure.staged",
+            ),
+            (
+                Ok(CommandState::Cancelled),
+                "warn",
+                "fresh_agent.configure.live_apply_refused",
+            ),
+            (
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "hosted fresh-agent command failed",
+                )),
+                "warn",
+                "fresh_agent.configure.failed",
+            ),
+        ] {
+            let logged = configure_outcome_event(&request_id, &outcome);
+            assert_eq!(logged["severity"], severity, "{outcome:?}");
+            assert_eq!(logged["event"], event, "{outcome:?}");
+            assert_eq!(logged["stage"], "session_host");
+            assert_eq!(logged["request_id"], "configure-log");
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_fresh_agent_rpc_keeps_one_host_owned_transport_until_explicit_stop() {
         let state = test_host_state();
         let transport = Arc::new(RpcFixtureTransport {
@@ -10159,6 +10724,7 @@ mod tests {
                 terminal: Some(terminal),
                 fresh_agent: None,
                 resume_spec: None,
+                dispatch_budget: None,
             },
         )
         .await;
@@ -10242,6 +10808,7 @@ mod tests {
                         terminal: terminal.clone(),
                         fresh_agent: fresh.clone(),
                         resume_spec: Some(resume.clone()),
+                        dispatch_budget: None,
                     },
                 )
                 .await
@@ -10314,6 +10881,7 @@ mod tests {
                         terminal: Some(terminal.clone()),
                         fresh_agent: None,
                         resume_spec: Some(resume.clone()),
+                        dispatch_budget: None,
                     },
                 )
                 .await
@@ -10374,6 +10942,143 @@ mod tests {
         assert!(state.child.lock().await.is_none());
     }
 
+    fn grant_timing_events(state_dir: &Path) -> Vec<serde_json::Value> {
+        journal_events(state_dir)
+            .into_iter()
+            .filter(|event| event["event"] == "host.grant_timing")
+            .map(|event| event["data"].clone())
+            .collect()
+    }
+
+    /// A refused grant still records how long the host held it and why, so a
+    /// supervisor-side timeout can be told apart from a host-side refusal.
+    #[tokio::test]
+    async fn refused_grant_records_its_timing_and_refusal_code() {
+        let state = test_host_state();
+        {
+            let mut persisted = state.persisted.lock().await;
+            persisted.max_control_epoch = 7;
+        }
+        let grant_id = GrantId::new();
+        let envelope = authenticated_host_envelope(
+            &state,
+            HostCommand::GrantExecution {
+                incarnation_id: state.incarnation_id.clone(),
+                soul_id: SoulId::new(),
+                host_boot_id: state.host_boot_id.clone(),
+                control_epoch: 1,
+                execution_generation: 1,
+                grant_id: grant_id.clone(),
+                fixture: Some(FixtureKind::Heartbeat),
+                provider_path_inputs: Default::default(),
+                terminal: None,
+                fresh_agent: None,
+                resume_spec: None,
+                dispatch_budget_ms: None,
+            },
+        );
+        let error = dispatch(envelope, &state).await.unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::StaleExecutionGrant);
+        let timing = grant_timing_events(&state.state_dir);
+        assert_eq!(timing.len(), 1, "{timing:?}");
+        assert_eq!(timing[0]["grantId"], serde_json::json!(grant_id));
+        assert_eq!(timing[0]["outcome"], "refused");
+        assert_eq!(timing[0]["severity"], "warn");
+        assert_eq!(timing[0]["errorCode"], "STALE_EXECUTION_GRANT");
+        assert_eq!(timing[0]["stages"], serde_json::json!([]));
+    }
+
+    /// The supervisor stops waiting shortly after the dispatch budget it sent.
+    /// A host whose budget is already spent must not cross the native dispatch
+    /// boundary: it refuses typed, names where the budget ran out, and leaves
+    /// the grant unconsumed and no worker behind.
+    #[tokio::test]
+    async fn grant_whose_dispatch_budget_is_spent_is_refused_before_consumption() {
+        let state = test_host_state();
+        let grant_id = GrantId::new();
+        let envelope = authenticated_host_envelope(
+            &state,
+            HostCommand::GrantExecution {
+                incarnation_id: state.incarnation_id.clone(),
+                soul_id: SoulId::new(),
+                host_boot_id: state.host_boot_id.clone(),
+                control_epoch: 1,
+                execution_generation: 1,
+                grant_id: grant_id.clone(),
+                fixture: Some(FixtureKind::Heartbeat),
+                provider_path_inputs: Default::default(),
+                terminal: None,
+                fresh_agent: None,
+                resume_spec: None,
+                dispatch_budget_ms: Some(0),
+            },
+        );
+
+        let error = dispatch(envelope, &state).await.unwrap_err();
+
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error.message.contains("0ms dispatch budget")
+                && error.message.contains("consume_grant"),
+            "{}",
+            error.message
+        );
+        let persisted = state.persisted.lock().await.clone();
+        assert!(persisted.grant_id.is_none(), "the grant stays replayable");
+        assert_eq!(persisted.worker_launch_count, 0);
+        assert!(state.child.lock().await.is_none());
+        let timing = grant_timing_events(&state.state_dir);
+        assert_eq!(timing.len(), 1, "{timing:?}");
+        assert_eq!(timing[0]["grantId"], serde_json::json!(grant_id));
+        assert_eq!(timing[0]["outcome"], "refused");
+        assert_eq!(timing[0]["errorCode"], "HOST_UNREACHABLE");
+        assert_eq!(timing[0]["budgetMs"], 0);
+        assert_eq!(timing[0]["budgetExhaustedBefore"], "consume_grant");
+    }
+
+    /// An awaited stage (a provider start that keeps retrying, a source
+    /// reader) is cut at the dispatch deadline rather than allowed to run past
+    /// the supervisor's wait, and the refusal names that stage.
+    #[tokio::test]
+    async fn awaited_stage_is_cut_at_the_dispatch_deadline() {
+        let mut timeline = GrantStageTimeline::start(Some(Duration::from_millis(300)));
+        timeline
+            .run("prepare_terminal", async { Ok(()) })
+            .await
+            .expect("a stage inside the budget completes");
+        let started = std::time::Instant::now();
+
+        let error = timeline
+            .run("start_sidecar", async {
+                sleep(Duration::from_secs(30)).await;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stage was cut at the deadline, not allowed to finish"
+        );
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error.message.contains("300ms dispatch budget")
+                && error.message.contains("start_sidecar"),
+            "{}",
+            error.message
+        );
+        let event = timeline.event(&GrantId::new(), Err(&error));
+        assert_eq!(event["budgetMs"], 300);
+        assert_eq!(event["budgetExhaustedBefore"], "start_sidecar");
+        let stages = event["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stage| stage["stage"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(stages, ["prepare_terminal"], "a cut stage is not completed");
+    }
+
     #[tokio::test]
     async fn grant_from_another_host_boot_is_rejected_before_consumption() {
         let state = test_host_state();
@@ -10391,6 +11096,7 @@ mod tests {
                 terminal: None,
                 fresh_agent: None,
                 resume_spec: None,
+                dispatch_budget_ms: None,
             },
         );
         let error = dispatch(envelope, &state).await.unwrap_err();
@@ -10573,6 +11279,7 @@ mod tests {
                 terminal: Some(Box::new(terminal)),
                 fresh_agent: None,
                 resume_spec: Some(Box::new(resume_spec)),
+                dispatch_budget_ms: Some(60_000),
             },
         );
 
@@ -10588,6 +11295,33 @@ mod tests {
         ));
         assert_eq!(state.persisted.lock().await.worker_launch_count, 1);
         assert!(state.pty.lock().await.is_some());
+        let timing = grant_timing_events(&state.state_dir);
+        assert_eq!(timing.len(), 1, "one dispatch records one timing event");
+        assert_eq!(timing[0]["outcome"], "accepted");
+        let stages = timing[0]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stage| stage["stage"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            [
+                "admit",
+                "resolve_secrets",
+                "prepare_provider_inputs",
+                "prepare_provider_state",
+                "prepare_terminal",
+                "verify_claude_sources",
+                "consume_grant",
+                "start_sidecar",
+                "spawn_worker",
+            ],
+            "the accepted terminal dispatch names every stage it spent time in"
+        );
+        assert!(timing[0]["totalMs"].as_u64().is_some());
+        assert_eq!(timing[0]["budgetMs"], 60_000);
+        assert_eq!(timing[0]["budgetExhaustedBefore"], serde_json::Value::Null);
         let mut observed = None;
         for _ in 0..100 {
             if let Ok(value) = std::fs::read(&child_output) {

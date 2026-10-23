@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import { openSync, readSync, closeSync, statSync, accessSync, constants } from 'node:fs'
 import { endianness } from 'node:os'
 import path from 'node:path'
+import { usesHostedClaudeRuntime } from './hosted.mjs'
 
 const fail = kind => { throw new Error(`provider exec profile ${kind}: repair inputs before dispatch`) }
 function readBounded(file, limit) {
@@ -79,7 +80,7 @@ export function checkSdkExec(options) {
 }
 
 export function managedSdkSpawn(stderr, environment = process.env) {
-  if (process.platform !== 'linux' || environment.FRESHELL_HOSTED_FRESH_AGENT !== 'claude') return undefined
+  if (process.platform !== 'linux' || !usesHostedClaudeRuntime(environment)) return undefined
   return options => {
     checkSdkExec(options)
     const child = spawn(options.command, options.args, {

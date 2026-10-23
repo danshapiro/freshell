@@ -9,6 +9,7 @@ import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 // @ts-expect-error The standalone sidecar helper is a plain Node ESM module.
 import { probeModelCatalog } from '../../../crates/freshell-claude-sidecar/model-catalog.mjs'
+import { createLog } from '../../../crates/freshell-claude-sidecar/log.mjs'
 
 describe('Claude model catalog helper', () => {
   it('reads models without sending a prompt and always closes the query', async () => {
@@ -21,6 +22,14 @@ describe('Claude model catalog helper', () => {
     expect(options.pathToClaudeCodeExecutable).toBe('/custom/claude')
     expect(options.env).toEqual({ CLAUDE_CMD: '/custom/claude', KEEP: 'yes' })
     expect(close).toHaveBeenCalledTimes(1)
+  })
+
+  it('gives the SDK the managed OneCLI key exactly when the session sidecar would', async () => {
+    const query = vi.fn((_input: any) => ({ supportedModels: async () => [], close: vi.fn() }))
+    await probeModelCatalog(query, {
+      env: { ANTHROPIC_API_KEY: 'managed', FRESHELL_CLAUDE_ONECLI_API_KEY: '1', CLAUDECODE: '1', KEEP: 'yes' },
+    })
+    expect(query.mock.calls[0][0].options.env).toEqual({ ANTHROPIC_API_KEY: 'managed', KEEP: 'yes' })
   })
 
   it('closes a failed query and preserves the failure', async () => {
@@ -39,6 +48,24 @@ describe('Claude model catalog helper', () => {
     await expect(probeModelCatalog(query, { timeoutMs: 10 })).rejects.toThrow('timed out')
     expect(signal.aborted).toBe(true)
     expect(close).toHaveBeenCalledTimes(1)
+  })
+
+  it('logs the probe CLI stderr at info (by size only when hosted) and a failed close at warn', async () => {
+    const lines: string[] = []
+    const log = createLog('claude-model-catalog', (line: string) => { lines.push(line) })
+    const models = [{ value: 'sonnet', displayName: 'Sonnet' }]
+    const query = ({ options }: any) => ({
+      supportedModels: async () => { options.stderr('probe warning\n'); return models },
+      close: async () => { throw new Error('close broke') },
+    })
+    await probeModelCatalog(query, { env: {}, log })
+    await probeModelCatalog(query, { env: { FRESHELL_HOSTED_FRESH_AGENT: 'kilroy' }, log })
+    expect(lines.map((line) => JSON.parse(line))).toEqual([
+      { severity: 'info', component: 'claude-model-catalog', event: 'cli.stderr', text: 'probe warning' },
+      { severity: 'warn', component: 'claude-model-catalog', event: 'catalog.close_failed', error: 'close broke' },
+      { severity: 'info', component: 'claude-model-catalog', event: 'cli.stderr', bytes: 14 },
+      { severity: 'warn', component: 'claude-model-catalog', event: 'catalog.close_failed', error: 'close broke' },
+    ])
   })
 
   it('runs the standalone catalog command with the configured SDK module', async () => {

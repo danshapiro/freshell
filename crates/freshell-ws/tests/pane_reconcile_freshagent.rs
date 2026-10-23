@@ -63,7 +63,7 @@ impl freshell_ws::existence::SessionExistenceProbe for StubProbe {
 /// A minimal scripted fake claude sidecar (no real SDK, no network, no cost)
 /// speaking the SAME newline-JSON protocol `spawn_sidecar()` drives the
 /// vendored package with. On `create` it replies `created`, then
-/// `sdk.session.init` echoing `resumeSessionId` (or a fixed durable UUID the
+/// `sdk.session.init` echoing the resume boot's id (or a fixed durable UUID the
 /// tests control) as the durable `cliSessionId`, then `sdk.status idle`; on
 /// `shutdown` it exits.
 const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
@@ -83,8 +83,8 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
-    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
+    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'shutdown') {

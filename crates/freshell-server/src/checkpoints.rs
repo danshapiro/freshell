@@ -47,6 +47,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex, OwnedMutexGuard};
 
+#[cfg(windows)]
+use freshell_platform::process_job::KillOnCloseJob;
 use freshell_protocol::{
     AgentProvider, CheckpointWorkspaceProvenance, FreshAgentCheckpointOutcome,
     FreshAgentCheckpointStatus, FreshAgentCheckpointWorkspace, FreshAgentSend, ServerMessage,
@@ -491,6 +493,9 @@ pub struct CheckpointService {
     test_capture_calls: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     test_capture_entered: tokio::sync::Notify,
+    /// When the latest automatic attempt finished resolving its workspace.
+    #[cfg(test)]
+    test_workspace_resolved_at: StdMutex<Option<Instant>>,
 }
 
 tokio::task_local! {
@@ -503,7 +508,7 @@ struct CheckpointCaptureControl {
     #[cfg(unix)]
     process_groups: StdMutex<HashSet<i32>>,
     #[cfg(windows)]
-    jobs: StdMutex<Vec<Arc<WindowsJob>>>,
+    jobs: StdMutex<Vec<Arc<KillOnCloseJob>>>,
     #[cfg(test)]
     test_settlement_gate: StdMutex<Option<Arc<TestSettlementGate>>>,
     #[cfg(test)]
@@ -561,7 +566,7 @@ impl CheckpointCaptureControl {
                     "checkpoint capture was cancelled",
                 ));
             }
-            let job = Arc::new(WindowsJob::new()?);
+            let job = Arc::new(KillOnCloseJob::new()?);
             command.as_std_mut().creation_flags(CREATE_SUSPENDED);
             command.kill_on_drop(true);
             let mut child = command.spawn()?;
@@ -569,7 +574,7 @@ impl CheckpointCaptureControl {
                 std::io::Error::other("checkpoint child process has no process id")
             })?;
             if let Err(error) = job.assign_suspended_process(process_id) {
-                job.terminate();
+                terminate_checkpoint_job(&job);
                 let _ = child.start_kill();
                 return Err(error);
             }
@@ -632,7 +637,7 @@ impl CheckpointCaptureControl {
                 .expect("checkpoint job list poisoned")
                 .clone();
             for job in jobs {
-                job.terminate();
+                terminate_checkpoint_job(&job);
             }
         }
         Ok(())
@@ -683,7 +688,7 @@ impl CheckpointCaptureControl {
                 .expect("checkpoint job list poisoned")
                 .clone();
             for job in jobs {
-                job.settle().await?;
+                settle_checkpoint_job(&job).await?;
                 self.jobs
                     .lock()
                     .expect("checkpoint job list poisoned")
@@ -734,7 +739,7 @@ struct CheckpointChild {
     control: Option<Arc<CheckpointCaptureControl>>,
     process_group: Option<i32>,
     #[cfg(windows)]
-    job: Option<Arc<WindowsJob>>,
+    job: Option<Arc<KillOnCloseJob>>,
 }
 
 impl CheckpointChild {
@@ -764,7 +769,7 @@ impl CheckpointChild {
         }
         #[cfg(windows)]
         if let (Some(control), Some(job)) = (&self.control, &self.job) {
-            job.settle().await?;
+            settle_checkpoint_job(job).await?;
             control
                 .jobs
                 .lock()
@@ -817,192 +822,54 @@ fn process_group_exists(group: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Terminate a checkpoint child's Job Object, logging (never propagating) a
+/// failure: the settlement wait that follows reports whether the job emptied.
 #[cfg(windows)]
-struct WindowsJob {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+fn terminate_checkpoint_job(job: &KillOnCloseJob) {
+    if let Err(cause) = job.terminate() {
+        tracing::error!(
+            event = "code_checkpoint.job_termination_failed",
+            cause = %cause,
+            "checkpoint child job could not be terminated"
+        );
+    }
 }
 
+/// Settle a checkpoint child's Job Object: terminate whatever is still
+/// running in it, then wait (up to five seconds) for the job to signal.
 #[cfg(windows)]
-unsafe impl Send for WindowsJob {}
-#[cfg(windows)]
-unsafe impl Sync for WindowsJob {}
-
-#[cfg(windows)]
-impl WindowsJob {
-    fn new() -> std::io::Result<Self> {
-        use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                std::ptr::addr_of!(limits).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if configured == 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-            return Err(error);
-        }
-        Ok(Self { handle })
-    }
-
-    fn assign_suspended_process(&self, process_id: u32) -> std::io::Result<()> {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-        };
-
-        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, process_id) };
-        if process.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let assigned = unsafe { AssignProcessToJobObject(self.handle, process) };
-        let assign_error = (assigned == 0).then(std::io::Error::last_os_error);
-        unsafe { CloseHandle(process) };
-        if let Some(error) = assign_error {
-            return Err(error);
-        }
-
-        let thread_id = find_process_thread(process_id)?;
-        let thread = unsafe {
-            windows_sys::Win32::System::Threading::OpenThread(
-                windows_sys::Win32::System::Threading::THREAD_SUSPEND_RESUME,
-                0,
-                thread_id,
-            )
-        };
-        if thread.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let resumed = unsafe { windows_sys::Win32::System::Threading::ResumeThread(thread) };
-        unsafe { CloseHandle(thread) };
-        if resumed == u32::MAX {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn active_processes(&self) -> std::io::Result<u32> {
-        use windows_sys::Win32::System::JobObjects::{
-            JobObjectBasicAccountingInformation, QueryInformationJobObject,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        };
-
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.handle,
-                JobObjectBasicAccountingInformation,
-                std::ptr::addr_of_mut!(accounting).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if queried == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(accounting.ActiveProcesses)
-    }
-
-    fn terminate(&self) {
-        let terminated =
-            unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) };
-        if terminated == 0 {
+async fn settle_checkpoint_job(job: &Arc<KillOnCloseJob>) -> std::io::Result<()> {
+    let active_processes = match job.active_processes() {
+        Ok(active_processes) => active_processes,
+        Err(error) => {
             tracing::error!(
-                event = "code_checkpoint.job_termination_failed",
-                cause = %std::io::Error::last_os_error(),
-                "checkpoint child job could not be terminated"
+                event = "code_checkpoint.job_process_query_failed",
+                cause = %error,
+                "checkpoint child job activity could not be queried; terminating it"
             );
+            u32::MAX
         }
+    };
+    if active_processes == 0 {
+        return Ok(());
     }
-
-    async fn settle(&self) -> std::io::Result<()> {
-        let active_processes = match self.active_processes() {
-            Ok(active_processes) => active_processes,
-            Err(error) => {
-                tracing::error!(
-                    event = "code_checkpoint.job_process_query_failed",
-                    cause = %error,
-                    "checkpoint child job activity could not be queried; terminating it"
-                );
-                u32::MAX
-            }
-        };
-        if active_processes > 0 {
-            self.terminate();
-        } else {
-            return Ok(());
-        }
-        let handle = self.handle as usize;
-        let wait_result = tokio::task::spawn_blocking(move || unsafe {
-            windows_sys::Win32::System::Threading::WaitForSingleObject(
-                handle as windows_sys::Win32::Foundation::HANDLE,
-                5_000,
-            )
-        })
+    terminate_checkpoint_job(job);
+    let waiting = Arc::clone(job);
+    tokio::task::spawn_blocking(move || waiting.wait_signaled(Duration::from_secs(5)))
         .await
         .map_err(|error| {
             std::io::Error::other(format!("checkpoint job wait task failed: {error}"))
-        })?;
-        match wait_result {
-            windows_sys::Win32::Foundation::WAIT_OBJECT_0 => Ok(()),
-            windows_sys::Win32::Foundation::WAIT_TIMEOUT => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "checkpoint job did not settle within five seconds",
-            )),
-            windows_sys::Win32::Foundation::WAIT_FAILED => Err(std::io::Error::last_os_error()),
-            status => Err(std::io::Error::other(format!(
-                "checkpoint job wait returned unexpected status {status}"
-            ))),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsJob {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
-    }
-}
-
-#[cfg(windows)]
-fn find_process_thread(process_id: u32) -> std::io::Result<u32> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut found = None;
-    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) };
-    while has_entry != 0 {
-        if entry.th32OwnerProcessID == process_id {
-            found = Some(entry.th32ThreadID);
-            break;
-        }
-        has_entry = unsafe { Thread32Next(snapshot, &mut entry) };
-    }
-    unsafe { CloseHandle(snapshot) };
-    found.ok_or_else(|| std::io::Error::other("suspended Git process thread was not found"))
+        })?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "checkpoint job did not settle within five seconds",
+                )
+            } else {
+                error
+            }
+        })
 }
 
 impl CheckpointService {
@@ -1035,6 +902,8 @@ impl CheckpointService {
             test_capture_calls: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             test_capture_entered: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            test_workspace_resolved_at: StdMutex::new(None),
         }
     }
 
@@ -2488,6 +2357,13 @@ impl CheckpointService {
                 return record;
             }
         };
+        #[cfg(test)]
+        {
+            *self
+                .test_workspace_resolved_at
+                .lock()
+                .expect("workspace resolution timestamp mutex poisoned") = Some(Instant::now());
+        }
         if let Some(remaining) = self.active_cooldown(&workspace.path) {
             log_automatic_checkpoint_failure(
                 Some(request_id),
@@ -6502,8 +6378,12 @@ mod tests {
         );
         let control = Arc::new(CheckpointCaptureControl::default());
         let mut command = Command::new("cmd.exe");
+        // cmd.exe does not follow CommandLineToArgvW quoting: an escaped
+        // `\"` would reach `start` literally and no descendant would ever
+        // launch. Pass the command line verbatim.
         command
-            .args(["/C", &script])
+            .raw_arg("/C")
+            .raw_arg(&script)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -9178,16 +9058,32 @@ mod tests {
             .is_empty());
     }
 
+    /// During a timeout cooldown an automatic attempt answers
+    /// `capture_timeout_cooldown` as soon as its workspace is known, and the
+    /// message is forwarded: the attempt neither waits for the workspace's
+    /// capture lock nor starts a capture, so it never repeats the capture
+    /// wait. The test holds that lock throughout, so an attempt that waited
+    /// for it (or captured under it) would settle as `workspace_lock_timeout`
+    /// instead. The answer's latency is measured from the moment workspace
+    /// resolution returns: every automatic attempt resolves its workspace
+    /// (which runs Git) before it can look up the cooldown, so that part
+    /// follows machine load, not the cooldown policy.
     #[tokio::test]
     async fn cooldown_sends_immediately_without_capture() {
         let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        // The cooldown and the capture lock are keyed by the resolved path.
+        let workspace = std::fs::canonicalize(workspace_dir.path()).unwrap();
         let service = checkpoint_test_service(home.path());
-        service.establish_cooldown(workspace.path());
+        service.establish_cooldown(&workspace);
+        let _capture_lock = service
+            .lock_workspace(&workspace, Duration::from_secs(1))
+            .await
+            .expect("the test holds the workspace's capture lock");
 
-        let (outcome, dispatches, elapsed) = run_checkpoint_policy_send(
+        let (outcome, dispatches, _) = run_checkpoint_policy_send(
             Arc::clone(&service),
-            checkpoint_policy_send(workspace.path(), "cooldown-send", "cooldown-attempt"),
+            checkpoint_policy_send(&workspace, "cooldown-send", "cooldown-attempt"),
         )
         .await;
 
@@ -9195,9 +9091,32 @@ mod tests {
         assert_eq!(outcome["code"], "capture_timeout_cooldown");
         assert_eq!(dispatches, 1);
         assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+
+        // Time the cooldown answer itself, from the resolved workspace on.
+        *service.test_workspace_resolved_at.lock().unwrap() = None;
+        let send = checkpoint_policy_send(&workspace, "cooldown-timed", "cooldown-timed-attempt");
+        let record = service
+            .capture_automatic(&send, "cooldown-timed", "cooldown-timed-attempt")
+            .await;
+        let answered_at = Instant::now();
+        let resolved_at = service
+            .test_workspace_resolved_at
+            .lock()
+            .unwrap()
+            .expect("the attempt resolved its workspace");
+        assert_eq!(
+            record.outcome.code.as_deref(),
+            Some("capture_timeout_cooldown")
+        );
         assert!(
-            elapsed < Duration::from_secs(1),
-            "cooldown should not repeat the capture wait: {elapsed:?}"
+            record.capture_settled,
+            "a cooldown answer forwards the send"
+        );
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+        let answer = answered_at.duration_since(resolved_at);
+        assert!(
+            answer < Duration::from_secs(1),
+            "cooldown should answer without waiting once the workspace is known: {answer:?}"
         );
     }
 

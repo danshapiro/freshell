@@ -6,6 +6,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { userTurnText } from '../helpers/fresh-agent-transcript.js'
 
 /**
  * SYNC-05 -- "Gate current-main expected-restart behavior across owners"
@@ -306,7 +307,7 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
         const turnText = `sync05-codex-turn-${Math.random().toString(36).slice(2, 8)}`
         await composer.fill(turnText)
         await sendButton.click()
-        await expect(paneRoot.getByText(turnText)).toBeVisible({ timeout: 10_000 })
+        await expect(userTurnText(paneRoot, turnText)).toBeVisible({ timeout: 10_000 })
         await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 20_000 })
 
         // Sanity: quiet BEFORE the restart too (genuinely quiet baseline).

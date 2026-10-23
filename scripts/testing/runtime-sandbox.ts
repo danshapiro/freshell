@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
-import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
+import { parseHelperCreateDelay, RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
 export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
@@ -68,6 +68,10 @@ export type FreshAgentQualificationBuildRecord = {
   supervisorBinary: string
   sessionHostBinary: string
 }
+
+/** How long cleanup waits for Docker to answer requests the broker forwarded:
+  * a create can wait tens of seconds for the host to flush its disk. */
+const BROKER_SETTLE_MS = 90_000
 
 export function phase2BootstrapFiles(
   env: NodeJS.ProcessEnv = process.env,
@@ -250,6 +254,11 @@ export class RuntimeHarness {
       testRunId: this.runId,
       logPath: path.join(this.evidenceDir, 'broker.jsonl'),
     })
+    const helperCreateDelay = parseHelperCreateDelay(process.env.FRESHELL_TEST_BROKER_DELAY_HELPER_CREATE)
+    if (helperCreateDelay) {
+      this.broker.delayHelperCreates(helperCreateDelay)
+      this.recordLifecycle('gate.broker.helper_create_delay', helperCreateDelay)
+    }
     await this.broker.start()
     this.brokerStarted = true
 
@@ -263,6 +272,13 @@ export class RuntimeHarness {
     const errors: string[] = []
     for (const id of [...this.trackedSupervisorContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
+    }
+    // A helper create Docker answers after the supervisor stopped waiting, or
+    // after the supervisor container above was removed with its background
+    // cleanup, still makes the helper. Let every forwarded request finish so
+    // the receipt removals below include that helper.
+    if (this.brokerStarted && !(await this.broker.settleForwarded(BROKER_SETTLE_MS))) {
+      errors.push(`docker requests forwarded by the broker were still unanswered after ${BROKER_SETTLE_MS / 1000}s`)
     }
     for (const id of [...this.broker?.receiptIds?.() ?? []]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`managed runtime ${id}: ${String(error)}`) }
@@ -297,6 +313,21 @@ export class RuntimeHarness {
         }
       } catch (error) { errors.push(`indexed volume ${volume}: ${String(error)}`) }
     }
+    // A candidate read whose supervisor was removed mid-read, or before its
+    // background cleanup ran, leaves its scratch volume. The broker knows
+    // exactly which ones this run created; every helper that mounted one is
+    // gone by now, so delete each through the broker's ownership check.
+    const candidateVolumes = this.broker?.candidateVolumeNames?.() ?? []
+    for (const volume of candidateVolumes) {
+      try {
+        const url = `/v1.47/volumes/${volume}`
+        const deleted = await brokerRequestStatus(this.broker.proxySocketPath, 'DELETE', url)
+        if (deleted !== 204 && deleted !== 404) throw new Error('owned candidate volume deletion unavailable')
+        if (await brokerRequestStatus(this.broker.proxySocketPath, 'GET', url) !== 404) {
+          throw new Error('owned candidate volume absence unconfirmed')
+        }
+      } catch (error) { errors.push(`candidate volume ${volume}: ${String(error)}`) }
+    }
     for (const volume of [...this.trackedVolumes]) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`volume ${volume}: ${String(error)}`) }
     }
@@ -317,7 +348,7 @@ export class RuntimeHarness {
         ...this.trackedContainers,
         ...this.broker?.receiptIds?.() ?? [],
       ])],
-      volumes: [...new Set([...this.trackedVolumes, ...providerVolumes, ...indexedVolumes])],
+      volumes: [...new Set([...this.trackedVolumes, ...providerVolumes, ...indexedVolumes, ...candidateVolumes])],
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
       completedAt: new Date().toISOString(),
     }

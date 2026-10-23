@@ -589,17 +589,17 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       })
 
       // The resume-on-attach spawns a fresh sidecar whose create carries
-      // resumeSessionId + the LEDGER-recorded settings (Task 10).
+      // a resume boot + the LEDGER-recorded settings (Task 10).
       await expect
         .poll(
           () =>
-            readJsonl(sidecarLogPath).some((m) => m.msg && m.msg.resumeSessionId === durable),
+            readJsonl(sidecarLogPath).some((m) => m.msg && m.msg.boot?.resume === durable),
           { timeout: 30_000 },
         )
         .toBe(true)
 
       const msgs = fs.readFileSync(sidecarLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
-      const resumeCreate = msgs.filter((m) => m.msg && m.msg.resumeSessionId).pop()
+      const resumeCreate = msgs.filter((m) => m.msg && m.msg.boot?.resume).pop()
       expect(resumeCreate, 'restart must issue a resume create').toBeTruthy()
       expect(resumeCreate.msg.model, 'resume must carry the recorded model, not null').toBe('opus-x')
       expect(resumeCreate.msg.permissionMode, 'resume must carry the recorded permissionMode').toBe('plan')

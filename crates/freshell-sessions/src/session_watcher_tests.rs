@@ -3197,18 +3197,31 @@ async fn metadata_late_subagent_named_mkdir_arms_via_deferred_recheck_without_a_
     .await
     .expect("the deferred probe recheck arms the drift root within seconds of its metadata");
     writer.join().unwrap();
+    // And the row is promptly visible — the watch-then-scan scoped mark
+    // drove a scoped re-parse, end to end. The arm is observable BEFORE
+    // the row: the flush releases the book lock (the arm) before its
+    // scoped mark drains into `mark_dirty`, and the mark's re-parse then
+    // publishes from a background refresh (a snapshot read while that
+    // sweep holds the refresh lock serves the previous generation). So
+    // the row is awaited under the same seconds-not-reconcile budget as
+    // the arm, never read once right after it.
+    let visible = |snap: &[crate::directory_index::IndexedSession]| {
+        snap.iter()
+            .any(|s| s.provider == "amplifier" && s.session_id == "late-drift-root")
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !visible(&index.snapshot().await) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the drift root's scoped mark made the row visible within seconds");
+    // Checked AFTER the row is visible: the row arrived without any full
+    // provider discover — scoped marks only, for the mkdir AND its row.
     assert_eq!(
         counted.discover_calls.load(Ordering::SeqCst),
         baseline_discovers,
         "the mkdir must never pay a full provider discover (scoped marks only)"
-    );
-    // And the row is promptly visible — the watch-then-scan scoped mark
-    // drove a scoped re-parse, end to end.
-    let snap = index.snapshot().await;
-    assert!(
-        snap.iter()
-            .any(|s| s.provider == "amplifier" && s.session_id == "late-drift-root"),
-        "the drift root's scoped mark made the row visible without a discover"
     );
     watcher.stop();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;

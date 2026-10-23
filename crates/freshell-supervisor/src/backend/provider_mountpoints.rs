@@ -1,4 +1,8 @@
 //! Fixed helper for descriptor-owned placeholders in the exact soul volume.
+use super::helper_lifecycle::{
+    AttemptStep, Deferred, HelperContainer, HelperDeadlines, HelperFailure, HelperKind,
+    HelperObjects, HELPER_CLEANUP_BUDGET,
+};
 use super::*;
 use freshell_platform::provider_mountpoints::Mountpoint;
 use std::time::Duration;
@@ -206,7 +210,6 @@ impl DockerEngineBackend {
         if self.daemon_id().await? != *daemon {
             return Err(fail("provider mountpoint daemon changed"));
         }
-        let mut owned = None;
         let target = MountpointHelperTarget {
             image: &spec.image_ref,
             volume: &spec.provider_volume_name,
@@ -214,28 +217,67 @@ impl DockerEngineBackend {
             daemon,
             labels: json!({"com.freshell.installation-id":spec.installation_id,"com.freshell.soul-id":spec.soul_id,"com.freshell.incarnation-id":spec.incarnation_id}),
         };
-        self.run_provider_mountpoint_helper(
+        self.run_launch_mountpoint_helper(
             target,
             selected,
-            (Duration::from_secs(30), Duration::from_secs(5)),
-            &mut owned,
+            HelperDeadlines::after(Duration::from_secs(30), HELPER_CLEANUP_BUDGET),
         )
         .await
     }
 
+    /// Run the fixed mountpoint helper for a launch within `deadlines`. A
+    /// launch has no later cleanup of its own, so whatever the run still owns
+    /// when it returns goes to the background reaper.
+    pub(super) async fn run_launch_mountpoint_helper(
+        &self,
+        target: MountpointHelperTarget<'_>,
+        selected: Vec<Mountpoint>,
+        deadlines: HelperDeadlines,
+    ) -> Result<(), BackendError> {
+        let mut owned = None;
+        let result = self
+            .run_provider_mountpoint_helper(
+                target,
+                selected,
+                deadlines,
+                &AttemptStep::new(),
+                &mut owned,
+            )
+            .await;
+        // The run still owns a helper Docker has not created yet, or one whose
+        // removal it could not confirm: either is still ours to remove.
+        if let Some(helper) = owned.take() {
+            let why = if helper.is_pending() {
+                Deferred::CreateUnanswered
+            } else {
+                Deferred::RemovalUnconfirmed
+            };
+            self.reap_helper_objects("provider_mountpoints", helper, why);
+        }
+        result.map_err(|failure| failure.error)
+    }
+
+    /// Run the fixed mountpoint helper against `target` within `deadlines`.
+    /// `owned` holds the helper from its create until its removal is
+    /// confirmed; it is still set on return when the removal is unconfirmed or
+    /// Docker has not answered the create yet, and the caller then owns the
+    /// helper's removal. A run that timed out, or whose create or start was
+    /// refused transiently, is reported as a transient failure; `step` records
+    /// the `mountpoints_*` step the run is in.
     pub(super) async fn run_provider_mountpoint_helper(
         &self,
         target: MountpointHelperTarget<'_>,
         selected: Vec<Mountpoint>,
-        budgets: (Duration, Duration),
-        owned: &mut Option<(String, Value)>,
-    ) -> Result<(), BackendError> {
+        deadlines: HelperDeadlines,
+        step: &AttemptStep,
+        owned: &mut Option<HelperContainer>,
+    ) -> Result<(), HelperFailure> {
         if owned.is_some() {
-            return Err(fail(
-                "provider mountpoint previous helper cleanup remains unconfirmed",
-            ));
+            return Err(
+                fail("provider mountpoint previous helper cleanup remains unconfirmed").into(),
+            );
         }
-        let deadline = tokio::time::Instant::now() + budgets.0;
+        let deadline = deadlines.operation;
         let request = freshell_runtime_protocol::bounded_json_bytes(&selected, 1024 * 1024)
             .map_err(|_| fail("provider mountpoint metadata profile exceeded"))?;
         let directory = native_auth::ExchangeDirectory::create_input()?;
@@ -249,9 +291,7 @@ impl DockerEngineBackend {
                 .await
                 .map_err(|_| fail("provider mountpoint image lookup timed out"))??;
         if tokio::time::Instant::now() >= deadline {
-            return Err(fail(
-                "provider mountpoint preparation timed out before create",
-            ));
+            return Err(fail("provider mountpoint preparation timed out before create").into());
         }
         let body = json!({
             "Image":target.image,"User":"0:0","Tty":false,
@@ -265,24 +305,28 @@ impl DockerEngineBackend {
                     {"Type":"volume","Source":target.volume,"Target":"/home/freshell/provider","ReadOnly":false,"VolumeOptions":{"NoCopy":true}},
                     {"Type":"bind","Source":directory.0,"Target":"/run/freshell-input-exchange","ReadOnly":true}]}
         });
-        let mut attempted = false;
         let operation = async {
-            attempted = true;
-            *owned = Some((name.clone(), body.clone()));
-            let created = self
-                .request_bounded(
-                    "POST",
-                    &format!("{DOCKER_API}/containers/create?name={name}"),
-                    Some(&body),
-                    64 * 1024,
-                )
-                .await?;
-            if created.status == 409 {
-                attempted = false;
-                *owned = None;
-            }
+            step.enter("mountpoints_create");
+            let created = owned
+                .insert(HelperContainer::new(
+                    HelperKind::ProviderMountpoints,
+                    name.clone(),
+                    body.clone(),
+                ))
+                .create(self)
+                .await
+                .map_err(|_| {
+                    HelperFailure::unanswered(
+                        "mountpoints_create",
+                        fail("provider mountpoint helper creation unanswered"),
+                    )
+                })?;
             if created.status != 201 {
-                return Err(fail("provider mountpoint helper creation failed"));
+                return Err(HelperFailure::answered(
+                    "mountpoints_create",
+                    created.status,
+                    fail("provider mountpoint helper creation failed"),
+                ));
             }
             let created: Value = serde_json::from_slice(&created.body)
                 .map_err(|_| fail("provider mountpoint helper identity unavailable"))?;
@@ -305,16 +349,28 @@ impl DockerEngineBackend {
                 || actual["State"]["Running"] != false
                 || !owned_mountpoint_helper(&actual, &body)
             {
-                return Err(fail(
-                    "provider mountpoint helper namespace changed before start",
-                ));
+                return Err(
+                    fail("provider mountpoint helper namespace changed before start").into(),
+                );
             }
+            step.enter("mountpoints_start");
             let started = self
                 .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
-                .await?;
+                .await
+                .map_err(|_| {
+                    HelperFailure::unanswered(
+                        "mountpoints_start",
+                        fail("provider mountpoint helper start unanswered"),
+                    )
+                })?;
             if started.status != 204 {
-                return Err(fail("provider mountpoint helper start failed"));
+                return Err(HelperFailure::answered(
+                    "mountpoints_start",
+                    started.status,
+                    fail("provider mountpoint helper start failed"),
+                ));
             }
+            step.enter("mountpoints_read");
             let exchange = async {
                 let (mut stream, _) = listener
                     .accept()
@@ -333,6 +389,7 @@ impl DockerEngineBackend {
                     .read_exact(&mut acknowledgement)
                     .await
                     .map_err(|_| fail("provider mountpoint acknowledgement unavailable"))?;
+                step.enter("mountpoints_exit");
                 match &acknowledgement {
                     b"ok" => Ok(()),
                     b"er" => {
@@ -378,24 +435,29 @@ impl DockerEngineBackend {
             let (exchange_result, wait_result) = tokio::join!(exchange, wait);
             exchange_result?;
             wait_result?;
+            step.enter("mountpoints_verify");
             if self.daemon_id().await? != *target.daemon {
-                return Err(fail(
-                    "provider mountpoint daemon changed before main create",
-                ));
+                return Err(fail("provider mountpoint daemon changed before main create").into());
             }
             Ok(())
         };
         let result = tokio::time::timeout_at(deadline, operation)
             .await
-            .unwrap_or_else(|_| Err(fail("provider mountpoint preparation timed out")));
-        if attempted {
-            tokio::time::timeout(
-                budgets.1,
-                self.cleanup_provider_mountpoint_helper(&name, &body),
-            )
-            .await
-            .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
-            *owned = None;
+            .unwrap_or_else(|_| {
+                Err(HelperFailure::timed_out(
+                    fail("provider mountpoint preparation timed out"),
+                    step,
+                ))
+            });
+        // A create Docker has not answered by the settle deadline stays in
+        // `owned`: the caller owns removing the helper it may still make.
+        if let Some(helper) = owned.as_mut() {
+            if helper.settle(deadlines.settle).await {
+                tokio::time::timeout_at(deadlines.removal_deadline(), helper.remove(self))
+                    .await
+                    .map_err(|_| fail("provider mountpoint cleanup timed out"))??;
+                *owned = None;
+            }
         }
         tracing::debug!(
             event = "runtime.provider_mountpoints.settled",
@@ -414,8 +476,32 @@ mod tests {
         ProviderConfigBind, ProviderResourceKind, ProviderResourceMount,
     };
 
-    #[tokio::test]
+    /// Holds the paused test clock still while real socket I/O runs: tokio
+    /// never auto-advances a paused clock while a blocking task is running.
+    /// A budget then expires only when the test advances the clock at the
+    /// exact stall it exercises, however loaded the machine is. The real-time
+    /// limit matters only if the code under test wedges: the hold ends, the
+    /// clock auto-advances, and the test's own bounds fail it instead of
+    /// letting it hang.
+    struct FrozenClock {
+        _release_on_drop: std::sync::mpsc::Sender<()>,
+    }
+
+    impl FrozenClock {
+        fn hold() -> Self {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            drop(tokio::task::spawn_blocking(move || {
+                let _ = held.recv_timeout(std::time::Duration::from_secs(60));
+            }));
+            Self {
+                _release_on_drop: release,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn provider_mountpoint_candidate_target_joins_owned_preparation_and_cleanup() {
+        use std::collections::BTreeSet;
         use std::sync::{Arc, Mutex};
         use tokio::task::JoinSet;
         for mode in [
@@ -429,6 +515,7 @@ mod tests {
             "cancel-private-exchange",
             "slow-image",
         ] {
+            let _clock = FrozenClock::hold();
             let owned = tempfile::tempdir().unwrap();
             let home = owned.path().join("scratch-home");
             std::fs::create_dir(&home).unwrap();
@@ -453,6 +540,9 @@ mod tests {
             let expected = Arc::new(Mutex::new(None::<Value>));
             let requests = Arc::new(Mutex::new(Vec::<String>::new()));
             let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // The fixture reports where it parks the operation, so the test
+            // expires a budget exactly at the stall the mode exercises.
+            let (stalls, mut stalled) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
             let (body, seen, deleted, fixture_home, fixture_daemon) = (
                 expected.clone(),
                 requests.clone(),
@@ -469,7 +559,7 @@ mod tests {
                         _=&mut stopped=>break,
                         accepted=listener.accept()=>{
                             let (mut stream,_)=accepted.unwrap();
-                            let (body,seen,deleted,home,daemon,private_jobs)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone());
+                            let (body,seen,deleted,home,daemon,private_jobs,stalls)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone(),stalls.clone());
                             jobs.spawn(async move {
                                 let mut header=Vec::new(); let mut byte=[0];
                                 while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
@@ -478,7 +568,7 @@ mod tests {
                                 let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
                                 assert!(length<=1024*1024);let mut raw=vec![0;length];stream.read_exact(&mut raw).await.unwrap();
                                 seen.lock().unwrap().push(line.clone());
-                                let (status,value)=if line.contains("/images/") {if mode=="slow-image" {tokio::time::sleep(Duration::from_secs(10)).await;} (200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_UNUSED_IMAGE_CREDENTIAL"]}}))}
+                                let (status,value)=if line.contains("/images/") {if mode=="slow-image" {stalls.send("image-withheld").unwrap();std::future::pending::<()>().await;} (200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_UNUSED_IMAGE_CREDENTIAL"]}}))}
                                 else if line.contains("/info ") {(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
                                 else if line.contains("/containers/create?") { *body.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(if mode=="lost-create-ack" {503} else {201},json!({"Id":"c".repeat(64)}))}
                                 else if line.starts_with("GET") && line.contains("/containers/") {
@@ -492,9 +582,10 @@ mod tests {
                                 else if line.contains("/start ") {
                                     let expected=body.lock().unwrap().as_ref().unwrap().clone();
                                     let exchange=expected["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|mount|mount["Target"]=="/run/freshell-input-exchange").unwrap()["Source"].as_str().unwrap().to_owned();
+                                    let stalls=stalls.clone();
                                     private_jobs.lock().unwrap().push(tokio::spawn(async move {
                                         let mut channel=UnixStream::connect(Path::new(&exchange).join("reply.sock")).await.unwrap();
-                                        if matches!(mode,"timeout"|"cancel-private-exchange") {tokio::time::sleep(Duration::from_secs(10)).await;return;}
+                                        if matches!(mode,"timeout"|"cancel-private-exchange") {stalls.send("exchange-withheld").unwrap();std::future::pending::<()>().await;}
                                         let length=channel.read_u32().await.unwrap() as usize; assert!(length<=1024*1024);
                                         let mut raw=vec![0;length];channel.read_exact(&mut raw).await.unwrap();
                                         let selected:Vec<Mountpoint>=serde_json::from_slice(&raw).unwrap();
@@ -512,6 +603,7 @@ mod tests {
                                 else {(500,json!({}))};
                                 let raw=value.to_string();let response=format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",raw.len());
                                 let _=stream.write_all(response.as_bytes()).await;
+                                if line.contains("/wait?") {stalls.send("wait-answered").unwrap();}
                             });
                         },
                         result=jobs.join_next(),if !jobs.is_empty()=>{result.unwrap().unwrap();}
@@ -528,17 +620,48 @@ mod tests {
             });
             let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
             let mut helper = None;
-            let outcome=tokio::time::timeout(if mode=="cancel-private-exchange" {Duration::from_millis(50)} else {Duration::from_secs(3)},backend.run_provider_mountpoint_helper(
-                MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
-            )).await;
+            let step = AttemptStep::new();
+            let budget = Duration::from_millis(250);
+            let caller_bound = if mode == "cancel-private-exchange" {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(3)
+            };
+            // Only the stalled modes move the clock, and only once every
+            // request before the stall has been answered: the private
+            // exchange (with the helper's exit already reported) or the image
+            // lookup is the one thing still pending when its bound expires.
+            let mut stall: BTreeSet<&str> = match mode {
+                "timeout" | "cancel-private-exchange" => {
+                    BTreeSet::from(["exchange-withheld", "wait-answered"])
+                }
+                "slow-image" => BTreeSet::from(["image-withheld"]),
+                _ => BTreeSet::new(),
+            };
+            let expire_at_stall = async {
+                if stall.is_empty() {
+                    return std::future::pending().await;
+                }
+                while !stall.is_empty() {
+                    stall.remove(stalled.recv().await.expect("fixture reports its stall"));
+                }
+                tokio::time::advance(caller_bound.min(budget)).await;
+                std::future::pending().await
+            };
+            let outcome = tokio::select! {
+                outcome = tokio::time::timeout(caller_bound,backend.run_provider_mountpoint_helper(
+                    MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,HelperDeadlines::after(budget,budget),&step,&mut helper
+                )) => outcome,
+                () = expire_at_stall => unreachable!("the stall clock never completes"),
+            };
             if mode == "cancel-private-exchange" {
                 assert!(outcome.is_err());
-                let (name, body) = helper
+                let owned = helper
                     .as_ref()
                     .expect("canceled private exchange must retain exact helper ownership");
                 tokio::time::timeout(
                     Duration::from_millis(250),
-                    backend.cleanup_provider_mountpoint_helper(name, body),
+                    backend.cleanup_provider_mountpoint_helper(&owned.name, &owned.expected),
                 )
                 .await
                 .unwrap()
@@ -617,6 +740,130 @@ mod tests {
                 "owned-candidate-volume"
             );
             assert!(!body.to_string().contains("PRIVATE_UNUSED_IMAGE_CREDENTIAL"));
+        }
+    }
+
+    /// A launch has no later cleanup of its own: whatever its helper run
+    /// still owns when it returns (a create Docker had not answered, or a
+    /// removal it could not confirm) goes to the background reaper. Real time,
+    /// because the reaper's removal is real socket I/O after the run returns.
+    #[tokio::test]
+    async fn launch_mountpoint_helper_hands_what_it_still_owns_to_the_reaper() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::task::JoinSet;
+        for mode in ["late-create", "slow-cleanup"] {
+            let owned = tempfile::tempdir().unwrap();
+            let daemon = DockerDaemonId::new();
+            let binary = owned.path().join("host");
+            std::fs::write(&binary, b"synthetic helper artifact").unwrap();
+            let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
+            let created = Arc::new(Mutex::new(None::<Value>));
+            let deleted = Arc::new(AtomicBool::new(false));
+            // The cleanup inspection that answers late has happened.
+            let slowed = Arc::new(AtomicBool::new(false));
+            let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+            let (fixture_created, fixture_deleted, fixture_daemon) =
+                (created.clone(), deleted.clone(), daemon.clone());
+            let server = tokio::spawn(async move {
+                let mut jobs = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _=&mut stopped=>break,
+                        accepted=listener.accept()=>{
+                            let (mut stream,_)=accepted.unwrap();
+                            let (created,deleted,slowed,daemon)=(fixture_created.clone(),fixture_deleted.clone(),slowed.clone(),fixture_daemon.clone());
+                            jobs.spawn(async move {
+                                let mut header=Vec::new(); let mut byte=[0];
+                                // A caller may abandon a request it no longer waits for.
+                                while !header.ends_with(b"\r\n\r\n") {if stream.read_exact(&mut byte).await.is_err() {return;}header.push(byte[0]);}
+                                let header=String::from_utf8(header).unwrap();
+                                let line=header.lines().next().unwrap().to_string();
+                                let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
+                                let mut raw=vec![0;length];if stream.read_exact(&mut raw).await.is_err() {return;}
+                                let (status,value)=if line.contains("/images/") {(200,json!({"Config":{"Env":["PATH=/usr/bin"]}}))}
+                                else if line.contains("/info ") {(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
+                                else if line.contains("/containers/create?") {
+                                    // A stalled daemon makes the helper well after the run gave up on it.
+                                    if mode=="late-create" {tokio::time::sleep(Duration::from_secs(9)).await;}
+                                    *created.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(201,json!({"Id":"c".repeat(64)}))}
+                                else if line.starts_with("GET") && line.contains("/containers/") {
+                                    // Cleanup's first inspection, by name, answers after the
+                                    // cleanup window: the helper is still there and still ours.
+                                    if mode=="slow-cleanup" && line.contains("/containers/freshell-mountpoints-") && !slowed.swap(true,Ordering::SeqCst) {tokio::time::sleep(Duration::from_secs(8)).await;}
+                                    let body=created.lock().unwrap().clone();
+                                    match body {Some(body) if !deleted.load(Ordering::SeqCst)=>(200,json!({"Id":"c".repeat(64),"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}})),_=>(404,json!({}))}
+                                }
+                                else if line.contains("/start ") {
+                                    let body=created.lock().unwrap().clone().unwrap();
+                                    let exchange=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|mount|mount["Target"]=="/run/freshell-input-exchange").unwrap()["Source"].as_str().unwrap().to_owned();
+                                    // The helper answers over its exchange once it is running.
+                                    tokio::spawn(async move {
+                                        let Ok(mut channel)=UnixStream::connect(Path::new(&exchange).join("reply.sock")).await else {return;};
+                                        let Ok(length)=channel.read_u32().await else {return;};
+                                        let mut request=vec![0;length as usize];
+                                        if channel.read_exact(&mut request).await.is_ok() {let _=channel.write_all(b"ok").await;}
+                                    });
+                                    (204,json!({}))
+                                }
+                                else if line.contains("/wait?") {(200,json!({"StatusCode":0}))}
+                                else if line.starts_with("DELETE") {deleted.store(true,Ordering::SeqCst);(204,json!({}))}
+                                else {(500,json!({}))};
+                                let raw=value.to_string();
+                                let _=stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",raw.len()).as_bytes()).await;
+                            });
+                        },
+                        result=jobs.join_next(),if !jobs.is_empty()=>{result.unwrap().unwrap();}
+                    }
+                }
+                jobs.shutdown().await;
+            });
+            let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
+            let target = MountpointHelperTarget {
+                image: "synthetic-image",
+                volume: "owned-provider-volume",
+                binary: &binary,
+                daemon: &daemon,
+                labels: json!({"com.freshell.soul-id":"synthetic-owner"}),
+            };
+            let selected = vec![Mountpoint {
+                relative_path: ".claude/settings.json".into(),
+                directory: false,
+            }];
+            // Seconds-long windows: the run reaches its create inside the
+            // first, and Docker answers the late create well after both.
+            let deadlines = if mode == "late-create" {
+                HelperDeadlines::after(Duration::from_secs(3), Duration::from_secs(2))
+            } else {
+                HelperDeadlines::after(Duration::from_secs(10), Duration::from_secs(2))
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                backend.run_launch_mountpoint_helper(target, selected, deadlines),
+            )
+            .await
+            .expect("the launch's helper window is bounded");
+            if mode == "late-create" {
+                assert!(result.is_err(), "{result:?}");
+            } else {
+                assert!(
+                    format!("{result:?}").contains("cleanup timed out"),
+                    "an unconfirmed removal stays a failure: {result:?}"
+                );
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !deleted.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                deleted.load(Ordering::SeqCst),
+                "{mode}: the helper the launch still owned is removed"
+            );
         }
     }
 

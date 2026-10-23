@@ -18,7 +18,7 @@ import { ApiError } from '@/lib/api'
 
 export type SnapshotTrigger =
   | 'identity' | 'event' | 'send-accepted' | 'materialized'
-  | 'manual' | 'poll' | 'reconnect' | 'reveal' | 'idle-incomplete'
+  | 'manual' | 'poll' | 'reconnect' | 'reveal' | 'reveal-surface' | 'idle-incomplete'
 
 export type SnapshotOutcome<T> =
   | { status: 'ok'; value: T }
@@ -31,7 +31,7 @@ export const SNAPSHOT_DEBOUNCE_MS = 250
 const BACKOFF_BASE_MS = 1_000
 const BACKOFF_MAX_MS = 30_000
 
-const DEBOUNCED_TRIGGERS: ReadonlySet<SnapshotTrigger> = new Set(['event', 'send-accepted', 'reveal', 'reconnect'])
+const DEBOUNCED_TRIGGERS: ReadonlySet<SnapshotTrigger> = new Set(['event', 'send-accepted', 'reveal', 'reveal-surface', 'reconnect'])
 
 export function makeSnapshotKey(input: {
   sessionType: string; provider: string; threadId: string; cwd?: string; soulId?: string; soulIntentRevision?: number

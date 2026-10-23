@@ -27,7 +27,7 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 /// A minimal scripted fake claude sidecar (no real SDK, no network, no cost) speaking
 /// the SAME newline-JSON protocol `spawn_sidecar()` drives the vendored package with.
-/// On `create` it replies `created`, then `sdk.session.init` echoing `resumeSessionId`
+/// On `create` it replies `created`, then `sdk.session.init` echoing the resume boot's id
 /// as the durable `cliSessionId` (resume continuity -- exactly what the real sidecar's
 /// SDK init does), then `sdk.status idle`; on `send` it emits `sdk.status busy` (the
 /// Task 10b event-after-rebind knob); on `shutdown` it exits. Every inbound request is
@@ -59,8 +59,8 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
-    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
+    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'send') {
@@ -343,7 +343,7 @@ async fn claude_attach_for_untracked_session_emits_lost_session_frame_over_ws() 
 
 /// Restart parity (Task 6): an attach for an untracked session that DOES carry a
 /// durable claude UUID with a resumable transcript must be resumed in place -- the
-/// server spawns a sidecar with `resumeSessionId` and emits the idle
+/// server spawns a sidecar with a resume boot and emits the idle
 /// `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID (the
 /// frozen client persists it unvalidated -- NEVER a nanoid), all under the CLIENT's
 /// original session id. Before the fix this attach produced the lost frame instead
@@ -378,6 +378,93 @@ async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over
     assert_eq!(frame["sessionType"], "freshclaude");
     assert_eq!(frame["event"]["status"], "idle");
     assert_eq!(frame["event"]["timelineSessionId"], durable);
+}
+
+/// Makes a directory unreadable (mode 000) and restores it on drop -- declared
+/// AFTER the env guard so it drops first and the env guard's `remove_dir_all`
+/// can clean up. `None` when the process bypasses permission bits (root), where
+/// the EACCES under test cannot be produced.
+#[cfg(unix)]
+struct UnreadableDir(std::path::PathBuf);
+#[cfg(unix)]
+impl UnreadableDir {
+    fn make(dir: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let guard = Self(dir.to_path_buf());
+        if std::fs::read_dir(dir).is_ok() {
+            eprintln!("skipping: euid bypasses permission checks");
+            return None;
+        }
+        Some(guard)
+    }
+}
+#[cfg(unix)]
+impl Drop for UnreadableDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// G28: an attach by durable UUID while the transcript store cannot be READ
+/// (EACCES on `projects/`) must not be adjudicated "lost". The server cannot
+/// prove the transcript gone, so it answers the transient
+/// `CLAUDE_ATTACH_RESUME_FAILED` error -- never the `INVALID_SESSION_ID` frame
+/// the client folds into `markSessionLost` and starts a recovery for -- and it
+/// spawns no sidecar against an unchecked store.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_attach_with_an_unreadable_store_is_transient_not_lost() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let durable = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    let env = FakeClaudeResumeEnv::install(durable);
+    let Some(_locked) = UnreadableDir::make(&env.dir.join("claude-store").join("projects")) else {
+        return;
+    };
+
+    let url = spawn_server().await;
+    let mut ws = connect_and_complete_handshake(&url).await;
+
+    send_json(
+        &mut ws,
+        &serde_json::json!({
+            "type": "freshAgent.attach",
+            "provider": "claude",
+            "sessionId": "pane-with-unreadable-store",
+            "sessionType": "freshclaude",
+            "sessionRef": { "provider": "claude", "sessionId": durable },
+        }),
+    )
+    .await;
+
+    // The FIRST answer is decisive: either the lost frame for this pane or the
+    // transient top-level error.
+    let frame = await_frame(&mut ws, Duration::from_secs(15), |v| {
+        (v["type"] == "freshAgent.event" && v["sessionId"] == "pane-with-unreadable-store")
+            || v["type"] == "error"
+    })
+    .await;
+    assert_eq!(
+        frame["type"], "error",
+        "an unreadable store must not mark the session lost: {frame}"
+    );
+    assert!(
+        frame["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("CLAUDE_ATTACH_RESUME_FAILED")),
+        "the attach answers with the transient resume failure: {frame}"
+    );
+
+    let creates = env
+        .request_log_rows()
+        .into_iter()
+        .filter(|r| r["msg"]["type"] == "create")
+        .count();
+    assert_eq!(
+        creates, 0,
+        "no sidecar may spawn against an unchecked store"
+    );
 }
 
 /// Kilroy panes ride the same claude provider arm with `sessionType: "kilroy"`; the

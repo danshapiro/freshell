@@ -3,6 +3,7 @@
 // permission.respond/question.respond pending-resolution (waiting edge
 // re-fires), interrupt-time pending cancellation (cancel frames, never an
 // sdk.exit), the parked-turn rule (no canned completion while parked), the
+// stream-error lane's exit (the real sidecar's end of stream), the
 // FRESHELL_FAKE_STDIN raw-stdin audit, and the durable-transcript writes the
 // reload-while-pending snapshot route depends on. Process/wire-level contract
 // for all seven fixtures stays in specs/harness-03-provider-fixtures.spec.ts;
@@ -269,7 +270,8 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       expect(cancelledPermission).toMatchObject({ sessionId, requestId: 'req-perm-1' })
       const cancelledQuestion = await fx.waitLine((o) => o.type === 'sdk.question.cancelled', 'sdk.question.cancelled')
       expect(cancelledQuestion).toMatchObject({ sessionId, requestId: 'req-q-1' })
-      await fx.waitLine((o) => o.type === 'sdk.status' && o.status === 'idle', 'idle after interrupt')
+      // The interrupted turn ends with its own (aborted) result, like the real CLI's (T11).
+      await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error_during_execution', 'the interrupted turn result')
 
       // AGENT-03 separation: interrupt ends the turn, never the session.
       expect(fx.stdoutLines().some((o) => o.type === 'sdk.exit')).toBe(false)
@@ -289,7 +291,7 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     }
   })
 
-  it('a deny/errored completion emits sdk.result + idle AND the unified attention edge (needs-attention)', async () => {
+  it('a deny/errored completion emits sdk.result AND the unified attention edge, and no per-turn idle (needs-attention)', async () => {
     const eventsLog = path.join(tmp, 'events.jsonl')
     const fx = launch({
       rules: [
@@ -319,13 +321,13 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
 
       fx.send({ type: 'permission.respond', sessionId, requestId: 'req-perm-1', decision: { behavior: 'deny' } })
       // Race-free: the errored sdk.result is the terminal marker for the deny
-      // continuation (the following sdk.status idle renders synchronously).
+      // continuation (its edge renders synchronously after it).
       await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error', 'errored sdk.result')
 
       // Unified needs-attention contract: a deny is an ERROR TURN END, so the
       // fake (mirroring the real sidecar's gate) rings the SAME attention
-      // edge a success would — exactly one, minted after the errored result
-      // and before the idle close, with a finite numeric monotonic `at`.
+      // edge a success would — exactly one, minted after the errored result,
+      // with a finite numeric monotonic `at`.
       const denyEdge = await fx.waitLine(
         (o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId,
         'the deny turn.complete attention edge',
@@ -343,10 +345,12 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       const denyEdgeIdx = out.findIndex((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId)
       expect(resultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
       expect(denyEdgeIdx, 'the edge follows the errored result in stream order').toBeGreaterThan(resultIdx)
-      const idleIdx = out.findIndex(
-        (o, i) => i > denyEdgeIdx && o.type === 'sdk.status' && o.sessionId === sessionId && o.status === 'idle',
-      )
-      expect(idleIdx, 'the idle close follows the edge in stream order').toBeGreaterThan(denyEdgeIdx)
+      // Like the real sidecar, the turn ends with its result alone: no idle
+      // follows it (the real sidecar sends no idle at all).
+      expect(
+        out.filter((o, i) => i > resultIdx && o.type === 'sdk.status' && o.sessionId === sessionId && o.status === 'idle'),
+        'no per-turn idle after the result',
+      ).toEqual([])
       expect(
         out.some((o) => o.type === 'sdk.assistant' && o.sessionId === sessionId
           && o.content?.[0]?.text?.includes('denied')),
@@ -426,38 +430,32 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     }
   })
 
-  it('a completion against a session that no longer exists is dropped entirely (real-sidecar parity, task-004 F-M2)', async () => {
+  it('the stream-error lane ends the sidecar like the real one: one edge, sdk.stream.ended last, exit code 3', async () => {
     const fx = launch({
       rules: [
         { on: 'msg:send', match: { text: 'DIE' }, emit: [{ kind: 'stream-error' }] },
-        { on: 'msg:send', match: { text: 'WITNESS' }, emit: [{ kind: 'activity', data: { status: 'compacting' } }] },
       ],
     })
     try {
       fx.send({ type: 'create', requestId: 'req-1', cwd: tmp })
       const created = await fx.waitLine((o) => o.type === 'created', 'created')
       const sessionId = created.sessionId as string
+      const exited = new Promise<number | null>((resolve) => fx.proc.once('exit', (code) => resolve(code)))
 
-      // The stream-error lane tears the session down mid-turn; its
-      // finally-mint edge fires (the send was accepted, pendingResults > 0).
+      // The stream ends mid-turn: the finally-mint edge fires (the send was
+      // accepted, pendingResults > 0), then the end report, then the exit.
       fx.send({ type: 'send', sessionId, text: 'DIE' })
-      await fx.waitLine((o) => o.type === 'sdk.error', 'stream-error sdk.error')
-      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'the stream-error finally-mint edge')
-
-      // Deterministic settle: a follow-up send against the dead session
-      // renders the WITNESS activity, proving the engine kept processing —
-      // while the default completion renders behind BOTH sends stay DROPPED.
-      // The real sidecar drops the whole message for a missing session
-      // (index.mjs:215-216): no assistant, no result, no second edge.
-      fx.send({ type: 'send', sessionId, text: 'WITNESS' })
-      await fx.waitLine((o) => o.type === 'sdk.status' && o.status === 'compacting', 'witness activity')
+      expect(await exited).toBe(3)
       const out = fx.stdoutLines()
-      expect(out.filter((o) => o.type === 'sdk.assistant'), 'no assistant frame for a dead session').toEqual([])
-      expect(out.filter((o) => o.type === 'sdk.result'), 'no result frame for a dead session').toEqual([])
+      expect(out.at(-1)).toEqual({ type: 'sdk.stream.ended', sessionId, reason: 'stream_error', message: 'Fixture stream error' })
+      expect(out.filter((o) => o.type === 'sdk.turn.complete'), 'exactly the result-less turn end rings').toHaveLength(1)
+      expect(out.filter((o) => o.type === 'sdk.result'), 'the turn ended with no result').toEqual([])
+      expect(out.filter((o) => o.type === 'sdk.error'), 'the end report carries the cause; no error frame repeats it').toEqual([])
+      const edgeIdx = out.findIndex((o) => o.type === 'sdk.turn.complete')
       expect(
-        out.filter((o) => o.type === 'sdk.turn.complete'),
-        'exactly the stream-error edge — no completion-render edge for the corpse',
-      ).toHaveLength(1)
+        out.slice(edgeIdx).filter((o) => o.type === 'sdk.status'),
+        'no stream-end status: the server reports the ended session as exited',
+      ).toEqual([])
     } finally {
       await fx.stop()
     }
@@ -512,7 +510,7 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
     return { sessionId: created.sessionId as string, cliSessionId: init.cliSessionId as string }
   }
 
-  it('forkSession create mints a fresh cliSessionId and seeds the transcript prefix (s2rk correction)', async () => {
+  it('a fork boot mints a fresh cliSessionId and seeds the transcript prefix (s2rk correction)', async () => {
     const fx = launch({ rules: [] })
     try {
       const { cliSessionId: ORIG } = await seedTwoTurns(fx)
@@ -525,16 +523,14 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
       expect(parentLines[1].parentUuid).toBe(parentLines[0].uuid)
       expect(parentLines[2].parentUuid).toBe(parentLines[1].uuid)
 
-      // Fork at a1 (keep through-and-including a1); the resumeDropsTurn guard
+      // Fork at a1 (keep through-and-including a1); the dropsTurn guard
       // is the RAW-chain successor of the resume point (u2).
       fx.send({
         type: 'create',
+        protocol: 2,
         requestId: 'req-fork',
         cwd: tmp,
-        resumeSessionId: ORIG,
-        resumeSessionAt: parentLines[1].uuid,
-        forkSession: true,
-        resumeDropsTurn: parentLines[2].uuid,
+        boot: { kind: 'fork', resume: ORIG, resumeSessionAt: parentLines[1].uuid, dropsTurn: parentLines[2].uuid },
       })
       const forkCreated = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-fork', 'created fork')
       const forkInit = await fx.waitLine(
@@ -553,7 +549,7 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
 
       // A follow-up plain-resume create still keeps ORIG (no same-id divergence
       // regression on the non-fork arm).
-      fx.send({ type: 'create', requestId: 'req-plain', cwd: tmp, resumeSessionId: ORIG })
+      fx.send({ type: 'create', protocol: 2, requestId: 'req-plain', cwd: tmp, boot: { kind: 'resume', resume: ORIG } })
       const plainCreated = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-plain', 'created plain resume')
       const plainInit = await fx.waitLine(
         (o) => o.type === 'sdk.session.init' && o.sessionId === plainCreated.sessionId,
@@ -565,11 +561,11 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
     }
   })
 
-  it('forkSession=false resume keeps the existing same-cliSessionId behavior', async () => {
+  it('a resume boot keeps the existing same-cliSessionId behavior', async () => {
     const fx = launch({ rules: [] })
     try {
       const { cliSessionId: ORIG } = await seedTwoTurns(fx)
-      fx.send({ type: 'create', requestId: 'req-resume', cwd: tmp, resumeSessionId: ORIG })
+      fx.send({ type: 'create', protocol: 2, requestId: 'req-resume', cwd: tmp, boot: { kind: 'resume', resume: ORIG } })
       const created = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-resume', 'created resume')
       const init = await fx.waitLine(
         (o) => o.type === 'sdk.session.init' && o.sessionId === created.sessionId,
@@ -588,7 +584,7 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
     }
   })
 
-  it('a resumeDropsTurn guard that is NOT the raw-chain successor of the resume point refuses with the SDK prefix', async () => {
+  it('a dropsTurn guard that is NOT the raw-chain successor of the resume point refuses with the SDK prefix', async () => {
     const fx = launch({ rules: [] })
     try {
       const { cliSessionId: ORIG } = await seedTwoTurns(fx)
@@ -597,16 +593,17 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
       // SDK's refused-completion contract (freshell retries once guard-less).
       fx.send({
         type: 'create',
+        protocol: 2,
         requestId: 'req-refused',
         cwd: tmp,
-        resumeSessionId: ORIG,
-        resumeSessionAt: parentLines[0].uuid,
-        forkSession: true,
-        resumeDropsTurn: parentLines[3].uuid, // a2 — NOT the successor of u1
+        // dropsTurn a2 — NOT the successor of u1
+        boot: { kind: 'fork', resume: ORIG, resumeSessionAt: parentLines[0].uuid, dropsTurn: parentLines[3].uuid },
       })
-      // The bridge placeholder `created` still lands (the real sidecar emits it
-      // immediately, before the SDK query runs — crates/freshell-claude-sidecar/
-      // index.mjs:278); the refusal surfaces on the wire AFTER it.
+      // This fake still reports the refusal after its placeholder `created`, the
+      // shape from before sidecar protocol v2 (the real sidecar now answers
+      // create.failed{FORK_GUARD_REFUSED} instead: test/unit/claude-sidecar/
+      // boot-handshake.test.ts); the server's rollback treats both as the guard
+      // refusal.
       await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-refused', 'created refused fork')
       const refusal = await fx.waitLine(
         (o) => typeof o?.message === 'string' && o.message.startsWith('Resume rejected by --resume-drops-turn:'),

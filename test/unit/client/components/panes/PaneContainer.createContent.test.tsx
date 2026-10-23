@@ -536,6 +536,185 @@ describe('createContentForType with ext: prefix', () => {
     })
   })
 
+  describe('saved fresh-pane default model (G11)', () => {
+    async function createClaudeFamilyPane({
+      label,
+      settingsOverrides,
+      featureFlags = {},
+    }: {
+      label: 'Freshclaude' | 'Kilroy'
+      settingsOverrides: ServerSettingsPatch
+      featureFlags?: Record<string, boolean>
+    }) {
+      const node = createPickerNode('pane-1')
+      const store = createStore(
+        { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+        [],
+        settingsOverrides,
+        {
+          status: 'ready',
+          platform: 'linux',
+          availableClis: { claude: true },
+          featureFlags,
+        },
+      )
+
+      render(
+        <Provider store={store}>
+          <PaneContainer tabId="tab-1" node={node} />
+        </Provider>,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: label }))
+      fireEvent.transitionEnd(getPickerContainer())
+      const input = await screen.findByLabelText(`Starting directory for ${label}`)
+      fireEvent.change(input, { target: { value: '/workspace/project' } })
+      fireEvent.keyDown(input, { key: 'Enter' })
+
+      let created: Extract<PaneNode, { type: 'leaf' }>['content'] | undefined
+      await waitFor(() => {
+        const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+        expect(paneContent.kind).toBe('fresh-agent')
+        created = paneContent
+      })
+      if (!created || created.kind !== 'fresh-agent') throw new Error('expected fresh-agent content')
+      return created
+    }
+
+    it('starts a new Freshclaude pane on the saved default model', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: { modelSelection: { kind: 'exact', modelId: 'sonnet' } },
+            },
+          },
+        },
+      })
+
+      expect(content.model).toBe('sonnet')
+      expect(content.modelSelection).toEqual({ kind: 'exact', modelId: 'sonnet' })
+    })
+
+    it('starts a new Kilroy pane on the saved Kilroy default model', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Kilroy',
+        featureFlags: { kilroy: true },
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: { modelSelection: { kind: 'exact', modelId: 'opus[1m]' } },
+              kilroy: { modelSelection: { kind: 'exact', modelId: 'sonnet' } },
+            },
+          },
+        },
+      })
+
+      expect(content.sessionType).toBe('kilroy')
+      expect(content.model).toBe('sonnet')
+      expect(content.modelSelection).toEqual({ kind: 'exact', modelId: 'sonnet' })
+    })
+
+    it('starts on the registry default when no fresh-pane default is saved', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: { enabled: true },
+        },
+      })
+
+      expect(content.model).toBe('opus[1m]')
+    })
+
+    it('carries the effort levels saved with a catalog-only default model, so effort clamps against them', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: {
+                modelSelection: { kind: 'exact', modelId: 'claude-haiku-x' },
+                modelEffortLevels: { modelId: 'claude-haiku-x', levels: [] },
+                effort: 'high',
+              },
+            },
+          },
+        },
+      })
+
+      expect(content.model).toBe('claude-haiku-x')
+      expect(content.modelEffortLevels).toEqual([])
+      // The model declares no effort levels: never the opus table's 'high'.
+      expect(content.effort).toBeUndefined()
+    })
+
+    it('clamps a saved effort the saved catalog-only model does not offer to its first level', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: {
+                modelSelection: { kind: 'exact', modelId: 'sonnet' },
+                modelEffortLevels: { modelId: 'sonnet', levels: ['alpha', 'beta'] },
+                effort: 'max',
+              },
+            },
+          },
+        },
+      })
+
+      expect(content.modelEffortLevels).toEqual(['alpha', 'beta'])
+      expect(content.effort).toBe('alpha')
+    })
+
+    it('ignores saved effort levels paired with a different model', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: { enabledProviders: ['claude'] },
+          freshAgent: {
+            enabled: true,
+            providers: {
+              freshclaude: {
+                modelSelection: { kind: 'exact', modelId: 'sonnet' },
+                modelEffortLevels: { modelId: 'claude-haiku-x', levels: [] },
+              },
+            },
+          },
+        },
+      })
+
+      expect(content.model).toBe('sonnet')
+      expect(content.modelEffortLevels).toBeUndefined()
+    })
+
+    it('does not fall back to the terminal Claude CLI model (decision D1)', async () => {
+      const content = await createClaudeFamilyPane({
+        label: 'Freshclaude',
+        settingsOverrides: {
+          codingCli: {
+            enabledProviders: ['claude'],
+            providers: { claude: { model: 'haiku' } },
+          },
+          freshAgent: { enabled: true },
+        },
+      })
+
+      expect(content.model).toBe('opus[1m]')
+    })
+  })
+
   it('creates editor content when the editor option is selected', async () => {
     const node = createPickerNode('pane-1')
     const store = createStore(

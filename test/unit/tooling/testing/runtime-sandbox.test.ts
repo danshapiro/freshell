@@ -897,3 +897,89 @@ describe('runtime harness indexed input cleanup', () => {
     },
   )
 })
+
+describe('runtime harness candidate scratch cleanup', () => {
+  it.each(['removed', 'already-gone', 'foreign-label'] as const)(
+    'removes the Claude candidate scratch volumes the broker saw created: %s', async outcome => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-candidate-cleanup-'))
+      const calls: { method: string; url: string }[] = []
+      let volume: any
+      fakeDocker.settled = false
+      fakeDocker.commands = []
+      const daemon = http.createServer(async (request, response) => {
+        const chunks: Buffer[] = []
+        for await (const chunk of request) chunks.push(Buffer.from(chunk))
+        const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined
+        calls.push({ method: request.method!, url: request.url! })
+        if (request.url === '/v1.47/volumes/create') {
+          volume = { Name: body.Name, Driver: body.Driver, Options: body.DriverOpts, Labels: body.Labels }
+          response.statusCode = 201
+          response.end(JSON.stringify(volume))
+        } else if (request.method === 'GET') {
+          response.statusCode = volume ? 200 : 404
+          response.end(JSON.stringify(volume ?? {}))
+        } else if (request.method === 'DELETE') {
+          response.statusCode = volume ? 204 : 404
+          volume = undefined
+          response.end()
+        } else { response.statusCode = 500; response.end() }
+      })
+      const harness = new RuntimeHarness(directory)
+      const binary = path.join(directory, 'host')
+      const broker = new RestrictedDockerBroker({ realSocketPath: path.join(directory, 'daemon.sock'),
+        proxySocketPath: path.join(directory, 'broker.sock'), runtimeRootPrefix: path.join(directory, 'r'),
+        allowedHostBinaryPaths: new Set([binary]), allowedImageRefs: new Set(['sha256:fixture']),
+        allowedWorkspaceRoots: new Set(['/workspace']), testRunId: harness.runId, logPath: path.join(directory, 'broker.jsonl') })
+      harness.broker = broker
+      const request = (method: string, url: string, body?: unknown) => new Promise<number>((resolve, reject) => {
+        const outgoing = http.request({ socketPath: broker.proxySocketPath, path: url, method }, response => {
+          response.resume()
+          response.once('end', () => resolve(response.statusCode!))
+        })
+        outgoing.once('error', reject)
+        outgoing.end(body === undefined ? undefined : JSON.stringify(body))
+      })
+      try {
+        await new Promise<void>(resolve => daemon.listen(path.join(directory, 'daemon.sock'), resolve))
+        await broker.start()
+        // Exercise cleanup's actual live-broker lifecycle without image/build preparation.
+        ;(harness as unknown as { brokerStarted: boolean }).brokerStarted = true
+        const installationId = 'installation-cleanup', soulId = 'soul-cleanup'
+        const owner = { installationId, soulId,
+          providerVolumeName: `freshell-provider-${createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex').slice(0, 24)}`,
+          imageRef: 'sha256:fixture', hostBinaryPath: binary, binarySha256: 'a'.repeat(64), daemonId: 'fixture-daemon' }
+        broker.authorizeInitialProviderVolume(owner)
+        const generationId = 'grant-44444444-4444-4444-8444-444444444444'
+        const candidate = { ...owner, generationId, reservationId: '11111111-1111-4111-8111-111111111111',
+          requestId: '22222222-2222-4222-8222-222222222222',
+          stageRoot: path.join(directory, 'scenarios/claude/control/provider-roots', generationId),
+          workspacePath: '/workspace', cwd: '/workspace', manifestRelativePath: '.freshell/input-manifest.json',
+          configurationBinds: [], resourceMounts: [] }
+        broker.authorizeClaudeCandidate(candidate)
+        const name = `freshell-claude-candidate-${candidate.requestId}`
+        const labels = { 'com.freshell.installation-id': installationId, 'com.freshell.soul-id': soulId,
+          'com.freshell.runtime-test-run-id': harness.runId, 'com.freshell.source-request-id': candidate.requestId,
+          'com.freshell.source-binary-sha256': owner.binarySha256, 'com.freshell.input-generation': generationId,
+          'com.freshell.source-reservation-id': candidate.reservationId, 'com.freshell.claude-candidate': 'ordinary' }
+        // The supervisor created the scratch volume; it was removed mid-read
+        // (or before its background cleanup ran) and left the volume behind.
+        expect(await request('POST', '/v1.47/volumes/create', { Name: name, Driver: 'local', DriverOpts: {}, Labels: labels })).toBe(201)
+        if (outcome === 'already-gone') volume = undefined
+        if (outcome === 'foreign-label') volume.Labels['com.freshell.soul-id'] = 'foreign'
+        const result = await harness.cleanup()
+        expect(result.ok).toBe(outcome !== 'foreign-label')
+        expect(volume === undefined).toBe(outcome !== 'foreign-label')
+        const deletes = calls.filter(call => call.method === 'DELETE')
+        expect(deletes).toEqual(outcome === 'foreign-label' ? [] : [{ method: 'DELETE', url: `/v1.47/volumes/${name}` }])
+        if (outcome === 'foreign-label') expect(result.errors.join('\n')).toContain(name)
+        else expect(calls.at(-1)).toEqual({ method: 'GET', url: `/v1.47/volumes/${name}` })
+        const cleanup = JSON.parse(await fs.readFile(path.join(harness.evidenceDir, 'cleanup.json'), 'utf8'))
+        expect(cleanup.volumes).toContain(name)
+      } finally {
+        await broker.close()
+        await new Promise<void>(resolve => daemon.close(() => resolve()))
+        await fs.rm(directory, { recursive: true, force: true })
+      }
+    },
+  )
+})

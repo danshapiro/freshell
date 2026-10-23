@@ -394,6 +394,12 @@ fn read_sql_json(
     .map_err(|e| e.to_string())
 }
 
+/// A saved claude/kilroy transcript through the per-line projection only
+/// (bounded retention, no cross-line folding; see the module docs of
+/// `claude_projection`): compaction markers, command output, errors and
+/// image placeholders match the live snapshot, while an `Agent` call stays a
+/// plain tool row with its result and a background agent's completion
+/// notice is not shown.
 fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
     let path = crate::claude_snapshot::find_transcript(&home.join(".claude"), id)
         .ok_or("saved native session not found")?;

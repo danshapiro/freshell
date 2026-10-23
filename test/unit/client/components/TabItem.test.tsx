@@ -8,7 +8,7 @@ import type { Tab } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import type { ReactElement } from 'react'
 
-// TabItem reads the tab-strip attention union (attentionByTab ∪
+// TabItem reads its needs-attention mark (attentionByTab ∪
 // watchedCompletionByTab) from the store, so every render needs a Provider.
 // Aliasing keeps the per-test call sites unchanged.
 const tabItemStore = configureStore({
@@ -17,6 +17,19 @@ const tabItemStore = configureStore({
 
 function render(ui: ReactElement) {
   return renderBase(<Provider store={tabItemStore}>{ui}</Provider>)
+}
+
+function renderWithTurnCompletion(ui: ReactElement, turnCompletion: Record<string, unknown>) {
+  const store = configureStore({
+    reducer: { turnCompletion: turnCompletionReducer },
+    preloadedState: { turnCompletion: turnCompletion as any },
+  })
+  return renderBase(<Provider store={store}>{ui}</Provider>)
+}
+
+/** Render with tab-1 (the default test tab) needing attention. */
+function renderMarked(ui: ReactElement) {
+  return renderWithTurnCompletion(ui, { attentionByTab: { 'tab-1': true } })
 }
 
 // Mock lucide-react icons
@@ -73,7 +86,6 @@ describe('TabItem', () => {
   const defaultProps = {
     tab: createTab(),
     isActive: false,
-    needsAttention: false,
     isDragging: false,
     isRenaming: false,
     renameValue: '',
@@ -105,7 +117,7 @@ describe('TabItem', () => {
   })
 
   it('applies emerald attention styles for highlight style (default)', () => {
-    render(<TabItem {...defaultProps} needsAttention={true} />)
+    renderMarked(<TabItem {...defaultProps} />)
     const el = getTabElement()
     expect(el?.className).toContain('bg-emerald-100')
     expect(el?.className).toContain('text-emerald-900')
@@ -113,21 +125,21 @@ describe('TabItem', () => {
   })
 
   it('applies emerald attention styles with animation for pulse style', () => {
-    render(<TabItem {...defaultProps} needsAttention={true} tabAttentionStyle="pulse" />)
+    renderMarked(<TabItem {...defaultProps} tabAttentionStyle="pulse" />)
     const el = getTabElement()
     expect(el?.className).toContain('bg-emerald-100')
     expect(el?.className).toContain('animate-pulse')
   })
 
   it('applies foreground-based attention styles for darken style', () => {
-    render(<TabItem {...defaultProps} needsAttention={true} tabAttentionStyle="darken" />)
+    renderMarked(<TabItem {...defaultProps} tabAttentionStyle="darken" />)
     const el = getTabElement()
     expect(el?.className).toContain('bg-foreground/15')
     expect(el?.className).not.toContain('bg-emerald-100')
   })
 
   it('applies no attention styles when style is none', () => {
-    render(<TabItem {...defaultProps} needsAttention={true} tabAttentionStyle="none" />)
+    renderMarked(<TabItem {...defaultProps} tabAttentionStyle="none" />)
     const el = getTabElement()
     expect(el?.className).not.toContain('bg-emerald-100')
     expect(el?.className).not.toContain('bg-foreground/15')
@@ -135,35 +147,33 @@ describe('TabItem', () => {
   })
 
   describe('tab-strip attention union (attentionByTab ∪ watchedCompletionByTab)', () => {
-    function renderWithTurnCompletion(state: Record<string, unknown>) {
-      const store = configureStore({
-        reducer: { turnCompletion: turnCompletionReducer },
-        preloadedState: { turnCompletion: state },
-      })
-      return renderBase(
-        <Provider store={store}>
-          <TabItem {...defaultProps} needsAttention={false} />
-        </Provider>,
-      )
-    }
-
-    it('renders emerald styling for a watched fresh-agent completion even without the attention prop', () => {
-      renderWithTurnCompletion({ watchedCompletionByTab: { 'tab-1': true } })
+    it('renders emerald styling for a watched fresh-agent completion', () => {
+      renderWithTurnCompletion(<TabItem {...defaultProps} />, { watchedCompletionByTab: { 'tab-1': true } })
       const el = getTabElement()
       expect(el?.className).toContain('bg-emerald-100')
       expect(el?.className).toContain('text-emerald-900')
     })
 
-    it('renders emerald styling from the store attention map even when the prop is false', () => {
-      renderWithTurnCompletion({ attentionByTab: { 'tab-1': true } })
+    it('renders emerald styling from the store attention map', () => {
+      renderWithTurnCompletion(<TabItem {...defaultProps} />, { attentionByTab: { 'tab-1': true } })
       const el = getTabElement()
       expect(el?.className).toContain('bg-emerald-100')
     })
 
     it('renders no emerald styling when neither mark is set', () => {
-      renderWithTurnCompletion({ attentionByTab: {}, watchedCompletionByTab: {} })
+      renderWithTurnCompletion(<TabItem {...defaultProps} />, { attentionByTab: {}, watchedCompletionByTab: {} })
       const el = getTabElement()
       expect(el?.className).not.toContain('bg-emerald-100')
+    })
+
+    it('ignores marks that belong to another tab', () => {
+      renderWithTurnCompletion(<TabItem {...defaultProps} />, {
+        attentionByTab: { 'tab-2': true },
+        watchedCompletionByTab: { 'tab-3': true },
+      })
+      const el = getTabElement()
+      expect(el?.className).not.toContain('bg-emerald-100')
+      expect(el?.className).toContain('bg-muted')
     })
   })
 
@@ -184,7 +194,7 @@ describe('TabItem', () => {
   })
 
   it('applies attention classes on active tab with highlight', () => {
-    render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="highlight" />)
+    renderMarked(<TabItem {...defaultProps} isActive={true} tabAttentionStyle="highlight" />)
     const el = getTabElement()
     expect(el?.className).toContain('border-t-[3px]')
     expect(el?.className).toContain('border-t-success')
@@ -192,14 +202,14 @@ describe('TabItem', () => {
   })
 
   it('bumps green fill opacity in dark mode for active attention tab with highlight', () => {
-    render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="highlight" />)
+    renderMarked(<TabItem {...defaultProps} isActive={true} tabAttentionStyle="highlight" />)
     const el = getTabElement()
     expect(el?.className).toContain('bg-success/15')
     expect(el?.className).toContain('dark:bg-success/25')
   })
 
   it('applies attention classes on active tab with darken', () => {
-    render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="darken" />)
+    renderMarked(<TabItem {...defaultProps} isActive={true} tabAttentionStyle="darken" />)
     const el = getTabElement()
     expect(el?.className).toContain('border-t-[3px]')
     expect(el?.className).toContain('border-t-muted-foreground')
@@ -207,7 +217,7 @@ describe('TabItem', () => {
   })
 
   it('does not apply attention classes on active tab with none', () => {
-    render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="none" />)
+    renderMarked(<TabItem {...defaultProps} isActive={true} tabAttentionStyle="none" />)
     const el = getTabElement()
     expect(el?.className).not.toContain('border-t-[3px]')
     expect(el?.className).not.toContain('border-t-success')
@@ -215,7 +225,7 @@ describe('TabItem', () => {
   })
 
   it('applies animate-pulse on active tab with pulse style and attention', () => {
-    render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="pulse" />)
+    renderMarked(<TabItem {...defaultProps} isActive={true} tabAttentionStyle="pulse" />)
     const el = getTabElement()
     expect(el?.className).toContain('animate-pulse')
   })

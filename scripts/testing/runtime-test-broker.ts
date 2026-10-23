@@ -209,6 +209,29 @@ type DockerResponse = {
   body: Buffer
 }
 
+/** The short-lived helpers whose create can be held by a test. */
+const DELAYABLE_HELPER_PREFIXES = ['freshell-claude-source-', 'freshell-claude-candidate-reader-', 'freshell-mountpoints-'] as const
+
+export type HelperCreateDelay = { prefix: typeof DELAYABLE_HELPER_PREFIXES[number]; delayMs: number; count: number }
+
+/**
+ * Parse `FRESHELL_TEST_BROKER_DELAY_HELPER_CREATE` (`<prefix>:<delayMs>[:<count>]`,
+ * e.g. `freshell-claude-source-:30000:1`): hold that many helper creates for
+ * that long before forwarding them, as a Docker create stalled behind a
+ * host-wide writeback is answered late.
+ */
+export function parseHelperCreateDelay(value: string | undefined): HelperCreateDelay | undefined {
+  if (value === undefined || value.trim() === '') return undefined
+  const [prefix, delay, count = '1', ...rest] = value.trim().split(':')
+  const delayMs = Number(delay), times = Number(count)
+  if (rest.length > 0 || !DELAYABLE_HELPER_PREFIXES.includes(prefix as HelperCreateDelay['prefix'])
+    || !Number.isInteger(delayMs) || delayMs < 1 || delayMs > 600_000
+    || !Number.isInteger(times) || times < 1 || times > 100) {
+    throw new Error(`invalid helper create delay ${JSON.stringify(value)}: expected <${DELAYABLE_HELPER_PREFIXES.join('|')}>:<delayMs>[:<count>]`)
+  }
+  return { prefix: prefix as HelperCreateDelay['prefix'], delayMs, count: times }
+}
+
 export class RestrictedDockerBroker {
   private readonly claudeCandidates = new Map<string, ClaudeCandidateAuthorization>()
   private readonly candidateVolumes = new Set<string>()
@@ -229,6 +252,8 @@ export class RestrictedDockerBroker {
   private server?: http.Server
   private stopFailuresRemaining = 0
   private inputPublicationBeforeCreateFailure = false
+  private readonly helperCreateDelays: HelperCreateDelay[] = []
+  private readonly inFlight = new Set<Promise<void>>()
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
@@ -375,6 +400,13 @@ export class RestrictedDockerBroker {
     return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values(),...this.inputPublishers.values(),...this.claudeSourceHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
+  /** Every Claude candidate scratch volume this proxy forwarded a create
+    * for (a lost acknowledgement included). Its proxied DELETE keeps the
+    * exact ownership check, so cleanup can remove what a supervisor left. */
+  candidateVolumeNames(): string[] {
+    return [...this.candidateVolumes]
+  }
+
   eventsSnapshot(): BrokerEvent[] {
     return [...this.events]
   }
@@ -393,19 +425,57 @@ export class RestrictedDockerBroker {
     this.stopFailuresRemaining = Math.max(0, count)
   }
 
+  /** Hold the next `count` creates of helpers named `prefix*` for `delayMs`
+    * before forwarding them, so Docker makes each helper after its caller's
+    * deadline, as a create stalled behind a host-wide writeback does. */
+  delayHelperCreates(delay: HelperCreateDelay): void {
+    this.helperCreateDelays.push({ ...delay })
+  }
+
+  private async holdHelperCreate(method: string, url: string, name: string): Promise<void> {
+    const delay = this.helperCreateDelays.find(candidate => candidate.count > 0 && name.startsWith(candidate.prefix))
+    if (!delay) return
+    delay.count -= 1
+    this.record({ method, url, decision: 'inject_failure', reason: `configured slow helper create (${delay.delayMs}ms)`,
+      destructive: false, unsafeAttempt: false, helperName: name })
+    await new Promise(resolve => setTimeout(resolve, delay.delayMs))
+  }
+
   async start(): Promise<void> {
     fs.mkdirSync(path.dirname(this.policy.proxySocketPath), { recursive: true, mode: 0o700 })
     fs.mkdirSync(path.dirname(this.policy.logPath), { recursive: true, mode: 0o700 })
     fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
-      void this.handle(request, response)
+      const handled = this.handle(request, response)
+      this.inFlight.add(handled)
+      void handled.finally(() => this.inFlight.delete(handled))
     })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
       this.server!.listen(this.policy.proxySocketPath, () => resolve())
     })
     fs.chmodSync(this.policy.proxySocketPath, 0o600)
+  }
+
+  /** Wait until every request this proxy accepted has its Docker answer
+    * recorded, at most `timeoutMs`. A helper create Docker answers after the
+    * supervisor stopped waiting, or after the supervisor container was
+    * removed, still makes the helper; once settled, receiptIds() names it.
+    * False when requests are still unanswered at the deadline. */
+  async settleForwarded(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (this.inFlight.size > 0) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return false
+      let timer: NodeJS.Timeout | undefined
+      await Promise.race([
+        Promise.allSettled([...this.inFlight]),
+        new Promise(resolve => { timer = setTimeout(resolve, remaining) }),
+      ])
+      clearTimeout(timer)
+    }
+    return true
   }
 
   async close(): Promise<void> {
@@ -495,7 +565,7 @@ export class RestrictedDockerBroker {
     }
     if (method === 'GET' && candidateVolume && !candidate
       && /^freshell-claude-candidate-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(candidateVolume)) {
-      const rejection = this.initialClaudePublicationRejection(candidateVolume.slice('freshell-claude-candidate-'.length))
+      const rejection = this.claudePublicationRejection(candidateVolume.slice('freshell-claude-candidate-'.length))
       if (rejection) {
         this.block(response, method, url, 403, `candidate absence qualification unavailable at ${rejection}`, false)
         return
@@ -704,6 +774,7 @@ export class RestrictedDockerBroker {
         }
         const helper: { expected: Record<string, any>; containerId?: string } = { expected: JSON.parse(body.toString()) }
         this.claudeSourceHelpers.set(name, helper)
+        await this.holdHelperCreate(method, url, name)
         try {
           const forwarded = await this.forward(request, body)
           if (forwarded.statusCode === 201) {
@@ -735,6 +806,7 @@ export class RestrictedDockerBroker {
         }
         const publisher:{input:PreparedInputAuthorization;expected:Record<string,any>;containerId?:string}={input,expected:JSON.parse(body.toString())}
         this.inputPublishers.set(name,publisher)
+        await this.holdHelperCreate(method, url, name)
         try {
           const forwarded=await this.forward(request,body)
           if (forwarded.statusCode===201) {
@@ -1224,51 +1296,102 @@ export class RestrictedDockerBroker {
   // stages exist before Docker receives their first request. Register that
   // immutable handoff here; the ordinary Docker validators still decide every
   // request. Explicit native fixture handoffs continue to use the same APIs.
-  private initialClaudePublicationRejection(requestId: string): string | undefined {
+  private claudePublicationRejection(requestId: string): string | undefined {
     let phase = 'physical_stage'
     try {
       const root = path.dirname(this.policy.runtimeRootPrefix)
       for (const scenario of this.fixtureDirectories(path.join(root, 'scenarios'), 32)) {
         const control = path.join(root, 'scenarios', scenario, 'control')
         for (const grant of this.fixtureDirectories(path.join(control, 'provider-roots'), 128)) {
-          if (!/^grant-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(grant)) continue
-          const stageRoot = path.join(control, 'provider-roots', grant)
-          const bindingFile = path.join(stageRoot, '.freshell/claude-candidate-binding.json')
-          if (!fs.existsSync(bindingFile)) continue
-          phase = 'owner_capability'
-          const binding = this.fixtureMetadata(bindingFile).value
-          const capability = this.fixtureMetadata(path.join(control, 'mcp-capabilities', `${grant}.json`), 128 * 1024).value
-          const owner = [...this.initialProviderVolumes.values()].find(owner => owner.soulId === binding.soulId && owner.soulId === capability.soulId)
-          if (!owner || capability.incarnationId != null || binding.version !== 1 || binding.provider !== 'claude'
-            || binding.generationId !== grant || binding.intentRevision !== 1 || binding.registryAttemptId != null
-            || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(binding.initialReservationId ?? '')) continue
-          phase = 'prepared_metadata'
-          const context = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-context.json'))
-          const result = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-result.json'))
-          const inputs = context.value.preparedInputs
-          if (!context.value.preparation?.claude || !inputs || inputs.generationId !== grant
-            || context.value.mcpCapability?.grantId !== grant || inputs.initialAuthReservation !== binding.initialReservationId
-            || JSON.stringify(result.value.providerLaunchContext) !== JSON.stringify(context.value)
-            || !Array.isArray(result.value.providerSecretReferences) || inputs.manifest?.relativePath !== '.freshell/input-manifest.json'
-            || sha256Hex(context.bytes) !== binding.preparedContextSha256 || sha256Hex(result.bytes) !== binding.preparedResultSha256) continue
-          phase = 'authority_binding'
-          if (sha256Hex(Buffer.from(JSON.stringify({ kind: 'initial_reservation', reservationId: binding.initialReservationId }))) !== binding.authoritySha256) continue
-          phase = 'manifest_artifact'
-          const manifest = this.fixtureMetadata(path.join(stageRoot, inputs.manifest.relativePath), 64 * 1024 * 1024)
-          const binary = fs.lstatSync(owner.hostBinaryPath)
-          if (sha256Hex(manifest.bytes) !== binding.manifestSha256 || inputs.manifest.sha256 !== binding.manifestSha256
-            || !binary.isFile() || binary.isSymbolicLink() || binary.size > 128 * 1024 * 1024
-            || sha256Hex(fs.readFileSync(owner.hostBinaryPath)) !== owner.binarySha256) continue
-          phase = 'selected_target'
-          this.validateClaudeCandidateAuthorization({ ...owner, generationId: grant, stageRoot,
-            requestId, reservationId: binding.initialReservationId, workspacePath: binding.workspacePath, cwd: binding.cwd,
-            gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir, manifestRelativePath: inputs.manifest.relativePath,
-            configurationBinds: inputs.configBinds ?? [], resourceMounts: inputs.resourceMounts ?? [] })
-          return undefined
+          if (!FIXTURE_GRANT.test(grant)) continue
+          if (!fs.existsSync(path.join(control, 'provider-roots', grant, '.freshell/claude-candidate-binding.json'))) continue
+          const qualified = this.qualifyPublishedClaudeCandidate(control, grant, requestId)
+          if ('authorization' in qualified) return undefined
+          phase = qualified.phase
         }
       }
     } catch { /* Unqualified publication exposes no daemon metadata. */ }
     return phase
+  }
+
+  /**
+   * Qualify one controller-published Claude candidate stage against its owned
+   * soul and return its exact candidate authorization. A creation candidate is
+   * bound to its initial reservation. A recovery candidate is bound to its
+   * registry attempt and to the frozen prior generation it retains, with the
+   * same profile the closed launch fixture hands off explicitly.
+   */
+  private qualifyPublishedClaudeCandidate(control: string, grant: string, requestId: string):
+    { authorization: ClaudeCandidateAuthorization } | { phase: string } {
+    let phase = 'owner_capability'
+    try {
+      const stageRoot = path.join(control, 'provider-roots', grant)
+      const binding = this.fixtureMetadata(path.join(stageRoot, '.freshell/claude-candidate-binding.json')).value
+      const capability = this.fixtureMetadata(path.join(control, 'mcp-capabilities', `${grant}.json`), 128 * 1024).value
+      const owner = [...this.initialProviderVolumes.values()].find(owner => owner.soulId === binding.soulId && owner.soulId === capability.soulId)
+      const recovery = binding.registryAttemptId != null
+      const prior = binding.priorGenerationId
+      if (!owner || capability.incarnationId != null || binding.version !== 1 || binding.provider !== 'claude'
+        || binding.generationId !== grant || !Number.isSafeInteger(binding.intentRevision) || binding.intentRevision < 1
+        || (recovery
+          ? binding.initialReservationId != null || typeof binding.registryAttemptId !== 'string'
+            || !/^recovery-/.test(binding.registryAttemptId) || !FIXTURE_UUID.test(binding.registryAttemptId.slice('recovery-'.length))
+            || typeof prior !== 'string' || !FIXTURE_GRANT.test(prior) || prior === grant
+            // The controller issues a replacement as a pending preparation
+            // that names exactly the generation it replaces.
+            || capability.preparation?.phase !== 'pending' || !Array.isArray(capability.preparation?.priorGrantIds)
+            || !capability.preparation.priorGrantIds.includes(prior)
+          : binding.intentRevision !== 1 || prior != null || !FIXTURE_UUID.test(binding.initialReservationId ?? ''))) return { phase }
+      phase = 'prepared_metadata'
+      const context = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-context.json'))
+      const result = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-result.json'))
+      const inputs = context.value.preparedInputs
+      if (!context.value.preparation?.claude || !inputs || inputs.generationId !== grant
+        || context.value.mcpCapability?.grantId !== grant
+        || (inputs.initialAuthReservation ?? null) !== (binding.initialReservationId ?? null)
+        || JSON.stringify(result.value.providerLaunchContext) !== JSON.stringify(context.value)
+        || !Array.isArray(result.value.providerSecretReferences) || inputs.manifest?.relativePath !== '.freshell/input-manifest.json'
+        || sha256Hex(context.bytes) !== binding.preparedContextSha256 || sha256Hex(result.bytes) !== binding.preparedResultSha256) return { phase }
+      phase = 'authority_binding'
+      // A creation authority is its public reservation. A recovery authority is
+      // the supervisor's private callback scope, which the supervisor itself
+      // requalifies against this publication; here only its digest shape is
+      // observable.
+      if (recovery
+        ? !/^[a-f0-9]{64}$/.test(binding.authoritySha256 ?? '')
+        : sha256Hex(Buffer.from(JSON.stringify({ kind: 'initial_reservation', reservationId: binding.initialReservationId }))) !== binding.authoritySha256) return { phase }
+      let reservationId: string = binding.initialReservationId
+      let retained: ClaudeCandidateAuthorization['retained']
+      if (recovery) {
+        phase = 'retained_generation'
+        const priorRoot = path.join(control, 'provider-roots', prior)
+        const priorContext = this.fixtureMetadata(path.join(priorRoot, '.freshell/prepared-context.json')).value
+        const priorInputs = priorContext.preparedInputs
+        // Original creation metadata is carried only by the frozen prior
+        // generation; the recovery authority remains its registry attempt.
+        if (!priorContext.preparation?.claude || !priorInputs || priorInputs.generationId !== prior
+          || priorContext.mcpCapability?.grantId !== prior || !FIXTURE_UUID.test(priorInputs.initialAuthReservation ?? '')) return { phase }
+        reservationId = priorInputs.initialAuthReservation
+        retained = { attemptId: binding.registryAttemptId, generationId: prior, stageRoot: priorRoot,
+          configurationBinds: priorInputs.configBinds ?? [], resourceMounts: priorInputs.resourceMounts ?? [] }
+      }
+      phase = 'manifest_artifact'
+      const manifest = this.fixtureMetadata(path.join(stageRoot, inputs.manifest.relativePath), 64 * 1024 * 1024)
+      const binary = fs.lstatSync(owner.hostBinaryPath)
+      if (sha256Hex(manifest.bytes) !== binding.manifestSha256 || inputs.manifest.sha256 !== binding.manifestSha256
+        || !binary.isFile() || binary.isSymbolicLink() || binary.size > 128 * 1024 * 1024
+        || sha256Hex(fs.readFileSync(owner.hostBinaryPath)) !== owner.binarySha256) return { phase }
+      phase = 'selected_target'
+      const authorization: ClaudeCandidateAuthorization = { ...owner, generationId: grant, stageRoot,
+        requestId, reservationId, workspacePath: binding.workspacePath, cwd: binding.cwd,
+        gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir, manifestRelativePath: inputs.manifest.relativePath,
+        configurationBinds: inputs.configBinds ?? [], resourceMounts: inputs.resourceMounts ?? [],
+        ...(retained ? { retained } : {}) }
+      this.validateClaudeCandidateAuthorization(authorization)
+      return { authorization }
+    } catch {
+      return { phase }
+    }
   }
 
   private async registerPublishedFixtureInputs(body: Buffer, url: string): Promise<void> {
@@ -1350,21 +1473,11 @@ export class RestrictedDockerBroker {
             || sha256Hex(fs.readFileSync(owner.hostBinaryPath)) !== owner.binarySha256) continue
           if (candidate) {
             phase = 'candidate_binding'
-            const binding = this.fixtureMetadata(path.join(stageRoot, '.freshell/claude-candidate-binding.json')).value
-            if (binding.version !== 1 || binding.provider !== 'claude' || binding.soulId !== owner.soulId
-              || binding.generationId !== grant || binding.intentRevision !== 1 || binding.registryAttemptId != null
-              || binding.initialReservationId !== inputs.initialAuthReservation
-              || binding.initialReservationId !== labels['com.freshell.source-reservation-id']
-              || binding.manifestSha256 !== inputs.manifest.sha256
-              || binding.preparedContextSha256 !== sha256Hex(contextDocument.bytes)
-              || binding.preparedResultSha256 !== sha256Hex(resultDocument.bytes)) continue
+            const qualified = this.qualifyPublishedClaudeCandidate(control, grant, labels['com.freshell.source-request-id'])
+            if (!('authorization' in qualified) || qualified.authorization.soulId !== owner.soulId
+              || !equalRecord(labels, candidateLabels(qualified.authorization, this.policy.testRunId))) continue
             phase = 'candidate_authorization'
-            this.authorizeClaudeCandidate({ ...owner, generationId: grant, stageRoot,
-              reservationId: binding.initialReservationId, requestId: labels['com.freshell.source-request-id'],
-              workspacePath: binding.workspacePath, cwd: binding.cwd, gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir,
-              manifestRelativePath: inputs.manifest.relativePath, configurationBinds: inputs.configBinds ?? [],
-              resourceMounts: inputs.resourceMounts ?? [],
-            })
+            this.authorizeClaudeCandidate(qualified.authorization)
           } else {
             if (initial ? inputs.initialAuthReservation !== reservation!.reservationId
               : inputs.initialAuthReservation != null) continue
@@ -1667,6 +1780,9 @@ function isStrictDescendant(candidate: string, root: string): boolean {
 function sha256(bytes: Buffer): string {
   return `sha256:${sha256Hex(bytes)}`
 }
+
+const FIXTURE_UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/
+const FIXTURE_GRANT = /^grant-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/
 
 function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex')

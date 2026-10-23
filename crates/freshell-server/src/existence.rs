@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use freshell_freshagent::TranscriptLocation;
 use freshell_sessions::directory_index::SessionIndex;
 use freshell_ws::existence::{SessionExistence, SessionExistenceProbe};
 
@@ -41,13 +42,14 @@ use freshell_ws::existence::{SessionExistence, SessionExistenceProbe};
 const KNOWN_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
 
 /// Injected raw-file transcript check for claude (kata 09v1). Wiring installs
-/// `freshell_freshagent::locate_transcript` — the SAME ordered-candidate-roots
-/// scan the attach arm trusts (`CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` >
-/// `$HOME/.claude`) — so reconcile and attach can never disagree about whether
-/// a claude transcript exists. A closure (not a direct call) keeps this probe
+/// `freshell_freshagent::locate_transcript_state` — the SAME ordered-candidate-
+/// roots scan the attach arm trusts (`CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` >
+/// platform home `.claude`) — so reconcile and attach can never disagree about
+/// whether a claude transcript exists. Three-state (G28): an unreadable store
+/// maps to `Unknown`, never `Absent`. A closure (not a direct call) keeps this probe
 /// unit-testable without process-global env mutation; precedent:
 /// `codex_rollout_locator` (main.rs).
-pub type ClaudeTranscriptLocator = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+pub type ClaudeTranscriptLocator = Arc<dyn Fn(&str) -> TranscriptLocation + Send + Sync>;
 
 /// Answer from the injected opencode by-id DB check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,17 +269,20 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 if provider == "claude" {
                     // Reuse the EXISTING claude transcript locator (raw-file
                     // check — cheap), same mapping as the warm fallback
-                    // below: hit => Present, clean miss => Absent (the
-                    // Option shape has no error channel).
+                    // below: hit => Present, clean miss => Absent, an
+                    // unreadable store => Unknown (G28: cannot check is a
+                    // bounded deferral, never a dead_session).
                     if let Some(locator) = &self.claude_transcript_locator {
-                        return if locator(session_id).is_some() {
-                            self.observed
-                                .lock()
-                                .expect("observed set lock")
-                                .insert(format!("{provider}:{session_id}"));
-                            SessionExistence::Present
-                        } else {
-                            SessionExistence::Absent
+                        return match locator(session_id) {
+                            TranscriptLocation::Found(_) => {
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                SessionExistence::Present
+                            }
+                            TranscriptLocation::Absent => SessionExistence::Absent,
+                            TranscriptLocation::Unreadable(_) => SessionExistence::Unknown,
                         };
                     }
                 }
@@ -303,19 +308,26 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                 // finalizing Absent for claude, consult the SAME raw-file
                 // check. CLAUDE-scoped only — zero-turn codex genuinely has
                 // no rollout file (reconcile_freshagent.rs module doc) — and
-                // R10b itself stays intact for History listing.
+                // R10b itself stays intact for History listing. An
+                // unreadable store (G28) is Unknown — reconcile's bounded
+                // deferral retries — NEVER a finalized Absent.
                 if provider == "claude" {
                     if let Some(locator) = &self.claude_transcript_locator {
-                        if locator(session_id).is_some() {
-                            // A fallback hit is an on-disk observation: feed
-                            // the monotone observed-set (module-doc invariant)
-                            // so a LATER genuine deletion still derives loud
-                            // dead_session even without the ledger.
-                            self.observed
-                                .lock()
-                                .expect("observed set lock")
-                                .insert(format!("{provider}:{session_id}"));
-                            return SessionExistence::Present;
+                        match locator(session_id) {
+                            TranscriptLocation::Found(_) => {
+                                // A fallback hit is an on-disk observation:
+                                // feed the monotone observed-set (module-doc
+                                // invariant) so a LATER genuine deletion still
+                                // derives loud dead_session even without the
+                                // ledger.
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                return SessionExistence::Present;
+                            }
+                            TranscriptLocation::Absent => {}
+                            TranscriptLocation::Unreadable(_) => return SessionExistence::Unknown,
                         }
                     }
                 }
@@ -530,14 +542,19 @@ mod tests {
         .expect("write zero-turn fixture");
     }
 
-    /// Test locator with the SAME contract as claude_snapshot::locate_transcript
-    /// (Some(path) iff the transcript file exists), scoped to the temp home so
-    /// tests never touch process-global CLAUDE_* env vars.
+    /// Test locator with the SAME contract as
+    /// claude_snapshot::locate_transcript_state (Found(path) iff the
+    /// transcript file exists, else a clean Absent), scoped to the temp home
+    /// so tests never touch process-global CLAUDE_* env vars.
     pub(super) fn direct_locator_over(home: &std::path::Path) -> ClaudeTranscriptLocator {
         let projects = home.join("projects/proj");
         Arc::new(move |session_id: &str| {
             let p = projects.join(format!("{session_id}.jsonl"));
-            p.is_file().then_some(p)
+            if p.is_file() {
+                TranscriptLocation::Found(p)
+            } else {
+                TranscriptLocation::Absent
+            }
         })
     }
 
@@ -607,6 +624,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A locator whose store cannot be read (EACCES/EIO on `projects/`).
+    fn unreadable_locator() -> ClaudeTranscriptLocator {
+        Arc::new(|_sid: &str| {
+            TranscriptLocation::Unreadable(freshell_freshagent::LocateError::Io {
+                root: std::path::PathBuf::from("/claude-store"),
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: "permission denied".to_string(),
+            })
+        })
+    }
+
+    /// G28 (warm path): an index-Absent claude session whose raw-file
+    /// recheck cannot READ the store is `Unknown` -- reconcile's bounded
+    /// deferral -- never a finalized `Absent` that can derive dead_session.
+    #[tokio::test]
+    async fn warm_absent_with_an_unreadable_store_is_unknown_not_absent() {
+        let home = temp_claude_home("warm-unreadable");
+        let (probe, index) = probe_over(&home);
+        let probe = probe.with_claude_transcript_locator(unreadable_locator());
+        index.warm().await;
+        assert_eq!(
+            probe.exists("claude", "6f708192-a3b4-4cc5-8d6e-7f8091021323"),
+            SessionExistence::Unknown,
+            "cannot check the transcript store => cannot adjudicate absence"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// G28 (cold path): the cold-index claude by-id check answers `Unknown`
+    /// for an unreadable store, never `Absent`. Plain #[test] (no tokio
+    /// runtime) so kick_refresh no-ops and the index stays cold.
+    #[test]
+    fn cold_index_with_an_unreadable_store_is_unknown_not_absent() {
+        let home = temp_claude_home("cold-unreadable");
+        let (probe, _index) = probe_over(&home);
+        let probe = probe.with_claude_transcript_locator(unreadable_locator());
+        assert_eq!(
+            probe.exists("claude", "708192a3-b4c5-4dd6-8e7f-809102132434"),
+            SessionExistence::Unknown,
+            "cannot check the transcript store => cannot adjudicate absence"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The fallback is CLAUDE-scoped: zero-turn codex genuinely has no rollout
     /// file (vendor deferred materialization — reconcile_freshagent.rs module
     /// doc), so a codex Absent must stay Absent even when the installed
@@ -616,7 +677,7 @@ mod tests {
         let home = temp_claude_home("codex-gate");
         let (probe, index) = probe_over(&home);
         let probe = probe.with_claude_transcript_locator(Arc::new(|_sid: &str| {
-            Some(std::path::PathBuf::from("/nonexistent/never-used.jsonl"))
+            TranscriptLocation::Found(std::path::PathBuf::from("/nonexistent/never-used.jsonl"))
         }));
         index.warm().await;
         assert_eq!(

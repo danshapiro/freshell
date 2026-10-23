@@ -30,4 +30,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` unlocks `#[tokio::test(start_paused = true)]`, so tests expire
+# budgets by advancing a paused clock instead of racing the wall clock.
+tokio = { version = "1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json"] }

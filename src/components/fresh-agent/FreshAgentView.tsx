@@ -126,9 +126,15 @@ import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentC
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
+import {
+  classifyHiddenPaneEvent,
+  FRESH_AGENT_BUSY_STATUSES,
+  isSnapshotInvalidatingFreshAgentEvent,
+  readMessageEventType,
+} from './fresh-agent-event-classes'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
-const BUSY_STATES = new Set(['running', 'compacting'])
+const BUSY_STATES = FRESH_AGENT_BUSY_STATUSES
 // Copy for the stuck-notice card (role="alert") shown while the store carries
 // the deadman's 'stuck' status; recovery actions live on the card itself.
 const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
@@ -144,42 +150,6 @@ export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
 // up). Exported so tests assert the cap against the real constant.
 export const IDLE_INCOMPLETE_MAX_RETRIES = 5
 const IDLE_INCOMPLETE_RETRY_DELAY_MS = 1_000
-// Exported so tests assert membership against the real constant.
-export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
-  'freshAgent.session.changed',
-  'freshAgent.session.snapshot',
-  'freshAgent.result',
-  'freshAgent.turn.complete',
-  'freshAgent.permission.request',
-  'freshAgent.permission.cancelled',
-  'freshAgent.question.request',
-  // A provider-cancelled question must also re-drive the snapshot, so the card clears
-  // even if the freshAgent.question.cancelled fold races (fresh-eyes round-3 F3).
-  'freshAgent.question.cancelled',
-  // kata 1wxv: rollback converges through the invalidating snapshot — the marker
-  // bucket, the active prefix, and rollback{canRedo,undoneDepth} all ride it.
-  'freshAgent.session.rolledBack',
-  'freshAgent.session.redone',
-  'freshAgent.rolledBack', // the requesting pane's ack also refetches
-  'freshAgent.redone',
-])
-// These events mean the durable transcript may have changed. Status, approval,
-// and question events are deliberately excluded: they update the surrounding
-// pane UI, but do not make an already-rendered transcript stale. That keeps a
-// hidden pane immediately usable when its last transcript snapshot is still
-// current.
-export const TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
-  'freshAgent.session.changed',
-  'freshAgent.result',
-  'freshAgent.turn.complete',
-  'freshAgent.error',
-  'freshAgent.assistant',
-  'freshAgent.stream',
-  'freshAgent.session.rolledBack',
-  'freshAgent.session.redone',
-  'freshAgent.rolledBack',
-  'freshAgent.redone',
-])
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const log = createLogger('FreshAgentView')
 let nextSnapshotAuditView = 0
@@ -520,6 +490,15 @@ function getEffectiveFreshAgentPermissionMode(content: FreshAgentPaneContent): s
   return content.provider === 'opencode' ? undefined : content.permissionMode
 }
 
+/**
+ * Why a send was refused, from its request error's message: the reason alone,
+ * without the `CODE: ` prefix some server errors carry.
+ */
+function sendFailureReason(message: unknown): string {
+  const text = typeof message === 'string' ? message.trim() : ''
+  return text.replace(/^[A-Z][A-Z0-9_]+:\s*/, '') || 'the server refused it'
+}
+
 function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
@@ -786,27 +765,6 @@ function getRestoreErrorMessage(reason: RestoreErrorReason): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
-}
-
-function readMessageEventType(message: Record<string, unknown>): string | undefined {
-  const event = isRecord(message.event) ? message.event : undefined
-  return typeof event?.type === 'string' ? event.type : undefined
-}
-
-function isSnapshotInvalidatingFreshAgentEvent(message: Record<string, unknown>): boolean {
-  if (message.type !== 'freshAgent.event') return false
-  const eventType = readMessageEventType(message)
-  return Boolean(eventType && SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS.has(eventType))
-}
-
-function isTranscriptInvalidatingFreshAgentEvent(message: Record<string, unknown>): boolean {
-  if (message.type !== 'freshAgent.event') return false
-  const eventType = readMessageEventType(message)
-  if (eventType === 'freshAgent.session.snapshot') {
-    const event = isRecord(message.event) ? message.event : undefined
-    return typeof event?.status === 'string' && BUSY_STATES.has(event.status)
-  }
-  return Boolean(eventType && TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS.has(eventType))
 }
 
 /**
@@ -1609,6 +1567,12 @@ export function FreshAgentView({
   }, [hidden])
   // Snapshot refresh owed at next reveal (set when a reconnect happens hidden).
   const pendingRevealRefreshRef = useRef(false)
+  // G26: a NON-blocking surface refresh owed at next reveal, set when an
+  // approval/question (or its cancellation) arrives while hidden. These do not
+  // change the transcript, so they must not take the blocking reveal path:
+  // its overlay clears only on a newer transcript revision, which an approval
+  // never produces (it would spin for REVEAL_REFRESH_MAX_WAIT_MS, then error).
+  const surfaceRefreshOwedRef = useRef(false)
   // Release callback for an in-flight queued CREATE rebind; released by the
   // freshAgent.created / create-failed ack (or the queue's 10s backstop).
   const pendingRebindReleaseRef = useRef<(() => void) | null>(null)
@@ -1643,6 +1607,7 @@ export function FreshAgentView({
     if (previousSnapshotHydrationIdentityRef.current === snapshotHydrationIdentity) return
     previousSnapshotHydrationIdentityRef.current = snapshotHydrationIdentity
     snapshotDirtyRef.current = false
+    surfaceRefreshOwedRef.current = false
     snapshotDirtyVersionRef.current += 1
     snapshotDirtyBaseRevisionRef.current = null
     revealRefreshVersionRef.current = null
@@ -2832,8 +2797,14 @@ export function FreshAgentView({
   useEffect(() => {
     if (hidden) return
     if (pendingRevealRefreshRef.current) pendingRevealRefreshRef.current = false
+    if (surfaceRefreshOwedRef.current) {
+      surfaceRefreshOwedRef.current = false
+      // A transcript-dirty pane's blocking reveal refresh fetches the same
+      // snapshot, so it covers the owed surface refresh.
+      if (!snapshotDirtyRef.current) requestSnapshotRefresh('reveal-surface')
+    }
     requestRevealRefresh()
-  }, [hidden, requestRevealRefresh, snapshotDirty])
+  }, [hidden, requestRevealRefresh, requestSnapshotRefresh, snapshotDirty])
 
   // reconcileNotice is a one-shot: visible for 5s, then consumed from the
   // pane content (a chat pane has no xterm write-notice channel; a timed
@@ -3107,6 +3078,7 @@ export function FreshAgentView({
         // the three leaks a failed send otherwise leaves behind -- the
         // pending-metadata entry, the stale local echo (dual-write), and the
         // optimistic `running` status.
+        const failedText = pendingSendMetadataRef.current.get(failedRequestId)?.text
         pendingSendMetadataRef.current.delete(failedRequestId)
         if (outgoingTurnRef.current?.requestId === failedRequestId) {
           outgoingTurnRef.current = null
@@ -3117,6 +3089,19 @@ export function FreshAgentView({
         }
         if (current.provider === 'opencode' && current.status === 'running') {
           dispatch(mergePaneContent({ tabId, paneId, updates: { status: 'idle' } }))
+        }
+        // G05 (C09): a claude send the server refused was never sent — for
+        // example its session ended — so the text goes back into the
+        // composer with the reason instead of vanishing with the echo.
+        if (current.provider === 'claude' && failedText) {
+          composerRef.current?.restoreText(failedText)
+          setNotice(`Message not sent: ${sendFailureReason(message.message)}`)
+          log.warn('fresh_agent.send_refused', {
+            provider: current.provider,
+            sessionType: current.sessionType,
+            sessionId: current.sessionId,
+            code: typeof message.code === 'string' ? message.code : undefined,
+          })
         }
         return
       }
@@ -3144,7 +3129,8 @@ export function FreshAgentView({
         && eventStatus !== undefined
         && !BUSY_STATES.has(eventStatus)
         && BUSY_STATES.has(previousStatus)
-      const transcriptChanged = isTranscriptInvalidatingFreshAgentEvent(message) || busySnapshotSettled
+      const eventClass = classifyHiddenPaneEvent(message, { busySnapshotSettled })
+      const transcriptChanged = eventClass === 'transcript'
       if (messageBelongsToPane && transcriptChanged && (hiddenRef.current || snapshotDirtyRef.current)) {
         markSnapshotDirty()
       }
@@ -3152,6 +3138,7 @@ export function FreshAgentView({
         requestRevealRefresh(true)
       } else if (messageBelongsToPane && isSnapshotInvalidatingFreshAgentEvent(message)) {
         if (!hiddenRef.current) requestSnapshotRefresh('event')
+        else if (eventClass === 'surface') surfaceRefreshOwedRef.current = true
       }
       // kata 1wxv: the requesting-sink ack drives the composer refill; rollback
       // refusals render their server-pinned message verbatim. Both match on the
@@ -3955,6 +3942,14 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // The durable conversation an ended session's Resume reopens (triggerRecovery
+  // resolves the same id): codex threads, and claude/kilroy sessions whose
+  // sidecar died (G05).
+  const endedSessionResumeId = paneContent.provider === 'codex'
+    ? getCanonicalCodexResumeSessionId(paneContent)
+    : paneContent.provider === 'claude'
+      ? getCanonicalDurableSessionId(claudeSession) ?? getCanonicalPaneResumeSessionId(paneContent)
+      : undefined
   isBusyRef.current = isBusy
   // kata 1wxv: snapshot-stamped rollback capabilities drive every client affordance
   // (per-turn icon, slash/menus, the pre-flight gate). Legacy servers emit neither
@@ -4621,9 +4616,7 @@ export function FreshAgentView({
                 <div className="fresh-agent-session-ended-card flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
                   <div className="flex flex-wrap gap-2">
-                    {paneContent.provider === 'codex'
-                      && effectiveStatus === 'exited'
-                      && getCanonicalCodexResumeSessionId(paneContent) ? (
+                    {effectiveStatus === 'exited' && endedSessionResumeId ? (
                         <button
                           type="button"
                           className="fresh-agent-session-ended-action rounded border border-border/70 px-2 py-1 text-xs"
@@ -4883,6 +4876,7 @@ export function FreshAgentView({
     claudeSession?.restoreFailureMessage,
     activeStyle,
     composerDisabled,
+    endedSessionResumeId,
     contextUsage,
     descriptor?.icon,
     descriptor?.label,

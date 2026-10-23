@@ -15,7 +15,7 @@ use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, R
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
     AgentProvider, FreshAgentApprovalRespond, FreshAgentCheckpointIntent, FreshAgentCompact,
-    FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
+    FreshAgentConfigure, FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
     FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendSettings, ServerMessage,
     SessionLocator, SessionType, StringOrNumber,
 };
@@ -59,6 +59,9 @@ enum ProviderState {
 struct HostedTransport {
     provider: FreshProvider,
     state: ProviderState,
+    /// The providers' own outbound stream (the bridge relays it into the
+    /// journal); an operation subscribes to read the provider's answer.
+    provider_frames: Arc<broadcast::Sender<String>>,
     profile: std::sync::Mutex<Option<FreshAgentProfile>>,
     session_id: Mutex<Option<String>>,
     created_rx: Mutex<watch::Receiver<Option<Result<String, ()>>>>,
@@ -148,6 +151,21 @@ impl HostedTransport {
         Self::new_with_context(provider, None).await
     }
 
+    /// A claude/kilroy transport whose sidecars get exactly `environment` (the
+    /// freshell-freshagent `test-support` seam): the real sidecar over a simulator.
+    #[cfg(test)]
+    async fn with_claude_sidecar_environment(
+        provider: FreshProvider,
+        environment: Vec<(String, String)>,
+    ) -> Arc<Self> {
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(1024);
+        let broadcast_tx = Arc::new(broadcast_tx);
+        let state = ProviderState::Claude(
+            FreshClaudeState::new(Arc::clone(&broadcast_tx)).with_sidecar_environment(environment),
+        );
+        Self::from_parts(provider, state, broadcast_tx, broadcast_rx)
+    }
+
     async fn new_with_context(
         provider: FreshProvider,
         context: Option<&ProviderLaunchContext>,
@@ -199,6 +217,17 @@ impl HostedTransport {
                 }
             }
         };
+        Self::from_parts(provider, state, broadcast_tx, broadcast_rx)
+    }
+
+    /// The transport around a provider `state` that publishes its frames on
+    /// `broadcast_tx`; they arrive on `broadcast_rx`.
+    fn from_parts(
+        provider: FreshProvider,
+        state: ProviderState,
+        broadcast_tx: Arc<broadcast::Sender<String>>,
+        broadcast_rx: broadcast::Receiver<String>,
+    ) -> Arc<Self> {
         let (created_tx, created_rx) = watch::channel(None);
         let (native_tx, native_rx) = watch::channel(None);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -220,6 +249,7 @@ impl HostedTransport {
         Arc::new(Self {
             provider,
             state,
+            provider_frames: broadcast_tx,
             profile: std::sync::Mutex::new(None),
             session_id: Mutex::new(None),
             created_rx: Mutex::new(created_rx),
@@ -769,7 +799,7 @@ impl FreshAgentTransport for HostedTransport {
             return delegate.supports_operation(operation).await;
         }
         match operation {
-            FreshAgentOperation::Compact { .. } => Ok(true),
+            FreshAgentOperation::Compact { .. } | FreshAgentOperation::Configure { .. } => Ok(true),
             FreshAgentOperation::Rollback {
                 direction: FreshAgentRollbackDirection::Redo,
                 ..
@@ -819,6 +849,52 @@ impl FreshAgentTransport for HostedTransport {
                     ProviderState::Opencode { runtime, .. } => {
                         runtime.handle_compact(message).await
                     }
+                }
+            }
+            FreshAgentOperation::Configure { settings } => {
+                // The provider answers on its own event stream, which the
+                // bridge relays to every device: a converged
+                // `freshAgent.session.metadata`, or an error when it refuses
+                // the live apply (the actor has already saved the intent for
+                // the next send). Each provider emits that answer before its
+                // configure handler returns, so a receiver opened first
+                // sees it.
+                let mut answers = self.provider_frames.subscribe();
+                let message = FreshAgentConfigure {
+                    provider: self.provider_wire(),
+                    session_id: session_id.clone(),
+                    session_type: self.session_type(),
+                    cwd: settings.cwd.clone(),
+                    request_id: Some(request_id.as_str().to_string()),
+                    settings: FreshAgentSendSettings {
+                        cwd: settings.cwd.clone(),
+                        effort: settings.effort.clone(),
+                        model: settings.model.clone(),
+                        permission_mode: settings.permission_mode.clone(),
+                        sandbox: settings.sandbox.as_deref().and_then(parse_sandbox),
+                    },
+                };
+                match &self.state {
+                    ProviderState::Claude(state) => state.handle_configure(message).await,
+                    ProviderState::Codex(state) => state.handle_configure(message).await,
+                    ProviderState::Opencode { runtime, .. } => {
+                        runtime.handle_configure(message).await
+                    }
+                }
+                if let Some(code) = configure_refusal_code(&mut answers, &session_id, request_id) {
+                    crate::emit_environment_event(json!({
+                        "severity": "warn",
+                        "event": "fresh_agent.configure.provider_refused",
+                        "stage": "session_host",
+                        "provider": self.provider.as_str(),
+                        "request_id": request_id.as_str(),
+                        "code": code,
+                    }));
+                    return Err(OperationFailure {
+                        kind: OperationFailureKind::Rejected,
+                        message: format!("provider refused the live configure ({code})"),
+                        acceptance_ambiguous: false,
+                    });
                 }
             }
             FreshAgentOperation::Rollback {
@@ -1072,6 +1148,13 @@ fn spawn_broadcast_bridge(
         kill_outcomes,
         suppressed_kills,
     } = outputs;
+    // claude/kilroy: the native identity is announced once per distinct id
+    // (design §7.3). `freshAgent.created` names a resumed conversation (the CLI
+    // booted it before the sidecar answered); a fresh one is named by its first
+    // turn's init or by `materialized`. Every later turn's init repeats the same
+    // id and announces nothing.
+    let claude = matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy);
+    let mut announced: Option<String> = None;
     tokio::spawn(async move {
         let mut dropped = 0u64;
         loop {
@@ -1109,6 +1192,13 @@ fn spawn_broadcast_bridge(
             }
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.created") {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
+                    if claude {
+                        if let Some(native_id) = claude_session_ref_id(&value) {
+                            if !announce_native(&mut announced, native_id, &native, &events).await {
+                                break;
+                            }
+                        }
+                    }
                     let _ = created.send(Some(Ok(session_id.to_string())));
                     if matches!(provider, FreshProvider::Codex)
                         || (matches!(provider, FreshProvider::Opencode)
@@ -1121,15 +1211,21 @@ fn spawn_broadcast_bridge(
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.session.materialized")
             {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
-                    let _ = native.send(Some(session_id.to_string()));
-                    if events
-                        .send(AgentEvent::Started {
-                            native_session_id: session_id.to_string(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    if claude {
+                        if !announce_native(&mut announced, session_id, &native, &events).await {
+                            break;
+                        }
+                    } else {
+                        let _ = native.send(Some(session_id.to_string()));
+                        if events
+                            .send(AgentEvent::Started {
+                                native_session_id: session_id.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -1145,15 +1241,22 @@ fn spawn_broadcast_bridge(
                         .or_else(|| event.get("sessionId"))
                         .and_then(Value::as_str)
                     {
-                        let _ = native.send(Some(session_id.to_string()));
-                        if events
-                            .send(AgentEvent::Started {
-                                native_session_id: session_id.to_string(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        if claude {
+                            if !announce_native(&mut announced, session_id, &native, &events).await
+                            {
+                                break;
+                            }
+                        } else {
+                            let _ = native.send(Some(session_id.to_string()));
+                            if events
+                                .send(AgentEvent::Started {
+                                    native_session_id: session_id.to_string(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1201,6 +1304,37 @@ fn spawn_broadcast_bridge(
     });
 }
 
+/// The claude conversation a `freshAgent.created` names in its `sessionRef`.
+fn claude_session_ref_id(created: &Value) -> Option<&str> {
+    let reference = created.get("sessionRef")?;
+    (reference.get("provider").and_then(Value::as_str) == Some("claude"))
+        .then(|| reference.get("sessionId").and_then(Value::as_str))
+        .flatten()
+        .filter(|id| !id.is_empty())
+}
+
+/// Publish `native_id` as the session's native identity and send one
+/// `AgentEvent::Started` for it, unless it is the id last announced. False once
+/// the event receiver is gone.
+async fn announce_native(
+    announced: &mut Option<String>,
+    native_id: &str,
+    native: &watch::Sender<Option<String>>,
+    events: &mpsc::Sender<AgentEvent>,
+) -> bool {
+    if announced.as_deref() == Some(native_id) {
+        return true;
+    }
+    *announced = Some(native_id.to_string());
+    let _ = native.send(Some(native_id.to_string()));
+    events
+        .send(AgentEvent::Started {
+            native_session_id: native_id.to_string(),
+        })
+        .await
+        .is_ok()
+}
+
 fn parse_sandbox(value: &str) -> Option<freshell_protocol::Sandbox> {
     match value {
         "read-only" | "readOnly" | "readonly" => Some(freshell_protocol::Sandbox::ReadOnly),
@@ -1225,7 +1359,7 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 
 fn operation_supported_by_snapshot(operation: &FreshAgentOperation, snapshot: &Value) -> bool {
     let capability = match operation {
-        FreshAgentOperation::Compact { .. } => return true,
+        FreshAgentOperation::Compact { .. } | FreshAgentOperation::Configure { .. } => return true,
         FreshAgentOperation::Rollback {
             direction: FreshAgentRollbackDirection::Undo,
             ..
@@ -1250,6 +1384,48 @@ fn find_operation_error_code(value: &Value) -> Option<&str> {
         Value::Object(object) => object.values().find_map(find_operation_error_code),
         Value::Array(values) => values.iter().find_map(find_operation_error_code),
         _ => None,
+    }
+}
+
+/// The code of the error a provider answered a configure with, if any: a
+/// `freshAgent.error` for the configured session, or a top-level `error`
+/// correlated to the configure's request id (the unknown-session answer).
+fn configure_refusal_code(
+    answers: &mut broadcast::Receiver<String>,
+    session_id: &str,
+    request_id: &RequestId,
+) -> Option<String> {
+    loop {
+        let frame = match answers.try_recv() {
+            Ok(frame) => frame,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => return None,
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&frame) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("error")
+            && value.get("requestId").and_then(Value::as_str) == Some(request_id.as_str())
+        {
+            return Some(
+                value
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+            );
+        }
+        if value.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+            continue;
+        }
+        if let Some(code) = value
+            .get("event")
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("freshAgent.error"))
+            .and_then(|event| event.get("code"))
+            .and_then(Value::as_str)
+        {
+            return Some(code.to_string());
+        }
     }
 }
 
@@ -1292,7 +1468,12 @@ fn render_snapshot_text(snapshot: &Value, max_bytes: usize) -> (String, bool) {
                 }
             }
             if body.is_empty() {
-                if let Some(summary) = turn.get("summary").and_then(Value::as_str) {
+                // An item-less turn carrying only the durable error module
+                // (a claude API error or failed local command) reads as its
+                // error; anything else falls back to the summary.
+                if let Some(message) = turn.pointer("/error/message").and_then(Value::as_str) {
+                    body.push(message);
+                } else if let Some(summary) = turn.get("summary").and_then(Value::as_str) {
                     body.push(summary);
                 }
             }
@@ -1398,8 +1579,8 @@ lines.on('line', line=>{
   const req=JSON.parse(line);
   if(req.type==='create'){
     writeFileSync(process.env.FRESHELL_TEST_MCP_RECEIPT,JSON.stringify(req));
-    process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture'})+'\n');
-    if(req.model!=='deferred-identity')process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
+    process.stdout.write(JSON.stringify({type:'created',requestId:req.requestId,sessionId:'owned-mcp-fixture',protocol:2})+'\n');
+    if(req.model!=='deferred-identity')process.stdout.write(JSON.stringify({type:'sdk.session.init',sessionId:'owned-mcp-fixture',cliSessionId:req.boot?.resume??'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',model:'fixture',cwd:req.cwd,tools:[],slashCommands:[]})+'\n');
   }
   if(req.type==='shutdown')process.exit(0);
 });
@@ -1457,15 +1638,19 @@ lines.on('line', line=>{
             let observed: Value =
                 serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
             transport.stop().await.unwrap();
-            let started = started.expect("Claude create cannot wait for the first model turn");
-            if expected_identity.is_some() {
-                assert!(
-                    started.is_err(),
-                    "an exact resume must reject a different actual native identity"
+            let started = started
+                .expect("Claude create cannot wait for the first model turn")
+                .unwrap();
+            if let Some(expected) = expected_identity {
+                // A resume is named by `created` (the sidecar answers it once the
+                // CLI booted that conversation), not by a later turn's init.
+                assert_eq!(started.native_session_id.as_deref(), Some(expected));
+                assert_eq!(
+                    observed["boot"],
+                    json!({ "kind": "resume", "resume": expected }),
+                    "the create boots the resumed conversation"
                 );
-                continue;
             }
-            let started = started.unwrap();
             if deferred_identity {
                 assert!(
                     started.native_session_id.is_none(),
@@ -1481,6 +1666,448 @@ lines.on('line', line=>{
                 "arbitrary MCP maps are never sent over private create IPC"
             );
         }
+    }
+
+    /// A hosted claude transport running the REAL sidecar over the CLI simulator
+    /// (`test/fixtures/claude-cli-sim/query.mjs`), with an isolated HOME whose
+    /// CLAUDE_CONFIG_DIR holds a transcript for each id in `conversations`.
+    struct SimulatedClaude {
+        root: tempfile::TempDir,
+        ledger: std::path::PathBuf,
+        transport: Arc<HostedTransport>,
+    }
+
+    impl SimulatedClaude {
+        async fn start(conversations: &[&str]) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let home = root.path().join("home");
+            let workspace = root.path().join("workspace");
+            let config = home.join(".claude");
+            let project = config.join("projects").join("-workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            for id in conversations {
+                let line = json!({ "type": "user", "uuid": format!("u-{id}"), "parentUuid": null,
+                    "sessionId": id, "cwd": workspace, "message": { "role": "user", "content": "hello" } });
+                std::fs::write(project.join(format!("{id}.jsonl")), format!("{line}\n")).unwrap();
+            }
+            let ledger = root.path().join("sim-ledger.jsonl");
+            let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
+            let environment = vec![
+                ("HOME".to_string(), text(&home)),
+                (
+                    "PATH".to_string(),
+                    std::env::var("PATH").unwrap_or_default(),
+                ),
+                ("LANG".to_string(), "C.UTF-8".to_string()),
+                ("CLAUDE_CONFIG_DIR".to_string(), text(&config)),
+                (
+                    "FRESHELL_CLAUDE_SDK_QUERY_MODULE".to_string(),
+                    text(&repo.join("test/fixtures/claude-cli-sim/query.mjs")),
+                ),
+                ("FRESHELL_CLAUDE_SIM_LEDGER".to_string(), text(&ledger)),
+            ];
+            let transport = HostedTransport::with_claude_sidecar_environment(
+                FreshProvider::Claude,
+                environment,
+            )
+            .await;
+            Self {
+                root,
+                ledger,
+                transport,
+            }
+        }
+
+        fn profile(&self, resume: Option<&str>) -> FreshAgentProfile {
+            FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "freshclaude".into(),
+                cwd: self.root.path().join("workspace").to_string_lossy().into(),
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+                provider_store_id: "owned-store".into(),
+                native_session_id: resume.map(str::to_owned),
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: vec![],
+            }
+        }
+
+        /// The simulator's ledger rows of one kind (`query`, `boot`, `prompt`, ...).
+        fn ledger_rows(&self, kind: &str) -> Vec<Value> {
+            std::fs::read_to_string(&self.ledger)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|row| row["kind"] == kind)
+                .collect()
+        }
+    }
+
+    /// The hosted claude resume `start` resolves from `freshAgent.created`'s
+    /// `sessionRef` (design §7.3): the sidecar answers `created` once the CLI booted
+    /// the conversation, so no prompt is needed. The bridge announces the native
+    /// identity once (a turn's init does not announce it again).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claude_resume_start_resolves_from_created_with_no_prompt() {
+        // The sidecar entry is resolved from this process's environment, which
+        // other tests here set: hold their lock.
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let conversation = "4b0e8f6a-1d2c-4e3f-9a5b-6c7d8e9f0a1b";
+        let claude = SimulatedClaude::start(&[conversation]).await;
+        let mut events = claude.transport.take_event_stream().expect("event stream");
+        let profile = claude.profile(Some(conversation));
+
+        let started =
+            tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+                .await
+                .expect("a claude resume start must not wait for a prompt")
+                .expect("the resume start succeeds");
+        assert_eq!(started.native_session_id.as_deref(), Some(conversation));
+        assert_eq!(
+            claude.ledger_rows("boot").len(),
+            1,
+            "the CLI booted the conversation"
+        );
+        assert!(
+            claude.ledger_rows("prompt").is_empty(),
+            "no prompt was needed"
+        );
+
+        // A turn's init names the same conversation: it is not announced again.
+        claude
+            .transport
+            .dispatch(
+                &RequestId::parse("resume-turn").unwrap(),
+                "hello again",
+                &profile,
+            )
+            .await
+            .expect("the send is accepted");
+        let mut announced = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::Started { native_session_id } => announced.push(native_session_id),
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.turn.complete" =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn completes");
+        assert_eq!(announced, vec![conversation.to_string()]);
+        Arc::clone(&claude.transport).stop().await.unwrap();
+    }
+
+    /// A hosted claude resume of a conversation the CLI does not have fails at start:
+    /// the boot is refused (`create.failed`), so no session is reported started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claude_resume_start_of_a_missing_conversation_fails() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let claude = SimulatedClaude::start(&[]).await;
+        let profile = claude.profile(Some("9c8b7a6f-5e4d-4c3b-8a2f-1e0d9c8b7a6f"));
+        let started =
+            tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+                .await
+                .expect("the refused boot answers promptly");
+        assert!(started.is_err(), "a refused resume boot fails the start");
+        Arc::clone(&claude.transport).stop().await.unwrap();
+    }
+
+    /// What one hosted Claude configure produced: the actor's answer, the
+    /// durable profile afterwards, every configure line the scripted sidecar
+    /// received, the provider event named `settled_on` once it reached the
+    /// host journal, and the whole journal at that point.
+    struct HostedClaudeConfigure {
+        outcome: Result<
+            freshell_runtime_protocol::CommandState,
+            freshell_agent_runtime::host_actor::ActorError,
+        >,
+        profile: FreshAgentProfile,
+        applied: Vec<Value>,
+        settled: Option<Value>,
+        events: Vec<AgentEvent>,
+    }
+
+    /// Runs one configure through the real `FreshClaudeState` behind a hosted
+    /// actor whose profile starts on sonnet/low. The scripted sidecar answers
+    /// the configure line with `receipt`, a JavaScript expression over `req`.
+    async fn hosted_claude_configure(
+        settings: freshell_runtime_protocol::FreshAgentTurnSettings,
+        receipt: &str,
+        settled_on: &str,
+    ) -> HostedClaudeConfigure {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("sidecar.mjs");
+        let receipt_log = dir.path().join("configure.jsonl");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+import {{createInterface}} from 'node:readline';
+import {{appendFileSync}} from 'node:fs';
+const lines=createInterface({{input:process.stdin}});
+const emit=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
+lines.on('line', line=>{{
+  const req=JSON.parse(line);
+  if(req.type==='create')emit({{type:'created',requestId:req.requestId,sessionId:'owned-configure',protocol:2}});
+  if(req.type==='configure'){{
+    appendFileSync(process.env.FRESHELL_TEST_CONFIGURE_RECEIPT,JSON.stringify(req)+'\n');
+    emit({receipt});
+  }}
+  if(req.type==='shutdown')process.exit(0);
+}});
+"#
+            ),
+        )
+        .unwrap();
+        let keys = [
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_NODE",
+            "FRESHELL_TEST_CONFIGURE_RECEIPT",
+        ];
+        let _env = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("FRESHELL_TEST_CONFIGURE_RECEIPT", &receipt_log);
+        let transport = HostedTransport::new(FreshProvider::Claude).await;
+        let profile = FreshAgentProfile {
+            provider: FreshProvider::Claude,
+            runtime_variant: "freshclaude".into(),
+            cwd: dir.path().to_string_lossy().into(),
+            model: Some("sonnet".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("default".into()),
+            sandbox: None,
+            provider_store_id: "owned-store".into(),
+            native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: vec![],
+        };
+        let actor = FreshAgentHostActor::open(dir.path().join("actor"), profile, transport.clone())
+            .await
+            .unwrap();
+
+        let outcome = actor
+            .configure(RequestId::parse("hosted-configure-1").unwrap(), settings)
+            .await;
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = actor.read_events(0, 256).await.events;
+                if let Some(event) = events.iter().find_map(|entry| match &entry.event {
+                    AgentEvent::Provider { payload } if payload["event"]["type"] == settled_on => {
+                        Some(payload["event"].clone())
+                    }
+                    _ => None,
+                }) {
+                    break event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .ok();
+        let profile = actor.profile().await;
+        let events = actor
+            .read_events(0, 256)
+            .await
+            .events
+            .into_iter()
+            .map(|entry| entry.event)
+            .collect();
+        let applied = std::fs::read_to_string(&receipt_log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        Arc::clone(&transport).stop().await.unwrap();
+        HostedClaudeConfigure {
+            outcome,
+            profile,
+            applied,
+            settled,
+            events,
+        }
+    }
+
+    const CLAUDE_CONFIGURED_OK: &str =
+        "{type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:true,settings:req.settings}";
+
+    #[tokio::test]
+    async fn hosted_claude_configure_applies_live_and_relays_the_session_metadata_frame() {
+        let run = hosted_claude_configure(
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+            CLAUDE_CONFIGURED_OK,
+            "freshAgent.session.metadata",
+        )
+        .await;
+
+        assert_eq!(
+            run.outcome.unwrap(),
+            freshell_runtime_protocol::CommandState::ProviderAcked
+        );
+        assert_eq!(run.profile.model.as_deref(), Some("opus"));
+        assert_eq!(
+            run.applied.len(),
+            1,
+            "one live configure reaches the sidecar"
+        );
+        assert_eq!(run.applied[0]["settings"]["model"], "opus");
+        assert_eq!(run.applied[0]["settings"]["effort"], "high");
+        let metadata = run
+            .settled
+            .expect("the provider's metadata frame reaches the host journal");
+        assert_eq!(metadata["sessionId"], "owned-configure");
+        assert_eq!(metadata["model"], "opus");
+        assert_eq!(metadata["effort"], "high");
+    }
+
+    /// The model selector's Default row is a model change with no effort.
+    /// Claude clears the effort live; the durable profile, which every later
+    /// send restates, must end on that same effort.
+    #[tokio::test]
+    async fn hosted_claude_configure_to_the_default_effort_persists_the_effort_claude_reports() {
+        let run = hosted_claude_configure(
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                model: Some("opus".into()),
+                ..Default::default()
+            },
+            CLAUDE_CONFIGURED_OK,
+            "freshAgent.session.metadata",
+        )
+        .await;
+
+        assert_eq!(
+            run.outcome.unwrap(),
+            freshell_runtime_protocol::CommandState::ProviderAcked
+        );
+        let metadata = run
+            .settled
+            .expect("the provider's metadata frame reaches the host journal");
+        assert_eq!(metadata["model"], "opus");
+        assert_eq!(run.profile.model.as_deref(), Some("opus"));
+        assert_eq!(
+            run.profile.effort.as_ref().map(|effort| json!(effort)),
+            metadata
+                .get("effort")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            "the durable effort equals the effort the live session reports"
+        );
+        assert!(run.profile.effort.is_none());
+    }
+
+    /// Claude refuses the live apply (here the sidecar cannot set the
+    /// model). The intent stays saved for the next send, the provider's own
+    /// error reaches the journal for every device, and the command journal
+    /// records the refusal instead of a provider acknowledgement.
+    #[tokio::test]
+    async fn hosted_claude_configure_refused_live_keeps_the_intent_and_journals_the_refusal() {
+        let run = hosted_claude_configure(
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+            "{type:'sdk.configured',sessionId:req.sessionId,requestId:req.requestId,ok:false,message:'Model or effort is unavailable'}",
+            "freshAgent.error",
+        )
+        .await;
+
+        assert_eq!(
+            run.outcome.unwrap(),
+            freshell_runtime_protocol::CommandState::Cancelled
+        );
+        assert_eq!(run.applied.len(), 1, "the live apply was attempted once");
+        let refusal = run
+            .settled
+            .expect("the provider's refusal reaches the host journal");
+        assert_eq!(refusal["code"], "CLAUDE_SETTINGS_FAILED");
+        assert_eq!(run.profile.model.as_deref(), Some("opus"));
+        assert_eq!(run.profile.effort.as_deref(), Some("high"));
+        assert!(
+            run.events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CommandOutcome {
+                    request_id,
+                    state: freshell_runtime_protocol::CommandState::Cancelled,
+                } if request_id.as_str() == "hosted-configure-1"
+            )),
+            "the command journal records the refused live apply: {:?}",
+            run.events
+        );
+    }
+
+    #[test]
+    fn configure_refusal_is_read_only_from_answers_to_this_configure() {
+        let request_id = RequestId::parse("configure-answer").unwrap();
+        let refusal = |frames: &[Value]| {
+            let (sender, mut answers) = broadcast::channel(16);
+            for frame in frames {
+                sender.send(frame.to_string()).unwrap();
+            }
+            configure_refusal_code(&mut answers, "session-a", &request_id)
+        };
+        let nested_error = |session: &str, code: &str| {
+            json!({"type":"freshAgent.event","provider":"codex","sessionId":session,
+                "sessionType":"freshcodex","event":{"type":"freshAgent.error","sessionId":session,
+                "code":code,"message":"refused"}})
+        };
+        let metadata = json!({"type":"freshAgent.event","provider":"claude","sessionId":"session-a",
+            "sessionType":"freshclaude","event":{"type":"freshAgent.session.metadata",
+            "sessionId":"session-a","model":"opus"}});
+
+        assert_eq!(
+            refusal(std::slice::from_ref(&metadata)),
+            None,
+            "a converged apply"
+        );
+        assert_eq!(
+            refusal(&[nested_error("session-b", "INVALID_EFFORT")]),
+            None,
+            "another session's error"
+        );
+        assert_eq!(
+            refusal(&[
+                json!({"type":"error","requestId":"another-request","code":"INTERNAL_ERROR"})
+            ]),
+            None,
+            "another request's error"
+        );
+        assert_eq!(
+            refusal(&[metadata, nested_error("session-a", "INVALID_EFFORT")]).as_deref(),
+            Some("INVALID_EFFORT")
+        );
+        assert_eq!(
+            refusal(&[json!({"type":"error","requestId":"configure-answer",
+                "code":"INTERNAL_ERROR","message":"SESSION_NOT_FOUND: claude session not found"})])
+            .as_deref(),
+            Some("INTERNAL_ERROR"),
+            "the unknown-session answer is correlated by request id"
+        );
     }
 
     #[tokio::test]
@@ -1987,6 +2614,7 @@ lines.on('line', line=>{
             );
             let name = match operation {
                 FreshAgentOperation::Compact { .. } => "compact",
+                FreshAgentOperation::Configure { .. } => "configure",
                 FreshAgentOperation::Rollback {
                     direction: FreshAgentRollbackDirection::Undo,
                     ..
@@ -2186,6 +2814,7 @@ lines.on('line', line=>{
             self.trace.record(
                 match operation {
                     FreshAgentOperation::Compact { .. } => "compact",
+                    FreshAgentOperation::Configure { .. } => "configure",
                     FreshAgentOperation::Rollback {
                         direction: FreshAgentRollbackDirection::Undo,
                         ..
@@ -2340,6 +2969,15 @@ lines.on('line', line=>{
                 mode: FreshAgentRollbackMode::Step,
                 turn_id: Some("turn-1".into()),
                 cwd: Some("/workspace".into()),
+            },
+            FreshAgentOperation::Configure {
+                settings: freshell_runtime_protocol::FreshAgentTurnSettings {
+                    cwd: None,
+                    model: Some("fixture-configured-model".into()),
+                    effort: Some("high".into()),
+                    permission_mode: Some("acceptEdits".into()),
+                    sandbox: None,
+                },
             },
         ]
     }
@@ -2496,6 +3134,11 @@ lines.on('line', line=>{
                     )
                     .await
                     .unwrap();
+            }
+            // The direct route stores configured settings on the live
+            // session, so its later resume launches with them.
+            if let FreshAgentOperation::Configure { settings } = operation {
+                profile.apply_configure_settings(settings);
             }
         }
         transport.capture(4096).await.unwrap();
@@ -2697,6 +3340,7 @@ lines.on('line', line=>{
                 "compact",
                 "rollback_undo",
                 "rollback_redo",
+                "configure",
                 "capture",
                 "fork",
                 "restart",
@@ -3163,5 +3807,25 @@ lines.on('line', line=>{
         assert!(short.len() <= 8);
         assert!(short.is_char_boundary(short.len()));
         assert!(truncated);
+    }
+
+    #[test]
+    fn snapshot_text_renders_error_only_turns_by_their_error_message() {
+        // Real claude snapshots (pinned CLI 2.1.237 goldens): a failed /compact
+        // and an API error are item-less turns carrying only the error module.
+        for (golden, expected) in [
+            (
+                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/compact-fail/snapshot.golden.json"),
+                "system: Error during compaction: API Error: 400 compaction refused by fake\n",
+            ),
+            (
+                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/api-error/snapshot.golden.json"),
+                "assistant: API Error: 400 fixture bad request\n",
+            ),
+        ] {
+            let snapshot: Value = serde_json::from_str(golden).unwrap();
+            let (text, _) = render_snapshot_text(&snapshot, 1 << 20);
+            assert!(text.contains(expected), "{text}");
+        }
     }
 }

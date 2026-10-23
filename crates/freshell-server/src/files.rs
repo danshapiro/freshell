@@ -1115,51 +1115,17 @@ fn internal_error(msg: &str) -> Response {
 mod tests {
     use super::*;
 
-    // `std::env::set_var` mutates whole-process state, and this bin test
-    // binary ALREADY serializes env-mutating tests (session_directory.rs
-    // provider_home tests, main.rs resolve-wiring tests) on the crate-wide
-    // `HOME_ENV_TEST_LOCK` (session_directory.rs:463-464). Reuse THAT lock —
-    // a files-local mutex would not serialize against those 11 tests.
-    use crate::session_directory::HOME_ENV_TEST_LOCK as ENV_LOCK;
+    // `std::env::set_var` mutates whole-process state: every test here that
+    // changes or reads process env owns it through the crate-wide
+    // `TestEnv` (`crate::test_env_lock`), which restores what it changed.
+    use crate::test_env_lock::TestEnv;
 
-    /// Poison-tolerant acquisition (same pattern as `main.rs:2460`).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// RAII: set/remove a group of env vars, restoring prior values on drop.
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvGuard {
-        /// `Some(v)` sets the var; `None` removes it. Prior state is restored
-        /// (set-or-removed) on drop, even on panic.
-        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
-            let saved = pairs
-                .iter()
-                .map(|(key, value)| {
-                    let prior = std::env::var_os(key);
-                    match value {
-                        Some(v) => std::env::set_var(key, v),
-                        None => std::env::remove_var(key),
-                    }
-                    (*key, prior)
-                })
-                .collect();
-            EnvGuard { saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, prior) in self.saved.drain(..) {
-                match prior {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
+    /// `Some(v)` sets the var; `None` removes it — for the rest of the test.
+    fn apply_env(env: &mut TestEnv, pairs: &[(&str, Option<&str>)]) {
+        for (key, value) in pairs {
+            match value {
+                Some(value) => env.set(key, value),
+                None => env.remove(key),
             }
         }
     }
@@ -1173,12 +1139,11 @@ mod tests {
     /// `^(.*)/[a-zA-Z]/Windows/System32$` shape or the mount prefix silently
     /// falls back to /mnt.
     struct WslMountFixture {
-        _env: EnvGuard,
         root: tempfile::TempDir,
     }
 
     impl WslMountFixture {
-        fn new() -> Self {
+        fn new(env: &mut TestEnv) -> Self {
             let root = tempfile::tempdir().unwrap();
             let sys32 = root.path().join("c/Windows/System32");
             std::fs::create_dir_all(&sys32).unwrap();
@@ -1186,13 +1151,16 @@ mod tests {
             std::fs::write(root.path().join("c/Users/notes.txt"), b"x").unwrap();
             std::fs::create_dir_all(root.path().join("d/proj")).unwrap();
             let sys32_str = sys32.to_string_lossy().into_owned();
-            let env = EnvGuard::set(&[
-                ("WSL_DISTRO_NAME", Some("Ubuntu")),
-                ("WSL_INTEROP", None),
-                ("WSLENV", None),
-                ("WSL_WINDOWS_SYS32", Some(sys32_str.as_str())),
-            ]);
-            WslMountFixture { _env: env, root }
+            apply_env(
+                env,
+                &[
+                    ("WSL_DISTRO_NAME", Some("Ubuntu")),
+                    ("WSL_INTEROP", None),
+                    ("WSLENV", None),
+                    ("WSL_WINDOWS_SYS32", Some(sys32_str.as_str())),
+                ],
+            );
+            WslMountFixture { root }
         }
 
         /// The native directory a `X:\` drive maps to, e.g. `mount("c")`.
@@ -1202,13 +1170,16 @@ mod tests {
     }
 
     /// Env pinned to a plain (non-WSL) Linux host.
-    fn non_wsl_env() -> EnvGuard {
-        EnvGuard::set(&[
-            ("WSL_DISTRO_NAME", None),
-            ("WSL_INTEROP", None),
-            ("WSLENV", None),
-            ("WSL_WINDOWS_SYS32", None),
-        ])
+    fn pin_non_wsl_env(env: &mut TestEnv) {
+        apply_env(
+            env,
+            &[
+                ("WSL_DISTRO_NAME", None),
+                ("WSL_INTEROP", None),
+                ("WSLENV", None),
+                ("WSL_WINDOWS_SYS32", None),
+            ],
+        );
     }
 
     fn test_state() -> FilesState {
@@ -1236,8 +1207,8 @@ mod tests {
 
     #[test]
     fn resolve_user_path_windows_drive_on_wsl_maps_to_mount() {
-        let _guard = env_lock();
-        let fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock_blocking();
+        let fixture = WslMountFixture::new(&mut env);
         let mount_c = fixture.mount("c").to_string_lossy().into_owned();
 
         let r = resolve_user_path("C:\\");
@@ -1257,8 +1228,8 @@ mod tests {
 
     #[test]
     fn resolve_user_path_windows_off_wsl_is_unaddressable() {
-        let _guard = env_lock();
-        let _env = non_wsl_env();
+        let mut env = TestEnv::lock_blocking();
+        pin_non_wsl_env(&mut env);
         let r = resolve_user_path("C:\\Users");
         assert_eq!(r.display, "C:\\Users");
         assert_eq!(r.fs_path, None);
@@ -1266,8 +1237,8 @@ mod tests {
 
     #[test]
     fn resolve_user_path_windows_unresolvable_forms_are_unaddressable() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock_blocking();
+        let _fixture = WslMountFixture::new(&mut env);
         // Bare drive, rooted, and generic (non-WSL) UNC inputs have no native
         // address even on WSL. (NOTE: drive-relative `C:foo` is NOT Windows
         // flavor — Node's WINDOWS_DRIVE_PREFIX_RE requires a separator or
@@ -1281,8 +1252,8 @@ mod tests {
 
     #[test]
     fn resolve_user_path_posix_and_tilde_unchanged() {
-        let _guard = env_lock();
-        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        let mut env = TestEnv::lock_blocking();
+        env.set("HOME", "/home/tester");
         // POSIX: exact normalize_user_path behavior — display == fs path.
         let r = resolve_user_path("/tmp/x///");
         assert_eq!(r.display, "/tmp/x");
@@ -1301,8 +1272,8 @@ mod tests {
     /// name that no endpoint could address (cluster tilde_expand regression).
     #[test]
     fn test_tilde_expand_backslash_form_expands_to_home() {
-        let _guard = env_lock();
-        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        let mut env = TestEnv::lock_blocking();
+        env.set("HOME", "/home/tester");
         let r = resolve_user_path("~\\proj");
         assert_eq!(r.display, "/home/tester/proj");
         assert_eq!(r.fs_path, Some("/home/tester/proj".to_string()));
@@ -1329,15 +1300,10 @@ mod tests {
 
     // ---- validate_dir (R-WIN2: Windows input on WSL resolves via the mount) ----
 
-    // Intentional: `_guard` is held across every `.await` BY DESIGN — the
-    // whole test mutates/reads process env and must stay serialized on the
-    // crate-wide HOME_ENV_TEST_LOCK end-to-end. Holding the env guard across
-    // .await is the point: it serializes env-mutating tests process-wide.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_accepts_windows_drive_on_wsl() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         let resp = validate_dir(
             State(test_state()),
             auth_headers(),
@@ -1351,12 +1317,10 @@ mod tests {
         assert_eq!(v["resolvedPath"], "C:\\");
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_windows_deep_path_and_missing_dir() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         // D:\proj exists in the fixture.
         let resp = validate_dir(
             State(test_state()),
@@ -1382,12 +1346,10 @@ mod tests {
         assert_eq!(v["resolvedPath"], "C:\\Nope");
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_windows_input_invalid_off_wsl() {
-        let _guard = env_lock();
-        let _env = non_wsl_env();
+        let mut env = TestEnv::lock().await;
+        pin_non_wsl_env(&mut env);
         let resp = validate_dir(
             State(test_state()),
             auth_headers(),
@@ -1401,11 +1363,9 @@ mod tests {
         assert_eq!(v["resolvedPath"], "C:\\");
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_posix_regression() {
-        let _guard = env_lock();
+        let _env = TestEnv::lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_string_lossy().into_owned();
         let resp = validate_dir(
@@ -1432,19 +1392,21 @@ mod tests {
         assert_eq!(v["checkpointWorkspaceEligible"], false);
     }
 
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_keeps_account_home_as_launch_directory_only() {
-        let _guard = env_lock();
+        let mut env = TestEnv::lock().await;
         let home = tempfile::tempdir().unwrap();
         let home_path = home.path().to_string_lossy().into_owned();
         let project = home.path().join("project");
         std::fs::create_dir(&project).unwrap();
-        let _env = EnvGuard::set(&[
-            ("HOME", Some(home_path.as_str())),
-            ("FRESHELL_HOME", None),
-            ("USERPROFILE", None),
-        ]);
+        apply_env(
+            &mut env,
+            &[
+                ("HOME", Some(home_path.as_str())),
+                ("FRESHELL_HOME", None),
+                ("USERPROFILE", None),
+            ],
+        );
         let response = validate_dir(
             State(test_state()),
             auth_headers(),
@@ -1485,20 +1447,22 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_excludes_passwd_home_when_home_env_is_redirected() {
-        let _guard = env_lock();
+        let mut env = TestEnv::lock().await;
         let redirected_home = tempfile::tempdir().unwrap();
         let redirected_home_path = redirected_home.path().to_string_lossy().into_owned();
         let account_home =
             std::fs::canonicalize(crate::session_directory::passwd_entry_home()).unwrap();
         let account_home_path = account_home.to_string_lossy().into_owned();
-        let _env = EnvGuard::set(&[
-            ("HOME", Some(redirected_home_path.as_str())),
-            ("FRESHELL_HOME", None),
-            ("USERPROFILE", None),
-        ]);
+        apply_env(
+            &mut env,
+            &[
+                ("HOME", Some(redirected_home_path.as_str())),
+                ("FRESHELL_HOME", None),
+                ("USERPROFILE", None),
+            ],
+        );
 
         let response = validate_dir(
             State(test_state()),
@@ -1543,11 +1507,9 @@ mod tests {
     /// ENOENT the raw stat on the missing `nope` intermediate and echo the
     /// un-collapsed path; both the stat and the display string must use the
     /// collapsed form.
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_dotseg_collapse_display() {
-        let _guard = env_lock();
+        let _env = TestEnv::lock().await;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("real")).unwrap();
         let spelled = format!("{}/nope/../real", tmp.path().to_string_lossy());
@@ -1590,14 +1552,10 @@ mod tests {
             .collect()
     }
 
-    // Intentional: `_guard` is held across every `.await` BY DESIGN — these
-    // tests mutate/read process env and must stay serialized on the
-    // crate-wide HOME_ENV_TEST_LOCK end-to-end.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn complete_windows_drive_root_lists_in_input_flavor() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         // C:\ is a directory (the fixture's <root>/c) -> list all children,
         // display paths joined win32-style in the input's flavor.
         // Children of <root>/c: Users/ and Windows/ (dirs sort before files;
@@ -1606,12 +1564,10 @@ mod tests {
         assert_eq!(paths, vec!["C:\\Users", "C:\\Windows"]);
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn complete_windows_partial_leaf_filters_and_preserves_flavor() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         // Partial leaf: split parent/leaf on the display path, filter by leaf.
         let paths = complete_paths("C:\\Us", None, None).await;
         assert_eq!(paths, vec!["C:\\Users"]);
@@ -1623,12 +1579,10 @@ mod tests {
         assert_eq!(paths, vec!["c:\\Users"]);
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn complete_windows_dirs_only_filters_files() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         // C:\Users contains dan/ (dir) and notes.txt (file).
         let all = complete_paths("C:\\Users\\", None, None).await;
         assert_eq!(all, vec!["C:\\Users\\dan", "C:\\Users\\notes.txt"]);
@@ -1636,27 +1590,23 @@ mod tests {
         assert_eq!(dirs, vec!["C:\\Users\\dan"]);
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn complete_windows_missing_parent_and_off_wsl_return_empty() {
-        let _guard = env_lock();
+        let mut env = TestEnv::lock().await;
         {
-            let _fixture = WslMountFixture::new();
+            let _fixture = WslMountFixture::new(&mut env);
             // Parent C:\Nope doesn't exist -> readdir NotFound -> 200 { suggestions: [] }.
             assert!(complete_paths("C:\\Nope\\x", None, None).await.is_empty());
         }
-        let _env = non_wsl_env();
+        pin_non_wsl_env(&mut env);
         // Windows input on a non-WSL host is unaddressable -> empty suggestions.
         assert!(complete_paths("C:\\", None, None).await.is_empty());
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn complete_windows_root_anchoring_composes() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         // Relative prefix under a windows-flavor root: resolve_completion_input
         // joins with `/`, and win32_resolve then normalizes the mixed
         // separators into a windows display path.
@@ -1664,12 +1614,10 @@ mod tests {
         assert_eq!(paths, vec!["C:\\Users\\dan"]);
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn complete_wsl_unc_partial_leaf_round_trips() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         // WSL-UNC inputs convert to native root-relative paths
         // (`\\wsl.localhost\Ubuntu\<p>` -> `/<p>`; distro matched
         // case-insensitively against WSL_DISTRO_NAME, path.rs:384-419) — so a
@@ -1690,11 +1638,9 @@ mod tests {
         );
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn complete_posix_regression_unchanged() {
-        let _guard = env_lock();
+        let _env = TestEnv::lock().await;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
         std::fs::create_dir_all(tmp.path().join("subzero")).unwrap();
@@ -1711,8 +1657,8 @@ mod tests {
 
     #[test]
     fn sandbox_target_uses_converted_native_path() {
-        let _guard = env_lock();
-        let fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock_blocking();
+        let fixture = WslMountFixture::new(&mut env);
         let mount_c = fixture.mount("c").to_string_lossy().into_owned();
         // R-WIN4: sandbox comparisons use the CONVERTED native path (Node's
         // validatePath resolves through toFilesystemPath before isPathAllowed).
@@ -1744,12 +1690,10 @@ mod tests {
 
     // ---- read/stat/write (R-WIN4: sandbox + fs access via the converted path) ----
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn read_stat_write_follow_windows_conversion_on_wsl() {
-        let _guard = env_lock();
-        let fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let fixture = WslMountFixture::new(&mut env);
         // stat: the fixture file C:\Users\notes.txt exists via the mount.
         let resp = stat_file(
             State(test_state()),
@@ -1793,12 +1737,10 @@ mod tests {
         assert!(!std::path::Path::new("C:\\Users\\dan\\note2.txt").exists());
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn stat_windows_path_off_wsl_reports_not_exists() {
-        let _guard = env_lock();
-        let _env = non_wsl_env();
+        let mut env = TestEnv::lock().await;
+        pin_non_wsl_env(&mut env);
         // Node parity: the literal `C:\…` string is handed to fs and the stat
         // fails naturally -> { exists: false } with HTTP 200.
         let resp = stat_file(
@@ -1819,12 +1761,10 @@ mod tests {
     // applies validatePath to validate-dir; 403 pinned by Node's
     // test/unit/server/files-router.test.ts:451-460) ----
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn validate_dir_denies_path_outside_allowed_roots() {
-        let _guard = env_lock();
-        let fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let fixture = WslMountFixture::new(&mut env);
         let state = test_state();
         // Configure a sandbox root via the store's public patch API (persist
         // no-ops for home: None stores — settings_store.rs:420-422 — so this
@@ -1864,8 +1804,8 @@ mod tests {
 
     #[test]
     fn windows_flavor_allowlist_roots_convert_like_node() {
-        let _guard = env_lock();
-        let fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock_blocking();
+        let fixture = WslMountFixture::new(&mut env);
         let mount_c = fixture.mount("c").to_string_lossy().into_owned();
         // Drive-root allowlist entry `C:\` matches the mount root and
         // anything under it (Node test lines 245-247).
@@ -1906,12 +1846,10 @@ mod tests {
         .into_response()
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn mkdir_windows_path_creates_under_mount() {
-        let _guard = env_lock();
-        let fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let fixture = WslMountFixture::new(&mut env);
         let resp = mkdir_resp("C:\\Users\\dan\\newproj").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
@@ -1925,12 +1863,10 @@ mod tests {
         assert!(!std::path::Path::new("C:\\Users\\dan\\newproj").exists());
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn mkdir_rejects_unaddressable_windows_input_off_wsl() {
-        let _guard = env_lock();
-        let _env = non_wsl_env();
+        let mut env = TestEnv::lock().await;
+        pin_non_wsl_env(&mut env);
         let resp = mkdir_resp("C:\\").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v = body_json(resp).await;
@@ -1940,12 +1876,10 @@ mod tests {
         assert!(!std::path::Path::new("C:\\").exists());
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn mkdir_rejects_unresolvable_windows_forms_even_on_wsl() {
-        let _guard = env_lock();
-        let _fixture = WslMountFixture::new();
+        let mut env = TestEnv::lock().await;
+        let _fixture = WslMountFixture::new(&mut env);
         // Bare drive / rooted inputs are Windows flavor but have no absolute
         // native address, even on WSL. (`C:foo` is `native` flavor in both
         // servers — see resolve_user_path_windows_unresolvable_forms — so it
@@ -1956,11 +1890,9 @@ mod tests {
         }
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn mkdir_posix_regression_unchanged() {
-        let _guard = env_lock();
+        let _env = TestEnv::lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let target = format!("{}/fresh-sub", tmp.path().display());
         let resp = mkdir_resp(&target).await;
@@ -1972,11 +1904,9 @@ mod tests {
         assert!(std::path::Path::new(&target).is_dir());
     }
 
-    // Intentional: env lock held across `.await` BY DESIGN (see above).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_mkdir_enotdir_is_409_not_500() {
-        let _guard = env_lock();
+        let _env = TestEnv::lock().await;
         let tmp = tempfile::tempdir().unwrap();
         // An INTERMEDIATE component that is a FILE: recursive mkdir fails
         // ENOTDIR, which Node maps to 409 "Path exists but is not a directory"
@@ -2035,8 +1965,8 @@ mod tests {
 
     #[test]
     fn expand_tilde_uses_home() {
-        let _guard = env_lock();
-        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        let mut env = TestEnv::lock_blocking();
+        env.set("HOME", "/home/tester");
         assert_eq!(expand_tilde("~"), "/home/tester");
         assert_eq!(expand_tilde("~/proj"), "/home/tester/proj");
         assert_eq!(expand_tilde("/abs"), "/abs");
@@ -2050,8 +1980,8 @@ mod tests {
     /// POSIX path was stat'd/written verbatim.
     #[test]
     fn test_posix_input_trims_and_unquotes() {
-        let _guard = env_lock();
-        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        let mut env = TestEnv::lock_blocking();
+        env.set("HOME", "/home/tester");
         // Leading/trailing whitespace padding is trimmed.
         assert_eq!(normalize_user_path("/tmp/x "), "/tmp/x");
         assert_eq!(normalize_user_path("  /tmp/x"), "/tmp/x");
@@ -2118,8 +2048,8 @@ mod tests {
 
     #[test]
     fn resolve_completion_input_honors_root_and_absolute() {
-        let _guard = env_lock();
-        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        let mut env = TestEnv::lock_blocking();
+        env.set("HOME", "/home/tester");
         // No root \u2192 prefix unchanged.
         assert_eq!(resolve_completion_input("a", None), "a");
         // Absolute prefix ignores root.

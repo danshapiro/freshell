@@ -18,6 +18,9 @@ import { test, expect } from '../helpers/fixtures.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 const LAYOUT_SYNC_DEBOUNCE_MS = 1000
+/** @dnd-kit/core's AbstractPointerSensor removes its post-drag document
+ *  click blocker on `setTimeout(..., 50)` after the drag ends. */
+const DND_KIT_POST_DRAG_CLICK_BLOCK_MS = 50
 
 type PaneNode = {
   type: 'leaf' | 'split'
@@ -197,6 +200,18 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
     await expect
       .poll(async () => (await harness.getState()).tabs.tabs[0].title, { timeout: 10_000 })
       .toBe('Beta')
+    // The reorder is in the store at pointerup, but dnd-kit's pointer sensor
+    // keeps a capture-phase click blocker on the document until a 50ms timer
+    // after the drag ends (AbstractPointerSensor.detach — it swallows the
+    // click the drop itself would fire). A click sent inside that window is
+    // eaten and the tab never activates (the observed activeTabId timeouts:
+    // Chrome runs input ahead of a starved timer under load). A page timer of
+    // at least that delay, scheduled after the drop, fires after dnd-kit's —
+    // the blocker is gone once it resolves.
+    await page.evaluate(
+      (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      DND_KIT_POST_DRAG_CLICK_BLOCK_MS,
+    )
 
     // ── select the "Alpha" tab by clicking it ──
     await page.locator('[data-context="tab"]').filter({ hasText: 'Alpha' }).first().click()

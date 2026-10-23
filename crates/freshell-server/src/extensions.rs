@@ -611,7 +611,9 @@ mod tests {
         // A shared process-global collector avoids competing test modules
         // installing subscribers with disconnected event buffers. Thread-local
         // set_default proved nondeterministic under parallel cargo test because
-        // of callsite interest caching; this test filters by its unique path.
+        // of callsite interest caching, and so did installing the collector
+        // lazily (see `test_trace_capture`: it is installed before `main`);
+        // this test filters by its unique path.
         let events = crate::test_trace_capture::captured_trace_events();
 
         let root = tmp();

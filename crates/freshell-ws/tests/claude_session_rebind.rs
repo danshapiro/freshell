@@ -319,7 +319,7 @@ async fn send_create(ws: &mut common::TestWs, body: serde_json::Value) -> serde_
 }
 
 /// Minimal fake claude sidecar speaking the newline-JSON protocol: answers
-/// `create` with `created` + `sdk.session.init` (echoing resumeSessionId as
+/// `create` with `created` + `sdk.session.init` (echoing the resume boot's id as
 /// the durable cliSessionId), exits on `shutdown`.#[cfg(unix)]
 const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"import readline from 'node:readline'
 
@@ -337,8 +337,8 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
-    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
+    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'shutdown') {

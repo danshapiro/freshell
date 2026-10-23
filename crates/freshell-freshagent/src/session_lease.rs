@@ -598,15 +598,40 @@ pub(crate) fn proc_starttime(pid: i32) -> Option<u64> {
     proc_starttime_observation(pid).ok().flatten()
 }
 
+/// Whether a failed `/proc/<pid>/…` access proves the process is gone: the
+/// entry is absent (`NotFound`), or the task exited and was reaped between the
+/// open and the read — procfs then answers `ESRCH` on the already-open
+/// descriptor. Both mean the observed incarnation no longer exists; neither is
+/// "unavailable" evidence. (A sweep reads exactly the processes it is killing,
+/// so a member reaped mid-read is the expected race, not an unknown writer.)
+#[cfg(target_os = "linux")]
+fn proc_entry_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Read a process start time while preserving unavailable observations as a
 /// distinct result from a process that is gone.
 #[cfg(target_os = "linux")]
 fn proc_starttime_observation(pid: i32) -> Result<Option<u64>, ()> {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    match std::fs::File::open(format!("/proc/{pid}/stat")) {
+        Ok(stat) => proc_starttime_from_open_stat(stat),
+        Err(error) if proc_entry_gone(&error) => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// [`proc_starttime_observation`] past the open: the read of an
+/// already-open `/proc/<pid>/stat` (split out so the open→read window —
+/// the process reaped in between — is testable deterministically).
+#[cfg(target_os = "linux")]
+fn proc_starttime_from_open_stat(mut stat_file: std::fs::File) -> Result<Option<u64>, ()> {
+    use std::io::Read;
+    let mut stat = String::new();
+    match stat_file.read_to_string(&mut stat) {
+        Ok(_) => {}
+        Err(error) if proc_entry_gone(&error) => return Ok(None),
         Err(_) => return Err(()),
-    };
+    }
     // comm (field 2) may contain spaces/parens: split at the LAST ')' — the remainder
     // starts at field 3 (state), so starttime (field 22) is index 19 there.
     let rest = stat.rsplit(')').next().ok_or(())?;
@@ -698,7 +723,7 @@ fn scan_tagged_pids(
         let status_path = std::path::Path::new("/proc").join(name).join("status");
         let status = match std::fs::read_to_string(status_path) {
             Ok(status) => status,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if proc_entry_gone(&error) => continue,
             Err(_) => {
                 if process_is_known_owned_process(pid, owned_root_pid) {
                     complete = false;
@@ -724,7 +749,7 @@ fn scan_tagged_pids(
             Ok(bytes) => bytes,
             // A process disappearing between the directory and environ read
             // is an expected race, not unknown surviving-writer evidence.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if proc_entry_gone(&error) => continue,
             Err(_) => {
                 // Same-user processes can still make environ unreadable (for
                 // example a non-dumpable user service). An unrelated process
@@ -767,7 +792,7 @@ fn process_is_descendant_of(mut pid: i32, root_pid: i32) -> Result<bool, ()> {
         }
         let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
             Ok(status) => status,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if proc_entry_gone(&error) => return Ok(false),
             Err(_) => return Err(()),
         };
         let parent = status
@@ -1081,6 +1106,41 @@ mod tests {
     use super::*;
 
     const TTL: u64 = FRESH_AGENT_SESSION_LEASE_TTL_MS;
+
+    /// A process reaped between the open and the read of its `/proc` files
+    /// reads as GONE — procfs answers ESRCH on the already-open descriptor —
+    /// never as unavailable evidence. The expired-lease kill sweep reads
+    /// exactly the processes it is killing; an "unavailable" verdict there
+    /// left the kill unconfirmed and the lease held closed, so the contending
+    /// create was refused SESSION_RESERVED although the tree was dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_reaped_between_proc_open_and_read_reads_as_gone() {
+        use std::io::Read;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child to observe");
+        let pid = child.id();
+        let stat = std::fs::File::open(format!("/proc/{pid}/stat")).expect("open the live stat");
+        let mut status =
+            std::fs::File::open(format!("/proc/{pid}/status")).expect("open the live status");
+        child.kill().expect("kill the child");
+        child.wait().expect("reap the child");
+
+        assert_eq!(
+            proc_starttime_from_open_stat(stat),
+            Ok(None),
+            "a start-time read racing the reap answers gone, not unavailable"
+        );
+        let error = status
+            .read_to_string(&mut String::new())
+            .expect_err("procfs refuses a reaped task's open descriptor");
+        assert!(
+            proc_entry_gone(&error),
+            "the scan's status/environ reads classify the reap race as gone: {error}"
+        );
+    }
 
     #[test]
     fn first_claim_acquires_second_is_held() {

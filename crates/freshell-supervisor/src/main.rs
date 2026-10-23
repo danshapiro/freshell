@@ -77,7 +77,7 @@ async fn run() -> Result<(), String> {
         .join("lifecycle.jsonl");
     let supervisor = Supervisor::new(
         registry,
-        default_backend(docker_socket),
+        default_backend(docker_socket, lifecycle_log.clone()),
         SupervisorConfig {
             runtime_root,
             control_socket_path: control_socket.clone(),

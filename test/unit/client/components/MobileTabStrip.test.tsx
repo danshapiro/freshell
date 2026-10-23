@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '@/store/tabsSlice'
@@ -8,7 +8,7 @@ import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
-import turnCompletionReducer from '@/store/turnCompletionSlice'
+import turnCompletionReducer, { markTabAttention } from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -62,6 +62,11 @@ function createStore(
     opencodeActivity?: Partial<OpencodeActivityState>
     includeCodexActivity?: boolean
     includeOpencodeActivity?: boolean
+    attentionByTab?: Record<string, boolean>
+    attentionByPane?: Record<string, boolean>
+    watchedCompletionByTab?: Record<string, boolean>
+    tabAttentionStyle?: 'highlight' | 'pulse' | 'darken' | 'none'
+    attentionDismiss?: 'click' | 'type'
   },
 ) {
   const layouts: Record<string, PaneNode> = {}
@@ -117,8 +122,24 @@ function createStore(
       availableClis: {},
     },
     settings: {
-      settings: defaultSettings,
+      settings: {
+        ...defaultSettings,
+        panes: {
+          ...defaultSettings.panes,
+          ...(opts?.tabAttentionStyle ? { tabAttentionStyle: opts.tabAttentionStyle } : {}),
+          ...(opts?.attentionDismiss ? { attentionDismiss: opts.attentionDismiss } : {}),
+        },
+      },
       loaded: true,
+    },
+    turnCompletion: {
+      seq: 0,
+      lastAtByTerminalId: {},
+      lastIdleAtByTerminalId: {},
+      pendingEvents: [],
+      attentionByTab: opts?.attentionByTab ?? {},
+      attentionByPane: opts?.attentionByPane ?? {},
+      watchedCompletionByTab: opts?.watchedCompletionByTab ?? {},
     },
   }
   if (includeCodexActivity) {
@@ -410,5 +431,126 @@ describe('MobileTabStrip', () => {
     } finally {
       warnSpy.mockRestore()
     }
+  })
+
+  describe('needs-attention marks (G17)', () => {
+    const fourTabs = () => [
+      createTab('tab-1', 'Alpha'),
+      createTab('tab-2', 'Bravo'),
+      createTab('tab-3', 'Charlie'),
+      createTab('tab-4', 'Delta'),
+    ]
+
+    // The "other tabs" status is a polite live region that stays mounted
+    // (empty while no other tab is marked); its label is the region's text.
+    const otherTabsStatus = () => screen.getByRole('status')
+    // The visible chevron mark is decorative (aria-hidden; the chevron's
+    // accessible description carries the meaning), so it has no role to query.
+    const chevronDot = (name: string) =>
+      screen.getByRole('button', { name }).querySelector('span[aria-hidden="true"]')
+
+    async function renderStrip(store: ReturnType<typeof createStore>) {
+      const { MobileTabStrip } = await import('@/components/MobileTabStrip')
+      render(
+        <Provider store={store}>
+          <MobileTabStrip />
+        </Provider>
+      )
+    }
+
+    it('marks the active tab title when the active tab needs attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', { attentionByTab: { 'tab-2': true } }))
+
+      expect(screen.getByText('Bravo')).toHaveClass('bg-emerald-100')
+      expect(screen.getByRole('button', { name: 'Open tab switcher' }))
+        .toHaveAccessibleDescription('This tab needs attention')
+      expect(otherTabsStatus()).toBeEmptyDOMElement()
+    })
+
+    it('counts the OTHER tabs that need attention in a status', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', {
+        attentionByTab: { 'tab-1': true, 'tab-2': true, 'tab-4': true },
+      }))
+
+      expect(within(otherTabsStatus()).getByText('2 other tabs need attention')).toBeInTheDocument()
+    })
+
+    it('dots only the chevron toward the tabs that need attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', { attentionByTab: { 'tab-4': true } }))
+
+      expect(screen.getByRole('button', { name: 'Next tab' }))
+        .toHaveAccessibleDescription('A later tab needs attention')
+      expect(screen.getByRole('button', { name: 'Previous tab' })).toHaveAccessibleDescription('')
+      expect(within(otherTabsStatus()).getByText('1 other tab needs attention')).toBeInTheDocument()
+      expect(chevronDot('Next tab')).toHaveClass('rounded-full', 'bg-emerald-500')
+      expect(chevronDot('Previous tab')).toBeNull()
+    })
+
+    it('dots the previous chevron for an earlier tab that needs attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-3', { attentionByTab: { 'tab-1': true } }))
+
+      expect(screen.getByRole('button', { name: 'Previous tab' }))
+        .toHaveAccessibleDescription('An earlier tab needs attention')
+      expect(screen.getByRole('button', { name: 'Next tab' })).toHaveAccessibleDescription('')
+      expect(chevronDot('Previous tab')).toHaveClass('rounded-full', 'bg-emerald-500')
+      expect(chevronDot('Next tab')).toBeNull()
+    })
+
+    it('draws the chevron dot in the user\'s attention style', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', {
+        tabAttentionStyle: 'darken',
+        attentionByTab: { 'tab-1': true, 'tab-4': true },
+      }))
+
+      for (const name of ['Previous tab', 'Next tab']) {
+        expect(chevronDot(name)).toHaveClass('rounded-full', 'bg-foreground/60')
+        expect(chevronDot(name)).not.toHaveClass('bg-emerald-500')
+      }
+    })
+
+    it('counts watched-completion marks like attention marks', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-1', { watchedCompletionByTab: { 'tab-3': true } }))
+
+      expect(within(otherTabsStatus()).getByText('1 other tab needs attention')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Next tab' }))
+        .toHaveAccessibleDescription('A later tab needs attention')
+    })
+
+    it('shows no mark at all when the attention style is none', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2', {
+        tabAttentionStyle: 'none',
+        attentionByTab: { 'tab-1': true, 'tab-2': true, 'tab-4': true },
+      }))
+
+      expect(otherTabsStatus()).toBeEmptyDOMElement()
+      expect(screen.getByText('Bravo')).not.toHaveClass('bg-emerald-100')
+      expect(screen.getByRole('button', { name: 'Open tab switcher' })).toHaveAccessibleDescription('')
+      expect(screen.getByRole('button', { name: 'Next tab' })).toHaveAccessibleDescription('')
+      expect(screen.getByRole('button', { name: 'Previous tab' })).toHaveAccessibleDescription('')
+      expect(chevronDot('Next tab')).toBeNull()
+      expect(chevronDot('Previous tab')).toBeNull()
+    })
+
+    it('shows no mark when no tab needs attention', async () => {
+      await renderStrip(createStore(fourTabs(), 'tab-2'))
+
+      expect(otherTabsStatus()).toBeEmptyDOMElement()
+      expect(screen.getByText('Bravo')).not.toHaveClass('bg-emerald-100')
+    })
+
+    it('announces a new mark as text added to the status that was already mounted', async () => {
+      const store = createStore(fourTabs(), 'tab-2')
+      await renderStrip(store)
+      const status = otherTabsStatus()
+      expect(status).toBeEmptyDOMElement()
+
+      act(() => { store.dispatch(markTabAttention({ tabId: 'tab-4' })) })
+      expect(otherTabsStatus()).toBe(status)
+      expect(within(status).getByText('1 other tab needs attention')).toBeInTheDocument()
+
+      act(() => { store.dispatch(markTabAttention({ tabId: 'tab-1' })) })
+      expect(otherTabsStatus()).toBe(status)
+      expect(within(status).getByText('2 other tabs need attention')).toBeInTheDocument()
+    })
   })
 })

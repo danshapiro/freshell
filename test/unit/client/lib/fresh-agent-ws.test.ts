@@ -638,8 +638,14 @@ describe('fresh-agent-ws', () => {
 
     // The snapshot-driven self-heal path must treat the cancel as invalidating too, so
     // the card clears even if the fold races (FreshAgentView.tsx's subscription re-query).
-    const { SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS } = await import('@/components/fresh-agent/FreshAgentView')
-    expect(SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS?.has('freshAgent.question.cancelled') ?? false).toBe(true)
+    const { isSnapshotInvalidatingFreshAgentEvent } = await import('@/components/fresh-agent/fresh-agent-event-classes')
+    expect(isSnapshotInvalidatingFreshAgentEvent({
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.question.cancelled', sessionId, requestId: 'question-7' },
+    })).toBe(true)
   })
 
   it('handles freshAgent.session.changed without mutating idle status', () => {

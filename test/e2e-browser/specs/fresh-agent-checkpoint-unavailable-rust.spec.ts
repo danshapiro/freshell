@@ -47,7 +47,6 @@ test.describe('fresh-agent checkpoint availability', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-checkpoint-restore-'))
     const projectDir = path.join(sharedRoot, 'selected-workspace')
     const sourceFile = path.join(projectDir, 'state.txt')
-    const codexHome = path.join(sharedRoot, 'codex-home')
     let server: RustServer | undefined
     let context: Awaited<ReturnType<typeof createFreshE2ePage>>['context'] | undefined
 
@@ -58,7 +57,6 @@ test.describe('fresh-agent checkpoint availability', () => {
       server = new RustServer({
         env: {
           CODEX_CMD: fakeCodexPath,
-          CODEX_HOME: codexHome,
           FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
           FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
         },
@@ -171,7 +169,6 @@ test.describe('fresh-agent checkpoint availability', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-checkpoint-unavailable-'))
     const projectDir = path.join(sharedRoot, 'project')
     const trackedFile = path.join(projectDir, 'private-fixture.txt')
-    const codexHome = path.join(sharedRoot, 'codex-home')
     let server: RustServer | undefined
     let context: Awaited<ReturnType<typeof createFreshE2ePage>>['context'] | undefined
 
@@ -190,7 +187,6 @@ test.describe('fresh-agent checkpoint availability', () => {
       server = new RustServer({
         env: {
           CODEX_CMD: fakeCodexPath,
-          CODEX_HOME: codexHome,
           FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
           FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
         },
@@ -272,6 +268,19 @@ test.describe('fresh-agent checkpoint availability', () => {
       ]))
       expect(JSON.stringify(content.checkpointOutcomes)).not.toContain(marker)
 
+      // The exact provider turn identity binds to the outcome only after the
+      // accepted turn retires: the codex identity probe waits for the turn to
+      // complete, then reads the thread and broadcasts the identity. That can
+      // land just after the pane goes idle, so wait for it rather than reading
+      // the idle snapshot once.
+      let unavailableOutcome: any
+      await expect.poll(async () => {
+        const layout = await harness.getPaneLayout(tabId!)
+        unavailableOutcome = findFreshAgentLeaf(layout)?.content?.checkpointOutcomes
+          ?.find((entry: any) => entry.status === 'unavailable' && entry.code === 'checkpoint_path_unreadable')
+        return unavailableOutcome?.nativeTurnId
+      }, { timeout: 30_000 }).toEqual(expect.any(String))
+
       await page.evaluate(() => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
@@ -294,14 +303,26 @@ test.describe('fresh-agent checkpoint availability', () => {
       await expect(reloadedUserTurn.getByRole('button', { name: 'Rewind unavailable for this message' }))
         .toBeDisabled()
 
-      const threadId = content.sessionId ?? content.sessionRef?.sessionId
+      // Provider ground truth: the send behind the unavailable checkpoint
+      // really reached the provider as that checkpoint's turn. The fake
+      // app-server records each turn/start (with its user text) under the
+      // spawned server's isolated CODEX_HOME (RustServer pins it to
+      // <homeDir>/.codex), so read it there. The record is written at
+      // turn/start and never updated, so it proves delivery, not completion;
+      // completion is proven above by the 'Fixture turn' reply and the pane
+      // settling back to idle.
+      const threadId = content.sessionRef?.sessionId ?? content.sessionId
       expect(threadId).toBeTruthy()
-      const recordedTurnsPath = path.join(codexHome, 'fake-turns', `${threadId}.json`)
+      const recordedTurnsPath = path.join(info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
       await expect.poll(async () => {
         const raw = await fs.readFile(recordedTurnsPath, 'utf8').catch(() => '[]')
-        const turns = JSON.parse(raw) as Array<{ items?: Array<{ type?: string; content?: Array<{ text?: string }> }> }>
-        return turns.some((turn) => turn.items?.some((item) => item.type === 'userMessage'
-          && item.content?.some((part) => part.text === marker)))
+        const turns = JSON.parse(raw) as Array<{
+          id?: string
+          items?: Array<{ type?: string; content?: Array<{ text?: string }> }>
+        }>
+        const turn = turns.find((candidate) => candidate.id === unavailableOutcome.nativeTurnId)
+        return turn?.items?.some((item) => item.type === 'userMessage'
+          && item.content?.some((part) => part.text === marker)) ?? false
       }, { timeout: 20_000 }).toBe(true)
     } finally {
       await context?.close().catch(() => {})

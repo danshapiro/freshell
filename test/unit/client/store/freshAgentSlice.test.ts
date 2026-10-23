@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { isFreshAgentBusy } from '@/lib/pane-activity'
 import reducer, {
   clearRestoreFailure,
   clearSessionError,
@@ -45,6 +46,19 @@ describe('freshAgentSlice busy/streaming clearing', () => {
     // Recovery must remain reachable: a stuck session still accepts later statuses.
     state = reducer(state, setSessionStatus({ ...stuckLoc, status: 'idle' }))
     expect(state.sessions[stuckKey].status).toBe('idle')
+  })
+
+  // G05 (C09): a claude sidecar killed mid-/compact must not leave the pane
+  // compacting (busy) forever. The server's exited status replaces it, and the
+  // SIDECAR_EXITED banner that follows does not bring back a busy status.
+  it('exited replaces compacting, and the exit banner keeps it exited and not busy', () => {
+    let state = reducer(undefined, sessionSnapshotReceived({ ...loc, latestTurnId: null, status: 'compacting', streamingActive: true }))
+    expect(isFreshAgentBusy({ kind: 'fresh-agent', ...loc, createRequestId: 'r', status: 'compacting' }, state.sessions[key])).toBe(true)
+    state = reducer(state, setSessionStatus({ ...loc, status: 'exited' }))
+    state = reducer(state, sessionError({ ...loc, code: 'SIDECAR_EXITED', message: 'The Claude agent process exited unexpectedly.' }))
+    expect(state.sessions[key].status).toBe('exited')
+    expect(state.sessions[key].streamingActive).toBe(false)
+    expect(isFreshAgentBusy({ kind: 'fresh-agent', ...loc, createRequestId: 'r', status: 'exited' }, state.sessions[key])).toBe(false)
   })
 
   it('sessionError (non-RESTORE) clears streamingActive and resets running -> idle', () => {

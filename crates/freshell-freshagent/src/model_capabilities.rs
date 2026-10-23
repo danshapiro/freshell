@@ -17,7 +17,6 @@
 //! agent turn or modifies an existing session.
 
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,8 +147,25 @@ impl ModelCatalogProbe for OpencodeCatalogProbe {
 }
 
 /// Runs only the SDK catalog control query, separately from live Claude sessions.
-#[derive(Default)]
-pub struct ClaudeCatalogProbe;
+pub struct ClaudeCatalogProbe {
+    /// How long the probe may run before its whole tree is killed.
+    timeout: Duration,
+}
+
+impl Default for ClaudeCatalogProbe {
+    fn default() -> Self {
+        Self {
+            timeout: CLAUDE_CATALOG_TIMEOUT,
+        }
+    }
+}
+
+impl ClaudeCatalogProbe {
+    #[cfg(test)]
+    pub(crate) fn with_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
 
 fn claude_probe_error(message: impl Into<String>) -> CapabilityError {
     CapabilityError {
@@ -159,49 +175,85 @@ fn claude_probe_error(message: impl Into<String>) -> CapabilityError {
     }
 }
 
+/// The model-catalog probe's launch recipe: the SAME builder and the same
+/// run-as wrapper, managed secrets and OneCLI key flag as the session
+/// sidecar (`claude::sidecar_node_command`), so the probe authenticates
+/// exactly like the sessions it describes (G30). No ownership tag: the probe
+/// is owned by its process-tree guard. Its stdin stays closed.
+pub(crate) fn catalog_node_command(
+    command: crate::claude_spawn::ClaudeNodeCommand,
+) -> crate::claude_spawn::ClaudeNodeCommand {
+    command
+        .with_run_as()
+        .with_managed_environment()
+        .with_closed_stdin()
+}
+
+/// How long the catalog probe may run before its whole tree is killed.
+const CLAUDE_CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl ModelCatalogProbe for ClaudeCatalogProbe {
     fn probe<'a>(&'a self, _cwd: Option<&'a str>) -> BoxFuture<'a, CatalogOut> {
         Box::pin(async move {
             let entry = crate::claude::sidecar_entry_path().with_file_name("model-catalog.mjs");
-            let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".into());
-            let mut command = tokio::process::Command::new(node);
-            command
-                .arg(entry)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            // The probe owns this new process group, including its SDK CLI.
-            // A hung SDK close cannot leave that grandchild behind on timeout.
-            #[cfg(target_os = "linux")]
-            command.process_group(0);
-            let child = command.spawn().map_err(|error| {
-                claude_probe_error(format!("Cannot start Claude model catalog: {error}"))
-            })?;
-            #[cfg(target_os = "linux")]
-            let process_group = child.id();
+            let (mut child, mut tree_guard) =
+                catalog_node_command(crate::claude_spawn::ClaudeNodeCommand::new(entry))
+                    .spawn_guarded()
+                    .map_err(|error| {
+                        claude_probe_error(format!("Cannot start Claude model catalog: {error}"))
+                    })?;
+            let pid = child.id();
+            // The helper's stderr is the sidecar's JSONL log (log.mjs): the same
+            // logger as a session sidecar re-emits each record at its severity,
+            // bounded and rate-limited (G14, design §5.9).
+            let stderr_logger = child.stderr.take().map(|stderr| {
+                crate::claude_sidecar_io::spawn_stderr_logger(
+                    stderr,
+                    crate::claude_sidecar_io::SidecarLogLabels::model_catalog(pid),
+                    crate::claude_sidecar_io::hosted_sidecar(None),
+                )
+            });
+            // On a timeout: what the tree guard established about the killed tree.
+            let mut timed_out_tree = None;
             let output =
-                match tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await
-                {
-                    Ok(result) => result.map_err(|error| claude_probe_error(error.to_string()))?,
+                match tokio::time::timeout(self.timeout, collect_child_output(&mut child)).await {
+                    Ok(result) => result.map_err(|error| claude_probe_error(error.to_string())),
                     Err(_) => {
-                        #[cfg(target_os = "linux")]
-                        if let Some(id) = process_group {
-                            // SAFETY: this is the group created for this probe only.
-                            unsafe {
-                                libc::kill(-(id as i32), libc::SIGKILL);
-                            }
-                        }
-                        tracing::warn!(
-                            component = "claude_model_catalog",
-                            "Claude model catalog process timed out"
-                        );
-                        return Err(claude_probe_error("Claude model catalog process timed out"));
+                        // The tree guard owns the probe's SDK-spawned CLI on every
+                        // platform, so a hung SDK close cannot leave it behind.
+                        timed_out_tree = Some(tree_guard.terminate(&mut child).await);
+                        Err(claude_probe_error("Claude model catalog process timed out"))
                     }
                 };
+            // The process is gone, so its stderr ends: let its last records
+            // land before the outcome is logged.
+            if let Some(logger) = stderr_logger {
+                let _ = tokio::time::timeout(Duration::from_secs(1), logger).await;
+            }
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = "claude",
+                        component = crate::claude_sidecar_io::MODEL_CATALOG_LABEL,
+                        pid,
+                        error = %error.message,
+                        tree = ?timed_out_tree,
+                        "freshagent.claude.model_catalog_unavailable"
+                    );
+                    return Err(error);
+                }
+            };
             if !output.status.success() {
-                let details = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(component = "claude_model_catalog", status = ?output.status, stderr = %details, "Claude model catalog unavailable");
+                tracing::warn!(
+                    provider = "claude",
+                    component = crate::claude_sidecar_io::MODEL_CATALOG_LABEL,
+                    pid,
+                    status = %output.status,
+                    see = "the helper's own freshagent.claude.sidecar_log records \
+                           (ownership_id claude-model-catalog) say why",
+                    "freshagent.claude.model_catalog_unavailable"
+                );
                 return Err(claude_probe_error("Claude model catalog is unavailable. Check Claude authentication and the server logs."));
             }
             let raw: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
@@ -210,6 +262,32 @@ impl ModelCatalogProbe for ClaudeCatalogProbe {
             normalize_claude_catalog(raw)
         })
     }
+}
+
+/// `wait_with_output` that borrows the child, so a timeout can still kill
+/// the child's tree afterwards.
+async fn collect_child_output(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::Output> {
+    async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(
+        pipe: Option<R>,
+    ) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut bytes).await?;
+        }
+        Ok(bytes)
+    }
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (status, stdout, stderr) =
+        tokio::try_join!(child.wait(), read_pipe(stdout), read_pipe(stderr))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn normalize_claude_catalog(raw: Value) -> CatalogOut {
@@ -314,7 +392,7 @@ impl ModelCapabilityRegistry {
     pub fn new(probe: Arc<dyn ModelCatalogProbe>) -> Self {
         Self {
             probe,
-            claude_probe: Arc::new(ClaudeCatalogProbe),
+            claude_probe: Arc::new(ClaudeCatalogProbe::default()),
             ttl: MODEL_CAPABILITY_CACHE_TTL,
             now: Arc::new(system_now_ms),
             state: Arc::new(Mutex::new(RegistryState::default())),
@@ -330,7 +408,7 @@ impl ModelCapabilityRegistry {
     ) -> Self {
         Self {
             probe,
-            claude_probe: Arc::new(ClaudeCatalogProbe),
+            claude_probe: Arc::new(ClaudeCatalogProbe::default()),
             ttl,
             now,
             state: Arc::new(Mutex::new(RegistryState::default())),

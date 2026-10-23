@@ -601,7 +601,18 @@ export function isFreshPlaceholderSessionId(sessionId: string | undefined): bool
  * (a codex/opencode terminal pane carries no client-visible identity until
  * the first input materializes and associates the durable session, and a
  * fresh pane's content first carries only the PLACEHOLDER session id —
- * poll bounded until a real naming identity lands, then return it). */
+ * poll bounded until a real runtime identity lands, then return it).
+ *
+ * What this does NOT guarantee: that the naming record has moved onto that
+ * session. The returned `sessionId` is the pane's RUNTIME identity, read
+ * from its content. freshcodex's `freshAgent.created` already carries the
+ * prospective thread id (before the first send), while its pending handle
+ * redirects onto that thread only once a completed turn's rollout verifies
+ * the materialization bind. Until then the session-kind naming ref has no
+ * record, and a rename addressed to it is a truthful 404 NAME_NOT_FOUND.
+ * A caller that reads or renames the SESSION-kind record must first poll
+ * the naming authority until the handle's pending `nameRef` resolves to a
+ * session record (the restart spec's `waitForMaterializationBind`). */
 export async function refreshHandle(
   harness: TestHarness,
   handle: NamedAgentHandle,
@@ -630,11 +641,13 @@ export async function refreshHandle(
       terminalId: handle.terminalId,
     }
   }
-  // The identity is RESOLVED only when a durable session id or a
-  // session-kind ref answers — a pending ref alone means the
-  // materialization bind is still in flight (freshopencode's shared
+  // The handle is RESOLVED once the content carries a non-placeholder
+  // runtime session id or a session-kind ref — a pending ref alone means
+  // the runtime identity has not landed yet (freshopencode's shared
   // sidecar materializes ~1s after the send), so the poll CONTINUES
-  // through the pending window instead of exiting on the first read.
+  // through that window instead of exiting on the first read. A runtime
+  // id is not proof of the naming bind (see the doc above): freshcodex
+  // resolves here before its first turn completes.
   const isResolved = (candidate: NamedAgentHandle): boolean =>
     Boolean(candidate.sessionId) || candidate.nameRef?.kind === 'session'
   const first = await readOnce()
@@ -1266,6 +1279,9 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
   const tab = page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
   await tab.dblclick({ timeout: RENAME_ACTION_TIMEOUT })
   const input = tab.locator('input')
+  // A failed session-owned tab rename renders its error as a role=alert
+  // sibling of the tab (TabBar) and keeps the editor open.
+  const renameError = tab.locator('xpath=following-sibling::*[@role="alert"]')
   await expect(input).toBeVisible({ timeout: 5_000 })
   await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
   await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
@@ -1273,20 +1289,26 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
   // the editor opened) keeps the editor open with the conflict folded and
   // a REFRESHED capture, and a transient 429 drains the shared bucket:
   // the user's resubmit from the still-open editor is the documented
-  // path (the shared pane-editor discipline).
+  // path (the shared pane-editor discipline). An open editor with NO shown
+  // error is an IN-FLIGHT commit (the session-owned rename keeps the editor
+  // open while its request runs): resubmitting then races the healthy
+  // request — it can close the editor between the visibility check and the
+  // resubmit's Enter, leaving the press waiting on a detached input until
+  // its 30s timeout. Resubmit ONLY on the shown error state, exactly like
+  // commitPaneRenameEditor.
   for (const backoff of RENAME_RESUBMIT_BACKOFFS) {
     await page.waitForTimeout(backoff)
     if (!(await input.isVisible().catch(() => false))) break
+    if (!(await renameError.isVisible().catch(() => false))) continue
     try {
       await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
       await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
     } catch (error) {
-      // The editor closed between the visibility check and the resubmit:
-      // the earlier submit committed (the editor closing is the product's
-      // success signal; the label assertion below is the commit gate). A
-      // resubmit failing while the editor is still open is a real failure.
-      if (await input.isVisible().catch(() => false)) throw error
-      break
+      // The editor closed between the error check and the resubmit: the
+      // earlier submit committed (the editor closing is the product's
+      // success signal; the label assertion below is the commit gate).
+      if (!(await input.isVisible().catch(() => false))) break
+      console.error(`[unified-agent-names] tab rename resubmit failed: ${String(error).slice(0, 200)}`)
     }
   }
   await expect(input).toBeHidden({ timeout: 10_000 })

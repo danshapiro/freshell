@@ -150,3 +150,18 @@ export function providerParityCommands(workspace: string): Record<string, string
     OPENCODE_CONFIG: path.join(workspace, 'opencode.jsonc'),
   }
 }
+
+/**
+ * The command the parity tests run in the supervisor container: exits 4 when
+ * a supervisor registry file (`runtime.sqlite3` and its `-wal`, `-shm` and
+ * `-journal` files) contains one of `markers`. SQLite can delete a `-wal`,
+ * `-shm` or `-journal` file between the listing and the read (after a
+ * checkpoint its bytes are in the main file); a vanished file restarts the
+ * whole scan, so every byte present is still read.
+ */
+export function supervisorRegistrySecretScan(markers: string[], directory = '/var/lib/freshell-supervisor'): string[] {
+  return ['node', '-e', `const fs=require('fs');const p=${JSON.stringify(directory)};const markers=${JSON.stringify(markers)};`
+    + 'for(let attempt=0;;attempt++){try{'
+    + `for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){const value=fs.readFileSync(p+'/'+f);if(markers.some(marker=>value.includes(marker)))process.exit(4)}`
+    + "break}catch(error){if(error.code!=='ENOENT'||attempt>=20)throw error}}"]
+}

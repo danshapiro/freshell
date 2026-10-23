@@ -785,3 +785,177 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
         pid_alive(sidecar_pid),
     );
 }
+
+/// A wedged freshclaude sidecar: it answers `create`, then ignores the
+/// shutdown line, stdin EOF and SIGTERM, so only the server's final SIGKILL
+/// ends it. CommonJS (`.cjs`): the server runs the entry as `node <entry>`.
+const WEDGED_CLAUDE_SIDECAR: &str = r#"
+process.on('SIGTERM', () => {})
+let created = 0
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  let msg
+  try { msg = JSON.parse(line) } catch { return }
+  if (msg.type === 'create') {
+    created += 1
+    const sessionId = `wedged-claude-${process.pid}-${created}`
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
+  }
+})
+setInterval(() => {}, 1000)
+"#;
+
+/// G31 + SAFE-11: the graceful claude sidecar stop waits for sidecars to exit
+/// on their own before killing them, and the server's whole stop has a 5 s
+/// hard ceiling (past it the watchdog exits 1 and skips the codex launch
+/// manager's retention step and the layout flush). Two freshclaude sidecars
+/// that ignore every polite request, next to a freshcodex sidecar, must
+/// still leave the server room to exit 0 within 5 s, log `server.stopped`,
+/// and leave no process behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_wedged_claude_sidecars_still_exits_0_within_5s() {
+    let server_binary = discover_server_binary();
+    let home = tempfile::tempdir().expect("create temp home");
+    let port = allocate_ephemeral_port();
+    seed_fresh_agent_enabled(home.path());
+    let sidecar = home.path().join("wedged-claude-sidecar.cjs");
+    std::fs::write(&sidecar, WEDGED_CLAUDE_SIDECAR).expect("write the wedged claude sidecar");
+
+    let mut child = Command::new(&server_binary)
+        .env("PORT", port.to_string())
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
+        .env("AUTH_TOKEN", AUTH_TOKEN)
+        .env("FRESHELL_HOME", home.path())
+        .env("HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+        .env("FRESHELL_CLAUDE_SIDECAR", &sidecar)
+        .env("FRESHELL_CLAUDE_NODE", "node")
+        .env("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()))
+        .env_remove("FAKE_CODEX_APP_SERVER_BEHAVIOR")
+        .env_remove("RUST_LOG")
+        .env_remove("FRESHELL_LOG_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn freshell-server");
+    let mut cleanup = KillOnPanic::new(vec![child.id()]);
+
+    if !wait_for_health(port, &mut child, Duration::from_secs(15)).await {
+        let _ = child.kill();
+        let _ = child.wait();
+        let stderr = drain_stderr(&mut child);
+        panic!("server never became healthy; stderr:\n{stderr}");
+    }
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("ws connect");
+    send_json(
+        &mut ws,
+        &serde_json::json!({
+            "type": "hello",
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "token": AUTH_TOKEN,
+        }),
+    )
+    .await;
+    wait_for_message_type(&mut ws, "ready", Duration::from_secs(5))
+        .await
+        .expect("expected a `ready` handshake frame");
+
+    for (request_id, session_type, provider) in [
+        ("rid-codex", "freshcodex", "codex"),
+        ("rid-claude-1", "freshclaude", "claude"),
+        ("rid-claude-2", "freshclaude", "claude"),
+    ] {
+        send_json(
+            &mut ws,
+            &serde_json::json!({
+                "type": "freshAgent.create",
+                "requestId": request_id,
+                "sessionType": session_type,
+                "provider": provider,
+            }),
+        )
+        .await;
+        match wait_for_any_message_type(
+            &mut ws,
+            &["freshAgent.created", "freshAgent.createFailed"],
+            Duration::from_secs(50),
+        )
+        .await
+        {
+            Some((got_type, frame)) if got_type == "freshAgent.created" => {
+                assert_eq!(frame["requestId"], request_id, "{frame}");
+            }
+            other => {
+                let log =
+                    std::fs::read_to_string(home.path().join(".freshell/logs/rust-server.jsonl"))
+                        .unwrap_or_default();
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = drain_stderr(&mut child);
+                panic!(
+                    "expected `freshAgent.created` for {request_id}, got {other:?}; server \
+                     stderr:\n{stderr}\nrust-server.jsonl:\n{log}"
+                );
+            }
+        }
+    }
+
+    let server_pid = child.id();
+    let descendants = descendant_pids(server_pid);
+    cleanup.pids.extend(descendants.iter().copied());
+    let wedged: Vec<u32> = descendants
+        .iter()
+        .copied()
+        .filter(|&pid| pid_cmdline(pid).contains("wedged-claude-sidecar"))
+        .collect();
+    assert_eq!(
+        wedged.len(),
+        2,
+        "both wedged claude sidecars run under the server: {descendants:?}"
+    );
+
+    let kill_rc = unsafe { libc::kill(server_pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(kill_rc, 0, "SIGTERM to the server pid must succeed");
+    let signal_sent_at = Instant::now();
+    let mut exit_status = None;
+    while signal_sent_at.elapsed() < Duration::from_secs(5) {
+        if let Ok(Some(status)) = child.try_wait() {
+            exit_status = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let elapsed = signal_sent_at.elapsed();
+    let Some(status) = exit_status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("server did not exit within 5s of SIGTERM (elapsed {elapsed:?})");
+    };
+
+    assert!(
+        status.success(),
+        "the stop finished inside the hard ceiling and exited 0, got {status:?} after {elapsed:?}"
+    );
+    let log = std::fs::read_to_string(home.path().join(".freshell/logs/rust-server.jsonl"))
+        .unwrap_or_default();
+    assert!(
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|line| line["msg"] == "server.stopped"),
+        "the stop ran to its end (server.stopped); rust-server.jsonl:\n{log}"
+    );
+    let still_alive: Vec<(u32, String)> = descendants
+        .iter()
+        .copied()
+        .filter(|&pid| pid_alive(pid))
+        .map(|pid| (pid, pid_cmdline(pid)))
+        .collect();
+    assert!(
+        still_alive.is_empty(),
+        "orphaned descendant pids after a graceful shutdown: {still_alive:?}"
+    );
+    cleanup.disarm();
+}

@@ -67,18 +67,18 @@ function hasFlagPair(argv: string[], flag: string, value: string): boolean {
 /**
  * Read the fake claude SIDECAR request log (FAKE_CLAUDE_SIDECAR_LOG,
  * fake-claude-sidecar.mjs: JSONL rows `{pid, t, msg}` -- one per inbound
- * stdio request; `msg.type === 'create'` rows carry `resumeSessionId`).
+ * stdio request; `msg.type === 'create'` rows carry the protocol-v2 `boot`).
  */
 async function readSidecarLog(
   logPath: string,
-): Promise<Array<{ pid: number; t: number; msg: { type?: string; resumeSessionId?: string } }>> {
+): Promise<Array<{ pid: number; t: number; msg: { type?: string; boot?: { kind?: string; resume?: string } } }>> {
   const raw = await fs.readFile(logPath, 'utf8').catch(() => '')
   if (!raw) return []
   return raw
     .trim()
     .split('\n')
     .filter(Boolean)
-    .map((line) => JSON.parse(line) as { pid: number; t: number; msg: { type?: string; resumeSessionId?: string } })
+    .map((line) => JSON.parse(line) as { pid: number; t: number; msg: { type?: string; boot?: { kind?: string; resume?: string } } })
 }
 
 /** Dismiss the initial pane-type picker by choosing the first visible shell. */
@@ -435,7 +435,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
       const countResumes = async () =>
         (await readSidecarLog(sidecarLogPath))
           .slice(watermark)
-          .filter((r) => r.msg?.type === 'create' && r.msg?.resumeSessionId === identity).length
+          .filter((r) => r.msg?.type === 'create' && r.msg?.boot?.resume === identity).length
       await expect.poll(countResumes, { timeout: 45_000 }).toBeGreaterThan(0)
       // STABLE-COUNT settle (donor: restore-contract-wall-rust.spec.ts):
       // accept only when two samples >=5s apart agree, so a tail-latency
@@ -568,7 +568,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
         .slice(watermarkSidecar)
         .filter((r) => r.msg?.type === 'create')
       expect(
-        creates.every((r) => r.msg?.resumeSessionId === freshclaudeIdentity),
+        creates.every((r) => r.msg?.boot?.resume === freshclaudeIdentity),
         `identity-less fresh-agent create detected: ${JSON.stringify(creates)}`,
       ).toBe(true)
     } finally {

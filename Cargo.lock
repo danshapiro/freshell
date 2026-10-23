@@ -1389,6 +1389,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1444,6 +1445,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "ctor",
  "dotenvy",
  "freshell-agent-runtime",
  "freshell-api",

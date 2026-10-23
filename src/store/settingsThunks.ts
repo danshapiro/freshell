@@ -64,6 +64,12 @@ function normalizeFreshAgentProviderPatchForApi(
   ) {
     normalizedProviderPatch.effort = null
   }
+  if (
+    Object.prototype.hasOwnProperty.call(providerPatch, 'modelEffortLevels')
+    && providerPatch.modelEffortLevels === undefined
+  ) {
+    normalizedProviderPatch.modelEffortLevels = null
+  }
 
   return normalizedProviderPatch
 }

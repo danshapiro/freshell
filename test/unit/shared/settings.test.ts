@@ -357,6 +357,50 @@ describe('shared settings contract', () => {
     })
   })
 
+  it('round-trips and clears the effort levels saved with a fresh-pane default model', () => {
+    const levels = { modelId: 'claude-haiku-x', levels: [] as string[] }
+    const saved = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      freshAgent: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'claude-haiku-x' },
+            modelEffortLevels: levels,
+          },
+        },
+      },
+    })
+    expect(saved.freshAgent.providers.freshclaude?.modelEffortLevels).toEqual(levels)
+
+    // A later patch that does not mention the levels keeps them.
+    const unrelated = mergeServerSettings(saved, {
+      freshAgent: { providers: { freshclaude: { effort: 'low' } } },
+    })
+    expect(unrelated.freshAgent.providers.freshclaude?.modelEffortLevels).toEqual(levels)
+
+    // null (the API clear sentinel) removes them.
+    const cleared = mergeServerSettings(unrelated, {
+      freshAgent: { providers: { freshclaude: { modelEffortLevels: null } } },
+    } as unknown as Parameters<typeof mergeServerSettings>[1])
+    expect(cleared.freshAgent.providers.freshclaude?.modelEffortLevels).toBeUndefined()
+    expect(cleared.freshAgent.providers.freshclaude?.modelSelection).toEqual({ kind: 'exact', modelId: 'claude-haiku-x' })
+  })
+
+  it('rejects malformed saved effort levels in the server patch schema', () => {
+    const schema = buildServerSettingsPatchSchema()
+    expect(schema.safeParse({
+      freshAgent: { providers: { freshclaude: { modelEffortLevels: { modelId: 'sonnet', levels: ['low', 'high'] } } } },
+    }).success).toBe(true)
+    expect(schema.safeParse({
+      freshAgent: { providers: { freshclaude: { modelEffortLevels: null } } },
+    }).success).toBe(true)
+    expect(schema.safeParse({
+      freshAgent: { providers: { freshclaude: { modelEffortLevels: { modelId: 'sonnet', levels: 'high' } } } },
+    }).success).toBe(false)
+    expect(schema.safeParse({
+      freshAgent: { providers: { freshclaude: { modelEffortLevels: { levels: ['high'] } } } },
+    }).success).toBe(false)
+  })
+
   it('mergeServerSettings preserves runtime CLI providers outside the built-in defaults', () => {
     const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
       codingCli: {

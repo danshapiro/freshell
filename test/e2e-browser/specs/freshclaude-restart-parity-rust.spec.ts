@@ -4,7 +4,7 @@
 //      IN PLACE: no INVALID_SESSION_ID lost frame, no client-driven re-create.
 //   2. History rehydrates via GET /api/fresh-agent/threads/... (transcript adapter).
 //   3. The next send continues the SAME conversation (fixture request log shows
-//      create carried resumeSessionId === the original durable UUID).
+//      create carried a resume boot of the original durable UUID).
 //   4. A pane BUSY at restart un-wedges (idle status snapshot from the attach arm).
 // exists only on RustServer). NOTE: no page.reload() in test 1/2 -- the reload leg
 // is the contract wall's freshclaude test; this spec owns the reconnect leg.
@@ -305,7 +305,7 @@ test.describe('freshclaude restart parity (rust)', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l))
-        .filter((e) => e.msg?.type === 'create' && e.msg?.resumeSessionId === originalDurable)
+        .filter((e) => e.msg?.type === 'create' && e.msg?.boot?.resume === originalDurable)
       expect(resumedCreates.length).toBeGreaterThanOrEqual(1)
 
       // History rehydrated (snapshot adapter): the PRE-restart prompt is back in
@@ -396,7 +396,7 @@ test.describe('freshclaude restart parity (rust)', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l))
-        .some((e) => e.msg?.type === 'create' && e.msg?.resumeSessionId === busyDurable)
+        .some((e) => e.msg?.type === 'create' && e.msg?.boot?.resume === busyDurable)
       expect(resumed).toBe(true)
     } finally {
       await server.stop().catch(() => {})

@@ -4,7 +4,7 @@ import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
-import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { resolveFreshAgentPaneModelDefaults, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { FreshAgentProviderName, FreshAgentProviderSettings } from '@/lib/fresh-agent-provider-types'
 import type { CodingCliProviderName } from '@/store/types'
 import type {
@@ -208,6 +208,8 @@ export function buildResumeContent(opts: {
     const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
       ? undefined
       : ps?.defaultPermissionMode ?? freshAgentProviderConfig?.defaultPermissionMode ?? freshAgentType.defaultPermissionMode
+    // D2: a resumed pane starts on the saved fresh-pane default, like a new one.
+    const modelDefaults = resolveFreshAgentPaneModelDefaults({ entry: freshAgentType, providerSettings: ps })
     return {
       kind: 'fresh-agent',
       sessionType: freshAgentType.sessionType,
@@ -220,7 +222,8 @@ export function buildResumeContent(opts: {
       initialCwd: opts.cwd,
       ...(opts.checkpointWorkspace ? { checkpointWorkspace: opts.checkpointWorkspace } : {}),
       modelSelection: ps?.modelSelection,
-      model: freshAgentType.defaultModel,
+      ...(modelDefaults.persistModel ? { model: modelDefaults.model } : {}),
+      ...(modelDefaults.modelEffortLevels ? { modelEffortLevels: modelDefaults.modelEffortLevels } : {}),
       ...(permissionMode ? { permissionMode } : {}),
       effort: ps?.effort,
     }

@@ -1,0 +1,196 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "b6393665-fc21-4957-aa64-4e79a261e26c",
+  "sessionId": "b6393665-fc21-4957-aa64-4e79a261e26c",
+  "revision": 1792656000000,
+  "latestTurnId": "ecdced8e-fd87-470c-bfbb-2b62c8207303",
+  "status": "idle",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "diffs": true,
+    "undo": true,
+    "redo": true,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 100,
+    "outputTokens": 20,
+    "cachedTokens": 10,
+    "totalTokens": 130,
+    "contextTokens": 130,
+    "compactPercent": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [
+    {
+      "id": "/fixture/ws/a.txt",
+      "path": "/fixture/ws/a.txt",
+      "status": "created"
+    }
+  ],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "c11abd8d-baec-4476-ad86-0f76335e0004",
+      "turnId": "c11abd8d-baec-4476-ad86-0f76335e0004",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:32.975Z",
+      "summary": "GO delegate in the background",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "c11abd8d-baec-4476-ad86-0f76335e0004-i0",
+          "kind": "text",
+          "text": "GO delegate in the background"
+        }
+      ]
+    },
+    {
+      "id": "1217cfea-b1b0-4ffe-aafa-aff523bfe696",
+      "turnId": "1217cfea-b1b0-4ffe-aafa-aff523bfe696",
+      "messageId": "msg_fixture0001",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:33.036Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Write",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "1217cfea-b1b0-4ffe-aafa-aff523bfe696-i0",
+          "kind": "tool_use",
+          "toolUseId": "toolu_write1",
+          "name": "Write",
+          "input": {
+            "file_path": "/fixture/ws/a.txt",
+            "content": "two\n"
+          }
+        }
+      ]
+    },
+    {
+      "id": "25dad3db-248f-4506-964a-855c7220c32f",
+      "turnId": "25dad3db-248f-4506-964a-855c7220c32f",
+      "ordinal": 2,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:33.066Z",
+      "summary": "Tool result",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "25dad3db-248f-4506-964a-855c7220c32f-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_write1",
+          "content": "File created successfully at: /fixture/ws/a.txt (file state is current in your context — no need to Read it back)",
+          "isError": false
+        }
+      ]
+    },
+    {
+      "id": "eda1f349-58fe-4300-b6e3-d75d71f08630",
+      "turnId": "eda1f349-58fe-4300-b6e3-d75d71f08630",
+      "messageId": "msg_fixture0002",
+      "ordinal": 3,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:33.087Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "General-purpose Task (background) — check file",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "eda1f349-58fe-4300-b6e3-d75d71f08630-i0",
+          "kind": "task_delegation",
+          "status": "completed",
+          "title": "General-purpose Task (background) — check file",
+          "description": "check file",
+          "subagent": "general-purpose",
+          "background": true,
+          "result": "SUBAGENT-DONE: file has two",
+          "durationMs": 68,
+          "activity": [
+            {
+              "tool": "Read",
+              "status": "completed",
+              "preview": "/fixture/ws/a.txt"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "36f61799-bc27-4530-bf86-1a380d8bb66c",
+      "turnId": "36f61799-bc27-4530-bf86-1a380d8bb66c",
+      "messageId": "msg_fixture0004",
+      "ordinal": 4,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:33.130Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "Launched the check in the background.",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "36f61799-bc27-4530-bf86-1a380d8bb66c-i0",
+          "kind": "text",
+          "text": "Launched the check in the background."
+        }
+      ]
+    },
+    {
+      "id": "ecdced8e-fd87-470c-bfbb-2b62c8207303",
+      "turnId": "ecdced8e-fd87-470c-bfbb-2b62c8207303",
+      "messageId": "msg_fixture0006",
+      "ordinal": 5,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:33.262Z",
+      "model": "claude-sonnet-4-5-20250929",
+      "summary": "The background check finished.",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "ecdced8e-fd87-470c-bfbb-2b62c8207303-i0",
+          "kind": "text",
+          "text": "The background check finished."
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "transcriptLineUuids": [
+        "c11abd8d-baec-4476-ad86-0f76335e0004",
+        "5282bf88-a2ca-449b-be9b-435c582c414b",
+        "dad57ddb-04cc-45c4-a654-23b245d773f6",
+        "71af62ff-b87d-4932-aa13-548a17acdeac",
+        "1217cfea-b1b0-4ffe-aafa-aff523bfe696",
+        "25dad3db-248f-4506-964a-855c7220c32f",
+        "44b58e70-0347-4660-a7b7-d708bff89a3a",
+        "eda1f349-58fe-4300-b6e3-d75d71f08630",
+        "4ad41e73-4fd0-45bc-98d9-07ec6e9bcae0",
+        "bfb47162-5932-4ccf-bb82-851a35fb7daa",
+        "36f61799-bc27-4530-bf86-1a380d8bb66c",
+        "d434b19c-5d4f-421b-8733-9f80ec7da320",
+        "34e86836-4de9-4b14-883d-cd9be1545213",
+        "ecdced8e-fd87-470c-bfbb-2b62c8207303"
+      ]
+    }
+  }
+}

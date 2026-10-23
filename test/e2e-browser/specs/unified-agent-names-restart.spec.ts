@@ -134,6 +134,23 @@ async function readUpdate(journey: Journey, ref: SessionNameRef): Promise<NameUp
   }
 }
 
+/** Wait for the materialization bind: poll the naming authority until the
+ * pane's pre-durable handle redirects onto its durable session record, and
+ * answer that bound update. The pane's CONTENT carries the runtime
+ * sessionRef BEFORE this bind (freshcodex's `freshAgent.created` already
+ * names the prospective thread id, and the rollout-verified bind only fires
+ * once the first turn completes), so a session-kind ref is not a naming
+ * target until this resolves — a rename addressed to it earlier is a
+ * truthful 404 NAME_NOT_FOUND. */
+async function waitForMaterializationBind(journey: Journey, pendingRef: SessionNameRef): Promise<NameUpdate> {
+  let bound: NameUpdate | null = null
+  await expect.poll(async () => {
+    bound = await readUpdate(journey, pendingRef)
+    return bound.record.ref.kind
+  }, { timeout: 90_000, intervals: [500, 1_000, 2_000] }).toBe('session')
+  return bound!
+}
+
 function sameRef(a: SessionNameRef, b: SessionNameRef): boolean {
   if (a.kind === 'pending' && b.kind === 'pending') return a.id === b.id
   if (a.kind === 'session' && b.kind === 'session') return a.provider === b.provider && a.sessionId === b.sessionId
@@ -236,24 +253,20 @@ for (const mode of UNIFIED_AGENT_MODES) {
         if (originalRef!.kind === 'pending') {
           // The pane's CONTENT materializes (the runtime frame folds the
           // durable sessionRef) BEFORE the naming bind redirects the
-          // pending record — poll for the redirect to land before the
+          // pending record — wait for the redirect to land before the
           // atomicity asserts.
-          let viaPending: NameUpdate | null = null
-          await expect.poll(async () => {
-            viaPending = await readUpdate(journey, originalRef!)
-            return viaPending.record.ref.kind === 'session' ? viaPending.record.ref.sessionId : ''
-          }, { timeout: 90_000, intervals: [500, 1_000, 2_000] }).toBe(sessionId)
+          const viaPending = await waitForMaterializationBind(journey, originalRef!)
           // One atomic redirect: the pending ref resolves to the durable
           // record, and the redirect is recorded on the same revision.
-          expect(viaPending!.record.ref).toEqual(sessionRef)
-          expect(viaPending!.record.name).toBe(PENDING_NAME)
+          expect(viaPending.record.ref).toEqual(sessionRef)
+          expect(viaPending.record.name).toBe(PENDING_NAME)
           expect(
-            viaPending!.redirects?.some((r) => sameRef(r.from, originalRef!) && sameRef(r.to, sessionRef)),
+            viaPending.redirects?.some((r) => sameRef(r.from, originalRef!) && sameRef(r.to, sessionRef)),
             'the pending→session redirect is present',
           ).toBe(true)
           const viaSession = await readUpdate(journey, sessionRef)
           expect(viaSession.record.name).toBe(PENDING_NAME)
-          expect(viaSession.record.revision).toBe(viaPending!.record.revision)
+          expect(viaSession.record.revision).toBe(viaPending.record.revision)
         } else {
           // An already-durable zero-turn identity (opencode's admitted
           // pre-POST variant): the name carried across the restart.
@@ -533,8 +546,17 @@ test.describe('unified agent names native write in flight', () => {
       handle = await refreshHandle(a.harness, handle, 'freshcodex')
       const sessionId = handle.sessionId
         ?? (handle.nameRef?.kind === 'session' ? handle.nameRef.sessionId : '')
-      expect(sessionId, 'the freshcodex session materialized').toBeTruthy()
+      expect(sessionId, 'the freshcodex pane carries its runtime thread id').toBeTruthy()
       const sessionRef: SessionNameRef = { kind: 'session', provider: 'codex', sessionId }
+      // The pane names through its pre-durable handle until the first
+      // turn's rollout verifies the materialization bind; only then is the
+      // thread a naming target. Rename the DURABLE record (the native
+      // writeback needs its verified location), and prove the handle bound
+      // onto the pane's own thread.
+      const pendingRef = handle.nameRef
+      expect(pendingRef?.kind, 'the freshcodex pane names through its pending handle').toBe('pending')
+      const bound = await waitForMaterializationBind(journey, pendingRef!)
+      expect(bound.record.ref, "the handle bound onto the pane's own thread").toEqual(sessionRef)
 
       // The deliberate user rename: the native worker dispatches the
       // writeback, and the fake app-server HOLDS it — the receipt is

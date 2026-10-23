@@ -107,6 +107,10 @@ sha2 = "0.10"
 libc = "0.2"
 
 [dev-dependencies]
+# The claude rigs (tests/common/claude_rig.rs) give every sidecar their own
+# isolated environment through FreshClaudeState::with_sidecar_environment, a seam
+# that only exists with this feature (dev builds only; production never has it).
+freshell-freshagent = { path = "../freshell-freshagent", features = ["test-support"] }
 # tabs_persist tests write snapshot generations into throwaway dirs. Same
 # version other workspace crates pin (e.g. crates/freshell-terminal).
 tempfile = "3"

@@ -5,19 +5,23 @@
 // doc comment lines 9-29) with kilroy flavour, so any harness that can drive a
 // fresh-agent claude/kilroy sidecar can drive this one deterministically:
 //
-//   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId}
+//   in : {"type":"create",protocol:2,requestId,cwd,model,permissionMode,effort,
+//         boot:{kind:'fresh'}|{kind:'resume',resume}}  (protocol v2, crates/freshell-claude-sidecar/boot.mjs)
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
-//   out: {"type":"created","requestId","sessionId"} FIRST (bare nanoid placeholder,
+//   out: {"type":"created","requestId","sessionId",protocol:2} FIRST (bare nanoid placeholder,
 //        read_created discards any earlier sdk.* line), then:
 //        sdk.session.init {sessionId,cliSessionId,model,cwd,tools:[]}
 //        sdk.session.snapshot {sessionId,messages}   (resume only)
-//        sdk.status {sessionId,status}               (running|idle)
+//        sdk.status {sessionId,status}               (running at a send; idle only after
+//                                                  create and an interrupt with nothing
+//                                                  in flight: a turn ends with its result)
 //        sdk.turn.waiting {sessionId,at}             (approval edge; before assistant)
 //        sdk.assistant {sessionId,content:[<blocks>],model}
 //        sdk.result {sessionId,result:<subtype>,durationMs,costUsd,usage}
 //        sdk.turn.complete {sessionId,at}            on EVERY result subtype — success,
-//                                                  error, … — EXCEPT one consumed by a
-//                                                  pending accepted user-interrupt mark
+//                                                  error, … — EXCEPT the stopped turn's
+//                                                  own aborted result under a pending
+//                                                  accepted user-interrupt mark
 //                                                  (the REAL gate, imported from
 //                                                  crates/freshell-claude-sidecar/)
 //        sdk.interrupt_settled {sessionId,ok}        (interrupt; the interrupted turn's
@@ -45,7 +49,7 @@
 // Turn semantics mirror the real sidecar exactly: sdk.result carries the
 // subtype in `result`; the unified attention edge `sdk.turn.complete` fires on
 // EVERY result subtype unless the REAL gate's pending accepted user-interrupt
-// mark consumes it (an interrupt arms the mark only while a turn is awaiting a
+// mark silences it as the stopped turn's aborted result (an interrupt arms the mark only while a turn is awaiting a
 // terminal frame; the settle is ok:true — the SDK contract documents
 // RESOLUTION, not rejection — and the interrupted turn's own NON-SUCCESS
 // result follows, silently). Interrupt ends the TURN, never the session: NO
@@ -68,6 +72,8 @@ const APPROVAL_DELAY_MS = Number(process.env.FAKE_KILROY_APPROVAL_DELAY_MS ?? 25
 const FAIL_RESULT = process.env.FAKE_KILROY_FAIL_RESULT === '1'
 const CRASH_ON_SEND = process.env.FAKE_KILROY_CRASH_ON_SEND === '1'
 const CLI_SESSION_ID = process.env.FAKE_KILROY_CLI_SESSION_ID ?? randomUUID()
+/** The SDK result the pinned CLI reports for a turn a Stop landed on (T11). */
+const STOPPED_RESULT = Object.freeze({ type: 'result', subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
 
 const NANOID_ALPHABET = 'useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict'
 function nanoid(size = 21) {
@@ -122,11 +128,12 @@ rl.on('line', (line) => {
 async function handle(msg) {
   if (msg.type === 'create') {
     const sessionId = nanoid()
-    const cliSessionId = msg.resumeSessionId ?? CLI_SESSION_ID
+    const resumeSessionId = msg.boot?.resume
+    const cliSessionId = resumeSessionId ?? CLI_SESSION_ID
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, unifiedSessionState(cliSessionId, cwd))
     // `created` MUST be the first line written for this request.
-    emit({ type: 'created', requestId: msg.requestId, sessionId })
+    emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
     emit({
       type: 'sdk.session.init',
       sessionId,
@@ -135,7 +142,7 @@ async function handle(msg) {
       cwd,
       tools: [],
     })
-    if (msg.resumeSessionId) {
+    if (resumeSessionId) {
       emit({ type: 'sdk.session.snapshot', sessionId, messages: [] })
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })
@@ -172,35 +179,35 @@ async function handle(msg) {
         content: [{ type: 'text', text: `kilroy fixture reply: ${msg.text}` }],
         model: 'claude-opus-4-6',
       })
-      let subtype = FAIL_RESULT ? 'error' : 'success'
-      if (st.interrupted) {
-        // An in-flight interrupt deferred to this scripted completion: the
-        // interrupted turn's own terminal result is non-success (the real SDK
-        // contract — an interrupted turn never ends 'success').
-        subtype = 'error_during_execution'
-        st.interrupted = false
-      }
+      // An in-flight interrupt deferred to this scripted completion: the
+      // interrupted turn's own terminal result is the CLI's aborted shape (T11
+      // — an interrupted turn never ends 'success').
+      const result = st.interrupted
+        ? STOPPED_RESULT
+        : { type: 'result', subtype: FAIL_RESULT ? 'error' : 'success' }
+      st.interrupted = false
       st.pendingResults = Math.max(0, st.pendingResults - 1)
       emit({
         type: 'sdk.result',
         sessionId: msg.sessionId,
-        result: subtype,
+        result: result.subtype,
         durationMs: 1,
         costUsd: 0,
         usage: { input_tokens: 1, output_tokens: 1 },
       })
-      // Unified attention edge (the REAL gate): every result subtype rings
-      // unless a pending accepted user-interrupt mark consumed it. The `at`
+      // Unified attention edge (the REAL gate): every result rings except the
+      // stopped turn's own aborted result under a pending accepted
+      // user-interrupt mark. The `at`
       // clamps through the sidecar package's shared monotonic clock — two
       // same-ms edges stay strictly increasing or the client's `at <= last`
       // dedupe silently drops the second ring.
-      if (st.turnCompleteGate.resultEmitsAttention()) {
+      if (st.turnCompleteGate.resultEmitsAttention(result)) {
         const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
         st.lastTurnCompleteAt = at
         emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at })
       }
+      // The result ends the turn: no idle follows (the real sidecar sends none).
       st.turnOpen = false
-      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
     } finally {
       st.sendInFlight = false
     }
@@ -241,12 +248,11 @@ async function handle(msg) {
       }
       // Held turn: nothing else will end it, so synthesize the interrupted
       // turn's own non-success terminal result — the armed gate consumes its
-      // ring — then idle. Still NEVER an sdk.exit.
+      // ring. The result ends the turn (no idle follows). Still NEVER an sdk.exit.
       st.interrupted = false
       st.turnOpen = false
-      emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution' })
-      st.turnCompleteGate.resultEmitsAttention()
-      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
+      emit({ type: 'sdk.result', sessionId: msg.sessionId, result: STOPPED_RESULT.subtype })
+      st.turnCompleteGate.resultEmitsAttention(STOPPED_RESULT)
       return
     }
     // No turn awaits a terminal frame — the SDK RESOLVES an idle-session

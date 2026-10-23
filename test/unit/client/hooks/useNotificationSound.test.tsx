@@ -3,8 +3,25 @@ import { renderHook, act, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import { useNotificationSound } from '@/hooks/useNotificationSound'
+import { RING_WATCHDOG_MS, useNotificationSound } from '@/hooks/useNotificationSound'
 import type { ReactNode } from 'react'
+
+const logMocks = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}))
+
+vi.mock('@/lib/client-logger', () => ({
+  createLogger: () => logMocks,
+}))
+
+function watchdogWarnings() {
+  return logMocks.warn.mock.calls.filter(
+    ([entry]) => (entry as { event?: string } | undefined)?.event === 'notification_ring_watchdog_fired',
+  )
+}
 
 function createStore(soundEnabled: boolean) {
   return configureStore({
@@ -45,6 +62,7 @@ describe('useNotificationSound', () => {
   let playImpl: () => Promise<void>
 
   beforeEach(() => {
+    logMocks.warn.mockClear()
     audioInstances = []
     playImpl = () => Promise.resolve()
     AudioSpy = vi.fn(function () {
@@ -72,6 +90,7 @@ describe('useNotificationSound', () => {
 
   afterEach(() => {
     cleanup()
+    vi.useRealTimers()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
@@ -359,5 +378,212 @@ describe('useNotificationSound', () => {
       audioInstances[0].emit('error')
     })
     expect(toneEndedCallbacks).toHaveLength(0)
+  })
+
+  describe('ring watchdog backstop', () => {
+    it('releases a wedged chime that never fires ended: the next ring starts after RING_WATCHDOG_MS and one warn is logged', () => {
+      vi.useFakeTimers()
+      const store = createStore(true)
+      const { result } = renderHook(() => useNotificationSound(), {
+        wrapper: createWrapper(store),
+      })
+
+      act(() => {
+        result.current.play()
+        result.current.play()
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+
+      // Ring 1 plays but the browser/OS pauses it without `ended` — no
+      // completion signal ever arrives. Just before the backstop nothing moves.
+      act(() => {
+        vi.advanceTimersByTime(RING_WATCHDOG_MS - 1)
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+      expect(watchdogWarnings()).toHaveLength(0)
+
+      act(() => {
+        vi.advanceTimersByTime(1)
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(2)
+      expect(audioInstances[1].play).toHaveBeenCalledTimes(1)
+      expect(watchdogWarnings()).toHaveLength(1)
+      expect(watchdogWarnings()[0][0]).toMatchObject({ stage: 'chime' })
+
+      // A late `ended` from the wedged ring must not double-advance the queue.
+      act(() => {
+        audioInstances[0].emit('ended')
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('clears the watchdog when a ring finishes normally: no backstop fires later', () => {
+      vi.useFakeTimers()
+      const store = createStore(true)
+      const { result } = renderHook(() => useNotificationSound(), {
+        wrapper: createWrapper(store),
+      })
+
+      act(() => {
+        result.current.play()
+      })
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+        audioInstances[0].emit('ended')
+      })
+      expect(vi.getTimerCount()).toBe(0)
+
+      act(() => {
+        vi.advanceTimersByTime(4_500)
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+      expect(watchdogWarnings()).toHaveLength(0)
+    })
+
+    it('does not drain the queue after unmount when a watchdog was pending', () => {
+      vi.useFakeTimers()
+      const store = createStore(true)
+      const { result, unmount } = renderHook(() => useNotificationSound(), {
+        wrapper: createWrapper(store),
+      })
+
+      act(() => {
+        result.current.play()
+        result.current.play()
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+
+      unmount()
+      expect(vi.getTimerCount()).toBe(0)
+
+      act(() => {
+        vi.advanceTimersByTime(RING_WATCHDOG_MS * 2)
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+      expect(watchdogWarnings()).toHaveLength(0)
+    })
+
+    it('backstops a fallback tone whose ended never fires', async () => {
+      vi.useFakeTimers()
+      class FakeOscillator {
+        type = 'sine'
+        frequency = { value: 0 }
+        connect = vi.fn()
+        start = vi.fn()
+        stop = vi.fn()
+        addEventListener = vi.fn()
+      }
+      class FakeAudioContext {
+        currentTime = 0
+        destination = {}
+        close = vi.fn().mockResolvedValue(undefined)
+        createOscillator = () => new FakeOscillator()
+        createGain = () => ({ gain: {}, connect: vi.fn() })
+      }
+      vi.stubGlobal('AudioContext', FakeAudioContext)
+      playImpl = () => Promise.reject(new Error('chime file failed to load'))
+
+      const store = createStore(true)
+      const { result } = renderHook(() => useNotificationSound(), {
+        wrapper: createWrapper(store),
+      })
+
+      act(() => {
+        result.current.play()
+        result.current.play()
+      })
+      await act(async () => {
+        await Promise.resolve()
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+
+      act(() => {
+        vi.advanceTimersByTime(RING_WATCHDOG_MS)
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(2)
+      expect(watchdogWarnings()).toHaveLength(1)
+      expect(watchdogWarnings()[0][0]).toMatchObject({ stage: 'fallback' })
+    })
+  })
+
+  describe('pause and abort release', () => {
+    it('a chime paused without ended releases the queue at once', () => {
+      const store = createStore(true)
+      const { result } = renderHook(() => useNotificationSound(), {
+        wrapper: createWrapper(store),
+      })
+
+      act(() => {
+        result.current.play()
+        result.current.play()
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+
+      act(() => {
+        audioInstances[0].emit('pause')
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(2)
+      expect(audioInstances[1].play).toHaveBeenCalledTimes(1)
+
+      // A natural end fires `pause` then `ended`: the trailing `ended` of the
+      // same ring must not advance the queue a second time.
+      act(() => {
+        audioInstances[0].emit('ended')
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('an aborted chime plays the fallback tone once and the queue continues after it', () => {
+      const toneEndedCallbacks: Array<() => void> = []
+      const oscillatorStarts: number[] = []
+      class FakeOscillator {
+        type = 'sine'
+        frequency = { value: 0 }
+        connect = vi.fn()
+        start = vi.fn(() => {
+          oscillatorStarts.push(1)
+        })
+        stop = vi.fn()
+        addEventListener = (type: string, cb: () => void) => {
+          if (type === 'ended') toneEndedCallbacks.push(cb)
+        }
+      }
+      class FakeAudioContext {
+        currentTime = 0
+        destination = {}
+        close = vi.fn().mockResolvedValue(undefined)
+        createOscillator = () => new FakeOscillator()
+        createGain = () => ({ gain: {}, connect: vi.fn() })
+      }
+      vi.stubGlobal('AudioContext', FakeAudioContext)
+
+      const store = createStore(true)
+      const { result } = renderHook(() => useNotificationSound(), {
+        wrapper: createWrapper(store),
+      })
+
+      act(() => {
+        result.current.play()
+        result.current.play()
+      })
+
+      act(() => {
+        audioInstances[0].emit('abort')
+      })
+      expect(oscillatorStarts).toHaveLength(1)
+      expect(AudioSpy).toHaveBeenCalledTimes(1)
+
+      // A trailing media error for the same dead ring must not arm a second tone.
+      act(() => {
+        audioInstances[0].emit('error')
+      })
+      expect(oscillatorStarts).toHaveLength(1)
+
+      act(() => {
+        for (const cb of [...toneEndedCallbacks]) cb()
+      })
+      expect(AudioSpy).toHaveBeenCalledTimes(2)
+      expect(audioInstances[1].play).toHaveBeenCalledTimes(1)
+    })
   })
 })

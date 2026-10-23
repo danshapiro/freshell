@@ -106,6 +106,34 @@ jobs:
         if: matrix.os == 'windows-2022'
         run: cargo test --locked -p freshell-server --bin freshell-server checkpoints::tests::windows_system_profile_is_rejected_as_checkpoint_scope
 
+      # Checkpoint Git children run inside freshell-platform's shared
+      # kill-on-close Job Object; a timed-out capture must leave no descendant.
+      # These process-ownership steps run even when an earlier one failed, so
+      # each reports its own result.
+      - name: Test Windows checkpoint Job Object settlement
+        if: ${{ !cancelled() && matrix.os == 'windows-2022' }}
+        run: cargo test --locked -p freshell-server --bin freshell-server checkpoints::tests::checkpoint_timeout_settles_windows_job_descendant_before_returning
+
+      # The shared kill-on-close Job Object on its own: terminating it, and
+      # closing its last handle, end every process in it.
+      - name: Test Windows kill-on-close Job Object
+        if: ${{ !cancelled() && matrix.os == 'windows-2022' }}
+        run: cargo test --locked -p freshell-platform --lib process_job::tests
+
+      # The Claude sidecar's process-tree guard (a Job Object on Windows, a
+      # process group on macOS), the graceful sidecar stop, and a session
+      # stop's "confirmed" answer (what lets a session handoff start a new
+      # writer), against Node fake sidecars. The crate's unit tests do not
+      # build on Windows, so this behavior lives in an integration target
+      # that runs everywhere.
+      - name: Test Claude sidecar tree guard (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows-2022' }}
+        run: cargo test --locked -p freshell-freshagent --test claude_sidecar_teardown
+
+      - name: Test Claude sidecar tree guard (macOS)
+        if: ${{ !cancelled() && startsWith(matrix.os, 'macos') }}
+        run: cargo test --locked -p freshell-freshagent --test claude_sidecar_teardown
+
       - name: Run Electron unit tests
         run: pnpm run test:electron
 

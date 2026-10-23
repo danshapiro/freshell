@@ -27,4 +27,35 @@ describe('rust claude snapshot contract', () => {
     const turnIds = parsed.data.turns.map((t: any) => t.turnId)
     expect(new Set(turnIds).size).toBe(turnIds.length)
   })
+
+  // Goldens built by the Rust builder from transcripts the pinned Claude CLI
+  // 2.1.237 wrote (crates/freshell-freshagent/src/claude_snapshot_real_cli_tests.rs
+  // asserts builder == golden). Each must satisfy the strict client schema.
+  const realCliRoot = path.join(__dirname, '../../fixtures/fresh-agent/claude/real-cli-2.1.237')
+  const realCliScenarios = fs.readdirSync(realCliRoot)
+    .filter((name) => fs.existsSync(path.join(realCliRoot, name, 'snapshot.golden.json')))
+
+  it('covers every captured real-CLI scenario', () => {
+    expect(realCliScenarios.sort()).toEqual([
+      'agent-async',
+      'agent-failed',
+      'api-error',
+      'compact-fail',
+      'compact-ok',
+      'image',
+      'tools-sync',
+    ])
+  })
+
+  it.each(realCliScenarios)('the %s real-CLI golden parses under FreshAgentSnapshotSchema (strict)', (scenario) => {
+    const golden = JSON.parse(
+      fs.readFileSync(path.join(realCliRoot, scenario, 'snapshot.golden.json'), 'utf-8'),
+    )
+    const parsed = FreshAgentSnapshotSchema.safeParse(golden)
+    if (!parsed.success) {
+      throw new Error(JSON.stringify(parsed.error.issues, null, 2))
+    }
+    const turnIds = parsed.data.turns.map((t) => t.turnId)
+    expect(new Set(turnIds).size).toBe(turnIds.length)
+  })
 })

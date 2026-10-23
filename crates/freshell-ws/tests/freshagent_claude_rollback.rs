@@ -45,9 +45,10 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// the raw parentUuid chain) as the child's file — the source file is NEVER
 /// touched (Stage-2-proven SDK invariant: the original's JSONL is hash-identical
 /// after a fork). A `<n>`-th `send` appends a uuid-chained u<n>/a<n> pair (the
-/// user line carries the verbatim prompt text) and answers `sdk.status idle`
-/// (the in_turn clear edge) — NEVER a result frame, so no completion chime can
-/// leak into the rollback capture.
+/// user line carries the verbatim prompt text) and answers with the turn's
+/// `sdk.result` (the in_turn clear edge, as the real sidecar ends a turn) — and
+/// NEVER a `sdk.turn.complete`, so no completion chime can leak into the rollback
+/// capture.
 const FAKE_ROLLBACK_SIDECAR_SOURCE: &str = r#"
 import fs from 'node:fs'
 import path from 'node:path'
@@ -104,11 +105,11 @@ rl.on('line', (line) => {
     placeholderCounter += 1
     const sessionId = `fake-sidecar-${process.pid}-${placeholderCounter}`
     fs.mkdirSync(projDir, { recursive: true })
-    if (msg.forkSession === true) {
+    if (msg.boot?.kind === 'fork') {
       // Fork-at-point: NEW durable id, child file = the parent transcript's prefix.
-      const src = msg.resumeSessionId
+      const src = msg.boot?.resume
       let lines = readLines(src)
-      if (msg.resumeSessionAt) lines = prefixThrough(lines, msg.resumeSessionAt)
+      if (msg.boot?.resumeSessionAt) lines = prefixThrough(lines, msg.boot?.resumeSessionAt)
       cliId = mintCliId()
       turnCount = 0
       fs.writeFileSync(transcriptPath(cliId), lines.length ? `${lines.join('\n')}\n` : '')
@@ -117,7 +118,7 @@ rl.on('line', (line) => {
       turnCount = 0
       fs.writeFileSync(transcriptPath(cliId), '')
     }
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId: cliId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'send') {
@@ -131,9 +132,10 @@ rl.on('line', (line) => {
     const user = { type: 'user', uuid: u, parentUuid: parent, timestamp: `t${turnCount}a`, cwd: '/tmp', message: { role: 'user', content: [{ type: 'text', text: msg.text }] } }
     const assistant = { type: 'assistant', uuid: a, parentUuid: u, timestamp: `t${turnCount}b`, message: { role: 'assistant', content: [{ type: 'text', text: `answer ${turnCount}` }] } }
     fs.appendFileSync(transcriptPath(cliId), `${JSON.stringify(user)}\n${JSON.stringify(assistant)}\n`)
-    // The rollback capture surface must NEVER see a completion chime; idle is the
-    // busy-clear edge.
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }) + '\n')
+    // The rollback capture surface must NEVER see a completion chime; the
+    // turn's result is the busy-clear edge (no per-turn idle, like the real
+    // sidecar).
+    process.stdout.write(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: {} }) + '\n')
   } else if (msg.type === 'rollback.quiesce') {
     // ep4-r3 wire parity: rollback's pre-teardown probe — this fake never has
     // an inflight turn at that point (its sends settle their statuses
@@ -812,12 +814,11 @@ async fn drive_conversation(
                 && v["requestId"] == json!(format!("send-{i}"))
         })
         .await;
-        // The fake appends the u<n>/a<n> pair BEFORE answering idle, so this waits
-        // out both the transcript append AND the busy-clear edge.
+        // The fake appends the u<n>/a<n> pair BEFORE answering with the result,
+        // so this waits out both the transcript append AND the busy-clear edge.
         await_frame_into(&mut ws, &mut frames, 15, |v| {
             v["type"] == json!("freshAgent.event")
-                && v["event"]["type"] == json!("freshAgent.status")
-                && v["event"]["status"] == json!("idle")
+                && v["event"]["type"] == json!("freshAgent.result")
         })
         .await;
     }
@@ -920,16 +921,16 @@ async fn setup_and_undo_two_turn_conversation() -> (
     let creates = rig.create_lines();
     let fork_create = creates
         .iter()
-        .find(|l| l["forkSession"] == json!(true))
+        .find(|l| l["boot"]["kind"] == json!("fork"))
         .expect("fork create observed");
-    assert_eq!(fork_create["resumeSessionId"], json!(original));
+    assert_eq!(fork_create["boot"]["resume"], json!(original));
     assert_eq!(
-        fork_create["resumeSessionAt"],
+        fork_create["boot"]["resumeSessionAt"],
         json!("a1"),
         "keep prefix through a1"
     );
     assert_eq!(
-        fork_create["resumeDropsTurn"],
+        fork_create["boot"]["dropsTurn"],
         json!("u2"),
         "the guard is the first-to-discard turn's prompt uuid"
     );
@@ -978,8 +979,16 @@ async fn setup_and_undo_two_turn_conversation() -> (
 #[tokio::test]
 async fn claude_undo_recreates_the_sidecar_with_resume_session_at_and_rekeys_the_pane() {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let (rig, _ws, _addr, _ledger, _frames, _original, _new_id) =
+    let logs = common::log_capture::install();
+    let (rig, _ws, _addr, _ledger, _frames, original, _new_id) =
         setup_and_undo_two_turn_conversation().await;
+    // G14: the respawned sidecar's log is bound to the session the undo named.
+    let bound = logs.matching(|event| {
+        event.message == "freshagent.claude.sidecar_bound"
+            && event.field("session_id") == Some(original.as_str())
+    });
+    assert_eq!(bound.len(), 1, "{bound:?}");
+    assert_eq!(bound[0].field("session_type"), Some("freshclaude"));
     drop(rig);
 }
 
@@ -1021,15 +1030,15 @@ async fn claude_redo_reforks_from_the_original_at_a_later_point() {
     let creates = rig.create_lines();
     let fork_creates: Vec<&Value> = creates
         .iter()
-        .filter(|l| l["forkSession"] == json!(true))
+        .filter(|l| l["boot"]["kind"] == json!("fork"))
         .collect();
     assert_eq!(fork_creates.len(), 2, "{creates:?}");
     let redo_create = fork_creates[1];
-    assert_eq!(redo_create["resumeSessionId"], json!(original));
-    assert_eq!(redo_create["resumeSessionAt"], json!("a2"));
-    assert_eq!(redo_create["forkSession"], json!(true));
+    assert_eq!(redo_create["boot"]["resume"], json!(original));
+    assert_eq!(redo_create["boot"]["resumeSessionAt"], json!("a2"));
+    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
     assert!(
-        redo_create.get("resumeDropsTurn").is_none(),
+        redo_create["boot"].get("dropsTurn").is_none(),
         "the guard is omitted when the discard range is empty (redo to the tip)"
     );
 
@@ -1099,17 +1108,11 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
         "the initial create + the rollback's FRESH create: {creates:?}"
     );
     let fresh_create = &creates[1];
-    for key in [
-        "resumeSessionId",
-        "resumeSessionAt",
-        "forkSession",
-        "resumeDropsTurn",
-    ] {
-        assert!(
-            fresh_create.get(key).is_none(),
-            "the fresh-conversation leg carries NO resume/fork keys ({key} absent): {fresh_create}"
-        );
-    }
+    assert_eq!(
+        fresh_create["boot"],
+        json!({ "kind": "fresh" }),
+        "the fresh-conversation leg boots a new conversation, with NO resume/fork keys: {fresh_create}"
+    );
 
     // The record retained the discarded session as the redo source.
     let rows = rollback_rows(&rig.ledger_dir());
@@ -1151,10 +1154,10 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
     let creates = rig.create_lines();
     assert_eq!(creates.len(), 3, "{creates:?}");
     let redo_create = &creates[2];
-    assert_eq!(redo_create["forkSession"], json!(true));
-    assert_eq!(redo_create["resumeSessionId"], json!(original));
+    assert_eq!(redo_create["boot"]["kind"], json!("fork"));
+    assert_eq!(redo_create["boot"]["resume"], json!(original));
     assert_eq!(
-        redo_create["resumeSessionAt"],
+        redo_create["boot"]["resumeSessionAt"],
         json!("a1"),
         "the r3 boundary rule — resume at a1, NOT u1"
     );
@@ -1170,6 +1173,234 @@ async fn claude_undo_of_the_only_turn_empties_the_conversation_via_a_fresh_creat
     );
     assert_never_completes(&frames);
     drop(rig);
+}
+
+/// Makes a directory unreadable (mode 000) and restores it on drop, so the
+/// rig's TempDir cleanup works even when an assertion panics. `None` when the
+/// process bypasses permission bits (root), where EACCES cannot be produced.
+#[cfg(unix)]
+struct UnreadableDir(PathBuf);
+#[cfg(unix)]
+impl UnreadableDir {
+    fn make(dir: &Path) -> Option<Self> {
+        Self::with_mode(dir, 0o000)
+    }
+    /// Mode 111: listing `dir` fails with EACCES, but a path THROUGH it still
+    /// opens -- a store a scan cannot check while a known file stays readable.
+    fn list_denied(dir: &Path) -> Option<Self> {
+        Self::with_mode(dir, 0o111)
+    }
+    fn with_mode(dir: &Path, mode: u32) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let guard = Self(dir.to_path_buf());
+        if std::fs::read_dir(dir).is_ok() {
+            eprintln!("skipping: euid bypasses permission checks");
+            return None;
+        }
+        Some(guard)
+    }
+}
+#[cfg(unix)]
+impl Drop for UnreadableDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// The rig's fake transcript store (`CLAUDE_CONFIG_DIR`) projects dir.
+#[cfg(unix)]
+fn rig_projects_dir(rig: &RollbackRig) -> PathBuf {
+    rig.home.path().join("claude-store").join("projects")
+}
+
+/// The rollback refusal answered for `request_id` (the requesting sink's
+/// `freshAgent.error{rollback:true}`).
+#[cfg(unix)]
+async fn await_rollback_error(ws: &mut TestWs, frames: &mut FrameBag, request_id: &str) -> Value {
+    let request_id = request_id.to_string();
+    await_frame_into(ws, frames, 20, move |v| {
+        v["type"] == json!("freshAgent.event")
+            && v["event"]["type"] == json!("freshAgent.error")
+            && v["event"]["requestId"] == json!(request_id)
+    })
+    .await
+}
+
+/// G28: an undo while the transcript store cannot be READ (EACCES) is a
+/// retryable `INTERNAL_ERROR` refusal -- never `NOTHING_TO_UNDO`, which tells
+/// the user their conversation has nothing in it. Nothing is forked and no
+/// rollback record is written.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_undo_with_an_unreadable_store_is_internal_error_not_nothing_to_undo() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let rig = RollbackRig::install();
+    let (mut ws, _addr, _ledger, mut frames, original) =
+        drive_conversation(&rig, &["first prompt", "second prompt"]).await;
+    let Some(_locked) = UnreadableDir::make(&rig_projects_dir(&rig)) else {
+        return;
+    };
+
+    send_json(
+        &mut ws,
+        &rollback_frame("rb-undo-unreadable", "undo", &original, "step"),
+    )
+    .await;
+    let refusal = await_rollback_error(&mut ws, &mut frames, "rb-undo-unreadable").await;
+    assert_eq!(
+        refusal["event"]["code"],
+        json!("INTERNAL_ERROR"),
+        "an unreadable store is a retryable failure, not an empty conversation: {refusal}"
+    );
+    // The create log holds protocol-2 creates, whose boot names the kind: a
+    // fork is `boot.kind == "fork"` (a v1 `forkSession` key is never written,
+    // so reading it would pass whatever ran).
+    let creates = rig.create_lines();
+    assert!(
+        !creates.is_empty() && creates.iter().all(|l| l["boot"]["kind"].is_string()),
+        "every logged create names its boot kind: {creates:?}"
+    );
+    assert!(
+        creates.iter().all(|l| l["boot"]["kind"] != json!("fork")),
+        "no fork may run against an unchecked store: {creates:?}"
+    );
+    assert!(
+        rollback_rows(&rig.ledger_dir()).is_empty(),
+        "a refused undo writes no rollback record"
+    );
+    assert_never_completes(&frames);
+}
+
+/// G28: a redo whose chain-root ORIGINAL cannot be read (EACCES) is a
+/// retryable `INTERNAL_ERROR` -- never `REDO_UNAVAILABLE`, which tells the user
+/// the removed history is permanently gone. The redo record stays intact.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_redo_with_an_unreadable_original_is_internal_error_not_redo_unavailable() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let (rig, mut ws, _addr, _ledger, mut frames, _original, new_id) =
+        setup_and_undo_two_turn_conversation().await;
+    let creates_before = rig.create_lines().len();
+    let Some(_locked) = UnreadableDir::make(&rig_projects_dir(&rig)) else {
+        return;
+    };
+
+    send_json(
+        &mut ws,
+        &rollback_frame("rb-redo-unreadable", "redo", &new_id, "step"),
+    )
+    .await;
+    let refusal = await_rollback_error(&mut ws, &mut frames, "rb-redo-unreadable").await;
+    assert_eq!(
+        refusal["event"]["code"],
+        json!("INTERNAL_ERROR"),
+        "an unreadable original is a retryable failure, not lost redo history: {refusal}"
+    );
+    assert_eq!(
+        rig.create_lines().len(),
+        creates_before,
+        "no fork may run against an unchecked store"
+    );
+    let rows = rollback_rows(&rig.ledger_dir());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0]["canRedo"],
+        json!(true),
+        "the refused redo leaves the record redoable for a retry"
+    );
+    assert_never_completes(&frames);
+}
+
+/// Sets an env var for one test and removes it on drop (also on panic, while
+/// the caller still holds `CLAUDE_ENV_LOCK`).
+#[cfg(unix)]
+struct EnvVarGuard(&'static str);
+#[cfg(unix)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        std::env::set_var(key, value);
+        Self(key)
+    }
+}
+#[cfg(unix)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
+/// Polls `check` every 10 ms until it holds (bounded).
+#[cfg(unix)]
+async fn wait_until(budget_secs: u64, what: &str, check: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+    while !check() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// G28: the fork resumes from the transcript the undo ALREADY located. If the
+/// store stops listing between that lookup and the fork (here: the projects
+/// dir turns list-denied while the handler is parked before teardown), a
+/// second scan would miss, and the fork would resume by bare id with no cwd
+/// after the old sidecar is gone. Using the located path keeps the
+/// transcript's own cwd (the CLI's resume lookup is scoped to it).
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_undo_forks_from_the_transcript_it_located_even_if_the_store_stops_listing() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let rig = RollbackRig::install();
+    let _park = EnvVarGuard::set("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS", "1500");
+    let (mut ws, _addr, _ledger, mut frames, original) =
+        drive_conversation(&rig, &["first prompt", "second prompt"]).await;
+
+    send_json(
+        &mut ws,
+        &rollback_frame("rb-undo-relocate", "undo", &original, "step"),
+    )
+    .await;
+    // The durable pre-write lands AFTER the undo located the transcript and
+    // BEFORE the parked pre-teardown window.
+    let ledger_dir = rig.ledger_dir();
+    wait_until(15, "the rollback pre-write", || {
+        !rollback_rows(&ledger_dir).is_empty()
+    })
+    .await;
+    let Some(locked) = UnreadableDir::list_denied(&rig_projects_dir(&rig)) else {
+        return;
+    };
+    wait_until(15, "the fork create", || {
+        rig.create_lines()
+            .iter()
+            .any(|l| l["boot"]["kind"] == json!("fork"))
+    })
+    .await;
+    drop(locked);
+
+    let creates = rig.create_lines();
+    let fork_create = creates
+        .iter()
+        .find(|l| l["boot"]["kind"] == json!("fork"))
+        .expect("fork create observed");
+    assert_eq!(fork_create["boot"]["resume"], json!(original));
+    assert_eq!(fork_create["boot"]["resumeSessionAt"], json!("a1"));
+    assert_eq!(
+        fork_create["cwd"],
+        json!("/tmp"),
+        "the fork runs in the located transcript's own cwd: {fork_create}"
+    );
+    let ack = await_frame_into(&mut ws, &mut frames, 20, |v| {
+        v["type"] == json!("freshAgent.event")
+            && v["event"]["type"] == json!("freshAgent.rolledBack")
+    })
+    .await;
+    assert_eq!(ack["event"]["requestId"], json!("rb-undo-relocate"));
+    assert_never_completes(&frames);
 }
 
 /// Sanity guard for the raw-HTTP helper's framing (keeps the ws::Write import

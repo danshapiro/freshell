@@ -632,6 +632,7 @@ mod tests {
                 owner: &ClaudeSourceOwner,
                 request: &ObserveClaudeSourcesRequest,
                 _: &str,
+                _: tokio::time::Instant,
             ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError>
             {
                 assert!(matches!(owner, ClaudeSourceOwner::Initial { .. }));

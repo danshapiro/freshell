@@ -1,0 +1,84 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "2967f27b-3a0a-41ce-bef3-e34aa7900051",
+  "sessionId": "2967f27b-3a0a-41ce-bef3-e34aa7900051",
+  "revision": 1792656000000,
+  "latestTurnId": "c7331bde-38c8-4e7b-b845-a1a5f45ee539",
+  "status": "idle",
+  "capabilities": {
+    "send": true,
+    "interrupt": true,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "diffs": false,
+    "undo": true,
+    "redo": true,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cachedTokens": 0,
+    "totalTokens": 0,
+    "contextTokens": 0,
+    "compactPercent": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "6dffdfc0-0b52-4e5e-8f47-cf1c925a854e",
+      "turnId": "6dffdfc0-0b52-4e5e-8f47-cf1c925a854e",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-22T09:09:42.702Z",
+      "summary": "hi",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "6dffdfc0-0b52-4e5e-8f47-cf1c925a854e-i0",
+          "kind": "text",
+          "text": "hi"
+        }
+      ]
+    },
+    {
+      "id": "c7331bde-38c8-4e7b-b845-a1a5f45ee539",
+      "turnId": "c7331bde-38c8-4e7b-b845-a1a5f45ee539",
+      "messageId": "9acf47c8-a1b2-4f1b-b4b3-d25666f6ab1e",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-22T09:09:42.768Z",
+      "error": {
+        "name": "ApiError",
+        "message": "API Error: 400 fixture bad request"
+      },
+      "summary": "",
+      "summaryKind": "echo",
+      "items": []
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "transcriptLineUuids": [
+        "6dffdfc0-0b52-4e5e-8f47-cf1c925a854e",
+        "110e3130-465e-4c8d-9518-5a374a4e93bc",
+        "7e2d7cd5-59d9-4c65-abf2-737f675312e0",
+        "c0903d70-7949-4a2b-b48c-1370928a00e2",
+        "c7331bde-38c8-4e7b-b845-a1a5f45ee539"
+      ]
+    }
+  }
+}

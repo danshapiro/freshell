@@ -519,6 +519,20 @@ describe('FreshAgentSettingsButton', () => {
     expect(configure.sessionId).toBe('thread-settings')
     expect(configure.provider).toBe('claude')
     expect(configure.settings).toEqual({ model: 'sonnet', effort: 'alpha' })
+
+    // The stamped levels are saved with the default model, paired with it, so
+    // a new pane on this default clamps effort against the same levels.
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'sonnet' },
+            effort: 'alpha',
+            modelEffortLevels: { modelId: 'sonnet', levels: ['alpha', 'beta'] },
+          },
+        },
+      },
+    })
   })
   it('stamps no modelLabel when the switched-to probed row\'s label echoes its raw id', async () => {
     getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
