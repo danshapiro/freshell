@@ -567,10 +567,13 @@ const freshAgentSlice = createSlice({
       costUsd?: number
       durationMs?: number
       usage?: { input_tokens?: number; output_tokens?: number }
+      /** The server still owes the session work (a send queued behind this turn). */
+      sessionBusy?: boolean
     }>) {
-      const session = resolveOrEnsureSession(state, action.payload, 'idle')
+      const status = action.payload.sessionBusy === true ? 'running' : 'idle'
+      const session = resolveOrEnsureSession(state, action.payload, status)
       if (!session) return
-      writeSessionStatus(session, 'idle')
+      writeSessionStatus(session, status)
       session.streamingActive = false
       // The SDK's total_cost_usd already covers the whole session so far: it
       // is the total, never an increment. (Token usage is per turn, so it adds.)

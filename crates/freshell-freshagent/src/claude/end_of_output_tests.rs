@@ -362,8 +362,8 @@ fn field<'a>(fields: &'a capture::Fields, name: &str) -> Option<&'a str> {
 /// C08 + G31: a sidecar whose SDK stream ended reports it and exits 3. Its
 /// whole tree (the CLI stand-in in its group AND the one that left the group)
 /// is dead by the time the pane hears `exited`, with no waiting on the test's
-/// side; the pane hears it once, with the reported cause, and nothing rings
-/// (the sidecar rings a cut-off turn itself before it reports the end).
+/// side; the pane hears it once, with the reported cause, and the cut-off turn
+/// rings exactly once, from Rust (C18: the sidecar mints no edge of its own).
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_stream_end_is_reported_once_its_whole_tree_is_confirmed_gone() {
@@ -403,8 +403,8 @@ async fn a_stream_end_is_reported_once_its_whole_tree_is_confirmed_gone() {
     assert_eq!(session.count(is_sidecar_exited), 1, "{:?}", session.frames);
     assert_eq!(
         session.count(is_turn_complete),
-        0,
-        "a reported stream end rings nothing from Rust: {:?}",
+        1,
+        "the cut-off turn rings once: {:?}",
         session.frames
     );
     assert!(session.st.dead_sessions.find(&session.pane).is_some());
@@ -415,7 +415,7 @@ async fn a_stream_end_is_reported_once_its_whole_tree_is_confirmed_gone() {
     assert_eq!(field(&logged[0], "stop"), Some("abnormal_exit"));
     assert_eq!(field(&logged[0], "confirmation"), Some("confirmed"));
     assert_eq!(field(&logged[0], "exit_status"), Some("code 3"));
-    assert_eq!(field(&logged[0], "rings"), Some("false"));
+    assert_eq!(field(&logged[0], "rings"), Some("true"));
 }
 
 /// C09 + G31: node killed mid-turn reports no stream end. Its exit status is
@@ -430,14 +430,14 @@ async fn a_node_killed_mid_turn_reports_its_signal_after_the_tree_is_gone_and_ri
         .st
         .handle_send(send_msg(&session.pane, "a turn the sidecar dies in"))
         .await;
-    let in_turn = session
+    let busy = session
         .st
         .sessions
         .lock()
         .await
         .get(&session.pane)
-        .map(|live| live.in_turn.load(std::sync::atomic::Ordering::SeqCst));
-    assert_eq!(in_turn, Some(true), "the turn is in flight");
+        .map(|live| live.ledger.lock().expect("turn ledger lock").busy());
+    assert_eq!(busy, Some(true), "the turn is in flight");
 
     // SAFETY: the sidecar is this test's own child.
     unsafe {

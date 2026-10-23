@@ -94,7 +94,8 @@ struct ForkParent {
     reply_id: String,
     /// The parent's durable id: whose effective transcript the fork reads.
     durable: String,
-    in_turn: Arc<std::sync::atomic::AtomicBool>,
+    /// The parent's turn ledger (the busy gate reads it).
+    ledger: crate::claude_turns::SharedLedger,
     /// The settings the parent runs with (model, effort, permission mode,
     /// plugins, cwd): the child starts with the same.
     settings: crate::identity_sink::FreshAgentSettings,
@@ -185,7 +186,7 @@ impl FreshClaudeState {
             reply_sink(lost_session_frame(&msg.session_id, msg.session_type));
             return;
         };
-        if parent.in_turn.load(std::sync::atomic::Ordering::SeqCst) {
+        if parent.ledger.lock().expect("turn ledger lock").busy() {
             tracing::info!(target: "freshell_freshagent::claude",
                 event = "freshagent.claude.fork_refused",
                 session_id = %parent.durable, code = "BUSY_TURN",
@@ -535,7 +536,7 @@ impl FreshClaudeState {
                 .cli_session_id
                 .clone()
                 .unwrap_or_else(|| live_key.clone()),
-            in_turn: Arc::clone(&session.in_turn),
+            ledger: Arc::clone(&session.ledger),
             settings: session.configuration.settings.clone(),
             freshell_context: session.configuration.freshell_context.clone(),
         })

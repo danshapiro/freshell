@@ -584,6 +584,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         costUsd: event.costUsd as number | undefined,
         durationMs: event.durationMs as number | undefined,
         usage: event.usage as { input_tokens?: number; output_tokens?: number } | undefined,
+        sessionBusy: event.sessionBusy === true,
       }))
       return true
     case 'freshAgent.rolledBack':

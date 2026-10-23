@@ -255,9 +255,11 @@ async fn an_idle_cli_death_reports_the_exit_without_an_edge() {
         "{:?}",
         conn.frames
     );
+    // The server announces the new session idle (C17), and it ends exited:
+    // never running or compacting.
     assert_eq!(
         statuses(&conn, &session_id),
-        vec!["exited".to_string()],
+        vec!["idle".to_string(), "exited".to_string()],
         "an idle session that ends reports exited; frames: {:?}",
         conn.frames
     );

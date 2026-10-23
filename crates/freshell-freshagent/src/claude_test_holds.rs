@@ -11,8 +11,9 @@
 //!   reports the exit, so a resume can land while the dead sidecar is reaped.
 //! - Rollback boot ([`ClaudeTestHolds::hold_rollback_boot`]): an undo or redo
 //!   parks after it wrote its durable record, holding the session's turn lock,
-//!   before it boots the replacement runtime, so a test can park a send behind
-//!   it or change the transcript store under it.
+//!   before its last busy recheck and the replacement runtime's boot, so a test
+//!   can park a send behind it, change the transcript store under it, or let
+//!   the CLI start a turn of its own.
 //! - Fork child ([`ClaudeTestHolds::hold_fork_child`]): a fork parks once its
 //!   child runtime is established, before it records the child's binding row,
 //!   so a test can close the parent while the child is still booting.

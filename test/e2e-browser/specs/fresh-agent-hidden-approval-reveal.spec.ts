@@ -24,12 +24,14 @@
  * itself. What this spec does catch is a regression to the blocking reveal
  * path (the overlay recorder) and a broken end-to-end journey.
  *
- * Trigger: the fake Claude-SDK sidecar is driven by the client's own
- * `freshAgent.interrupt` frame for the hidden pane's session — the exact frame
- * the Stream Deck "stop" sends to a pane in a background tab — so the spec
- * needs no composer send and no turn lane. Its program raises one Bash
- * approval on the first interrupt; the second interrupt cancels it (the
- * sidecar's interrupt-time pending cancellation, mirroring the real one).
+ * Trigger: the hidden pane's session gets a `freshAgent.send` written straight
+ * to the socket (the pane's composer is hidden), and the fake Claude-SDK
+ * sidecar's program answers it with one Bash approval: the turn parks on it.
+ * Then the client's own `freshAgent.interrupt` frame for the session — the
+ * exact frame the Stream Deck "stop" sends to a pane in a background tab —
+ * cancels it (the sidecar's interrupt-time pending cancellation, mirroring
+ * the real one). The Stop reaches the sidecar because the parked turn is
+ * running (an idle session's Stop sends nothing, C18).
  *
  * CLOUD-LEGALITY: no timing dependencies — every wait is a poll on observed
  * state (sidecar stdin/wire ledgers, received WS frames, DOM). This spec must
@@ -53,11 +55,15 @@ const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fa
 
 const APPROVAL_REQUEST_ID = 'perm-raised-while-hidden'
 
-/** The first interrupt raises one Bash approval; a later one cancels it. */
+/** The message that raises the approval (its turn parks on it). */
+const RAISE_TEXT = 'raise an approval while hidden'
+
+/** The send raises one Bash approval; the Stop cancels it. */
 const FAKE_PROGRAM = {
   rules: [
     {
-      on: 'msg:interrupt',
+      on: 'msg:send',
+      match: { text: RAISE_TEXT },
       once: true,
       emit: [
         {
@@ -236,6 +242,16 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const tabALocator = page.locator(`[data-context="tab"][data-tab-id="${tabA}"]`)
       const tabBLocator = page.locator(`[data-context="tab"][data-tab-id="${tabB}"]`)
 
+      const sendToHiddenPane = () => page.evaluate(({ sessionId, text }) => {
+        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
+          type: 'freshAgent.send',
+          requestId: 'send-while-hidden',
+          sessionId,
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          text,
+        })
+      }, { sessionId: bridgeSessionId, text: RAISE_TEXT })
       const interruptHiddenPane = () => page.evaluate((sessionId) => {
         // The Stream Deck stop's exact frame for a fresh-agent pane.
         window.__FRESHELL_TEST_HARNESS__?.sendWsMessage({
@@ -247,7 +263,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       }, bridgeSessionId)
 
       // ── 1. An approval RAISED while hidden appears on reveal ─────────────
-      await interruptHiddenPane()
+      await sendToHiddenPane()
       await expect
         .poll(() => wireFrames(eventsLog, 'sdk.permission.request').length, {
           timeout: 15_000,
@@ -276,9 +292,9 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       await expect
         .poll(() => stdinFrames(stdinLog, 'interrupt').length, {
           timeout: 15_000,
-          message: 'the server forwards the second interrupt',
+          message: 'the server forwards the Stop of the parked turn',
         })
-        .toBe(2)
+        .toBe(1)
       await expect
         .poll(() => wireFrames(eventsLog, 'sdk.permission.cancelled').map((frame) => frame.requestId), {
           timeout: 15_000,

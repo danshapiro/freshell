@@ -299,8 +299,9 @@ test.describe('harness-06 misc fixtures smoke', () => {
       await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'running')
       const assistant = (await rt.nextEvent('sdk.assistant')) as { content: Array<{ text?: string }> }
       expect(assistant.content[0].text).toContain('kilroy smoke turn')
+      // The result ends the turn; the server mints its edge (C18), the fake none.
       await rt.nextEvent('sdk.result', (e) => (e as { result?: string }).result === 'success')
-      await rt.nextEvent('sdk.turn.complete')
+      expect(rt.events().some((e) => (e as { type?: string }).type === 'sdk.turn.complete')).toBe(false)
 
       // "Records Kilroy invocations": the JSONL ledger carries both requests.
       const ledger = await readKilroyLedger(logPath)
