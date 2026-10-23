@@ -8709,6 +8709,7 @@ fn log_claude_teardown(
 mod create_outcome;
 pub use create_outcome::ClaudeCreateOutcome;
 
+mod continuation_name;
 mod establish;
 mod fork;
 mod genesis;

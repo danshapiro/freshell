@@ -36,6 +36,28 @@ pub trait SessionNaming: Send + Sync {
     /// Idempotent: re-ensuring a bound handle resolves its durable record.
     fn ensure_pending(&self, input: PendingNameInput) -> NameFuture<SessionNameUpdate>;
 
+    /// Admit a known session that has no name yet (for example immediately
+    /// after an in-pane conversation switch). Existing records are unchanged.
+    fn ensure_session(
+        &self,
+        _target: SessionNameRef,
+        _cwd: Option<String>,
+    ) -> NameFuture<SessionNameUpdate> {
+        Box::pin(async { Err(naming_unavailable("durable session admission")) })
+    }
+
+    /// Seed an internal continuation once from its source's saved name.
+    /// Durable identities remain independent: no redirect is created, an
+    /// existing child is unchanged, and an unnamed source produces no name.
+    /// Ordinary forks and new conversations must never call this operation.
+    fn continue_session(
+        &self,
+        _source: SessionNameRef,
+        _target: SessionNameRef,
+    ) -> NameFuture<Option<SessionNameUpdate>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Atomically transfer a pending record onto its verified durable
     /// provider/session identity (rejecting prospective evidence).
     fn bind_pending(&self, input: BindNameInput) -> NameFuture<SessionNameUpdate>;

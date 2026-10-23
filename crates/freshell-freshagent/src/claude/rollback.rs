@@ -1132,6 +1132,26 @@ impl FreshClaudeState {
             }
         };
 
+        // Preserve the name before any identity announcement can re-key a
+        // resumed pane. The source stays independent, including its manual
+        // provenance. A failed name commit leaves the original live.
+        if self
+            .preserve_rollback_name(&map_key, &durable_id, &replacement, session_type)
+            .await
+            .is_err()
+        {
+            self.unwind_replacement(&replacement, &durable_id, lease_held)
+                .await;
+            self.compensate_rollback_record(&durable_id, existing.clone())
+                .await;
+            reply_sink(rollback_error_frame(
+                &op,
+                "NAME_PERSISTENCE_FAILED",
+                "The conversation's saved name could not be retained. Try again.",
+            ));
+            return;
+        }
+
         // ONE awaited ledger batch: the replacement's binding (its genesis,
         // the original's settings, `supersedes` = the original, which retires
         // the original's row and links it to the replacement) with the
@@ -1284,13 +1304,10 @@ impl FreshClaudeState {
             index.insert(original_durable.to_string(), replacement.to_string());
             original
         };
-        let handle = self.naming_handles.lock().await.remove(original_key);
-        if let Some(handle) = handle {
-            self.naming_handles
-                .lock()
-                .await
-                .insert(replacement.to_string(), handle);
-        }
+        // The replacement was seeded with its own durable saved name
+        // before this rekey. Keeping the source's handle would send later
+        // input and renames to the ancestor instead of this child.
+        self.naming_handles.lock().await.remove(original_key);
         // A replayed create requestId of the original must not answer with
         // its retired map key.
         self.create_dedup
