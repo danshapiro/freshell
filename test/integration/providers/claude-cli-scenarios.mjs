@@ -488,6 +488,37 @@ const SCENARIOS = {
     ctx.observe('afterGuard', { files: await ctx.files() })
   },
 
+  /**
+   * T19 T5: a background agent's completion is written into the turn that
+   * launched it as a user line of origin `task-notification` (no prompt of its
+   * own), so a guarded fork that undoes the launching turn is refused: the
+   * discarded range holds an externally-sourced entry.
+   */
+  async 'notification-undo'(ctx) {
+    const P = ctx.uuid('P')
+    const s = ctx.open('S', { options: { sessionId: P } })
+    s.push('turn one', 'u1')
+    await s.waitForResults(1)
+    const u2 = s.push('AGENT:async', 'u2')
+    await s.waitForResults(3, 30_000)
+    await s.waitForCount(isStateIdle, 2, 10_000, 'idle')
+    ctx.need(await ctx.pollTranscript(P, 4000, 2), 'parent transcript')
+    await s.close()
+    await sleep(300)
+    const lines = await ctx.fixture.readTranscript(P)
+    const u2Index = lines.findIndex((line) => line.uuid === u2)
+    const keepAt = ctx.need(lines.slice(0, u2Index).reverse().find((line) => typeof line.uuid === 'string')?.uuid, 'fork point')
+    ctx.label(keepAt, 'keepAt')
+    ctx.observe('parent', {
+      shape: transcriptShape(lines),
+      notifications: lines.filter((line) => line.origin?.kind === 'task-notification').map((line) => ({ type: line.type, origin: line.origin.kind, xml: typeof line.message?.content === 'string' && line.message.content.startsWith('<task-notification>') })),
+    })
+    const guarded = ctx.open('guarded', { options: { resume: P, resumeSessionAt: keepAt, forkSession: true, sessionId: ctx.uuid('F'), resumeDropsTurn: u2 } })
+    await guarded.init()
+    await Promise.race([guarded.done, sleep(8000)])
+    await guarded.close()
+  },
+
   /** T8 T9 T10: a send absorbed during a tool call, then a send queued during streamed text. */
   async turns(ctx) {
     const s = ctx.open('S')

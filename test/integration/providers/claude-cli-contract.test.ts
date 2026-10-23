@@ -285,6 +285,18 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(afterGuard.files.map((f: string) => path.basename(f))).toEqual(['P.jsonl'])
   }, SCENARIO_TIMEOUT)
 
+  it('T19 T5: a background agent\'s completion is a task-notification line inside the launching turn, so a guarded fork that undoes that turn is refused', async () => {
+    const r = await real('notification-undo')
+    const { parent } = r.observations
+    expect(parent.notifications).toEqual([{ type: 'user', origin: 'task-notification', xml: true }])
+    const shape = parent.shape as Array<{ type: string, uuid: string }>
+    expect(shape.filter((line) => line.type === 'user' && line.uuid.startsWith('u')).map((line) => line.uuid)).toEqual(['u1', 'u2'])
+    const guarded = messagesOf(r, 'guarded')
+    expect(guarded).toHaveLength(1)
+    expect(guarded[0]).toMatchObject({ type: 'result', subtype: 'error_during_execution', num_turns: 0 })
+    expect(guarded[0].errors[0]).toMatch(/^Resume rejected by --resume-drops-turn: resuming at keepAt would discard entries not attributable to turn u2: range contains an externally-sourced user entry; entry \d+ \[type=user, uuid=cli\]$/)
+  }, SCENARIO_TIMEOUT)
+
   it('T11: a warm interrupt ends the turn with error_during_execution, aborted_streaming or aborted_tools, diagnostic errors and a cancelled lifecycle; the receipt comes first', async () => {
     const r = await real('interrupts')
     const events = eventsOf(r, 'S')

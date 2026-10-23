@@ -116,6 +116,19 @@ function markerSteps(text) {
   }
 }
 
+/** The `<task-notification>` a finished background task leaves in the transcript. */
+function taskNotificationXml(task) {
+  return [
+    '<task-notification>',
+    `<task-id>${task.task_id}</task-id>`,
+    ...(task.toolUseId ? [`<tool-use-id>${task.toolUseId}</tool-use-id>`] : []),
+    '<status>completed</status>',
+    `<summary>Agent "${task.description ?? 'background task'}" finished</summary>`,
+    `<result>${SUBAGENT_TEXT}</result>`,
+    '</task-notification>',
+  ].join('\n')
+}
+
 class AbortError extends Error {
   constructor(message) {
     super(message)
@@ -533,8 +546,9 @@ class SimulatedCli {
       this.background(this.runCommand(cmd))
       return
     }
-    if (this.cliTurns.shift()) {
-      this.background(this.runCliTurn())
+    const task = this.cliTurns.shift()
+    if (task) {
+      this.background(this.runCliTurn(task))
       return
     }
     if (this.busy) {
@@ -575,10 +589,14 @@ class SimulatedCli {
   }
 
   /** A turn the CLI starts by itself: a background task finished (T19). */
-  async runCliTurn() {
+  async runCliTurn(task) {
     const turn = new Turn(null)
     this.turn = turn
     await this.sleep(T.queuedToStarted)
+    // The CLI writes the completion into the transcript as a user line of
+    // origin task-notification: no prompt of its own, and no SDK message.
+    this.transcript.append({ type: 'user', message: { role: 'user', content: taskNotificationXml(task) }, origin: { kind: 'task-notification' } })
+    this.transcript.append({ type: 'attachment', attachment: { type: 'total_tokens_reminder', text: '<total_tokens>15000000 tokens left</total_tokens>' } })
     this.emit(this.systemInit())
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
@@ -719,7 +737,7 @@ class SimulatedCli {
     this.emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [] })
     this.emit({ type: 'system', subtype: 'task_updated', task_id: task.task_id, patch: { status: 'completed', end_time: Date.now() } })
     this.emit({ type: 'system', subtype: 'task_notification', task_id: task.task_id, tool_use_id: toolUseId ?? null, status: 'completed', output_file: '', summary: SUBAGENT_TEXT, usage: { total_tokens: 1, tool_uses: 0, duration_ms: T.subagent } })
-    this.cliTurns.push(task)
+    this.cliTurns.push({ ...task, toolUseId })
     if (!this.turn && !this.finishing) {
       if (!this.busy) {
         this.busy = true
