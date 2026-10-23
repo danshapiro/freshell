@@ -714,6 +714,7 @@ move itself.
 | Client models | 7 Saved-name tab title mirror (D2) | 2 | — |
 | | 8 Managed-runtime merge never writes names (D6) | 1, 7 (the mirror must read records only before reconstructed agent tabs rely on it) | V3 (new local-only spec), V4 (scoped-only session ownership); LB-B3 (stored-state assertions, red receipts), LB-B4/B14 (fallbacks) |
 | | 9 New-window rebuild keeps pane titles and flags (D7) | 7 | — |
+| | 14 Heal stored provider-label tab titles; registry opens keep pane names (added after the Stage 2 reviews; Residual 23, Task 9 receipt open concern 3) | 1, 7, 8, 9 | — |
 | Server binding | 10 Bind naming on every terminal row path; a conversation switch adopts the new session's name (D8) | — | V3 (restart naming at Rust integration level); LB-B2 (every adopt/create entry) |
 | Store perf | 11 Lock-free reads and a cheap cross-process peek (D9) | — | — |
 | Observability | 12 Name-change events; codex proxy `RepairTrigger` log spam diagnosed and bounded (D11) | 3–6, 10 | — |
@@ -1896,6 +1897,114 @@ repeats its error where possible, not only by hiding the lines.
   report the out-of-scope finding (Residuals): a managed shell is not
   re-adopted after a web-server restart on `main` today (P2-G01).
 
+### Task 14: Heal stored provider-label tab titles; registry opens keep pane names
+
+Added by the coordinator after the Stage 2 reviews (Residual 23 from the
+Task 8 review; open concern 3 of the Task 9 receipt). Its specs join the
+Task 13 roll-up.
+
+**Intent:** (a) a tab whose stored title is a provider/runtime label an
+earlier managed-runtime merge wrote ("Shell agent", "OpenCode agent",
+"Recovered <X> agent", or any other label the shared classifier recognizes
+as default/derived for that tab's mode and folder) stops showing it: such a
+stored title is not a name. (b) Opening a tabs-registry record from the Tabs
+view keeps pane names and their rename protection, exactly as the Task 9
+new-window rebuild does.
+
+**Decisions:**
+- **One heal point.** A store middleware,
+  `src/store/storedTabTitleHeal.ts` (`storedTabTitleHealMiddleware`), next to
+  the Task 7 mirror, plus one pass at store creation so the loaded layout is
+  healed before anything reads it. Every way a tab enters the store passes
+  it: the persisted-layout load, cross-window sync, the new-window rebuild,
+  a registry open, a write from an old client. The heal is a `tabs/` action,
+  so the persist middleware writes the healed layout, the layout mirror
+  sends the healed title (`GET /api/tabs`), and the tabs registry (built
+  from the display title) follows the display: all four agree.
+- **The rule.** A stored title heals when all of these hold: the tab has no
+  `titleSetByUser`; it has a layout; the title is not already the unnamed
+  placeholder (`Tab N`); the Task 7 mirror does not own it (a session-owned
+  tab whose saved record is cached keeps the mirrored saved name, so the two
+  never fight); the title differs from the tab's derived label
+  (`deriveTabName`; a create-time label equal to it is already no title to
+  every display and stays); and
+  `isDefaultOrDerivedName(title, { cwd, mode, provider })` holds with the
+  tab's folder (`tab.initialCwd`, else its naming pane's `initialCwd`), mode
+  and provider. It heals to `unnamedTabTitle(position)` ("Tab N", the
+  placeholder `addTab` and the mirror's reset already store): the title
+  only, no `updatedAt` bump, no flag. A real OSC title, session title or
+  rename is never classified default, so it is never healed and still wins.
+- **Classifier.** It already recognizes every form the old code wrote
+  (`"{Label} agent"` with the server's label or the raw mode string,
+  `"Recovered {label} agent"`, and `Recovered`, the rebuild's fallback). The
+  shared fixture gains rows pinning those exact forms; both implementations
+  read it. No rule change.
+- **Registry opens reuse the Task 9 helper.** `restoredTabNames` moves from
+  `build-recovery-plan.ts` to `src/lib/restored-tab-names.ts` with the same
+  rules (titles remapped through the pane-id map, a flag only with its
+  title, scoped agent panes stripped by `stripScopedPaneTitleMetadata`, the
+  tab flag only on a tab that is not session-owned).
+  `openRecordAsUnlinkedCopy` restores the tab flag, the pane titles and the
+  pane flags; `openPaneInNewTab` restores the moved pane's title and flag
+  (its tab is new, so it gets no tab flag).
+- **Contract doc.** Task 13's `:176-191` ("Tab display title") edit also
+  records the heal rule.
+
+**Files:**
+- Create: `src/store/storedTabTitleHeal.ts` (middleware + store-creation pass); `src/lib/restored-tab-names.ts` (the Task 9 helper, moved)
+- Modify (wiring): `src/store/tabsSlice.ts` (reducer `healStoredTabTitles(record<tabId,title>)`: title only, never a user-renamed tab); `src/store/store.ts` (register the middleware after the mirror; run the creation pass)
+- Modify: `src/lib/recovery/build-recovery-plan.ts` (import the moved helper); `src/lib/tab-registry-open.ts` (both opens restore names); `src/lib/recovery/managed-runtime-recovery.ts` and `src/lib/tab-name-source.ts` (refactor: the naming-pane lookup moves to `tab-name-source.ts` for both users)
+- Modify: `test/fixtures/name-evidence/cases.json` (old-merge label rows)
+- Tests: create `test/unit/client/store/storedTabTitleHeal.test.ts`; extend `test/unit/client/lib/tab-registry-open.test.ts`; replace the Task 8 pinning test in `test/unit/lib/managed-runtime-recovery.test.ts`
+- E2e: create `test/e2e-browser/specs/stored-tab-title-heal-rust.spec.ts` and `test/e2e-browser/specs/tabs-view-name-restore-rust.spec.ts` (cloud-legal: plain shells only); create `test/e2e-browser/helpers/stored-names.ts` (stored-state reads, the persisted-registry wait and the OSC title command, shared with `new-window-name-restore-rust.spec.ts`, which moves onto it)
+
+- [ ] **Step 1: Failing tests.**
+  - The Task 8 pinning test `a stored "Shell agent" title is visible on a
+    single-pane shell tab` is deliberately reversed: replaced by
+    `a stored "Shell agent" title on an unrenamed single-pane shell tab heals to the derived label`
+    (stored title `Tab 1`, displayed `Shell`, `updatedAt` unchanged).
+  - `storedTabTitleHeal.test.ts`: heals on store creation; heals every
+    old-merge label form; never touches a renamed tab; leaves real titles,
+    the placeholder and a create-time label equal to the derived label
+    alone; heals a tab that arrives later (hydrate, registry open, restore);
+    a real OSC title still wins after a heal; a session-owned tab with a
+    cached record keeps the mirrored saved name (no fight), one without a
+    record heals; the healed title reaches the registry record.
+  - `tab-registry-open.test.ts`: a copy restores pane titles and flags
+    through the pane-id remap and the tab flag on a legacy tab; a flag
+    without its title is not restored; scoped agent panes get no title and a
+    session-owned copy no tab flag; a pane opened in a new tab keeps its
+    title and flag; a scoped pane opened in a new tab gets none.
+  - Fixture rows: `Recovered Shell agent`, `Recovered shell agent`,
+    `Recovered OpenCode agent`, `opencode agent`, `claude agent`,
+    `Recovered amplifier agent` → default.
+  - E2e `stored-tab-title-heal-rust.spec.ts`:
+    `it('an unrenamed "Shell agent" tab heals on load and stays healed across reload; a renamed one keeps its name')`
+    (a seeded per-window layout; label, Redux title, persisted layout,
+    `GET /api/tabs` and the server's persisted registry record, before and
+    after a second reload) and
+    `it('a healed tab still takes the shell's own window title')`.
+  - E2e `tabs-view-name-restore-rust.spec.ts`:
+    `it('a renamed pane reopened from the Tabs view keeps its name and rename protection')`
+    (closed record, card click) and
+    `it('a renamed pane opened in its own tab from the Tabs view keeps its name and rename protection')`
+    (card menu); each sends an OSC title into the reopened pane afterwards.
+- [ ] **Step 2: Red.** `pnpm run test:vitest run test/unit/client/store/storedTabTitleHeal.test.ts test/unit/client/lib/tab-registry-open.test.ts test/unit/lib/managed-runtime-recovery.test.ts test/unit/shared/name-evidence.test.ts --config config/vitest/vitest.config.ts`;
+  `~/.local/bin/mise exec rust@1.96 -- cargo test -p freshell-sessions --locked --test name_evidence`;
+  `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_E2E_BACKEND=cloud pnpm run test:e2e --project=chromium test/e2e-browser/specs/stored-tab-title-heal-rust.spec.ts test/e2e-browser/specs/tabs-view-name-restore-rust.spec.ts`
+  from a clean tests-only commit.
+- [ ] **Step 3: Implement** per the decisions above.
+- [ ] **Step 4: Green** (same commands), plus the neighbors
+  `test/unit/client/store/savedNameTabTitleMirror.test.ts`,
+  `test/unit/client/lib/recovery/build-recovery-plan.test.ts`,
+  `test/unit/client/lib/machine-workspace.test.ts`, and on cloud
+  `managed-runtime-title-merge.spec.ts`, `new-window-name-restore-rust.spec.ts`,
+  `session-tab-title-mirror-rust.spec.ts`, `sidebar-registry-sync-rust.spec.ts`.
+- [ ] **Step 5: Refactor.** One naming-pane lookup (`tab-name-source.ts`)
+  for the managed merge and the heal; the moved helper is the only place the
+  restore rules live.
+- [ ] **Step 6: Commit** `fix(names): heal stored provider-label tab titles; registry opens keep pane names`.
+
 ## E2e coverage by root cause
 
 All specs use the owned `RustServer` with an isolated HOME and ephemeral port,
@@ -1912,6 +2021,8 @@ approach, already productized in `test/e2e-browser/helpers/unified-agent-names.t
 | RC5 placeholder / automation no-op | `unified-agent-names-opencode.spec.ts`, `unified-agent-names-freshopencode.spec.ts` (extended); `name-automation-outcome-rust.spec.ts` (new) | `FAKE_OPENCODE_TITLE_SEQUENCE` in fake opencode terminal/server; built CLI `rename-tab` | cloud |
 | RC6 no first-message fallback in terminals | `name-import-shutdown-rust.spec.ts` D (claude/codex/opencode) | fake CLIs, fake Gemini 403, `sendFirstMessage` | cloud |
 | RC7 new window drops names | `new-window-name-restore-rust.spec.ts` (new) | UI renames, `context.newPage()`, `browser.newContext()`, OSC `printf` | cloud |
+| RC7 Tabs-view opens drop names (Task 14) | `tabs-view-name-restore-rust.spec.ts` (new) | UI pane rename in a split shell tab, close it, reopen from the Tabs view card and open one pane in its own tab from the card menu; OSC `printf` | cloud |
+| RC4 old stored provider-label titles (Task 14, Residual 23) | `stored-tab-title-heal-rust.spec.ts` (new) | per-window layout seeded by an init script with an unrenamed and a renamed "Shell agent" tab; label, Redux title, persisted layout, `GET /api/tabs` and the server's persisted registry record across two reloads; OSC `printf` after the heal | cloud |
 | RC8 rows without name binding | `agent-crash-autoresume-rust.spec.ts`, `unified-agent-names-claude.spec.ts` (extended, incl. a conversation switch); Rust `crates/freshell-ws/tests/managed_restart_naming.rs` (new) | crashing fake CLI; fake claude switch arm; restarted in-process server reaching a managed soul through every adopt/create entry (reconcile adopt, compat adopt, resume-create, managed create) | cloud; Rust integration |
 | RC9 lock contention | Rust `reads_do_not_take_the_document_lock` (red); `name-read-under-load-rust.spec.ts` (smoke) | held lock; synthetic 4.5 MB document, 3 pages reloading + rename burst | Rust; cloud |
 | RC10 storage quota blocks saves | `name-storage-quota-rust.spec.ts` (new) | `addInitScript` fills localStorage near quota and seeds 20 stale envelopes/acks; rename a shell tab; reload → name kept; envelope keys gone | cloud |
@@ -2008,7 +2119,8 @@ and must be red before Task 2's implementation.
 22. **Managed-runtime rigs can flake when they are not run alone** (LB-B15):
     the cause of the baseline's parallel timeouts is inferred, not proven;
     the local-only rules run every managed case alone.
-23. **Tab titles the old merge already wrote stay** (Task 8 review). Task 8
+23. **Fixed by Task 14** (the text below records the gap as Task 8 left
+    it). **Tab titles the old merge already wrote stay** (Task 8 review). Task 8
     stops new "Shell agent"/"Recovered Shell agent"/"OpenCode agent" writes,
     but nothing rewrites a title an earlier merge stored on an unrenamed
     shell tab (shell tabs are not session-owned). `getTabDisplayTitle`
@@ -2025,7 +2137,10 @@ and must be red before Task 2's implementation.
     (`isDefaultOrDerivedName` with the tab's folder and mode) as no title
     on a tab without `titleSetByUser`; projections that copy the stored
     title (`GET /api/tabs`, the tabs registry) would still carry it until
-    a write replaces it.
+    a write replaces it. Task 14 took the stored-state route instead of
+    that display-only one: one store middleware heals the stored title, so
+    the display, the persisted layout, `GET /api/tabs` and the registry
+    agree.
 
 ### Out-of-scope finding for Dan (pre-existing, not fixed here)
 **A managed shell is not re-adopted after a web-server restart on `main`
