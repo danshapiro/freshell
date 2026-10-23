@@ -17,8 +17,9 @@ import {
  * Name-reliability Task 4 (RC5): an automation rename reports whether it
  * applied. A Claude pane the user named "LotL" in the UI keeps that name
  * when an agent runs `freshell rename-tab "Bot name"`, and the built CLI
- * says so on stderr (`name not applied: protected_name`); on a fresh pane
- * the same call applies.
+ * says so on stderr (`name not applied: protected_name`) while the response
+ * it prints never claims the rename happened; on a fresh pane the same call
+ * applies.
  *
  * Owned server only: the spec boots its own Rust server on an ephemeral
  * loopback port with an isolated home (the fake Claude CLI wired through
@@ -53,6 +54,16 @@ async function runCli(
     run = await attempt()
   }
   return run
+}
+
+type RenameCliBody = {
+  message?: string
+  data?: { sessionName?: { outcome?: { applied?: boolean } } }
+}
+
+/** The JSON response body the CLI printed on stdout. */
+function cliBody(stdout: string): RenameCliBody {
+  return JSON.parse(stdout.slice(stdout.indexOf('{'), stdout.lastIndexOf('}') + 1)) as RenameCliBody
 }
 
 /**
@@ -93,6 +104,11 @@ test.describe('automation rename outcome', () => {
       const refused = await runCli(server, ['rename-tab', '--target', first.tabId, 'Bot name'])
       expect(refused.code, refused.stderr).toBe(0)
       expect(refused.stderr).toContain('name not applied: protected_name')
+      // The printed response agrees with its own outcome: it never says
+      // "session renamed" for a rename that kept the name.
+      const refusedBody = cliBody(refused.stdout)
+      expect(refusedBody.data?.sessionName?.outcome?.applied, refused.stdout).toBe(false)
+      expect(refusedBody.message, refused.stdout).toBe('session name not applied: protected_name')
       await page.waitForTimeout(2_000)
       await expectSharedName(harness, first.nameRef!, 'LotL', {
         page, server, tabId: first.tabId, surfaces: ['http', 'redux', 'pane', 'tab'],
@@ -108,12 +124,9 @@ test.describe('automation rename outcome', () => {
       // The response reached the naming record (the tab route nests the
       // update under `data.sessionName`) and says it applied — not a
       // layout-label rename, which carries no outcome at all.
-      const appliedBody = JSON.parse(
-        applied.stdout.slice(applied.stdout.indexOf('{'), applied.stdout.lastIndexOf('}') + 1),
-      ) as {
-        data?: { sessionName?: { outcome?: { applied?: boolean } } }
-      }
+      const appliedBody = cliBody(applied.stdout)
       expect(appliedBody.data?.sessionName?.outcome?.applied, applied.stdout).toBe(true)
+      expect(appliedBody.message, applied.stdout).toBe('session renamed')
       await expectSharedName(harness, second.nameRef!, 'Bot name', {
         page, server, tabId: second.tabId, surfaces: ['http', 'redux', 'tab'],
       })

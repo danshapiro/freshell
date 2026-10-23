@@ -82,6 +82,7 @@ pub(crate) mod quiet_deadman;
 pub mod rest_lane;
 pub(crate) mod rest_lane_create;
 mod rest_lane_sync;
+mod rename_response;
 mod rename_target_cwd;
 pub mod rollback_record;
 pub mod session_handoff;
@@ -6196,24 +6197,7 @@ pub(crate) async fn rename_scoped_session(
         })
         .await
     {
-        Ok(update) => {
-            let mut data = Map::new();
-            if let Some(tab_id) = tab_id {
-                data.insert("tabId".into(), json!(tab_id));
-            }
-            if let Some(pane_id) = pane_id {
-                data.insert("paneId".into(), json!(pane_id));
-            }
-            data.insert(
-                "nameRef".into(),
-                serde_json::to_value(&update.record.name_ref).unwrap_or(Value::Null),
-            );
-            data.insert(
-                "sessionName".into(),
-                serde_json::to_value(&update).unwrap_or(Value::Null),
-            );
-            ok_json(Value::Object(data), "session renamed")
-        }
+        Ok(update) => rename_response::scoped_rename_response(tab_id, pane_id, &update),
         Err(error) => {
             // Unified agent names (Task 8 acceptance): the pre-bind
             // fallback. A fresh claude pane's content carries the
@@ -6245,21 +6229,11 @@ pub(crate) async fn rename_scoped_session(
                             .await
                         {
                             Ok(update) => {
-                                let mut data = Map::new();
-                                if let Some(tab_id) = tab_id {
-                                    data.insert("tabId".into(), json!(tab_id));
-                                }
-                                data.insert("paneId".into(), json!(pane_id));
-                                data.insert(
-                                    "nameRef".into(),
-                                    serde_json::to_value(&update.record.name_ref)
-                                        .unwrap_or(Value::Null),
+                                return rename_response::scoped_rename_response(
+                                    tab_id,
+                                    Some(pane_id),
+                                    &update,
                                 );
-                                data.insert(
-                                    "sessionName".into(),
-                                    serde_json::to_value(&update).unwrap_or(Value::Null),
-                                );
-                                return ok_json(Value::Object(data), "session renamed");
                             }
                             Err(retry_error) => {
                                 naming::log_name_error("rename", &pending, &retry_error);
