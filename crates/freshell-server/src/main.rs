@@ -1151,6 +1151,13 @@ async fn main() -> ExitCode {
     fresh_agent_state
         .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
         .expect("OpenCode checkpoint event persister is installed once");
+    let rest_create_settings = settings_store.shared_settings_lock();
+    fresh_agent_state
+        .set_rest_create_settings_reader(Arc::new(move || {
+            let settings = Arc::clone(&rest_create_settings);
+            Box::pin(async move { settings.read().await.fresh_agent.clone() })
+        }))
+        .expect("REST create settings reader is installed once");
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =
@@ -2082,6 +2089,15 @@ async fn main() -> ExitCode {
     fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());
     // opencode REST surface (Task 7's materialization site; V10 A13-N1)
     fresh_agent_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    let rest_enabled = fresh_codex_state.clone();
+    fresh_agent_state
+        .set_claude_rest_lane(Arc::new(
+            freshell_freshagent::claude_rest_lane::ClaudeRestLane::new(
+                fresh_claude_state.clone(),
+                Arc::new(move || rest_enabled.is_enabled()),
+            ),
+        ))
+        .expect("local Claude REST lane is installed once");
     // Lane D1: the crash-event channel for terminal auto-resume. The receiver
     // is consumed by `auto_resume::spawn_auto_resume_hub`, spawned right
     // after `ws_state` is assembled (the hub needs the full state).

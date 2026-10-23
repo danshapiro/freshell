@@ -73,6 +73,50 @@ describe('standalone CLI capability contract', () => {
   })
 
   it.each([
+    ['new-tab', 'claude'],
+    ['new-tab', 'kilroy'],
+    ['split-pane', 'claude'],
+    ['split-pane', 'kilroy'],
+  ])('%s sends %s fresh-agent options and canonical Claude resume identity', async (action, agent) => {
+    const bodies: Array<{ url: string; body: Record<string, unknown> }> = []
+    const server = createServer(async (request, response) => {
+      response.setHeader('content-type', 'application/json')
+      if (request.method === 'POST') {
+        let text = ''
+        for await (const chunk of request) text += String(chunk)
+        bodies.push({ url: request.url ?? '', body: JSON.parse(text) })
+        response.end(JSON.stringify({ status: 'ok', data: { tabId: 't1', paneId: 'new-pane' } }))
+      } else if (request.url === '/api/tabs') {
+        response.end(JSON.stringify({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' }))
+      } else {
+        response.end(JSON.stringify({ panes: [{ id: 'p1', index: 0, kind: 'terminal' }] }))
+      }
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('test server did not listen')
+    try {
+      const args = [action, '--agent', agent, '--model', 'catalog-model', '--effort', 'max', '--resume', '550e8400-e29b-41d4-a716-446655440000']
+      if (action === 'split-pane') args.push('--target', 'p1')
+      const result = await runCli(args, `http://127.0.0.1:${address.port}`)
+      expect(result.code, result.stderr).toBe(0)
+      expect(bodies).toHaveLength(1)
+      expect(bodies[0]).toMatchObject({
+        url: action === 'new-tab' ? '/api/tabs' : '/api/panes/p1/split',
+        body: {
+          agent, model: 'catalog-model', effort: 'max',
+          sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+        },
+      })
+      expect(bodies[0].body).not.toHaveProperty('resumeSessionId')
+    } finally {
+      server.close()
+      await once(server, 'close')
+    }
+  })
+
+  it.each([
     ['run', 'echo', 'blocked'],
     ['fresh-send', 'blocked'],
     ['attach', '--terminal', 'term-1'],
