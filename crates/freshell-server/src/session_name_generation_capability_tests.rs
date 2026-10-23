@@ -406,6 +406,23 @@ fn refused(attempt_id: &str) -> GenerationOutcome {
     }
 }
 
+/// Only the index can correct an already captured first message. A later
+/// accepted send carries the current turn and must keep the original.
+async fn correct_first_message(store: &Arc<SessionNames>, target: SessionNameRef, message: &str) {
+    use freshell_freshagent::naming::{NameActivity, NameActivityReason, SessionNaming};
+    store
+        .activity(NameActivity {
+            target,
+            mode: "freshclaude".to_string(),
+            event_id: "corrected-first-message".to_string(),
+            reason: NameActivityReason::IndexUserMessage,
+            first_user_message: Some(message.to_string()),
+            cwd: None,
+        })
+        .await
+        .expect("the index corrects naming input");
+}
+
 /// The re-arm makes the in-flight request's input stale, but its start was
 /// still charged: a refusal gives it back.
 #[tokio::test]
@@ -415,13 +432,7 @@ async fn a_refused_start_is_refunded_after_a_rearm_during_the_request() {
     let target = armed_target(&store, "h-rearm-refund", "The message the request carried").await;
     let claim = claim_named(&store, &target, "attempt-rearm-refund").await;
     assert_eq!(claim.consumed, 1);
-    arm_with_message(
-        &store,
-        target.clone(),
-        "freshclaude",
-        "A newer first message",
-    )
-    .await;
+    correct_first_message(&store, target.clone(), "A newer first message").await;
 
     fold(&store, &claim, refused("attempt-rearm-refund")).await;
     let doc = document_json(dir.path());
@@ -458,10 +469,9 @@ async fn a_rearm_during_the_last_start_still_exhausts_on_failure() {
     consume_failed_starts(&store, dir.path(), &target, 2).await;
     let claim = claim_named(&store, &target, "attempt-last").await;
     assert_eq!(claim.consumed, MAX_GENERATION_STARTS);
-    arm_with_message(
+    correct_first_message(
         &store,
         target.clone(),
-        "freshclaude",
         "A newer first message during the last start",
     )
     .await;
@@ -491,13 +501,7 @@ async fn a_rearm_during_the_last_start_still_exhausts_on_failure() {
 
     // A second fold for the same start, then another message: still spent.
     fold(&store, &claim, refused("attempt-last")).await;
-    arm_with_message(
-        &store,
-        target.clone(),
-        "freshclaude",
-        "Yet another first message",
-    )
-    .await;
+    correct_first_message(&store, target.clone(), "Yet another first message").await;
     let doc = document_json(dir.path());
     assert_eq!(
         generation_status(&doc, &target).as_deref(),
@@ -525,13 +529,7 @@ async fn a_rearm_during_the_last_start_keeps_the_refund_and_the_newer_input() {
     let target = armed_target(&store, "h-rearm-last-refused", "The original first message").await;
     consume_failed_starts(&store, dir.path(), &target, 2).await;
     let claim = claim_named(&store, &target, "attempt-last-refused").await;
-    arm_with_message(
-        &store,
-        target.clone(),
-        "freshclaude",
-        "The newer first message",
-    )
-    .await;
+    correct_first_message(&store, target.clone(), "The newer first message").await;
 
     fold(&store, &claim, refused("attempt-last-refused")).await;
     let doc = document_json(dir.path());
@@ -560,13 +558,7 @@ async fn a_rearm_during_the_last_start_still_exhausts_at_recovery() {
     let target = armed_target(&store, "h-rearm-last-crash", "The original first message").await;
     consume_failed_starts(&store, dir.path(), &target, 2).await;
     claim_named(&store, &target, "attempt-last-interrupted").await;
-    arm_with_message(
-        &store,
-        target.clone(),
-        "freshclaude",
-        "A newer first message",
-    )
-    .await;
+    correct_first_message(&store, target.clone(), "A newer first message").await;
 
     // Restart: the start was persisted, never folded.
     let store = open_store(dir.path());

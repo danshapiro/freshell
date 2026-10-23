@@ -870,6 +870,56 @@ async fn an_accepted_send_heals_a_junk_name_while_no_input_is_stored() {
     assert_eq!(healed.record.source, NameSource::FirstMessage);
 }
 
+/// A later send is not a corrected first message. In particular, a
+/// "continue" sent while naming is paused or in flight must not become
+/// the input for a permanent AI name.
+#[tokio::test]
+async fn later_accepted_messages_preserve_the_first_generation_input() {
+    for status in [
+        GenerationStatus::Idle,
+        GenerationStatus::Eligible,
+        GenerationStatus::InFlight,
+    ] {
+        let dir = temp_dir();
+        let store = open(dir.path());
+        let target = directory_record(&store, NamedProvider::Claude, "first-input").await;
+        activity(
+            &store,
+            &target,
+            NameActivityReason::AcceptedUserMessage,
+            Some(SARDINE),
+        )
+        .await;
+        rewrite(dir.path(), |document| {
+            document
+                .generation
+                .get_mut(&name_ref_key(&target))
+                .unwrap()
+                .status = status;
+        });
+        let store = open(dir.path());
+        let before = series_of(dir.path(), &target).unwrap();
+
+        activity(
+            &store,
+            &target,
+            NameActivityReason::AcceptedUserMessage,
+            Some("continue"),
+        )
+        .await;
+
+        let after = series_of(dir.path(), &target).unwrap();
+        assert_eq!(after.excerpt.as_deref(), Some(SARDINE), "{status:?}");
+        assert_eq!(
+            after.input_fingerprint, before.input_fingerprint,
+            "{status:?}"
+        );
+        assert_eq!(after.status, before.status, "{status:?}");
+        assert_eq!(after.consumed, before.consumed, "{status:?}");
+        assert_eq!(get_one(&store, &target).await.name, SARDINE);
+    }
+}
+
 // The sweep (one pass at a time, against the real store) lives in a child
 // module so this file stays under the 1000-line cap; its tests are still
 // selected by `plan_activity`.

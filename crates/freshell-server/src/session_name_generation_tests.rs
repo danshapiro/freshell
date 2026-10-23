@@ -1675,14 +1675,18 @@ async fn a_rearmed_series_rejects_answers_from_older_input() {
         .expect("claim runs")
         .expect("claimable");
 
-    // A genuinely new message re-arms the series (new fingerprint).
-    arm_with_message(
+    // The index re-derived the actual first message (new fingerprint).
+    // A later accepted send must never replace the first naming input.
+    activity(
         &store,
         target.clone(),
         "freshclaude",
-        "Second conversation message",
+        "corrected-first-message",
+        NameActivityReason::IndexUserMessage,
+        Some("Corrected first conversation message"),
     )
-    .await;
+    .await
+    .expect("the index corrects naming input");
 
     // The OLD input's late answer is rejected.
     store

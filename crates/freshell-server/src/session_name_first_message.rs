@@ -134,7 +134,8 @@ impl SeriesPlan {
 /// Plan the series side of one activity on an UNPROTECTED record (the
 /// caller skips protected ones: a protected winner keeps generation
 /// stopped). The arming rules are the existing ones — an accepted or
-/// indexed message (re)arms when its fingerprint differs; an open or
+/// indexed message (re)arms when its fingerprint differs; accepted sends
+/// keep an already captured real first message; an open or
 /// resume arms only an unattempted series, including the boot-absorbed Idle
 /// series an explicit open may arm with the same message; an exhausted
 /// series never re-arms — plus re-absorb at rest and the prompt-input guard
@@ -168,6 +169,16 @@ pub(super) fn plan_series(
             excerpt: excerpt(),
         });
     };
+    // AcceptedUserMessage carries the current send, not a corrected first
+    // message from the index. Preserve the original input across later
+    // turns, pauses and in-flight requests: otherwise "continue" becomes
+    // the input for a protected AI name. Refused old wrapper input may
+    // still be replaced by the first real message.
+    if reason == NameActivityReason::AcceptedUserMessage
+        && series.excerpt.as_deref().is_some_and(is_generation_input)
+    {
+        return None;
+    }
     if series.status == GenerationStatus::Exhausted {
         return None;
     }
