@@ -457,7 +457,10 @@ impl FreshAgentTransport for HostedTransport {
         *self.profile.lock().expect("profile lock") = Some(profile.clone());
         let create = create_request_for_profile(profile);
         match &self.state {
-            ProviderState::Claude(state) => state.handle_create(create, None).await,
+            // The answer also rides the bus (`wait_created` below reads it).
+            ProviderState::Claude(state) => {
+                state.handle_create(create, None).await;
+            }
             ProviderState::Codex(state) => state.handle_create(create, None).await,
             ProviderState::Opencode { runtime, .. } => runtime.handle_create(create, None).await,
         }

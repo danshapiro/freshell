@@ -69,10 +69,10 @@ use tokio::sync::Mutex as TokioMutex;
 use freshell_codex::next_monotonic_turn_complete_at;
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
-    FreshAgentConfigure, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
-    FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendAccepted,
-    FreshAgentSessionMaterialized, ServerMessage, SessionRuntimeOwner, SessionType,
+    FreshAgentConfigure, FreshAgentCreate, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
+    FreshAgentKill, FreshAgentKilled, FreshAgentQuestionRespond, FreshAgentSend,
+    FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage, SessionRuntimeOwner,
+    SessionType,
 };
 
 use crate::claude_handshake::{read_created, BootContext};
@@ -2023,7 +2023,7 @@ impl FreshClaudeState {
         &self,
         msg: FreshAgentCreate,
         provenance: Option<crate::BindProvenance>,
-    ) {
+    ) -> ClaudeCreateOutcome {
         let request_id = msg.request_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -2043,13 +2043,16 @@ impl FreshClaudeState {
                     provider: PROVIDER.to_string(),
                     request_id,
                     runtime_provider: PROVIDER.to_string(),
-                    session_id: cached.session_id,
+                    session_id: cached.session_id.clone(),
                     session_type: session_type.to_string(),
-                    session_ref: cached.session_ref,
+                    session_ref: cached.session_ref.clone(),
                     name_ref,
                     session_name,
                 }));
-                return;
+                return ClaudeCreateOutcome::Created {
+                    session_id: cached.session_id,
+                    session_ref: cached.session_ref,
+                };
             }
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
@@ -2114,8 +2117,8 @@ impl FreshClaudeState {
                 let owner_fields = crate::ownership_lane::terminal_owner_fields_from_snapshot(
                     &self.ownership_snapshot(PROVIDER, sid),
                 );
-                self.fail_create_session_reserved_with_owner(&request_id, owner_fields.as_ref());
-                return;
+                return self
+                    .fail_create_session_reserved_with_owner(&request_id, owner_fields.as_ref());
             }
             // b8ke delta round-3 F2: the existing-session ADOPT is
             // COORDINATED — the coordinator claim decides BEFORE any
@@ -2140,8 +2143,7 @@ impl FreshClaudeState {
                     tracing::warn!(target: "freshell_freshagent::claude",
                         session_id = %sid, request_id = %request_id, code = err.code(),
                         "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    self.fail_create(&request_id, err.code(), err.message());
-                    return;
+                    return self.fail_create(&request_id, err.code(), err.message());
                 }
             };
             match self.begin_lane_claim_at(
@@ -2212,16 +2214,14 @@ impl FreshClaudeState {
                                      moved on while the live-runtime adopt committed — the \
                                      create is refused (never a live writer left unowned)"
                                 );
-                                self.fail_create(
+                                return self.fail_create(
                                     &request_id,
                                     "STALE_CLAIM",
                                     "ownership moved on while adopting the live session; refresh and retry",
                                 );
-                                return;
                             }
                         }
-                        self.adopt_live_create(&request_id, sid, session_type).await;
-                        return;
+                        return self.adopt_live_create(&request_id, sid, session_type).await;
                     }
                     own_ticket = Some(ticket);
                     // b8ke delta round-2 F2: register the start's
@@ -2242,16 +2242,14 @@ impl FreshClaudeState {
                     // live session adopts, spawn nothing. With no
                     // coordinator there is no fence to consult.
                     if self.has_live_session(sid).await {
-                        self.adopt_live_create(&request_id, sid, session_type).await;
-                        return;
+                        return self.adopt_live_create(&request_id, sid, session_type).await;
                     }
                 }
                 crate::ownership_lane::LaneClaim::Adopt => {
                     // A same-kind live runtime the coordinator names —
                     // adopt it, spawn nothing (the COORDINATED map-hit:
                     // the claim already verified the key's state).
-                    self.adopt_live_create(&request_id, sid, session_type).await;
-                    return;
+                    return self.adopt_live_create(&request_id, sid, session_type).await;
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_freshagent::claude",
@@ -2267,11 +2265,10 @@ impl FreshClaudeState {
                         &self.ownership,
                         &outcome,
                     );
-                    self.fail_create_session_reserved_with_owner(
+                    return self.fail_create_session_reserved_with_owner(
                         &request_id,
                         owner_fields.as_ref(),
                     );
-                    return;
                 }
             }
             for round in 0..2u8 {
@@ -2293,12 +2290,10 @@ impl FreshClaudeState {
                     crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
                         // Under-lock ADOPT: the winner completed between our pre-check
                         // and the claim (the V5 TOCTOU window).
-                        self.adopt_live_create(&request_id, sid, session_type).await;
-                        return;
+                        return self.adopt_live_create(&request_id, sid, session_type).await;
                     }
                     crate::session_lease::FreshSessionClaim::Held { .. } => {
-                        self.fail_create_session_reserved(&request_id);
-                        return;
+                        return self.fail_create_session_reserved(&request_id);
                     }
                     crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
                         pid,
@@ -2318,8 +2313,7 @@ impl FreshClaudeState {
                         }
                         tracing::error!(target: "invariant", pid, session_id = sid,
                             "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                        self.fail_create_session_reserved(&request_id);
-                        return;
+                        return self.fail_create_session_reserved(&request_id);
                     }
                 }
             }
@@ -2368,9 +2362,9 @@ impl FreshClaudeState {
                     // (the key is Aliased{to: the live session} after its
                     // mint-time rekey); the idempotent re-drive ADOPTS the
                     // live session, spawning nothing.
-                    self.adopt_live_create(&request_id, &claim_key, session_type)
+                    return self
+                        .adopt_live_create(&request_id, &claim_key, session_type)
                         .await;
-                    None
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     // A duplicate create for this pane is still in flight
@@ -2386,11 +2380,10 @@ impl FreshClaudeState {
                         &self.ownership,
                         &outcome,
                     );
-                    self.fail_create_session_reserved_with_owner(
+                    return self.fail_create_session_reserved_with_owner(
                         &request_id,
                         owner_fields.as_ref(),
                     );
-                    None
                 }
             }
         } else {
@@ -2467,12 +2460,11 @@ impl FreshClaudeState {
         {
             Ok(established) => established,
             Err(error) => {
-                self.fail_create(
+                return self.fail_create(
                     &request_id,
                     error.create_code(),
                     &error.message(EstablishLane::Create),
                 );
-                return;
             }
         };
         let created = established.map_key;
@@ -2508,43 +2500,48 @@ impl FreshClaudeState {
             provider: PROVIDER.to_string(),
             request_id,
             runtime_provider: PROVIDER.to_string(),
-            session_id: created,
+            session_id: created.clone(),
             session_type: session_type.to_string(),
-            session_ref,
+            session_ref: session_ref.clone(),
             name_ref,
             session_name,
         }));
+        ClaudeCreateOutcome::Created {
+            session_id: created,
+            session_ref,
+        }
     }
 
-    fn fail_create(&self, request_id: &str, code: &str, message: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
+    /// Answer the create `request_id` with the failed `outcome` on the bus, and
+    /// return the outcome (I1: the frame is built from it).
+    fn answer_create_failure(
+        &self,
+        request_id: &str,
+        outcome: ClaudeCreateOutcome,
+    ) -> ClaudeCreateOutcome {
+        if let Some(frame) = outcome.create_failed_frame(request_id) {
+            self.broadcast(&frame);
+        }
+        outcome
+    }
+
+    fn fail_create(&self, request_id: &str, code: &str, message: &str) -> ClaudeCreateOutcome {
+        self.answer_create_failure(
+            request_id,
+            ClaudeCreateOutcome::Failed {
                 code: code.to_string(),
                 message: message.to_string(),
-                request_id: request_id.to_string(),
                 retryable: None,
+                owner: None,
             },
-        ));
+        )
     }
 
     /// The D8 loser answer (Task 12): reuses the existing create-failed frame with the
     /// fixed reservation code — NO new protocol fields (deliberate: avoids a C3 wire
     /// change; the client re-drive uses a fixed floor).
-    fn fail_create_session_reserved(&self, request_id: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
-                code: "SESSION_RESERVED".to_string(),
-                message: "Another resume for this session is in flight".to_string(),
-                request_id: request_id.to_string(),
-                retryable: Some(true),
-            },
-        ));
+    fn fail_create_session_reserved(&self, request_id: &str) -> ClaudeCreateOutcome {
+        self.fail_create_session_reserved_with_owner(request_id, None)
     }
 
     /// [`Self::fail_create_session_reserved`] + the coordinator's additive
@@ -2556,33 +2553,28 @@ impl FreshClaudeState {
         &self,
         request_id: &str,
         owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
-    ) {
-        let (owner_kind, owner_generation, owner_epoch) = match owner {
-            Some(fields) => (
-                Some(fields.owner_kind.to_string()),
-                Some(fields.owner_generation),
-                Some(fields.owner_epoch),
-            ),
-            None => (None, None, None),
-        };
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
-            FreshAgentCreateFailed {
-                owner_kind,
-                owner_generation,
-                owner_epoch,
+    ) -> ClaudeCreateOutcome {
+        self.answer_create_failure(
+            request_id,
+            ClaudeCreateOutcome::Failed {
                 code: "SESSION_RESERVED".to_string(),
                 message: "Another resume for this session is in flight".to_string(),
-                request_id: request_id.to_string(),
                 retryable: Some(true),
+                owner: owner.cloned(),
             },
-        ));
+        )
     }
 
     /// The HAS-LIVE→ADOPT arm (Task 12, V1: new server behavior): answer a loser's
     /// create-with-resume with `freshAgent.created` naming the adopted DURABLE session
     /// (send/attach route to it via Task 10b's `cli_index` resolution) under the
     /// loser's own `requestId` — no spawn, no second writer.
-    async fn adopt_live_create(&self, request_id: &str, durable: &str, session_type: &str) {
+    async fn adopt_live_create(
+        &self,
+        request_id: &str,
+        durable: &str,
+        session_type: &str,
+    ) -> ClaudeCreateOutcome {
         self.create_dedup
             .record_success(
                 request_id,
@@ -2616,6 +2608,10 @@ impl FreshClaudeState {
             name_ref,
             session_name,
         }));
+        ClaudeCreateOutcome::Created {
+            session_id: durable.to_string(),
+            session_ref: Some(claude_session_ref(durable)),
+        }
     }
 
     // ── freshAgent.kill (WS) ─────────────────────────────────────────────────
@@ -10026,6 +10022,9 @@ fn log_claude_teardown(
     }
 }
 
+mod create_outcome;
+pub use create_outcome::ClaudeCreateOutcome;
+
 mod establish;
 use establish::{
     BootedSidecar, DurableClaim, EstablishError, EstablishLane, EstablishPlan, RegisterUnder,
@@ -13101,6 +13100,92 @@ rl.on('line', (line) => {
             "the provisional key is the rekey family's resolution alias — got {:?}",
             registry.observe(PROVIDER, provisional).state
         );
+    }
+
+    /// A fresh create whose pane-scoped claim the coordinator refuses (another
+    /// operation holds the key) answers that refusal and nothing else: no
+    /// sidecar is spawned and no `created` follows the `create.failed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_fresh_create_claim_answers_only_the_refusal_and_spawns_nothing() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                "pending-create-req-refused-claim",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-holding-the-pane-key",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+
+        let outcome = st
+            .handle_create(dedup_create_msg("req-refused-claim"), None)
+            .await;
+
+        let mut answers = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).expect("json frame");
+            if frame["requestId"] == json!("req-refused-claim") {
+                answers.push(frame);
+            }
+        }
+        assert_eq!(answers.len(), 1, "one answer: {answers:?}");
+        assert_eq!(answers[0]["type"], "freshAgent.create.failed");
+        assert_eq!(answers[0]["code"], "SESSION_RESERVED");
+        assert_eq!(env.spawn_count(), 0, "no sidecar was spawned");
+        // I1: the returned outcome is the answer the frame carries.
+        assert!(matches!(
+            &outcome,
+            ClaudeCreateOutcome::Failed { code, retryable: Some(true), .. } if code == "SESSION_RESERVED"
+        ));
+        assert_eq!(
+            serde_json::to_value(outcome.create_failed_frame("req-refused-claim").unwrap())
+                .unwrap(),
+            answers[0]
+        );
+    }
+
+    /// I1: a create returns the session its `freshAgent.created` frame names, with
+    /// the durable conversation when it resumed one.
+    #[tokio::test]
+    async fn a_create_returns_the_session_its_created_frame_names() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+
+        let fresh = st
+            .handle_create(dedup_create_msg("req-outcome-fresh"), None)
+            .await;
+        let frame = await_claude_created(&mut rx, "req-outcome-fresh").await;
+        assert_eq!(
+            fresh,
+            ClaudeCreateOutcome::Created {
+                session_id: frame["sessionId"].as_str().unwrap().to_string(),
+                session_ref: None,
+            }
+        );
+
+        let durable = "77777777-7777-4777-8777-777777777777";
+        let mut resume = dedup_create_msg("req-outcome-resume");
+        resume.resume_session_id = Some(durable.to_string());
+        let resumed = st.handle_create(resume, None).await;
+        let frame = await_claude_created(&mut rx, "req-outcome-resume").await;
+        assert_eq!(
+            resumed,
+            ClaudeCreateOutcome::Created {
+                session_id: frame["sessionId"].as_str().unwrap().to_string(),
+                session_ref: Some(claude_session_ref(durable)),
+            }
+        );
+        assert_eq!(frame["sessionRef"]["sessionId"], durable);
+        drop(env);
     }
 
     /// b8ke ext r22 F1 (b): a spawn-time provider rejection during the
