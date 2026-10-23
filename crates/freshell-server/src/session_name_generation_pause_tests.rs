@@ -1,19 +1,31 @@
-//! The naming pause on routes the scripted capability tests cannot reach:
-//! a route whose packets are silently dropped (a firewall that answers
-//! nothing, so the connect never completes). The real worker, the real
-//! temp-file store and the real HTTP transport run against a loopback port
+//! The naming pause in conditions the scripted capability tests do not
+//! reach: a route whose packets are silently dropped (a firewall that
+//! answers nothing, so the connect never completes), and a refusal that
+//! depends on one session's request rather than on the credential or the
+//! route. The real worker and the real temp-file store run throughout; the
+//! dropped-route tests use the real HTTP transport against a loopback port
 //! that drops every connect, in tokio virtual time (no wall-clock wait).
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::capability_tests::{armed_target, generator, named, GENERATION_TARGET};
+use freshell_protocol::session_names::NameSource;
+
+use super::capability_tests::{
+    armed_target, generator, keyed_auth, named, wait_for, windows, GENERATION_TARGET,
+};
 use super::tests::{
-    document_json, generation_consumed, generation_status, open_store, temp_data_dir,
+    document_json, generation_consumed, generation_status, get_one, open_store, temp_data_dir,
+    NoRouteNative,
 };
 use super::GENERATION_REQUEST_TIMEOUT;
-use crate::ai_title::AiKeyCell;
+use crate::ai_title::{AiKeyCell, BoxFuture};
+use crate::gemini_failure::{classify_gemini_failure, GeminiFailure};
 use crate::session_name_capability::tests::session_name_http;
-use crate::session_name_capability::{KeyRouteTransport, LatchWindows, NamingRoute, PauseKind};
+use crate::session_name_capability::{
+    KeyRouteTransport, LatchWindows, NamingRoute, PauseKind, SessionNameTransport,
+};
+use crate::session_name_native::{select_generation, SessionNameWorker};
 use crate::test_trace_capture::scoped_trace_capture;
 
 /// A loopback port whose connects never complete, as behind a firewall that
@@ -151,4 +163,100 @@ async fn a_dropped_proxy_connect_pauses_naming_without_using_the_attempt() {
         "proxy_unreachable",
     )
     .await;
+}
+
+/// A transport whose refusal depends on the request, as a proxy that
+/// inspects traffic refuses content it blocks (a bare 403, which pauses
+/// naming like any permission refusal): a prompt holding `blocked` is
+/// refused, any other prompt is named.
+struct ContentRefusingTransport {
+    blocked: &'static str,
+    refused: Mutex<u32>,
+}
+
+impl SessionNameTransport for ContentRefusingTransport {
+    fn generate_content(
+        &self,
+        prompt: String,
+        _max_output_tokens: u32,
+    ) -> BoxFuture<Result<String, GeminiFailure>> {
+        let answer = if prompt.contains(self.blocked) {
+            *self.refused.lock().unwrap() += 1;
+            Err(classify_gemini_failure(403, b""))
+        } else {
+            Ok("Parser bug fix".to_string())
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// The probe after a pause rotates: a session whose own request is
+/// refused is not the one probed after every window, so the other armed
+/// sessions still get named. The refused one keeps its whole allowance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_session_does_not_hold_the_probe_after_a_pause() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let refused = armed_target(&store, "h-a-refused", "Deploy with the BLOCKED-WORD token").await;
+    let clean = armed_target(&store, "h-b-clean", "Fix the parser bug").await;
+    let first = select_generation(&store.generation_work_snapshot()).expect("two armed series");
+    assert_eq!(first.target, refused, "the refused session is probed first");
+
+    let transport = Arc::new(ContentRefusingTransport {
+        blocked: "BLOCKED-WORD",
+        refused: Mutex::new(0),
+    });
+    let generator = generator(
+        dir.path(),
+        keyed_auth("rotation-key-value"),
+        transport.clone(),
+        windows(50, 20),
+    );
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        Arc::new(NoRouteNative),
+        Arc::clone(&generator),
+    );
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(update) = get_one(&store, clean.clone()).await {
+            if update.record.source == NameSource::FreshellAi {
+                assert_eq!(update.record.name, "Parser bug fix");
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the clean session is named after the first pause (refused {} times)",
+            *transport.refused.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The success ends the pause, so the refused session is probed (and
+    // refused) again at once. Stop the worker between probes: its refund is
+    // on disk and the next re-probe is still well ahead.
+    wait_for(
+        Duration::from_secs(5),
+        "a folded refund inside a window",
+        || {
+            let doc = document_json(dir.path());
+            generation_status(&doc, &refused).as_deref() == Some("eligible")
+                && generator
+                    .latch()
+                    .reprobe_in(tokio::time::Instant::now())
+                    .is_some_and(|left| left >= Duration::from_millis(25))
+        },
+    )
+    .await;
+    worker.abort();
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_consumed(&doc, &refused),
+        0,
+        "the refused session keeps its allowance"
+    );
+    assert_eq!(
+        generation_status(&doc, &refused).as_deref(),
+        Some("eligible")
+    );
 }

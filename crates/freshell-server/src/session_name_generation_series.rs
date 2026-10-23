@@ -31,12 +31,15 @@ pub(super) fn charge_start(series: &mut GenerationState, attempt_id: &str, now: 
     series.consumed
 }
 
-/// Give back the in-flight start of `attempt_id`: consumed −1, its attempt
-/// id and start time removed, the series Eligible again with its input and
-/// its due time unchanged (the naming pause, not the series, decides when
-/// it is tried again). `false` (nothing changed) when the series is not in
-/// flight or never recorded that attempt.
-pub(super) fn refund_start(series: &mut GenerationState, attempt_id: &str) -> bool {
+/// Give back the in-flight start of `attempt_id`, refused at `now`:
+/// consumed −1, its attempt id and start time removed, the series Eligible
+/// again with its input. Its due time becomes `now`: still due (the naming
+/// pause, not the series, decides when naming resumes), but behind every
+/// series that was already waiting, so the probe after the pause tries
+/// another session first and a refusal caused by this one request cannot
+/// hold naming for the rest. `false` (nothing changed) when the series is
+/// not in flight or never recorded that attempt.
+pub(super) fn refund_start(series: &mut GenerationState, attempt_id: &str, now: i64) -> bool {
     if series.status != GenerationStatus::InFlight {
         return false;
     }
@@ -57,6 +60,7 @@ pub(super) fn refund_start(series: &mut GenerationState, attempt_id: &str) -> bo
     }
     series.consumed = series.consumed.saturating_sub(1);
     series.status = GenerationStatus::Eligible;
+    series.next_due = Some(now);
     true
 }
 
@@ -87,7 +91,7 @@ pub(super) fn settle_superseded_start(
 ) -> bool {
     match outcome {
         GenerationOutcome::CapabilityUnavailable { attempt_id }
-        | GenerationOutcome::Throttled { attempt_id } => refund_start(series, attempt_id),
+        | GenerationOutcome::Throttled { attempt_id } => refund_start(series, attempt_id, now),
         GenerationOutcome::Answer(_) | GenerationOutcome::Empty | GenerationOutcome::Failed(_) => {
             if series.status != GenerationStatus::InFlight {
                 return false;

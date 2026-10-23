@@ -3712,7 +3712,7 @@ fn fold_generation_outcome_decision(
             // Name-reliability Task 6: the request never had a fair chance
             // (refused credential, permission, proxy or quota): give the
             // start back and keep the input.
-            if session_name_generation_series::refund_start(series, &attempt_id) {
+            if session_name_generation_series::refund_start(series, &attempt_id, meta.now_ms) {
                 Ok(commit_decision(document, &key, None))
             } else {
                 Ok(Decision::Read(read_update(document, &key)))

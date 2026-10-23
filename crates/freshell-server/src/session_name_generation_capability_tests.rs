@@ -592,7 +592,7 @@ async fn a_rearm_during_the_last_start_still_exhausts_at_recovery() {
 // The worker under a pause
 // ---------------------------------------------------------------------------
 
-async fn wait_for(deadline: Duration, what: &str, mut done: impl FnMut() -> bool) {
+pub(super) async fn wait_for(deadline: Duration, what: &str, mut done: impl FnMut() -> bool) {
     let until = tokio::time::Instant::now() + deadline;
     while !done() {
         assert!(tokio::time::Instant::now() < until, "timed out: {what}");
