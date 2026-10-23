@@ -254,41 +254,6 @@ fn transcript_of(rig: &ClaudeRig, session_id: &str) -> Option<PathBuf> {
         .find(|path| path.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
 }
 
-/// Whether process `pid` is gone (or a zombie, which holds no pipes).
-fn process_gone(pid: i64) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Err(_) => true,
-        Ok(stat) => stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest.trim_start().starts_with('Z'))
-            .unwrap_or(false),
-    }
-}
-
-/// The sidecar and stand-in CLI processes of the runtime that booted `session_id`.
-fn runtime_pids(rig: &ClaudeRig, session_id: &str) -> Vec<i64> {
-    let boot = rig
-        .ledger_rows("boot")
-        .into_iter()
-        .find(|row| row["sessionId"] == session_id)
-        .unwrap_or_else(|| panic!("a boot row for {session_id}"));
-    vec![
-        boot["pid"].as_i64().expect("the sidecar's pid"),
-        boot["cliPid"].as_i64().expect("the CLI's pid"),
-    ]
-}
-
-async fn wait_until_gone(pids: &[i64], what: &str) {
-    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
-    while !pids.iter().all(|pid| process_gone(*pid)) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{what} ({pids:?}) is still running"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 fn assert_never_chimes(conn: &RigConnection) {
     assert_eq!(
         conn.events_seen("freshAgent.turn.complete"),
@@ -324,7 +289,7 @@ async fn an_undo_answers_in_time_with_a_fork_materialized_under_a_new_id() {
     let lines = chain_lines(&a_path);
     let u2 = prompt_uuid(&lines, "second prompt");
     let keep = uuid_before(&lines, &u2);
-    let a_runtime = runtime_pids(&rig, &a);
+    let a_runtime = rig.runtime_processes(&a);
 
     let (ack, c) = rollback_ok(&mut conn, "undo", &pane, &a, "undo-1").await;
     assert_eq!(ack["removedPromptText"], "second prompt", "{ack}");
@@ -385,7 +350,7 @@ async fn an_undo_answers_in_time_with_a_fork_materialized_under_a_new_id() {
         "the fork writes nothing yet (T6)"
     );
     assert_eq!(std::fs::read_to_string(&a_path).expect("read A"), a_before);
-    wait_until_gone(&a_runtime, "A's runtime").await;
+    a_runtime.wait_until_exited("A's runtime").await;
     assert!(rig.fresh_claude.has_live_session(&c).await);
     assert_never_chimes(&conn);
 }
@@ -885,7 +850,7 @@ async fn an_undo_forks_from_the_transcript_it_located_even_if_the_store_stops_li
 /// SIGKILL the sidecar of the runtime that booted `session_id`, then wait for
 /// the pane's `SIDECAR_EXITED` (the pane then shows "Resume session").
 async fn kill_sidecar_of(rig: &ClaudeRig, conn: &mut RigConnection, session_id: &str) {
-    let sidecar = runtime_pids(rig, session_id)[0];
+    let [sidecar, _cli] = rig.runtime_pids(session_id);
     // SAFETY: a plain signal to a sidecar process this rig's server spawned.
     assert_eq!(unsafe { libc::kill(sidecar as i32, libc::SIGKILL) }, 0);
     conn.wait_for("the sidecar's exit", |v| {

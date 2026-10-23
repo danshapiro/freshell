@@ -21,6 +21,10 @@ pub mod claude_rig;
 pub mod ledger_sink;
 pub mod log_capture;
 pub mod opencode_home;
+/// Whether a process a test started has exited (a zombie has). The same file
+/// `freshell-freshagent`'s tests use, so the rule is defined once.
+#[path = "../../../freshell-freshagent/tests/support/process_probe.rs"]
+pub mod process_probe;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 

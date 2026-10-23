@@ -37,6 +37,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_ws::WsState;
 
+use super::process_probe::ProcessProbe;
 use super::{handshake_settings_lock, test_settings_value, TestWs, AUTH_TOKEN};
 
 /// The repository root (the rigs read the sidecar, the simulator and the provider
@@ -457,6 +458,57 @@ impl ClaudeRig {
                 "the genesis of {session_id} was never cleared"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The pids of the sidecar and the simulated CLI of the runtime that booted
+    /// `session_id`, from its `boot` row.
+    pub fn runtime_pids(&self, session_id: &str) -> [i64; 2] {
+        let boot = self
+            .ledger_rows("boot")
+            .into_iter()
+            .find(|row| row["sessionId"] == session_id)
+            .unwrap_or_else(|| panic!("a boot row for {session_id}"));
+        [
+            boot["pid"].as_i64().expect("the sidecar's pid"),
+            boot["cliPid"].as_i64().expect("the CLI's pid"),
+        ]
+    }
+
+    /// The processes of the runtime that booted `session_id` (see
+    /// [`Self::runtime_pids`]), observed from now on. Take them while that
+    /// runtime runs: a later process that reuses one of the ids is then never
+    /// mistaken for it.
+    pub fn runtime_processes(&self, session_id: &str) -> RuntimeProcesses {
+        let pids = self.runtime_pids(session_id);
+        let probes = pids.map(|pid| {
+            let probe = ProcessProbe::open(u32::try_from(pid).expect("a process id"));
+            assert!(
+                probe.running(),
+                "process {pid} of {session_id}'s runtime runs when it is first observed"
+            );
+            probe
+        });
+        RuntimeProcesses { pids, probes }
+    }
+}
+
+/// A runtime's sidecar and simulated CLI, observed since they ran
+/// ([`ClaudeRig::runtime_processes`]).
+pub struct RuntimeProcesses {
+    pids: [i64; 2],
+    probes: [ProcessProbe; 2],
+}
+
+impl RuntimeProcesses {
+    /// Returns once both processes have exited (a zombie has: it runs nothing
+    /// and holds no pipes), or fails naming `what`.
+    pub async fn wait_until_exited(&self, what: &str) {
+        for (pid, probe) in self.pids.iter().zip(&self.probes) {
+            assert!(
+                probe.exits_within(RIG_FRAME_BUDGET).await,
+                "{what}: process {pid} is still running"
+            );
         }
     }
 }

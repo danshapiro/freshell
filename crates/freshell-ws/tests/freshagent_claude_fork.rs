@@ -538,17 +538,6 @@ async fn a_child_whose_sidecar_died_before_its_first_send_resumes_through_the_cr
         .any(|line| line["message"]["content"][0]["text"] == "second prompt"));
 }
 
-/// Whether process `pid` is gone (or a zombie, which holds no pipes).
-fn process_gone(pid: i64) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Err(_) => true,
-        Ok(stat) => stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest.trim_start().starts_with('Z'))
-            .unwrap_or(false),
-    }
-}
-
 /// The user closes the pane (the client kills the parent) while the fork's
 /// child is still booting. Nothing would ever show or close that child, so the
 /// fork must not hand it out: it answers a refusal instead of `forked`, the
@@ -565,6 +554,15 @@ async fn closing_the_pane_while_the_child_boots_leaves_no_child_behind() {
     let seen = conn.frames.len();
     request_fork(&mut conn, &pane, &a, "fork-1", None).await;
     hold.parked().await;
+    let boot = queries(&rig)
+        .into_iter()
+        .find(|o| o["forkSession"] == true)
+        .expect("the child booted");
+    let child = boot["sessionId"]
+        .as_str()
+        .expect("the child's id")
+        .to_string();
+    let child_runtime = rig.runtime_processes(&child);
     conn.kill(&pane).await;
     hold.release();
 
@@ -574,34 +572,11 @@ async fn closing_the_pane_while_the_child_boots_leaves_no_child_behind() {
         "no child is handed out: {answer}"
     );
     assert_eq!(answer["event"]["code"], "FORK_REFUSED", "{answer}");
-    let boot = queries(&rig)
-        .into_iter()
-        .find(|o| o["forkSession"] == true)
-        .expect("the child booted");
-    let child = boot["sessionId"]
-        .as_str()
-        .expect("the child's id")
-        .to_string();
     assert!(
         !rig.fresh_claude.has_live_session(&child).await,
         "the child is torn down"
     );
-    let pids: Vec<i64> = rig
-        .ledger_rows("boot")
-        .into_iter()
-        .filter(|row| row["sessionId"] == child.as_str())
-        .flat_map(|row| [row["pid"].as_i64(), row["cliPid"].as_i64()])
-        .flatten()
-        .collect();
-    assert_eq!(pids.len(), 2, "the child's sidecar and CLI pids");
-    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
-    while !pids.iter().all(|pid| process_gone(*pid)) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the child's processes ({pids:?}) are still running"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    child_runtime.wait_until_exited("the child's runtime").await;
     assert!(
         ledger(&rig)
             .load_binding("claude", &child)
