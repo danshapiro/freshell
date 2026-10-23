@@ -657,7 +657,13 @@ impl DockerEngineBackend {
             )
             .await?;
         if absent.status != 404 {
-            return Err(fail("Claude candidate scratch name is already present"));
+            // Only an answered lookup proves presence; any other refusal
+            // leaves absence unconfirmed. Either way nothing is created.
+            return Err(fail(if absent.status == 200 {
+                "Claude candidate scratch name is already present"
+            } else {
+                "Claude candidate scratch absence could not be confirmed"
+            }));
         }
         // Retain ownership on a lost acknowledgement. A conflict is foreign.
         scratch.attempted = true;

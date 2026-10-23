@@ -1,5 +1,5 @@
 // The injected SDK call boundary for the session-names helper tests — the
-// same env-seam pattern as the sidecar's fake-query-module. Exports ONLY the
+// same env-seam pattern as the sidecar's FRESHELL_CLAUDE_SDK_QUERY_MODULE seam. Exports ONLY the
 // two metadata functions the helper consumes; refuses to load when the
 // ambient project-key override leaked into the child env un-removed (the
 // Rust parent must set OR remove CLAUDE_CODE_PROJECT_DIR_NAME deliberately —

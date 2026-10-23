@@ -342,11 +342,15 @@ async fn spawn_sidecar_runs_the_sidecar_inside_its_own_process_group() {
     let script = dir.path().join("idle-sidecar.mjs");
     std::fs::write(&script, "setInterval(() => {}, 1000)\n").unwrap();
     std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
-    let spawned = spawn_sidecar().await;
+    let spawned = spawn_sidecar(None, "freshclaude").await;
     std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
 
-    let (mut child, stdin, _stdout, _ownership_id, mut tree_guard) =
-        spawned.expect("spawn the sidecar");
+    let SpawnedSidecar {
+        mut child,
+        stdin,
+        mut tree_guard,
+        ..
+    } = spawned.expect("spawn the sidecar");
     let pid = child.id().expect("a live sidecar") as i32;
     assert_eq!(
         // SAFETY: getpgid only reads the process table.

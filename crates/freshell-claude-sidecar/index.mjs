@@ -32,19 +32,24 @@
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
-//                                  the interrupted turn's own (an accepted user interrupt's mark consumes
-//                                  it — turn-complete-gate.mjs); also minted from consumeStream's finally
+//                                  the stopped turn's own aborted result (an accepted user interrupt's mark
+//                                  silences only that — turn-complete-gate.mjs); also minted from consumeStream's finally
 //                                  when a turn ends with NO result frame (stream exception or natural EOF
 //                                  with a send still pending) — the abort/sdk.exit requested-teardown path
 //                                  stays silent
 //     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
 //     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
-//     { type:'sdk.error',               sessionId, message }
+//     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
+//                                  (sanitized text, no [ede_diagnostic] lines); never for the user's own Stop
 //     { type:'sdk.exit',                sessionId }
 //     { type:'sdk.permission.request',  sessionId, requestId, subtype:'can_use_tool', tool:{name,input}, toolUseID, suggestions, blockedPath, decisionReason }
 //     { type:'sdk.question.request',    sessionId, requestId, questions }
 //     { type:'sdk.permission.cancelled', sessionId, requestId }
 //     { type:'sdk.question.cancelled',  sessionId, requestId }
+//
+//   sidecar → Rust (stderr): log records only, one JSON object per line
+//     ({ severity, component, event, ...ids }, log.mjs). Rust re-emits each
+//     through `tracing` at its severity (claude_sidecar_io.rs).
 //
 // The Rust side normalizes `sdk.* -> freshAgent.*` (a port of
 // server/fresh-agent/sdk-events.ts) and wraps each in a `freshAgent.event`
@@ -53,8 +58,8 @@
 //
 // A sidecar death mid-turn can therefore NEVER produce a false completion
 // from this process's own stdout: `sdk.turn.complete` rides every SDK
-// `result` (the unified needs-attention edge — the interrupted turn's own
-// result is consumed silently by the accepted-interrupt mark) plus the
+// `result` (the unified needs-attention edge — only the stopped turn's own
+// aborted result is silenced, by the accepted-interrupt mark) plus the
 // consumeStream finally mint for a result-less turn end (stream exception or
 // natural EOF with a send pending; never the aborted/sdk.exit teardown). If
 // the PROCESS dies mid-turn, stdout simply ends and no completion is ever
@@ -75,11 +80,15 @@
 
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
-import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
+import { configureSession, userMessageContent } from './session-settings.mjs'
+import { resultFrames } from './sdk-message-frames.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
+import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 import { hostedMcpServers } from './hosted-mcp.mjs'
+import { cliStderrLogger, errorText, log } from './log.mjs'
+import { isHostedSidecar } from './hosted.mjs'
 import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 import {
   canUseTool as routeCanUseTool,
@@ -94,12 +103,9 @@ import {
 const sdkModule = await import(process.env.FRESHELL_CLAUDE_SDK_QUERY_MODULE || '@anthropic-ai/claude-agent-sdk')
 const { query } = sdkModule
 
-// ── stdout writer (newline-JSON; stderr is the only log sink) ────────────────
+// ── stdout writer (newline-JSON; stderr is the only log sink: log.mjs) ───────
 function emit(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`)
-}
-function logerr(msg) {
-  process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', message: msg })}\n`)
 }
 
 // ── nanoid()-compatible bare id: 21 url-safe chars ([A-Za-z0-9_-]) ───────────
@@ -237,22 +243,9 @@ function handleSdkMessage(sessionId, msg) {
     case 'user': {
       // The SDK replays actual persisted user messages when this query opts in.
       // Only the unique UUID that this sidecar supplied for a checkpointed send
-      // can resolve its attempt; assistant/tool/result frames and unrelated
-      // user rows are never identity evidence.
-      if (msg.isReplay === true && msg.message?.role === 'user' && isUuid(msg.uuid)) {
-        const attempt = st.pendingCheckpointAttempts.get(msg.uuid)
-        if (attempt) {
-          st.pendingCheckpointAttempts.delete(msg.uuid)
-          emit({
-            type: 'sdk.checkpointTurnIdentity',
-            sessionId,
-            logicalAttemptId: attempt.logicalAttemptId,
-            requestId: attempt.requestId,
-            nativeTurnId: msg.uuid,
-            displayTurnId: msg.uuid,
-          })
-        }
-      }
+      // can resolve its attempt (checkpoint-identity.mjs).
+      const identity = takeCheckpointIdentity(st.pendingCheckpointAttempts, sessionId, msg)
+      if (identity) emit(identity)
       break
     }
     case 'system': {
@@ -309,22 +302,14 @@ function handleSdkMessage(sessionId, msg) {
       // The awaited turn's terminal frame arrived: drop one pending send
       // (clamped at 0 — an unsolicited result must not underflow the counter).
       st.pendingResults = Math.max(0, st.pendingResults - 1)
-      const usage = msg.usage
-        ? {
-            input_tokens: msg.usage.input_tokens,
-            output_tokens: msg.usage.output_tokens,
-            cache_creation_input_tokens: msg.usage.cache_creation_input_tokens,
-            cache_read_input_tokens: msg.usage.cache_read_input_tokens,
-          }
-        : undefined
-      emit({ type: 'sdk.result', sessionId, result: msg.subtype, durationMs: msg.duration_ms, costUsd: msg.total_cost_usd, usage })
-      const failure = resultErrorMessage(msg)
-      if (failure) emit({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
-      // Unified attention edge: any turn end rings unless this result is the
-      // interrupted turn's own (the SDK contract orders the settle receipt
-      // before it). No outcome rides the wire — the client treats all ends
-      // identically.
-      if (st.turnCompleteGate.resultEmitsAttention()) {
+      // The gate's verdict comes first: the stopped turn's own (aborted)
+      // result is the user's Stop, so it carries neither a bell nor a failure
+      // banner (G03). Any other turn end rings, including one a Stop missed
+      // (G06); a failed one also reports why. No outcome rides the edge — the
+      // client treats all ends identically.
+      const rings = st.turnCompleteGate.resultEmitsAttention(msg)
+      for (const frame of resultFrames(sessionId, msg, { userStopped: !rings })) emit(frame)
+      if (rings) {
         const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
         st.lastTurnCompleteAt = at
         emit({ type: 'sdk.turn.complete', sessionId, at })
@@ -343,11 +328,18 @@ function handleSdkMessage(sessionId, msg) {
 
 async function consumeStream(sessionId, sdkQuery) {
   const st = sessions.get(sessionId)
+  let failure
   try {
     for await (const msg of sdkQuery) handleSdkMessage(sessionId, msg)
   } catch (err) {
+    failure = err
     emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
   } finally {
+    // A requested teardown (abort) is routine; any other error end is the CLI
+    // dying or failing under the session.
+    if (st?.abort.signal.aborted) log('info', 'stream.ended', { sessionId, reason: 'aborted' })
+    else if (failure) log('warn', 'stream.ended', { sessionId, reason: 'stream_error', error: errorText(failure) })
+    else log('info', 'stream.ended', { sessionId, reason: 'stream_eof' })
     // Stream ended (natural end, error, or abort). The transport is closing:
     // clear any parked cards WITHOUT resolving their promises (LB-04: a late
     // resolve lands inside the SDK's floating promise chain → unhandled
@@ -360,9 +352,10 @@ async function consumeStream(sessionId, sdkQuery) {
     // witness: ring the unified edge (the abort/sdk.exit path is a
     // REQUESTED teardown and deliberately stays silent). pendingResults
     // covers the accept→first-message window turnOpen cannot see, and
-    // counts queued sends a boolean would lose. The gate consult is LAST in
-    // the guard so a no-mint path never consumes an interrupt mark.
-    if (st && st.pendingResults > 0 && !st.abort.signal.aborted && st.turnCompleteGate.resultEmitsAttention()) {
+    // counts queued sends a boolean would lose. A pending Stop mark does not
+    // silence it: only an aborted result is the stopped turn's own
+    // (turn-complete-gate.mjs), and this end has no result.
+    if (st && st.pendingResults > 0 && !st.abort.signal.aborted) {
       const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
       st.lastTurnCompleteAt = at
       emit({ type: 'sdk.turn.complete', sessionId, at })
@@ -413,9 +406,7 @@ function handleCreate(req) {
     // events (macrotasks) cannot interleave inside that finally.
     sessions.set(sessionId, state)
 
-    const sdkStderr = process.env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
-      ? data => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', event: 'provider.stderr', bytes: Buffer.byteLength(String(data)) })}\n`)
-      : data => logerr(`sdk stderr: ${String(data).trimEnd()}`)
+    const sdkStderr = cliStderrLogger(log, { hosted: isHostedSidecar(), fields: { sessionId } })
     const sdkQuery = query({
       prompt: iterable,
       options: {
@@ -467,14 +458,15 @@ function handleCreate(req) {
         if (commands === undefined) return
         state.commandCatalog = commands
         publishCommands(sessionId, state)
-      }).catch((error) => logerr(`session commands unavailable: ${error?.message || error}`))
+      }).catch((error) => log('warn', 'commands.unavailable', { sessionId, error: errorText(error) }))
     }
 
     // Return the placeholder before the native system/init identity arrives.
     emit({ type: 'created', requestId, sessionId })
-    consumeStream(sessionId, sdkQuery).catch((err) => logerr(`consume error: ${err?.message}`))
+    consumeStream(sessionId, sdkQuery).catch((err) => log('error', 'stream.consume_failed', { sessionId, error: errorText(err) }))
   } catch (err) {
     if (sessionId) sessions.delete(sessionId)
+    log('warn', 'create.failed', { requestId, error: errorText(err) })
     emit({ type: 'create.failed', requestId, message: err?.message || String(err) })
   }
 }
@@ -489,12 +481,7 @@ function handleSend(req) {
   // the quiesce handler can drain never-handed compacts from the input queue
   // and so a same-tick handoff arms the BUSY-forcing handed flag.
   const isCompact = /^\s*\/compact(\s|$)/.test(String(req.text ?? ''))
-  const attempt = req.checkpointAttempt
-  const checkpointAttempt = attempt && isUuid(attempt.uuid)
-    && typeof attempt.logicalAttemptId === 'string' && attempt.logicalAttemptId.length > 0
-    && typeof attempt.requestId === 'string' && attempt.requestId.length > 0
-    ? { uuid: attempt.uuid, logicalAttemptId: attempt.logicalAttemptId, requestId: attempt.requestId }
-    : undefined
+  const checkpointAttempt = checkpointAttemptOf(req.checkpointAttempt)
   const userMessage = {
       type: 'user',
       message: { role: 'user', content: userMessageContent(req.text, req.images) },
@@ -502,15 +489,7 @@ function handleSend(req) {
       session_id: st.cliSessionId || 'default',
       ...(checkpointAttempt ? { uuid: checkpointAttempt.uuid } : {}),
     }
-  if (checkpointAttempt) {
-    // Bound stale/missing-replay entries. Eviction means unavailable identity,
-    // never an approximate join by request order or prompt text.
-    st.pendingCheckpointAttempts.delete(checkpointAttempt.uuid)
-    st.pendingCheckpointAttempts.set(checkpointAttempt.uuid, checkpointAttempt)
-    while (st.pendingCheckpointAttempts.size > 128) {
-      st.pendingCheckpointAttempts.delete(st.pendingCheckpointAttempts.keys().next().value)
-    }
-  }
+  if (checkpointAttempt) rememberCheckpointAttempt(st.pendingCheckpointAttempts, checkpointAttempt)
   st.inputStream.push(userMessage, isCompact)
   // Unified attention bookkeeping: this send is now ACCEPTED (the input-stream
   // push succeeded) and awaits exactly one terminal frame — a COUNTER, not a
@@ -520,11 +499,6 @@ function handleSend(req) {
   // the first assistant/system frame and cannot see the accept→first-message
   // window. The gate is NOT reset here — see turn-complete-gate.mjs.
   st.pendingResults += 1
-}
-
-function isUuid(value) {
-  return typeof value === 'string'
-    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 }
 
 async function handleConfigure(req) {
@@ -539,7 +513,7 @@ async function handleConfigure(req) {
     })
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings })
   } catch (err) {
-    logerr(`session settings failed: ${err?.message || err}`)
+    log('warn', 'configure.failed', { sessionId: req.sessionId, requestId: req.requestId, error: errorText(err) })
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, settings: { ...st.settings }, message: String(err?.message || err) })
   }
 }
@@ -598,11 +572,12 @@ function handleInterrupt(req) {
   // the NEXT unrelated turn's result, silently suppressing exactly the ring
   // this feature exists to produce. While a turn IS pending, the settle
   // receipt (sdk.d.ts:3765) lands BEFORE the interrupted turn's own result,
-  // so the mark deterministically consumes exactly that result (including the
-  // crash-order case where the result wins the race to the wire — the mark
-  // was armed at request time and is still there to consume it). A REJECTED
-  // interrupt (the turn kept running) clears the mark; noteInterruptSettled
-  // stays in both promise arms — settle(true) without a mark is a no-op.
+  // so the mark is consumed by exactly that result, and silences it only if
+  // the Stop landed (the result was aborted). A Stop that missed — the CLI was
+  // still starting (T13), or the turn finished first — leaves a result that
+  // rings. A REJECTED interrupt (the turn kept running) clears the mark;
+  // noteInterruptSettled stays in both promise arms — settle(true) without a
+  // mark is a no-op.
   if (st.pendingResults > 0) st.turnCompleteGate.noteInterruptRequest()
   st.query.interrupt()
     .then(() => {
@@ -611,7 +586,7 @@ function handleInterrupt(req) {
     })
     .catch((err) => {
       st.turnCompleteGate.noteInterruptSettled(false)
-      logerr(`interrupt failed: ${err?.message || err}`)
+      log('warn', 'interrupt.failed', { sessionId: req.sessionId, error: errorText(err) })
       emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: String(err?.message || err) })
     })
 }
@@ -632,7 +607,8 @@ rl.on('line', (line) => {
   const trimmed = line.trim()
   if (!trimmed) return
   let req
-  try { req = JSON.parse(trimmed) } catch { logerr(`unparseable request: ${trimmed.slice(0, 200)}`); return }
+  // A request line may carry prompt text: log its size, never its content.
+  try { req = JSON.parse(trimmed) } catch { log('warn', 'request.unparseable', { bytes: Buffer.byteLength(trimmed) }); return }
   switch (req?.type) {
     case 'create': handleCreate(req); break
     case 'send': handleSend(req); break
@@ -652,13 +628,13 @@ rl.on('line', (line) => {
       // no-op; the entry stays parked for a later valid respond (mirrors the
       // coerced-answers asymmetry one arm below).
       if (req.decision == null) {
-        logerr(`permission.respond: missing decision for request ${req.requestId} (session ${req.sessionId})`)
+        log('warn', 'respond.invalid', { kind: 'permission', sessionId: req.sessionId, requestId: req.requestId })
         break
       }
       // Unknown requestId: lose-safely (Rust validates its pending set first) —
       // stderr log only, no frame.
       if (!respondPermission(st, String(req.requestId), req.decision)) {
-        logerr(`permission.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+        log('warn', 'respond.unknown', { kind: 'permission', sessionId: req.sessionId, requestId: req.requestId })
       }
       break
     }
@@ -667,12 +643,12 @@ rl.on('line', (line) => {
       if (!st) break
       const answers = req.answers && typeof req.answers === 'object' ? req.answers : {}
       if (!respondQuestion(st, String(req.requestId), answers)) {
-        logerr(`question.respond: no pending request ${req.requestId} for session ${req.sessionId}`)
+        log('warn', 'respond.unknown', { kind: 'question', sessionId: req.sessionId, requestId: req.requestId })
       }
       break
     }
     case 'shutdown': shutdown(); process.exit(0); break
-    default: logerr(`unknown request type: ${req?.type}`)
+    default: log('warn', 'request.unknown_type', { requestType: String(req?.type) })
   }
 })
 // stdin closed (Rust reaped us): abort every query and exit so no claude CLI
@@ -684,11 +660,11 @@ rl.on('close', () => { shutdown(); process.exit(0) })
 // the SDK query is aborted, and nothing stops the claude CLI: it runs on until
 // it next writes into its own closed pipe or Rust kills the process tree.
 process.stdout.on('error', (err) => {
-  logerr(`stdout closed (${err?.code || err}); shutting down`)
+  log('warn', 'stdout.closed', { code: err?.code ?? null, error: errorText(err) })
   shutdown()
   process.exit(0)
 })
 process.on('SIGTERM', () => { shutdown(); process.exit(0) })
 process.on('SIGINT', () => { shutdown(); process.exit(0) })
 
-logerr('ready')
+log('info', 'sidecar.ready', { pid: process.pid })

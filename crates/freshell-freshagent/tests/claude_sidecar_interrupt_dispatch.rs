@@ -10,8 +10,8 @@
 //! This test spawns the REAL `index.mjs` source with `node` and drives its stdin
 //! directly. The `@anthropic-ai/claude-agent-sdk` dependency is vendored via
 //! `pnpm install` into the sidecar package's own node_modules and is NOT present
-//! in a plain checkout/CI, so the test copies the real sidecar entrypoint and its
-//! local helper modules VERBATIM into a temp dir with a
+//! in a plain checkout/CI, so the test copies the real sidecar entrypoint and every
+//! local helper module (each `*.mjs` of the package) VERBATIM into a temp dir with a
 //! stub `node_modules/@anthropic-ai/claude-agent-sdk` that satisfies only the
 //! top-level SDK import (the interrupt-dispatch path under test never calls
 //! `query()`; the stub throws if it is called). Only module RESOLUTION is redirected
@@ -43,15 +43,32 @@ const STUB_SDK_PACKAGE_JSON: &str = r#"{
 }
 "#;
 
-/// Read one real sidecar module verbatim. The entrypoint and every local helper
-/// it imports must be present in the staged dir for ESM resolution to succeed.
-fn real_sidecar_source(module: &str) -> String {
-    let path = format!(
-        "{}/../freshell-claude-sidecar/{module}",
-        env!("CARGO_MANIFEST_DIR")
+/// Every real sidecar module (the entrypoint and each local helper it imports),
+/// read verbatim. All of them are staged, so ESM resolution succeeds however the
+/// sidecar splits its modules.
+fn real_sidecar_modules() -> Vec<(String, String)> {
+    let package = format!("{}/../freshell-claude-sidecar", env!("CARGO_MANIFEST_DIR"));
+    let mut modules: Vec<(String, String)> = std::fs::read_dir(&package)
+        .unwrap_or_else(|e| panic!("list the real crates/freshell-claude-sidecar: {e}"))
+        .map(|entry| entry.expect("sidecar dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "mjs"))
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 module name")
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read the real {}: {e}", path.display()));
+            (name, source)
+        })
+        .collect();
+    modules.sort();
+    assert!(
+        modules.iter().any(|(name, _)| name == "index.mjs"),
+        "the sidecar entrypoint index.mjs is missing from {package}"
     );
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read the real crates/freshell-claude-sidecar/{module}: {e}"))
+    modules
 }
 
 /// Keep the child and its pipe readers owned until every assertion has settled,
@@ -83,17 +100,8 @@ impl Drop for SidecarProcess {
 #[test]
 fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
     let dir = tempfile::tempdir().expect("create temp dir");
-    for module in [
-        "index.mjs",
-        "exec-profile.mjs",
-        "hosted-mcp.mjs",
-        "monotonic-clock.mjs",
-        "permission-channel.mjs",
-        "sdk-env.mjs",
-        "session-settings.mjs",
-        "turn-complete-gate.mjs",
-    ] {
-        std::fs::write(dir.path().join(module), real_sidecar_source(module))
+    for (module, source) in real_sidecar_modules() {
+        std::fs::write(dir.path().join(&module), source)
             .unwrap_or_else(|e| panic!("copy real {module} verbatim: {e}"));
     }
     let sdk_dir = dir

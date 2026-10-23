@@ -75,8 +75,9 @@
 // Wire-truth completion invariant (unified needs-attention contract; the REAL
 // gate imported above): a closing turn emits `sdk.result{result:<subtype>}`
 // ALWAYS and the attention edge `sdk.turn.complete{sessionId,at}` on EVERY
-// subtype — success, error, max-turns, denied — EXCEPT a result consumed by a
-// pending accepted user-interrupt mark (the user's own interrupt never rings).
+// subtype — success, error, max-turns, denied — EXCEPT the stopped turn's own
+// aborted result under a pending accepted user-interrupt mark (the user's own
+// interrupt never rings).
 // The `stream-error` lane models the real consumeStream catch+finally for a
 // mid-turn stream exception: sdk.error + the finally-minted edge + session
 // teardown WITHOUT exiting the process; the `crash` lane stays as-is (a real
@@ -117,6 +118,8 @@ import { createTurnCompleteGate } from '../../../../crates/freshell-claude-sidec
 import { nextMonotonic } from '../../../../crates/freshell-claude-sidecar/monotonic-clock.mjs'
 
 const provider = process.env.FRESHELL_FAKE_PROVIDER ?? 'kilroy'
+/** The SDK result the pinned CLI reports for a turn a Stop landed on (T11). */
+const STOPPED_RESULT = Object.freeze({ type: 'result', subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
 const env = process.env
 appendLaunchLedger({ provider, argv: process.argv.slice(2), env })
 const program = loadProgram(env)
@@ -274,22 +277,22 @@ async function render(event) {
         model: st.settings.model ?? 'fixture-model',
       })
       appendTranscript(st.cliSessionId, st.cwd, 'assistant', data.text ?? 'Fixture turn', st.transcriptOverride)
-      let subtype = data.subtype ?? 'success'
-      if (st.interrupted) {
-        // An in-flight interrupt deferred to this scripted completion: the
-        // interrupted turn's own terminal result is non-success (real SDK
-        // contract — an interrupted turn never ends 'success').
-        subtype = 'error_during_execution'
-        st.interrupted = false
-      }
+      // An in-flight interrupt deferred to this scripted completion: the
+      // interrupted turn's own terminal result is the CLI's aborted shape
+      // (T11 — an interrupted turn never ends 'success').
+      const result = st.interrupted
+        ? STOPPED_RESULT
+        : { type: 'result', subtype: data.subtype ?? 'success' }
+      st.interrupted = false
       st.pendingResults = Math.max(0, st.pendingResults - 1)
-      emit({ type: 'sdk.result', sessionId, result: subtype })
-      // Unified attention edge (the REAL gate): every result subtype rings
-      // except one consumed by a pending accepted user-interrupt mark. The
-      // `at` mint clamps through the REAL sidecar's shared clock
-      // (monotonic-clock.mjs) — two same-ms edges stay strictly increasing,
-      // or the client's `at <= last` dedupe silently drops the second ring.
-      if (st.turnCompleteGate.resultEmitsAttention()) {
+      emit({ type: 'sdk.result', sessionId, result: result.subtype })
+      // Unified attention edge (the REAL gate): every result rings except the
+      // stopped turn's own aborted result under a pending accepted user
+      // interrupt mark. The `at` mint clamps through the REAL sidecar's shared
+      // clock (monotonic-clock.mjs) — two same-ms edges stay strictly
+      // increasing, or the client's `at <= last` dedupe silently drops the
+      // second ring.
+      if (st.turnCompleteGate.resultEmitsAttention(result)) {
         const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
         st.lastTurnCompleteAt = at
         emit({ type: 'sdk.turn.complete', sessionId, at })
@@ -302,7 +305,8 @@ async function render(event) {
       // The real consumeStream catch+finally for a mid-turn stream exception:
       // the catch arm's sdk.error, then the finally's teardown — cancel every
       // parked entry, mint the unified attention edge (a turn ended with NO
-      // result frame: pendingResults > 0, not aborted, gate consulted), idle
+      // result frame: pendingResults > 0, not aborted; a pending Stop mark
+      // never silences a result-less end), idle
       // status — and the session is deleted WITHOUT exiting the process (a
       // later create on the same live process works). The separate `crash`
       // lane deliberately stays different: no protocol frame + process exit.
@@ -317,7 +321,7 @@ async function render(event) {
           })
         }
         st.pending = 0
-        if (st.pendingResults > 0 && st.turnCompleteGate.resultEmitsAttention()) {
+        if (st.pendingResults > 0) {
           const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
           st.lastTurnCompleteAt = at
           emit({ type: 'sdk.turn.complete', sessionId, at })
@@ -564,8 +568,8 @@ async function handleInput(line) {
       // counter here would let a later stream-error lane mint a phantom ring
       // (task-004-review F-N1).
       st.pendingResults = 0
-      emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution' })
-      st.turnCompleteGate.resultEmitsAttention()
+      emit({ type: 'sdk.result', sessionId: msg.sessionId, result: STOPPED_RESULT.subtype })
+      st.turnCompleteGate.resultEmitsAttention(STOPPED_RESULT)
       st.turnOpen = false
       st.interrupted = false
       emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })

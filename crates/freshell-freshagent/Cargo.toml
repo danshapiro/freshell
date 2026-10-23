@@ -27,6 +27,10 @@ publish.workspace = true
 [features]
 default = []
 provider-qualification = ["freshell-agent-runtime/provider-qualification"]
+# Test seams for other crates' integration tests (never enabled in a production
+# build): FreshClaudeState::with_sidecar_environment, used by the freshell-ws
+# claude rigs (crates/freshell-ws/tests/common/claude_rig.rs).
+test-support = []
 
 [dependencies]
 # kata b8ke Task 3: the ONE server-wide runtime-ownership coordinator this

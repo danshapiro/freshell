@@ -18,6 +18,11 @@ async fn managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_pro
             "exec-profile.mjs",
             include_str!("../../freshell-claude-sidecar/exec-profile.mjs"),
         ),
+        // Both modules above read the hosted mode through hosted.mjs.
+        (
+            "hosted.mjs",
+            include_str!("../../freshell-claude-sidecar/hosted.mjs"),
+        ),
         ("probe.mjs", include_str!("managed_provider_sdk_probe.mjs")),
     ] {
         std::fs::write(fixture.path().join(name), source).unwrap();
