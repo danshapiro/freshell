@@ -79,10 +79,17 @@ export function resultFrames(sessionId, result, { userStopped }) {
 // ── content kinds (docs/plans/2026-10-22-freshclaude-transcript-live.md §4.2) ──
 //
 // framesForSdkMessage maps the SDK messages whose content reaches the server:
-// assistant messages, stream events and the compaction status frames. Every
-// other kind maps to no frame here: `result`, `system/init`, `commands_changed`
-// and the checkpoint replay binding carry side effects, so index.mjs handles
-// them itself.
+// assistant and user messages, stream events and the compaction status frames.
+// Every other kind maps to no frame here: `result`, `system/init`,
+// `commands_changed` and the checkpoint replay binding carry side effects, so
+// index.mjs handles them itself.
+//
+// Transcript announcements: the CLI writes each assistant and user message,
+// each compaction boundary and each local command's output to its transcript
+// (JSONL) under the message's own uuid (main or subagent file), about 100 ms
+// after it emits it. Each such message is followed by
+// `sdk.session.changed {reason:'transcript', uuid, parentToolUseId}`, which
+// tells the client to refetch the snapshot and which line to expect in it.
 
 /**
  * The per-session state of the content mapping. index.mjs keeps one per
@@ -100,11 +107,13 @@ export function createFrameState() {
 export function framesForSdkMessage(sessionId, msg, session) {
   switch (msg?.type) {
     case 'assistant': return assistantFrames(sessionId, msg)
+    case 'user': return transcriptAnnouncement(sessionId, msg)
     case 'stream_event': return streamEventFrames(sessionId, msg, session.stream)
     case 'system':
       switch (msg.subtype) {
         case 'status': return statusFrames(sessionId, msg)
         case 'compact_boundary': return compactBoundaryFrames(sessionId, msg)
+        case 'local_command_output': return transcriptAnnouncement(sessionId, msg)
         default: return []
       }
     default: return []
@@ -120,10 +129,39 @@ function contentBlock(block) {
   return block
 }
 
-/** An assistant message (the CLI sends one per completed content block): `sdk.assistant`. */
+/** The parent tool use of a subagent (sidechain) message, or null for the main thread. */
+function parentToolUseIdOf(msg) {
+  return typeof msg.parent_tool_use_id === 'string' && msg.parent_tool_use_id ? msg.parent_tool_use_id : null
+}
+
+/**
+ * The announcement that the CLI writes this message to its transcript under
+ * its uuid (none for a message without one).
+ */
+export function transcriptAnnouncement(sessionId, msg) {
+  if (typeof msg.uuid !== 'string' || !msg.uuid) return []
+  return [{ type: 'sdk.session.changed', sessionId, reason: 'transcript', uuid: msg.uuid, parentToolUseId: parentToolUseIdOf(msg) }]
+}
+
+/**
+ * An assistant message (the CLI sends one per completed content block, all
+ * sharing the API message id): `sdk.assistant`, then its announcement. The
+ * uuid and messageId bind a streamed block to the transcript line it becomes.
+ */
 export function assistantFrames(sessionId, msg) {
   const content = msg.message?.content || []
-  return [{ type: 'sdk.assistant', sessionId, content: content.map(contentBlock), model: msg.message?.model }]
+  return [
+    {
+      type: 'sdk.assistant',
+      sessionId,
+      content: content.map(contentBlock),
+      model: msg.message?.model,
+      uuid: msg.uuid,
+      messageId: msg.message?.id,
+      parentToolUseId: parentToolUseIdOf(msg),
+    },
+    ...transcriptAnnouncement(sessionId, msg),
+  ]
 }
 
 /** A streaming event: `sdk.stream`. */
@@ -149,5 +187,5 @@ export function statusFrames(sessionId, msg) {
  */
 export function compactBoundaryFrames(sessionId, msg) {
   const trigger = msg.compact_metadata?.trigger === 'manual' ? 'manual' : 'auto'
-  return [{ type: 'sdk.compact_boundary', sessionId, trigger }]
+  return [{ type: 'sdk.compact_boundary', sessionId, trigger }, ...transcriptAnnouncement(sessionId, msg)]
 }

@@ -1,0 +1,67 @@
+// @vitest-environment node
+//
+// The frames a live turn sends the server, through the production index.mjs
+// over the CLI simulator (harness.ts): transcript announcements whose uuids
+// land in the transcript the (simulated) CLI writes, assistant frames that
+// carry their ids, and what the compaction and permission-mode status frames
+// become. The mapping itself is pinned on the pinned CLI's recorded sequences
+// in sdk-content-frames.test.ts; test/integration/providers/
+// claude-live-frames.test.ts runs the same sidecar over the real pinned CLI.
+
+import fs from 'node:fs'
+import path from 'node:path'
+import { describe, expect, it } from 'vitest'
+import { startRealSidecar, type RealSidecar, type SidecarFrame } from './harness'
+
+/** The uuids of the lines the simulated CLI has written for its session so far. */
+function transcriptUuids(sidecar: RealSidecar, cliSessionId: string): Set<string> {
+  const projects = path.join(sidecar.claudeConfigDir, 'projects')
+  const uuids = new Set<string>()
+  for (const dir of fs.existsSync(projects) ? fs.readdirSync(projects) : []) {
+    const file = path.join(projects, dir, `${cliSessionId}.jsonl`)
+    if (!fs.existsSync(file)) continue
+    const text = fs.readFileSync(file, 'utf8')
+    for (const line of text.slice(0, text.lastIndexOf('\n') + 1).split('\n').filter(Boolean)) {
+      const row = JSON.parse(line)
+      if (typeof row.uuid === 'string') uuids.add(row.uuid)
+    }
+  }
+  return uuids
+}
+
+const isAnnouncement = (frame: SidecarFrame) => frame.type === 'sdk.session.changed' && frame.reason === 'transcript'
+
+describe('a live turn\'s frames', () => {
+  it('announces each transcript message right after its content, and every announced uuid lands in the transcript', async () => {
+    const sidecar = await startRealSidecar()
+    const sessionId = await sidecar.create()
+    const checkpointAttempt = { uuid: '0b8e1f4c-6a55-4f4e-9d0a-3c2b1a090807', requestId: 'send-1', logicalAttemptId: 'attempt-1' }
+    sidecar.send({ type: 'send', sessionId, text: 'TOOL:sleep=0', checkpointAttempt })
+    await sidecar.waitFor('sdk.result', 'the turn result')
+    const { cliSessionId } = await sidecar.waitFor('sdk.session.init')
+
+    const announcements = sidecar.frames.filter(isAnnouncement)
+    // The prompt, the tool call, the tool result and the reply.
+    expect(announcements.map((frame) => frame.uuid)).toContain(checkpointAttempt.uuid)
+    expect(announcements.length).toBeGreaterThanOrEqual(4)
+    for (const announcement of announcements) expect(announcement).toMatchObject({ sessionId, parentToolUseId: null })
+
+    // Each sdk.assistant is followed at once by the announcement of its own uuid.
+    const assistants = sidecar.frames.filter((frame) => frame.type === 'sdk.assistant')
+    expect(assistants.length).toBeGreaterThanOrEqual(2)
+    for (const assistant of assistants) {
+      expect(assistant).toMatchObject({ uuid: expect.any(String), messageId: expect.any(String), parentToolUseId: null })
+      expect(sidecar.frames[sidecar.frames.indexOf(assistant) + 1]).toMatchObject({ type: 'sdk.session.changed', reason: 'transcript', uuid: assistant.uuid })
+    }
+    // The prompt's replay binds the checkpoint first, then is announced.
+    const identity = sidecar.frames.findIndex((frame) => frame.type === 'sdk.checkpointTurnIdentity')
+    expect(identity).toBeGreaterThanOrEqual(0)
+    expect(sidecar.frames[identity + 1]).toMatchObject({ type: 'sdk.session.changed', uuid: checkpointAttempt.uuid })
+
+    // The CLI writes its transcript about 100 ms after it emits a message.
+    await expect.poll(() => {
+      const written = transcriptUuids(sidecar, cliSessionId)
+      return announcements.filter((frame) => !written.has(frame.uuid)).map((frame) => frame.uuid)
+    }, { timeout: 2_000 }).toEqual([])
+  })
+})

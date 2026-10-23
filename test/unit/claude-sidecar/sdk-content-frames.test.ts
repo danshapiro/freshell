@@ -31,6 +31,23 @@ function recorded(scenario: string): Msg[] {
     .map((line) => JSON.parse(line).msg as Msg)
 }
 
+/** The uuids of the lines the CLI wrote: the main transcript and every subagent transcript. */
+function persistedUuids(scenario: string): Set<string> {
+  const files = [path.join(RECORDINGS, scenario, 'session.jsonl')]
+  const subagents = path.join(RECORDINGS, scenario, 'session', 'subagents')
+  if (fs.existsSync(subagents)) {
+    for (const name of fs.readdirSync(subagents)) if (name.endsWith('.jsonl')) files.push(path.join(subagents, name))
+  }
+  const uuids = new Set<string>()
+  for (const file of files) {
+    for (const line of fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)) {
+      const row = JSON.parse(line)
+      if (typeof row.uuid === 'string') uuids.add(row.uuid)
+    }
+  }
+  return uuids
+}
+
 /** What the sidecar knows about its session when a message arrives. */
 function session(state = createFrameState(), overrides: Record<string, unknown> = {}) {
   return { stream: state, permissionMode: 'bypassPermissions', turnPending: true, ...overrides }
@@ -54,6 +71,59 @@ describe('framesForSdkMessage over the pinned CLI\'s recorded sequences', () => 
       expect(assistant[0]).toMatchObject({ sessionId: 's1', model: msg.message.model })
       expect(assistant[0].content.map((block: Msg) => block.type)).toEqual(msg.message.content.map((block: Msg) => block.type))
     }
+  })
+
+  it.each(SCENARIOS)('%s: sdk.assistant carries the message uuid, the API message id and the parent tool use id', (scenario) => {
+    for (const { msg, frames } of mapRecording(scenario).filter(({ msg }) => msg.type === 'assistant')) {
+      expect(frames.find((frame: Msg) => frame.type === 'sdk.assistant')).toMatchObject({
+        uuid: msg.uuid,
+        messageId: msg.message.id,
+        parentToolUseId: msg.parent_tool_use_id ?? null,
+      })
+    }
+  })
+
+  it.each(SCENARIOS)('%s: every message the CLI wrote to its transcript is announced once, after its content, and nothing else is', (scenario) => {
+    const persisted = persistedUuids(scenario)
+    const mapped = mapRecording(scenario)
+    const announced: string[] = []
+    for (const { msg, frames } of mapped) {
+      const announcements = frames.filter((frame: Msg) => frame.type === 'sdk.session.changed' && frame.reason === 'transcript')
+      for (const announcement of announcements) {
+        expect(announcement).toEqual({ type: 'sdk.session.changed', sessionId: 's1', reason: 'transcript', uuid: msg.uuid, parentToolUseId: msg.parent_tool_use_id ?? null })
+        expect(frames.at(-1)).toBe(announcement)
+        announced.push(announcement.uuid)
+      }
+    }
+    // Exactly the SDK messages whose uuid is a line of the main or a subagent transcript.
+    const expected = mapped.map(({ msg }) => msg.uuid).filter((uuid) => persisted.has(uuid))
+    expect(expected.length).toBeGreaterThan(0)
+    expect(announced).toEqual(expected)
+  })
+
+  it('announces sidechain (subagent) messages with the tool use that started the subagent', () => {
+    const sidechain = mapRecording('tools-sync').filter(({ msg }) => (msg.type === 'assistant' || msg.type === 'user') && msg.parent_tool_use_id)
+    expect(sidechain.length).toBeGreaterThan(0)
+    for (const { frames } of sidechain) {
+      expect(frames.at(-1)).toMatchObject({ type: 'sdk.session.changed', reason: 'transcript', parentToolUseId: 'toolu_agent1' })
+    }
+  })
+
+  it('announces the transcript lines of a compaction and of local command output', () => {
+    const boundary = mapRecording('compact-ok').find(({ msg }) => msg.type === 'system' && msg.subtype === 'compact_boundary')!
+    expect(boundary.frames.map((frame: Msg) => frame.type)).toEqual(['sdk.compact_boundary', 'sdk.session.changed'])
+    expect(boundary.frames[1]).toMatchObject({ reason: 'transcript', uuid: boundary.msg.uuid, parentToolUseId: null })
+    // The SDK's own local command output message (SDKLocalCommandOutputMessage).
+    const output = { type: 'system', subtype: 'local_command_output', content: 'Total cost: $0.00', uuid: '5f0f3a3e-0d0e-4a43-9a0e-0a3c6b1c2d3e', session_id: 'c1' }
+    expect(framesForSdkMessage('s1', output, session())).toEqual([
+      { type: 'sdk.session.changed', sessionId: 's1', reason: 'transcript', uuid: output.uuid, parentToolUseId: null },
+    ])
+  })
+
+  it('a message without a uuid is not announced', () => {
+    expect(framesForSdkMessage('s1', { type: 'user', message: { role: 'user', content: 'hi' }, parent_tool_use_id: null }, session())).toEqual([])
+    const frames = framesForSdkMessage('s1', { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'x' }] }, parent_tool_use_id: null }, session())
+    expect(frames.map((frame: Msg) => frame.type)).toEqual(['sdk.assistant'])
   })
 
   it.each(SCENARIOS)('%s: messages that carry nothing for the server map to no frame', (scenario) => {

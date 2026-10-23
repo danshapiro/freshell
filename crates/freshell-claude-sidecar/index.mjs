@@ -37,7 +37,9 @@
 //                                    turn), and the sidecar then exits with code 2.
 //     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
 //     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
-//     { type:'sdk.assistant',           sessionId, content, model }
+//     { type:'sdk.assistant',           sessionId, content, model, uuid, messageId, parentToolUseId }
+//                                  — one per completed content block (blocks of one API message share
+//                                    messageId); parentToolUseId is set inside a subagent, else null
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
@@ -51,6 +53,11 @@
 //                                  — the command catalog without the terminal-only commands (the pinned
 //                                    CLI's until a turn's init names its own): from the boot, then
 //                                    whenever a turn's init or commands_changed changes it
+//     { type:'sdk.session.changed',     sessionId, reason:'transcript', uuid, parentToolUseId }
+//                                  — the CLI writes this message (assistant, user, compaction boundary,
+//                                    local command output) to its transcript under `uuid`, about 100 ms
+//                                    later; sent right after the message's own frames
+//                                    (sdk-message-frames.mjs)
 //     { type:'sdk.status',              sessionId, status }               // compacting (an ended stream sends
 //                                  no status: the server reports the session as exited)
 //     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
