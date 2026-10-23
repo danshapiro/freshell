@@ -991,6 +991,66 @@ mod sim {
         conn.kill(&session_id).await;
     }
 
+    /// Answering one approval then receiving another creates another waiting
+    /// interval. Each request is announced before its one edge; the result
+    /// remains a separate single completion edge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_approvals_each_raise_one_waiting_edge() {
+        let program = json!({"rules": [{
+            "on": "msg:prompt", "match": {"text": "ask twice"},
+            "emit": [
+                {"kind": "approval", "data": {"tool":"Bash", "input":{"command":"ls"}}},
+                {"kind": "approval", "data": {"tool":"Bash", "input":{"command":"pwd"}}},
+                {"kind": "text", "data":{"text":"both answered"}},
+            ],
+        }]})
+        .to_string();
+        let rig =
+            ClaudeRig::start_with_env(RigKind::Sim, &[("FRESHELL_CLAUDE_SIM_PROGRAM", &program)])
+                .await;
+        let mut conn = rig.connect().await;
+        let created = conn
+            .request_create("create-1", json!({"permissionMode":"default"}))
+            .await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        conn.send_text(&session_id, "send-1", "ask twice").await;
+        let mut previous_at = 0i64;
+        for command in ["ls", "pwd"] {
+            let request = conn
+                .wait_for("the next approval", |frame| {
+                    frame["event"]["type"] == "freshAgent.permission.request"
+                        && frame["event"]["tool"]["input"]["command"] == command
+                })
+                .await;
+            let waiting = conn
+                .wait_for("the next waiting edge", |frame| {
+                    frame["event"]["type"] == "freshAgent.turn.waiting"
+                        && frame["event"]["at"]
+                            .as_i64()
+                            .is_some_and(|at| at > previous_at)
+                })
+                .await;
+            previous_at = waiting["event"]["at"].as_i64().unwrap();
+            conn.send(json!({
+                "type":"freshAgent.approval.respond", "provider":"claude", "sessionType":"freshclaude",
+                "sessionId":session_id, "requestId":request["event"]["requestId"],
+                "decision":{"behavior":"allow", "updatedInput":{"command":command}},
+            })).await;
+        }
+        wait_for_results(&mut conn, 1, "the twice-approved turn").await;
+        conn.wait_for_event("freshAgent.turn.complete").await;
+        conn.read_for(Duration::from_millis(200)).await;
+        assert_eq!(
+            session_events(&conn, &session_id, "freshAgent.turn.waiting").len(),
+            2
+        );
+        assert_eq!(
+            session_events(&conn, &session_id, "freshAgent.turn.complete").len(),
+            1
+        );
+        conn.kill(&session_id).await;
+    }
+
     /// In-process observers (design §9.3 I3, §9.2 I-1): every settled turn is
     /// published with the requests it retired and its edge's `at`, a turn the
     /// user's Stop silenced with no `at`; the attention observer hears the

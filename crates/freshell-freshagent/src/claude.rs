@@ -575,10 +575,11 @@ struct PendingQuestionEntry {
 
 /// Handles a response needs after releasing the shared sessions-map lock.
 struct ResponseSession {
+    map_key: String,
+    ownership_id: String,
     stdin: crate::claude_sidecar_io::SidecarWriter,
     sidecar_session_id: String,
     pending: Arc<std::sync::Mutex<ClaudePending>>,
-    broadcast_id: Arc<std::sync::Mutex<String>>,
 }
 
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
@@ -4713,10 +4714,11 @@ impl FreshClaudeState {
             return None;
         };
         Some(ResponseSession {
+            map_key,
+            ownership_id: session.ownership_id.clone(),
             stdin: session.stdin.clone(),
             sidecar_session_id: session.sidecar_session_id.clone(),
             pending: session.pending.clone(),
-            broadcast_id: session.broadcast_id.clone(),
         })
     }
 
@@ -4737,10 +4739,7 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = request_id_string(&msg.request_id);
 
-        let Some(session) = self
-            .response_session(&session_id, msg.session_type)
-            .await
-        else {
+        let Some(session) = self.response_session(&session_id, msg.session_type).await else {
             return;
         };
         if !session
@@ -4817,20 +4816,8 @@ impl FreshClaudeState {
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
             return;
         }
-        let drained = {
-            let mut pending = session.pending.lock().expect("pending lock");
-            pending.permissions.retain(|p| p.request_id != request_id);
-            pending.len() == 0
-        };
-        if drained {
-            let stamp = session
-                .broadcast_id
-                .lock()
-                .expect("broadcast id lock")
-                .clone();
-            drop(session);
-            self.edges.pending_drained(&stamp);
-        }
+        self.complete_pending_response(&session, &request_id, PendingResponse::Approval)
+            .await;
     }
 
     /// Handle a `freshAgent.question.respond` for claude/kilroy: identical ordering
@@ -4842,10 +4829,7 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = request_id_string(&msg.request_id);
 
-        let Some(session) = self
-            .response_session(&session_id, msg.session_type)
-            .await
-        else {
+        let Some(session) = self.response_session(&session_id, msg.session_type).await else {
             return;
         };
         if !session
@@ -4881,20 +4865,8 @@ impl FreshClaudeState {
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
             return;
         }
-        let drained = {
-            let mut pending = session.pending.lock().expect("pending lock");
-            pending.questions.retain(|q| q.request_id != request_id);
-            pending.len() == 0
-        };
-        if drained {
-            let stamp = session
-                .broadcast_id
-                .lock()
-                .expect("broadcast id lock")
-                .clone();
-            drop(session);
-            self.edges.pending_drained(&stamp);
-        }
+        self.complete_pending_response(&session, &request_id, PendingResponse::Question)
+            .await;
     }
 
     /// Handle a `freshAgent.compact` for claude/kilroy: write the legacy adapter's plain
@@ -6835,10 +6807,15 @@ impl FreshClaudeState {
                     }
                     _ => {}
                 }
-                // Task 2: fold the pending approval/question state BEFORE the
-                // normalize/broadcast step, so a respond racing the event never
-                // observes a stale membership check.
-                let pending_change = fold_pending_frame(&pending, &value);
+                // Pending mutation and its request/attention publication are
+                // one ordered operation, fenced to this runtime. A response
+                // may otherwise drain the set between the fold and its edge.
+                if is_pending_frame(&value) {
+                    state
+                        .publish_pending_frame(&session_id, &pending, &value, &session_type)
+                        .await;
+                    continue;
+                }
                 // The status a content line changed is published before the line
                 // is forwarded (`running` precedes the first assistant frame); a
                 // result instead says whether the session is still busy, and the
@@ -6906,15 +6883,6 @@ impl FreshClaudeState {
                     session_type: &session_type,
                     clock: &clock,
                 };
-                // C18: the waiting edge is the server's, on the 0 -> >=1
-                // pending transition (after the request frame it follows).
-                match pending_change {
-                    Some(PendingChange::Waiting) => {
-                        state.edges.waiting(&record);
-                    }
-                    Some(PendingChange::Drained) => state.edges.pending_drained(&stamp),
-                    None => {}
-                }
                 if let LedgerStep::Settled(settled) = step {
                     state.ring_settled_turn(&record, settled);
                     state.publish_claude_status(&ledger, &stamp, &session_type, true);
@@ -7139,6 +7107,12 @@ impl ClaudePending {
     fn len(&self) -> usize {
         self.permissions.len() + self.questions.len()
     }
+
+    fn fold_frame(&mut self, value: &Value) -> Option<PendingChange> {
+        let before = self.len();
+        fold_pending_line(self, value);
+        PendingChange::between(before, self.len())
+    }
 }
 
 /// Fold one sidecar line into the session's pending approval/question state:
@@ -7148,16 +7122,15 @@ impl ClaudePending {
 /// to the client (see `normalize_sdk_type`) — the fold never suppresses a broadcast.
 /// Returns how the line changed the pending set's emptiness (C18: the server's
 /// waiting edge rides the 0 -> >=1 change).
+#[cfg(test)]
 fn fold_pending_frame(
     pending: &std::sync::Mutex<ClaudePending>,
     value: &Value,
 ) -> Option<PendingChange> {
-    let before = pending.lock().expect("pending lock").len();
-    fold_pending_line(pending, value);
-    PendingChange::between(before, pending.lock().expect("pending lock").len())
+    pending.lock().expect("pending lock").fold_frame(value)
 }
 
-fn fold_pending_line(pending: &std::sync::Mutex<ClaudePending>, value: &Value) {
+fn fold_pending_line(pending: &mut ClaudePending, value: &Value) {
     let Some(sdk_type) = value.get("type").and_then(Value::as_str) else {
         return;
     };
@@ -7192,17 +7165,14 @@ fn fold_pending_line(pending: &std::sync::Mutex<ClaudePending>, value: &Value) {
                     value.get("suggestions"),
                 ),
             };
-            let mut p = pending.lock().expect("pending lock");
-            p.permissions.retain(|e| e.request_id != entry.request_id);
-            p.permissions.push(entry);
+            pending
+                .permissions
+                .retain(|e| e.request_id != entry.request_id);
+            pending.permissions.push(entry);
         }
         "sdk.permission.cancelled" => {
             if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
-                pending
-                    .lock()
-                    .expect("pending lock")
-                    .permissions
-                    .retain(|e| e.request_id != request_id);
+                pending.permissions.retain(|e| e.request_id != request_id);
             }
         }
         "sdk.question.request" => {
@@ -7221,17 +7191,14 @@ fn fold_pending_line(pending: &std::sync::Mutex<ClaudePending>, value: &Value) {
                 request_id,
                 questions: normalize_question_definitions(value.get("questions")),
             };
-            let mut p = pending.lock().expect("pending lock");
-            p.questions.retain(|e| e.request_id != entry.request_id);
-            p.questions.push(entry);
+            pending
+                .questions
+                .retain(|e| e.request_id != entry.request_id);
+            pending.questions.push(entry);
         }
         "sdk.question.cancelled" => {
             if let Some(request_id) = value.get("requestId").and_then(frame_request_id) {
-                pending
-                    .lock()
-                    .expect("pending lock")
-                    .questions
-                    .retain(|e| e.request_id != request_id);
+                pending.questions.retain(|e| e.request_id != request_id);
             }
         }
         _ => {}
@@ -8193,6 +8160,8 @@ mod establish;
 mod fork;
 mod genesis;
 mod history;
+mod pending_runtime;
+use pending_runtime::{is_pending_frame, PendingResponse};
 mod rollback;
 mod sidecar_writer;
 mod stop;
@@ -8209,6 +8178,9 @@ mod end_of_output_tests;
 
 #[cfg(test)]
 mod live_frames_tests;
+
+#[cfg(test)]
+mod pending_tests;
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
@@ -17807,7 +17779,8 @@ rl.on('line', (line) => {
         let reader = BufReader::new(stdout).lines();
 
         let st = state();
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        insert_fake_claude_session(&st, "fold-session").await;
+        let pending = st.sessions.lock().await["fold-session"].pending.clone();
         let consumer = st.spawn_consumer(
             reader,
             "fold-session".to_string(),
