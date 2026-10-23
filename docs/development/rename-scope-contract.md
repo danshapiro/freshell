@@ -273,7 +273,10 @@ absent for a new record); the `cause` (`import`, `native_observation`,
 replaced a junk name with one whose source ranks the same or lower); and
 `from_ref`, `import_id`, `evidence_key` or `series` where they apply. A
 failed commit logs nothing, and a change to bookkeeping only (a generation
-advance, a native sync status) logs no line. A change another process
+advance, a native sync status) logs no line. A commit whose replacement
+landed but whose durability is unproven (the operation failed with
+`commit_uncertain`) is logged with its own cause, once, by the next naming
+transaction that confirms the document. A change another process
 committed is logged once, with cause `adopted_external`, when this server
 adopts it (never for the document loaded at startup). A conversation
 switch changes no record, so it logs `session_names.terminal_binding_moved`
