@@ -14,9 +14,8 @@ import {
 import { buildRecoveryPlan, countRecoverablePanes, isRestorablePane, placeLedgerEntries } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
-import { addTab } from '@/store/tabsSlice'
-import { restoreLayout } from '@/store/panesSlice'
-import { addTerminalRestoreRequestId, armRecoveredLiveTerminalTarget } from '@/lib/terminal-restore'
+import { applyRecoveryTabPlan } from '@/lib/recovery/apply-recovery-plan'
+import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import type { PaneNode } from '@/store/paneTypes'
 import { OVERLAY_Z } from '@/components/ui/overlay'
 import { Button } from '@/components/ui/button'
@@ -161,22 +160,9 @@ export function RecoveryOfferPanel(): JSX.Element | null {
     clearPendingOffer()
     const plans = buildRecoveryPlan(inventory)
     for (const plan of plans) {
-      dispatch(addTab({
-        id: plan.tabId,
-        title: plan.title,
-        // Unified agent names (Task 6): the restored tab keeps its stable
-        // naming-source relationship, remapped to the reminted pane ids.
-        ...(plan.nameSource ? { nameSource: plan.nameSource } : {}),
-      }))
-      dispatch(restoreLayout({ tabId: plan.tabId, layout: plan.layout, paneTitles: plan.paneTitles }))
-      // Focused-episode-6 round 5 (Finding F1): live terminal panes reattach
-      // to their still-running terminals — arm the plan's one-shot
-      // paneId→terminalId targets (pane node ids survive restoreLayout
-      // normalization, so the store leaf's own TerminalView mount consults
-      // this exact key before any create).
-      for (const target of plan.liveTerminalReattach ?? []) {
-        armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)
-      }
+      // Cross-device recovery remints the pane identity (no
+      // preserveCreateRequestIds); live terminal panes still reattach.
+      applyRecoveryTabPlan(dispatch, plan)
     }
     armRecoveredTerminalRestores(store.getState(), plans.map((p) => p.tabId))
     setInventory(null)

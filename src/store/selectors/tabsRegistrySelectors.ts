@@ -147,6 +147,7 @@ function dedupeByTabKey(records: RegistryTabRecord[]): RegistryTabRecord[] {
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectLayouts = (state: RootState) => state.panes.layouts
 const selectPaneTitles = (state: RootState) => state.panes.paneTitles
+const selectPaneTitleSetByUser = (state: RootState) => state.panes.paneTitleSetByUser
 const selectPaneLastInputAt = (state: RootState) => state.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT
 const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
@@ -161,8 +162,8 @@ const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1,
 )))
 
 export const selectLiveLocalTabRecords = createSelector(
-  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries, selectSessionTabSavedNames],
-  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions, savedTabNames): RegistryTabRecord[] => {
+  [selectTabs, selectLayouts, selectPaneTitles, selectPaneTitleSetByUser, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries, selectSessionTabSavedNames],
+  (tabs, layouts, paneTitles, paneTitleSetByUser, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions, savedTabNames): RegistryTabRecord[] => {
     const records: RegistryTabRecord[] = []
     for (const tab of tabs) {
       const layout = layouts[tab.id]
@@ -177,6 +178,7 @@ export const selectLiveLocalTabRecords = createSelector(
         layout,
         serverInstanceId,
         paneTitles: paneTitles[tab.id],
+        paneTitleSetByUser: paneTitleSetByUser?.[tab.id],
         extensions,
         deviceId,
         deviceLabel,
