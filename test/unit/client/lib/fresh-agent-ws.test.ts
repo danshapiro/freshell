@@ -609,7 +609,7 @@ describe('fresh-agent-ws', () => {
   it('folds freshAgent.status(stuck) with no attention action; a companion turn.complete edge folds attention independently', () => {
     // Wedged-sidecar deadman fold: the STATUS frame itself dispatches no
     // attention — it must land (and stop the busy-driving streaming flag)
-    // with zero turnCompletion/* actions. The deadman's companion
+    // without recording an attention event. The deadman's companion
     // freshAgent.turn.complete edge is a SEPARATE frame: when it follows for
     // the same session, it folds attention independently (the unified
     // contract — the deadman rings deliberately). The pane layout below is
@@ -669,8 +669,8 @@ describe('fresh-agent-ws', () => {
 
     // Companion edge: the deadman's discrete freshAgent.turn.complete for the
     // same session dispatches recordTurnComplete — attention folds
-    // independently of the status frame (exactly one turnCompletion action,
-    // and it is the record, not anything the status fold minted).
+    // independently of the status frame (exactly one attention record;
+    // observing its reconnect baselines does not record an event).
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
       sessionId,

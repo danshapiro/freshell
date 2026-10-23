@@ -183,6 +183,27 @@ impl AttentionLedger {
     }
 }
 
+impl crate::claude_edges::AttentionObserver for AttentionLedger {
+    fn on_registered(&self, id: &str, session_type: &str) {
+        self.observe(id, session_type);
+    }
+    fn on_turn_complete(&self, id: &str, session_type: &str, at: i64) {
+        self.record_turn_complete(id, session_type, at);
+    }
+    fn on_waiting(&self, id: &str, session_type: &str, at: i64) {
+        self.record_waiting(id, session_type, at);
+    }
+    fn on_pending_drained(&self, id: &str) {
+        self.clear_waiting(id);
+    }
+    fn on_rekeyed(&self, old: &str, new: &str) {
+        self.alias(old, new);
+    }
+    fn on_forgotten(&self, id: &str) {
+        self.forget(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

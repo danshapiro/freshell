@@ -820,6 +820,11 @@ impl FreshClaudeState {
         self.edges.subscribe()
     }
 
+    /// Last attention marks retained for negotiated same-page reconnects.
+    pub fn attention_marks(&self) -> Vec<freshell_protocol::FreshAgentAttentionMark> {
+        self.edges.attention_marks()
+    }
+
     /// Wire where every sidecar's CLI reaches this server (G19): its
     /// environment carries `FRESHELL=1`, `FRESHELL_URL` and `FRESHELL_TOKEN`.
     /// Set-once; `false` when an endpoint was already wired.
@@ -4737,10 +4742,7 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = request_id_string(&msg.request_id);
 
-        let Some(session) = self
-            .response_session(&session_id, msg.session_type)
-            .await
-        else {
+        let Some(session) = self.response_session(&session_id, msg.session_type).await else {
             return;
         };
         if !session
@@ -4842,10 +4844,7 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = request_id_string(&msg.request_id);
 
-        let Some(session) = self
-            .response_session(&session_id, msg.session_type)
-            .await
-        else {
+        let Some(session) = self.response_session(&session_id, msg.session_type).await else {
             return;
         };
         if !session

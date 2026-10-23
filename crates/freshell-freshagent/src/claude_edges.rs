@@ -10,9 +10,9 @@
 //!    source are strictly ordered per session (G24);
 //! 2. is logged at info as `freshagent.turn.complete` / `freshagent.turn.waiting`
 //!    with the provider, the ids, the source and `at` (never content, G14);
-//! 3. is broadcast as the client frame (its shape is unchanged);
-//! 4. is reported to the [`AttentionObserver`], when one is installed (the
-//!    client-alerts work's attention ledger, §9.2 I-1);
+//! 3. is retained in the replay ledger before it is broadcast as the client
+//!    frame (its shape is unchanged);
+//! 4. is reported to an additional [`AttentionObserver`], when installed;
 //! 5. is published as a typed [`ClaudeTurnEvent`] on a low-volume channel of its
 //!    own (the agent API's turn correlation, §9.3 I3), which never carries
 //!    stream traffic and so cannot lag behind it. A result the user's Stop
@@ -139,6 +139,7 @@ pub(crate) struct SettledReport {
 #[derive(Clone)]
 pub(crate) struct ClaudeEdgeHub {
     broadcast_tx: Arc<broadcast::Sender<String>>,
+    ledger: Arc<crate::attention_ledger::AttentionLedger>,
     observer: Arc<RwLock<Option<Arc<dyn AttentionObserver>>>>,
     turn_events: broadcast::Sender<ClaudeTurnEvent>,
 }
@@ -147,6 +148,7 @@ impl ClaudeEdgeHub {
     pub(crate) fn new(broadcast_tx: Arc<broadcast::Sender<String>>) -> Self {
         Self {
             broadcast_tx,
+            ledger: Arc::default(),
             observer: Arc::new(RwLock::new(None)),
             turn_events: broadcast::channel(TURN_EVENTS_CAPACITY).0,
         }
@@ -162,7 +164,26 @@ impl ClaudeEdgeHub {
         self.turn_events.subscribe()
     }
 
-    fn observe(&self, notify: impl FnOnce(&dyn AttentionObserver)) {
+    pub(crate) fn attention_marks(&self) -> Vec<freshell_protocol::FreshAgentAttentionMark> {
+        self.ledger
+            .snapshot()
+            .into_iter()
+            .map(|mark| freshell_protocol::FreshAgentAttentionMark {
+                provider: PROVIDER.to_string(),
+                session_id: mark.session_id,
+                session_type: mark.session_type,
+                last_turn_complete_at: mark.last_turn_complete_at,
+                last_waiting_at: mark.last_waiting_at,
+            })
+            .collect()
+    }
+
+    fn observe(&self, notify: impl Fn(&dyn AttentionObserver)) {
+        notify(self.ledger.as_ref());
+        self.observe_external(notify);
+    }
+
+    fn observe_external(&self, notify: impl FnOnce(&dyn AttentionObserver)) {
         let observer = self
             .observer
             .read()
@@ -205,15 +226,19 @@ impl ClaudeEdgeHub {
             session_id: record.stamp.to_string(),
             session_type: record.session_type.to_string(),
         });
-        if let Ok(frame) = serde_json::to_string(&frame) {
-            let _ = self.broadcast_tx.send(frame);
-        }
-        self.observe(|observer| match kind {
+        let observe_edge = |observer: &dyn AttentionObserver| match kind {
             EdgeKind::TurnComplete => {
                 observer.on_turn_complete(record.stamp, record.session_type, at)
             }
             EdgeKind::Waiting => observer.on_waiting(record.stamp, record.session_type, at),
-        });
+        };
+        // Retain before publication: a socket subscribing just after this
+        // broadcast must already see the mark in its ready snapshot.
+        observe_edge(self.ledger.as_ref());
+        if let Ok(frame) = serde_json::to_string(&frame) {
+            let _ = self.broadcast_tx.send(frame);
+        }
+        self.observe_external(observe_edge);
         at
     }
 
@@ -285,6 +310,42 @@ mod tests {
 
     use super::*;
     use crate::claude_sidecar_io::test_capture::{capture, with_message};
+
+    #[test]
+    fn replay_marks_are_retained_before_the_edge_wakes_a_receiver() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        // broadcast::send wakes the receiver synchronously. Reading the ledger
+        // from that waker pins the publication order without a timing race.
+        struct SnapshotOnWake {
+            ledger: Arc<crate::attention_ledger::AttentionLedger>,
+            observed: AtomicBool,
+        }
+        impl Wake for SnapshotOnWake {
+            fn wake(self: Arc<Self>) {
+                assert!(self
+                    .ledger
+                    .snapshot()
+                    .iter()
+                    .any(|mark| mark.last_waiting_at.is_some()));
+                self.observed.store(true, Ordering::SeqCst);
+            }
+        }
+        let (hub, mut rx) = hub();
+        let witness = Arc::new(SnapshotOnWake {
+            ledger: hub.ledger.clone(),
+            observed: AtomicBool::new(false),
+        });
+        let waker = Waker::from(witness.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut receive = std::pin::pin!(rx.recv());
+        assert!(matches!(receive.as_mut().poll(&mut context), Poll::Pending));
+        let clock = AttentionClock::default();
+        hub.waiting(&record(&clock));
+        assert!(witness.observed.load(Ordering::SeqCst));
+    }
 
     /// Every hook call, in order.
     #[derive(Default)]
@@ -370,6 +431,11 @@ mod tests {
             complete < waiting && waiting < death,
             "one clock: {complete} {waiting} {death}"
         );
+        // Installing an extra observer never replaces replay retention.
+        let marks = hub.attention_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].last_turn_complete_at, Some(death));
+        assert_eq!(marks[0].last_waiting_at, Some(waiting));
 
         let frames = frames(&mut rx);
         for frame in &frames {

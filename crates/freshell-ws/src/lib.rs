@@ -656,6 +656,12 @@ pub async fn build_handshake_with_capabilities(
         fresh_agent_attention_replay_v1,
     } = capabilities;
     let boot_id = state.boot_id.as_ref().clone();
+    let fresh_agent_attention = fresh_agent_attention_replay_v1
+        .then(|| state.fresh_claude.attention_marks())
+        .filter(|marks| !marks.is_empty());
+    if let Some(marks) = fresh_agent_attention.as_ref() {
+        tracing::debug!(count = marks.len(), "ws.handshake.attention_marks");
+    }
     // kata b8ke Task 4 (reconnect-owner discovery, T1 rec A3): replay current
     // runtime-owner state on EVERY handshake — a device that missed a
     // handoff broadcast (offline during handoff, lag-4008 disconnect, page
@@ -700,7 +706,7 @@ pub async fn build_handshake_with_capabilities(
         });
     let mut messages = vec![
         ServerMessage::Ready(Ready {
-            fresh_agent_attention: None,
+            fresh_agent_attention,
             runtime_owners,
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
