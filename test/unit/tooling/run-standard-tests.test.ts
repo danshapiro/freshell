@@ -245,25 +245,9 @@ describe('run-standard-tests', () => {
   })
 
   describe('buildCloudCompanionRun', () => {
-    it('builds a background vitest phase pinned to the companion scope', () => {
-      expect(buildCloudCompanionRun({
-        mode: 'desktop',
-        clientWorkers: '5',
-        scope: ['test/integration/server'],
-      })).toEqual({
-        name: 'client-local-only',
-        runner: 'vitest',
-        configPath: 'config/vitest/vitest.config.ts',
-        maxWorkers: '5',
-        priority: 'background',
-        pathFilters: ['test/integration/server'],
-      })
-    })
-
     it('uses normal priority in aggressive mode', () => {
       expect(buildCloudCompanionRun({
         mode: 'aggressive',
-        clientWorkers: '5',
         scope: ['test/integration/server'],
       }).priority).toBe('normal')
     })

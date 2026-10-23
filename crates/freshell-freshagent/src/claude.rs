@@ -830,6 +830,11 @@ impl FreshClaudeState {
         self.edges.subscribe()
     }
 
+    /// Last attention marks retained for negotiated same-page reconnects.
+    pub fn attention_marks(&self) -> Vec<freshell_protocol::FreshAgentAttentionMark> {
+        self.edges.attention_marks()
+    }
+
     /// Wire where every sidecar's CLI reaches this server (G19): its
     /// environment carries `FRESHELL=1`, `FRESHELL_URL` and `FRESHELL_TOKEN`.
     /// Set-once; `false` when an endpoint was already wired.

@@ -25,6 +25,13 @@ export const ReadyMessageSchema = z.object({
   // loose record: an unexpected capabilities shape must never fail the WHOLE
   // ready frame and silently disable restart detection.
   capabilities: z.record(z.string(), z.unknown()).optional(),
+  freshAgentAttention: z.array(z.object({
+    provider: z.string().min(1),
+    sessionId: z.string().min(1),
+    sessionType: z.string().optional(),
+    lastTurnCompleteAt: z.number().finite().optional(),
+    lastWaitingAt: z.number().finite().optional(),
+  })).optional().catch(undefined),
   // kata b8ke: the handshake's runtime-owner replay (additive/optional —
   // old servers omit it). Same ready-frame doctrine: `.catch(undefined)`
   // degrades a malformed replay to "no owners folded" (the reconcile gate

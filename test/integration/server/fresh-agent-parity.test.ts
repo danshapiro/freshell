@@ -92,6 +92,9 @@ describe('hosted fresh-agent provider inputs', () => {
 
   beforeAll(async () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-provider-parity-home-'))
+    workspace = path.join(homeDir, 'workspace')
+    fs.mkdirSync(workspace)
+    execFileSync('git', ['init', '--quiet', workspace])
     onecli = fakeOnecliGrants(providers.map(row => row.provider))
     restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     const xdgConfigHome = path.join(homeDir, 'custom-xdg')
@@ -106,16 +109,21 @@ describe('hosted fresh-agent provider inputs', () => {
       providerSettings: {},
       freshAgentModes: providers.map(row => row.sessionType),
       fixtureFreshAgentModes: providers.map(row => row.sessionType),
-    }, homeDir)
+    }, homeDir, {
+      workspaceRoots: [workspace],
+      providerInputRoots: [],
+      bootstrapFiles: Object.values(onecli.grants),
+      defaultCwd: workspace,
+    })
     await rig.start()
     const health = await rig.runtime.adminOk(rig.supervisor, { method: 'health' })
     expect(health.kind).toBe('health')
     providerSource = await readProviderParitySource(rig.runtime, health.data.installation_id)
     // Select a synthetic project, so providers never inherit this checkout's
     // own skills, installed dependencies, or linked-worktree Git topology.
-    workspace = path.join(rig.runtime.testRoot, 'workspace')
-    fs.mkdirSync(workspace)
-    execFileSync('git', ['init', '--quiet', workspace])
+    // Keep it under the owned synthetic HOME: installed-package ancestor
+    // discovery then stops at this boundary instead of capturing a shared
+    // /tmp/node_modules directory outside the broker's selected roots.
     // Every create selects this plugin directory relative to its cwd.
     fs.mkdirSync(path.join(workspace, 'fixture-plugin/.claude-plugin'), { recursive: true })
     fs.writeFileSync(path.join(workspace, 'fixture-plugin/.claude-plugin/plugin.json'), JSON.stringify({ name: 'fixture-plugin' }))
