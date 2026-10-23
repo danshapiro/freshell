@@ -1194,6 +1194,76 @@ async fn cancelled_wait_retains_executing_lock() {
     assert_eq!(third.expect("third").record.name, "Third writer");
 }
 
+/// A transaction's commit frees the document lock even when a child process
+/// forked mid-transaction still holds an inherited duplicate of the locked
+/// file description: the store unlocks that description at release instead
+/// of only closing its own descriptor (which leaves the child's copy holding
+/// the lock until the child execs — another participant, or this store's
+/// next transaction, would then find the lock busy after the transaction
+/// already completed).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_forked_mid_transaction_does_not_keep_the_document_lock() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-forked");
+    ensure(&store, "h-forked", NamedProvider::Claude, Some("/w/forked"))
+        .await
+        .expect("ensure pending");
+
+    set_test_hooks(dir.path(), vec![TestHook::HoldLockUntilReleased]);
+    let rename = tokio::spawn({
+        let store = Arc::clone(&store);
+        let target = target.clone();
+        async move { rename_user(&store, target, "Renamed").await }
+    });
+    wait_for_lock_held_sentinel(dir.path()).await;
+
+    // Fork while the transaction holds the document lock.
+    let child = crate::test_parked_child::ParkedChild::fork_now();
+    release_held_lock(dir.path());
+    let renamed = rename
+        .await
+        .expect("rename task")
+        .expect("the held transaction commits");
+    assert_eq!(renamed.record.name, "Renamed");
+
+    let probe = open_lock_file(&dir.path().join(LOCK_FILE_NAME)).expect("open sidecar probe");
+    let free = probe.try_lock().is_ok();
+    drop(probe);
+    child.release();
+    assert!(
+        free,
+        "a committed transaction leaves the document lock held by a child forked mid-transaction"
+    );
+}
+
+/// The background worker lock has the same release contract: dropping the
+/// guard frees the lock even while a child forked during the hold still
+/// holds an inherited duplicate, so the next worker cycle (or another
+/// cooperating process) can take it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_forked_while_the_worker_lock_is_held_does_not_keep_it() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let guard = store
+        .try_background_guard()
+        .expect("worker lock opens")
+        .expect("worker lock is free");
+
+    let child = crate::test_parked_child::ParkedChild::fork_now();
+    drop(guard);
+    let reacquired = store
+        .try_background_guard()
+        .expect("worker lock opens again");
+    child.release();
+    assert!(
+        reacquired.is_some(),
+        "a dropped worker guard leaves the worker lock held by a child forked during the hold"
+    );
+}
+
 /// Local serialization (plan Task 1, item 5): the bounded one-second retry
 /// budget is for contention with ANOTHER process. A transaction of this same
 /// process that holds the document lock longer than that (a durable write

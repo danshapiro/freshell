@@ -86,6 +86,8 @@ pub(crate) mod test_clock_gate;
 mod test_clock_router;
 #[cfg(test)]
 pub(crate) mod test_env_lock;
+#[cfg(all(test, unix))]
+mod test_parked_child;
 #[cfg(test)]
 mod test_trace_capture;
 mod updater;
