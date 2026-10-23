@@ -26,16 +26,17 @@ use freshell_protocol::native_location::{
 use freshell_protocol::session_names::{
     LegacyCandidateScope, LegacyEvidenceEnvelope, LegacyNameCandidate, LegacyNameImport,
     LegacyNameTarget, LegacyProtectionEvidence, NameIntent, NameSource, NamedProvider,
-    SessionNameRef, SessionNameUpdate,
+    SessionNameRecord, SessionNameRef, SessionNameUpdate,
 };
 use freshell_terminal::registry::HeadlessTerminal;
 use freshell_terminal::TerminalRegistry;
 use serde_json::json;
 
+use super::{log_name_changes, NameChangeCause, NameChangeEvent};
 use crate::session_name_generation::{GenerationOutcome, IndexedNameInput};
 use crate::session_names::{
-    clear_test_hooks, name_ref_key, set_test_hooks, SessionNames, SweepMaintenanceItem, TestHook,
-    NAME_MIGRATION_BOOT_IMPORT_ID,
+    clear_test_hooks, name_ref_key, set_test_hooks, SessionNames, StoredDocument,
+    SweepMaintenanceItem, TestHook, NAME_MIGRATION_BOOT_IMPORT_ID,
 };
 use crate::test_trace_capture::captured_trace_events;
 
@@ -605,6 +606,64 @@ async fn adopted_external_logs_another_processes_change_once_and_never_the_boot_
     assert_no_change(again, &target, "nothing new to adopt");
 }
 
+/// A store that commits its own change on top of a newer document from
+/// another process adopts that document with the commit: the other
+/// process's change is logged once, as `adopted_external`, beside the
+/// store's own change.
+#[tokio::test]
+async fn adopted_external_logs_another_processes_change_once_when_a_commit_lands_over_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = open_store(dir.path());
+    let theirs = claude("evt-adopt-commit");
+    let before = hydrate(&writer, "evt-adopt-commit", None, None).await;
+    let reader = open_store(dir.path());
+    let renamed = rename(&writer, &theirs, "Renamed by the writer", NameIntent::User)
+        .await
+        .unwrap();
+    let own = pending("evt-adopt-commit-own");
+    let since = mark();
+
+    // The reader writes a different record without adopting first.
+    let created = ensure(&reader, "evt-adopt-commit-own", "/w/evt-adopt-commit-own").await;
+
+    assert_eq!(
+        one_change(since, &theirs),
+        NameChanged {
+            cause: "adopted_external".into(),
+            old: old_of(&before),
+            new: new_of(&renamed),
+            self_heal: false,
+            extra: no_extra(),
+        }
+    );
+    assert_eq!(
+        one_change(since, &own),
+        NameChanged {
+            cause: "ensure_pending".into(),
+            old: None,
+            new: new_of(&created),
+            self_heal: false,
+            extra: no_extra(),
+        }
+    );
+    // The commit adopted the writer's document: the reader's next reads and
+    // writes log neither change again.
+    let again = mark();
+    reader.refresh_current().await.unwrap();
+    rename(&reader, &own, "Reader's own name", NameIntent::User)
+        .await
+        .unwrap();
+    assert_no_change(again, &theirs, "the writer's change was already adopted");
+    assert_eq!(
+        name_changes_since(again, &own)
+            .into_iter()
+            .map(|change| change.cause)
+            .collect::<Vec<_>>(),
+        vec!["manual_rename".to_string()],
+        "the reader's own record logs only its new rename"
+    );
+}
+
 #[tokio::test]
 async fn import_logs_a_boot_installed_label_with_its_import_and_evidence() {
     let dir = tempfile::tempdir().unwrap();
@@ -643,6 +702,76 @@ async fn import_logs_a_boot_installed_label_with_its_import_and_evidence() {
             extra: extra(&[
                 ("import_id", NAME_MIGRATION_BOOT_IMPORT_ID),
                 ("evidence_key", evidence_key),
+            ]),
+        }
+    );
+}
+
+/// Two candidates of one import that both win for the same session change
+/// its record twice in one transaction: one event, measured from the record
+/// before the import to the committed name, with the evidence that won.
+#[tokio::test]
+async fn import_logs_one_change_when_two_candidates_win_for_one_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = open_store(dir.path());
+    let target = claude("evt-import-twice");
+    let before = hydrate(
+        &names,
+        "evt-import-twice",
+        Some("Sort the import backlog"),
+        None,
+    )
+    .await;
+    let (tab_key, session_key) = (
+        "tabs-registry:device-1:claude:evt-import-twice:source-tab",
+        "tabs-registry:device-1:claude:evt-import-twice:session",
+    );
+    // The tab label outranks the first-message name; the session-scoped
+    // label then outranks the tab label on scope.
+    let tab_label = label_candidate(
+        "evt-import-twice-tab",
+        "evt-import-twice",
+        "Tab label",
+        tab_key,
+    );
+    let session_label = LegacyNameCandidate {
+        scope: LegacyCandidateScope::Session,
+        ..label_candidate(
+            "evt-import-twice-session",
+            "evt-import-twice",
+            "Session label",
+            session_key,
+        )
+    };
+    let since = mark();
+
+    let result = names
+        .import_legacy(LegacyNameImport {
+            version: 1,
+            import_id: NAME_MIGRATION_BOOT_IMPORT_ID.to_string(),
+            evidence: vec![],
+            candidates: vec![tab_label, session_label],
+        })
+        .await
+        .expect("boot import succeeds");
+
+    let installed = result
+        .names
+        .iter()
+        .rev()
+        .find(|update| update.record.name_ref == target)
+        .expect("the import installed the record");
+    assert_eq!(installed.record.name, "Session label");
+    assert_eq!(
+        one_change(since, &target),
+        NameChanged {
+            cause: "import".into(),
+            old: old_of(&before),
+            new: new_of(installed),
+            self_heal: false,
+            extra: extra(&[
+                ("import_id", NAME_MIGRATION_BOOT_IMPORT_ID),
+                ("evidence_key", session_key),
             ]),
         }
     );
@@ -688,6 +817,72 @@ async fn self_heal_flag_marks_a_healed_default_label() {
         NameChanged {
             cause: "first_message_fallback".into(),
             old: old_of(&real_before),
+            new: new_of(&raised),
+            self_heal: false,
+            extra: no_extra(),
+        }
+    );
+}
+
+/// The flag depends on the before/after pair, not on which path made the
+/// change: a folder name giving way to the first message is an ordinary
+/// rank raise, so it is not a heal when the session index makes it (which
+/// can replace an existing record only through the self-heal rule) nor when
+/// the first-message fallback makes it.
+#[tokio::test]
+async fn self_heal_flag_is_the_same_for_a_rank_raise_from_either_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = open_store(dir.path());
+
+    let by_index = claude("evt-raise-index");
+    let index_before = hydrate(&names, "evt-raise-index", None, None).await;
+    assert_eq!(
+        (
+            index_before.record.name.as_str(),
+            index_before.record.source
+        ),
+        ("evt-raise-index", NameSource::Directory)
+    );
+    let since = mark();
+    let raised = hydrate(
+        &names,
+        "evt-raise-index",
+        Some("Chart the index ledger"),
+        None,
+    )
+    .await;
+    assert_eq!(raised.record.source, NameSource::FirstMessage);
+    assert_eq!(
+        one_change(since, &by_index),
+        NameChanged {
+            cause: "hydrate".into(),
+            old: old_of(&index_before),
+            new: new_of(&raised),
+            self_heal: false,
+            extra: no_extra(),
+        }
+    );
+
+    let by_message = claude("evt-raise-message");
+    let message_before = hydrate(&names, "evt-raise-message", None, None).await;
+    let since = mark();
+    let raised = names
+        .activity(NameActivity {
+            target: by_message.clone(),
+            mode: "claude".to_string(),
+            event_id: "evt-raise-message-index".to_string(),
+            reason: NameActivityReason::IndexUserMessage,
+            first_user_message: Some("Chart the message ledger".to_string()),
+            cwd: Some("/w/evt-raise-message".to_string()),
+        })
+        .await
+        .expect("activity succeeds");
+    assert_eq!(raised.record.source, NameSource::FirstMessage);
+    assert_eq!(
+        one_change(since, &by_message),
+        NameChanged {
+            cause: "first_message_fallback".into(),
+            old: old_of(&message_before),
             new: new_of(&raised),
             self_heal: false,
             extra: no_extra(),
@@ -752,6 +947,113 @@ async fn sweep_maintenance_logs_each_healed_record_once_as_a_self_heal() {
             cause: "first_message_fallback".into(),
             old: old_of(&message_before),
             new: new_of(&healed_message),
+            self_heal: true,
+            extra: no_extra(),
+        }
+    );
+}
+
+/// One sweep item can change one record twice: the index heals the junk
+/// name to the folder name, then the first message raises the folder name.
+/// That logs one change, from the junk name to the first message, and it
+/// is a heal.
+#[tokio::test]
+async fn sweep_maintenance_logs_a_record_healed_by_index_then_message_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = open_store(dir.path());
+    let target = claude("evt-sweep-both");
+    let cwd = "/w/evt-sweep-both";
+    let junk = hydrate(&names, "evt-sweep-both", None, Some("Tab 33")).await;
+    assert_eq!(
+        (junk.record.name.as_str(), junk.record.source),
+        ("Tab 33", NameSource::ProviderAi)
+    );
+    let since = mark();
+
+    let report = names
+        .sweep_maintenance(vec![SweepMaintenanceItem {
+            hydrate: Some(IndexedNameInput {
+                provider: NamedProvider::Claude,
+                session_id: "evt-sweep-both".to_string(),
+                cwd: Some(cwd.to_string()),
+                first_user_message: None,
+                provider_title: None,
+            }),
+            activity: Some(NameActivity {
+                target: target.clone(),
+                mode: "claude".to_string(),
+                event_id: "evt-sweep-both-index".to_string(),
+                reason: NameActivityReason::IndexUserMessage,
+                first_user_message: Some("Balance the sweep ledger".to_string()),
+                cwd: Some(cwd.to_string()),
+            }),
+        }])
+        .await
+        .expect("the batch commits");
+
+    assert_eq!(report.healed, 1);
+    let healed = names.get(vec![target.clone()]).await.unwrap().remove(0);
+    assert_eq!(
+        (healed.record.name.as_str(), healed.record.source),
+        ("Balance the sweep ledger", NameSource::FirstMessage)
+    );
+    assert_eq!(
+        one_change(since, &target),
+        NameChanged {
+            cause: "first_message_fallback".into(),
+            old: old_of(&junk),
+            new: new_of(&healed),
+            self_heal: true,
+            extra: no_extra(),
+        }
+    );
+}
+
+/// The merge rule itself: when one transaction hands the logger several
+/// changes of one record, the logged change runs from the first change's
+/// prior record, and the self-heal flag is judged against that same prior
+/// (here a junk "Tab 41" that the first message replaced only because of
+/// the self-heal rule), never against an intermediate record.
+#[test]
+fn merged_changes_judge_the_self_heal_flag_from_the_first_prior() {
+    let target = claude("evt-merge-rule");
+    let key = name_ref_key(&target);
+    let cwd = Some("/w/evt-merge-rule");
+    let record = |name: &str, source: NameSource, revision: u64| SessionNameRecord {
+        name_ref: target.clone(),
+        name: name.to_string(),
+        source,
+        revision,
+        manual_revision: None,
+        renamed_at: None,
+        legacy_origin: None,
+    };
+    let junk = record("Tab 41", NameSource::ProviderAi, 1);
+    let folder = record("evt-merge-rule", NameSource::Directory, 2);
+    let mut document = StoredDocument::initial();
+    document.records.insert(
+        key.clone(),
+        record("Merge the rule ledger", NameSource::FirstMessage, 3),
+    );
+    let healed_to_folder = NameChangeEvent::new(NameChangeCause::Hydrate, Some(&junk), cwd);
+    let raised_to_message =
+        NameChangeEvent::new(NameChangeCause::FirstMessageFallback, Some(&folder), cwd);
+    let since = mark();
+
+    log_name_changes(
+        &document,
+        [
+            (key.as_str(), &healed_to_folder),
+            (key.as_str(), &raised_to_message),
+        ],
+    );
+
+    assert_eq!(
+        one_change(since, &target),
+        NameChanged {
+            cause: "first_message_fallback".into(),
+            old: Some(("Tab 41".into(), "provider_ai".into(), 1)),
+            new: ("Merge the rule ledger".into(), "first_message".into(), 3),
             self_heal: true,
             extra: no_extra(),
         }
