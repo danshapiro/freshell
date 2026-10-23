@@ -116,8 +116,19 @@ fn sessions_router_state(
 /// and a seeded single-pane layout whose pane content is the given scoped
 /// content (carrying `sessionRef` so the route resolves the durable record).
 fn fresh_router(names: &Arc<SessionNames>, pane_content: Value) -> Router {
+    fresh_router_with_registry(names, pane_content, None)
+}
+
+fn fresh_router_with_registry(
+    names: &Arc<SessionNames>,
+    pane_content: Value,
+    registry: Option<freshell_terminal::TerminalRegistry>,
+) -> Router {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
-    let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+    let mut state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+    if let Some(registry) = registry {
+        state = state.with_terminal_registry(registry);
+    }
     state.set_session_naming(names.clone());
     let sync: freshell_protocol::UiLayoutSync = serde_json::from_value(json!({
         "tabs": [{ "id": "t1", "title": "First" }],
@@ -717,6 +728,166 @@ async fn a_pending_retry_rename_message_follows_its_outcome() {
     );
     assert_eq!(body["message"], "session renamed", "{body}");
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// A switched conversation may be visible before the session index names it.
+/// A retained pre-create handle belongs to the old conversation and cannot
+/// authorize redirecting a rename back to it.
+#[tokio::test]
+async fn rename_after_switch_admits_the_new_session_and_never_renames_a_spent_handle() {
+    for uri in ["/api/panes/p1", "/api/tabs/t1"] {
+        for retained_handle in [false, true] {
+            let home = temp_home();
+            let names = names_state(&home).names;
+            admit_pending(&names, "spent", NamedProvider::Claude, Some("/w")).await;
+            let old =
+                bind_verified(&names, "spent", NamedProvider::Claude, "old-conversation").await;
+            let mut content = scoped_pane_content("claude", "claude", "new-conversation");
+            content["nameRef"] =
+                json!({"kind": "session", "provider": "claude", "sessionId": "new-conversation"});
+            if retained_handle {
+                content["namingHandle"] = json!("spent");
+            }
+            let (status, body) = patch(
+                fresh_router(&names, content), uri,
+                json!({"name": "New billing conversation", "nameIntent": "user", "expectedNameRef": {
+                    "kind": "session", "provider": "claude", "sessionId": "new-conversation"
+                }}),
+            ).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}, handle={retained_handle}: {body}"
+            );
+            assert_eq!(
+                body["data"]["sessionName"]["record"]["name"], "New billing conversation",
+                "{body}"
+            );
+            assert_eq!(
+                body["data"]["nameRef"]["sessionId"], "new-conversation",
+                "{body}"
+            );
+            let old_after = names.get(vec![old.record.name_ref.clone()]).await.unwrap();
+            assert_eq!(
+                old_after[0].record, old.record,
+                "the old name must stay untouched"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+}
+
+#[tokio::test]
+async fn captureless_rename_after_switch_uses_registry_before_a_stale_layout() {
+    for uri in ["/api/panes/p1", "/api/tabs/t1"] {
+        for mixed_pending in [false, true] {
+            let home = temp_home();
+            let names = names_state(&home).names;
+            admit_pending(&names, "old-handle", NamedProvider::Claude, Some("/w")).await;
+            let old = bind_verified(
+                &names,
+                "old-handle",
+                NamedProvider::Claude,
+                "old-conversation",
+            )
+            .await;
+            let mut content = scoped_pane_content(
+                "claude",
+                "claude",
+                if mixed_pending {
+                    "new-conversation"
+                } else {
+                    "old-conversation"
+                },
+            );
+            content["nameRef"] = if mixed_pending {
+                json!({"kind": "pending", "id": "old-handle"})
+            } else {
+                serde_json::to_value(&old.record.name_ref).unwrap()
+            };
+            content["namingHandle"] = json!("old-handle");
+            content["terminalId"] = json!("T-switched");
+            let registry = freshell_terminal::TerminalRegistry::new();
+            registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+                terminal_id: "T-switched".into(),
+                stream_id: "stream".into(),
+                mode: "claude".into(),
+                resume_session_id: Some("new-conversation".into()),
+                create_request_id: None,
+                created_at: None,
+            });
+            let new_ref = SessionNameRef::Session {
+                provider: NamedProvider::Claude,
+                session_id: "new-conversation".into(),
+            };
+            registry.set_naming("T-switched", Some(new_ref.clone()), None);
+            let (status, body) = patch(
+                fresh_router_with_registry(&names, content, Some(registry)),
+                uri,
+                json!({"name": "Name after switch", "nameIntent": "user"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["data"]["nameRef"],
+                serde_json::to_value(new_ref).unwrap(),
+                "captureless rename must follow the terminal's new session"
+            );
+            assert_eq!(
+                names.get(vec![old.record.name_ref.clone()]).await.unwrap()[0].record,
+                old.record
+            );
+            std::fs::remove_dir_all(home).ok();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_materialized_registry_accepts_its_own_pending_capture_and_keeps_revision_guards() {
+    let home = temp_home();
+    let names = names_state(&home).names;
+    let admitted = admit_pending(&names, "materialized", NamedProvider::Claude, Some("/w")).await;
+    let bound = bind_verified(
+        &names,
+        "materialized",
+        NamedProvider::Claude,
+        "same-conversation",
+    )
+    .await;
+    let mut content = scoped_pane_content("claude", "claude", "same-conversation");
+    content["nameRef"] = json!({"kind": "pending", "id": "materialized"});
+    content["namingHandle"] = json!("materialized");
+    content["terminalId"] = json!("T-materialized");
+    let registry = freshell_terminal::TerminalRegistry::new();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "T-materialized".into(),
+        stream_id: "stream".into(),
+        mode: "claude".into(),
+        resume_session_id: Some("same-conversation".into()),
+        create_request_id: None,
+        created_at: None,
+    });
+    registry.set_naming("T-materialized", Some(bound.record.name_ref.clone()), None);
+    let router = fresh_router_with_registry(&names, content, Some(registry));
+    let body = |revision| {
+        json!({"name": "Accepted same conversation", "nameIntent": "user",
+        "expectedNameRef": {"kind": "pending", "id": "materialized"}, "ifRevision": revision})
+    };
+    let (status, conflict) = patch(
+        router.clone(),
+        "/api/panes/p1",
+        body(admitted.record.revision),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"], "NAME_REVISION_CONFLICT");
+    let (status, accepted) = patch(router, "/api/panes/p1", body(bound.record.revision)).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(
+        accepted["data"]["nameRef"],
+        serde_json::to_value(bound.record.name_ref).unwrap()
+    );
+    std::fs::remove_dir_all(home).ok();
 }
 
 /// A second state over the SAME store with its own (empty) identity table.
