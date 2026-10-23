@@ -7256,17 +7256,6 @@ impl InFlightRegistry {
             held,
         })
     }
-
-    /// Snapshot membership check — never an acquisition. Claude's `handle_send`
-    /// parks while a rollback names this durable id (kata 1wxv task 4 review C1):
-    /// a session-map resolve miss inside the rollback's teardown→respawn window
-    /// must WAIT for the re-insert, never refuse with SESSION_NOT_FOUND.
-    pub(crate) fn contains(&self, key: &str) -> bool {
-        self.keys
-            .lock()
-            .expect("in-flight registry lock")
-            .contains(key)
-    }
 }
 
 /// RAII release for an [`InFlightRegistry`] acquisition: removes its held key(s)
@@ -7290,17 +7279,22 @@ mod in_flight_registry_tests {
     use super::*;
 
     #[test]
-    fn contains_tracks_acquire_and_drop_without_acquiring() {
+    fn an_acquisition_is_single_flight_until_its_guard_drops() {
         let registry = InFlightRegistry::new();
-        assert!(!registry.contains("dur-1"));
         let guard = registry.try_acquire("dur-1").expect("first acquire");
-        assert!(registry.contains("dur-1"));
-        // contains is a snapshot, NOT an acquisition: a second try_acquire still
-        // refuses (single-flight) while contains never blocks.
-        assert!(registry.try_acquire("dur-1").is_none());
-        assert!(registry.contains("dur-1"));
+        assert!(
+            registry.try_acquire("dur-1").is_none(),
+            "a second acquisition of a held key refuses"
+        );
+        assert!(
+            registry.try_acquire("dur-2").is_some(),
+            "another key is independent"
+        );
         drop(guard);
-        assert!(!registry.contains("dur-1"));
+        assert!(
+            registry.try_acquire("dur-1").is_some(),
+            "the key is free once the guard drops"
+        );
     }
 }
 

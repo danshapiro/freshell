@@ -7000,20 +7000,17 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
     let sidecar_pid = env.sidecar_pid_for(&superseded);
     assert!(sidecar_pid.is_some(), "the live owner's sidecar pid");
 
-    // The rollback's re-key in the FULL production sequence: (1) the fork
-    // adoption publishes the re-key bookkeeping at the LANE level (the
-    // preseed publication: cli_index[new] = map key + the session's
-    // cli_session_id = new — the same write adopt_session_init performs
-    // for the supersedes-carrying preseed), then (2) the registry's own
-    // rekey_live performs the atomic old→new coordinator move (the same
-    // step the rollback's Adopt-path commit performs), leaving
-    // Aliased{to: canonical} at the superseded key — the COORDINATOR as
-    // the single source of truth (e2r3 F3). Pre-fix this id pair was a
+    // A re-key in the FULL production sequence: (1) an in-stream init
+    // naming the NEW durable id publishes the re-key bookkeeping at the LANE
+    // level (cli_index[new] = map key + the session's cli_session_id = new;
+    // the session already carries the old id, so the adoption claims
+    // nothing under the new one), then (2) the registry's own rekey_live
+    // performs the atomic old→new coordinator move, leaving
+    // Aliased{to: canonical} at the superseded key — the COORDINATOR as the
+    // single source of truth (e2r3 F3). Pre-fix this id pair was a
     // lane-local HashMap nobody hydrated.
-    // (1) The fork adoption's publication — the REAL lane-level re-key
-    // bookkeeping (cli_index[new] = map key + the session's
-    // cli_session_id = new), driven through the adoption itself exactly
-    // like the rollback's preseed arm.
+    // (1) The re-key's publication — the REAL lane-level bookkeeping,
+    // driven through the adoption itself.
     {
         let map_key = rig
             .fresh_claude
@@ -7021,7 +7018,7 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
             .await
             .expect("the live session's map key");
         rig.fresh_claude
-            .test_adopt_session_init(&canonical, &map_key, "freshclaude", Some(&superseded))
+            .test_adopt_session_init(&canonical, &map_key, "freshclaude")
             .await;
     }
     // (2) The registry's own rekey_live performs the atomic old→new
