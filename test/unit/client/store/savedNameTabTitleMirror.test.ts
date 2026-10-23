@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { configureStore, type Middleware } from '@reduxjs/toolkit'
-import tabsReducer, { addTab, mirrorSessionTabTitles, setActiveTab } from '@/store/tabsSlice'
+import tabsReducer, { addTab, mirrorSessionTabTitles, setActiveTab, updateTab } from '@/store/tabsSlice'
 import panesReducer, {
   closePane,
   initLayout,
@@ -293,6 +293,119 @@ describe('savedNameTabTitleMirrorMiddleware', () => {
     const state = store.getState() as unknown as RootState
     expect(selectTabDisplayName(state, tabId)).not.toBe('LotL')
     expect(tabOf(store, tabId).title).not.toBe('LotL')
+  })
+
+  it('a tab whose last agent pane closes stops showing that session\'s name', () => {
+    const store = buildStore()
+    const { tabId, paneId } = createSessionTab(store, { title: 'freshell' })
+    store.dispatch(splitPane({
+      tabId,
+      paneId,
+      direction: 'horizontal',
+      newContent: shellTerminal('crid-split'),
+      newPaneId: 'pane-shell',
+    }))
+    store.dispatch(receiveSessionNames([update(SESSION_REF, 'Billing bug', 1)]))
+    expect(tabOf(store, tabId).title).toBe('Billing bug')
+
+    // Closing the Claude pane leaves only the shell: no scoped pane is left,
+    // so the tab no longer takes its name from a session.
+    store.dispatch(closePane({ tabId, paneId }))
+    expect(tabOf(store, tabId).nameSource).toEqual({ kind: 'legacy' })
+
+    // The stored title (copied by the persisted layout, the server layout
+    // mirror and closed-tab records) returns to the unnamed placeholder, so
+    // the tab bar and the tabs registry show the shell's own label.
+    const state = store.getState() as unknown as RootState
+    expect(tabOf(store, tabId).title).toBe('Tab 1')
+    expect(selectTabDisplayName(state, tabId)).not.toBe('Billing bug')
+    expect(selectTabDisplayName(state, tabId)).toBe(selectPaneDisplayName(state, tabId, 'pane-shell'))
+    const record = selectLiveLocalTabRecords(state).find((candidate) => candidate.tabId === tabId)
+    expect(record?.tabName).not.toBe('Billing bug')
+    // The session keeps its own name.
+    expect(store.getState().sessionNames.records[sessionNameRefKey(SESSION_REF)]?.name).toBe('Billing bug')
+  })
+
+  it('a split tab whose agent pane closes shows its derived label, not the session\'s name', () => {
+    const store = buildStore()
+    const { tabId, paneId } = createSessionTab(store, { title: 'freshell' })
+    store.dispatch(splitPane({
+      tabId,
+      paneId,
+      direction: 'horizontal',
+      newContent: shellTerminal('crid-split'),
+      newPaneId: 'pane-shell',
+    }))
+    store.dispatch(splitPane({
+      tabId,
+      paneId: 'pane-shell',
+      direction: 'vertical',
+      newContent: shellTerminal('crid-split-2'),
+      newPaneId: 'pane-shell-2',
+    }))
+    store.dispatch(receiveSessionNames([update(SESSION_REF, 'Billing bug', 1)]))
+    expect(tabOf(store, tabId).title).toBe('Billing bug')
+
+    store.dispatch(closePane({ tabId, paneId }))
+
+    // Still split, so no single-pane title can stand in: the stored title is
+    // what a split tab shows.
+    expect(tabOf(store, tabId).nameSource).toEqual({ kind: 'legacy' })
+    expect(tabOf(store, tabId).title).toBe('Tab 1')
+    expect(selectTabDisplayName(store.getState() as unknown as RootState, tabId)).not.toBe('Billing bug')
+  })
+
+  it('an agent pane replaced by non-agent content stops the tab showing the session\'s name', () => {
+    vi.useFakeTimers({ now: 1_000 })
+    const store = buildStore()
+    store.dispatch(addTab({ id: 'tab-0', title: 'first', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-0', paneId: 'pane-0', content: shellTerminal('crid-0') }))
+    const { tabId, paneId } = createSessionTab(store, { title: 'freshell' })
+    store.dispatch(receiveSessionNames([update(SESSION_REF, 'Billing bug', 1)]))
+    expect(tabOf(store, tabId).title).toBe('Billing bug')
+    vi.setSystemTime(9_000)
+
+    store.dispatch(updatePaneContent({ tabId, paneId, content: shellTerminal('crid-replaced') }))
+
+    expect(tabOf(store, tabId).nameSource).toEqual({ kind: 'legacy' })
+    // The placeholder carries the tab's position, and the write leaves tab
+    // recency alone.
+    expect(tabOf(store, tabId).title).toBe('Tab 2')
+    expect(tabOf(store, tabId).updatedAt).toBe(1_000)
+    expect(tabOf(store, tabId).titleSetByUser).toBeUndefined()
+    expect(selectTabDisplayName(store.getState() as unknown as RootState, tabId)).not.toBe('Billing bug')
+    // The other tab is untouched.
+    expect(tabOf(store, 'tab-0').title).toBe('first')
+  })
+
+  it('a title that arrives with the change away from the session is kept', () => {
+    const store = buildStore()
+    const { tabId } = createSessionTab(store, { title: 'freshell' })
+    createSessionTab(store, {
+      title: 'freshell',
+      tabId: 'tab-2',
+      paneId: 'pane-2',
+      content: claudeTerminal({ createRequestId: 'crid-claude-2', sessionRef: { provider: 'claude', sessionId: 'sess-2' } }),
+    })
+    store.dispatch(receiveSessionNames([
+      update(SESSION_REF, 'Billing bug', 1),
+      update(NEXT_SESSION_REF, 'Login fix', 1),
+    ]))
+    expect(tabOf(store, tabId).title).toBe('Billing bug')
+    expect(tabOf(store, 'tab-2').title).toBe('Login fix')
+
+    // One write turns each tab legacy together with its title: a new title
+    // on the first, and a user rename that kept the text on the second.
+    // The mirror only takes back a name it wrote and nobody claimed since.
+    store.dispatch(updateTab({ id: tabId, updates: { nameSource: { kind: 'legacy' }, title: 'my notes' } }))
+    store.dispatch(updateTab({
+      id: 'tab-2',
+      updates: { nameSource: { kind: 'legacy' }, titleSetByUser: true },
+    }))
+
+    expect(tabOf(store, tabId).title).toBe('my notes')
+    expect(tabOf(store, 'tab-2').title).toBe('Login fix')
+    expect(tabOf(store, 'tab-2').titleSetByUser).toBe(true)
   })
 
   it('a new tab keeps its create-time title while its pane gains a naming identity', () => {

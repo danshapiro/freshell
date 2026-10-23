@@ -9,6 +9,7 @@ import {
   type NamedAgentHandle,
 } from '../helpers/unified-agent-names.js'
 import { bootJourney, type Journey } from '../helpers/unified-agent-names-modes.js'
+import { clickFirstVisibleShellOption } from '../helpers/pane-picker.js'
 
 // NAME RELIABILITY (plan Task 7, RC2) — a Claude/Codex/OpenCode tab's stored
 // title is a mirror of the session's saved name. Before the fix nothing ever
@@ -33,6 +34,11 @@ import { bootJourney, type Journey } from '../helpers/unified-agent-names-modes.
 // label AND that the page's name cache holds no record, so the label can only
 // come from the mirrored stored title. It also asserts the persisted layout
 // before the reload.
+//
+// The last case covers the reverse: a tab whose Claude pane closes, leaving
+// only a shell, no longer takes its name from that session. Before the fix
+// its stored title kept the session's name, so the tab bar, the persisted
+// layout and GET /api/tabs all called the plain shell tab by it.
 
 test.setTimeout(300_000)
 
@@ -174,6 +180,21 @@ function tabLabel(page: Page, tabId: string) {
   return page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
 }
 
+/** Split the active tab's terminal through its context menu and choose a
+ * shell for the new pane. */
+async function splitWithShell(page: Page): Promise<void> {
+  await page.locator('.xterm:visible').first().click({ button: 'right' })
+  await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+  const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+  await expect(picker).toBeVisible({ timeout: 10_000 })
+  await clickFirstVisibleShellOption(page)
+}
+
+type MirrorState = {
+  tabs?: { tabs?: Array<{ id: string; title?: string; nameSource?: { kind: string } }> }
+  panes?: { layouts?: Record<string, { type?: string; content?: { mode?: string } }> }
+}
+
 test.describe('session tab title mirror', () => {
   test('a reload with names unavailable still shows the saved name', async ({ browser }) => {
     const journey = await bootForbiddenGeminiJourney()
@@ -215,6 +236,47 @@ test.describe('session tab title mirror', () => {
       // GET /api/tabs answers from the server's layout mirror, which stores
       // each tab's stored title as the client last synced it.
       await expect.poll(() => serverTabTitle(journey, handle.tabId), { timeout: 30_000 }).toBe(SAVED_NAME)
+      await context.close()
+    } finally {
+      await journey.cleanup()
+    }
+  })
+
+  test('a tab whose Claude pane closes stops carrying the session\'s name', async ({ browser }) => {
+    const journey = await bootForbiddenGeminiJourney()
+    try {
+      const { context, page, harness } = await connectUnifiedPage({ browser, info: journey.server.info })
+      const handle = await createRenamedClaudeTab(page, harness, journey)
+      await expect.poll(() => serverTabTitle(journey, handle.tabId), { timeout: 30_000 }).toBe(SAVED_NAME)
+
+      // [Claude | shell], then close the Claude pane from its header.
+      await splitWithShell(page)
+      await expect(page.locator('.xterm:visible')).toHaveCount(2, { timeout: 30_000 })
+      await page
+        .locator(`[data-context="pane-header"][data-pane-id="${handle.paneId}"]`)
+        .getByRole('button', { name: 'Close pane' })
+        .click()
+
+      // Only the shell is left, so the tab no longer takes its name from the
+      // Claude session.
+      await expect.poll(async () => {
+        const state = await harness.getState() as MirrorState
+        const tab = state.tabs?.tabs?.find((candidate) => candidate.id === handle.tabId)
+        const layout = state.panes?.layouts?.[handle.tabId]
+        return { nameSource: tab?.nameSource?.kind, layout: layout?.type, mode: layout?.content?.mode }
+      }, { timeout: 30_000 }).toEqual({ nameSource: 'legacy', layout: 'leaf', mode: 'shell' })
+
+      // Every copy of the tab drops the session's name: the tab bar, the
+      // stored title, the persisted layout and the server's layout mirror.
+      await expect(tabLabel(page, handle.tabId)).not.toContainText(SAVED_NAME, { timeout: 30_000 })
+      const storedTitle = async () => {
+        const state = await harness.getState() as MirrorState
+        return state.tabs?.tabs?.find((candidate) => candidate.id === handle.tabId)?.title ?? null
+      }
+      await expect.poll(storedTitle, { timeout: 30_000 }).not.toBe(SAVED_NAME)
+      await expect.poll(() => persistedTabTitle(page, handle.tabId), { timeout: 30_000 }).not.toBe(SAVED_NAME)
+      await expect.poll(() => serverTabTitle(journey, handle.tabId), { timeout: 30_000 }).not.toBe(SAVED_NAME)
+      await expect(tabLabel(page, handle.tabId)).not.toContainText(SAVED_NAME)
       await context.close()
     } finally {
       await journey.cleanup()
