@@ -35,9 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use freshell_protocol::session_names::{
-    NamedProvider, SessionNameRecord, SessionNameRef, SessionNameUpdate,
-};
+use freshell_protocol::session_names::{NamedProvider, SessionNameRecord, SessionNameRef};
 use freshell_terminal::TerminalRegistry;
 
 use crate::naming::{
@@ -47,6 +45,7 @@ use crate::naming::{
 
 #[path = "terminal_name_cache.rs"]
 mod cache;
+use cache::{answers, fill_uncached_rows, UncachedRow};
 
 /// The bounded retry schedule for a transient store failure: each delay
 /// precedes one more attempt, so a persistently busy store costs at most
@@ -626,108 +625,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// A bound row whose display cache is empty.
-struct UncachedRow {
-    terminal_id: String,
-    provider: NamedProvider,
-    cwd: Option<String>,
-    name_ref: SessionNameRef,
-    durable_target: Option<SessionNameRef>,
-    fallback_title: String,
-}
-
-/// What one cache-fill pass found.
-#[derive(Default)]
-struct FillReport {
-    filled: usize,
-    /// Rows still bound to a durable session that answered "no record".
-    empty: Vec<(String, SessionNameRef)>,
-}
-
-/// Fill every uncached bound row from ONE batched read; a pending binding
-/// whose record was never admitted (its create's `ensure_pending` failed)
-/// is admitted here, once per tick. An answer for a row whose binding moved
-/// during the read is dropped.
-async fn fill_uncached_rows(
-    sink: &dyn SessionNaming,
-    registry: &TerminalRegistry,
-    binder: &dyn TerminalNameBinder,
-    uncached: &[UncachedRow],
-) -> FillReport {
-    let mut report = FillReport::default();
-    if uncached.is_empty() {
-        return report;
-    }
-    let mut refs: Vec<SessionNameRef> = Vec::new();
-    for row in uncached {
-        if !refs.contains(&row.name_ref) {
-            refs.push(row.name_ref.clone());
-        }
-    }
-    let updates = match sink.get(refs).await {
-        Ok(updates) => updates,
-        Err(error) => {
-            tracing::warn!(
-                target: "freshell_freshagent::naming",
-                op = "get",
-                rows = uncached.len(),
-                class = %error.code(),
-                "session_names.terminal_cache_fill_deferred: {error}"
-            );
-            return report;
-        }
-    };
-    for row in uncached {
-        if !still_bound(registry, &row.terminal_id, &row.name_ref) {
-            log_superseded(&row.terminal_id, &row.name_ref);
-            continue;
-        }
-        if let Some(update) = updates.iter().find(|update| answers(update, &row.name_ref)) {
-            if cache::accept_answer(registry, binder, row, &update.record) {
-                report.filled += 1;
-            }
-            continue;
-        }
-        let SessionNameRef::Pending { id } = &row.name_ref else {
-            // A durable session with no record yet: nothing to fill; the
-            // publisher fills the row when the session is named.
-            report
-                .empty
-                .push((row.terminal_id.clone(), row.name_ref.clone()));
-            continue;
-        };
-        let admitted = sink
-            .ensure_pending(PendingNameInput {
-                handle: id.clone(),
-                provider: row.provider,
-                cwd: row.cwd.clone(),
-            })
-            .await;
-        match admitted {
-            Ok(_) if !still_bound(registry, &row.terminal_id, &row.name_ref) => {
-                log_superseded(&row.terminal_id, &row.name_ref);
-            }
-            Ok(update) => {
-                if cache::accept_answer(registry, binder, row, &update.record) {
-                    report.filled += 1;
-                }
-            }
-            Err(error) => log_name_error("ensure_pending", &row.name_ref, &error),
-        }
-    }
-    report
-}
-
-/// Whether `update` answers a read of `name_ref` (directly, or through the
-/// pending→durable redirect the store traversed).
-fn answers(update: &SessionNameUpdate, name_ref: &SessionNameRef) -> bool {
-    &update.record.name_ref == name_ref
-        || update
-            .redirects
-            .iter()
-            .any(|redirect| &redirect.from == name_ref)
 }
 
 /// A row already bound keeps its binding; its identity home is re-stamped
