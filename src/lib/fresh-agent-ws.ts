@@ -34,6 +34,7 @@ import {
   sessionSnapshotReceived,
   setSessionStatus,
   streamOpened,
+  turnRequestRetried,
   turnResult,
 } from '@/store/freshAgentSlice'
 
@@ -551,7 +552,11 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       return true
     case 'freshAgent.retry': {
       const retry = parseLiveRetry(event)
-      if (retry) dispatch(liveRetrySet({ ...locator, ...retry }))
+      if (!retry) return true
+      // A retry is a request of a running turn: the turn shows running from it
+      // (a new session's first request retries before anything says so).
+      dispatch(turnRequestRetried(locator))
+      dispatch(liveRetrySet({ ...locator, ...retry }))
       return true
     }
     case 'freshAgent.notice': {

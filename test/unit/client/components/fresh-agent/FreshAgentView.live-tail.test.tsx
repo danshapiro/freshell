@@ -549,3 +549,23 @@ describe('snapshot commits re-render only what changed (transcript-live risk 1)'
     expect(new Set(markdownRenders.contents)).toEqual(new Set(['The **new** answer']))
   })
 })
+
+describe('an API retry before anything streams (the session\'s first request)', () => {
+  it('shows the turn running, with Stop, while the CLI retries', async () => {
+    // A new session's transcript does not exist until its first request is
+    // answered, so no snapshot says the turn is running: the retry does.
+    serve(() => claudeSnapshot([]))
+    const store = createStore()
+    await mount(store)
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+
+    deliver(store, { type: 'freshAgent.retry', attempt: 1, maxRetries: 10, delayMs: 500, errorStatus: 529, error: 'overloaded' })
+    await advance(0)
+
+    const live = screen.getByRole('article', { name: /live response/ })
+    expect(live).toHaveTextContent('Retrying')
+    expect(live).toHaveTextContent('attempt 1')
+    expect(store.getState().freshAgent.sessions[KEY].status).toBe('running')
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeVisible()
+  })
+})

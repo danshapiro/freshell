@@ -578,6 +578,18 @@ const freshAgentSlice = createSlice({
       if (!session.streamingActive) session.streamingActive = true
       if (session.status === 'idle') writeSessionStatus(session, 'running')
     },
+    /**
+     * The CLI is retrying an API request (live only, transcript-live F11):
+     * a turn is in flight even though nothing has streamed yet. A new
+     * session's first request can retry before its transcript exists, so no
+     * snapshot says the turn is running; the retry does. Only an idle session
+     * changes: a running one is not written again (transcript-live P3).
+     */
+    turnRequestRetried(state, action: PayloadAction<SessionMutationPayload>) {
+      const session = resolveOrEnsureSession(state, action.payload, 'running')
+      if (!session) return
+      if (session.status === 'idle') writeSessionStatus(session, 'running')
+    },
     clearPendingCreateFailureForSession() {},
     sessionExited(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
@@ -713,6 +725,7 @@ export const {
   setAvailableModels,
   setSessionStatus,
   streamOpened,
+  turnRequestRetried,
   historyLoadFailed,
   historyLoadStarted,
   historyPageReceived,
