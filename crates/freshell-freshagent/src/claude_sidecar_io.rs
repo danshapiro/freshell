@@ -736,7 +736,7 @@ fn emit_dropped(labels: &SidecarLogLabels, dropped: u64, window: Duration) {
 #[cfg(test)]
 pub(crate) mod test_capture {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Level, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -800,6 +800,14 @@ pub(crate) mod test_capture {
         Arc<StdMutex<Vec<Captured>>>,
         tracing::subscriber::DefaultGuard,
     ) {
+        // tracing-core's lone-dispatch optimization registers a new callsite
+        // using the emitting thread's default. A different test thread has
+        // no capture and can cache "never" globally. Keep a second, inert
+        // registrar alive so interest combines all scoped captures instead.
+        // This does not install or replace the process-wide subscriber.
+        static REGISTRAR: OnceLock<tracing::Dispatch> = OnceLock::new();
+        REGISTRAR
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let events = Arc::new(StdMutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&events)));
         (events, tracing::subscriber::set_default(subscriber))
@@ -823,6 +831,20 @@ pub(crate) mod test_capture {
 #[cfg(test)]
 mod tests {
     use super::test_capture::{capture, with_message, Captured};
+
+    #[test]
+    fn scoped_capture_keeps_events_when_another_thread_first_logs_the_callsite() {
+        fn emit() {
+            tracing::info!("capture-cross-thread-registration");
+        }
+        let (events, _guard) = capture();
+        std::thread::spawn(emit).join().unwrap();
+        emit();
+        assert_eq!(
+            with_message(&events, "capture-cross-thread-registration").len(),
+            1
+        );
+    }
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tracing::Level;
