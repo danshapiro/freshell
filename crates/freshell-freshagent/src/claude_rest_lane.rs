@@ -298,12 +298,18 @@ fn retryable_conflict(code: &str, message: &str) -> RestLaneError {
 
 fn send_error(code: String, message: String) -> RestLaneError {
     match code.as_str() {
-        "SESSION_NOT_FOUND" | "INVALID_SESSION_ID" => retryable_conflict(
-            "FRESH_AGENT_SESSION_NOT_LIVE",
-            "Claude is not running for this session; attach the pane and retry",
-        ),
+        "SESSION_NOT_FOUND" | "INVALID_SESSION_ID" | "SESSION_CLOSED" => {
+            let kind = if code == "SESSION_CLOSED" {
+                RestLaneErrorKind::Conflict
+            } else {
+                RestLaneErrorKind::NotFound
+            };
+            let mut error = RestLaneError::new(kind, code, message);
+            error.retryable = Some(false);
+            error
+        }
         "SESSION_BUSY" | "SESSION_RESERVED" | "STALE_CLAIM" => retryable_conflict(&code, &message),
-        "CLAUDE_SEND_FAILED" | "CLAUDE_SETTINGS_FAILED" => {
+        "CLAUDE_SEND_FAILED" | "CLAUDE_SETTINGS_FAILED" | "CLAUDE_ATTACH_RESUME_FAILED" => {
             RestLaneError::new(RestLaneErrorKind::Unavailable, code, message)
         }
         code if code.starts_with("INVALID_") => {

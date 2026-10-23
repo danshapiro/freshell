@@ -313,6 +313,122 @@ async fn rest_deadline_is_approx_and_a_runtime_exit_is_a_retryable_conflict() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_recovery_does_not_reopen_an_explicitly_closed_session() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let mut browser = rig.connect().await;
+    let created = create(&rig, "claude").await;
+    let id = created["sessionId"].as_str().unwrap();
+    let pane = created["paneId"].as_str().unwrap();
+    browser.kill(id).await;
+    let (status, refused) = rig
+        .post_json(
+            &format!("/api/panes/{pane}/send-keys"),
+            &json!({"data":"a late prompt must stay unsent"}),
+        )
+        .await;
+    assert_eq!(status, 409, "{refused}");
+    assert_eq!(refused["code"], "SESSION_CLOSED");
+    assert_eq!(refused["retryable"], false);
+    assert!(refused.get("retryAfterMs").is_none(), "{refused}");
+    assert_eq!(rig.query_options().len(), 1);
+    assert!(rig.ledger_rows("prompt").is_empty());
+    assert!(!rig.fresh_claude.has_live_session(id).await);
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_recovery_reports_unreadable_storage_as_retryable_and_can_retry_after_repair() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let mut browser = rig.connect().await;
+    let created = create(&rig, "claude").await;
+    let id = created["sessionId"].as_str().unwrap();
+    let pane = created["paneId"].as_str().unwrap();
+    let first = send(&rig, pane, "the existing saved conversation").await;
+    wait_for_saved_turn(&rig, id, first["submittedTurnId"].as_str().unwrap()).await;
+    rig.wait_for_genesis_cleared(id).await;
+    rig.kill_first_sidecar(&mut browser).await;
+    let saved = rig.claude_config_dir.with_extension("saved");
+    std::fs::rename(&rig.claude_config_dir, &saved).unwrap();
+    std::fs::create_dir_all(&rig.claude_config_dir).unwrap();
+    // An actual traversal failure remains an error even when tests run as root.
+    std::os::unix::fs::symlink("projects", rig.claude_config_dir.join("projects")).unwrap();
+    let (status, refused) = rig
+        .post_json(
+            &format!("/api/panes/{pane}/send-keys"),
+            &json!({"data":"continue after storage is repaired"}),
+        )
+        .await;
+    assert_eq!(status, 503, "{refused}");
+    assert_eq!(refused["code"], "CLAUDE_ATTACH_RESUME_FAILED");
+    assert_eq!(refused["retryable"], true);
+    assert!(refused["retryAfterMs"]
+        .as_u64()
+        .is_some_and(|delay| delay > 0));
+    assert_eq!(
+        rig.query_options().len(),
+        1,
+        "unchecked history never starts a replacement"
+    );
+    assert_eq!(
+        rig.ledger_rows("prompt").len(),
+        1,
+        "the refused prompt was not written"
+    );
+    std::fs::rename(
+        &rig.claude_config_dir,
+        rig.claude_config_dir.with_extension("unreadable"),
+    )
+    .unwrap();
+    std::fs::rename(saved, &rig.claude_config_dir).unwrap();
+    let retried = send(&rig, pane, "continue after storage is repaired").await;
+    assert_eq!(retried["sessionId"], id);
+    wait_for_saved_turn(&rig, id, retried["submittedTurnId"].as_str().unwrap()).await;
+    let (status, capture) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert_eq!(status, 200, "{capture}");
+    assert!(
+        capture.contains("the existing saved conversation"),
+        "{capture}"
+    );
+    assert!(
+        capture.contains("continue after storage is repaired"),
+        "{capture}"
+    );
+    assert_eq!(rig.query_options().len(), 2);
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_recovery_reports_a_positively_missing_conversation_as_permanent_not_found() {
+    let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
+    let mut browser = rig.connect().await;
+    let created = create(&rig, "claude").await;
+    let id = created["sessionId"].as_str().unwrap();
+    let pane = created["paneId"].as_str().unwrap();
+    let first = send(&rig, pane, "the conversation that later goes missing").await;
+    wait_for_saved_turn(&rig, id, first["submittedTurnId"].as_str().unwrap()).await;
+    rig.wait_for_genesis_cleared(id).await;
+    rig.kill_first_sidecar(&mut browser).await;
+    std::fs::rename(
+        rig.claude_config_dir.join("projects"),
+        rig.claude_config_dir.with_extension("projects-saved"),
+    )
+    .unwrap();
+    let (status, refused) = rig
+        .post_json(
+            &format!("/api/panes/{pane}/send-keys"),
+            &json!({"data":"never replace missing saved history"}),
+        )
+        .await;
+    assert_eq!(status, 404, "{refused}");
+    assert_eq!(refused["code"], "INVALID_SESSION_ID");
+    assert_eq!(refused["retryable"], false);
+    assert!(refused.get("retryAfterMs").is_none(), "{refused}");
+    assert_eq!(rig.query_options().len(), 1);
+    assert_eq!(rig.ledger_rows("prompt").len(), 1);
+    rig.fresh_claude.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_fenced_send_refusal_reports_its_owner_and_keeps_the_prompt_unsent() {
     let rig = ClaudeRig::start_with_options(RigKind::Sim, options()).await;
     let created = create(&rig, "claude").await;
