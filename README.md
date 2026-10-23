@@ -125,6 +125,8 @@ The service is standalone and independent of Electron.
 
 Freshclaude, Freshcodex, and Freshopencode share a chat interface with tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
 
+In Freshclaude and Kilroy, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. In Freshcodex, “Always allow” lasts until the pane reloads.
+
 You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
 
 ### Session switching and recovery
