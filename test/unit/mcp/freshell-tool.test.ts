@@ -127,6 +127,29 @@ describe('focus neutrality (MCP wrapper)', () => {
 })
 
 describe('executeAction -- tab actions', () => {
+  it.each(['claude', 'kilroy'])('new-tab supports agent %s and maps resume sugar to Claude identity', async (agent) => {
+    mockClient.post.mockResolvedValue({ data: { tabId: 'tab-new', paneId: 'pane-new' } })
+    const result = await executeAction('new-tab', { agent, model: 'catalog-model', effort: 'max', resume: '550e8400-e29b-41d4-a716-446655440000' })
+    expect(result).not.toHaveProperty('error')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      agent, model: 'catalog-model', effort: 'max',
+      sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+    }))
+  })
+
+  it.each(['claude', 'kilroy'])('split-pane supports agent %s and maps resume sugar to Claude identity', async (agent) => {
+    mockClient.get.mockImplementation((url: string) => Promise.resolve(url === '/api/tabs'
+      ? { data: { tabs: [{ id: 'tab-a', activePaneId: 'pmain' }], activeTabId: 'tab-a' } }
+      : { data: { panes: [{ id: 'pmain', tabId: 'tab-a', index: 0 }] } }))
+    mockClient.post.mockResolvedValue({ data: { paneId: 'pane-new' } })
+    const result = await executeAction('split-pane', { target: 'pmain', agent, model: 'catalog-model', effort: 'max', resume: '550e8400-e29b-41d4-a716-446655440000' })
+    expect(result).not.toHaveProperty('error')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/panes/pmain/split', expect.objectContaining({
+      agent, model: 'catalog-model', effort: 'max',
+      sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+    }))
+  })
+
   it('new-tab calls POST /api/tabs with name and mode', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })
     await executeAction('new-tab', { name: 'Work', mode: 'claude' })
@@ -366,19 +389,23 @@ describe('executeAction -- tab actions', () => {
       resume: 'thread-pre-durable',
     })
 
-    expect(result).toEqual(expect.objectContaining({ error: "Only agent 'opencode' is supported with the Rust Freshell server." }))
+    expect(result).toEqual(expect.objectContaining({ error: 'This fresh-agent provider is unavailable with the Rust Freshell server.' }))
     expect(mockClient.post).not.toHaveBeenCalled()
   })
 
-  it.each(['claude', 'kilroy'])('new-tab with agent: %s is locally rejected by the Rust capability contract', async (agent) => {
+  it.each(['claude', 'kilroy'])('new-tab with agent %s accepts the resumeSessionId alias', async (agent) => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 
     await executeAction('new-tab', {
       agent,
-      resume: '550e8400-e29b-41d4-a716-446655440000',
+      resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
     })
 
-    expect(mockClient.post).not.toHaveBeenCalled()
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      agent,
+      sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+    }))
+    expect(mockClient.post.mock.calls[0][1]).not.toHaveProperty('resumeSessionId')
   })
 
   it('list-tabs calls GET /api/tabs', async () => {

@@ -25,7 +25,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RIG_FRAME_BUDGET};
+use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions, RIG_FRAME_BUDGET};
 use serde_json::{json, Value};
 
 /// How long a test keeps reading after the exit report before it counts edges: the
@@ -333,18 +333,31 @@ async fn a_sidecar_death_mid_compact_ends_exited_with_one_ring_and_an_exited_sna
     }
 }
 
-/// A send that reaches a session whose sidecar has ended is refused visibly: the
-/// pane's lost-session frame (nested `INVALID_SESSION_ID`, which starts the client's
-/// recovery) and a request error that hands the message back to the composer. It is
-/// never accepted and never silently dropped. Either id the pane may hold works.
+/// An ended conversation with a cleanly missing transcript is refused visibly:
+/// nested INVALID_SESSION_ID and the correlated unsent prompt, with no fresh
+/// replacement conversation. Resolvable crashes are covered by the recovery suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_send_to_a_dead_session_gets_the_lost_frame_and_a_request_error() {
-    let rig = ClaudeRig::start(RigKind::Sim).await;
+async fn a_send_to_a_dead_session_with_a_missing_transcript_gets_lost_and_a_request_error() {
+    let rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            ..RigOptions::default()
+        },
+    )
+    .await;
     let mut conn = rig.connect().await;
     let session_id = conn.create("create-1").await;
     conn.send_text(&session_id, "send-1", "first").await;
     conn.wait_for_event("freshAgent.turn.complete").await;
     let durable = durable_id(&conn, &session_id);
+    rig.wait_for_genesis_cleared(&durable).await;
+    let projects = rig.claude_config_dir.join("projects");
+    std::fs::rename(
+        &projects,
+        rig.claude_config_dir.with_extension("projects-saved"),
+    )
+    .unwrap();
     let pid = sidecar_pid(&rig).await;
     sigkill(pid);
     wait_for_sidecar_exited(&mut conn, &session_id).await;
@@ -375,7 +388,7 @@ async fn a_send_to_a_dead_session_gets_the_lost_frame_and_a_request_error() {
         assert!(
             error["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("exited")),
+                .is_some_and(|message| message.contains("could not be found")),
             "the error says why: {error}"
         );
     }
@@ -592,17 +605,35 @@ async fn the_boot_catalog_reaches_the_live_state_however_long_the_registration_t
 /// the session, still ends the session: the exit report arrives and the session
 /// reads as exited, never as a live session nobody will ever end (review PRB-C10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cli_death_while_the_session_registers_still_ends_the_session() {
+async fn a_cli_death_during_registration_refuses_create_and_leaves_no_runtime() {
     let rig =
         rig_with_program(json!([{ "on": "start", "emit": [{ "kind": "crash", "delayMs": 300 }] }]))
             .await;
     rig.fresh_claude
         .hold_session_registration(REGISTRATION_HOLD);
     let mut conn = rig.connect().await;
-    let session_id = conn.create("create-1").await;
-
-    let exited = wait_for_sidecar_exited(&mut conn, &session_id).await;
-    assert_eq!(exited["cause"]["reason"], "cli_exited", "{exited}");
-    let overlay = overlay_once(&rig, &session_id, |overlay| overlay["status"].is_string()).await;
-    assert_eq!(overlay["status"], "exited", "{overlay}");
+    let refused = conn.request_create("create-1", json!({})).await;
+    assert_eq!(refused["type"], "freshAgent.create.failed", "{refused}");
+    assert_eq!(refused["code"], "FRESH_AGENT_CREATE_FAILED", "{refused}");
+    let boot = rig
+        .ledger_rows("boot")
+        .into_iter()
+        .next()
+        .expect("the CLI booted before crashing");
+    let session_id = boot["sessionId"].as_str().unwrap();
+    // Creation failed before a runtime was acknowledged; its failure is the
+    // client-visible outcome. Confirm cleanup directly for both child pids.
+    assert!(!rig.fresh_claude.has_live_session(session_id).await);
+    for pid in rig.runtime_pids(session_id) {
+        wait_until_gone(pid as i32).await;
+    }
+    conn.read_for(QUIET).await;
+    assert!(
+        !conn
+            .frames
+            .iter()
+            .any(|frame| frame["type"] == "freshAgent.created" && frame["requestId"] == "create-1"),
+        "{:#?}",
+        conn.frames
+    );
 }

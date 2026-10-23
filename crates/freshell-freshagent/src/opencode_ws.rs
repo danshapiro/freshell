@@ -2163,7 +2163,7 @@ impl FreshOpencodeState {
                 ) {
                     crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
                     crate::ownership_lane::LaneOpGuard::Unwired => None,
-                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                         drop(session);
                         tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %session_id, request_id = ?request_id,
@@ -3042,7 +3042,7 @@ impl FreshOpencodeState {
                 ) {
                     crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
                     crate::ownership_lane::LaneOpGuard::Unwired => None,
-                    crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                    crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                         session.pending_sends.pop_front();
                         tracing::warn!(target: "freshell_freshagent::opencode",
                             session_id = %lookup_id, request_id = ?msg.request_id,
@@ -5258,7 +5258,7 @@ impl FreshOpencodeState {
         ) {
             crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
             crate::ownership_lane::LaneOpGuard::Unwired => None,
-            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+            crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %session_id, real_id = %real_id,
                     "fresh_agent_compact_refused: the op guard refused to arm");
@@ -5739,7 +5739,7 @@ impl FreshOpencodeState {
         ) {
             crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
             crate::ownership_lane::LaneOpGuard::Unwired => None,
-            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+            crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %msg.session_id, real_id = %real_id,
                     "fresh_agent_fork_refused: the op guard refused to arm");
@@ -6330,7 +6330,7 @@ impl FreshOpencodeState {
         ) {
             crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
             crate::ownership_lane::LaneOpGuard::Unwired => None,
-            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+            crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %op.session_id, real_id = %real_id,
                     request_id = %op.request_id,

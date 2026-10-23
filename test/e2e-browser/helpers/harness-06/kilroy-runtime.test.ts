@@ -59,17 +59,18 @@ async function readEverythingSoFar(rt: KilroyRuntime, sessionId: string): Promis
 describe('harness-06 fake kilroy runtime', () => {
   it('answers create with created-first, init, idle — and records the invocation', async () => {
     const { rt, logPath } = await make()
-    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp/fixture-cwd', model: 'claude-opus-4-6' })
+    const sessionId = '11111111-1111-4111-8111-111111111111'
+    rt.send({ type: 'create', sessionId, requestId: 'r-1', cwd: '/tmp/fixture-cwd', model: 'claude-opus-4-6' })
 
     const created = (await rt.nextEvent('created')) as { requestId: string; sessionId: string }
     expect(created.requestId).toBe('r-1')
-    expect(created.sessionId).toMatch(/^[A-Za-z0-9_-]{16,32}$/) // bare nanoid shape
+    expect(created.sessionId).toBe(sessionId)
 
     const init = (await rt.nextEvent('sdk.session.init', undefined, 5000)) as {
       sessionId: string; cliSessionId: string; model: string; cwd: string
     }
     expect(init.sessionId).toBe(created.sessionId)
-    expect(init.cliSessionId).toMatch(/^[0-9a-f-]{36}$/) // canonical durable UUID
+    expect(init.cliSessionId).toBe(sessionId)
     expect(init.cwd).toBe('/tmp/fixture-cwd')
 
     const idle = (await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle', 5000))

@@ -28,6 +28,7 @@ pub use qualification_policy::{
 };
 pub mod host_actor;
 pub mod snapshot_projection;
+pub mod snapshot_text;
 
 #[cfg(test)]
 #[path = "snapshot_projection_tests.rs"]

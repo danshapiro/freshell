@@ -112,9 +112,9 @@ rl.on('line', (line) => {
 
 async function handle(msg) {
   if (msg.type === 'create') {
-    const sessionId = nanoid()
+    const sessionId = msg.sessionId ?? nanoid()
     const resumeSessionId = msg.boot?.resume
-    const cliSessionId = resumeSessionId ?? CLI_SESSION_ID
+    const cliSessionId = resumeSessionId ?? msg.sessionId ?? CLI_SESSION_ID
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, sessionState(cliSessionId, cwd))
     // `created` MUST be the first line written for this request.

@@ -477,6 +477,9 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .fresh-minimap-tick { position: absolute; left: 0; right: 0; height: 3px; border-radius: 2px; background: rgba(127, 127, 127, 0.45); }
 .fresh-turn { border-left: 2px solid hsl(var(--border)); padding-left: 10px; margin-bottom: 14px; }
 .fresh-turn.user { border-left-color: hsl(var(--foreground)); }
+.fresh-turn-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.fresh-turn-action { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border: 1px solid hsl(var(--border)); border-radius: 5px; background: transparent; color: hsl(var(--muted-foreground)); font: inherit; font-size: 11px; }
+.fresh-turn-action:disabled { opacity: .5; }
 .fresh-role { font-size: 11px; text-transform: uppercase; color: hsl(var(--muted-foreground)); margin-bottom: 6px; }
 .fresh-copy { font-size: 16px; line-height: 1.25; color: hsl(var(--foreground)); }
 .fresh-activity { font: 11px 'JetBrains Mono', monospace; color: hsl(var(--muted-foreground)); margin-bottom: 6px; }
@@ -1026,6 +1029,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
                       <div class="fresh-tool-row fresh-tool-row--child"><span aria-hidden="true">↳</span><span class="fresh-tool-name">Read</span><span class="fresh-tool-preview">src/store/store.ts</span></div>
                       <div class="fresh-tool-row"><span class="fresh-tool-ok" aria-label="complete">✓</span><span class="fresh-tool-name">Edit</span><span class="fresh-tool-preview">src/store/store.ts</span></div>
                     </div>
+                    <div class="fresh-turn-actions"><button type="button" class="fresh-turn-action" aria-label="Fork conversation from this turn" title="Fork from this turn after Claude finishes" disabled><i data-lucide="git-fork" class="icon-xs" aria-hidden="true"></i>Fork from turn</button></div>
                   </article>
                   <article class="fresh-turn fresh-turn--live" aria-label="Freshclaude live response" aria-busy="true">
                     <div class="fresh-copy">Renamed the slice and its two imports. Running the store tests next, so nothing still points at the old name<span class="fresh-stream-caret" aria-hidden="true"></span></div>

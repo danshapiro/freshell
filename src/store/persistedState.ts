@@ -431,6 +431,11 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
 
   return {
     ...restWithNormalizedModel,
+    // Older Claude panes persisted a runtime placeholder alongside their
+    // durable reference. New runtimes use that durable UUID from creation.
+    ...(provider === 'claude' && durableState.sessionRef?.provider === 'claude'
+      ? { sessionId: durableState.sessionRef.sessionId }
+      : {}),
     ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
     ...(('restoreError' in durableState && durableState.restoreError) || existingRestoreError

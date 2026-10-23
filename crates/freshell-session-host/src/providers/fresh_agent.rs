@@ -10,6 +10,7 @@ use freshell_agent_runtime::host_actor::{
     FreshAgentProfile, FreshAgentTransport, OperationAck, OperationFailure, OperationFailureKind,
     TransportStart,
 };
+use freshell_agent_runtime::snapshot_text::render_snapshot_text;
 use freshell_codex::launch_plan::CodexSidecarLaunchContext;
 use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, RollbackRequest};
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
@@ -1463,55 +1464,6 @@ fn find_operation_session_id(value: &Value) -> Option<String> {
     }
 }
 
-fn render_snapshot_text(snapshot: &Value, max_bytes: usize) -> (String, bool) {
-    let mut output = String::new();
-    if let Some(turns) = snapshot.get("turns").and_then(Value::as_array) {
-        for turn in turns {
-            let role = turn
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("assistant");
-            let mut body = Vec::new();
-            if let Some(items) = turn.get("items").and_then(Value::as_array) {
-                for item in items {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        body.push(text);
-                    } else if let Some(command) = item.get("command").and_then(Value::as_str) {
-                        body.push(command);
-                    } else if let Some(result) = item.get("output").and_then(Value::as_str) {
-                        body.push(result);
-                    }
-                }
-            }
-            if body.is_empty() {
-                // An item-less turn carrying only the durable error module
-                // (a claude API error or failed local command) reads as its
-                // error; anything else falls back to the summary.
-                if let Some(message) = turn.pointer("/error/message").and_then(Value::as_str) {
-                    body.push(message);
-                } else if let Some(summary) = turn.get("summary").and_then(Value::as_str) {
-                    body.push(summary);
-                }
-            }
-            if !body.is_empty() {
-                output.push_str(role);
-                output.push_str(": ");
-                output.push_str(&body.join("\n"));
-                output.push('\n');
-            }
-        }
-    }
-    if output.len() <= max_bytes {
-        return (output, false);
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !output.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    output.truncate(boundary);
-    (output, true)
-}
-
 fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
     let event_type = value.get("type")?.as_str()?;
     let request_id = value.get("requestId").and_then(|value| match value {
@@ -1668,9 +1620,10 @@ lines.on('line', line=>{
                 );
             }
             if deferred_identity {
-                assert!(
-                    started.native_session_id.is_none(),
-                    "unrecorded native identity must remain unknown"
+                assert_eq!(
+                    started.native_session_id.as_deref(),
+                    observed["sessionId"].as_str(),
+                    "fresh native identity is known before any prompt or init"
                 );
             }
             assert_eq!(
@@ -1823,6 +1776,54 @@ lines.on('line', line=>{
         .await
         .expect("the turn completes");
         assert_eq!(announced, vec![conversation.to_string()]);
+        Arc::clone(&claude.transport).stop().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_claude_start_resolves_its_uuid_before_any_prompt() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let claude = SimulatedClaude::start(&[]).await;
+        let mut events = claude.transport.take_event_stream().expect("event stream");
+        let profile = claude.profile(None);
+        let started =
+            tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+                .await
+                .expect("fresh start cannot wait for a prompt")
+                .expect("fresh start succeeds");
+        let durable = started
+            .native_session_id
+            .expect("identity is known at create");
+        assert!(uuid::Uuid::parse_str(&durable).is_ok(), "{durable}");
+        assert!(claude.ledger_rows("prompt").is_empty());
+        let query = claude.ledger_rows("query");
+        assert_eq!(query.len(), 1);
+        assert_eq!(query[0]["options"]["sessionId"], durable);
+        claude
+            .transport
+            .dispatch(
+                &RequestId::parse("fresh-first-turn").unwrap(),
+                "the first prompt",
+                &profile,
+            )
+            .await
+            .unwrap();
+        let mut announced = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::Started { native_session_id } => announced.push(native_session_id),
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.turn.complete" =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn completes");
+        assert_eq!(announced, vec![durable]);
         Arc::clone(&claude.transport).stop().await.unwrap();
     }
 
@@ -2049,7 +2050,7 @@ const lines=createInterface({{input:process.stdin}});
 const emit=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
 lines.on('line', line=>{{
   const req=JSON.parse(line);
-  if(req.type==='create')emit({{type:'created',requestId:req.requestId,sessionId:'owned-configure',protocol:2}});
+  if(req.type==='create')emit({{type:'created',requestId:req.requestId,sessionId:req.sessionId??'owned-configure',protocol:2}});
   if(req.type==='configure'){{
     appendFileSync(process.env.FRESHELL_TEST_CONFIGURE_RECEIPT,JSON.stringify(req)+'\n');
     emit({receipt});
@@ -2167,7 +2168,11 @@ lines.on('line', line=>{{
         let metadata = run
             .settled
             .expect("the provider's metadata frame reaches the host journal");
-        assert_eq!(metadata["sessionId"], "owned-configure");
+        assert_eq!(metadata["sessionId"], run.applied[0]["sessionId"]);
+        assert_eq!(
+            metadata["sessionId"].as_str(),
+            run.profile.native_session_id.as_deref()
+        );
         assert_eq!(metadata["model"], "opus");
         assert_eq!(metadata["effort"], "high");
     }
@@ -3962,40 +3967,5 @@ lines.on('line', line=>{{
             })),
             Some("new-native".into())
         );
-    }
-
-    #[test]
-    fn snapshot_text_renderer_is_plain_and_utf8_bounded() {
-        let snapshot = json!({"turns":[
-            {"role":"user","summary":"ignored","items":[{"kind":"text","text":"héllo"}]},
-            {"role":"assistant","summary":"world","items":[]}
-        ]});
-        let (full, truncated) = render_snapshot_text(&snapshot, 100);
-        assert_eq!(full, "user: héllo\nassistant: world\n");
-        assert!(!truncated);
-        let (short, truncated) = render_snapshot_text(&snapshot, 8);
-        assert!(short.len() <= 8);
-        assert!(short.is_char_boundary(short.len()));
-        assert!(truncated);
-    }
-
-    #[test]
-    fn snapshot_text_renders_error_only_turns_by_their_error_message() {
-        // Real claude snapshots (pinned CLI 2.1.237 goldens): a failed /compact
-        // and an API error are item-less turns carrying only the error module.
-        for (golden, expected) in [
-            (
-                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/compact-fail/snapshot.golden.json"),
-                "system: Error during compaction: API Error: 400 compaction refused by fake\n",
-            ),
-            (
-                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/api-error/snapshot.golden.json"),
-                "assistant: API Error: 400 fixture bad request\n",
-            ),
-        ] {
-            let snapshot: Value = serde_json::from_str(golden).unwrap();
-            let (text, _) = render_snapshot_text(&snapshot, 1 << 20);
-            assert!(text.contains(expected), "{text}");
-        }
     }
 }

@@ -269,6 +269,13 @@ turning it off removes the server from Freshclaude and Kilroy agents started or
 resumed after the change, with no restart. Terminal panes do not follow the
 switch yet.
 
+With fresh agents enabled, the CLI and MCP client can create Freshclaude or
+Kilroy tabs, split them into panes, send prompts, and capture their conversation
+as plain text. These operations also work without an open browser. Use
+`agent: "claude"` or `agent: "kilroy"` with MCP `new-tab` and `split-pane`, or
+`--agent claude` / `--agent kilroy` with the CLI. Both support resuming a saved
+Claude conversation through `resume`.
+
 ### Rust server scope
 
 The Rust server supports the browser UI, terminal and session workflows, the

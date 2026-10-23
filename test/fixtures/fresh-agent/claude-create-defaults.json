@@ -1,0 +1,83 @@
+[
+  {
+    "name": "freshclaude registry defaults",
+    "sessionType": "freshclaude",
+    "settings": {},
+    "expected": { "model": "opus[1m]", "permissionMode": "bypassPermissions", "effort": "high", "plugins": [] }
+  },
+  {
+    "name": "kilroy has independent saved defaults",
+    "sessionType": "kilroy",
+    "settings": {
+      "freshAgent": {
+        "defaultPlugins": ["/workspace/plugin"],
+        "providers": {
+          "freshclaude": { "effort": "low" },
+          "kilroy": { "modelSelection": { "kind": "exact", "modelId": "claude-sonnet-custom" }, "defaultPermissionMode": "plan", "effort": "max" }
+        }
+      }
+    },
+    "expected": { "model": "claude-sonnet-custom", "modelSelection": { "kind": "exact", "modelId": "claude-sonnet-custom" }, "permissionMode": "plan", "effort": "max", "plugins": ["/workspace/plugin"] }
+  },
+  {
+    "name": "terminal model does not set a fresh pane default",
+    "sessionType": "freshclaude",
+    "settings": { "codingCli": { "providers": { "claude": { "model": "terminal-model", "permissionMode": "default" } } } },
+    "expected": { "model": "opus[1m]", "permissionMode": "bypassPermissions", "effort": "high", "plugins": [] }
+  },
+  {
+    "name": "saved static effort is trimmed",
+    "sessionType": "freshclaude",
+    "settings": { "freshAgent": { "providers": { "freshclaude": { "effort": " xhigh ", "defaultPermissionMode": "default" } } } },
+    "expected": { "model": "opus[1m]", "permissionMode": "default", "effort": "xhigh", "plugins": [] }
+  },
+  {
+    "name": "probed model clamps to its saved levels",
+    "sessionType": "freshclaude",
+    "settings": { "freshAgent": { "providers": { "freshclaude": {
+      "modelSelection": { "kind": "exact", "modelId": "catalog-model" },
+      "modelEffortLevels": { "modelId": "catalog-model", "levels": ["low", "max"] },
+      "effort": "medium"
+    } } } },
+    "expected": { "model": "catalog-model", "modelSelection": { "kind": "exact", "modelId": "catalog-model" }, "modelEffortLevels": ["low", "max"], "permissionMode": "bypassPermissions", "effort": "low", "plugins": [] }
+  },
+  {
+    "name": "probed model with no effort levels omits effort",
+    "sessionType": "freshclaude",
+    "settings": { "freshAgent": { "providers": { "freshclaude": {
+      "modelSelection": { "kind": "exact", "modelId": "catalog-model" },
+      "modelEffortLevels": { "modelId": "catalog-model", "levels": [] },
+      "effort": "high"
+    } } } },
+    "expected": { "model": "catalog-model", "modelSelection": { "kind": "exact", "modelId": "catalog-model" }, "modelEffortLevels": [], "permissionMode": "bypassPermissions", "plugins": [] }
+  },
+  {
+    "name": "stale levels from a different model are ignored",
+    "sessionType": "freshclaude",
+    "settings": { "freshAgent": { "providers": { "freshclaude": {
+      "modelSelection": { "kind": "exact", "modelId": "catalog-model" },
+      "modelEffortLevels": { "modelId": "old-model", "levels": ["low"] },
+      "effort": "not-a-level"
+    } } } },
+    "expected": { "model": "catalog-model", "modelSelection": { "kind": "exact", "modelId": "catalog-model" }, "permissionMode": "bypassPermissions", "effort": "high", "plugins": [] }
+  },
+  {
+    "name": "probed model retains a supported default effort even when it is not first",
+    "sessionType": "freshclaude",
+    "settings": { "freshAgent": { "providers": { "freshclaude": {
+      "modelSelection": { "kind": "exact", "modelId": "catalog-model" },
+      "modelEffortLevels": { "modelId": "catalog-model", "levels": ["max", "high"] }
+    } } } },
+    "expected": { "model": "catalog-model", "modelSelection": { "kind": "exact", "modelId": "catalog-model" }, "modelEffortLevels": ["max", "high"], "permissionMode": "bypassPermissions", "effort": "high", "plugins": [] }
+  },
+  {
+    "name": "static model ignores stamped levels",
+    "sessionType": "kilroy",
+    "settings": { "freshAgent": { "providers": { "kilroy": {
+      "modelSelection": { "kind": "exact", "modelId": "opus[1m]" },
+      "modelEffortLevels": { "modelId": "opus[1m]", "levels": [] },
+      "effort": "max"
+    } } } },
+    "expected": { "model": "opus[1m]", "modelSelection": { "kind": "exact", "modelId": "opus[1m]" }, "modelEffortLevels": [], "permissionMode": "bypassPermissions", "effort": "max", "plugins": [] }
+  }
+]
