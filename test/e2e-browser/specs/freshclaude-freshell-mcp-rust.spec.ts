@@ -8,9 +8,12 @@
 // CLI does (conformance scenario `mcp`), and calls its tools for the model.
 //
 //   1. the agent calls the Freshell MCP `list-tabs` and its reply lists the
-//      open tabs: the command Rust resolved, the endpoint and the token in
-//      the sidecar's environment all work against the real server;
-//   2. with Settings → Advanced → "Agent MCP server" turned off, a new pane's
+//      open tabs, its own among them: the command Rust resolved, the endpoint
+//      and the token in the sidecar's environment all work against the real
+//      server;
+//   2. an untargeted `split-pane` splits the agent's own pane, even while the
+//      user is looking at another tab (the pane context the CLI got);
+//   3. with Settings → Advanced → "Agent MCP server" turned off, a new pane's
 //      agent has no Freshell MCP server: the same call is "No such tool".
 //
 // CLOUD-LEGALITY: no CLI binary and no network (the simulator stands in for
@@ -24,15 +27,28 @@ import { ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-stdio-client.js'
 
 const PROMPT = 'which tabs are open?'
 const REPLY_PREFIX = 'Open tabs: '
+const SPLIT_PROMPT = 'split your pane'
+const SPLIT_PREFIX = 'Split: '
 /** A tab the agent's list-tabs must find, named so its title is unmistakable. */
 const PROBE_TAB = 'g19 probe tab'
 
-/** The model calls the Freshell MCP tool's list-tabs, then repeats its answer. */
+/**
+ * The model calls the Freshell MCP tool's list-tabs, then repeats its answer;
+ * asked to split its pane, it thinks for a few seconds (time for the user to
+ * switch tabs), then calls split-pane with no target.
+ */
 const program = {
-  rules: [onPrompt(PROMPT, [
-    { kind: 'tool', data: { name: 'mcp__freshell__freshell', input: { action: 'list-tabs' } } },
-    { kind: 'text', data: { text: REPLY_PREFIX, echoToolResult: true } },
-  ])],
+  rules: [
+    onPrompt(PROMPT, [
+      { kind: 'tool', data: { name: 'mcp__freshell__freshell', input: { action: 'list-tabs' } } },
+      { kind: 'text', data: { text: REPLY_PREFIX, echoToolResult: true } },
+    ]),
+    onPrompt(SPLIT_PROMPT, [
+      { kind: 'text', data: { chunks: 32, delayMs: 250 } },
+      { kind: 'tool', data: { name: 'mcp__freshell__freshell', input: { action: 'split-pane', mode: 'shell' } } },
+      { kind: 'text', data: { text: SPLIT_PREFIX, echoToolResult: true } },
+    ]),
+  ],
 }
 
 async function withLane(
@@ -59,13 +75,31 @@ async function api(lane: ClaudeSimLane, method: 'GET' | 'POST', route: string, b
   return response.json()
 }
 
+/** The agent's turn in `pane` whose reply starts with `prefix`. */
+async function replyTurn(pane: ClaudeSimPane, prefix: string) {
+  const turn = pane.paneRoot.getByRole('article', { name: /transcript turn$/ }).filter({ hasText: prefix })
+  await expect(turn).toHaveCount(1, { timeout: 30_000 })
+  return turn
+}
+
 /** The agent's reply to PROMPT in `pane`, once its turn is over. */
 async function reply(lane: ClaudeSimLane, pane: ClaudeSimPane) {
   await lane.send(pane, PROMPT)
   await lane.waitForIdle(pane)
-  const turn = pane.paneRoot.getByRole('article', { name: /transcript turn$/ }).filter({ hasText: REPLY_PREFIX })
-  await expect(turn).toHaveCount(1, { timeout: 30_000 })
-  return turn
+  return replyTurn(pane, REPLY_PREFIX)
+}
+
+/** The server's tab list (GET /api/tabs), the list the agent's MCP server reads. */
+async function serverTabs(lane: ClaudeSimLane): Promise<{ ids: string[]; activeTabId: string | null }> {
+  const { data } = await api(lane, 'GET', '/api/tabs')
+  return { ids: data.tabs.map((tab: { id: string }) => tab.id), activeTabId: data.activeTabId ?? null }
+}
+
+/** How many panes a pane layout holds. */
+function leafCount(node: any): number {
+  if (!node) return 0
+  if (node.type === 'leaf') return 1
+  return (node.children ?? []).reduce((sum: number, child: any) => sum + leafCount(child), 0)
 }
 
 /** The `query()` options the simulated CLI recorded for its sessions, in order. */
@@ -85,12 +119,21 @@ test.describe('freshclaude Freshell MCP (production sidecar over the CLI simulat
     test(`${flavour}: the agent lists the open tabs through the Freshell MCP server`, async ({ browser }) => {
       await withLane(browser, { flavour, program }, async (lane) => {
         const pane = await lane.openPane()
-        await api(lane, 'POST', '/api/tabs', { name: PROBE_TAB, mode: 'shell' })
+        const probeTabId: string = (await api(lane, 'POST', '/api/tabs', { name: PROBE_TAB, mode: 'shell' })).data.tabId
+        // The browser mirrors its layout to the server a moment after the
+        // layout settles (a debounce), so a just-opened pane's tab reaches the
+        // server's tab list shortly after it opens.
+        await expect.poll(async () => (await serverTabs(lane)).ids, {
+          timeout: 15_000,
+          message: 'the server knows the browser\'s tabs',
+        }).toEqual(expect.arrayContaining([pane.tabId, probeTabId]))
 
         const turn = await reply(lane, pane)
         // The real server's own tab list (GET /api/tabs), read through the MCP
-        // server with the endpoint and token the server gave the sidecar.
+        // server with the endpoint and token the server gave the sidecar; the
+        // agent's own tab (the FRESHELL_TAB_ID it got) is in it.
         await expect(turn).toContainText('"status": "ok"')
+        await expect(turn).toContainText(pane.tabId)
         await expect(turn).toContainText(PROBE_TAB)
         await expect(turn).not.toContainText('No such tool')
 
@@ -103,6 +146,31 @@ test.describe('freshclaude Freshell MCP (production sidecar over the CLI simulat
           FRESHELL_TAB_ID: pane.tabId,
           FRESHELL_PANE_ID: pane.paneId,
         })
+
+        // While the model thinks, the user switches to the probe tab. The
+        // untargeted split must still split the agent's own pane, not the
+        // pane the user is looking at.
+        await lane.send(pane, SPLIT_PROMPT)
+        await api(lane, 'POST', `/api/tabs/${encodeURIComponent(probeTabId)}/select`, {})
+        await expect.poll(async () => (await serverTabs(lane)).activeTabId, {
+          timeout: 5_000,
+          message: 'the probe tab is the active tab',
+        }).toBe(probeTabId)
+        expect(
+          leafCount(await lane.harness.getPaneLayout(pane.tabId)),
+          'the model is still thinking when the user switches tabs',
+        ).toBe(1)
+        await expect.poll(() => lane.paneStatus(pane), { timeout: 30_000, message: 'the split turn ends' }).toBe('idle')
+        await expect.poll(async () => leafCount(await lane.harness.getPaneLayout(pane.tabId)), {
+          timeout: 15_000,
+          message: 'the agent\'s own tab gains the new pane',
+        }).toBe(2)
+        expect(leafCount(await lane.harness.getPaneLayout(probeTabId)), 'the active tab is left alone').toBe(1)
+        // Back on the agent's tab, its reply shows the split succeeded.
+        await api(lane, 'POST', `/api/tabs/${encodeURIComponent(pane.tabId)}/select`, {})
+        await expect.poll(() => lane.harness.getActiveTabId(), { timeout: 5_000 }).toBe(pane.tabId)
+        const splitTurn = await replyTurn(pane, SPLIT_PREFIX)
+        await expect(splitTurn).toContainText('"status": "ok"')
       })
     })
   }
