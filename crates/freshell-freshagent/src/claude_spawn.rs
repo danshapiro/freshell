@@ -17,14 +17,23 @@
 //! - **Unix** (Linux and macOS): the child leads its own process group
 //!   (`process_group(0)`); the SDK spawns the CLI non-detached, so the CLI
 //!   shares that group. Escalation signals the group, and "the tree is gone"
-//!   means no live process is left in it (on Linux zombies are not counted;
-//!   they hold no pipes and write nothing).
+//!   means no live process is left in it. On Linux a zombie is not counted
+//!   once its last thread has ended (it holds no pipes and writes nothing),
+//!   but one whose main thread alone ended still runs and is counted.
 //! - **Windows**: the child is created suspended, assigned to a
 //!   kill-on-close Job Object (`freshell_platform::process_job`), and only
 //!   then resumed, so every process it starts is born in the job.
 //!   Escalation terminates the job, and "the tree is gone" means the job has
-//!   no active process. If the job cannot be created or assigned, the child
-//!   runs unguarded and `freshagent.claude.tree_guard_unavailable` is logged.
+//!   no active process AND every process the guard saw in it has exited (its
+//!   handle is signaled, as node's is once reaped). The job stops counting a
+//!   process as soon as it starts to exit, a few milliseconds (more for a
+//!   large process) before Windows has finished that exit, and may stop
+//!   listing it then too. So when a stop begins the guard records the job's members
+//!   and has the job report every process that joins it from then on, and
+//!   at every check it watches the members reported since, even one already
+//!   exiting (`freshell_platform::process_job::JobMembers`). If the job
+//!   cannot be created or assigned, the child runs unguarded and
+//!   `freshagent.claude.tree_guard_unavailable` is logged.
 //! - Dropping the guard (an early-return path, a panic, a dropped session)
 //!   kills whatever is left of the tree (Windows: closing the job handle does
 //!   it too), so no path leaks the CLI.
@@ -344,6 +353,9 @@ pub async fn graceful_then_kill(
 ) -> SidecarExit {
     let started = Instant::now();
     let deadline = started + grace;
+    // Before anything can end a member (node's exit can: on Windows node
+    // keeps the children it spawns in a kill-on-close job of its own).
+    guard.watch_members();
     request_shutdown(stdin, deadline).await;
     if let Ok(Ok(status)) = tokio::time::timeout_at(deadline, child.wait()).await {
         let (stop, drain) = if status.success() {
@@ -445,7 +457,7 @@ pub fn spawn_guarded(command: &mut Command) -> std::io::Result<(Child, SidecarTr
 #[cfg(windows)]
 fn spawn_in_job(command: &mut Command) -> std::io::Result<(Child, SidecarTreeGuard)> {
     use freshell_platform::process_job::{
-        resume_suspended_process, KillOnCloseJob, CREATE_SUSPENDED,
+        resume_suspended_process, JobMembers, KillOnCloseJob, CREATE_SUSPENDED,
     };
 
     let job = match KillOnCloseJob::new() {
@@ -466,7 +478,11 @@ fn spawn_in_job(command: &mut Command) -> std::io::Result<(Child, SidecarTreeGua
     };
     let guard = match job.assign_process(process_id) {
         Ok(()) => SidecarTreeGuard {
-            tree: Tree::Job { job, gone: false },
+            tree: Tree::Job {
+                job,
+                members: JobMembers::default(),
+                gone: false,
+            },
         },
         Err(error) => {
             tree_guard_unavailable(&format!("job assignment failed: {error}"));
@@ -504,10 +520,12 @@ enum Tree {
         gone: bool,
     },
     /// Closing the job's last handle (dropping it) kills every process
-    /// still in it.
+    /// still in it. `members` holds the processes seen in it, which must
+    /// have exited too before the tree is gone (see the module docs).
     #[cfg(windows)]
     Job {
         job: freshell_platform::process_job::KillOnCloseJob,
+        members: freshell_platform::process_job::JobMembers,
         gone: bool,
     },
 }
@@ -605,6 +623,28 @@ impl SidecarTreeGuard {
         (status, tree)
     }
 
+    /// Windows: start watching every process in the job not watched yet,
+    /// and (the first time) every process that joins it from now on (see
+    /// the module docs). Nothing to do elsewhere: the process group is
+    /// checked as a whole.
+    fn watch_members(&mut self) {
+        #[cfg(windows)]
+        if let Tree::Job {
+            job,
+            members,
+            gone: false,
+        } = &mut self.tree
+        {
+            if let Err(error) = members.record(job) {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.tree_members_unwatched",
+                    cause = %error,
+                    "the Claude child's job members could not be watched; the tree stays unconfirmed until they can"
+                );
+            }
+        }
+    }
+
     /// Poll until no tree member is alive (marking the guard spent) or
     /// `budget` elapses.
     async fn wait_gone(&mut self, budget: Duration) -> bool {
@@ -621,8 +661,8 @@ impl SidecarTreeGuard {
         }
     }
 
-    fn tree_alive(&self) -> bool {
-        match &self.tree {
+    fn tree_alive(&mut self) -> bool {
+        match &mut self.tree {
             Tree::None => false,
             #[cfg(unix)]
             Tree::ProcessGroup { gone: true, .. } => false,
@@ -630,10 +670,19 @@ impl SidecarTreeGuard {
             Tree::ProcessGroup { pgid, gone: false } => process_group_alive(*pgid),
             #[cfg(windows)]
             Tree::Job { gone: true, .. } => false,
-            // A failed query counts as alive: the bounded wait then ends
-            // as Lingering rather than claiming a confirmation.
+            // Alive while the job counts an active process or a member it
+            // held has not finished exiting (see the module docs). A failed
+            // query counts as alive: the bounded wait then ends as Lingering
+            // rather than claiming a confirmation.
             #[cfg(windows)]
-            Tree::Job { job, gone: false } => job.active_processes().map_or(true, |n| n > 0),
+            Tree::Job {
+                job,
+                members,
+                gone: false,
+            } => members
+                .record(job)
+                .and_then(|()| Ok(job.active_processes()? > 0 || members.any_running()?))
+                .unwrap_or(true),
         }
     }
 
@@ -648,11 +697,16 @@ impl SidecarTreeGuard {
     }
 
     /// Hard-kill every process still in the tree.
-    fn kill_now(&self) {
+    fn kill_now(&mut self) {
+        // While the job still lists them (Windows).
+        self.watch_members();
         #[cfg(unix)]
         self.signal_tree(libc::SIGKILL);
         #[cfg(windows)]
-        if let Tree::Job { job, gone: false } = &self.tree {
+        if let Tree::Job {
+            job, gone: false, ..
+        } = &self.tree
+        {
             if let Err(error) = job.terminate() {
                 tracing::warn!(target: "freshell_freshagent::claude",
                     event = "freshagent.claude.tree_terminate_failed",
@@ -682,7 +736,8 @@ impl Drop for SidecarTreeGuard {
     }
 }
 
-/// Whether any live (non-zombie) process remains in process group `pgid`.
+/// Whether any live process remains in process group `pgid` (on Linux a
+/// zombie is not live once its last thread has ended).
 #[cfg(unix)]
 fn process_group_alive(pgid: i32) -> bool {
     // SAFETY: signal 0 only probes for existence.
@@ -694,7 +749,7 @@ fn process_group_alive(pgid: i32) -> bool {
     {
         // The group exists; it is alive only if a member is not a zombie
         // (an orphan waiting for a reaper that may never come in a
-        // container without one).
+        // container without one) or is one that still has threads.
         linux_group_has_live_member(pgid)
     }
     #[cfg(not(target_os = "linux"))]
@@ -720,15 +775,28 @@ fn linux_group_has_live_member(pgid: i32) -> bool {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
-        // `comm` may hold spaces or parentheses: fields resume after the
-        // last ')' with field 3 (state), then ppid, then pgrp.
+        // `comm` may hold spaces or parentheses: the fields resume after
+        // the last ')' at field 3 (state). `proc(5)` numbers them from 1.
         let Some(rest) = stat.rsplit(')').next() else {
             continue;
         };
-        let mut fields = rest.split_whitespace();
-        let state = fields.next();
-        let group = fields.nth(1).and_then(|group| group.parse::<i32>().ok());
-        if group == Some(pgid) && !matches!(state, Some("Z") | Some("X")) {
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let field = |number: usize| fields.get(number - 3).copied();
+        if field(5).and_then(|group| group.parse::<i32>().ok()) != Some(pgid) {
+            continue;
+        }
+        let live = match field(3) {
+            Some("X" | "x") => false,
+            // `Z` is the main thread's state. The process has exited only
+            // once no other thread (field 20 counts them) is left: one
+            // whose main thread alone ended runs on, and a killed one's
+            // other threads may still be finishing their exit.
+            Some("Z") => field(20)
+                .and_then(|threads| threads.parse::<u32>().ok())
+                .is_none_or(|threads| threads > 1),
+            _ => true,
+        };
+        if live {
             return true;
         }
     }

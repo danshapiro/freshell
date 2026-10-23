@@ -287,9 +287,15 @@ async function writeFakeClaudeSdk(root: string): Promise<{ modulePath: string; r
   const fileName = `checkout-free-fake-claude-sdk-${randomUUID()}.mjs`
   const modulePath = path.join(root, fileName)
   await writeFile(modulePath, `
+// Like the pinned SDK with no prompt pushed: the CLI boots (its boot report
+// carries the command catalog) and no message arrives until close.
 export function query() {
-  let emitted = false
+  let closed = false
+  let wake = () => {}
   return {
+    async initializationResult() {
+      return { pid: process.pid, commands: [{ name: 'checkout-free-command', description: 'Checkout-free command', argumentHint: '' }] }
+    },
     async supportedModels() {
       return [{
         value: 'checkout-free-relocated-model',
@@ -298,14 +304,10 @@ export function query() {
         supportsAdaptiveThinking: true,
       }]
     },
-    async close() {},
+    close() { closed = true; wake() },
     async next() {
-      if (emitted) return { done: true, value: undefined }
-      emitted = true
-      return {
-        done: false,
-        value: { type: 'system', subtype: 'init', session_id: 'checkout-free-fake-claude', model: 'fake', cwd: process.cwd(), tools: [] },
-      }
+      if (!closed) await new Promise((resolve) => { wake = resolve })
+      return { done: true, value: undefined }
     },
     [Symbol.asyncIterator]() { return this },
   }
@@ -580,18 +582,19 @@ describe('checkout-free Electron runtime acceptance', () => {
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       })
-      // The sidecar can emit created and idle in one stdout chunk. Subscribe
-      // to both before sending the command so neither response can be lost.
+      // The sidecar answers created once the CLI booted and publishes the
+      // boot's command catalog right after it, possibly in one stdout chunk.
+      // Subscribe to both before sending the command so neither is lost.
       const responses = waitForJsonLines(claude, [
         (message) => message.type === 'created',
-        (message) => message.type === 'sdk.status',
+        (message) => message.type === 'sdk.session.changed',
       ])
-      claude.stdin?.write(`${JSON.stringify({ type: 'create', requestId: 'checkout-free-create' })}\n`)
-      const [created, idle] = await responses
-      expect(created).toMatchObject({ type: 'created', requestId: 'checkout-free-create' })
+      claude.stdin?.write(`${JSON.stringify({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'checkout-free-create' })}\n`)
+      const [created, commandCatalog] = await responses
+      expect(created).toMatchObject({ type: 'created', requestId: 'checkout-free-create', protocol: 2 })
       const sessionId = (created as { sessionId?: string }).sessionId
       expect(sessionId).toEqual(expect.any(String))
-      expect(idle).toMatchObject({ type: 'sdk.status', sessionId, status: 'idle' })
+      expect(commandCatalog).toMatchObject({ type: 'sdk.session.changed', sessionId, reason: 'session-commands', commands: [{ name: 'checkout-free-command' }] })
       claude.stdin?.write('{"type":"shutdown"}\n')
       await waitForExit(claude)
 

@@ -62,8 +62,8 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
-    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
+    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'shutdown') {
@@ -105,7 +105,7 @@ impl FakeSidecarEnv {
     fn sidecar_pid_for(&self, sid: &str) -> Option<u32> {
         self.create_rows()
             .into_iter()
-            .find(|r| r["msg"]["resumeSessionId"] == sid)
+            .find(|r| r["msg"]["boot"]["resume"] == sid)
             .and_then(|r| r["pid"].as_u64())
             .map(|p| p as u32)
     }
@@ -5705,7 +5705,7 @@ async fn a_handoff_target_exiting_before_the_commit_never_publishes_live() {
     let target_pid = rows
         .iter()
         .rev()
-        .find(|r| r["msg"]["resumeSessionId"] == sid)
+        .find(|r| r["msg"]["boot"]["resume"] == sid)
         .and_then(|r| r["pid"].as_u64())
         .expect("the target sidecar's create row") as u32;
     let _ = std::process::Command::new("kill")
@@ -6183,7 +6183,7 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     let target_pid = env
         .create_rows()
         .into_iter()
-        .filter(|r| r["msg"]["resumeSessionId"] == sid)
+        .filter(|r| r["msg"]["boot"]["resume"] == sid)
         .filter_map(|r| r["pid"].as_u64())
         .find(|pid| *pid != prior_pid as u64)
         .expect("the target sidecar's create row") as u32;
@@ -6515,7 +6515,7 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     let target_pid = env
         .create_rows()
         .into_iter()
-        .filter(|r| r["msg"]["resumeSessionId"] == sid)
+        .filter(|r| r["msg"]["boot"]["resume"] == sid)
         .filter_map(|r| r["pid"].as_u64())
         .find(|pid| *pid != prior_pid as u64)
         .expect("the target sidecar's create row") as u32;
@@ -6811,7 +6811,7 @@ async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_wat
     let target_pid = env
         .create_rows()
         .into_iter()
-        .filter(|r| r["msg"]["resumeSessionId"] == sid)
+        .filter(|r| r["msg"]["boot"]["resume"] == sid)
         .filter_map(|r| r["pid"].as_u64())
         .find(|pid| *pid != 0)
         .expect("the target sidecar's create row") as u32;
@@ -6945,7 +6945,7 @@ async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
     );
 }
 
-/// The fake sidecar's durable id for a create with NO resumeSessionId
+/// The fake sidecar's durable id for a create with NO resume boot
 /// (the fresh-create fallback in FAKE_CLAUDE_SIDECAR_SOURCE).
 const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 

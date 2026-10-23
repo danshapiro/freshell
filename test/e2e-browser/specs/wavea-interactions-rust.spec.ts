@@ -417,7 +417,7 @@ test.describe('wave-A cross-lane interactions', () => {
         expect(rowsAfter.some((r) => r.sessionId === terminalSession)).toBe(true)
 
         // A2 path: the fresh-agent pane resumed in place — server-side proof
-        // is the sidecar create carrying resumeSessionId (UUID or transcript
+        // is the sidecar create carrying a resume boot (UUID or transcript
         // path shape, claude.rs decision table).
         await expect
           .poll(async () => {
@@ -429,9 +429,9 @@ test.describe('wave-A cross-lane interactions', () => {
               .some(
                 (e) =>
                   e.msg?.type === 'create' &&
-                  typeof e.msg?.resumeSessionId === 'string' &&
-                  (e.msg.resumeSessionId === FRESH_DURABLE ||
-                    e.msg.resumeSessionId.endsWith(`/${FRESH_DURABLE}.jsonl`)),
+                  typeof e.msg?.boot?.resume === 'string' &&
+                  (e.msg.boot.resume === FRESH_DURABLE ||
+                    e.msg.boot.resume.endsWith(`/${FRESH_DURABLE}.jsonl`)),
               )
           }, { timeout: 30_000 })
           .toBe(true)

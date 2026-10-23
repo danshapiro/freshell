@@ -667,14 +667,19 @@ export function query() {
 
     let error = result.expect_err("a hung catalog probe times out");
     assert!(error.message.contains("timed out"), "{error:?}");
-    let grandchild: i32 = std::fs::read_to_string(&pid_file)
-        .expect("the fake SDK started its grandchild")
-        .trim()
-        .parse()
-        .expect("a pid");
-    // SAFETY: signal 0 only probes for existence.
-    let alive = unsafe { libc::kill(grandchild, 0) } == 0;
-    assert!(!alive, "the probe's grandchild did not outlive the timeout");
+    let grandchild = crate::process_probe::ProcessProbe::open(
+        std::fs::read_to_string(&pid_file)
+            .expect("the fake SDK started its grandchild")
+            .trim()
+            .parse()
+            .expect("a pid"),
+    );
+    // The killed grandchild may still be a zombie its adopter has not reaped
+    // yet; `kill(pid, 0)` would find that, the probe does not.
+    assert!(
+        grandchild.exited(),
+        "the probe's grandchild did not outlive the timeout"
+    );
 }
 
 // ── route level (model-capabilities-router.ts ports) ─────────────────────────

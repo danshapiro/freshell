@@ -798,7 +798,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
   if (msg.type === 'create') {
     created += 1
     const sessionId = `wedged-claude-${process.pid}-${created}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
   }
 })
 setInterval(() => {}, 1000)

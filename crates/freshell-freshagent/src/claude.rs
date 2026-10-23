@@ -75,10 +75,12 @@ use freshell_protocol::{
     FreshAgentSessionMaterialized, ServerMessage, SessionRuntimeOwner, SessionType,
 };
 
+use crate::claude_handshake::{read_created, BootContext};
+use crate::claude_launch::{create_line, ClaudeBoot};
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
-const PROVIDER: &str = "claude";
+pub(crate) const PROVIDER: &str = "claude";
 
 /// Build the sidecar-only correlation record for one checkpointed Claude
 /// send. The UUID is supplied on SDKUserMessage and later accepted only when
@@ -293,6 +295,15 @@ pub struct FreshClaudeState {
     /// (idempotent in the store) even when blank settings bypass
     /// `record_binding`.
     naming_handles: Arc<TokioMutex<HashMap<String, String>>>,
+    /// Sessions whose sidecar ended unrequested (C09, G05): the end-of-output
+    /// path records each one here as it evicts it from [`Self::sessions`], so the
+    /// pane's ids still resolve to an ended session — its snapshot overlay says
+    /// `exited` and a send to it is refused visibly. Resuming or closing the
+    /// session forgets the record. See [`crate::claude_dead_sessions`].
+    dead_sessions: crate::claude_dead_sessions::SharedDeadSessions,
+    /// Test holds on the session lifecycle ([`crate::claude_test_holds`]); none
+    /// is set in production.
+    test_holds: Arc<crate::claude_test_holds::ClaudeTestHolds>,
 }
 
 /// Focused-ep5-r1 Finding 1: retention for demoted alias records. The
@@ -474,13 +485,21 @@ impl AliasTombstones {
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
-/// `requestId` in [`FreshClaudeState::create_dedup`]. Claude's `create()` returns only a
-/// bare nanoid placeholder (no `sessionRef` -- `adapter.ts` returns `{ sessionId }` only),
-/// so only `session_id` need be cached; the replay branch mirrors the live path's own
-/// broadcast (NO `sessionRef`).
+/// `requestId` in [`FreshClaudeState::create_dedup`]: what the original
+/// `freshAgent.created` said, so the replay branch re-answers identically (a resume
+/// create's `sessionRef` included).
 #[derive(Clone)]
 struct ClaudeCreateRecord {
     session_id: String,
+    session_ref: Option<freshell_protocol::SessionLocator>,
+}
+
+/// The `sessionRef` of the claude conversation `session_id`.
+fn claude_session_ref(session_id: &str) -> freshell_protocol::SessionLocator {
+    freshell_protocol::SessionLocator {
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+    }
 }
 
 /// The per-session pending approval/question set folded from the sidecar's stdout
@@ -651,23 +670,6 @@ struct ClaudeSession {
     ///       is gone).
     /// Carried across the rollback's kill+respawn exactly like `in_turn`.
     turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
-    /// Focused-review ep2-r1 F1: the paired-terminal-frames mark. The
-    /// supported protocol closes EVERY turn with `sdk.result` AND a trailing
-    /// `sdk.status:idle` (both provider fixtures emit exactly that pair; the
-    /// real sidecar's consumeStream finally emits the trailing idle). The
-    /// idle is the SAME turn's closing punctuation, never a new op's edge —
-    /// set by the consumer after folding ANY `sdk.result`, consumed by the
-    /// NEXT `sdk.status:idle` which skips the fold (a second edge's
-    /// attribution would double-count the turn — the reviewer's exact repro:
-    /// A's trailing idle misattributed to a queued garlanded send fired the
-    /// FIFO-drop branch and released the busy gate over still-queued work).
-    /// Arms/sends NEVER reset it (a fresh op submitted between a turn's
-    /// result and its trailing idle must not let that idle fold); an
-    /// in-stream `sdk.error` DOES reset it (the fail-closed `in_turn` needs a
-    /// LIVE terminal edge after the error — the trailing idle must fold
-    /// there), and sidecar EOF zeroes it with the tracker set. Carried across
-    /// the rollback's kill+respawn exactly like `in_turn`.
-    result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Task 5 (unified needs-attention signal): the session's Rust-side
     /// completion clock — an UNREQUESTED sidecar death with a turn in flight
     /// synthesizes the `freshAgent.turn.complete` edge the dead sidecar could
@@ -676,9 +678,11 @@ struct ClaudeSession {
     /// its process (and resets across a rollback fork, same as the sidecar's
     /// own per-session state); wall-clock advancement orders the Rust-minted
     /// `at`s against the sidecar-minted ones — the accepted regime, same as
-    /// Task 3. Minted ONLY by the consumer's unrequested-death arm: requested
-    /// deaths (kill/shutdown/teardown/rollback fork) never reach it, and an
-    /// idle death (no armed turn) mints nothing.
+    /// Task 3. Minted ONLY by the consumer's unrequested-death arm, and only
+    /// for a death that reported no stream end (`sdk.stream.ended`: the
+    /// sidecar already rang that one itself — the interim rule until C18):
+    /// requested deaths (kill/shutdown/teardown/rollback fork) never reach it,
+    /// and an idle death (no armed turn) mints nothing.
     last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
     /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
@@ -812,6 +816,8 @@ impl FreshClaudeState {
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             naming: crate::naming::NamingSink::default(),
             naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
+            dead_sessions: Default::default(),
+            test_holds: Arc::default(),
             handoff_kill_pause: None,
             rollback_adopt_parked: None,
             rollback_adopt_release: None,
@@ -845,6 +851,23 @@ impl FreshClaudeState {
     ) -> Self {
         self.sidecar_environment = Some(environment.into_iter().collect());
         self
+    }
+
+    /// Test seam (see [`crate::claude_test_holds`]): every later session
+    /// registration waits `hold` between starting the session's consumer and
+    /// inserting its record, the way a production resume create awaits its
+    /// identity-sink write there.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_session_registration(&self, hold: Duration) {
+        self.test_holds.hold_registration(hold);
+    }
+
+    /// Test seam (see [`crate::claude_test_holds`]): park every later
+    /// end-of-output path after it recorded the dead session, before it reaps the
+    /// sidecar and reports the exit, until the returned hold is released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_exit_reports(&self) -> Arc<crate::claude_test_holds::ExitReportHold> {
+        self.test_holds.hold_exit_report()
     }
 
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
@@ -1086,33 +1109,15 @@ impl FreshClaudeState {
     /// holds `Stopping`) additionally defers its commit on the escalation.
     async fn teardown_removed_session_logged(&self, session: ClaudeSession) -> LoggedTeardown {
         let session_label = session.sidecar_session_id.clone();
-        match teardown_removed_session(
-            session,
-            self.handoff_confirm_rounds
-                .unwrap_or(TREE_DEATH_CONFIRM_ROUNDS),
-        )
-        .await
-        {
-            TeardownConfirmation::Confirmed => LoggedTeardown::Confirmed,
-            TeardownConfirmation::PlatformLimited => LoggedTeardown::PlatformLimited,
-            TeardownConfirmation::NotConfirmed { tree, ownership_id } => {
-                tracing::error!(target: "freshell_freshagent::claude",
-                    session_id = %session_label,
-                    lingering = tree.len(),
-                    "freshagent.claude.teardown_unconfirmed: the bounded confirmation \
-                     window expired with tagged descendants still alive — the teardown \
-                     did NOT confirm the runtime tree's death; the escalation continues \
-                     detached and the caller's coordinator fence (if any) stays held"
-                );
-                LoggedTeardown::NotConfirmed {
-                    escalation: spawn_claude_tree_death_escalation(
-                        tree,
-                        ownership_id,
-                        session_label,
-                    ),
-                }
-            }
-        }
+        let confirmation = teardown_removed_session(session, self.tree_confirm_rounds()).await;
+        escalate_unconfirmed_teardown(confirmation, session_label)
+    }
+
+    /// The tree-death confirmation budget every sidecar stop uses (a test can
+    /// shorten it).
+    fn tree_confirm_rounds(&self) -> u8 {
+        self.handoff_confirm_rounds
+            .unwrap_or(TREE_DEATH_CONFIRM_ROUNDS)
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -1922,9 +1927,7 @@ impl FreshClaudeState {
             let mut guard = self.sessions.lock().await;
             guard.drain().map(|(_, s)| s).collect()
         };
-        let confirm_rounds = self
-            .handoff_confirm_rounds
-            .unwrap_or(TREE_DEATH_CONFIRM_ROUNDS);
+        let confirm_rounds = self.tree_confirm_rounds();
         // One task per session: each teardown's synchronous `/proc` scans run
         // on the runtime's workers in parallel, so no session's shutdown
         // line waits behind another session's scan.
@@ -2009,8 +2012,10 @@ impl FreshClaudeState {
     // ── freshAgent.create (WS) ───────────────────────────────────────────────────────
 
     /// Handle a `freshAgent.create` for claude/kilroy: spawn the Node sidecar, drive the
-    /// SDK `create` to get the BARE nanoid placeholder, register the session + its stdout
-    /// consumer, and broadcast `freshAgent.created` (or `freshAgent.create.failed`).
+    /// SDK `create` to get the BARE nanoid placeholder (the sidecar answers `created` only
+    /// once the CLI booted the conversation; a refused boot is a typed `create.failed`),
+    /// register the session + its stdout consumer, and broadcast `freshAgent.created`
+    /// (with `sessionRef` for a resume) or `freshAgent.create.failed`.
     /// Long-running (cold sidecar spawn), so the WS loop dispatches this as a detached task.
     /// `provenance` (D8): the WS connection's stamped identity for this create
     /// (`None` on conn-less lanes); threaded to the `sdk.session.init` binding write.
@@ -2040,7 +2045,7 @@ impl FreshClaudeState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.session_id,
                     session_type: session_type.to_string(),
-                    session_ref: None,
+                    session_ref: cached.session_ref,
                     name_ref,
                     session_name,
                 }));
@@ -2478,18 +2483,21 @@ impl FreshClaudeState {
         };
 
         // Send the create request (faithful to createClaudeSdkOptions inputs).
-        let create_req = json!({
-            "type": "create",
-            "requestId": request_id,
-            "cwd": msg.cwd,
-            "model": msg.model,
-            "permissionMode": msg.permission_mode,
-            "effort": msg.effort,
-            "plugins": msg.plugins,
-            "hostedMcp": self.hosted_mcp,
-            "modelSelection": msg.model_selection,
-            "resumeSessionId": resume_sid,
-        });
+        let boot = ClaudeBoot::resume_or_fresh(resume_sid.as_deref());
+        let create_req = create_line(
+            &request_id,
+            session_type,
+            &boot,
+            json!({
+                "cwd": msg.cwd,
+                "model": msg.model,
+                "permissionMode": msg.permission_mode,
+                "effort": msg.effort,
+                "plugins": msg.plugins,
+                "hostedMcp": self.hosted_mcp,
+                "modelSelection": msg.model_selection,
+            }),
+        );
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&ownership_id);
@@ -2501,19 +2509,27 @@ impl FreshClaudeState {
             return;
         }
 
-        // Read stdout until `created` / `create.failed` (bounded). Keep the reader to hand
-        // to the consumer so no post-created event line is lost.
+        // Read stdout until `created` / `create.failed` (bounded): the sidecar answers
+        // `created` only once the CLI has booted the conversation, and a refused boot
+        // (a resume of a conversation the CLI does not have, a CLAUDE_CMD that is not
+        // the CLI) is a typed `create.failed`, never a session that is already dead.
+        // Keep the reader to hand to the consumer so no post-created event line is lost.
         let mut reader = BufReader::new(stdout).lines();
-        let created = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(session_id) => session_id,
-            Err(err) => {
+        let boot_context = BootContext {
+            request_id: &request_id,
+            session_type,
+            boot: &boot,
+        };
+        let created = match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
+            Ok(created) => created.session_id,
+            Err(failure) => {
                 let _ = child.start_kill();
                 reap_owned_claude_sidecars(&ownership_id);
                 // Own tree torn down above -- release so the loser can acquire.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                self.fail_create(&request_id, "CLAUDE_CREATE_FAILED", &err);
+                self.fail_create(&request_id, failure.code(), failure.message());
                 return;
             }
         };
@@ -2620,37 +2636,6 @@ impl FreshClaudeState {
             }
         }
 
-        // Start the stdout consumer (the completion edge normalization + the Task 2
-        // pending-set fold live here). `Some(settings)` => the consumer records a
-        // binding row at `sdk.session.init`.
-        let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
-        log_labels.bind_session(&broadcast_id);
-        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Task 5: the fresh session's death-mint clock (see the field doc).
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
-        let turn_lock = Arc::new(TokioMutex::new(()));
-        // Fresh session: nothing announced yet; the consumer's status fold owns it.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        let consumer = self.spawn_consumer(
-            reader,
-            created.clone(),
-            session_type.to_string(),
-            created.clone(),
-            Some(settings.clone()),
-            Arc::clone(&broadcast_id),
-            Arc::clone(&pending),
-            Arc::clone(&last_status),
-            Arc::clone(&in_turn),
-            Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
-            Arc::clone(&last_synthesized_complete_at),
-            None,
-            provenance,
-        );
-
         // V5 interleaving 2 (Task 12): on the create-resume path, insert
         // `cli_index[durable] = map_key` SYNCHRONOUSLY at session registration
         // (mirroring the attach path) -- NOT lazily at `sdk.session.init`, which lands
@@ -2661,8 +2646,82 @@ impl FreshClaudeState {
                 .lock()
                 .await
                 .insert(sid.to_string(), created.clone());
-            // Round 6 (Finding 2): the alias mapping is durable at
-            // registration (the adopt path's corrector re-stamps it later).
+        }
+
+        // Start the stdout consumer (the completion edge normalization + the Task 2
+        // pending-set fold live here) and register the session, under the sessions
+        // map lock (review PRB-C10): the consumer reaches its session only through
+        // that lock, so no line it reads -- the boot's command catalog, a CLI death
+        // right after the boot -- can find the session missing. `Some(settings)` =>
+        // the consumer records a binding row at `sdk.session.init`.
+        let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
+        log_labels.bind_session(&broadcast_id);
+        let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
+        // Task 5: the fresh session's death-mint clock (see the field doc).
+        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
+        let turn_lock = Arc::new(TokioMutex::new(()));
+        // Fresh session: nothing announced yet; the consumer's status fold owns it.
+        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        {
+            let mut sessions = self.sessions.lock().await;
+            let consumer = self.spawn_consumer(
+                reader,
+                created.clone(),
+                session_type.to_string(),
+                created.clone(),
+                Some(settings.clone()),
+                Arc::clone(&broadcast_id),
+                Arc::clone(&pending),
+                Arc::clone(&last_status),
+                Arc::clone(&in_turn),
+                Arc::clone(&turn_tracker),
+                Arc::clone(&last_synthesized_complete_at),
+                None,
+                provenance,
+            );
+            self.test_holds.registration().await;
+            sessions.insert(
+                created.clone(),
+                ClaudeSession {
+                    configuration: ClaudeConfiguration {
+                        settings,
+                        ..ClaudeConfiguration::default()
+                    },
+                    stdin,
+                    child,
+                    tree_guard,
+                    ownership_id: ownership_id.clone(),
+                    consumer,
+                    sidecar_session_id: created.clone(),
+                    cli_session_id: resume_sid.clone(),
+                    // b8ke focused episode-2 round-2 F2: the owning lifecycle op
+                    // — the create-resume claim's op id, so the session-init
+                    // adoption's Blocked arm can correlate its OWN in-flight
+                    // claim (a foreign blocker tears down instead).
+                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+                    owning_generation: None,
+                    broadcast_id,
+                    pending,
+                    in_turn,
+                    turn_tracker,
+                    last_synthesized_complete_at,
+                    turn_lock,
+                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
+                    last_status,
+                },
+            );
+            // C09: a create that resumes an ended session makes it live again.
+            // Forgotten before the lock is released, so a death of this new
+            // incarnation is recorded after it, never forgotten by it.
+            if let Some(sid) = resume_sid.as_deref() {
+                self.dead_sessions.forget(&[sid], "resumed");
+            }
+        }
+        // Round 6 (Finding 2): the alias mapping is durable at registration (the
+        // adopt path's corrector re-stamps it later).
+        if let Some(sid) = resume_sid.as_deref() {
             if let Some(sink) = self.identity_sink() {
                 if let Err(e) = sink
                     .record_alias_tombstone(
@@ -2678,37 +2737,6 @@ impl FreshClaudeState {
                 }
             }
         }
-        self.sessions.lock().await.insert(
-            created.clone(),
-            ClaudeSession {
-                configuration: ClaudeConfiguration {
-                    settings,
-                    ..ClaudeConfiguration::default()
-                },
-                stdin,
-                child,
-                tree_guard,
-                ownership_id: ownership_id.clone(),
-                consumer,
-                sidecar_session_id: created.clone(),
-                cli_session_id: resume_sid.clone(),
-                // b8ke focused episode-2 round-2 F2: the owning lifecycle op
-                // — the create-resume claim's op id, so the session-init
-                // adoption's Blocked arm can correlate its OWN in-flight
-                // claim (a foreign blocker tears down instead).
-                owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
-                owning_generation: None,
-                broadcast_id,
-                pending,
-                in_turn,
-                turn_tracker,
-                result_idle_pair_pending,
-                last_synthesized_complete_at,
-                turn_lock,
-                rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status,
-            },
-        );
 
         // Round 5 (focused-ep5-r4 Finding 1): the claim's POST-REGISTRATION
         // dead-state re-check. The commit above and a kill's retire serialize
@@ -2818,18 +2846,23 @@ impl FreshClaudeState {
         // codex/opencode: a duplicate `create` arriving right after this point must see
         // the cache populated, never race past this guard's release and spawn a second
         // sidecar).
+        // A resume create names the conversation the CLI booted: `created` comes
+        // only after that boot, so the caller learns the native identity here
+        // instead of waiting for a turn's init (design §6, §7.3). A fresh create
+        // has no durable id until its first turn, so it carries none.
+        let session_ref = resume_sid.as_deref().map(claude_session_ref);
         self.create_dedup
             .record_success(
                 &request_id,
                 ClaudeCreateRecord {
                     session_id: created.clone(),
+                    session_ref: session_ref.clone(),
                 },
             )
             .await;
 
-        // Broadcast freshAgent.created (ws-handler.ts:3378). NO sessionRef for claude
-        // (adapter.ts returns { sessionId } only); placeholder == the bare nanoid.
-        // Unified agent names: the created frame carries the pane's naming
+        // Broadcast freshAgent.created (ws-handler.ts:3378); placeholder == the bare
+        // nanoid. Unified agent names: the created frame carries the pane's naming
         // projection (the pending handle's record) when one was admitted.
         let name_ref = naming_projection
             .as_ref()
@@ -2841,7 +2874,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: created,
             session_type: session_type.to_string(),
-            session_ref: None,
+            session_ref,
             name_ref,
             session_name,
         }));
@@ -2919,6 +2952,7 @@ impl FreshClaudeState {
                 request_id,
                 ClaudeCreateRecord {
                     session_id: durable.to_string(),
+                    session_ref: Some(claude_session_ref(durable)),
                 },
             )
             .await;
@@ -2942,10 +2976,7 @@ impl FreshClaudeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: durable.to_string(),
             session_type: session_type.to_string(),
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: PROVIDER.to_string(),
-                session_id: durable.to_string(),
-            }),
+            session_ref: Some(claude_session_ref(durable)),
             name_ref,
             session_name,
         }));
@@ -3669,6 +3700,8 @@ impl FreshClaudeState {
         // Live-state destruction begins (every durable id the one envelope
         // covers is durably closed by this point). The consumer ABORT stays
         // synchronous (the minter channel closes).
+        // C09: a closed session is not an ended one waiting to be resumed.
+        self.dead_sessions.forget(&retire_ids, "killed");
         let removed = self.sessions.lock().await.remove(&map_key);
         // The gate entry dies with the session (the map rule was the gate's
         // whole meaning; an aborted session adopts nothing more).
@@ -4513,7 +4546,7 @@ impl FreshClaudeState {
                 break handles;
             }
             if !self.rollback_in_flight.contains(&session_id) {
-                self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+                self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
                 return;
             }
             tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
@@ -4649,7 +4682,7 @@ impl FreshClaudeState {
                 }),
                 None => {
                     drop(guard);
-                    self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+                    self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
                     return;
                 }
             }
@@ -4684,7 +4717,7 @@ impl FreshClaudeState {
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
             undo_turn_op_arm(&in_turn, &turn_tracker, send_was_busy);
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
             return;
         };
         // Address the sidecar by ITS id for this session (== the map key for created
@@ -5301,24 +5334,50 @@ impl FreshClaudeState {
         Ok(snapshot)
     }
 
+    /// Test seam (`test-support`, C09 rigs): the live-state overlay the snapshot
+    /// route applies ([`Self::apply_snapshot_metadata`]), over an empty snapshot. A
+    /// rig cannot read a transcript through its server (the store root comes from
+    /// this process's environment), so it reads the overlay directly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn live_snapshot_overlay(&self, any_id: &str) -> Value {
+        let mut snapshot = json!({});
+        self.apply_snapshot_metadata(any_id, &mut snapshot).await;
+        snapshot
+    }
+
+    /// The snapshot overlay from the server's own state: the live session's status,
+    /// settings and commands, or, for a session whose sidecar ended unrequested,
+    /// `exited` with the settings and commands it last had (C09, G05). Both are
+    /// live-state truth (`statusFromLiveState`), so the client adopts the status.
+    /// An id the server holds nothing for leaves the snapshot untouched.
     pub(crate) async fn apply_snapshot_metadata(&self, any_id: &str, snapshot: &mut Value) {
-        let Some(key) = self.resolve_session_key(any_id).await else {
-            return;
+        let live = match self.resolve_session_key(any_id).await {
+            Some(key) => self.sessions.lock().await.get(&key).map(|session| {
+                let status = session.current_status();
+                let status = if status == "idle"
+                    && session.in_turn.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    "running".to_string()
+                } else {
+                    status
+                };
+                (
+                    status,
+                    session.configuration.settings.clone(),
+                    session.configuration.commands.clone(),
+                )
+            }),
+            None => None,
         };
-        let sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get(&key) else {
-            return;
+        let (status, settings, commands) = match live {
+            Some(live) => live,
+            None => match self.dead_sessions.find(any_id) {
+                Some(dead) => ("exited".to_string(), dead.settings, dead.commands),
+                None => return,
+            },
         };
-        let status = session.current_status();
-        snapshot["status"] = json!(if status == "idle"
-            && session.in_turn.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            "running".to_string()
-        } else {
-            status
-        });
+        snapshot["status"] = json!(status);
         snapshot["extensions"]["claude"]["statusFromLiveState"] = json!(true);
-        let settings = &session.configuration.settings;
         let mut fields = Map::new();
         for (key, value) in [
             ("model", &settings.model),
@@ -5332,7 +5391,7 @@ impl FreshClaudeState {
         if !fields.is_empty() {
             snapshot["settings"] = Value::Object(fields);
         }
-        if let Some(commands) = &session.configuration.commands {
+        if let Some(commands) = &commands {
             snapshot["commands"] = json!(commands);
         }
     }
@@ -5371,6 +5430,34 @@ impl FreshClaudeState {
             return false;
         };
         self.sessions.lock().await.contains_key(&key)
+    }
+
+    /// A send whose session is not live (C09, G05). A send to a dead session is
+    /// refused visibly: the lost-session frame for the id the pane sent (the
+    /// client starts its recovery from it) and a request error that hands the
+    /// message back to the composer. Until the transparent resume (C20) it is
+    /// never accepted. Any other id keeps the `SESSION_NOT_FOUND` request error.
+    fn refuse_send_to_missing_session(
+        &self,
+        request_id: &Option<String>,
+        session_id: &str,
+        session_type: SessionType,
+    ) {
+        let Some(dead) = self.dead_sessions.find(session_id) else {
+            self.send_error(request_id, "SESSION_NOT_FOUND", "claude session not found");
+            return;
+        };
+        tracing::warn!(target: "freshell_freshagent::claude",
+            provider = PROVIDER, session_id = %session_id,
+            session_type = session_type_str(session_type), request_id = ?request_id,
+            reason = %dead.reason, died_at_ms = dead.at_ms,
+            "freshagent.claude.send_to_dead_session");
+        self.broadcast(&lost_session_frame(session_id, session_type));
+        self.send_request_error(
+            request_id,
+            ErrorCode::InvalidSessionId,
+            crate::claude_dead_sessions::SEND_TO_DEAD_SESSION_MESSAGE,
+        );
     }
 
     pub(crate) async fn local_snapshot_owner(
@@ -5581,7 +5668,6 @@ impl FreshClaudeState {
             durable_id,
             in_turn,
             turn_tracker,
-            result_idle_pair_pending,
             turn_lock,
             session_type,
             last_synthesized_complete_at,
@@ -5592,7 +5678,6 @@ impl FreshClaudeState {
                     s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
                     s.in_turn.clone(),
                     s.turn_tracker.clone(),
-                    s.result_idle_pair_pending.clone(),
                     s.turn_lock.clone(),
                     session_type_str(op.session_type),
                     // Task 5: the fork continues the SAME per-session
@@ -6486,11 +6571,6 @@ impl FreshClaudeState {
         let mut guard_retried = guard_uuid.is_none(); // no guard => nothing to retry
         let spawned = loop {
             let mut create_req = Map::new();
-            create_req.insert("type".to_string(), json!("create"));
-            create_req.insert(
-                "requestId".to_string(),
-                json!(format!("rollback-{}", uuid::Uuid::new_v4())),
-            );
             if let Some(cwd) = &spawn_cwd {
                 create_req.insert("cwd".to_string(), json!(cwd));
             }
@@ -6505,20 +6585,23 @@ impl FreshClaudeState {
                     create_req.insert("effort".to_string(), json!(effort));
                 }
             }
-            if let Some(resume_at) = &resume_at_uuid {
-                create_req.insert("resumeSessionId".to_string(), json!(resume_value));
-                create_req.insert("resumeSessionAt".to_string(), json!(resume_at));
-                create_req.insert("forkSession".to_string(), json!(true));
-                if let Some(guard) = &guard_uuid {
+            let boot = match &resume_at_uuid {
+                Some(resume_at) => ClaudeBoot::Fork {
+                    resume: resume_value.clone(),
+                    at: Some(resume_at.clone()),
                     // attempt 1 arms the guard; the retried recovery omits it.
-                    if !guard_retried {
-                        create_req.insert("resumeDropsTurn".to_string(), json!(guard));
-                    }
-                }
-            }
-            let create_req = Value::Object(create_req);
+                    drops_turn: guard_uuid.clone().filter(|_| !guard_retried),
+                },
+                None => ClaudeBoot::Fresh,
+            };
+            let create_req = create_line(
+                &format!("rollback-{}", uuid::Uuid::new_v4()),
+                session_type,
+                &boot,
+                Value::Object(create_req),
+            );
             match self
-                .rollback_spawn_create(&create_req, session_type, lease_guard.as_mut())
+                .rollback_spawn_create(&create_req, &boot, session_type, lease_guard.as_mut())
                 .await
             {
                 Ok(ok) => break Ok(ok),
@@ -6586,59 +6669,63 @@ impl FreshClaudeState {
         // clock (extracted with the other carried handles above) — the fork
         // continues the same logical session lifetime, so its Rust-minted
         // `at`s stay ordered against anything the session minted before.
-        let consumer = self.spawn_consumer(
-            reader,
-            map_key.clone(),
-            session_type.to_string(),
-            sidecar_session_id.clone(),
-            recovered.clone(),
-            Arc::clone(&broadcast_id),
-            Arc::clone(&pending),
-            Arc::clone(&last_status),
-            in_turn.clone(),
-            turn_tracker.clone(),
-            result_idle_pair_pending.clone(),
-            Arc::clone(&last_synthesized_complete_at),
-            Some(RollbackAdoption {
-                supersedes: durable_id.clone(),
-                preseeded_init,
-                adopted_tx,
-            }),
-            // Conn-less lane (D8): the rollback respawn has no client
-            // connection — the ledger merge inherits the superseded parent's
-            // stamps.
-            None,
-        );
-        self.sessions.lock().await.insert(
-            map_key.clone(),
-            ClaudeSession {
-                configuration: ClaudeConfiguration {
-                    settings: recovered.clone().unwrap_or_default(),
-                    ..ClaudeConfiguration::default()
+        // Spawned and registered under the sessions map lock (review PRB-C10): no
+        // line the consumer reads can find the replacement session missing.
+        {
+            let mut sessions = self.sessions.lock().await;
+            let consumer = self.spawn_consumer(
+                reader,
+                map_key.clone(),
+                session_type.to_string(),
+                sidecar_session_id.clone(),
+                recovered.clone(),
+                Arc::clone(&broadcast_id),
+                Arc::clone(&pending),
+                Arc::clone(&last_status),
+                in_turn.clone(),
+                turn_tracker.clone(),
+                Arc::clone(&last_synthesized_complete_at),
+                Some(RollbackAdoption {
+                    supersedes: durable_id.clone(),
+                    preseeded_init,
+                    adopted_tx,
+                }),
+                // Conn-less lane (D8): the rollback respawn has no client
+                // connection — the ledger merge inherits the superseded parent's
+                // stamps.
+                None,
+            );
+            self.test_holds.registration().await;
+            sessions.insert(
+                map_key.clone(),
+                ClaudeSession {
+                    configuration: ClaudeConfiguration {
+                        settings: recovered.clone().unwrap_or_default(),
+                        ..ClaudeConfiguration::default()
+                    },
+                    stdin,
+                    child,
+                    tree_guard,
+                    ownership_id,
+                    consumer,
+                    sidecar_session_id,
+                    cli_session_id: Some(cli_id.clone()),
+                    // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
+                    // owns this respawn's coordinator transition — the
+                    // adoption's Blocked arm correlates through the op id.
+                    owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+                    owning_generation: None,
+                    broadcast_id: Arc::clone(&broadcast_id),
+                    pending,
+                    in_turn: in_turn.clone(),
+                    turn_tracker: turn_tracker.clone(),
+                    last_synthesized_complete_at,
+                    turn_lock: turn_lock.clone(),
+                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
+                    last_status,
                 },
-                stdin,
-                child,
-                tree_guard,
-                ownership_id,
-                consumer,
-                sidecar_session_id,
-                cli_session_id: Some(cli_id.clone()),
-                // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
-                // owns this respawn's coordinator transition — the
-                // adoption's Blocked arm correlates through the op id.
-                owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
-                owning_generation: None,
-                broadcast_id: Arc::clone(&broadcast_id),
-                pending,
-                in_turn: in_turn.clone(),
-                turn_tracker: turn_tracker.clone(),
-                result_idle_pair_pending: result_idle_pair_pending.clone(),
-                last_synthesized_complete_at,
-                turn_lock: turn_lock.clone(),
-                rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status,
-            },
-        );
+            );
+        }
 
         // Adoption rides the EXISTING sdk.session.init consumer (preseeded):
         // cli_index insert + AWAITED binding WITH supersedes + rollback-row
@@ -7205,7 +7292,7 @@ impl FreshClaudeState {
     }
 
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
-    /// flavored): transcript-present gate -> spawn sidecar with `resumeSessionId` ->
+    /// flavored): transcript-present gate -> spawn sidecar with a resume boot ->
     /// register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
     /// attach-path D8 lease -- the kill handle is armed after the spawn and the lease
     /// completed (bound to the map key) at registration; error paths tear down their
@@ -7297,7 +7384,7 @@ impl FreshClaudeState {
         // keeping the attach cwd for the process itself. The path form is
         // reserved for a transcript WITH records: a zero-turn transcript
         // (touched at create, no records) has no cwd to resolve and NOTHING
-        // to path-resume — and the sidecar protocol's `resumeSessionId` is a
+        // to path-resume — and the create line's resume boot names a
         // SESSION ID (the real sidecar forwards it verbatim to the SDK's
         // `resume` option), so a path there would make the recovered session
         // write under a path-flattened phantom file. An empty transcript
@@ -7308,17 +7395,20 @@ impl FreshClaudeState {
             .map(|meta| meta.len() > 0)
             .unwrap_or(false);
         let (resume_value, resume_cwd) = match original_cwd {
-            Some(cwd) => (json!(durable), json!(cwd)),
+            Some(cwd) => (durable.to_string(), json!(cwd)),
             None if transcript_has_records => (
-                json!(transcript.to_string_lossy()),
+                transcript.to_string_lossy().to_string(),
                 json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
             ),
             // Attach cwd stays primary; the ledger record's cwd is a FINAL
             // fallback only when both existing sources are absent (Task 10).
             None => (
-                json!(durable),
+                durable.to_string(),
                 json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
             ),
+        };
+        let boot = ClaudeBoot::Resume {
+            resume: resume_value,
         };
 
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
@@ -7359,31 +7449,47 @@ impl FreshClaudeState {
             sidecar_pid,
         );
         let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
-        let create_req = json!({
-            "type": "create",
-            "requestId": request_id,
-            "cwd": resume_cwd,
-            // Recovered from the ledger record (Task 10); `json!` serializes `None`
-            // as `null`, preserving today's fallback wire shape exactly on a miss.
-            "model": rec.model,
-            "permissionMode": rec.permission_mode,
-            "effort": rec.effort,
-            "resumeSessionId": resume_value,
-        });
+        let session_type = session_type_str(msg.session_type);
+        let create_req = create_line(
+            &request_id,
+            session_type,
+            &boot,
+            json!({
+                "cwd": resume_cwd,
+                // Recovered from the ledger record (Task 10); `json!` serializes
+                // `None` as `null`, preserving today's fallback wire shape exactly
+                // on a miss.
+                "model": rec.model,
+                "permissionMode": rec.permission_mode,
+                "effort": rec.effort,
+            }),
+        );
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&ownership_id);
             return Err(ResumeClaudeError::Transient(err));
         }
         let mut reader = BufReader::new(stdout).lines();
-        let sidecar_session_id = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(id) => id,
-            Err(err) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                return Err(ResumeClaudeError::Transient(err));
-            }
+        let boot_context = BootContext {
+            request_id: &request_id,
+            session_type,
+            boot: &boot,
         };
+        // A refusal stays transient here: the transcript was found just above, so a
+        // CLI that cannot resume it is not proof the conversation is gone.
+        let sidecar_session_id =
+            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
+                Ok(created) => created.session_id,
+                Err(failure) => {
+                    let _ = child.start_kill();
+                    reap_owned_claude_sidecars(&ownership_id);
+                    return Err(ResumeClaudeError::Transient(format!(
+                        "{}: {}",
+                        failure.code(),
+                        failure.message()
+                    )));
+                }
+            };
 
         // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
         // 4+5): this attach is a NEW pane GENUINELY CLAIMING `durable` — the
@@ -7442,58 +7548,66 @@ impl FreshClaudeState {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Task 5: the resumed session's death-mint clock (see the field doc).
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         // Freshly resumed session: the tracked status starts "idle" (truthful — no
         // turn can be in flight before the client sends).
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
-        let consumer = self.spawn_consumer(
-            reader,
-            msg.session_id.clone(),
-            session_type.clone(),
-            sidecar_session_id.clone(),
-            recovered.clone(),
-            Arc::clone(&broadcast_id),
-            Arc::clone(&pending),
-            Arc::clone(&last_status),
-            Arc::clone(&in_turn),
-            Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
-            Arc::clone(&last_synthesized_complete_at),
-            None,
-            // Conn-less lane (D8): attach-resume is not a create; the ledger
-            // merge keeps the row's existing stamps.
-            None,
-        );
-        self.sessions.lock().await.insert(
-            msg.session_id.clone(),
-            ClaudeSession {
-                configuration: ClaudeConfiguration {
-                    settings: recovered.unwrap_or_default(),
-                    ..ClaudeConfiguration::default()
+        // Spawned and registered under the sessions map lock (review PRB-C10): no
+        // line the consumer reads can find the resumed session missing.
+        {
+            let mut sessions = self.sessions.lock().await;
+            let consumer = self.spawn_consumer(
+                reader,
+                msg.session_id.clone(),
+                session_type.clone(),
+                sidecar_session_id.clone(),
+                recovered.clone(),
+                Arc::clone(&broadcast_id),
+                Arc::clone(&pending),
+                Arc::clone(&last_status),
+                Arc::clone(&in_turn),
+                Arc::clone(&turn_tracker),
+                Arc::clone(&last_synthesized_complete_at),
+                None,
+                // Conn-less lane (D8): attach-resume is not a create; the ledger
+                // merge keeps the row's existing stamps.
+                None,
+            );
+            self.test_holds.registration().await;
+            sessions.insert(
+                msg.session_id.clone(),
+                ClaudeSession {
+                    configuration: ClaudeConfiguration {
+                        settings: recovered.unwrap_or_default(),
+                        ..ClaudeConfiguration::default()
+                    },
+                    stdin,
+                    child,
+                    tree_guard,
+                    ownership_id,
+                    consumer,
+                    sidecar_session_id,
+                    cli_session_id: Some(durable.to_string()),
+                    owning_operation,
+                    owning_generation: handoff_generation,
+                    broadcast_id,
+                    pending,
+                    in_turn,
+                    turn_tracker,
+                    last_synthesized_complete_at,
+                    turn_lock,
+                    rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
+                    last_status,
                 },
-                stdin,
-                child,
-                tree_guard,
-                ownership_id,
-                consumer,
-                sidecar_session_id,
-                cli_session_id: Some(durable.to_string()),
-                owning_operation,
-                owning_generation: handoff_generation,
-                broadcast_id,
-                pending,
-                in_turn,
-                turn_tracker,
-                result_idle_pair_pending,
-                last_synthesized_complete_at,
-                turn_lock,
-                rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status,
-            },
-        );
+            );
+            // C09: the session is live again, so it is no longer an ended one.
+            // Forgotten before the lock is released, so a death of this new
+            // incarnation is recorded after it, never forgotten by it.
+            self.dead_sessions
+                .forget(&[msg.session_id.as_str(), durable], "resumed");
+        }
         self.cli_index
             .lock()
             .await
@@ -7617,13 +7731,22 @@ impl FreshClaudeState {
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
+        self.send_request_error(
+            request_id,
+            ErrorCode::InternalError,
+            &format!("{code}: {message}"),
+        );
+    }
+
+    /// A top-level `error` frame correlated to `request_id`.
+    fn send_request_error(&self, request_id: &Option<String>, code: ErrorCode, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
             provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
-            code: ErrorCode::InternalError,
-            message: format!("{code}: {message}"),
+            code,
+            message: message.to_string(),
             timestamp: now_iso(),
             actual_session_ref: None,
             expected_session_ref: None,
@@ -8514,11 +8637,11 @@ impl FreshClaudeState {
         // turn lock, the promote/retire/disarm folds live here). `in_turn` is
         // its DERIVED busy cache — this task's folds recompute it from
         // [`TurnTracker::busy`] at every terminal edge:
-        // (a) result/unpaired-idle while a compact was PROMOTED (manual-confirmed
+        // (a) result/idle while a compact was PROMOTED (manual-confirmed
         //     by its completion boundary, ep3-r1 F1) — the
         //     compact's own terminal edge: retire `running`, hold busy while
         //     anything remains outstanding (ep1-r3 F1);
-        // (b) the FIFO-drop peel — result/unpaired-idle with NO running op and
+        // (b) the FIFO-drop peel — result/idle with NO running op and
         //     an UNPROMOTED compact at the queue head: the compact provably
         //     dropped, evidenced by the oldest queued Turn behind it (peel
         //     leading compacts up to that Turn; compacts queued BEHIND the send
@@ -8528,14 +8651,9 @@ impl FreshClaudeState {
         //     own terminal edge or EOF retires it), or EOF (the queue died
         //     with the sidecar) zeroes everything.
         turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
-        // ep2-r1 F1: the paired-terminal-frames mark — see
-        // [`ClaudeSession::result_idle_pair_pending`]. This consumer sets it
-        // after folding ANY `sdk.result`, and the NEXT `sdk.status:idle`
-        // consumes it to skip the fold (pair punctuation, never an edge).
-        result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
         // Task 5 (unified needs-attention signal): the session's Rust-side
         // completion clock — see [`ClaudeSession::last_synthesized_complete_at`].
-        // Held by the consumer (like the latch above) so the unrequested-death
+        // Held by the consumer (like the tracker above) so the unrequested-death
         // arm below can mint AFTER the eviction has already torn the session
         // record out of the map.
         last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
@@ -8598,6 +8716,9 @@ impl FreshClaudeState {
                     let _ = adoption.adopted_tx.send(None);
                 }
             }
+            // The sidecar's report of its SDK stream's end (its last line before it
+            // exits), read by the end-of-output path below.
+            let mut stream_ended: Option<crate::claude_sidecar_exit::StreamEnded> = None;
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -8606,6 +8727,10 @@ impl FreshClaudeState {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
+                if let Some(ended) = crate::claude_sidecar_exit::StreamEnded::from_line(&value) {
+                    stream_ended = Some(ended);
+                    continue;
+                }
                 // kata 1wxv Task 4 busy-truth clear edges — IN-STREAM arms (a) and
                 // (b): `sdk.result` with ANY subtype ends the turn (r2: the earlier
                 // success-only wording is void), and `sdk.status:idle`. NO other
@@ -8623,10 +8748,12 @@ impl FreshClaudeState {
                 // outstanding op's own edge. Any `sdk.error` clears the QUEUE
                 // outright (the queued ops provably never arrive) while leaving
                 // the running op / `in_turn` fail-closed untouched.
-                // ep2-r1 F1 (the paired terminal frames): EVERY turn closes with
-                // `sdk.result` AND a trailing `sdk.status:idle` — the idle is
-                // the SAME turn's punctuation, never a second edge; the fold
-                // below skips the fold for exactly that paired idle.
+                // A turn ends with its `sdk.result` alone. The real sidecar
+                // sends no `sdk.status:idle` at all since C09 (its stream's end
+                // is `sdk.stream.ended` and its exit, G23); only the legacy
+                // protocol fakes still send one, until C17/C18 delete this arm.
+                // An idle is never a result's trailing punctuation, so it
+                // always folds.
                 // ep4-r2 F2: the fold NEVER serializes behind rollback's
                 // turn_lock (blocking it let rollback absorb compact debt and
                 // then miss a compaction that started in the sidecar behind
@@ -8683,23 +8810,11 @@ impl FreshClaudeState {
                     }
                     Some("sdk.result") => {
                         fold_terminal_edge(&in_turn, &turn_tracker);
-                        // A result's trailing idle is its pair punctuation the
-                        // idle arm below skips (ep2-r1 F1).
-                        result_idle_pair_pending.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("idle") =>
                     {
-                        // ep2-r1 F1: the idle trailing a result is the SAME
-                        // turn's closing punctuation — NEVER a new op's edge
-                        // (folding it would double-attribute the turn: the
-                        // reviewer's exact repro fired the drop branch on
-                        // A's trailing idle while C/S sat queued).
-                        if !result_idle_pair_pending
-                            .swap(false, std::sync::atomic::Ordering::SeqCst)
-                        {
-                            fold_terminal_edge(&in_turn, &turn_tracker);
-                        }
+                        fold_terminal_edge(&in_turn, &turn_tracker);
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("compacting") =>
@@ -8813,21 +8928,18 @@ impl FreshClaudeState {
                         // The queued ops provably never arrive as
                         // their own turns — clear the QUEUE outright (the running
                         // op and `in_turn` stay fail-closed for its own terminal
-                        // edge or EOF to retire). ep2-r1 F1: the pair mark
-                        // resets TOO — the fail-closed `in_turn` needs a LIVE
-                        // terminal edge after the error; a result's trailing
-                        // idle past an error must fold, never be skipped.
+                        // edge or EOF to retire).
                         let session_dead =
                             value.get("sessionNotFound").and_then(Value::as_bool) == Some(true);
                         {
                             let mut tracker = turn_tracker.lock().expect("turn tracker lock");
                             tracker.queued.clear();
                             if session_dead {
-                                // ep3-r2 F2: the provider-side session is DEAD —
-                                // the sidecar (handleSend/handleInterrupt)
-                                // answers `sdk.error` and keeps the long-lived
-                                // stdout OPEN, so NO terminal edge or EOF will
-                                // ever retire what remains. Every tracked op —
+                                // ep3-r2 F2: the sidecar does not host the
+                                // named session (handleSend/handleInterrupt
+                                // answer `sdk.error` with stdout still OPEN),
+                                // so NO terminal edge or EOF will ever retire
+                                // what remains. Every tracked op —
                                 // including `running` — can never complete:
                                 // retire the whole tracker and open the gate
                                 // (else the pane wedges BUSY forever after an
@@ -8837,7 +8949,6 @@ impl FreshClaudeState {
                                 in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
                             }
                         }
-                        result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -8852,7 +8963,7 @@ impl FreshClaudeState {
                 // (:445) — so a mid-turn "compacting" can never wedge the tracker
                 // for the rest of the session's life — and the raw sdk.status wire
                 // value folds on top (:351-352 compacting announces truthfully
-                // mid-turn; the stream-end idle is a no-op after the last result).
+                // mid-turn; only the legacy protocol fakes still send an idle).
                 match value.get("type").and_then(Value::as_str) {
                     Some("sdk.assistant") => {
                         *last_status.lock().expect("last status lock") = "running".to_string();
@@ -8957,23 +9068,23 @@ impl FreshClaudeState {
                 tracker.queued.clear();
                 tracker.compact_candidate = false;
             }
-            result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
-            // Consumer exit == this sidecar's stdout closed == sidecar death
-            // (ledger A9). Evict the dead session and its cli_index entries,
-            // identity-guarded: a newer session re-registered under the same
-            // map key (attach-resume, Task 6) has a DIFFERENT
-            // sidecar_session_id and must not be evicted by this stale consumer.
+            // Consumer exit == this sidecar's stdout closed == the sidecar ended
+            // (ledger A9): it exits after reporting its SDK stream's end
+            // (`sdk.stream.ended`, G02), or the Node process died. Evict the dead
+            // session and its cli_index entries, identity-guarded: a newer session
+            // re-registered under the same map key (attach-resume, Task 6) has a
+            // DIFFERENT sidecar_session_id and must not be evicted by this stale
+            // consumer.
             let evicted = {
                 let mut map = sessions.lock().await;
                 match map.get(&session_id) {
                     Some(s) if s.sidecar_session_id == sidecar_session_id => {
-                        map.remove(&session_id);
-                        true
+                        map.remove(&session_id)
                     }
-                    _ => false,
+                    _ => None,
                 }
             };
-            if evicted {
+            if let Some(evicted) = evicted {
                 // Focused-ep5-r1 Finding 1: the aliases are DEMOTED to the
                 // retained alias tombstones, never dropped — the client closes
                 // a crashed pane by its ORIGINAL bare placeholder, and a kill
@@ -9000,46 +9111,139 @@ impl FreshClaudeState {
                         "freshclaude/consumer-exit",
                     );
                 }
-                // Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar
-                // death must never be TOTAL SILENCE. The codex sibling broadcasts its
-                // crash self-heal `exited` status (`codex.rs spawn_exit_watcher`) and
-                // opencode's turn task emits an unconditional `idle`
-                // (`opencode_ws.rs run_turn`); the reference bridge broadcasts an
-                // explicit idle for exactly this edge so the pane doesn't stay stuck
-                // blue (`server/sdk-bridge.ts:344-353`). Claude alone dropped the pane
-                // into a forever-"working" wedge. Broadcast the `freshAgent.error`
-                // shape the client folds into a visible banner AND a
-                // running/streaming->idle drop (`fresh-agent-ws.ts:333-342`,
-                // `freshAgentSlice.sessionError`). This branch is UNREQUESTED-death
-                // only: `handle_kill`/`shutdown`/attach-teardown all remove the map
-                // entry (and abort this consumer) first, so `evicted` is false there
-                // and stays silent. ADR Decision 2.1's no-FALSE-completion property
-                // now holds through the GATE below: an in-flight death rings the
-                // unified attention edge (a turn end the user did not witness),
-                // an IDLE death still fabricates no chime.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                tracing::warn!(session_id = %stamp, "freshagent.claude.sidecar_death_detected");
-                state.emit_fresh_agent_error(
-                    &stamp,
-                    &session_type,
-                    "SIDECAR_EXITED",
-                    "Claude agent process exited unexpectedly - the in-flight turn was lost. Reopen the pane or create a new agent to continue.",
-                );
-                // Task 5 (unified needs-attention signal): an UNREQUESTED death
-                // ends any in-flight turn — the user must come look. The sidecar
-                // (Task 4) rings its own edge on every turn end its stream can
-                // report; the ONE end it cannot report is a process death
-                // mid-turn (its finally never runs), so synthesize the SAME
-                // `freshAgent.turn.complete` edge here. The armed state was
-                // captured at EOF entry above — the clearing + eviction in
-                // between have already torn down the latch and the session
-                // record, so the mint reads the CAPTURED value and the
-                // consumer-held clock Arc. The sidecar's own monotonic clock
-                // died with its process; wall-clock advancement orders the
-                // Rust-minted `at`s against the sidecar-minted ones — the
-                // accepted regime, same as Task 3. Requested deaths never
-                // reach this arm; an idle death (no armed turn) stays silent.
-                if turn_was_in_flight {
+                // G05 (C09): the ended session stays known as ended — its ids
+                // resolve to a dead record, not to nothing. It is recorded
+                // before the stop on purpose: a resume (an attach, which is a
+                // recovery verb, or a create that resumes) can land while the
+                // stop runs and forgets the record, which is how the report
+                // below knows to stay away from a session that is live again.
+                // So for as long as the stop runs, a snapshot already reads
+                // `exited` and a send already gets the lost-session frame.
+                // That is short: node has usually exited by now (it ended its
+                // stream, or it died), so the stop is the tree guard's kill and
+                // the confirmation; only a node that closed its output and kept
+                // running is given the whole grace period before it is killed.
+                let reason = stream_ended
+                    .as_ref()
+                    .map_or(crate::claude_sidecar_exit::PROCESS_ENDED_REASON, |ended| {
+                        ended.reason.as_str()
+                    });
+                state
+                    .dead_sessions
+                    .record(crate::claude_dead_sessions::Death {
+                        map_key: &session_id,
+                        stamp: &stamp,
+                        session_type: &session_type,
+                        durables: &removed_durables,
+                        cli_session_id: evicted.cli_session_id.as_deref(),
+                        settings: &evicted.configuration.settings,
+                        commands: evicted.configuration.commands.as_ref(),
+                        reason,
+                    });
+                state.test_holds.exit_report().await;
+                // Stop the ended sidecar through the one sidecar stop every
+                // teardown uses (G31): node is reaped for its exit status (the
+                // cause of a death that reported no stream end), whatever is
+                // left of its tree (the CLI) is killed and, within the stop's
+                // bounded confirmation window, confirmed gone before the exit
+                // report offers Resume, and no zombie is left behind. It is not
+                // this consumer's to abort: the consumer is this task.
+                let processes = SidecarProcesses {
+                    child: evicted.child,
+                    stdin: evicted.stdin,
+                    tree_guard: evicted.tree_guard,
+                    ownership_id: evicted.ownership_id,
+                };
+                let tree = processes.capture_tree();
+                let (exit, confirmation) = processes
+                    .stop(
+                        tree,
+                        &stamp,
+                        state.tree_confirm_rounds(),
+                        crate::claude_spawn::SIDECAR_GRACEFUL_EXIT,
+                    )
+                    .await;
+                let confirmed = confirmation.label();
+                // A tree the window could not confirm gone keeps being killed in
+                // the background (logged there), and the report does not wait
+                // for it. On Linux such a member has outlived SIGKILL: it runs
+                // no more code and is only slow to finish dying (or stuck in
+                // the kernel), so a resume cannot race it, while holding the
+                // report back would leave the pane busy for as long as the
+                // kernel keeps it. Off Linux an unconfirmed tree is the guard's
+                // typed platform limitation, logged by the stop.
+                let _ = escalate_unconfirmed_teardown(confirmation, stamp.clone());
+                // A node that outlived the grace period was killed by the stop:
+                // the signal it died of is ours, not the cause.
+                let status = exit
+                    .status
+                    .filter(|_| exit.stop != crate::claude_spawn::SidecarStop::Forced);
+                let cause =
+                    crate::claude_sidecar_exit::SidecarExitCause::new(stream_ended.take(), status);
+                // Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar
+                // end must never be TOTAL SILENCE. Broadcast the `freshAgent.error`
+                // shape the client folds into a visible banner AND a
+                // running/streaming->idle drop (`fresh-agent-ws.ts`,
+                // `freshAgentSlice.sessionError`), with the cause. This branch is
+                // UNREQUESTED-end only: `handle_kill`/`shutdown`/attach-teardown all
+                // remove the map entry (and abort this consumer) first, so nothing is
+                // evicted here and it stays silent.
+                let rings = crate::claude_sidecar_exit::death_rings(turn_was_in_flight, &cause);
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    provider = PROVIDER,
+                    session_id = %stamp,
+                    session_type = %session_type,
+                    reason = cause.reason(),
+                    cause = %cause.detail(),
+                    exit_status = %crate::claude_sidecar_exit::describe_status(exit.status),
+                    stop = exit.stop.label(),
+                    confirmation = confirmed,
+                    turn_in_flight = turn_was_in_flight,
+                    rings,
+                    "freshagent.claude.sidecar_exit");
+                // G05: every pane learns the session exited — a compacting or
+                // running pane stops being busy and offers Resume — and why
+                // (SIDECAR_EXITED, which also drops the pane to idle). The report
+                // belongs to the dead incarnation: a resume that registered the
+                // session again during the stop (an attach under the same pane
+                // id) or a close forgot the dead record, and then neither frame
+                // may reach the id, which names a live session or nothing now.
+                if state.dead_sessions.find(&stamp).is_some() {
+                    state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: crate::claude_dead_sessions::exited_status_event(&stamp),
+                        provider: PROVIDER.to_string(),
+                        session_id: stamp.clone(),
+                        session_type: session_type.clone(),
+                    }));
+                    state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: crate::claude_sidecar_exit::sidecar_exited_event(&stamp, &cause),
+                        provider: PROVIDER.to_string(),
+                        session_id: stamp.clone(),
+                        session_type: session_type.clone(),
+                    }));
+                } else {
+                    tracing::info!(target: "freshell_freshagent::claude",
+                        provider = PROVIDER,
+                        session_id = %stamp,
+                        session_type = %session_type,
+                        reason = cause.reason(),
+                        "freshagent.claude.exit_report_skipped: the session was resumed or \
+                         closed while its dead sidecar was reaped");
+                }
+                // Task 5 (unified needs-attention signal): an UNREQUESTED end of a
+                // running turn is a turn end the user did not witness, even when a
+                // resume brought the session back during the stop. Interim
+                // rule (design §5.7, until C18): a sidecar that reported its
+                // stream's end already rang a result-less turn end itself, so the
+                // server rings only for a death that reported nothing (a Node
+                // death mid-turn) — exactly one edge either way. The armed state
+                // was captured at EOF entry above; the clearing + eviction in
+                // between have torn down the tracker and the session record, so
+                // the mint reads the CAPTURED value and the consumer-held clock
+                // Arc. Wall-clock advancement orders the Rust-minted `at`s against
+                // the sidecar-minted ones — the accepted regime, same as Task 3.
+                if rings {
                     let at = {
                         let mut guard = last_synthesized_complete_at
                             .lock()
@@ -9079,9 +9283,9 @@ impl FreshClaudeState {
 /// Stream invariants the attribution leans on (provider FIFO discipline): the
 /// sidecar processes its input queue strictly in acceptance order; at most one
 /// op runs at a time; EVERY op ends with exactly one logical terminal edge —
-/// a turn emits `sdk.result` (any subtype) followed by its trailing
-/// `sdk.status:idle` PUNCTUATION (paired-skipped by the consumer before this
-/// fold ever sees it, ep2-r1 F1), or a completed interrupt stands in for the
+/// a turn emits `sdk.result` (any subtype) — the real sidecar sends no idle
+/// (G23; only the legacy protocol fakes do, until C17/C18) — or a completed
+/// interrupt stands in for the
 /// running op's edge at the write site (no result frame exists, Task 4 edge
 /// (d)); and a compact's terminal edge is ALWAYS preceded by its
 /// manual-confirmed completion boundary in-stream (an unpromoted compact can
@@ -9281,8 +9485,9 @@ fn absorb_unstarted_compact_debt(
     }
 }
 
-/// The in-stream TERMINAL-edge fold (`sdk.result` any subtype; `sdk.status:idle`
-/// only when the consumer's pair-skip let it through, ep2-r1 F1). Attribution
+/// The in-stream TERMINAL-edge fold (`sdk.result` any subtype; `sdk.status:idle`,
+/// which only the legacy protocol fakes still send: the real sidecar sends none
+/// since C09). Attribution
 /// retires the OLDEST outstanding op:
 ///
 ///   (running) the edge belongs to the op in the `running` slot — the active
@@ -9740,6 +9945,10 @@ fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMess
 /// twice).
 const RESUME_DROPS_TURN_REFUSAL_PREFIX: &str = "Resume rejected by --resume-drops-turn:";
 
+/// The `create.failed` code of the same refusal when the CLI reports it at boot
+/// (`crates/freshell-claude-sidecar/boot.mjs`).
+const FORK_GUARD_REFUSED_CODE: &str = "FORK_GUARD_REFUSED";
+
 /// Why one rollback-respawn attempt failed.
 enum RollbackSpawnError {
     /// The create's early output carried the `--resume-drops-turn` refusal
@@ -9793,6 +10002,7 @@ impl FreshClaudeState {
     async fn rollback_spawn_create(
         &self,
         create_req: &Value,
+        boot: &ClaudeBoot,
         session_type: &str,
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
     ) -> Result<RollbackSpawned, RollbackSpawnError> {
@@ -9818,14 +10028,30 @@ impl FreshClaudeState {
             return Err(RollbackSpawnError::Other(err));
         }
         let mut reader = BufReader::new(stdout).lines();
-        let sidecar_session_id = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
-            Ok(id) => id,
-            Err(err) => {
-                let _ = child.start_kill();
-                reap_owned_claude_sidecars(&ownership_id);
-                return Err(RollbackSpawnError::Other(err));
-            }
+        let request_id = create_req
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let boot_context = BootContext {
+            request_id,
+            session_type,
+            boot,
         };
+        let sidecar_session_id =
+            match read_created(&mut reader, SIDECAR_CREATE_BUDGET, &boot_context).await {
+                Ok(created) => created.session_id,
+                Err(failure) => {
+                    let _ = child.start_kill();
+                    reap_owned_claude_sidecars(&ownership_id);
+                    // The CLI refuses a fork whose drops-turn guard does not hold at
+                    // boot (T5): the same refusal the init pre-read below watches for.
+                    return Err(if failure.is_refusal(FORK_GUARD_REFUSED_CODE) {
+                        RollbackSpawnError::GuardRefusal
+                    } else {
+                        RollbackSpawnError::Other(failure.message().to_string())
+                    });
+                }
+            };
         match read_session_init(&mut reader, SIDECAR_CREATE_BUDGET).await {
             Ok(init) => {
                 let cli_id = init
@@ -10039,58 +10265,6 @@ mod provider_exec_tests {
     }
 }
 
-/// Read the sidecar's stdout until the `created` (→ the nanoid placeholder) or
-/// `create.failed` control line, bounded by `budget`. EOF before either is a failure.
-async fn read_created(
-    reader: &mut tokio::io::Lines<BufReader<ChildStdout>>,
-    budget: Duration,
-) -> Result<String, String> {
-    let read = async {
-        loop {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                        continue;
-                    };
-                    match value.get("type").and_then(Value::as_str) {
-                        Some("created") => {
-                            let session_id = value
-                                .get("sessionId")
-                                .and_then(Value::as_str)
-                                .ok_or("created carried no sessionId")?;
-                            return Ok(session_id.to_string());
-                        }
-                        Some("create.failed") => {
-                            let message = value
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown sidecar create failure");
-                            return Err(message.to_string());
-                        }
-                        // sdk.* events before `created` are impossible (the sidecar emits
-                        // `created` first), but tolerate + skip any stray line.
-                        _ => continue,
-                    }
-                }
-                // EOF before `created` → the sidecar died at startup (e.g. bad node/SDK).
-                Ok(None) => return Err("sidecar stdout closed before `created`".to_string()),
-                Err(e) => return Err(format!("sidecar stdout read error: {e}")),
-            }
-        }
-    };
-    match tokio::time::timeout(budget, read).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "sidecar did not answer `create` within {}s",
-            budget.as_secs()
-        )),
-    }
-}
-
 /// Resolve the sidecar entry (`index.mjs`). `FRESHELL_CLAUDE_SIDECAR` overrides; otherwise
 /// the vendored package sits beside this crate at `crates/freshell-claude-sidecar/index.mjs`
 /// (baked from `CARGO_MANIFEST_DIR` so it is cwd-independent).
@@ -10253,32 +10427,120 @@ enum LoggedTeardown {
     },
 }
 
+/// A sidecar stop's typed outcome (b8ke focused round-2 review R2-2): an
+/// unconfirmed tree is never a silent success — the structured error line
+/// lands AND the detached escalation keeps killing the tree, its handle in
+/// the answer.
+fn escalate_unconfirmed_teardown(
+    confirmation: TeardownConfirmation,
+    session_label: String,
+) -> LoggedTeardown {
+    match confirmation {
+        TeardownConfirmation::Confirmed => LoggedTeardown::Confirmed,
+        TeardownConfirmation::PlatformLimited => LoggedTeardown::PlatformLimited,
+        TeardownConfirmation::NotConfirmed { tree, ownership_id } => {
+            tracing::error!(target: "freshell_freshagent::claude",
+                session_id = %session_label,
+                lingering = tree.len(),
+                "freshagent.claude.teardown_unconfirmed: the bounded confirmation \
+                 window expired with tagged descendants still alive — the teardown \
+                 did NOT confirm the runtime tree's death; the escalation continues \
+                 detached and the caller's coordinator fence (if any) stays held"
+            );
+            LoggedTeardown::NotConfirmed {
+                escalation: spawn_claude_tree_death_escalation(tree, ownership_id, session_label),
+            }
+        }
+    }
+}
+
 /// The detached unconfirmed-tree escalation (b8ke focused round-2 review
-/// R2-2): SIGTERM→SIGKILL rounds until the captured tree is confirmed
-/// dead-by-starttime. Resolves `true` only on confirmed death — the
-/// deferred stop commit releases on exactly that.
+/// R2-2): SIGTERM→SIGKILL windows until the captured tree is confirmed
+/// dead-by-starttime ([`escalate_until_dead`]). Resolves `true` only on
+/// confirmed death — the deferred stop commit releases on exactly that.
 fn spawn_claude_tree_death_escalation(
     tree: Vec<(i32, u64)>,
     ownership_id: String,
     session_label: String,
 ) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
-        let mut tree = tree;
-        while !confirm_captured_claude_tree_dead(
-            &mut tree,
-            &ownership_id,
+        let mut captured = CapturedClaudeTree { tree, ownership_id };
+        escalate_until_dead(&mut captured, &session_label).await
+    })
+}
+
+/// One bounded kill-and-confirm window of the detached escalation.
+trait TreeDeathWindow {
+    /// Signal the tree and poll it for one window; `true` once every member
+    /// is confirmed dead.
+    async fn confirm_dead(&mut self) -> bool;
+    /// How many members were still alive after the last window.
+    fn lingering(&self) -> usize;
+}
+
+/// The captured ownership-tagged tree a stop could not confirm gone.
+struct CapturedClaudeTree {
+    tree: Vec<(i32, u64)>,
+    ownership_id: String,
+}
+
+impl TreeDeathWindow for CapturedClaudeTree {
+    async fn confirm_dead(&mut self) -> bool {
+        confirm_captured_claude_tree_dead(
+            &mut self.tree,
+            &self.ownership_id,
             TREE_DEATH_CONFIRM_ROUNDS,
         )
         .await
-        {
-            tracing::warn!(target: "freshell_freshagent::claude",
-                session_id = %session_label, lingering = tree.len(),
-                "freshagent.claude.teardown_escalation_continues: the detached tree-death \
-                 escalation re-armed its bounded window"
-            );
-        }
-        true
-    })
+    }
+
+    fn lingering(&self) -> usize {
+        self.tree.len()
+    }
+}
+
+/// The detached escalation's pause before the next window, after
+/// `failed_windows` windows that ended with the tree alive: half a second,
+/// doubling, at most a minute. A tree that outlives a whole window
+/// (SIGKILL included) is stuck in the kernel; retrying it at once would only
+/// rescan `/proc` every 25 ms and warn every 0.6 s for as long as it stays
+/// stuck.
+fn escalation_pause(failed_windows: u32) -> Duration {
+    const FIRST: Duration = Duration::from_millis(500);
+    const LONGEST: Duration = Duration::from_secs(60);
+    let doublings = failed_windows.saturating_sub(1).min(16);
+    FIRST.saturating_mul(1 << doublings).min(LONGEST)
+}
+
+/// Run `window` until it confirms the tree dead, pausing between windows
+/// ([`escalation_pause`]). It never gives up: an explicit kill's deferred
+/// stop commit waits on the confirmation. Each unconfirmed window logs
+/// `freshagent.claude.teardown_escalation_continues` (warn), the
+/// confirmation `freshagent.claude.teardown_escalation_confirmed` (info).
+async fn escalate_until_dead(window: &mut impl TreeDeathWindow, session_label: &str) -> bool {
+    let started = std::time::Instant::now();
+    let mut failed_windows: u32 = 0;
+    while !window.confirm_dead().await {
+        failed_windows = failed_windows.saturating_add(1);
+        let pause = escalation_pause(failed_windows);
+        tracing::warn!(target: "freshell_freshagent::claude",
+            session_id = %session_label,
+            lingering = window.lingering(),
+            windows = failed_windows,
+            next_window_in_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            "freshagent.claude.teardown_escalation_continues: the detached tree-death \
+             escalation's window ended with the tree still alive; it tries again after a pause"
+        );
+        tokio::time::sleep(pause).await;
+    }
+    tracing::info!(target: "freshell_freshagent::claude",
+        session_id = %session_label,
+        windows = failed_windows.saturating_add(1),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "freshagent.claude.teardown_escalation_confirmed: the detached escalation confirmed \
+         the runtime tree's death"
+    );
+    true
 }
 
 /// The bounded SIGTERM→SIGKILL confirmation round budget (24 × 25ms with
@@ -10387,57 +10649,98 @@ async fn teardown_removed_session_within(
     grace: Duration,
 ) -> TeardownConfirmation {
     let started = std::time::Instant::now();
-    let mut tree = capture_owned_claude_tree(&session.ownership_id, session.child.id());
+    let processes = SidecarProcesses {
+        child: session.child,
+        stdin: session.stdin,
+        tree_guard: session.tree_guard,
+        ownership_id: session.ownership_id,
+    };
+    let tree = processes.capture_tree();
     session.consumer.abort();
     let _ = session.consumer.await;
-    // G31: ask first — the shutdown request lets the sidecar abort its SDK
-    // query (which stops the claude CLI mid-turn) and exit; SIGTERM/SIGKILL
-    // only after the grace period. Node's reaped exit is the portable
-    // confirmation floor, awaited on EVERY platform.
-    let exit = crate::claude_spawn::graceful_then_kill(
-        session.child,
-        session.stdin,
-        session.tree_guard,
-        grace,
-    )
-    .await;
-    reap_owned_claude_sidecars(&session.ownership_id);
-    // The captured ownership-tagged tree's confirmed death (bounded poll,
-    // SIGKILL escalation — a TERM-immune grandchild cannot outlive this).
-    #[cfg(target_os = "linux")]
-    let confirmation = {
-        if confirm_captured_claude_tree_dead(&mut tree, &session.ownership_id, confirm_rounds).await
-        {
-            TeardownConfirmation::Confirmed
-        } else {
-            TeardownConfirmation::NotConfirmed {
-                tree,
-                ownership_id: session.ownership_id,
-            }
-        }
-    };
-    // Off Linux the process-tree guard is the confirmation (macOS: the
-    // sidecar's process group is empty). Without a guard the typed
-    // platform limitation stands: node's awaited exit is the only floor.
-    #[cfg(not(target_os = "linux"))]
-    let confirmation = {
-        let _ = (&mut tree, confirm_rounds);
-        if exit.tree == crate::claude_spawn::TreeConfirmation::Confirmed {
-            TeardownConfirmation::Confirmed
-        } else {
-            tracing::warn!(target: "freshell_freshagent::claude",
-                session_id = %session.sidecar_session_id,
-                platform_limitation = "descendant_tree_unverifiable",
-                tree = ?exit.tree,
-                "freshagent.claude.teardown_platform_limited: the process-tree guard could \
-                 not confirm the sidecar's descendants gone; node's awaited exit is the only \
-                 confirmation"
-            );
-            TeardownConfirmation::PlatformLimited
-        }
-    };
+    let (exit, confirmation) = processes
+        .stop(tree, &session.sidecar_session_id, confirm_rounds, grace)
+        .await;
     log_claude_teardown(&session.sidecar_session_id, &exit, started, &confirmation);
     confirmation
+}
+
+/// A claude sidecar's processes, taken out of its session record to be
+/// stopped: node with its stdin, the guard that owns node's whole process
+/// tree (G31), and the ownership tag the `/proc` reaper finds that tree by.
+struct SidecarProcesses {
+    child: Child,
+    stdin: ChildStdin,
+    tree_guard: crate::claude_spawn::SidecarTreeGuard,
+    ownership_id: String,
+}
+
+impl SidecarProcesses {
+    /// The ownership-tagged tree as `(pid, starttime)` pairs. Capture it
+    /// before anything is stopped: YAMA hides a reparented grandchild's
+    /// environ once node is gone ([`capture_owned_claude_tree`]).
+    fn capture_tree(&self) -> Vec<(i32, u64)> {
+        capture_owned_claude_tree(&self.ownership_id, self.child.id())
+    }
+
+    /// The ONE way a claude sidecar's process tree is stopped and reaped, for
+    /// a requested teardown and for a sidecar that ended on its own (C08)
+    /// alike. G31: ask first — the shutdown request lets the sidecar abort
+    /// its SDK query (which stops the claude CLI mid-turn) and exit;
+    /// SIGTERM/SIGKILL only after `grace`. A sidecar that already ended no
+    /// longer reads the request, so its stop is just the wait for node's exit
+    /// status and the guard settling the rest of the tree. Node's reaped exit
+    /// is the portable confirmation floor, awaited on EVERY platform; then
+    /// the `/proc` ownership reap and the captured `tree`'s confirmed death
+    /// (bounded poll, SIGKILL escalation — a TERM-immune grandchild cannot
+    /// outlive this).
+    async fn stop(
+        self,
+        mut tree: Vec<(i32, u64)>,
+        session_label: &str,
+        confirm_rounds: u8,
+        grace: Duration,
+    ) -> (crate::claude_spawn::SidecarExit, TeardownConfirmation) {
+        let exit =
+            crate::claude_spawn::graceful_then_kill(self.child, self.stdin, self.tree_guard, grace)
+                .await;
+        reap_owned_claude_sidecars(&self.ownership_id);
+        #[cfg(target_os = "linux")]
+        let confirmation = {
+            let _ = session_label;
+            if confirm_captured_claude_tree_dead(&mut tree, &self.ownership_id, confirm_rounds)
+                .await
+            {
+                TeardownConfirmation::Confirmed
+            } else {
+                TeardownConfirmation::NotConfirmed {
+                    tree,
+                    ownership_id: self.ownership_id,
+                }
+            }
+        };
+        // Off Linux the process-tree guard is the confirmation (macOS: the
+        // sidecar's process group is empty). Without a guard the typed
+        // platform limitation stands: node's awaited exit is the only floor.
+        #[cfg(not(target_os = "linux"))]
+        let confirmation = {
+            let _ = (&mut tree, confirm_rounds);
+            if exit.tree == crate::claude_spawn::TreeConfirmation::Confirmed {
+                TeardownConfirmation::Confirmed
+            } else {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %session_label,
+                    platform_limitation = "descendant_tree_unverifiable",
+                    tree = ?exit.tree,
+                    "freshagent.claude.teardown_platform_limited: the process-tree guard could \
+                     not confirm the sidecar's descendants gone; node's awaited exit is the only \
+                     confirmation"
+                );
+                TeardownConfirmation::PlatformLimited
+            }
+        };
+        (exit, confirmation)
+    }
 }
 
 /// The one structured record of every sidecar stop (G31): `info` when the
@@ -10477,6 +10780,9 @@ fn log_claude_teardown(
 
 #[cfg(test)]
 mod teardown_tests;
+
+#[cfg(test)]
+mod end_of_output_tests;
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
@@ -10583,7 +10889,6 @@ pub(crate) mod tests {
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -10959,11 +11264,11 @@ pub(crate) mod tests {
             st.cli_index.lock().await.get(durable),
             Some(&"client-nanoid-1".to_string())
         );
-        // The fake received resumeSessionId (spawn log now records the create request).
+        // The fake received the resume boot (spawn log now records the create request).
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         assert!(
             log.contains(durable),
-            "sidecar create must carry resumeSessionId"
+            "sidecar create must carry the resume boot"
         );
         // Idle snapshot frame, tagged with the client's id + the durable timeline id.
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -11921,7 +12226,7 @@ rl.on('line', (line) => {
   }
   if (msg.type === 'create') {
     // Log the WHOLE create request (one line per create) so tests can both count
-    // spawns AND assert what the sidecar received (e.g. resumeSessionId).
+    // spawns AND assert what the sidecar received (e.g. the resume boot).
     if (spawnLog) {
       fs.appendFileSync(spawnLog, `${JSON.stringify(msg)}\n`)
     }
@@ -11931,14 +12236,14 @@ rl.on('line', (line) => {
       const sessionId = `fake-claude-session-${process.pid}-${counter}`
       liveSessions.add(sessionId)
       configuredSettings.set(sessionId, { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd: msg.cwd })
-      process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
-      // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
-      // id when present (resume continuity), else a fixed fake uuid.
-      // Task 4 (kata 1wxv): a forkSession:true create mints a FRESH durable id,
+      process.stdout.write(JSON.stringify({ type: 'created', sessionId, protocol: 2 }) + '\n')
+      // Mirror the real sidecar's post-create init: echo the resume boot's id as the
+      // durable id when present (resume continuity), else a fixed fake uuid.
+      // Task 4 (kata 1wxv): a fork boot mints a FRESH durable id,
       // never an echo — fork-at-point adoption depends on the id changing.
-      const cliSessionId = msg.forkSession === true
+      const cliSessionId = msg.boot?.kind === 'fork'
         ? `fork-${process.pid}-${counter}-0000-4000-8000-000000000000`
-        : (msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+        : (msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
       console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
       console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
     }
@@ -12029,22 +12334,23 @@ rl.on('line', (line) => {
     // asynchronously, and per the SDK contract (`sdk.d.ts:3760`) the control
     // receipt is written BEFORE the interrupted turn's terminal `sdk.result`
     // — so the fake mirrors: settle frame first, then (accepted case) the
-    // interrupted turn's own result + paired idle, IN THAT ORDER. The
+    // interrupted turn's own result, IN THAT ORDER (no trailing idle: the
+    // real sidecar sends none). The
     // rollback gate opens at the RESULTS, never at the receipt. A knocked-out
     // settle (probe on an idle sidecar) still stands alone: with no in-flight
     // op the result folds harmlessly on an empty tracker.
     //
     // Knobs: FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT=1 — the provider REJECTED
-    // the interrupt (ok:false, NO trailing result/idle: the turn still runs
+    // the interrupt (ok:false, NO trailing result: the turn still runs
     // and its own later edge owns it — the gate stays closed);
     // FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS — defer the whole settle→result
-    // →idle chain (the request↔settle window is the provider-work window the
+    // chain (the request↔settle window is the provider-work window the
     // gate must hold);
     // FRESHELL_TEST_CLAUDE_PROBE_COMPACT_BEFORE_SETTLE=1 — BEFORE the settle,
     // emit `sdk.status:compacting` (the absorbed compact debt started in the
     // sidecar before consuming the probe request: rollback's recheck must see
     // the revived candidate via the probe's in-order stream position and
-    // ABORT the teardown) — and NO trailing result/idle for the compact: its
+    // ABORT the teardown) — and NO trailing result for the compact: its
     // own terminal edge has not yet landed (the hazard window).
     const settleMs = parseInt(process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS || '0', 10)
     const reject = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT === '1'
@@ -12056,7 +12362,6 @@ rl.on('line', (line) => {
       console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: !reject }))
       if (!reject && !compactBeforeSettle) {
         console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, subtype: 'error', errors: ['interrupted'] }))
-        console.log(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }))
       }
     }
     if (settleMs > 0) setTimeout(settle, settleMs)
@@ -12153,7 +12458,7 @@ rl.on('line', (line) => {
         }
 
         /// Path of the spawn log (one full JSON create-request line per spawn) so tests
-        /// can assert what the sidecar received (e.g. `resumeSessionId`).
+        /// can assert what the sidecar received (e.g. the resume boot).
         fn spawn_log_path(&self) -> &std::path::Path {
             &self.spawn_log
         }
@@ -13305,8 +13610,8 @@ rl.on('line', (line) => {
     /// ONLY identity is a provider-matched `sessionRef` must resume exactly
     /// like the legacy `resumeSessionId` carrier — the canonical field cannot
     /// be a second-class citizen while the client migrates off the legacy
-    /// duplicate. The fake sidecar echoes the create request's
-    /// `resumeSessionId` back as the durable id, so the created frame's
+    /// duplicate. The fake sidecar echoes the create request's resume
+    /// boot back as the durable id, so the created frame's
     /// sessionId proves the promotion reached the sidecar.
     #[tokio::test]
     async fn handle_create_with_session_ref_only_resumes_like_legacy() {
@@ -13330,7 +13635,7 @@ rl.on('line', (line) => {
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         assert!(
             log.contains(durable),
-            "sidecar create must carry the sessionRef-derived resumeSessionId: {log}"
+            "sidecar create must carry the sessionRef-derived resume boot: {log}"
         );
         drop(env);
     }
@@ -15231,7 +15536,7 @@ rl.on('line', (line) => {
 
     // ── b8ke focused episode-2 round-1: the adoption's atomicity tests ─────
 
-    /// The fake sidecar's durable id for a create with NO resumeSessionId.
+    /// The fake sidecar's durable id for a create with NO resume boot.
     const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     /// A minimal thread-local tracing capture (the session_handoff
@@ -17347,7 +17652,7 @@ rl.on('line', (line) => {
         let created = await_claude_created(&mut rx, "req-alias-exit").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         // The fake sidecar's default durable cliSessionId (its script emits it
-        // on sdk.session.init when no resumeSessionId was supplied).
+        // on sdk.session.init when no resume boot was supplied).
         let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         // The REAL consumer fold adopts the alias (poll, bounded) — the kill
         // must race NOTHING here: the alias exists before the exit.
@@ -17494,7 +17799,7 @@ rl.on('line', (line) => {
     /// Focused-ep5-r1 Finding 2, the tombstone lifecycle's exit: an EXPLICIT
     /// late resume of a killed session still works — the claim clears the
     /// tombstone, and the resumed session's own adoption write (the fake
-    /// sidecar echoes resumeSessionId as the durable cliSessionId) lands
+    /// sidecar echoes the resume boot's id as the durable cliSessionId) lands
     /// instead of being suppressed as a stale orphan.
     #[tokio::test]
     async fn resume_create_after_a_kill_clears_the_tombstone_and_rebinds() {
@@ -17705,7 +18010,7 @@ rl.on('line', (line) => {
         );
 
         // Epoch 2: the genuine claim — resume the SAME durable id (the fake
-        // sidecar echoes resumeSessionId as the cliSessionId).
+        // sidecar echoes the resume boot's id as the cliSessionId).
         let mut resume = dedup_create_msg("req-reopen-2");
         resume.resume_session_id = Some(durable.to_string());
         resume.cwd = Some("/tmp".to_string());
@@ -19645,7 +19950,6 @@ rl.on('line', (line) => {
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -20089,7 +20393,6 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new("idle".to_string())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(None)),
             None,
             None, // provenance: test lane is conn-less (D8)
@@ -20321,7 +20624,7 @@ rl.on('line', (line) => {
             json!(["/workspace/.claude/plugins/local"])
         );
         assert_eq!(creates[1]["plugins"], Value::Null);
-        assert_eq!(creates[1]["resumeSessionId"], Value::Null);
+        assert_eq!(creates[1]["boot"], json!({ "kind": "fresh" }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -20735,7 +21038,10 @@ rl.on('line', (line) => {
         let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
         let create_req: serde_json::Value =
             serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(create_req["resumeSessionId"], DURABLE);
+        assert_eq!(
+            create_req["boot"],
+            json!({ "kind": "resume", "resume": DURABLE })
+        );
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
@@ -20751,7 +21057,7 @@ rl.on('line', (line) => {
     /// create TOUCHES its transcript (the file exists with zero records).
     /// After a restart, attach's resume lane finds that empty transcript —
     /// its cwd lookup answers nothing — and the path-based resume fallback
-    /// must NOT fire: the sidecar protocol's `resumeSessionId` is a SESSION
+    /// must NOT fire: the create line's resume boot names a SESSION
     /// ID (the real sidecar forwards it verbatim to the SDK's `resume`
     /// option), and a transcript PATH there makes the recovered session
     /// write its conversation under a path-flattened phantom file (observed
@@ -20788,9 +21094,9 @@ rl.on('line', (line) => {
             serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
                 .unwrap();
         assert_eq!(
-            create_req["resumeSessionId"]
+            create_req["boot"]["resume"]
                 .as_str()
-                .expect("resumeSessionId on the wire"),
+                .expect("the resume on the wire"),
             DURABLE,
             "an empty zero-turn transcript must resume by session id, never by transcript path"
         );
@@ -21106,6 +21412,186 @@ rl.on('line', (line) => {
         );
     }
 
+    /// C09: crash the session's sidecar (an unrequested death, not `handle_kill`)
+    /// and wait for its exit report. Returns the session's map key.
+    async fn crash_a_new_session(
+        st: &FreshClaudeState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        request_id: &str,
+    ) -> String {
+        st.handle_create(dedup_create_msg(request_id), None).await;
+        let created = await_claude_created_and_session_init(rx, request_id).await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&session_id)
+            .expect("live session in map")
+            .child
+            .start_kill()
+            .expect("kill the sidecar");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let frame: Value = match rx.recv().await {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
+                if frame["event"]["code"] == "SIDECAR_EXITED" {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the death is reported");
+        session_id
+    }
+
+    /// C09: once an ended session is resumed (here by an attach, the reload and
+    /// reconnect path) it is live again, so none of its ids may still read as
+    /// ended — not even the old pane id the resumed session no longer uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_dead_session_no_longer_reads_as_ended() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        // The fake sidecar's session reports this durable id.
+        const DURABLE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let (st, mut rx) = state_with_bus();
+        let old_pane_id = crash_a_new_session(&st, &mut rx, "req-dead-resume").await;
+        for id in [old_pane_id.as_str(), DURABLE] {
+            assert_eq!(
+                st.live_snapshot_overlay(id).await["status"],
+                "exited",
+                "{id} reads as ended after the crash"
+            );
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        st.handle_attach(attach_msg_with_resume("pane-after-reload", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert!(st.has_live_session(DURABLE).await, "the attach resumed it");
+
+        assert_ne!(st.live_snapshot_overlay(DURABLE).await["status"], "exited");
+        assert_eq!(
+            st.live_snapshot_overlay(&old_pane_id).await,
+            json!({}),
+            "the old pane id no longer names an ended session"
+        );
+    }
+
+    /// Review PRB-C09: an attach that resumes the session under its own pane id
+    /// while the dead sidecar is still being reaped (the reload and reconnect
+    /// path) makes that id live again, so the dead incarnation's exit report —
+    /// the `exited` status and the SIDECAR_EXITED banner, which also resets the
+    /// pane to idle — must not reach it. The turn the death cut short still
+    /// rings, once: it ended, and nobody saw it end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_during_the_reap_gets_no_exit_report_but_the_lost_turn_rings() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        // The fake sidecar's session reports this durable id.
+        const DURABLE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-reap-resume"), None)
+            .await;
+        let created = await_claude_created_and_session_init(&mut rx, "req-reap-resume").await;
+        let pane_id = created["sessionId"].as_str().unwrap().to_string();
+        // The fake never answers a plain send: the turn stays in flight.
+        st.handle_send(send_msg(&pane_id, "a turn the sidecar dies in"))
+            .await;
+        assert!(in_turn_of(&st, &pane_id).await);
+
+        let hold = st.hold_exit_reports();
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&pane_id)
+            .expect("live session in map")
+            .child
+            .start_kill()
+            .expect("kill the sidecar");
+        tokio::time::timeout(Duration::from_secs(15), hold.parked())
+            .await
+            .expect("the end-of-output path reached the exit report");
+
+        let home = tempfile::tempdir().unwrap();
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        st.handle_attach(attach_msg_with_resume(&pane_id, DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert!(st.has_live_session(DURABLE).await, "the attach resumed it");
+        while rx.try_recv().is_ok() {}
+
+        hold.release();
+        let mut frames = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Ok(raw)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            frames.push(serde_json::from_str::<Value>(&raw).unwrap());
+        }
+        let about_the_pane: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame["sessionId"] == pane_id.as_str())
+            .collect();
+        assert!(
+            about_the_pane
+                .iter()
+                .all(|frame| frame["event"]["status"] != "exited"
+                    && frame["event"]["code"] != "SIDECAR_EXITED"),
+            "no exit report reaches the resumed session: {about_the_pane:?}"
+        );
+        assert_eq!(
+            about_the_pane
+                .iter()
+                .filter(|frame| frame["event"]["type"] == "freshAgent.turn.complete")
+                .count(),
+            1,
+            "the lost turn rings once: {about_the_pane:?}"
+        );
+        assert_ne!(st.live_snapshot_overlay(&pane_id).await["status"], "exited");
+    }
+
+    /// C09: closing an ended session forgets it: its snapshot no longer says
+    /// `exited`, and a later send is an ordinary unknown-session refusal, not the
+    /// ended session's lost frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_dead_session_forgets_it() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let pane_id = crash_a_new_session(&st, &mut rx, "req-dead-close").await;
+        assert_eq!(st.live_snapshot_overlay(&pane_id).await["status"], "exited");
+
+        st.handle_kill(kill_msg(&pane_id)).await;
+        assert_eq!(st.live_snapshot_overlay(&pane_id).await, json!({}));
+
+        while rx.try_recv().is_ok() {}
+        let mut send = send_msg(&pane_id, "after the close");
+        send.request_id = Some("send-after-close".into());
+        st.handle_send(send).await;
+        let mut frames = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            frames.push(serde_json::from_str::<Value>(&raw).unwrap());
+        }
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame["event"]["code"] != "INVALID_SESSION_ID"),
+            "no lost frame for a closed session: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|frame| frame["type"] == "error"
+                && frame["requestId"] == "send-after-close"
+                && frame["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("SESSION_NOT_FOUND"))),
+            "the send is refused as unknown: {frames:?}"
+        );
+    }
+
     // ── kata 1wxv Task 4: claude/kilroy undo/redo (fork-at-point emulation) ──
 
     use crate::identity_sink::PaneIdentitySink as _;
@@ -21260,7 +21746,6 @@ rl.on('line', (line) => {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
@@ -21276,7 +21761,6 @@ rl.on('line', (line) => {
             Arc::clone(&last_status),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
             Arc::clone(&last_synthesized_complete_at),
             None,
             None, // provenance: test lane is conn-less (D8)
@@ -21298,7 +21782,6 @@ rl.on('line', (line) => {
                 pending,
                 in_turn,
                 turn_tracker,
-                result_idle_pair_pending,
                 last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -21350,7 +21833,6 @@ rl.on('line', (line) => {
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -21410,7 +21892,6 @@ rl.on('line', (line) => {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
@@ -21426,7 +21907,6 @@ rl.on('line', (line) => {
             Arc::clone(&last_status),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
-            Arc::clone(&result_idle_pair_pending),
             Arc::clone(&last_synthesized_complete_at),
             None,
             None, // provenance: test lane is conn-less (D8)
@@ -21448,7 +21928,6 @@ rl.on('line', (line) => {
                 pending,
                 in_turn,
                 turn_tracker,
-                result_idle_pair_pending,
                 last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
@@ -21566,6 +22045,37 @@ rl.on('line', (line) => {
         }
     }
 
+    /// The consumer's `sdk.status:idle` arm, which only the legacy protocol fakes
+    /// still reach (the real sidecar sends no idle since C09; C17/C18 delete the
+    /// arm). An idle after an earlier turn's result is an edge of its own and
+    /// releases the busy truth: the deleted result/idle pair latch skipped
+    /// exactly this idle and left the session busy (`apply_snapshot_metadata`
+    /// then reported `running`). The real sidecar's G23 behavior is pinned on
+    /// RealSidecarSim by `a_natural_end_of_stream_mid_turn_leaves_the_session_not_busy`
+    /// (crates/freshell-ws/tests/freshagent_claude_lifecycle.rs).
+    #[tokio::test]
+    async fn a_legacy_fake_idle_after_an_earlier_result_releases_the_busy_truth() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-stream-end-idle"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-stream-end-idle").await;
+        let sid = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &sid, "idle").await;
+
+        st.handle_send(send_msg(&sid, "turn one")).await;
+        inject_raw_send(&st, &sid, "__emit_result__").await;
+        await_in_turn(&st, &sid, false).await;
+
+        st.handle_send(send_msg(&sid, "turn two")).await;
+        assert!(in_turn_of(&st, &sid).await, "the second turn is running");
+        // A legacy fake's idle while the second turn runs.
+        inject_raw_send(&st, &sid, "__emit_idle__").await;
+        await_in_turn(&st, &sid, false).await;
+        drop(env);
+    }
+
     #[tokio::test]
     async fn in_turn_clears_on_exactly_the_four_contract_edges_fail_closed_otherwise() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -21608,15 +22118,15 @@ rl.on('line', (line) => {
         await_in_turn(&st, &sid, false).await;
 
         // (d) a completed handle_interrupt clears — the interrupted turn's OWN
-        // terminal frames (result + idle, per the SDK receipt-before-result
-        // contract) do it; an error-subtype result never chimes:
+        // terminal result (per the SDK receipt-before-result contract) does
+        // it; an error-subtype result never chimes:
         st.handle_send(send_msg(&sid, "turn three")).await;
         assert!(in_turn_of(&st, &sid).await);
         // Baseline: drop every frame the create/emit dance left on the bus.
         while rx.try_recv().is_ok() {}
         st.handle_interrupt(interrupt_msg(&sid)).await;
         // ep4-r2 F1: the gate releases at the interrupted op's OWN result fold
-        // (the fake emits settle → result → idle in SDK order); poll it.
+        // (the fake emits settle → result in SDK order); poll it.
         await_in_turn(&st, &sid, false).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         while let Ok(raw) = rx.try_recv() {
@@ -21950,14 +22460,14 @@ rl.on('line', (line) => {
     /// ahead, B queued as the de-facto active turn], B automatically
     /// compacts mid-turn: status-time promotion attributed the AUTO compaction
     /// to C1 ("promotes the phantom"); B's own result frame then retired the
-    /// PHANTOM compact and stranded B queued — its PAIRED idle deliberately
-    /// skipped (ep2-r1 F1) — `in_turn` held FOREVER (BUSY_TURN for every later
+    /// PHANTOM compact and stranded B queued with no edge left to retire it —
+    /// `in_turn` held FOREVER (BUSY_TURN for every later
     /// undo). Only the SDK's compact COMPLETION boundary
     /// (`sdk.compact_boundary {trigger}`) discriminates the trigger; promotion
     /// now requires the `manual` boundary.
     ///
-    ///   A → C1 → B → A's pair (A retires) → B generating → AUTO compact
-    ///   (status + boundary auto — NO promotion) → B's own result + idle pair
+    ///   A → C1 → B → A's result (A retires) → B generating → AUTO compact
+    ///   (status + boundary auto — NO promotion) → B's own result
     ///   (B retires) → the gate OPENS.
     #[tokio::test]
     async fn an_automatic_compaction_mid_turn_is_never_attributed_to_a_queued_compact() {
@@ -21974,9 +22484,8 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_send(send_msg(&session_id, "turn two")).await; // B
 
-        // A's pair retires A; [C1 dropped, B (de-facto active)] remains.
+        // A's result retires A; [C1 dropped, B (de-facto active)] remains.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "C1(dropped) + B owed");
 
@@ -21998,11 +22507,10 @@ rl.on('line', (line) => {
             "ep3-r1 F1: the queued C1 is NOT promoted by an automatic compaction — B still owes its terminal edge"
         );
 
-        // B's own result + its PAIRED idle retires B — and the gate OPENS:
+        // B's own result retires B — and the gate OPENS:
         // nothing is owed (C1's silent drop is proven by B's activity per the
         // existing drop-absorber), the pane is never permanently busy.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -22027,9 +22535,9 @@ rl.on('line', (line) => {
     /// the sole mid-turn gate admitted a rollback wipe mid-generation. With a
     /// LIVE candidate the interrupt retires EXACTLY the front compact.
     ///
-    ///   A → C1 → C2 → S → A's pair (A retires) → C1 compacting (candidate) →
+    ///   A → C1 → C2 → S → A's result (A retires) → C1 compacting (candidate) →
     ///   INTERRUPT (cancels C1 only — the gate STAYS CLOSED for C2 + S) → C2's
-    ///   manual boundary + pair (C2 retires; S still owed) → S's pair (gate
+    ///   manual boundary + result (C2 retires; S still owed) → S's result (gate
     ///   OPENS exactly here).
     #[tokio::test]
     async fn an_interrupt_inside_the_compact_candidate_window_retires_only_the_interrupted_compact()
@@ -22047,9 +22555,8 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C2
         st.handle_send(send_msg(&session_id, "turn two")).await; // S
 
-        // A's pair retires A: [C1, C2, S] all queued, running empty.
+        // A's result retires A: [C1, C2, S] all queued, running empty.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // C1 starts compacting (candidate pending — the boundary lands later).
@@ -22076,18 +22583,16 @@ rl.on('line', (line) => {
         );
 
         // C2 then runs for real: status marks its candidate, the manual
-        // boundary promotes it, and its own pair retires it; S is still owed
+        // boundary promotes it, and its own result retires it; S is still owed
         // behind it — the gate holds.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "S still owed behind C2");
 
         // S's own pair: the gate OPENS at the last owed edge, exactly.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -22121,10 +22626,9 @@ rl.on('line', (line) => {
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
 
-        // One completed turn (armed then retired by its pair) — the gate is open.
+        // One completed turn (armed then retired by its result) — the gate is open.
         st.handle_send(send_msg(&session_id, "turn one")).await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
 
         // The provider-side session DIES (stream end deletes it) — stdout stays
@@ -22366,7 +22870,7 @@ rl.on('line', (line) => {
     /// compact ahead of a running one — in-band indistinguishable, so the debt
     /// must settle at the gate, not the attribution). A turnaround edge replay
     /// after absorption folds as benign noise (boundary-promotion on an empty
-    /// queue promotes nothing; the pair-skip consumes the trailing idle).
+    /// queue promotes nothing).
     #[tokio::test]
     async fn two_queued_compacts_are_provably_quiescent_and_absorb_at_the_rollback_gate() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -22426,7 +22930,6 @@ rl.on('line', (line) => {
             "a revived absorbed compact RE-ARMS the gate at its proven start"
         );
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -22565,108 +23068,6 @@ rl.on('line', (line) => {
         drop(env);
     }
 
-    /// Focused-review ep2-r1 F1 (the PAIRED terminal frames): the supported
-    /// Claude/Kilroy protocol emits `sdk.result` AND a trailing
-    /// `sdk.status:idle` for ONE turn (both provider fixtures emit exactly that
-    /// pair; the real sidecar's consumeStream finally emits the trailing idle).
-    /// The trailing idle is the SAME turn's closing punctuation, never a new
-    /// op's edge — folding it through attribution double-counts the turn. The
-    /// repair-delta fold missed this: with turn A running and C+S queued
-    /// behind it, A's result consumed the prior debt and then A's TRAILING IDLE
-    /// was attributed to the garlanded send (the FIFO-drop branch), clearing
-    /// the compact/send trackers and `in_turn` while C and S were still
-    /// queued — rollback passed the sole busy gate mid-queue.
-    ///
-    /// Queue: A running → C queued → S queued. EVERY turn ends with its pair
-    /// (result then idle).
-    ///   1. A's pair: the result folds as the owed prior edge; the trailing
-    ///      idle is pair-skipped (NEVER the garlanded drop proof) — the gate
-    ///      HOLDS;
-    ///   2. C's observed compacting + result + trailing idle retires C — the
-    ///      gate HOLDS (S still owed);
-    ///   3. S's result releases the gate (its trailing idle is skipped too).
-    #[tokio::test]
-    async fn a_turns_trailing_idle_is_pair_skipped_never_attributed_to_queued_ops() {
-        let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
-        let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qpair"), None).await;
-        let created = await_claude_created(&mut rx, "req-qpair").await;
-        let session_id = created["sessionId"].as_str().unwrap().to_string();
-        await_status_frame(&mut rx, &session_id, "idle").await;
-
-        st.handle_send(send_msg(&session_id, "turn one")).await; // A
-        st.handle_compact(compact_msg(&session_id, None)).await; // C
-        st.handle_send(send_msg(&session_id, "turn two")).await; // S
-
-        // (1) A's pair — the result consumes the ONE owed prior edge; the
-        // trailing idle is C's/S's edges' queue-mate punctuation, NEVER theirs.
-        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            in_turn_of(&st, &session_id).await,
-            "A's trailing idle is pair-punctuation, not the garlanded drop proof — the compact and send are STILL queued"
-        );
-        let (sink, captured) = capturing_sink();
-        st.handle_rollback(
-            rollback_op(&session_id, "rb-qpair-1", RollbackDirection::Undo),
-            sink,
-        )
-        .await;
-        let frames = captured_json(&captured);
-        assert_eq!(
-            frames[0]["event"]["code"], "BUSY_TURN",
-            "ep2-r1 F1: A's trailing idle must not release the gate over queued C/S: {frames:?}"
-        );
-        assert_eq!(
-            env.spawn_count(),
-            1,
-            "zero teardown from the refused attempt"
-        );
-
-        // (2) C observably runs and its pair lands: retires C — the gate HOLDS
-        // (S is generating behind it).
-        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
-        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
-        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            in_turn_of(&st, &session_id).await,
-            "C's pair retires C only — S's own terminal edge is still owed"
-        );
-        let (sink, captured) = capturing_sink();
-        st.handle_rollback(
-            rollback_op(&session_id, "rb-qpair-2", RollbackDirection::Undo),
-            sink,
-        )
-        .await;
-        assert_eq!(
-            captured_json(&captured)[0]["event"]["code"],
-            "BUSY_TURN",
-            "the garlanded send is still owed after C's pair — the gate holds"
-        );
-
-        // (3) S's pair: the result is the garlanded tail's last owed edge — the
-        // gate releases here; the trailing idle folds nothing further.
-        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
-        await_in_turn(&st, &session_id, false).await;
-        let (sink, captured) = capturing_sink();
-        st.handle_rollback(
-            rollback_op(&session_id, "rb-qpair-3", RollbackDirection::Undo),
-            sink,
-        )
-        .await;
-        let frames = captured_json(&captured);
-        assert_eq!(
-            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
-            "the gate released exactly at S's own terminal edge: {frames:?}"
-        );
-        drop(env);
-    }
-
     /// Focused-review ep2-r1 F2 (the stale prior-edge debt): a SECOND compact
     /// armed while the FIRST compact is mid-compaction owes C₁'s terminal edge
     /// (the one op active at its arm). When C₁'s terminal lands it is C₁'s OWN
@@ -22694,10 +23095,8 @@ rl.on('line', (line) => {
 
         st.handle_send(send_msg(&session_id, "turn one")).await; // A
         st.handle_compact(compact_msg(&session_id, None)).await; // C₁ queued
-                                                                 // A's pair lands first: the result settles the arm's prior debt; A's
-                                                                 // trailing idle is pair-skipped.
+                                                                 // A's result lands first: it settles the arm's prior debt.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // C₁ observably starts; C₂ arms while C₁ is MID-COMPACTION — it owes
@@ -22708,10 +23107,9 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C₂ armed
         st.handle_send(send_msg(&session_id, "turn two")).await; // S garlanded
 
-        // C₁'s pair: retires C₁ AND settles C₂'s owed edge — C₂ remains the
+        // C₁'s result: retires C₁ AND settles C₂'s owed edge — C₂ remains the
         // sole queued compact; S is still owed. The gate HOLDS throughout.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -22726,14 +23124,13 @@ rl.on('line', (line) => {
         assert_eq!(
             captured_json(&captured)[0]["event"]["code"],
             "BUSY_TURN",
-            "C₂ queued + S owed — the gate holds past C₁'s pair"
+            "C₂ queued + S owed — the gate holds past C₁'s result"
         );
 
-        // C₂ is provider-DROPPED (never observed compacting); S's pair lands:
+        // C₂ is provider-DROPPED (never observed compacting); S's result lands:
         // the result is the FIFO-drop proof (C₂ provably never ran), releasing
-        // at the LAST garlanded edge; the trailing idle is pair-skipped.
+        // at the LAST garlanded edge.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -22863,9 +23260,9 @@ rl.on('line', (line) => {
     /// AND closes the gate (in_turn=true); consumption at the boundary either
     /// promotes (gate stays held) or recomputes the owed-debt busy truth.
     ///
-    ///   A → C1 → C2 → A's pair → absorb probe (admitted; C1+C2 survive; gate
+    ///   A → C1 → C2 → A's result → absorb probe (admitted; C1+C2 survive; gate
     ///   open) → C1's STATUS lands (candidate: the gate RE-CLOSES immediately)
-    ///   → manual boundary (C1 promoted; held) → C1's pair (C1 retires; C2
+    ///   → manual boundary (C1 promoted; held) → C1's result (C1 retires; C2
     ///   owed) → absorb probe (admitted again) — the gate never rides the
     ///   proven-running interval.
     #[tokio::test]
@@ -22883,9 +23280,8 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_compact(compact_msg(&session_id, None)).await; // C2
 
-        // A's pair retires A: [C1, C2] queued, nothing running.
+        // A's result retires A: [C1, C2] queued, nothing running.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Provably-quiescent debt: the gate ADMITS (entries survive).
@@ -22923,7 +23319,7 @@ rl.on('line', (line) => {
         );
         assert!(in_turn_of(&st, &session_id).await);
 
-        // C1's boundary promotes it (still held); its own pair retires it; C2
+        // C1's boundary promotes it (still held); its own result retires it; C2
         // is owed; the gate admits at the next absorb probe, quiescent again.
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -22932,7 +23328,6 @@ rl.on('line', (line) => {
             "promotion holds the closed gate through the boundary"
         );
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -22957,7 +23352,7 @@ rl.on('line', (line) => {
     /// promotes the FRONT queued compact, so [C1 silently dropped, C2 runs] is
     /// in-band indistinguishable from [C1 runs, C2 queued]: C2's whole evidence
     /// set is consumed by the phantom C1 entry, and C2's own entry remains as
-    /// debt with NO further evidence — the trailing idle is pair-skipped, so
+    /// debt with NO further evidence, so
     /// `in_turn` holds forever and every later undo/redo is refused BUSY_TURN
     /// ("unavailable until another submission, which would itself destroy
     /// redo"). The gate now admits when the debt is provably quiescent:
@@ -22965,9 +23360,9 @@ rl.on('line', (line) => {
     /// compacts have not started (their runs raise the candidate FIRST), and
     /// the rollback teardown discards their provider-side inputs.
     ///
-    ///   A → C1 → C2 → A's pair (A retires) → C1 dropped (never evidences) →
+    ///   A → C1 → C2 → A's result (A retires) → C1 dropped (never evidences) →
     ///   C2 runs (status + manual boundary promotes the phantom C1) → C2's
-    ///   result + paired idle (the phantom retires; C2's entry remains) →
+    ///   result (the phantom retires; C2's entry remains) →
     ///   the rollback gate OPENS on admission: the provably-quiescent debt
     ///   absorbs (both in a single atomic decision).
     #[tokio::test]
@@ -22986,21 +23381,18 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_compact(compact_msg(&session_id, None)).await; // C2
 
-        // A's pair retires A: [C1, C2] queued, running empty.
+        // A's result retires A: [C1, C2] queued, running empty.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "both compacts owed");
 
         // C1 is provider-DROPPED (never evidences). C2 RUNS: its status marks
         // the candidate and its manual boundary promotes the FRONT — the
-        // phantom C1. C2's pair lands: the result retires running (phantom C1);
-        // the trailing idle is deliberately pair-skipped (ep2-r1 F1). C2's own
-        // entry is the surviving dead debt.
+        // phantom C1. C2's result lands: it retires running (phantom C1).
+        // C2's own entry is the surviving dead debt.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The debt is provably quiescent (nothing running, no candidate, no
@@ -23050,17 +23442,15 @@ rl.on('line', (line) => {
         st.handle_send(send_msg(&session_id, "turn two")).await; // S1
         st.handle_compact(compact_msg(&session_id, None)).await; // C2 (behind S1)
 
-        // A's pair: the result retires A; the trailing idle is pair-skipped.
+        // A's result retires A.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "three ops still queued");
 
-        // C1 is provider-DROPPED (never observed); S1's pair lands: the result
+        // C1 is provider-DROPPED (never observed); S1's result lands: the result
         // evidences C1's drop and retires S1 — but C2 is queued BEHIND S1 and
         // may still run, so the busy gate MUST stay closed past S1's edge.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -23089,7 +23479,6 @@ rl.on('line', (line) => {
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23116,7 +23505,7 @@ rl.on('line', (line) => {
     /// of it already retired-or-dropped: those ahead compacts' silence at the
     /// live turn's generation IS the drop evidence, absorbed here.
     ///
-    ///   A running → C1 queued → B queued → A's pair → B generating NOW →
+    ///   A running → C1 queued → B queued → A's result → B generating NOW →
     ///   interrupt. Aftermath: NOTHING stands — the gate opens and STAYS sized
     ///   (a follow-up turn cycles fully clean).
     #[tokio::test]
@@ -23134,10 +23523,9 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_send(send_msg(&session_id, "turn two")).await; // B
 
-        // A's pair retires the running op; C1's compacting frame NEVER came —
+        // A's result retires the running op; C1's compacting frame NEVER came —
         // B generates (the drop-evidence window). The gate is closed.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -23172,11 +23560,10 @@ rl.on('line', (line) => {
             "ep2-r4 F1: the gate opened exactly at the interrupt and stays truthful: {frames:?}"
         );
 
-        // No-residue proof: a fresh turn's pair cycles the tracker fully clean.
+        // No-residue proof: a fresh turn's result cycles the tracker fully clean.
         st.handle_send(send_msg(&session_id, "turn three")).await;
         assert!(in_turn_of(&st, &session_id).await);
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         drop(env);
     }
@@ -23191,7 +23578,7 @@ rl.on('line', (line) => {
     /// interrupt retires the running slot OR the queue FRONT (the op actually in
     /// flight) — never the still-queued ops behind it.
     ///
-    /// A running → B queued → A's pair retires A → B starts → interrupt B.
+    /// A running → B queued → A's result retires A → B starts → interrupt B.
     #[tokio::test]
     async fn interrupting_a_queue_advanced_turn_releases_the_gate() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -23205,10 +23592,9 @@ rl.on('line', (line) => {
         st.handle_send(send_msg(&session_id, "turn one")).await; // A
         st.handle_send(send_msg(&session_id, "turn two")).await; // B queued
 
-        // A's pair retires the running op; B (the queue front) is now the
+        // A's result retires the running op; B (the queue front) is now the
         // de-facto active turn — the gate stays closed (B owes its own edge).
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -23271,10 +23657,9 @@ rl.on('line', (line) => {
         st.handle_compact(compact_msg(&session_id, None)).await; // C1
         st.handle_send(send_msg(&session_id, "turn two")).await; // B
 
-        // A's pair retires A. [C1 (never promoted — dropped), B (now the
+        // A's result retires A. [C1 (never promoted — dropped), B (now the
         // de-facto active turn)] remains; the gate is closed.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(in_turn_of(&st, &session_id).await, "C1(dropped) + B owed");
         let (sink, captured) = capturing_sink();
@@ -23351,12 +23736,11 @@ rl.on('line', (line) => {
         );
 
         // C runs for real: observed compacting + confirmed-manual boundary +
-        // its pair — retires C, and S is STILL owed: the gate MUST stay closed
+        // its result — retires C, and S is STILL owed: the gate MUST stay closed
         // here.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &session_id).await,
@@ -23376,9 +23760,8 @@ rl.on('line', (line) => {
         );
         assert_eq!(env.spawn_count(), 1, "zero teardown from refused attempts");
 
-        // S's pair: the gate releases exactly at S's own terminal edge.
+        // S's result: the gate releases exactly at S's own terminal edge.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23398,7 +23781,7 @@ rl.on('line', (line) => {
     /// settle-ack ≠ turn-complete per the SDK receipt-before-result contract
     /// at ep4-r2): with the settle deferred, the gate must stay closed for the
     /// whole provider-work window — and opens only at the interrupted turn's
-    /// OWN terminal frames (result + paired idle, emitted after the receipt
+    /// OWN terminal frame (its result, emitted after the receipt
     /// in that order).
     ///
     ///   A running → interrupt (settle chain deferred by knob) → mid-window
@@ -23436,8 +23819,8 @@ rl.on('line', (line) => {
             "the busy truth holds past the request write"
         );
 
-        // The deferred chain arrives (receipt, then the turn's own result +
-        // paired idle): the gate opens exactly at the op's own terminal edge.
+        // The deferred chain arrives (receipt, then the turn's own result):
+        // the gate opens exactly at the op's own terminal edge.
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23491,10 +23874,9 @@ rl.on('line', (line) => {
             "the rejected interrupt left the running turn owed — gate closed"
         );
 
-        // The turn's OWN terminal edge (its real result + paired idle) retires
+        // The turn's OWN terminal edge (its real result) retires
         // it — the gate opens exactly there.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23523,7 +23905,7 @@ rl.on('line', (line) => {
     /// (BUSY_TURN + compensating ledger rewrite), the sidecar survives.
     ///
     ///   Transcript-eligible durable fixture on a LIVE fake sidecar; [A → C1 →
-    ///   A's pair → C2] owed compacts; the gate absorb admits; the pre-teardown
+    ///   A's result → C2] owed compacts; the gate absorb admits; the pre-teardown
     ///   quiesce probe (an interrupt write) elicits the fake's
     ///   FRESHELL_TEST_CLAUDE_PROBE_COMPACT_BEFORE_SETTLE compacting STATUS
     ///   before its settle → the recheck provably sees the revived candidate
@@ -23542,13 +23924,12 @@ rl.on('line', (line) => {
         st.set_identity_sink(sink_impl.clone());
         insert_rollback_fixture_session_with_live_sidecar(&st, "rb-probe", "dur-probe").await;
 
-        // [A → C1][A's pair][C2] — compact-only owed queue (C1 promoted
+        // [A → C1][A's result][C2] — compact-only owed queue (C1 promoted
         // briefly under A, so retiring A leaves BOTH compacts queued and
         // never-promoted: the absorb family's admittance shape).
         st.handle_send(send_msg("rb-probe", "turn one")).await; // A
         st.handle_compact(compact_msg("rb-probe", None)).await; // C1 queued behind A
         inject_raw_send(&st, "rb-probe", "__emit_result_error__").await;
-        inject_raw_send(&st, "rb-probe", "__emit_idle__").await;
         st.handle_compact(compact_msg("rb-probe", None)).await; // C2 queued
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -23604,7 +23985,7 @@ rl.on('line', (line) => {
         st.handle_send(send_msg(&session_id, "turn one")).await; // A running
         st.handle_send(send_msg(&session_id, "turn two")).await; // B queued
 
-        // Interrupt A: receipt + A's own trailing result/idle (in that order).
+        // Interrupt A: receipt + A's own result (in that order).
         // NOTHING beyond A may retire.
         st.handle_interrupt(interrupt_msg(&session_id)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -23626,7 +24007,6 @@ rl.on('line', (line) => {
 
         // B's own terminal frames retire it — the gate opens exactly there.
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
-        inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -23705,11 +24085,10 @@ rl.on('line', (line) => {
         let _ =
             insert_rollback_fixture_session_with_live_sidecar(&st, "rb-qadmit", "dur-qadmit").await;
 
-        // Compact-only owed queue (C1 rides under A; A's pair retires it; C2).
+        // Compact-only owed queue (C1 rides under A; A's result retires it; C2).
         st.handle_send(send_msg("rb-qadmit", "turn one")).await;
         st.handle_compact(compact_msg("rb-qadmit", None)).await;
         inject_raw_send(&st, "rb-qadmit", "__emit_result_error__").await;
-        inject_raw_send(&st, "rb-qadmit", "__emit_idle__").await;
         st.handle_compact(compact_msg("rb-qadmit", None)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -23761,12 +24140,11 @@ rl.on('line', (line) => {
         st.set_identity_sink(sink_impl.clone());
         insert_rollback_fixture_session_with_live_sidecar(&st, "rb-vhanded", "dur-vhanded").await;
 
-        // A send+compact arm the debt realistically (A's pair folds them to
+        // A send+compact arm the debt realistically (A's result folds them to
         // absorb shape: [C] owed, running empty).
         st.handle_send(send_msg("rb-vhanded", "turn one")).await;
         st.handle_compact(compact_msg("rb-vhanded", None)).await;
         inject_raw_send(&st, "rb-vhanded", "__emit_result_error__").await;
-        inject_raw_send(&st, "rb-vhanded", "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let (sink, captured) = capturing_sink();
@@ -24451,11 +24829,11 @@ rl.on('line', (line) => {
             1,
             "exactly the rollback's fork create: {creates:?}"
         );
-        assert_eq!(creates[0]["resumeSessionId"], json!("s-prime"));
-        assert_eq!(creates[0]["resumeSessionAt"], json!("a1"));
-        assert_eq!(creates[0]["forkSession"], json!(true));
+        assert_eq!(creates[0]["boot"]["resume"], json!("s-prime"));
+        assert_eq!(creates[0]["boot"]["resumeSessionAt"], json!("a1"));
+        assert_eq!(creates[0]["boot"]["kind"], json!("fork"));
         assert_eq!(
-            creates[0]["resumeDropsTurn"],
+            creates[0]["boot"]["dropsTurn"],
             json!("uq"),
             "the guard is the first-to-discard turn's prompt uuid (brief/SDK semantics)"
         );
@@ -24595,14 +24973,14 @@ rl.on('line', (line) => {
             .collect();
         assert_eq!(creates.len(), 2, "{creates:?}");
         assert_eq!(
-            creates[1]["resumeSessionId"],
+            creates[1]["boot"]["resume"],
             json!("s-prime"),
             "redo re-forks the re-rooted chain root"
         );
-        assert_eq!(creates[1]["resumeSessionAt"], json!("aq"));
-        assert_eq!(creates[1]["forkSession"], json!(true));
+        assert_eq!(creates[1]["boot"]["resumeSessionAt"], json!("aq"));
+        assert_eq!(creates[1]["boot"]["kind"], json!("fork"));
         assert!(
-            creates[1].get("resumeDropsTurn").is_none(),
+            creates[1]["boot"].get("dropsTurn").is_none(),
             "the guard is omitted when the discard range is empty (redo to the tip) — never fabricated"
         );
         let record2 = sink_impl

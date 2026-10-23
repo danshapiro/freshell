@@ -23,6 +23,8 @@ export function query({ options }) {
     child.on('close', code => code === 0 ? resolve(digest) : reject(new Error('synthetic grandchild failed')))
   })
   return {
+    // The pinned SDK's boot report (T2): the spawned process booted.
+    async initializationResult() { return { pid: child.pid, commands: [] } },
     async *[Symbol.asyncIterator]() {
       const digest = await complete
       yield { type: 'system', subtype: 'init', session_id: 'synthetic-exec-session', model: 'synthetic', tools: [] }

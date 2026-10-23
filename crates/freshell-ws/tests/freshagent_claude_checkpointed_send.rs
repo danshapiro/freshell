@@ -75,7 +75,7 @@ rl.on('line', (line) => {
     const sessionId = `fake-claude-${process.pid}-${counter}`
     const st = { cliSessionId: randomUUID() }
     sessions.set(sessionId, st)
-    emit({ type: 'created', requestId: msg.requestId, sessionId })
+    emit({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
     if (initAt === 'create') reportSession(sessionId, st)
     emit({ type: 'sdk.status', sessionId, status: 'idle' })
   } else if (msg.type === 'send') {

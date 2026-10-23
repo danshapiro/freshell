@@ -592,8 +592,8 @@ rl.on('line', (line) => {
   if (msg.type === 'create') {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
-    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
-    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 }) + '\n')
+    const cliSessionId = msg.boot?.resume || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'shutdown') {
@@ -800,7 +800,7 @@ async fn rest_ws_and_browser_paths_share_the_one_coordinator() {
     let sidecar_creates = sidecar
         .create_rows()
         .iter()
-        .filter(|r| r["msg"]["resumeSessionId"].as_str() == Some(sid.as_str()))
+        .filter(|r| r["msg"]["boot"]["resume"].as_str() == Some(sid.as_str()))
         .count();
     assert_eq!(sidecar_creates, 1, "exactly the one freshclaude owner");
 

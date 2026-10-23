@@ -24,8 +24,17 @@ export async function runLocalCommand(cli, turn, { name, args }) {
 
   if (name === 'compact') {
     cli.emit({ type: 'system', subtype: 'status', status: 'compacting' })
-    await cli.sleep(T.compaction)
     const marker = parsePromptMarkers(args)
+    if (marker.kind === 'hang') {
+      // The instructions reach the summary request (APIERR does the same on
+      // the real CLI, T15), so HANG leaves the compaction in progress until
+      // the CLI dies. What the CLI does when interrupted here is not recorded,
+      // so an interrupt fails the simulator loudly instead of guessing.
+      await cli.wait(Number.POSITIVE_INFINITY, turn)
+      if (cli.dead) return undefined
+      throw new Error('an interrupt during a hung /compact is not modeled')
+    }
+    await cli.sleep(T.compaction)
     const error = marker.kind === 'api_error'
       ? `Error during compaction: API Error: ${marker.status} local provider error`
       : cli.modelTurnsSinceCompact === 0 ? 'Not enough messages to compact.' : null
