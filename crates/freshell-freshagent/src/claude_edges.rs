@@ -106,6 +106,7 @@ pub(crate) enum EdgeSource {
     Death,
     /// Pending approvals or questions went from none to some.
     Pending,
+    QuietDeadman,
 }
 
 impl EdgeSource {
@@ -114,6 +115,7 @@ impl EdgeSource {
             Self::Result => "result",
             Self::Death => "death",
             Self::Pending => "pending",
+            Self::QuietDeadman => "quiet_deadman",
         }
     }
 }
@@ -246,6 +248,12 @@ impl ClaudeEdgeHub {
             at,
         });
         at
+    }
+
+    /// A busy runtime exhausted its quiet window. It still owes its turn;
+    /// this attention edge does not publish a settlement.
+    pub(crate) fn quiet_deadman(&self, record: &EdgeRecord<'_>) -> i64 {
+        self.emit(record, EdgeKind::TurnComplete, EdgeSource::QuietDeadman)
     }
 
     /// The sidecar ended unrequested: ring when a turn was owed, and publish the
