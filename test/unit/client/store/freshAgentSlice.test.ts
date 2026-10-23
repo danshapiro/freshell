@@ -11,6 +11,7 @@ import reducer, {
   registerPendingCreate,
   sessionCreated,
   sessionError,
+  sessionExited,
   sessionInit,
   sessionSnapshotReceived,
   setSessionStatus,
@@ -23,6 +24,11 @@ describe('freshAgentSlice busy/streaming clearing', () => {
   function streaming() {
     return reducer(undefined, sessionSnapshotReceived({ ...loc, latestTurnId: null, status: 'running', streamingActive: true }))
   }
+
+  it('sessionExited for a session this client never saw changes nothing', () => {
+    const before = reducer(undefined, { type: '@@init' })
+    expect(reducer(before, sessionExited(loc))).toBe(before)
+  })
 
   it('setSessionStatus(idle) clears streamingActive so the pane does not stay blue', () => {
     let state = streaming()

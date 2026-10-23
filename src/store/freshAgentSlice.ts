@@ -567,8 +567,9 @@ const freshAgentSlice = createSlice({
     clearPendingCreateFailureForSession() {},
     sessionExited(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      writeSessionStatus(state.sessions[key], 'exited')
+      const session = key ? state.sessions[key] : undefined
+      if (!session) return
+      writeSessionStatus(session, 'exited')
     },
 
     /**
