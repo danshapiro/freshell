@@ -1620,9 +1620,10 @@ lines.on('line', line=>{
                 );
             }
             if deferred_identity {
-                assert!(
-                    started.native_session_id.is_none(),
-                    "unrecorded native identity must remain unknown"
+                assert_eq!(
+                    started.native_session_id.as_deref(),
+                    observed["sessionId"].as_str(),
+                    "fresh native identity is known before any prompt or init"
                 );
             }
             assert_eq!(
@@ -1775,6 +1776,54 @@ lines.on('line', line=>{
         .await
         .expect("the turn completes");
         assert_eq!(announced, vec![conversation.to_string()]);
+        Arc::clone(&claude.transport).stop().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_claude_start_resolves_its_uuid_before_any_prompt() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let claude = SimulatedClaude::start(&[]).await;
+        let mut events = claude.transport.take_event_stream().expect("event stream");
+        let profile = claude.profile(None);
+        let started =
+            tokio::time::timeout(Duration::from_secs(20), claude.transport.start(&profile))
+                .await
+                .expect("fresh start cannot wait for a prompt")
+                .expect("fresh start succeeds");
+        let durable = started
+            .native_session_id
+            .expect("identity is known at create");
+        assert!(uuid::Uuid::parse_str(&durable).is_ok(), "{durable}");
+        assert!(claude.ledger_rows("prompt").is_empty());
+        let query = claude.ledger_rows("query");
+        assert_eq!(query.len(), 1);
+        assert_eq!(query[0]["options"]["sessionId"], durable);
+        claude
+            .transport
+            .dispatch(
+                &RequestId::parse("fresh-first-turn").unwrap(),
+                "the first prompt",
+                &profile,
+            )
+            .await
+            .unwrap();
+        let mut announced = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::Started { native_session_id } => announced.push(native_session_id),
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "freshAgent.turn.complete" =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn completes");
+        assert_eq!(announced, vec![durable]);
         Arc::clone(&claude.transport).stop().await.unwrap();
     }
 
@@ -2001,7 +2050,7 @@ const lines=createInterface({{input:process.stdin}});
 const emit=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
 lines.on('line', line=>{{
   const req=JSON.parse(line);
-  if(req.type==='create')emit({{type:'created',requestId:req.requestId,sessionId:'owned-configure',protocol:2}});
+  if(req.type==='create')emit({{type:'created',requestId:req.requestId,sessionId:req.sessionId??'owned-configure',protocol:2}});
   if(req.type==='configure'){{
     appendFileSync(process.env.FRESHELL_TEST_CONFIGURE_RECEIPT,JSON.stringify(req)+'\n');
     emit({receipt});
@@ -2119,7 +2168,11 @@ lines.on('line', line=>{{
         let metadata = run
             .settled
             .expect("the provider's metadata frame reaches the host journal");
-        assert_eq!(metadata["sessionId"], "owned-configure");
+        assert_eq!(metadata["sessionId"], run.applied[0]["sessionId"]);
+        assert_eq!(
+            metadata["sessionId"].as_str(),
+            run.profile.native_session_id.as_deref()
+        );
         assert_eq!(metadata["model"], "opus");
         assert_eq!(metadata["effort"], "high");
     }

@@ -166,16 +166,8 @@ export const PROVIDER_ID_SHAPES: Record<string, { placeholder: RegExp; durable: 
     durable: /^ses_[A-Za-z0-9]+$/,
   },
   claude: {
-    // CORRECTED against real freshclaude behavior (this is the first live claude
-    // T2 run). Unlike opencode's `freshopencode-<requestId>` placeholder, the
-    // freshclaude create returns the SDK bridge's BARE nanoid
-    // (server/sdk-bridge.ts createSession → `const sessionId = nanoid()`, surfaced
-    // verbatim by the claude adapter + runtime-manager). nanoid()'s default is 21
-    // url-safe chars ([A-Za-z0-9_-]); the {16,32} bound tolerates length drift
-    // while still excluding the 36-char durable UUID below (so placeholder≠durable).
-    // The pre-existing `^freshclaude-` here was aspirational and never validated
-    // against a live claude run — see notes/t2-claude-haiku.md.
-    placeholder: /^[A-Za-z0-9_-]{16,32}$/,
+    // Fresh Claude and Kilroy use one durable UUID from creation onward.
+    placeholder: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     durable: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
   },
   codex: {
