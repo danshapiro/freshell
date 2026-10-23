@@ -4,6 +4,8 @@ import type { LandedTranscript } from '@/lib/fresh-agent-landed-transcript'
 import { useAppDispatch, useAppStore } from '@/store/hooks'
 import {
   liveTailCleared,
+  liveTailViewerAdded,
+  liveTailViewerRemoved,
   transcriptExpectationsDropped,
   transcriptLanded,
 } from '@/store/freshAgentLiveSlice'
@@ -32,16 +34,20 @@ function hasLiveContent(tail: FreshAgentLiveSession | undefined): boolean {
  * tail is cleared — after its lines are on screen, so the text never blinks
  * out between the result and the snapshot. A turn that ends with live content
  * left asks for one more snapshot, so the clear never waits on an unrelated
- * refresh.
+ * refresh. While the pane is visible it is one of the tail's viewers: a tail
+ * no visible pane settles is dropped when its turn ends.
  */
 export function useTranscriptLandings({
   sessionKey,
+  visible,
   landed,
   busy,
   isBusyNow,
   requestRefresh,
 }: {
   sessionKey: string | undefined
+  /** Whether the pane shows (and so refreshes) its transcript now. */
+  visible: boolean
   /** What the committed snapshot holds; null before the first one. */
   landed: LandedTranscript | null
   busy: boolean
@@ -60,6 +66,14 @@ export function useTranscriptLandings({
   useEffect(() => {
     attemptsRef.current.clear()
   }, [sessionKey])
+
+  useEffect(() => {
+    if (!sessionKey || !visible) return
+    dispatch(liveTailViewerAdded({ sessionKey }))
+    return () => {
+      dispatch(liveTailViewerRemoved({ sessionKey }))
+    }
+  }, [dispatch, sessionKey, visible])
 
   useEffect(() => {
     if (!sessionKey || !landed) return

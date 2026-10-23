@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
-import freshAgentLiveReducer from '@/store/freshAgentLiveSlice'
+import freshAgentLiveReducer, { liveTailViewerAdded } from '@/store/freshAgentLiveSlice'
 import { LIVE_STREAM_FLUSH_MS } from '@/lib/fresh-agent-stream-batcher'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
 import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
@@ -542,6 +542,8 @@ describe('fresh-agent-ws', () => {
     it('applies pending deltas before any other event of the session', () => {
       vi.useFakeTimers()
       const store = createFreshAgentStore()
+      // A visible pane settles the tail, so the turn's end keeps its blocks.
+      store.dispatch(liveTailViewerAdded({ sessionKey: key }))
       handleFreshAgentMessage(store.dispatch, frame({ type: 'freshAgent.status', status: 'running' }))
       handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
       handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'done' } }))

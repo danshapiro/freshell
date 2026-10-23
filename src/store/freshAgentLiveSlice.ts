@@ -8,6 +8,7 @@ import {
   sessionError,
   sessionExited,
   setSessionStatus,
+  turnResult,
 } from './freshAgentSlice'
 import type { FreshAgentSessionLocator } from './freshAgentTypes'
 import type {
@@ -23,6 +24,7 @@ import type {
 const initialState: FreshAgentLiveState = {
   bySession: {},
   noticeSeq: 0,
+  viewers: {},
 }
 
 /** The payload shape of the freshAgent session actions this slice follows. */
@@ -68,6 +70,40 @@ function clearTail(session: FreshAgentLiveSession): void {
 
 function clearTailsFor(state: FreshAgentLiveState, payload: SessionMutationPayload): void {
   for (const key of tailKeysFor(state, payload)) clearTail(state.bySession[key])
+}
+
+function isViewed(state: FreshAgentLiveState, key: string): boolean {
+  return (state.viewers[key] ?? 0) > 0
+}
+
+/**
+ * The session's turn ended (its result, or an idle status). A tail a visible
+ * pane settles keeps its blocks, marked ended, until their lines land; the
+ * retry is over. A tail no pane settles is dropped: nothing would ever land it.
+ */
+function endTurnsFor(state: FreshAgentLiveState, payload: SessionMutationPayload): void {
+  for (const key of tailKeysFor(state, payload)) {
+    if (!isViewed(state, key)) {
+      delete state.bySession[key]
+      continue
+    }
+    const session = state.bySession[key]
+    for (const block of session.blocks) if (!block.ended) block.ended = true
+    if (session.retry) delete session.retry
+  }
+}
+
+/**
+ * A session error (not a restore failure). It may end the turn (a failed
+ * turn's error follows its result) or not (a refused configure mid-turn), so
+ * a settled tail keeps every block and every line its pane waits for: they
+ * land, or the pane clears them, as at any turn's end. Only the retry is over.
+ */
+function errorTailsFor(state: FreshAgentLiveState, payload: SessionMutationPayload): void {
+  for (const key of tailKeysFor(state, payload)) {
+    if (!isViewed(state, key)) delete state.bySession[key]
+    else if (state.bySession[key].retry) delete state.bySession[key].retry
+  }
 }
 
 function applyStreamOp(session: FreshAgentLiveSession, op: LiveStreamOp): void {
@@ -200,10 +236,34 @@ const freshAgentLiveSlice = createSlice({
       sessionFor(state, { sessionId, sessionType, provider }).notice = { seq: state.noticeSeq, ...notice }
     },
 
-    /** The pane's turn has landed and ended: nothing live is left to show. */
+    /**
+     * The pane's ended turn has landed: its blocks and the lines it awaited
+     * are done. A block of a turn still streaming stays (the pane can believe
+     * the session idle while the CLI streams on, after a refused configure).
+     */
     liveTailCleared(state, action: PayloadAction<{ sessionKey: string }>) {
       const session = state.bySession[action.payload.sessionKey]
-      if (session) clearTail(session)
+      if (!session) return
+      if (session.blocks.some((block) => block.ended)) session.blocks = session.blocks.filter((block) => !block.ended)
+      if (session.expectedTurnIds.length > 0) session.expectedTurnIds = []
+    },
+
+    /** A visible pane now settles this session's tail. */
+    liveTailViewerAdded(state, action: PayloadAction<{ sessionKey: string }>) {
+      const { sessionKey } = action.payload
+      state.viewers[sessionKey] = (state.viewers[sessionKey] ?? 0) + 1
+    },
+
+    /**
+     * A pane stopped settling this session's tail (it hid, closed or
+     * remounted). Nothing is dropped here: a remount re-adds itself at once,
+     * and the turn's end drops a tail no pane settles.
+     */
+    liveTailViewerRemoved(state, action: PayloadAction<{ sessionKey: string }>) {
+      const { sessionKey } = action.payload
+      const count = state.viewers[sessionKey] ?? 0
+      if (count > 1) state.viewers[sessionKey] = count - 1
+      else if (count === 1) delete state.viewers[sessionKey]
     },
   },
   extraReducers: (builder) => {
@@ -223,12 +283,15 @@ const freshAgentLiveSlice = createSlice({
       .addCase(sessionExited, (state, action) => clearTailsFor(state, action.payload))
       .addCase(markSessionLost, (state, action) => clearTailsFor(state, action.payload))
       .addCase(setSessionStatus, (state, action) => {
-        // Idle is not here: the pane clears the tail once the turn's lines landed,
-        // so the text never blinks out between the result and the snapshot.
         if (action.payload.status === 'exited' || action.payload.status === 'stuck') clearTailsFor(state, action.payload)
+        // Idle ends the turn but clears nothing a pane settles: the pane clears
+        // the tail once the turn's lines landed, so the text never blinks out
+        // between the result and the snapshot.
+        else if (action.payload.status === 'idle') endTurnsFor(state, action.payload)
       })
+      .addCase(turnResult, (state, action) => endTurnsFor(state, action.payload))
       .addCase(sessionError, (state, action) => {
-        if (!action.payload.code?.startsWith('RESTORE_')) clearTailsFor(state, action.payload)
+        if (!action.payload.code?.startsWith('RESTORE_')) errorTailsFor(state, action.payload)
       })
   },
 })
@@ -238,6 +301,8 @@ export const {
   liveNoticeReceived,
   liveRetrySet,
   liveTailCleared,
+  liveTailViewerAdded,
+  liveTailViewerRemoved,
   streamOpsApplied,
   transcriptAnnounced,
   transcriptExpectationsDropped,

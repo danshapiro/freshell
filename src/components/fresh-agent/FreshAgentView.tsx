@@ -4006,6 +4006,7 @@ export function FreshAgentView({
   }, [requestSnapshotRefresh])
   useTranscriptLandings({
     sessionKey: liveSessionKey,
+    visible: !hidden,
     landed: snapshot ? landedTranscript : null,
     busy: isBusy,
     isBusyNow: isLiveSessionBusyNow,

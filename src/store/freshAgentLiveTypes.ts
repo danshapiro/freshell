@@ -27,6 +27,11 @@ export type LiveBlock = {
   input?: unknown
   /** The transcript line uuid the block becomes (its assistant message's uuid). */
   uuid?: string
+  /**
+   * The turn the block belongs to has ended (its result arrived): nothing
+   * streams into it any more, and it only waits for its line to land.
+   */
+  ended?: true
 }
 
 /** One stream event, reduced to what the tail renders. */
@@ -88,4 +93,11 @@ export type FreshAgentLiveSession = {
 export type FreshAgentLiveState = {
   bySession: Record<string, FreshAgentLiveSession>
   noticeSeq: number
+  /**
+   * How many visible panes settle each session's tail (land its blocks and
+   * clear it once its turn is on screen). A tail no pane settles is dropped
+   * when its turn ends, so a session this client does not show never keeps
+   * more than its running turn.
+   */
+  viewers: Record<string, number>
 }

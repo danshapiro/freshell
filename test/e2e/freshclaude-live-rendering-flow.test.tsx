@@ -248,4 +248,85 @@ describe('freshclaude live rendering flow (transcript-live D9)', () => {
     expect(document.querySelector('[data-turn-source="live"]')).toBeNull()
     expect(framesSinceFirstShown(frames).filter((count) => count !== 1)).toEqual([])
   })
+
+  // error_max_turns, error_during_execution and error_max_budget_usd: the CLI
+  // sends the turn's result and then the error that explains it, before it
+  // writes the turn's last line (about 100 ms later).
+  async function failTurn(store: Store) {
+    deliver(store, { type: 'freshAgent.result', costUsd: 0.01 })
+    deliver(store, { type: 'freshAgent.error', message: 'Claude reached its turn limit. Send a message to continue.', turnFailure: true })
+    deliver(store, { type: 'freshAgent.turn.complete', at: Date.now() })
+  }
+
+  it('keeps the answer of a failed turn on screen exactly once when its line lands after the error and its refetches', async () => {
+    const store = createStore()
+    const frames = renderFlow(store)
+    await settleRefetches(2)
+
+    await streamAnswer(store)
+    await failTurn(store)
+    await settleRefetches(2)
+    expect(countOnScreen(ANSWER)).toBe(1)
+
+    served = [question, answer]
+    await settleRefetches(4)
+
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(document.querySelector('[data-turn-source="live"]')).toBeNull()
+    expect(framesSinceFirstShown(frames).filter((count) => count !== 1)).toEqual([])
+  })
+
+  it('never blinks out the answer of a failed turn whose line lands 100 ms after the error', async () => {
+    const store = createStore()
+    const frames = renderFlow(store)
+    await settleRefetches(2)
+
+    await streamAnswer(store)
+    await failTurn(store)
+    await advance(100)
+    served = [question, answer]
+    await settleRefetches(6)
+
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(document.querySelector('[data-turn-source="live"]')).toBeNull()
+    expect(framesSinceFirstShown(frames).filter((count) => count !== 1)).toEqual([])
+  })
+
+  it('keeps streaming a block through an error that does not end the turn (a refused configure)', async () => {
+    const store = createStore()
+    renderFlow(store)
+    await settleRefetches(2)
+    const textOnScreen = () => document.querySelector('[data-turn-source="live"]')?.textContent ?? ''
+
+    deliver(store, { type: 'freshAgent.status', status: 'running' })
+    deliver(store, stream({ type: 'message_start', message: { id: 'msg_kittens' } }))
+    deliver(store, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+    deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Kittens are ' } }))
+    await advance(LIVE_STREAM_FLUSH_MS)
+
+    // The user changed the model mid-turn: the server refuses until the turn ends.
+    deliver(store, { type: 'freshAgent.error', code: 'CLAUDE_SETTINGS_FAILED', message: 'Wait for the current turn to finish before changing agent settings.' })
+    deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'small cats ' } }))
+    await advance(LIVE_STREAM_FLUSH_MS)
+    expect(textOnScreen()).toContain('Kittens are small cats')
+
+    // The refreshes the error causes come and go; the CLI streams on.
+    await settleRefetches(4)
+    deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'that love ' } }))
+    deliver(store, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'yarn.' } }))
+    await advance(LIVE_STREAM_FLUSH_MS)
+    expect(textOnScreen()).toContain(ANSWER)
+
+    // The block completes and lands as usual.
+    deliver(store, stream({ type: 'content_block_stop', index: 0 }))
+    deliver(store, {
+      type: 'freshAgent.assistant', content: [{ type: 'text', text: ANSWER }], uuid: 'u-answer', messageId: 'msg_kittens', parentToolUseId: null,
+    })
+    deliver(store, { type: 'freshAgent.session.changed', reason: 'transcript', uuid: 'u-answer', parentToolUseId: null })
+    deliver(store, { type: 'freshAgent.result', costUsd: 0.01 })
+    served = [question, answer]
+    await settleRefetches(4)
+    expect(countOnScreen(ANSWER)).toBe(1)
+    expect(document.querySelector('[data-turn-source="live"]')).toBeNull()
+  })
 })

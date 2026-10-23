@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, {
   markSessionLost,
@@ -7,18 +7,21 @@ import freshAgentReducer, {
   sessionError,
   sessionExited,
   setSessionStatus,
+  turnResult,
 } from '@/store/freshAgentSlice'
 import freshAgentLiveReducer, {
   assistantBlockBound,
   liveRetrySet,
   liveTailCleared,
+  liveTailViewerAdded,
+  liveTailViewerRemoved,
   streamOpsApplied,
   transcriptAnnounced,
   transcriptExpectationsDropped,
   transcriptLanded,
 } from '@/store/freshAgentLiveSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
-import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
+import { LIVE_STREAM_FLUSH_MS, streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
 import type { LiveStreamOp } from '@/store/freshAgentLiveTypes'
 
 const locator = { sessionId: 'live-1', sessionType: 'freshclaude' as const, provider: 'claude' as const }
@@ -178,10 +181,13 @@ describe('freshAgentLive slice (transcript-live D3)', () => {
     ['the session is killed', (store: Store) => store.dispatch(removeSession(locator))],
     ['the status turns exited', (store: Store) => store.dispatch(setSessionStatus({ ...locator, status: 'exited' }))],
     ['the status turns stuck', (store: Store) => store.dispatch(setSessionStatus({ ...locator, status: 'stuck' }))],
-    ['a turn error ends it', (store: Store) => store.dispatch(sessionError({ ...locator, message: 'boom' }))],
-    ['the pane clears it', (store: Store) => store.dispatch(liveTailCleared({ sessionKey: KEY }))],
+    ['the pane clears it after the turn ended', (store: Store) => {
+      store.dispatch(turnResult(locator))
+      store.dispatch(liveTailCleared({ sessionKey: KEY }))
+    }],
   ])('clears the tail when %s', (_label, end) => {
     const store = createStore()
+    store.dispatch(liveTailViewerAdded({ sessionKey: KEY }))
     apply(store, start('msg_1', 0, 'text'), delta('msg_1', 0, 'gone'))
     store.dispatch(liveRetrySet({ ...locator, attempt: 1 }))
     store.dispatch(transcriptAnnounced({ ...locator, uuid: 'u-1' }))
@@ -196,9 +202,81 @@ describe('freshAgentLive slice (transcript-live D3)', () => {
     ['a restore failure is reported', (store: Store) => store.dispatch(sessionError({ ...locator, code: 'RESTORE_NOT_FOUND', message: 'gone' }))],
   ])('keeps the tail when %s', (_label, event) => {
     const store = createStore()
+    store.dispatch(liveTailViewerAdded({ sessionKey: KEY }))
     apply(store, start('msg_1', 0, 'text'), delta('msg_1', 0, 'kept'))
     event(store)
     expect(tail(store).blocks.map((block) => block.text)).toEqual(['kept'])
+  })
+
+  it('drops only the retry on a session error: the blocks and the lines the pane waits for stay until they land', () => {
+    const store = createStore()
+    store.dispatch(liveTailViewerAdded({ sessionKey: KEY }))
+    apply(store, start('msg_1', 0, 'text'), delta('msg_1', 0, 'answer'))
+    store.dispatch(assistantBlockBound({ ...locator, uuid: 'u-1', messageId: 'msg_1', content: [{ type: 'text', text: 'answer' }] }))
+    store.dispatch(transcriptAnnounced({ ...locator, uuid: 'u-1' }))
+    apply(store, start('msg_1', 1, 'text'), delta('msg_1', 1, 'still streaming'))
+    store.dispatch(liveRetrySet({ ...locator, attempt: 3 }))
+
+    // error_max_turns after its result, or a refused configure mid-turn.
+    store.dispatch(sessionError({ ...locator, message: 'Claude reached its turn limit.' }))
+
+    expect(tail(store).retry).toBeUndefined()
+    expect(tail(store).blocks.map((block) => block.text)).toEqual(['answer', 'still streaming'])
+    expect(tail(store).expectedTurnIds).toEqual(['u-1'])
+    // The streaming block keeps growing.
+    apply(store, delta('msg_1', 1, ' and more'))
+    expect(tail(store).blocks[1].text).toBe('still streaming and more')
+  })
+
+  it('the pane\'s clear keeps the blocks of a turn still streaming and drops those of a turn that ended', () => {
+    const store = createStore()
+    store.dispatch(liveTailViewerAdded({ sessionKey: KEY }))
+    apply(store, start('msg_1', 0, 'text'), delta('msg_1', 0, 'previous answer'))
+    store.dispatch(turnResult(locator))
+    apply(store, start('msg_2', 0, 'text'), delta('msg_2', 0, 'next answer'))
+    store.dispatch(transcriptAnnounced({ ...locator, uuid: 'u-gone' }))
+
+    // The pane believes the session idle (an error said so) while the CLI streams on.
+    store.dispatch(liveTailCleared({ sessionKey: KEY }))
+
+    expect(tail(store).blocks.map((block) => block.text)).toEqual(['next answer'])
+    expect(tail(store).expectedTurnIds).toEqual([])
+    apply(store, delta('msg_2', 0, ', continued'))
+    expect(tail(store).blocks[0].text).toBe('next answer, continued')
+
+    store.dispatch(turnResult(locator))
+    store.dispatch(liveTailCleared({ sessionKey: KEY }))
+    expect(tail(store).blocks).toEqual([])
+  })
+
+  it.each([
+    ['its result arrives', (store: Store) => store.dispatch(turnResult(locator))],
+    ['its status turns idle', (store: Store) => store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))],
+    ['an error ends it', (store: Store) => store.dispatch(sessionError({ ...locator, message: 'boom' }))],
+  ])('drops the tail no visible pane settles when its turn ends (%s)', (_label, end) => {
+    const store = createStore()
+    apply(store, start('msg_1', 0, 'text'), delta('msg_1', 0, 'nobody here sees this'))
+    store.dispatch(transcriptAnnounced({ ...locator, uuid: 'u-1' }))
+    store.dispatch(liveRetrySet({ ...locator, attempt: 1 }))
+    end(store)
+    expect(tail(store)).toBeUndefined()
+  })
+
+  it('keeps a tail while any visible pane settles it, and drops it at the turn\'s end once the last one left', () => {
+    const store = createStore()
+    store.dispatch(liveTailViewerAdded({ sessionKey: KEY }))
+    store.dispatch(liveTailViewerAdded({ sessionKey: KEY }))
+    apply(store, start('msg_1', 0, 'text'), delta('msg_1', 0, 'first turn'))
+    store.dispatch(liveTailViewerRemoved({ sessionKey: KEY }))
+    store.dispatch(turnResult(locator))
+    expect(tail(store).blocks.map((block) => block.text)).toEqual(['first turn'])
+
+    // A pane leaving drops nothing by itself (a split remounts its panes).
+    store.dispatch(liveTailViewerRemoved({ sessionKey: KEY }))
+    expect(tail(store).blocks.map((block) => block.text)).toEqual(['first turn'])
+    apply(store, start('msg_2', 0, 'text'), delta('msg_2', 0, 'second turn'))
+    store.dispatch(turnResult(locator))
+    expect(tail(store)).toBeUndefined()
   })
 
   it('never writes a session that has no tail', () => {
@@ -212,6 +290,10 @@ describe('freshAgentLive slice (transcript-live D3)', () => {
 })
 
 describe('websocket routing into the live tail (transcript-live D3)', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   const frame = (event: Record<string, unknown>) => ({ type: 'freshAgent.event', ...locator, event: { sessionId: locator.sessionId, ...event } })
   const stream = (event: Record<string, unknown>, extra: Record<string, unknown> = {}) => frame({
     type: 'freshAgent.stream', messageId: 'msg_1', parentToolUseId: null, event, ...extra,
@@ -270,6 +352,16 @@ describe('websocket routing into the live tail (transcript-live D3)', () => {
     expect(tail(store).notice?.seq).toBe(2)
     // A notice never ends the turn or touches the session (P4).
     expect(store.getState().freshAgent.sessions).toBe(sessionsBefore)
+  })
+
+  it('applies a session\'s pending stream events before a stopped recovery removes it, leaving no tail behind', () => {
+    vi.useFakeTimers()
+    const store = createStore()
+    handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }))
+    handleFreshAgentMessage(store.dispatch, stream({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'pending' } }))
+    handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.recovery.stopped', ...locator, success: true })
+    vi.advanceTimersByTime(LIVE_STREAM_FLUSH_MS)
+    expect(tail(store)).toBeUndefined()
   })
 
   it('drops a retry frame without a positive attempt', () => {
