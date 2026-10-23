@@ -5,8 +5,9 @@
 // session, so when its SDK message stream ends without being asked to, the
 // sidecar is done: it reports how the stream ended in `sdk.stream.ended`, its
 // last stdout line, and exits with code 3. The Rust server's end-of-output path
-// then ends the session. A requested teardown (shutdown, stdin closing) exits 0
-// and reports nothing about the stream.
+// then ends the session, and rings a turn the user was owed (C18: the sidecar
+// mints no edge of its own). A requested teardown (shutdown, stdin closing)
+// exits 0 and reports nothing about the stream.
 //
 // Driven through the production index.mjs over the CLI simulator (harness.ts),
 // plus the pure `streamEnd` classification on the SDK's exact error strings
@@ -17,6 +18,9 @@ import { STREAM_ENDED_EXIT_CODE, streamEnd } from '../../../crates/freshell-clau
 import { startRealSidecar, type RealSidecar, type SidecarFrame } from './harness'
 
 const ALERT_FRAMES = new Set(['sdk.stream.ended', 'sdk.turn.complete', 'sdk.error', 'sdk.status'])
+
+/** Frames only the server may originate (C18). */
+const EDGE_FRAMES = new Set(['sdk.turn.complete', 'sdk.turn.waiting', 'sdk.exit'])
 
 /**
  * A frame that reports an end or a status the client shows. A model request
@@ -88,9 +92,8 @@ describe('the sidecar exits when its SDK stream ends', () => {
     // The cause travels in sdk.stream.ended; no second error frame repeats it.
     expect(framesOf(sidecar, 'sdk.error')).toEqual([])
     expect(framesOf(sidecar, 'sdk.result')).toEqual([])
-    // Interim (until Rust mints every edge, C18): the sidecar still rings the
-    // result-less turn end, once.
-    expect(framesOf(sidecar, 'sdk.turn.complete')).toHaveLength(1)
+    // The result-less turn end rings from the server, not from here (C18).
+    expect(sidecar.frames.filter((frame) => EDGE_FRAMES.has(frame.type))).toEqual([])
     // No stream-end idle: the server reports the ended session as `exited` (C09).
     expect(framesOf(sidecar, 'sdk.status').filter((frame) => frame.status === 'idle')).toEqual([])
   })
@@ -99,7 +102,7 @@ describe('the sidecar exits when its SDK stream ends', () => {
     const sidecar = await startRealSidecar()
     const sessionId = await bootedSession(sidecar)
     sidecar.send({ type: 'send', sessionId, text: 'something to compact' })
-    await sidecar.waitFor('sdk.turn.complete')
+    await sidecar.waitFor('sdk.result')
     sidecar.send({ type: 'send', sessionId, text: '/compact HANG' })
     await sidecar.waitFor((frame) => frame.type === 'sdk.status' && frame.status === 'compacting', 'compacting')
     // Kill the (stand-in) CLI, not the sidecar.
@@ -118,14 +121,14 @@ describe('the sidecar exits when its SDK stream ends', () => {
     ] } })
     const sessionId = await bootedSession(sidecar)
     sidecar.send({ type: 'send', sessionId, text: 'first' })
-    await sidecar.waitFor('sdk.turn.complete')
+    await sidecar.waitFor('sdk.result')
     sidecar.send({ type: 'send', sessionId, text: 'second' })
 
     expect(await sidecar.waitExit()).toEqual({ code: STREAM_ENDED_EXIT_CODE, signal: null })
     expect(sidecar.frames.at(-1)).toMatchObject({ type: 'sdk.stream.ended', sessionId, reason: 'stream_eof' })
     expect(framesOf(sidecar, 'sdk.result')).toHaveLength(1)
-    // One edge for the first turn's result, one (interim) for the second turn's end.
-    expect(framesOf(sidecar, 'sdk.turn.complete')).toHaveLength(2)
+    // Both turn ends ring from the server (C18): the sidecar wrote no edge.
+    expect(sidecar.frames.filter((frame) => EDGE_FRAMES.has(frame.type))).toEqual([])
   })
 
   it('a stream that fails for another reason: sdk.stream.ended (stream_error) and exit code 3', async () => {
@@ -148,7 +151,7 @@ describe('the sidecar exits when its SDK stream ends', () => {
 
     expect(await sidecar.waitExit()).toEqual({ code: STREAM_ENDED_EXIT_CODE, signal: null })
     expect(sidecar.frames.at(-1)).toMatchObject({ type: 'sdk.stream.ended', sessionId, reason: 'cli_exited' })
-    expect(framesOf(sidecar, 'sdk.turn.complete')).toEqual([])
+    expect(sidecar.frames.filter((frame) => EDGE_FRAMES.has(frame.type))).toEqual([])
   })
 
   it('a shutdown request mid-turn exits 0 and reports nothing alert-related', async () => {

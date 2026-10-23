@@ -35,6 +35,18 @@
 //   FRESHELL_CLAUDE_SIM_COLD_STOP_RECEIPT  'empty' (default) or 'queued': whether a
 //                                       Stop sent while the CLI boots overtakes the
 //                                       pending send (both shapes are real, T13)
+//   FRESHELL_CLAUDE_SIM_COLD_COMMAND    'empty', 'queued' or 'started': the first
+//                                       uuid-stamped command after the boot starts cold.
+//                                       A Stop that arrives while it is still starting
+//                                       misses it (T13; the real CLI's order of receipt
+//                                       and lifecycle is racy, this makes one shape
+//                                       deterministic): 'empty' overtakes it (receipt
+//                                       [] before its queued), 'queued' finds it queued
+//                                       (receipt [uuid]), 'started' is answered as it
+//                                       starts (receipt [] after its queued and
+//                                       started). The command then runs to its result
+//                                       unless another interrupt arrives once it runs.
+//                                       With no Stop it starts after T.coldStart.
 //   FRESHELL_CLAUDE_SIM_STALL_STDIN     '1'/'boot' or 'prompt': the host process
 //                                       stops reading stdin after boot / at the
 //                                       first prompt
@@ -51,7 +63,10 @@
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
 //                                       under), `can_use_tool` (each answer the host's
-//                                       canUseTool gave) and `emission` (program steps)
+//                                       canUseTool gave), `interrupt` (each interrupt
+//                                       the CLI took: the receipt's stillQueued and
+//                                       whether a turn was running) and `emission`
+//                                       (program steps)
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -184,6 +199,9 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
+/** The shapes FRESHELL_CLAUDE_SIM_COLD_COMMAND names (see the knobs above). */
+const COLD_COMMAND_SHAPES = new Set(['empty', 'queued', 'started'])
+
 /** One command or CLI-initiated turn being worked on. */
 class Turn {
   constructor(cmd) {
@@ -218,6 +236,14 @@ class SimulatedCli {
     this.permissionMode = options.permissionMode || 'default'
     this.partial = options.includePartialMessages === true
     this.stateEvents = this.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS === '1'
+    this.coldShape = this.env.FRESHELL_CLAUDE_SIM_COLD_COMMAND || null
+    if (this.coldShape && !COLD_COMMAND_SHAPES.has(this.coldShape)) {
+      throw new Error(`FRESHELL_CLAUDE_SIM_COLD_COMMAND must be one of ${[...COLD_COMMAND_SHAPES].join(', ')}, not ${JSON.stringify(this.coldShape)}`)
+    }
+    // The cold command being started, while a Stop can still miss it, and the
+    // receipt of a Stop that missed it, when it is answered at its start.
+    this.cold = null
+    this.coldReceipt = null
     this.queue = []
     this.cliTurns = []
     this.preBoot = []
@@ -515,6 +541,12 @@ class SimulatedCli {
       this.deferredPushes.push(cmd)
       return
     }
+    if (this.coldShape && cmd.uuid) {
+      const shape = this.coldShape
+      this.coldShape = null
+      this.background(this.acceptCold(cmd, shape))
+      return
+    }
     if (!this.busy) {
       this.busy = true
       this.emitState('running')
@@ -526,6 +558,34 @@ class SimulatedCli {
     }
     this.queue.push(cmd)
     if (start && !this.turn) this.startNextOrIdle()
+  }
+
+  /**
+   * Take the cold command (FRESHELL_CLAUDE_SIM_COLD_COMMAND): it is still
+   * starting at the point `shape` names until a Stop misses it (or the cold
+   * window ends), and only then goes on.
+   */
+  async acceptCold(cmd, shape) {
+    const cold = { shape, uuid: cmd.uuid, missed: false, stopped: deferred() }
+    this.cold = cold
+    if (shape === 'queued') {
+      this.accept(cmd, { start: false })
+      await this.holdCold(cold)
+      this.startNextOrIdle()
+    } else {
+      // 'empty': the Stop overtook the command; 'started': the CLI answers the
+      // Stop only once it reported the command's start (runCommand).
+      await this.holdCold(cold)
+      this.accept(cmd)
+    }
+  }
+
+  /** Wait for a Stop to miss the cold command, or for the cold window to end. */
+  async holdCold(cold) {
+    await Promise.race([cold.stopped.promise, this.sleep(T.coldStart)])
+    if (this.cold === cold) this.cold = null
+    // The receipt reaches the host before anything the command does next.
+    await this.tick()
   }
 
   endWhenIdle() {
@@ -563,6 +623,13 @@ class SimulatedCli {
     this.turn = turn
     await this.sleep(T.queuedToStarted)
     if (cmd.uuid) this.emit({ type: 'command_lifecycle', command_uuid: cmd.uuid, state: 'started' })
+    if (this.coldReceipt && this.coldReceipt.uuid === cmd.uuid) {
+      // The receipt of the Stop that missed this command comes after its start.
+      const { resolve } = this.coldReceipt
+      this.coldReceipt = null
+      await this.tick()
+      resolve()
+    }
     this.recordPrompt(cmd)
     this.transcript.materialize()
     if (/^prompt$/.test(this.env.FRESHELL_CLAUDE_SIM_STALL_STDIN ?? '')) process.stdin.pause()
@@ -892,7 +959,20 @@ class SimulatedCli {
     if (this.dead) return Promise.reject(new Error('Query closed'))
     const receipt = deferred()
     const run = () => {
+      const cold = this.cold
+      if (cold && !cold.missed) {
+        // The command is still starting: this Stop misses it (T13).
+        cold.missed = true
+        const stillQueued = cold.shape === 'queued' ? [cold.uuid] : []
+        this.ledger('interrupt', { stillQueued, running: false, missed: cold.uuid })
+        const answer = () => receipt.resolve({ still_queued: stillQueued })
+        if (cold.shape === 'started') this.coldReceipt = { uuid: cold.uuid, resolve: answer }
+        else answer()
+        cold.stopped.resolve()
+        return
+      }
       const stillQueued = [...this.queue, ...(this.turn?.absorbed ?? []).filter((cmd) => !cmd.started)].filter((cmd) => cmd.uuid).map((cmd) => cmd.uuid)
+      this.ledger('interrupt', { stillQueued, running: Boolean(this.turn) })
       receipt.resolve({ still_queued: stillQueued })
       this.turn?.abort()
     }

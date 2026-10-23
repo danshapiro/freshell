@@ -205,14 +205,7 @@ impl FreshClaudeState {
             ));
             return;
         }
-        let (
-            durable_id,
-            ledger,
-            turn_lock,
-            session_type,
-            last_synthesized_complete_at,
-            live_settings,
-        ) = {
+        let (durable_id, ledger, turn_lock, session_type, clock, live_settings) = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(s) => (
@@ -224,7 +217,7 @@ impl FreshClaudeState {
                     // death-mint clock (carried like the ledger — the fork is
                     // the same logical session lifetime, so a death-mint
                     // after the fork can never regress past one before it).
-                    s.last_synthesized_complete_at.clone(),
+                    s.clock.clone(),
                     // The settings the session runs with (G15): the
                     // replacement launches with them, on every lane.
                     s.configuration.settings.clone(),
@@ -943,7 +936,7 @@ impl FreshClaudeState {
                     inherit: Some(InheritedRuntime {
                         turn_lock: turn_lock.clone(),
                         ledger: ledger.clone(),
-                        last_synthesized_complete_at: Arc::clone(&last_synthesized_complete_at),
+                        clock: clock.clone(),
                     }),
                     genesis: Some(genesis.clone()),
                     retry: None,

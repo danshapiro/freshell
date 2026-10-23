@@ -112,7 +112,7 @@ async fn fake_session(
         broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
         pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
         ledger: crate::claude_turns::SharedLedger::default(),
-        last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+        clock: crate::attention::AttentionClock::default(),
         turn_lock: Arc::new(TokioMutex::new(())),
         launch_genesis: None,
     };

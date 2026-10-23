@@ -44,9 +44,9 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 ///   - `first-prompt`: never before the first prompt runs, like the real CLI;
 ///   - `create`: also right after `created`, like the e2e fake sidecar.
 ///
-/// Every prompt is one turn: assistant text, a `success` result, one
-/// `sdk.turn.complete` with a strictly increasing `at`, then idle. Each prompt's
-/// text is appended to `FRESHELL_TEST_CLAUDE_SEND_LOG`.
+/// Every prompt is one turn: assistant text, a `success` result (the server
+/// rings it, C18), then idle. Each prompt's text is appended to
+/// `FRESHELL_TEST_CLAUDE_SEND_LOG`.
 const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
 import fs from 'node:fs'
 import readline from 'node:readline'
@@ -56,7 +56,6 @@ const initAt = process.env.FRESHELL_TEST_CLAUDE_INIT_AT
 const sendLog = process.env.FRESHELL_TEST_CLAUDE_SEND_LOG
 const sessions = new Map()
 let counter = 0
-let lastAt = 0
 const emit = (frame) => process.stdout.write(JSON.stringify(frame) + '\n')
 
 function reportSession(sessionId, st) {
@@ -86,11 +85,9 @@ rl.on('line', (line) => {
     reportSession(msg.sessionId, st)
     emit({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: `echo: ${msg.text}` }], model: 'fake-model' })
     emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success' })
-    lastAt = Math.max(Date.now(), lastAt + 1)
-    emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at: lastAt })
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
   } else if (msg.type === 'interrupt') {
-    emit({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: false, message: 'no in-flight SDK query' })
+    emit({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, stopId: msg.stopId, ok: false, message: 'no in-flight SDK query' })
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }

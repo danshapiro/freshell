@@ -7,10 +7,40 @@
 use serde_json::{json, Value};
 
 use super::{FreshClaudeState, PROVIDER};
-use crate::claude_turns::{EffectiveStatus, Folded, SharedLedger, TurnFact};
+use crate::claude_turns::{
+    EffectiveStatus, Folded, ResultVerdict, SharedLedger, StopReissue, TurnFact,
+};
 use freshell_protocol::{FreshAgentEvent, ServerMessage};
 
 const TARGET: &str = "freshell_freshagent::claude";
+
+/// The banner code of a failed turn (design §5.3, §6).
+pub(super) const TURN_FAILED_CODE: &str = "CLAUDE_TURN_FAILED";
+
+/// What folding one sidecar line asks the stdout consumer to do next.
+pub(super) enum LedgerStep {
+    /// Nothing beyond forwarding the line.
+    Nothing,
+    /// A result settled a turn (design §5.3): forward it with `sessionBusy`,
+    /// then show its banner and ring its edge as its verdict says.
+    Settled(SettledTurn),
+    /// A latched Stop missed a command the CLI was still starting: send the
+    /// interrupt again (§5.4).
+    Reissue(StopReissue),
+    /// The CLI refused the latched Stop's interrupt; the turn keeps running.
+    StopRefused { stop_id: String },
+}
+
+/// One settled turn, as the consumer reports it.
+pub(super) struct SettledTurn {
+    /// The session is still busy after it (the result frame's `sessionBusy`).
+    pub(super) busy: bool,
+    pub(super) verdict: ResultVerdict,
+    /// The request ids of the commands it retired (compacts have none).
+    pub(super) request_ids: Vec<String>,
+    /// The uuids of the commands it retired.
+    pub(super) command_ids: Vec<String>,
+}
 
 /// The `freshAgent.status` event for the session's envelope id.
 pub(crate) fn status_event(session_id: &str, status: EffectiveStatus) -> Value {
@@ -86,18 +116,19 @@ impl FreshClaudeState {
         }));
     }
 
-    /// Fold one sidecar line into the session's ledger. For a result, returns
-    /// whether the session is still busy after it (the result frame's
-    /// `sessionBusy`); `None` for every other line. Settlements are logged at
-    /// debug, the old-CLI head fallback at warn, an unknown command at debug.
+    /// Fold one sidecar line into the session's ledger and say what it asks for
+    /// next ([`LedgerStep`]). Settlements are logged at debug with their
+    /// verdict, the old-CLI head fallback at warn, an unknown command at debug.
     pub(super) fn fold_into_ledger(
         &self,
         ledger: &SharedLedger,
         line: &Value,
         broadcast_id: &std::sync::Mutex<String>,
         session_type: &str,
-    ) -> Option<bool> {
-        let fact = TurnFact::from_line(line)?;
+    ) -> LedgerStep {
+        let Some(fact) = TurnFact::from_line(line) else {
+            return LedgerStep::Nothing;
+        };
         let (folded, busy) = {
             let mut ledger = ledger.lock().expect("turn ledger lock");
             let folded = ledger.fold(&fact);
@@ -105,40 +136,77 @@ impl FreshClaudeState {
         };
         let session_id = broadcast_id.lock().expect("broadcast id lock").clone();
         match folded {
-            Folded::Applied => None,
+            Folded::Applied => LedgerStep::Nothing,
             Folded::UnknownCommand => {
                 let uuid = line.get("uuid").and_then(serde_json::Value::as_str);
                 let state = line.get("state").and_then(serde_json::Value::as_str);
                 tracing::debug!(target: TARGET, provider = PROVIDER,
                     session_id = %session_id, session_type, uuid, state,
                     "freshagent.claude.ledger_unknown_command");
-                None
+                LedgerStep::Nothing
             }
+            Folded::Reissue(reissue) => LedgerStep::Reissue(reissue),
+            Folded::StopRefused { stop_id } => LedgerStep::StopRefused { stop_id },
             Folded::Settled(settlement) => {
-                let uuids: Vec<&str> = settlement
+                let command_ids: Vec<String> = settlement
                     .retired
                     .iter()
-                    .map(|command| command.uuid.as_str())
+                    .map(|command| command.uuid.clone())
                     .collect();
-                let request_ids: Vec<&str> = settlement
+                let request_ids: Vec<String> = settlement
                     .retired
                     .iter()
-                    .filter_map(|command| command.request_id.as_deref())
+                    .filter_map(|command| command.request_id.clone())
                     .collect();
                 if settlement.head_retired {
                     tracing::warn!(target: TARGET, provider = PROVIDER,
-                        session_id = %session_id, session_type, retired = ?uuids,
+                        session_id = %session_id, session_type, retired = ?command_ids,
                         "ledger.fallback_head_retire: the CLI reports no command \
                          lifecycle and no command started, so the result settles the \
                          oldest one sent");
                 }
                 tracing::debug!(target: TARGET, provider = PROVIDER,
-                    session_id = %session_id, session_type, retired = ?uuids,
+                    session_id = %session_id, session_type, retired = ?command_ids,
                     request_ids = ?request_ids, session_busy = busy,
+                    verdict = settlement.verdict.as_str(),
+                    stop_id = settlement.stop_id.as_deref(),
                     "freshagent.claude.turn_settled");
-                Some(busy)
+                LedgerStep::Settled(SettledTurn {
+                    busy,
+                    verdict: settlement.verdict,
+                    request_ids,
+                    command_ids,
+                })
             }
         }
+    }
+
+    /// A result settled a turn (design §5.3): after its `freshAgent.result`, a
+    /// failed turn shows why (the nested `freshAgent.error{CLAUDE_TURN_FAILED}`
+    /// banner, never for an API error, which the transcript shows), and the
+    /// turn rings through the edge hub unless the user's Stop silenced it.
+    pub(super) fn ring_settled_turn(
+        &self,
+        record: &crate::claude_edges::EdgeRecord<'_>,
+        settled: SettledTurn,
+    ) {
+        if let Some(message) = settled.verdict.banner() {
+            self.emit_fresh_agent_error(
+                record.stamp,
+                record.session_type,
+                TURN_FAILED_CODE,
+                message,
+            );
+        }
+        self.edges.settle(
+            record,
+            crate::claude_edges::SettledReport {
+                rings: settled.verdict.rings(),
+                outcome: settled.verdict.outcome(),
+                retired_request_ids: settled.request_ids,
+                retired_command_ids: settled.command_ids,
+            },
+        );
     }
 
     /// Publish the session's effective status when it changed (design §5.2

@@ -68,7 +68,7 @@ pub(super) enum RegisterUnder {
 pub(super) struct InheritedRuntime {
     pub(super) turn_lock: Arc<TokioMutex<()>>,
     pub(super) ledger: crate::claude_turns::SharedLedger,
-    pub(super) last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
+    pub(super) clock: crate::attention::AttentionClock,
 }
 
 /// What a launch's claim of the provider lease on a durable id found (design
@@ -696,15 +696,24 @@ impl FreshClaudeState {
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.clone()));
         log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
+        // A resume after an unrequested death continues the dead session's
+        // attention clock (design §5.5): its edges stay above the death's.
+        let resumed_clock = || {
+            [Some(map_key.as_str()), durable.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|id| self.dead_sessions.find(id))
+                .map(|dead| dead.clock)
+        };
         let InheritedRuntime {
             turn_lock,
             ledger,
-            // Task 5: the session's death-mint clock (see the field doc).
-            last_synthesized_complete_at,
+            // The session's attention clock (see the field doc).
+            clock,
         } = inherit.unwrap_or_else(|| InheritedRuntime {
             turn_lock: Arc::new(TokioMutex::new(())),
             ledger: crate::claude_turns::SharedLedger::default(),
-            last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+            clock: resumed_clock().unwrap_or_default(),
         });
         {
             let mut sessions = self.sessions.lock().await;
@@ -717,7 +726,7 @@ impl FreshClaudeState {
                 Arc::clone(&broadcast_id),
                 Arc::clone(&pending),
                 Arc::clone(&ledger),
-                Arc::clone(&last_synthesized_complete_at),
+                clock.clone(),
                 provenance,
             );
             self.test_holds.registration().await;
@@ -745,7 +754,7 @@ impl FreshClaudeState {
                     broadcast_id,
                     pending,
                     ledger,
-                    last_synthesized_complete_at,
+                    clock,
                     turn_lock,
                     launch_genesis: genesis.map(|genesis| crate::identity_sink::RecordedGenesis {
                         genesis,
@@ -753,6 +762,7 @@ impl FreshClaudeState {
                     }),
                 },
             );
+            self.edges.registered(&map_key, &spec.session_type);
             // C09: a resumed session is live again, so it is no longer an ended
             // one. Forgotten before the lock is released, so a death of this new
             // incarnation is recorded after it, never forgotten by it.

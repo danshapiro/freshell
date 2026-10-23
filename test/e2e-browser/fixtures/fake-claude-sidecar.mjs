@@ -11,7 +11,7 @@
 // FIELD shapes come from the REAL sidecar (crates/freshell-claude-sidecar/
 // index.mjs:15-30) + the client consumer (src/lib/fresh-agent-ws.ts:195-284):
 //   - sdk.assistant content MUST be an ARRAY of blocks (fresh-agent-ws.ts:260-265);
-//   - sdk.turn.complete MUST carry a numeric `at` (fresh-agent-ws.ts:233-240);
+//   - no attention edge: the server rings each turn from its sdk.result (C18);
 //   - sdk.session.init cliSessionId MUST be a canonical UUID
 //     (shared/session-contract.ts:34) or no durable sessionRef ever lands.
 // The process MUST stay alive (no EOF) until shutdown/kill -- an early exit
@@ -165,10 +165,9 @@ rl.on('line', (line) => {
       content: [{ type: 'text', text }],
       model,
     })
-    // A turn ends the way the real sidecar ends it: its result, then the
-    // attention edge. No per-turn idle (the real sidecar sends no idle at all).
-    emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: { input_tokens: 1, output_tokens: 1 } })
-    emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at: Date.now() })
+    // A turn ends the way the real sidecar ends it: its result, which the
+    // server rings (C18). No per-turn idle (the real sidecar sends no idle at all).
+    emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', subtype: 'success', isError: false, terminalReason: 'completed', numTurns: 1, durationMs: 1, costUsd: 0, usage: { input_tokens: 1, output_tokens: 1 } })
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }

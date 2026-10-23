@@ -6,9 +6,8 @@
 // for the command and the user line, and reports the command's lifecycle under
 // it (T8). The sidecar forwards those facts, the session state (T9), status
 // ends (T15), heartbeats (T17), interrupt receipts (T12) and each result's
-// verdict facts, so the server can own turn accounting. Until the server's
-// turn ledger takes over (C17/C18) the sidecar still emits its own
-// turn.complete per result.
+// verdict facts, so the server owns turn accounting: from C18 the server mints
+// every attention edge, and the sidecar none.
 
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
@@ -48,8 +47,8 @@ describe('uuid-stamped sends', () => {
     const completed = bridge.frames.findIndex((frame) => frame.type === 'sdk.command' && frame.state === 'completed')
     expect(result).toBeGreaterThan(-1)
     expect(result).toBeLessThan(completed)
-    // Staging rule: the sidecar's own edge is still sent until the server mints it (C18).
-    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
+    // The server rings the turn from these facts (C18): the sidecar sends no edge.
+    expect(bridge.frames.filter((frame) => frame.type === 'sdk.turn.complete')).toEqual([])
   })
 
   // C17: the server's turn ledger reads msg_lifecycle_v1 from the per-turn
@@ -134,8 +133,8 @@ describe('session facts', () => {
     // A send during streamed text queues as its own turn (T10).
     bridge.send({ type: 'send', sessionId, uuid: queued, text: 'next' })
     await bridge.waitFor((frame) => frame.type === 'sdk.command' && frame.uuid === queued && frame.state === 'queued', 'the queued send')
-    bridge.send({ type: 'interrupt', sessionId })
-    expect(await bridge.waitFor('sdk.interrupt_settled')).toEqual({ type: 'sdk.interrupt_settled', sessionId, ok: true, stillQueued: [queued] })
+    bridge.send({ type: 'interrupt', sessionId, stopId: 'stop-1' })
+    expect(await bridge.waitFor('sdk.interrupt_settled')).toEqual({ type: 'sdk.interrupt_settled', sessionId, stopId: 'stop-1', ok: true, stillQueued: [queued] })
     // The stopped command ends cancelled; the survivor runs as its own turn.
     await bridge.waitFor((frame) => frame.type === 'sdk.command' && frame.uuid === queued && frame.state === 'completed', 'the survivor completed')
     expect(commandStates(bridge, running)).toEqual(['queued', 'started', 'replayed', 'cancelled'])

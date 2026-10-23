@@ -799,25 +799,6 @@ fn a_result_during_a_sends_write_settles_only_the_running_command() {
     assert!(t.busy());
 }
 
-/// The sidecar reports a session it does not host: nothing it owed can end any
-/// more, so everything is cleared (the deleted session-not-found test's
-/// property: the session is never wedged busy).
-#[test]
-fn a_session_the_sidecar_lost_owes_nothing() {
-    let mut t = Trace::default();
-    t.arm("a").arm_compact("c").feed_all([
-        session_state("running"),
-        command("a", "started"),
-        compacting(),
-    ]);
-    t.feed(json!({
-        "type": "sdk.error", "sessionId": "s", "message": "session not found", "sessionNotFound": true,
-    }));
-    assert!(!t.busy());
-    assert!(t.outstanding().is_empty());
-    assert_eq!(t.status(), "idle");
-}
-
 /// The end of the sidecar's output reports whether anything was owed and
 /// clears the ledger.
 #[test]
@@ -942,12 +923,31 @@ fn the_lines_the_ledger_folds() {
             }),
         ),
         (requesting(), Some(TurnFact::TurnEvidence)),
-        (assistant(), Some(TurnFact::TurnEvidence)),
-        (stream(), Some(TurnFact::TurnEvidence)),
+        (assistant(), Some(TurnFact::Content)),
+        (stream(), Some(TurnFact::Content)),
         (compacting(), Some(TurnFact::CompactStarted)),
         (status_ended(), Some(TurnFact::CompactEnded)),
         (boundary(), Some(TurnFact::CompactEnded)),
-        (result("success"), Some(TurnFact::Result)),
+        (
+            result("success"),
+            Some(TurnFact::Result(ResultFacts {
+                subtype: "success".into(),
+                ..ResultFacts::default()
+            })),
+        ),
+        (
+            json!({
+                "type": "sdk.result", "subtype": "error_during_execution", "isError": true,
+                "terminalReason": "aborted_tools", "numTurns": 3, "errorText": "boom",
+            }),
+            Some(TurnFact::Result(ResultFacts {
+                subtype: "error_during_execution".into(),
+                is_error: true,
+                terminal_reason: Some("aborted_tools".into()),
+                num_turns: Some(3),
+                error_text: Some("boom".into()),
+            })),
+        ),
         (
             json!({ "type": "sdk.status", "status": "running" }),
             Some(TurnFact::TurnEvidence),
@@ -956,13 +956,24 @@ fn the_lines_the_ledger_folds() {
             json!({ "type": "sdk.status", "status": "idle" }),
             Some(TurnFact::SessionState(SessionState::Idle)),
         ),
-        (
-            json!({ "type": "sdk.error", "sessionNotFound": true }),
-            Some(TurnFact::SessionLost),
-        ),
         (json!({ "type": "sdk.error", "message": "boom" }), None),
         (heartbeat(), None),
-        (json!({ "type": "sdk.interrupt_settled", "ok": true }), None),
+        (
+            json!({ "type": "sdk.interrupt_settled", "ok": true }),
+            Some(TurnFact::InterruptSettled {
+                stop_id: None,
+                ok: true,
+                still_queued: None,
+            }),
+        ),
+        (
+            json!({ "type": "sdk.interrupt_settled", "stopId": "s-1", "ok": true, "stillQueued": ["u"] }),
+            Some(TurnFact::InterruptSettled {
+                stop_id: Some("s-1".into()),
+                ok: true,
+                still_queued: Some(vec!["u".into()]),
+            }),
+        ),
         (json!({ "type": "sdk.send.rejected", "uuid": "u" }), None),
         (json!({ "type": "sdk.turn.complete", "at": 1 }), None),
         (

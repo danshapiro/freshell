@@ -14,6 +14,12 @@
 //! retires every started command, so an absorbed send (T10) ends with the turn
 //! that absorbed it, and a send queued behind a turn stays owed until its own
 //! result. The session's effective status is derived from it.
+//!
+//! C18: the ledger also holds the session's Stop latch ([`StopLatch`], design
+//! §5.4) and decides each result's [`ResultVerdict`] (§5.3): a Stop that landed
+//! on what it targeted is silent, every other turn end rings, and a failed turn
+//! also shows why. The server mints every attention edge from these verdicts
+//! (`claude_edges.rs`); the sidecar mints none.
 
 use std::collections::VecDeque;
 
@@ -330,19 +336,29 @@ pub(crate) enum TurnFact {
     /// The per-turn init; `lifecycle_capable` when it advertises
     /// `msg_lifecycle_v1` (T8). It opens no turn (see [`ClaudeTurnLedger::fold`]).
     Init { lifecycle_capable: bool },
-    /// Work in a turn: a model request, assistant text, a stream event (a legacy
+    /// Work in a turn that is not its content: a model request (a legacy
     /// fake's `sdk.status running`). The fallback for a CLI that announces no
-    /// session state. A subagent's own output is its parent's tool call.
+    /// session state.
     TurnEvidence,
+    /// The turn's own content: assistant text or a stream event (a subagent's
+    /// output is its parent's tool call, not the turn's content). Turn evidence
+    /// too, and the "first content" a cold Stop waits for (§5.4 case B).
+    Content,
     /// A compaction started (`sdk.status compacting`).
     CompactStarted,
     /// A compaction ended (`sdk.status null`, `sdk.compact_boundary`).
     CompactEnded,
-    /// A turn's result (`sdk.result`).
-    Result,
-    /// The sidecar does not host the session (`sdk.error{sessionNotFound}`):
-    /// nothing it owed can end any more.
-    SessionLost,
+    /// A turn's result (`sdk.result`), with the facts its verdict reads.
+    Result(ResultFacts),
+    /// The CLI's receipt for an interrupt (`sdk.interrupt_settled`): `stop_id`
+    /// echoes the interrupt's (absent from a protocol fake), and `still_queued`
+    /// lists the sent commands the CLI says will still run (T12, T13; absent
+    /// when the CLI sends no receipt).
+    InterruptSettled {
+        stop_id: Option<String>,
+        ok: bool,
+        still_queued: Option<Vec<String>>,
+    },
 }
 
 impl TurnFact {
@@ -376,12 +392,26 @@ impl TurnFact {
                             .any(|cap| cap.as_str() == Some(LIFECYCLE_CAPABILITY))
                     }),
             }),
-            "sdk.assistant" | "sdk.stream" if !subagent() => Some(Self::TurnEvidence),
+            "sdk.assistant" | "sdk.stream" if !subagent() => Some(Self::Content),
             "sdk.compact_boundary" => Some(Self::CompactEnded),
-            "sdk.result" => Some(Self::Result),
-            "sdk.error" if line.get("sessionNotFound").and_then(Value::as_bool) == Some(true) => {
-                Some(Self::SessionLost)
-            }
+            "sdk.result" => Some(Self::Result(ResultFacts::from_line(line))),
+            "sdk.interrupt_settled" => Some(Self::InterruptSettled {
+                stop_id: line
+                    .get("stopId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                ok: line.get("ok").and_then(Value::as_bool) == Some(true),
+                still_queued: line
+                    .get("stillQueued")
+                    .and_then(Value::as_array)
+                    .map(|uuids| {
+                        uuids
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    }),
+            }),
             _ => None,
         }
     }
@@ -403,6 +433,10 @@ pub(crate) struct Settlement {
     /// No command had started on a CLI that reports no lifecycle, so the oldest
     /// armed one was taken for the result's (T8's unknown slash command).
     pub(crate) head_retired: bool,
+    /// Whether the result rings, and whether it failed (§5.3).
+    pub(crate) verdict: ResultVerdict,
+    /// The Stop latched when the result arrived, if any.
+    pub(crate) stop_id: Option<String>,
 }
 
 /// What folding one fact did.
@@ -414,6 +448,12 @@ pub(crate) enum Folded {
     UnknownCommand,
     /// A result, and what it retired.
     Settled(Settlement),
+    /// The fact was applied, and a Stop that missed a command the CLI was
+    /// still starting must be sent again now (§5.4).
+    Reissue(StopReissue),
+    /// The CLI refused the latched Stop's interrupt (`ok: false`): the latch is
+    /// disarmed, and the turn it targeted keeps running.
+    StopRefused { stop_id: String },
 }
 
 /// The busy truth of one claude session (design §5.2): every command the
@@ -435,6 +475,8 @@ pub(crate) struct ClaudeTurnLedger {
     lifecycle_capable: bool,
     /// The status last published for the session.
     published: EffectiveStatus,
+    /// The Stop in force (§5.4), until every command it targeted has ended.
+    stop: Option<StopLatch>,
 }
 
 impl ClaudeTurnLedger {
@@ -494,7 +536,10 @@ impl ClaudeTurnLedger {
             .commands
             .iter()
             .position(|command| command.uuid == uuid)?;
-        self.commands.remove(at)
+        let command = self.commands.remove(at);
+        self.stop_targets_ended(&[uuid]);
+        self.clear_stop_if_spent();
+        command
     }
 
     /// Fold one fact from the sidecar.
@@ -509,8 +554,20 @@ impl ClaudeTurnLedger {
                 // reported may have been pushed just as the CLI went idle (T9).
                 self.turn_open = false;
                 self.compacting = false;
+                let ended: Vec<String> = self
+                    .commands
+                    .iter()
+                    .filter(|command| command.phase == CommandPhase::Started)
+                    .map(|command| command.uuid.clone())
+                    .collect();
                 self.commands
                     .retain(|command| command.phase != CommandPhase::Started);
+                let ended: Vec<&str> = ended.iter().map(String::as_str).collect();
+                self.stop_targets_ended(&ended);
+                if let Some(stop) = self.stop.as_mut() {
+                    stop.cli_turn = false;
+                }
+                self.clear_stop_if_spent();
             }
             TurnFact::Init { lifecycle_capable } => {
                 // Not turn evidence: every real turn has opened by its init (its
@@ -519,12 +576,26 @@ impl ClaudeTurnLedger {
                 self.lifecycle_capable |= lifecycle_capable;
             }
             TurnFact::TurnEvidence => self.turn_open = true,
+            TurnFact::Content => {
+                self.turn_open = true;
+                let only_started = self.only_started_command().map(str::to_string);
+                if let Some(stop) = self.stop.as_mut() {
+                    if stop.awaiting_start.is_some()
+                        && only_started.as_deref() == stop.awaiting_start.as_deref()
+                    {
+                        stop.target_content = true;
+                    }
+                }
+                return self.evaluate_stop();
+            }
             TurnFact::CompactStarted => self.compacting = true,
             TurnFact::CompactEnded => self.compacting = false,
-            TurnFact::Result => return Folded::Settled(self.settle()),
-            TurnFact::SessionLost => {
-                self.clear();
-            }
+            TurnFact::Result(facts) => return Folded::Settled(self.settle(facts)),
+            TurnFact::InterruptSettled {
+                stop_id,
+                ok,
+                still_queued,
+            } => return self.fold_receipt(stop_id.as_deref(), *ok, still_queued.as_deref()),
         }
         Folded::Applied
     }
@@ -553,15 +624,32 @@ impl ClaudeTurnLedger {
             }
             CommandState::Completed | CommandState::Cancelled | CommandState::Discarded => {
                 self.commands.remove(at);
+                self.stop_targets_ended(&[uuid]);
+                self.clear_stop_if_spent();
+                return Folded::Applied;
             }
         }
-        Folded::Applied
+        if let Some(stop) = self.stop.as_mut() {
+            if stop.awaiting_start.as_deref() == Some(uuid) {
+                if stop.receipt == StopReceipt::Pending {
+                    stop.target_lifecycle_before_receipt = true;
+                }
+                if matches!(state, CommandState::Started | CommandState::Replayed) {
+                    stop.target_started = true;
+                }
+                if state == CommandState::Replayed {
+                    stop.target_content = true;
+                }
+            }
+        }
+        self.evaluate_stop()
     }
 
     /// A result ends the turn: it retires every started command (one turn runs
     /// at a time, and absorbed commands start inside it, T10), so it rings at
     /// most once and its trailers (the lifecycle's end, the idle) find nothing.
-    fn settle(&mut self) -> Settlement {
+    /// Its verdict is decided against the Stop latched when it arrived.
+    fn settle(&mut self, facts: &ResultFacts) -> Settlement {
         let (retired, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.commands)
             .into_iter()
             .partition(|command| command.phase == CommandPhase::Started);
@@ -576,14 +664,27 @@ impl ClaudeTurnLedger {
         }
         self.turn_open = false;
         self.compacting = false;
+        let verdict = ResultVerdict::decide(facts, &retired, self.stop.as_ref());
+        let stop_id = self.stop.as_ref().map(|stop| stop.stop_id.clone());
+        let ended: Vec<&str> = retired
+            .iter()
+            .map(|command| command.uuid.as_str())
+            .collect();
+        self.stop_targets_ended(&ended);
+        if let Some(stop) = self.stop.as_mut() {
+            stop.cli_turn = false;
+        }
+        self.clear_stop_if_spent();
         Settlement {
             retired,
             head_retired,
+            verdict,
+            stop_id,
         }
     }
 
     /// The sidecar's output ended: whether anything was owed, and the ledger
-    /// is cleared (the CLI and its queue are gone).
+    /// is cleared (the CLI and its queue are gone, and so is any Stop).
     pub(crate) fn eof(&mut self) -> bool {
         let owed = self.busy();
         self.clear();
@@ -594,12 +695,467 @@ impl ClaudeTurnLedger {
         self.commands.clear();
         self.turn_open = false;
         self.compacting = false;
+        self.stop = None;
+    }
+
+    // ── the Stop latch (C18, design §5.4) ────────────────────────────────────
+
+    /// The user's Stop. A session with nothing owed has nothing to stop: `None`,
+    /// and nothing is sent. Otherwise the Stop targets one thing: the running
+    /// turn's commands; else the oldest command the CLI has not started (it may
+    /// still be starting, T13: the latch waits for it); else the turn the CLI
+    /// runs by itself. Commands queued behind the running turn are not targets
+    /// (decision 1): they run and ring. A Stop while another is latched keeps
+    /// the earlier one's targets, so everything the user stopped stays silent.
+    pub(crate) fn stop(&mut self, stop_id: String) -> Option<StopArmed> {
+        if !self.busy() {
+            return None;
+        }
+        let started: Vec<String> = self
+            .commands
+            .iter()
+            .filter(|command| command.phase == CommandPhase::Started)
+            .map(|command| command.uuid.clone())
+            .collect();
+        let (target, commands, awaiting_start) = if !started.is_empty() {
+            (StopTargetKind::Running, started, None)
+        } else if let Some(head) = self.commands.front() {
+            (
+                StopTargetKind::NotStarted,
+                vec![head.uuid.clone()],
+                Some(head.uuid.clone()),
+            )
+        } else {
+            (StopTargetKind::CliTurn, Vec::new(), None)
+        };
+        let earlier = self.stop.take();
+        let mut latch = StopLatch {
+            stop_id: stop_id.clone(),
+            commands: Vec::new(),
+            cli_turn: target == StopTargetKind::CliTurn,
+            awaiting_start: awaiting_start.clone(),
+            receipt: StopReceipt::Pending,
+            target_lifecycle_before_receipt: false,
+            target_started: false,
+            target_content: false,
+            reissues: 0,
+        };
+        if let Some(earlier) = earlier {
+            latch.commands = earlier.commands;
+            latch.cli_turn |= earlier.cli_turn;
+            latch.reissues = earlier.reissues;
+        }
+        for uuid in &commands {
+            if !latch.commands.contains(uuid) {
+                latch.commands.push(uuid.clone());
+            }
+        }
+        let armed = StopArmed {
+            stop_id,
+            target,
+            commands: latch.commands.clone(),
+        };
+        self.stop = Some(latch);
+        Some(armed)
+    }
+
+    /// The interrupt for `stop_id` could not be written: the Stop never reached
+    /// the CLI, so the latch is disarmed (a later Stop's latch is kept).
+    pub(crate) fn stop_unsent(&mut self, stop_id: &str) {
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.stop_id == stop_id)
+        {
+            self.stop = None;
+        }
+    }
+
+    /// A Stop is latched.
+    #[cfg(test)]
+    pub(crate) fn stop_latched(&self) -> bool {
+        self.stop.is_some()
+    }
+
+    /// The CLI's receipt for an interrupt. Only the latch's own receipt counts
+    /// (a re-sent interrupt's, or an earlier Stop's, is not); a protocol fake
+    /// echoes no stop id, so its receipt is the pending latch's.
+    fn fold_receipt(
+        &mut self,
+        stop_id: Option<&str>,
+        ok: bool,
+        still_queued: Option<&[String]>,
+    ) -> Folded {
+        let Some(stop) = self.stop.as_mut() else {
+            return Folded::Applied;
+        };
+        let ours = match stop_id {
+            Some(id) => id == stop.stop_id,
+            None => stop.receipt == StopReceipt::Pending,
+        };
+        if !ours || stop.receipt != StopReceipt::Pending {
+            return Folded::Applied;
+        }
+        if !ok {
+            let stop_id = stop.stop_id.clone();
+            self.stop = None;
+            return Folded::StopRefused { stop_id };
+        }
+        let lists_target = stop.awaiting_start.as_ref().is_some_and(|target| {
+            still_queued.is_some_and(|queued| queued.iter().any(|uuid| uuid == target))
+        });
+        stop.receipt = StopReceipt::Received { lists_target };
+        self.evaluate_stop()
+    }
+
+    /// Whether the latched Stop must be sent again now (§5.4): it waits for a
+    /// command the CLI had not started, the command is still owed, and:
+    /// - case A (the receipt lists the command, or came before any of its
+    ///   lifecycle): both the receipt and the command's start have been seen;
+    /// - case B (an empty receipt after its lifecycle: the interrupt may have
+    ///   landed on it): its first content has been seen.
+    fn evaluate_stop(&mut self) -> Folded {
+        let owed = |uuid: &str| self.commands.iter().any(|command| command.uuid == uuid);
+        let Some(stop) = self.stop.as_ref() else {
+            return Folded::Applied;
+        };
+        let Some(target) = stop.awaiting_start.clone() else {
+            return Folded::Applied;
+        };
+        if !owed(&target) || stop.reissues >= MAX_STOP_REISSUES {
+            return Folded::Applied;
+        }
+        let StopReceipt::Received { lists_target } = stop.receipt else {
+            return Folded::Applied;
+        };
+        let case = if lists_target || !stop.target_lifecycle_before_receipt {
+            ReissueCase::A
+        } else {
+            ReissueCase::B
+        };
+        let due = match case {
+            ReissueCase::A => stop.target_started,
+            ReissueCase::B => stop.target_content,
+        };
+        if !due {
+            return Folded::Applied;
+        }
+        let stop = self.stop.as_mut().expect("checked above");
+        stop.reissues += 1;
+        stop.awaiting_start = None;
+        Folded::Reissue(StopReissue {
+            stop_id: stop.stop_id.clone(),
+            reissue_id: format!("{}:{}", stop.stop_id, stop.reissues),
+            case,
+            target,
+            reissues: stop.reissues,
+        })
+    }
+
+    /// `ended` commands are no longer owed: they leave the latch's targets.
+    fn stop_targets_ended(&mut self, ended: &[&str]) {
+        let Some(stop) = self.stop.as_mut() else {
+            return;
+        };
+        stop.commands.retain(|uuid| !ended.contains(&uuid.as_str()));
+        if stop
+            .awaiting_start
+            .as_deref()
+            .is_some_and(|target| ended.contains(&target))
+        {
+            stop.awaiting_start = None;
+        }
+    }
+
+    /// The latch clears once nothing it targeted is left.
+    fn clear_stop_if_spent(&mut self) {
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.commands.is_empty() && !stop.cli_turn)
+        {
+            self.stop = None;
+        }
+    }
+
+    /// The one started command, when exactly one has started.
+    fn only_started_command(&self) -> Option<&str> {
+        let mut started = self
+            .commands
+            .iter()
+            .filter(|command| command.phase == CommandPhase::Started);
+        let first = started.next()?;
+        started.next().is_none().then_some(first.uuid.as_str())
     }
 
     /// The outstanding commands' uuids, in acceptance order.
     #[cfg(test)]
     pub(crate) fn outstanding(&self) -> impl Iterator<Item = &str> {
         self.commands.iter().map(|command| command.uuid.as_str())
+    }
+}
+
+// ── the Stop latch and the result verdict (C18, design §5.3, §5.4) ──────────
+
+/// A Stop re-sends its interrupt at most this many times in all (a re-send
+/// ends the wait for its command, so one Stop re-sends at most once; the cap
+/// bounds a run of Stops that keep one latch).
+pub(crate) const MAX_STOP_REISSUES: u8 = 2;
+
+/// What a Stop targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopTargetKind {
+    /// The running turn's commands.
+    Running,
+    /// The oldest command the CLI had not started (it may still be starting).
+    NotStarted,
+    /// A turn the CLI runs by itself (no command of the server's runs).
+    CliTurn,
+}
+
+impl StopTargetKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::NotStarted => "not_started",
+            Self::CliTurn => "cli_turn",
+        }
+    }
+}
+
+/// A Stop the ledger latched: what the interrupt is written for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StopArmed {
+    pub(crate) stop_id: String,
+    pub(crate) target: StopTargetKind,
+    /// Every command the latch now targets (an earlier latched Stop's too).
+    pub(crate) commands: Vec<String>,
+}
+
+/// The interrupt's receipt, as far as the latch has seen it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopReceipt {
+    Pending,
+    /// `lists_target`: the receipt lists the command the latch waits for among
+    /// the ones that will still run.
+    Received {
+        lists_target: bool,
+    },
+}
+
+/// Which re-send rule fired (§5.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReissueCase {
+    /// The receipt lists the command, or came before its lifecycle: re-sent at
+    /// its start.
+    A,
+    /// An empty receipt after its lifecycle: re-sent on its first content.
+    B,
+}
+
+impl ReissueCase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+        }
+    }
+}
+
+/// A Stop to send again: the command it missed now runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StopReissue {
+    /// The latched Stop.
+    pub(crate) stop_id: String,
+    /// The re-sent interrupt's own id (its receipt is not the latch's).
+    pub(crate) reissue_id: String,
+    pub(crate) case: ReissueCase,
+    /// The command the Stop missed.
+    pub(crate) target: String,
+    /// How many times the latch has re-sent, this one included.
+    pub(crate) reissues: u8,
+}
+
+/// The Stop in force for a session (§5.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StopLatch {
+    stop_id: String,
+    /// The commands it targets; a result that retires only these is silent.
+    commands: Vec<String>,
+    /// It targets a turn the CLI runs by itself (a result retiring nothing).
+    cli_turn: bool,
+    /// The command the CLI had not started at the Stop, while the latch still
+    /// waits to see whether the interrupt missed it.
+    awaiting_start: Option<String>,
+    receipt: StopReceipt,
+    /// That command's queued, started or replay came before the receipt.
+    target_lifecycle_before_receipt: bool,
+    /// That command started (or was replayed).
+    target_started: bool,
+    /// That command's first content was seen (its replay, or the turn's own
+    /// assistant or stream frame while it is the only started command).
+    target_content: bool,
+    reissues: u8,
+}
+
+/// The banner of a turn a Stop did not end but that the CLI aborted.
+pub(crate) const ABORTED_TURN_MESSAGE: &str = "Claude stopped the turn before it finished.";
+/// The banner of a failed turn whose kind has no copy of its own.
+pub(crate) const DEFAULT_TURN_FAILURE_MESSAGE: &str =
+    "Claude could not complete this turn. Try sending your message again.";
+
+/// The banner for a failed result of `subtype` that says nothing itself.
+fn subtype_failure_message(subtype: &str) -> &'static str {
+    match subtype {
+        "error_max_turns" => "Claude reached its turn limit. Send a message to continue.",
+        "error_max_budget_usd" => "Claude reached the configured spending limit.",
+        "error_max_structured_output_retries" => {
+            "Claude could not produce the requested response format."
+        }
+        _ => DEFAULT_TURN_FAILURE_MESSAGE,
+    }
+}
+
+/// The `terminal_reason`s of a turn that was aborted (T11).
+const ABORTED_TERMINAL_REASONS: [&str; 2] = ["aborted_streaming", "aborted_tools"];
+
+/// What a result says about its turn (`sdk.result`, design §5.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResultFacts {
+    /// The result's subtype (`success`, `error_during_execution`, ...). A
+    /// protocol fake names it in `result` instead.
+    pub(crate) subtype: String,
+    pub(crate) is_error: bool,
+    pub(crate) terminal_reason: Option<String>,
+    pub(crate) num_turns: Option<u64>,
+    /// The CLI's own error text, without its diagnostics.
+    pub(crate) error_text: Option<String>,
+}
+
+impl ResultFacts {
+    pub(crate) fn from_line(line: &Value) -> Self {
+        let text = |key: &str| {
+            line.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        let subtype = text("subtype")
+            .or_else(|| text("result"))
+            .unwrap_or_else(|| "success".to_string());
+        Self {
+            is_error: line
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(subtype != "success"),
+            terminal_reason: text("terminalReason"),
+            num_turns: line.get("numTurns").and_then(Value::as_u64),
+            error_text: text("errorText"),
+            subtype,
+        }
+    }
+
+    /// The CLI aborted the turn: its terminal reason says so, or (an older CLI
+    /// that reports none) it ended `error_during_execution` after running a turn
+    /// while a Stop was latched. A boot refusal ran no turn (T5), so it is never
+    /// a stopped turn.
+    fn aborted(&self, stop_latched: bool) -> bool {
+        match self.terminal_reason.as_deref() {
+            Some(reason) => ABORTED_TERMINAL_REASONS.contains(&reason),
+            None => {
+                stop_latched
+                    && self.subtype == "error_during_execution"
+                    && self.num_turns.is_some_and(|turns| turns > 0)
+            }
+        }
+    }
+}
+
+/// How a turn ended, for in-process observers (design §9.3 I3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// It ran to a successful result.
+    Completed,
+    /// It ended with an error (a failed subtype, or an API error).
+    Failed,
+    /// The user's Stop ended it.
+    Interrupted,
+}
+
+/// What a result means for the user (§5.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResultVerdict {
+    /// The user's Stop landed on what it targeted: no edge, no banner.
+    Silent,
+    /// The turn failed: it rings, and the banner says why.
+    Failed { message: String },
+    /// The turn ended (an API error too, which the transcript shows): it rings.
+    Completed { is_error: bool },
+}
+
+impl ResultVerdict {
+    /// Silent only for an aborted result that retired nothing but what the
+    /// latched Stop targeted (or, retiring nothing, ended the CLI's own turn it
+    /// targeted). A command that started after the Stop, or another device's
+    /// that a mistaken re-send aborted, rings.
+    fn decide(facts: &ResultFacts, retired: &[LedgerCommand], stop: Option<&StopLatch>) -> Self {
+        let aborted = facts.aborted(stop.is_some());
+        let landed = stop.is_some_and(|stop| {
+            if retired.is_empty() {
+                stop.cli_turn
+            } else {
+                retired
+                    .iter()
+                    .all(|command| stop.commands.contains(&command.uuid))
+            }
+        });
+        if aborted && landed {
+            Self::Silent
+        } else if facts.subtype != "success" {
+            let message = facts.error_text.clone().unwrap_or_else(|| {
+                if aborted {
+                    ABORTED_TURN_MESSAGE.to_string()
+                } else {
+                    subtype_failure_message(&facts.subtype).to_string()
+                }
+            });
+            Self::Failed { message }
+        } else {
+            Self::Completed {
+                is_error: facts.is_error,
+            }
+        }
+    }
+
+    /// The result rings the attention edge.
+    pub(crate) fn rings(&self) -> bool {
+        !matches!(self, Self::Silent)
+    }
+
+    /// The failure banner the result shows, if any.
+    pub(crate) fn banner(&self) -> Option<&str> {
+        match self {
+            Self::Failed { message } => Some(message),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn outcome(&self) -> TurnOutcome {
+        match self {
+            Self::Silent => TurnOutcome::Interrupted,
+            Self::Failed { .. } | Self::Completed { is_error: true } => TurnOutcome::Failed,
+            Self::Completed { is_error: false } => TurnOutcome::Completed,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Silent => "silent",
+            Self::Failed { .. } => "failed",
+            Self::Completed { is_error: true } => "completed_with_error",
+            Self::Completed { is_error: false } => "completed",
+        }
     }
 }
 
@@ -791,3 +1347,7 @@ mod tests {
 #[cfg(test)]
 #[path = "claude_turns_ledger_tests.rs"]
 mod ledger_tests;
+
+#[cfg(test)]
+#[path = "claude_turns_stop_tests.rs"]
+mod stop_tests;

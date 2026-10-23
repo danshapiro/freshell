@@ -38,6 +38,9 @@ pub(crate) struct DeadClaudeSession {
     pub(crate) reason: String,
     /// When it ended (epoch ms).
     pub(crate) at_ms: i64,
+    /// The session's attention clock (design §5.5): a resume continues it, so
+    /// the resumed session's edges land strictly above the dead one's.
+    pub(crate) clock: crate::attention::AttentionClock,
 }
 
 impl DeadClaudeSession {
@@ -101,6 +104,8 @@ pub(crate) struct Death<'a> {
     pub(crate) commands: Option<&'a Vec<Value>>,
     /// The `sdk.stream.ended` reason, or `sidecar_exited`.
     pub(crate) reason: &'a str,
+    /// The session's attention clock, for the resume to continue.
+    pub(crate) clock: &'a crate::attention::AttentionClock,
 }
 
 /// The claude lane's dead-session records, shared by every clone of its state
@@ -133,6 +138,7 @@ impl SharedDeadSessions {
             commands: death.commands.cloned(),
             reason: death.reason.to_string(),
             at_ms: crate::rollback_record::now_ms(),
+            clock: death.clock.clone(),
         };
         let (dropped, remembered) = {
             let mut store = self.0.lock().expect("dead sessions lock");
@@ -190,6 +196,7 @@ mod tests {
             commands: None,
             reason: "cli_exited".into(),
             at_ms: 1,
+            clock: Default::default(),
         }
     }
 

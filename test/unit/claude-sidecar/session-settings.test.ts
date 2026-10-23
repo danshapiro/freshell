@@ -119,7 +119,7 @@ async function sidecar(extraEnv: Record<string, string> = {}) {
   const harness = await startRealSidecar({ env: extraEnv, program: FAILING_TURN_PROGRAM })
   const waitFor = (type: string, requestId?: string) =>
     harness.waitFor((frame) => frame.type === type && (!requestId || frame.requestId === requestId), requestId ? `${type} ${requestId}` : type)
-  return { ...harness, waitFor }
+  return { ...harness, waitFor, waitForFrame: harness.waitFor }
 }
 
 /** The query() options the simulated CLI received (the sidecar makes one query per create). */
@@ -237,15 +237,14 @@ describe('Claude sidecar configuration protocol', () => {
     expect(bridge.frames.some((frame) => frame.type === 'sdk.exit')).toBe(false)
   })
 
-  it('surfaces failed turn details and rings the unified attention edge', async () => {
+  it('reports a failed turn\'s own error text on its result, and no banner or edge (the server mints both)', async () => {
     const bridge = await sidecar()
     const sessionId = await bridge.create({ requestId: 'create', model: 'opus' })
     bridge.send({ type: 'send', sessionId, text: '__fail__' })
-    expect(await bridge.waitFor('sdk.error')).toMatchObject({ message: 'Request timed out', turnFailure: true })
-    // Unified needs-attention contract: EVERY result subtype rings — the
-    // failed turn's edge is identical to a success turn's (no outcome rides
-    // the wire); only a result consumed by a pending accepted user-interrupt
-    // mark stays silent (turn-complete-gate.mjs).
-    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
+    expect(await bridge.waitFor('sdk.result')).toMatchObject({ sessionId, subtype: 'error_during_execution', isError: true, errorText: 'Request timed out' })
+    await bridge.waitForFrame((frame) => frame.type === 'sdk.session.state' && frame.state === 'idle', 'the CLI goes idle')
+    // C18: the failure banner and the attention edge are the server's
+    // (claude_turns.rs verdict, claude_edges.rs); the sidecar sends neither.
+    expect(bridge.frames.filter((frame) => frame.type === 'sdk.error' || frame.type === 'sdk.turn.complete')).toEqual([])
   })
 })

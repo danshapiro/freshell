@@ -41,6 +41,7 @@
 pub(crate) mod attention;
 pub mod claude;
 pub(crate) mod claude_dead_sessions;
+pub(crate) mod claude_edges;
 pub(crate) mod claude_handshake;
 pub(crate) mod claude_launch;
 pub(crate) mod claude_projection;
@@ -84,6 +85,8 @@ pub mod terminal_tabs;
 mod test_environment;
 
 pub use claude::{ClaudeCreateOutcome, ClaudeSendOutcome, FreshClaudeState};
+pub use claude_edges::{AttentionObserver, ClaudeTurnEvent};
+pub use claude_turns::TurnOutcome;
 // Kata 09v1 + SYNC-06 + G28: the claude_snapshot items visible outside this
 // crate — the ONE shared claude store-root rule (`claude_home_candidates`,
 // also read by freshell-ws's PTY truth probe), the three-state transcript

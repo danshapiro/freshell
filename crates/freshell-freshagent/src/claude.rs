@@ -15,33 +15,31 @@
 //! | `freshAgent.create {sessionType:'freshclaude'\|'kilroy',…}` | spawn the Node sidecar (ownership-tagged, isolated HOME inherited) → SDK `query()` → the SDK bridge's **BARE nanoid** placeholder id (NO placeholder→durable materialization — claude's send returns void), broadcast `freshAgent.created`, start the stdout consumer |
 //! | `freshAgent.send {sessionId,text}` | push the user turn into the sidecar's SDK input stream, broadcast `freshAgent.send.accepted` (NO `submittedTurnId` — claude) |
 //!
-//! ## Events + the completion edge
+//! ## Events + the attention edges
 //!
 //! The sidecar emits the SAME `sdk.*` shapes `SdkBridge` broadcasts. The stdout consumer
 //! normalizes each `sdk.* → freshAgent.*` (a port of `server/fresh-agent/sdk-events.ts`)
 //! and wraps it in a `freshAgent.event` envelope: `sdk.session.init` → `freshAgent.session.init`
-//! (durable Claude UUID via `cliSessionId`), `sdk.stream`/`sdk.assistant`/`sdk.result`, and
-//! the discrete `freshAgent.turn.complete` attention edge. Task 4 made the edge UNIFIED:
-//! the sidecar rings it on EVERY turn end except a user-initiated interrupt (its
-//! result-gate + consumeStream finally mint); the consumer never mints one from a live
-//! stream. That edge is the T2 `provider.emits-completion-signal` invariant. The `.jsonl`
-//! transcript the claude CLI persists under the isolated `<CLAUDE_HOME>/projects/…`
-//! corroborates it.
+//! (durable Claude UUID via `cliSessionId`), `sdk.stream`/`sdk.assistant`/`sdk.result`.
+//! The `.jsonl` transcript the claude CLI persists under the isolated
+//! `<CLAUDE_HOME>/projects/…` corroborates them.
 //!
-//! ## Sidecar death (ADR Decision 2.1, revised by Task 5) — an in-flight death rings
+//! The server mints every attention edge itself (design §5, C18; the sidecar mints
+//! none): the stdout consumer folds each line into the session's turn ledger
+//! (`claude_turns.rs`), whose verdict on each result says whether it rings, and every
+//! `freshAgent.turn.complete` / `freshAgent.turn.waiting` leaves through the edge hub
+//! (`claude_edges.rs`) on the session's one attention clock. Only the user's own Stop is
+//! silent, and only for the turn it targeted (the Stop latch, re-sent when it missed a
+//! command the CLI was still starting); a failed result also shows why.
 //!
-//! The sidecar's own edge covers every turn end its stream can report. The ONE end it
-//! cannot report is an UNREQUESTED process death mid-turn (SIGKILL — stdout just ends,
-//! the sidecar's finally never runs): the consumer's EOF tail then synthesizes the SAME
-//! `freshAgent.turn.complete` edge for the armed state captured at EOF entry, stamped by
-//! the session's Rust-side monotonic clock
-//! ([`ClaudeSession::last_synthesized_complete_at`] — the sidecar's own clock died with
-//! the process; wall-clock advancement orders the two timelines, the accepted regime).
-//! Requested deaths (kill/shutdown/teardown/rollback fork) never reach the death arm (the
-//! map entry is removed first) and stay silent, and an IDLE death mints nothing — the
-//! no-FALSE-completion property holds. Verified by
-//! [`tests::sidecar_death_with_turn_in_flight_rings_the_unified_edge`] and its idle twin
-//! [`tests::sidecar_death_while_idle_emits_no_completion`].
+//! ## Sidecar death — an in-flight death rings
+//!
+//! When the sidecar's output ends unrequested (it reported its SDK stream's end and
+//! exited, or the Node process died), the consumer's end-of-output path rings once if
+//! the ledger owed the user a turn end, through the same hub and clock. Requested
+//! deaths (kill/shutdown/teardown/rollback fork) never reach the death arm (the map
+//! entry is removed first) and stay silent, and an IDLE death mints nothing — the
+//! no-FALSE-completion property holds.
 //!
 //! ## Safety
 //!
@@ -66,7 +64,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as TokioMutex;
 
-use freshell_codex::next_monotonic_turn_complete_at;
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
     FreshAgentConfigure, FreshAgentCreate, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
@@ -78,6 +75,7 @@ use freshell_protocol::{
 use crate::claude_handshake::{read_created, BootContext};
 use crate::claude_launch::{ClaudeBoot, ClaudeLaunchSpec};
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
+use turn_status::LedgerStep;
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 pub(crate) const PROVIDER: &str = "claude";
@@ -301,6 +299,9 @@ pub struct FreshClaudeState {
     /// `exited` and a send to it is refused visibly. Resuming or closing the
     /// session forgets the record. See [`crate::claude_dead_sessions`].
     dead_sessions: crate::claude_dead_sessions::SharedDeadSessions,
+    /// The one place a claude attention edge leaves the server (design §5.5,
+    /// C18): edges, the attention observer and the typed turn events.
+    edges: crate::claude_edges::ClaudeEdgeHub,
     /// Test holds on the session lifecycle ([`crate::claude_test_holds`]); none
     /// is set in production.
     test_holds: Arc<crate::claude_test_holds::ClaudeTestHolds>,
@@ -623,20 +624,13 @@ struct ClaudeSession {
     /// [`crate::claude_turns::ClaudeTurnLedger::busy`]. An undo's replacement
     /// takes it over (the same logical session).
     ledger: crate::claude_turns::SharedLedger,
-    /// Task 5 (unified needs-attention signal): the session's Rust-side
-    /// completion clock — an UNREQUESTED sidecar death with a turn in flight
-    /// synthesizes the `freshAgent.turn.complete` edge the dead sidecar could
-    /// not emit, stamped strictly-monotonically per session via
-    /// [`next_monotonic_turn_complete_at`]. The sidecar's own clock died with
-    /// its process (and resets across a rollback fork, same as the sidecar's
-    /// own per-session state); wall-clock advancement orders the Rust-minted
-    /// `at`s against the sidecar-minted ones — the accepted regime, same as
-    /// Task 3. Minted ONLY by the consumer's unrequested-death arm, and only
-    /// for a death that reported no stream end (`sdk.stream.ended`: the
-    /// sidecar already rang that one itself — the interim rule until C18):
-    /// requested deaths (kill/shutdown/teardown/rollback fork) never reach it,
-    /// and an idle death (no armed turn) mints nothing.
-    last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
+    /// The session's attention clock (design §5.5, C18): every edge the server
+    /// mints for it (a result that rings, a death while a turn was owed, a
+    /// waiting edge) takes its strictly increasing `at` from here, so edges
+    /// from different sources never collide or regress (G24). An undo's
+    /// replacement and a resume after an unrequested death take it over (the
+    /// same logical session).
+    clock: crate::attention::AttentionClock,
     /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
     /// reads → record pre-write → pending-cancel → kill+spawn+adoption → reply);
@@ -729,6 +723,7 @@ impl FreshClaudeState {
         Self {
             hosted_mcp: false,
             sidecar_environment: None,
+            edges: crate::claude_edges::ClaudeEdgeHub::new(Arc::clone(&broadcast_tx)),
             broadcast_tx,
             checkpoint_event_sink: crate::CheckpointEventSink::default(),
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
@@ -769,6 +764,27 @@ impl FreshClaudeState {
     pub fn with_hosted_mcp(mut self, selected: bool) -> Self {
         self.hosted_mcp = selected;
         self
+    }
+
+    /// Report every claude attention edge, pending drain and session identity
+    /// change to `observer` (design §9.2 I-1). Every clone of this state
+    /// reports to it.
+    pub fn with_attention_observer(
+        self,
+        observer: Arc<dyn crate::claude_edges::AttentionObserver>,
+    ) -> Self {
+        self.edges.set_observer(observer);
+        self
+    }
+
+    /// Every claude turn event from now on (design §9.3 I3): each settled turn
+    /// with the requests it retired (a turn the user's Stop silenced too, with
+    /// no `at`), each waiting edge and each unrequested session end. A
+    /// dedicated low-volume channel: stream traffic never fills it.
+    pub fn subscribe_turn_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::claude_edges::ClaudeTurnEvent> {
+        self.edges.subscribe()
     }
 
     /// Test seam (see [`Self::sidecar_environment`]): every sidecar this state
@@ -1872,45 +1888,6 @@ impl FreshClaudeState {
         if let Ok(frame) = serde_json::to_string(msg) {
             let _ = self.broadcast_tx.send(frame);
         }
-    }
-
-    /// The one way a claude attention edge leaves the server: every site that
-    /// forwards or mints a `freshAgent.turn.complete` / `freshAgent.turn.waiting`
-    /// calls this (design §9.2 I-1; C18's `ClaudeEdgeHub::emit` replaces it).
-    /// It logs the edge at info (G14, design §5.5: ids, type, source and `at`;
-    /// never content), then broadcasts its client frame. `stamp` is the
-    /// envelope id clients address the session by; `sidecar_session_id` is the
-    /// id inside the event, as the sidecar names the session.
-    pub(crate) fn emit_attention_edge(
-        &self,
-        edge: AttentionEdge,
-        stamp: &str,
-        sidecar_session_id: &str,
-        session_type: &str,
-        at: i64,
-        source: AttentionEdgeSource,
-    ) {
-        let source = source.as_str();
-        match edge {
-            AttentionEdge::TurnComplete => tracing::info!(
-                provider = PROVIDER, session_id = %stamp, session_type = %session_type,
-                source, at, "freshagent.turn.complete"
-            ),
-            AttentionEdge::Waiting => tracing::info!(
-                provider = PROVIDER, session_id = %stamp, session_type = %session_type,
-                source, at, "freshagent.turn.waiting"
-            ),
-        }
-        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-            event: json!({
-                "type": edge.wire_type(),
-                "sessionId": sidecar_session_id,
-                "at": at,
-            }),
-            provider: PROVIDER.to_string(),
-            session_id: stamp.to_string(),
-            session_type: session_type.to_string(),
-        }));
     }
 
     async fn broadcast_checkpoint_frame(
@@ -3472,6 +3449,7 @@ impl FreshClaudeState {
             }
         }
 
+        self.edges.forgotten(&session_id);
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id,
@@ -4013,17 +3991,17 @@ impl FreshClaudeState {
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
 
-    /// Handle a `freshAgent.interrupt` for claude/kilroy: forward an `interrupt`
-    /// request to the owned sidecar, which calls the SDK's `query.interrupt()` --
-    /// mirrors `server/fresh-agent/adapters/claude/adapter.ts:163-168`'s
-    /// `interrupt(sessionId) { mapMissingResult(deps.sdkBridge.interrupt(sessionId), ...) }`
-    /// -> `server/sdk-bridge.ts:785-793`'s `sp.query.interrupt().catch(warn)`. Fire-and-
-    /// forget on success: legacy's `ws-handler.ts:3503-3517` sends NO confirmation frame
-    /// when `manager.interrupt(locator)` resolves, only `sendError` on a throw -- so a
-    /// successful interrupt here broadcasts nothing either. A missing session mirrors
-    /// the `SESSION_NOT_FOUND` convention [`Self::handle_send`] already established for
-    /// this provider (and codex/opencode's own `handle_interrupt`), rather than
-    /// reproducing legacy's adapter-specific message text verbatim.
+    /// Handle a `freshAgent.interrupt` (the user's Stop) for claude/kilroy (design
+    /// §5.4, C18). A session with nothing owed has nothing to stop: nothing is
+    /// sent (logged `freshagent.claude.stop` outcome `idle`). Otherwise the
+    /// session's turn ledger latches the Stop on one target (the running turn,
+    /// else the oldest command the CLI has not started, else the turn the CLI
+    /// runs by itself; commands queued behind the running turn are not targets)
+    /// and the interrupt is written with the latch's `stopId`. The stopped turn's
+    /// own result is then silent; every other turn end rings. A Stop that missed
+    /// a command the CLI was still starting is sent again by the stdout consumer
+    /// ([`Self::reissue_stop`]). Success broadcasts nothing. A missing session
+    /// mirrors the `SESSION_NOT_FOUND` convention [`Self::handle_send`] uses.
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_id = msg.session_id.clone();
 
@@ -4032,24 +4010,12 @@ impl FreshClaudeState {
             self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
-        let mut guard = self.sessions.lock().await;
-        let Some(session) = guard.get_mut(&map_key) else {
-            drop(guard);
+        if !self
+            .stop_live_session(&map_key, session_type_str(msg.session_type))
+            .await
+        {
             self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
-            return;
-        };
-        // Address the sidecar by ITS id for this session (== the map key for created
-        // sessions; differs for resumed-on-attach sessions, Task 6).
-        let interrupt_req = json!({ "type": "interrupt", "sessionId": session.sidecar_session_id });
-        if let Err(err) = write_line(&mut session.stdin, &interrupt_req).await {
-            drop(guard);
-            self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &err);
         }
-        // Nothing settles here and nothing settles at the sidecar's receipt
-        // (`sdk.interrupt_settled`): the receipt lands BEFORE the stopped turn's
-        // own result (sdk.d.ts:3765), which the turn ledger settles like any
-        // other result. Success: no broadcast (mirrors legacy's silent
-        // fire-and-forget interrupt).
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
@@ -4128,9 +4094,9 @@ impl FreshClaudeState {
     }
 
     /// Handle a `freshAgent.send` for claude: push the user turn into the sidecar's SDK
-    /// input stream, then broadcast `freshAgent.send.accepted`. The stdout consumer surfaces
-    /// the unified attention edge (sidecar `sdk.turn.complete` — minted for EVERY result
-    /// subtype except a user-interrupted turn's own → `freshAgent.turn.complete`).
+    /// input stream, then broadcast `freshAgent.send.accepted`. The stdout consumer rings
+    /// the turn's end itself (`freshAgent.turn.complete` for every result except the one
+    /// the user's own Stop landed on: the turn ledger's verdict, C18).
     ///
     /// C16: the send carries a uuid minted here. The sidecar puts it on the SDK user
     /// message, so the CLI writes the user line with it: it is the `submittedTurnId` of
@@ -4749,12 +4715,20 @@ impl FreshClaudeState {
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
             return;
         }
-        session
-            .pending
-            .lock()
-            .expect("pending lock")
-            .permissions
-            .retain(|p| p.request_id != request_id);
+        let drained = {
+            let mut pending = session.pending.lock().expect("pending lock");
+            pending.permissions.retain(|p| p.request_id != request_id);
+            pending.len() == 0
+        };
+        if drained {
+            let stamp = session
+                .broadcast_id
+                .lock()
+                .expect("broadcast id lock")
+                .clone();
+            drop(session);
+            self.edges.pending_drained(&stamp);
+        }
     }
 
     /// Handle a `freshAgent.question.respond` for claude/kilroy: identical ordering
@@ -4805,12 +4779,20 @@ impl FreshClaudeState {
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
             return;
         }
-        session
-            .pending
-            .lock()
-            .expect("pending lock")
-            .questions
-            .retain(|q| q.request_id != request_id);
+        let drained = {
+            let mut pending = session.pending.lock().expect("pending lock");
+            pending.questions.retain(|q| q.request_id != request_id);
+            pending.len() == 0
+        };
+        if drained {
+            let stamp = session
+                .broadcast_id
+                .lock()
+                .expect("broadcast id lock")
+                .clone();
+            drop(session);
+            self.edges.pending_drained(&stamp);
+        }
     }
 
     /// Handle a `freshAgent.compact` for claude/kilroy: write the legacy adapter's plain
@@ -5116,6 +5098,7 @@ impl FreshClaudeState {
             name_ref,
             session_name,
         });
+        self.edges.rekeyed(old_id, new_id);
         if let Ok(frame) = serde_json::to_string(&message) {
             if let Err(error) = self
                 .checkpoint_event_sink
@@ -5508,7 +5491,11 @@ impl FreshClaudeState {
                     // ack speaks is the consumer's tracked-status fold — truth at
                     // ack time (a completed turn settles it; a live compaction or
                     // in-flight turn announces truthfully).
-                    *session.broadcast_id.lock().expect("broadcast id lock") = durable.to_string();
+                    let previous = std::mem::replace(
+                        &mut *session.broadcast_id.lock().expect("broadcast id lock"),
+                        durable.to_string(),
+                    );
+                    self.edges.rekeyed(&previous, durable);
                     Some(session.current_status())
                 }
                 None => None,
@@ -6542,7 +6529,10 @@ impl FreshClaudeState {
     /// or an attach acknowledgement racing the line never understates it) and
     /// publishes the session's effective status on change: before a content
     /// frame is forwarded (so `running` precedes the first assistant frame), and
-    /// after a result is forwarded (the result carries `sessionBusy`).
+    /// after a result is forwarded (the result carries `sessionBusy`). C18: the
+    /// ledger's verdict on each result says whether it rings, and every edge
+    /// (a result, a waiting edge, a death while a turn was owed) leaves through
+    /// the edge hub on the session's `clock`.
     #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer; four call sites.
     fn spawn_consumer(
         &self,
@@ -6554,12 +6544,11 @@ impl FreshClaudeState {
         broadcast_id: Arc<std::sync::Mutex<String>>,
         pending: Arc<std::sync::Mutex<ClaudePending>>,
         ledger: crate::claude_turns::SharedLedger,
-        // Task 5 (unified needs-attention signal): the session's Rust-side
-        // completion clock — see [`ClaudeSession::last_synthesized_complete_at`].
-        // Held by the consumer (like the ledger above) so the unrequested-death
-        // arm below can mint AFTER the eviction has already torn the session
-        // record out of the map.
-        last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
+        // The session's attention clock (see [`ClaudeSession::clock`]). Held by
+        // the consumer (like the ledger above) so the unrequested-death arm
+        // below can mint AFTER the eviction has already torn the session record
+        // out of the map.
+        clock: crate::attention::AttentionClock,
         // D8: the creating connection's provenance stamps, handed to the
         // in-stream `sdk.session.init` adoption. `None` on conn-less consumers
         // (rollback replacement, attach-resume) — the ledger merge keeps prior
@@ -6589,8 +6578,29 @@ impl FreshClaudeState {
                 // C17: fold the line into the session's turn ledger (design
                 // §5.2) before anything else reads it: a gate, an attach
                 // acknowledgement or the status published below sees it.
-                let settled_busy =
-                    state.fold_into_ledger(&ledger, &value, &broadcast_id, &session_type);
+                let step = state.fold_into_ledger(&ledger, &value, &broadcast_id, &session_type);
+                // C18: a latched Stop that missed a command the CLI was still
+                // starting is sent again now (design §5.4); a refused one is
+                // disarmed (the turn keeps running and rings when it ends).
+                match &step {
+                    LedgerStep::Reissue(reissue) => {
+                        let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                        state
+                            .reissue_stop(
+                                &session_id,
+                                &sidecar_session_id,
+                                &stamp,
+                                &session_type,
+                                reissue,
+                            )
+                            .await;
+                    }
+                    LedgerStep::StopRefused { stop_id } => {
+                        let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                        state.log_stop_refused(&stamp, &session_type, stop_id);
+                    }
+                    LedgerStep::Nothing | LedgerStep::Settled(_) => {}
+                }
                 // C16: the lifecycle facts the sidecar forwards for turn
                 // accounting (a command's lifecycle, the session state, a status
                 // end or a model request, heartbeats) are never client content:
@@ -6669,28 +6679,29 @@ impl FreshClaudeState {
                         // the genesis once the transcript is on disk.
                         state.spawn_genesis_clear_after_result(&session_id);
                     }
-                    // The receipt ends nothing: the stopped turn's own result
-                    // does (the receipt lands before it, sdk.d.ts:3765). A
-                    // rejected interrupt leaves the turn running.
-                    Some("sdk.interrupt_settled")
-                        if value.get("ok").and_then(Value::as_bool) != Some(true) =>
-                    {
-                        tracing::warn!(session = %session_id, "freshagent.claude.interrupt_rejected_or_unsettled");
+                    // A protocol fake that predates C18 still sends its own
+                    // edges: the server mints every edge itself, so they are
+                    // dropped (the fakes are retired by C30).
+                    Some(legacy @ ("sdk.turn.complete" | "sdk.turn.waiting")) => {
+                        tracing::debug!(target: "freshell_freshagent::claude",
+                            provider = PROVIDER, session_id = %session_id, line_type = legacy,
+                            "freshagent.claude.legacy_edge_dropped: the server mints every edge");
+                        continue;
                     }
                     _ => {}
                 }
                 // Task 2: fold the pending approval/question state BEFORE the
                 // normalize/broadcast step, so a respond racing the event never
                 // observes a stale membership check.
-                fold_pending_frame(&pending, &value);
+                let pending_change = fold_pending_frame(&pending, &value);
                 // The status a content line changed is published before the line
                 // is forwarded (`running` precedes the first assistant frame); a
                 // result instead says whether the session is still busy, and the
                 // status follows it.
                 let mut value = value;
-                match settled_busy {
-                    Some(busy) => value["sessionBusy"] = json!(busy),
-                    None => {
+                match &step {
+                    LedgerStep::Settled(settled) => value["sessionBusy"] = json!(settled.busy),
+                    _ => {
                         let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                         state.publish_claude_status(&ledger, &stamp, &session_type, false);
                     }
@@ -6727,26 +6738,7 @@ impl FreshClaudeState {
                 // Task 10b: stamp the envelope from the SHARED handle (not the captured
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-                if let Some(edge) = AttentionEdge::from_sidecar_type(line_type) {
-                    // The sidecar's attention edges leave through the one edge
-                    // exit (logged there, G14).
-                    match value.get("at").and_then(Value::as_i64) {
-                        Some(at) => state.emit_attention_edge(
-                            edge,
-                            &stamp,
-                            &sidecar_session_id,
-                            &session_type,
-                            at,
-                            AttentionEdgeSource::Sidecar,
-                        ),
-                        // The client drops an edge without a numeric `at`; say so here.
-                        None => tracing::warn!(target: "freshell_freshagent::claude",
-                            provider = PROVIDER, session_id = %stamp,
-                            session_type = %session_type, edge = edge.wire_type(),
-                            "freshagent.claude.attention_edge_dropped_malformed_at"),
-                    }
-                } else if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
+                if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
                     if value.get("type").and_then(Value::as_str)
                         == Some("sdk.checkpointTurnIdentity")
                     {
@@ -6761,18 +6753,34 @@ impl FreshClaudeState {
                         let _ = broadcast_tx.send(frame);
                     }
                 }
-                if settled_busy.is_some() {
-                    let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                let record = crate::claude_edges::EdgeRecord {
+                    session_key: &session_id,
+                    stamp: &stamp,
+                    sidecar_session_id: &sidecar_session_id,
+                    session_type: &session_type,
+                    clock: &clock,
+                };
+                // C18: the waiting edge is the server's, on the 0 -> >=1
+                // pending transition (after the request frame it follows).
+                match pending_change {
+                    Some(PendingChange::Waiting) => {
+                        state.edges.waiting(&record);
+                    }
+                    Some(PendingChange::Drained) => state.edges.pending_drained(&stamp),
+                    None => {}
+                }
+                if let LedgerStep::Settled(settled) = step {
+                    state.ring_settled_turn(&record, settled);
                     state.publish_claude_status(&ledger, &stamp, &session_type, true);
                 }
             }
             // C17: the end of output ends whatever the CLI owed (its queue died
-            // with it), before the eviction verdict below (an unrequested death
-            // can never hold a rollback BUSY_TURN hostage). Task 5: whether a
-            // turn was owed is captured here, because by the time the
-            // unrequested-death arm below runs the ledger is cleared and the
-            // session record evicted (the clock and id handles it needs are
-            // consumer-owned locals that survive the eviction).
+            // with it, and so did any Stop), before the eviction verdict below
+            // (an unrequested death can never hold a rollback BUSY_TURN
+            // hostage). Whether a turn was owed is captured here, because by the
+            // time the unrequested-death arm below runs the ledger is cleared
+            // and the session record evicted (the clock and id handles it needs
+            // are consumer-owned locals that survive the eviction).
             let turn_was_in_flight = ledger.lock().expect("turn ledger lock").eof();
             // Consumer exit == this sidecar's stdout closed == the sidecar ended
             // (ledger A9): it exits after reporting its SDK stream's end
@@ -6846,6 +6854,7 @@ impl FreshClaudeState {
                         settings: &evicted.configuration.settings,
                         commands: evicted.configuration.commands.as_ref(),
                         reason,
+                        clock: &clock,
                     });
                 state.test_holds.exit_report().await;
                 // Stop the ended sidecar through the one sidecar stop every
@@ -6895,7 +6904,9 @@ impl FreshClaudeState {
                 // UNREQUESTED-end only: `handle_kill`/`shutdown`/attach-teardown all
                 // remove the map entry (and abort this consumer) first, so nothing is
                 // evicted here and it stays silent.
-                let rings = crate::claude_sidecar_exit::death_rings(turn_was_in_flight, &cause);
+                // C18: an unrequested end of a turn the user was owed rings,
+                // however the sidecar ended (it reports no edge of its own).
+                let rings = turn_was_in_flight;
                 tracing::warn!(target: "freshell_freshagent::claude",
                     provider = PROVIDER,
                     session_id = %stamp,
@@ -6937,39 +6948,21 @@ impl FreshClaudeState {
                         "freshagent.claude.exit_report_skipped: the session was resumed or \
                          closed while its dead sidecar was reaped");
                 }
-                // Task 5 (unified needs-attention signal): an UNREQUESTED end of a
-                // running turn is a turn end the user did not witness, even when a
-                // resume brought the session back during the stop. Interim
-                // rule (design §5.7, until C18): a sidecar that reported its
-                // stream's end already rang a result-less turn end itself, so the
-                // server rings only for a death that reported nothing (a Node
-                // death mid-turn) — exactly one edge either way. Whether a turn
-                // was owed was captured at EOF entry above (the ledger is
-                // cleared and the session record evicted since), so the mint
-                // reads the CAPTURED value and the consumer-held clock
-                // Arc. Wall-clock advancement orders the Rust-minted `at`s against
-                // the sidecar-minted ones — the accepted regime, same as Task 3.
-                if rings {
-                    let at = {
-                        let mut guard = last_synthesized_complete_at
-                            .lock()
-                            .expect("synthesized clock lock");
-                        let at = next_monotonic_turn_complete_at(
-                            *guard,
-                            crate::rollback_record::now_ms(),
-                        );
-                        *guard = Some(at);
-                        at
-                    };
-                    state.emit_attention_edge(
-                        AttentionEdge::TurnComplete,
-                        &stamp,
-                        &sidecar_session_id,
-                        &session_type,
-                        at,
-                        AttentionEdgeSource::ConsumerExit,
-                    );
-                }
+                // An UNREQUESTED end of a running turn is a turn end the user
+                // did not witness, even when a resume brought the session back
+                // during the stop: it rings once (design §5.7), from the
+                // session's clock, and the end is published either way.
+                state.edges.ended(
+                    &crate::claude_edges::EdgeRecord {
+                        session_key: &session_id,
+                        stamp: &stamp,
+                        sidecar_session_id: &sidecar_session_id,
+                        session_type: &session_type,
+                        clock: &clock,
+                    },
+                    rings,
+                    cause.reason(),
+                );
             }
         })
     }
@@ -6977,12 +6970,48 @@ impl FreshClaudeState {
 
 // ── pending-set fold (Task 2) ────────────────────────────────────────────────────────────
 
+/// How a line changed the session's pending approvals and questions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingChange {
+    /// From none to some: the session now waits on its user (the waiting edge).
+    Waiting,
+    /// From some to none.
+    Drained,
+}
+
+impl PendingChange {
+    fn between(before: usize, after: usize) -> Option<Self> {
+        match (before, after) {
+            (0, 1..) => Some(Self::Waiting),
+            (1.., 0) => Some(Self::Drained),
+            _ => None,
+        }
+    }
+}
+
+impl ClaudePending {
+    fn len(&self) -> usize {
+        self.permissions.len() + self.questions.len()
+    }
+}
+
 /// Fold one sidecar line into the session's pending approval/question state:
 /// `sdk.permission.request`/`sdk.question.request` PUSH (resend of the same requestId
 /// REPLACES — de-dupe), `sdk.permission.cancelled`/`sdk.question.cancelled` REMOVE.
 /// Every other line is a no-op here. The cancelled frames are additionally forwarded
 /// to the client (see `normalize_sdk_type`) — the fold never suppresses a broadcast.
-fn fold_pending_frame(pending: &std::sync::Mutex<ClaudePending>, value: &Value) {
+/// Returns how the line changed the pending set's emptiness (C18: the server's
+/// waiting edge rides the 0 -> >=1 change).
+fn fold_pending_frame(
+    pending: &std::sync::Mutex<ClaudePending>,
+    value: &Value,
+) -> Option<PendingChange> {
+    let before = pending.lock().expect("pending lock").len();
+    fold_pending_line(pending, value);
+    PendingChange::between(before, pending.lock().expect("pending lock").len())
+}
+
+fn fold_pending_line(pending: &std::sync::Mutex<ClaudePending>, value: &Value) {
     let Some(sdk_type) = value.get("type").and_then(Value::as_str) else {
         return;
     };
@@ -7157,53 +7186,6 @@ struct ClaudeOwnerKey {
 
 // ── sdk.* → freshAgent.event frame (port of sdk-events.ts normalizeFreshAgentProviderEvent) ─
 
-/// The two attention edges a claude session raises (AGENTS.md "Agent Status
-/// Indicators"): a turn ended that the user did not witness, or the agent waits
-/// on the user (a pending approval or question).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttentionEdge {
-    TurnComplete,
-    Waiting,
-}
-
-impl AttentionEdge {
-    /// The edge a sidecar stdout line carries, if it carries one.
-    fn from_sidecar_type(sdk_type: &str) -> Option<Self> {
-        match sdk_type {
-            "sdk.turn.complete" => Some(Self::TurnComplete),
-            "sdk.turn.waiting" => Some(Self::Waiting),
-            _ => None,
-        }
-    }
-
-    /// The client event type.
-    pub(crate) fn wire_type(self) -> &'static str {
-        match self {
-            Self::TurnComplete => "freshAgent.turn.complete",
-            Self::Waiting => "freshAgent.turn.waiting",
-        }
-    }
-}
-
-/// Where an attention edge was minted (logged as `source`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttentionEdgeSource {
-    /// The sidecar minted it (a result, a result-less stream end, a pending
-    /// card) and the stdout consumer forwarded it.
-    Sidecar,
-    /// The stdout consumer minted it for an unrequested sidecar death mid-turn.
-    ConsumerExit,
-}
-
-impl AttentionEdgeSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Sidecar => "freshclaude/sidecar",
-            Self::ConsumerExit => "freshclaude/consumer-exit",
-        }
-    }
-}
-
 /// Map an `sdk.*` event line from the sidecar to a `freshAgent.event` wire frame. Renames
 /// the inner `type` `sdk.X → freshAgent.X` (only the known set — matching sdk-events.ts,
 /// which passes unknown types through unchanged and thus never surfaces them as fresh-agent
@@ -7248,10 +7230,9 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         "sdk.question.cancelled" => "freshAgent.question.cancelled",
         "sdk.status" => "freshAgent.status",
         // `sdk.turn.complete` / `sdk.turn.waiting` are deliberately absent: the
-        // consumer routes them to `emit_attention_edge` (AttentionEdge), the one
-        // logged edge exit, so no other path can broadcast an edge.
+        // server mints every edge itself (`claude_edges.rs`, C18), so no sidecar
+        // line becomes one.
         "sdk.error" => "freshAgent.error",
-        "sdk.exit" => "freshAgent.exit",
         "sdk.killed" => "freshAgent.killed",
         _ => return None,
     })
@@ -8051,6 +8032,7 @@ mod fork;
 mod genesis;
 mod history;
 mod rollback;
+mod stop;
 mod turn_status;
 use establish::{
     BootRetry, DurableClaim, EstablishLane, EstablishPlan, LaunchLease, RegisterUnder,
@@ -8166,7 +8148,7 @@ pub(crate) mod tests {
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 ledger: crate::claude_turns::SharedLedger::default(),
-                last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+                clock: crate::attention::AttentionClock::default(),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 launch_genesis: None,
             },
@@ -8930,107 +8912,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn attention_edge_lines_leave_only_through_the_edge_exit() {
-        // The sidecar's attention edges are classified as edges, and the plain
-        // frame mapping refuses them: only `emit_attention_edge` (logged, G14)
-        // can put a freshAgent.turn.complete / turn.waiting on the wire. Its
-        // frame shape is pinned by
-        // `emit_attention_edge_logs_each_edge_and_broadcasts_its_frame`.
-        for (line, edge) in [
-            (
-                json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 }),
-                AttentionEdge::TurnComplete,
-            ),
-            (
-                json!({ "type": "sdk.turn.waiting", "sessionId": "s-1", "at": 43 }),
-                AttentionEdge::Waiting,
-            ),
+    fn sidecar_edge_lines_never_become_frames() {
+        // C18: the server mints every attention edge itself (`claude_edges.rs`),
+        // so an edge line a protocol fake still writes is never forwarded as a
+        // frame of its own (the consumer drops it with a debug log).
+        for line in [
+            json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 }),
+            json!({ "type": "sdk.turn.waiting", "sessionId": "s-1", "at": 43 }),
+            json!({ "type": "sdk.exit", "sessionId": "s-1" }),
         ] {
-            let line_type = line["type"].as_str().unwrap();
-            assert_eq!(AttentionEdge::from_sidecar_type(line_type), Some(edge));
             assert!(
                 sdk_line_to_frame(&line, "s-1", "freshclaude").is_none(),
-                "{line_type} must not become a plain frame"
+                "{line} must not become a plain frame"
             );
-        }
-    }
-
-    /// G14 / design §9.2 I-1: every claude attention edge leaves through
-    /// `emit_attention_edge`, which logs it at info (provider, session, type,
-    /// source and `at`, never content) and broadcasts the client frame.
-    #[tokio::test]
-    async fn emit_attention_edge_logs_each_edge_and_broadcasts_its_frame() {
-        use crate::claude_sidecar_io::test_capture::{capture, with_message};
-        let (events, _guard) = capture();
-        let (st, mut rx) = state_with_bus();
-        st.emit_attention_edge(
-            AttentionEdge::TurnComplete,
-            "envelope-1",
-            "sidecar-1",
-            "kilroy",
-            41,
-            AttentionEdgeSource::Sidecar,
-        );
-        st.emit_attention_edge(
-            AttentionEdge::Waiting,
-            "envelope-1",
-            "sidecar-1",
-            "kilroy",
-            42,
-            AttentionEdgeSource::Sidecar,
-        );
-        st.emit_attention_edge(
-            AttentionEdge::TurnComplete,
-            "envelope-1",
-            "sidecar-1",
-            "kilroy",
-            43,
-            AttentionEdgeSource::ConsumerExit,
-        );
-
-        let frames: Vec<Value> = (0..3)
-            .map(|_| serde_json::from_str(&rx.try_recv().expect("an edge frame")).unwrap())
-            .collect();
-        for frame in &frames {
-            assert_eq!(frame["type"], "freshAgent.event");
-            assert_eq!(frame["provider"], "claude");
-            assert_eq!(frame["sessionId"], "envelope-1");
-            assert_eq!(frame["sessionType"], "kilroy");
-        }
-        assert_eq!(
-            frames
-                .iter()
-                .map(|frame| frame["event"].clone())
-                .collect::<Vec<_>>(),
-            vec![
-                json!({ "type": "freshAgent.turn.complete", "sessionId": "sidecar-1", "at": 41 }),
-                json!({ "type": "freshAgent.turn.waiting", "sessionId": "sidecar-1", "at": 42 }),
-                json!({ "type": "freshAgent.turn.complete", "sessionId": "sidecar-1", "at": 43 }),
-            ]
-        );
-
-        let completes = with_message(&events, "freshagent.turn.complete");
-        let waits = with_message(&events, "freshagent.turn.waiting");
-        assert_eq!(completes.len(), 2, "{completes:?}");
-        assert_eq!(waits.len(), 1, "{waits:?}");
-        let logged: Vec<(Option<&str>, Option<&str>)> = completes
-            .iter()
-            .chain(&waits)
-            .map(|event| (event.field("source"), event.field("at")))
-            .collect();
-        assert_eq!(
-            logged,
-            vec![
-                (Some("freshclaude/sidecar"), Some("41")),
-                (Some("freshclaude/consumer-exit"), Some("43")),
-                (Some("freshclaude/sidecar"), Some("42")),
-            ]
-        );
-        for event in completes.iter().chain(&waits) {
-            assert_eq!(event.level, tracing::Level::INFO);
-            assert_eq!(event.field("provider"), Some("claude"));
-            assert_eq!(event.field("session_id"), Some("envelope-1"));
-            assert_eq!(event.field("session_type"), Some("kilroy"));
         }
     }
 
@@ -9086,24 +8980,22 @@ pub(crate) mod tests {
     #[test]
     fn sidecar_death_while_idle_emits_no_completion() {
         // The ADR Decision 2.1 no-FALSE-completion property, IDLE-death twin: a
-        // death-truncated stream WITHOUT an armed turn (stdout ends after some
-        // events but BEFORE any sdk.turn.complete) can NEVER produce a
-        // freshAgent.turn.complete. We model the consumer's mapping over the
-        // death-truncated line stream and assert no completion frame is produced.
+        // death-truncated stream with nothing owed (no send armed, so the turn
+        // ledger owes the user nothing at the end of output) can NEVER produce
+        // a freshAgent.turn.complete: the end-of-output arm rings only what the
+        // ledger owed, and no sidecar line becomes an edge frame.
         let death_stream = [
             json!({ "type": "sdk.session.init", "sessionId": "s", "cliSessionId": "0199abcd-1234-7abc-8def-0123456789ab" }),
-            json!({ "type": "sdk.stream", "sessionId": "s", "event": { "type": "content_block_delta" } }),
-            json!({ "type": "sdk.assistant", "sessionId": "s", "content": [{ "type": "text", "text": "part" }] }),
-            // …process is SIGKILLed here — stdout ends. NO sdk.result, NO sdk.turn.complete.
+            json!({ "type": "sdk.session.state", "sessionId": "s", "state": "idle" }),
+            // …process is SIGKILLed here — stdout ends. NO sdk.result.
         ];
-        // The consumer's per-line split: an edge line goes to the edge exit,
-        // anything else through the plain frame mapping.
-        let edge_of = |line: &Value| AttentionEdge::from_sidecar_type(line["type"].as_str()?);
-        let edges: Vec<AttentionEdge> = death_stream.iter().filter_map(edge_of).collect();
-        assert!(
-            edges.is_empty(),
-            "a death-truncated stream must never yield an attention edge, got {edges:?}"
-        );
+        let mut ledger = crate::claude_turns::ClaudeTurnLedger::default();
+        for line in &death_stream {
+            if let Some(fact) = crate::claude_turns::TurnFact::from_line(line) {
+                ledger.fold(&fact);
+            }
+        }
+        assert!(!ledger.eof(), "an idle session owes nothing at its death");
         let inner_types: Vec<String> = death_stream
             .iter()
             .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude"))
@@ -9113,11 +9005,13 @@ pub(crate) mod tests {
             !inner_types.iter().any(|t| t.contains("turn.complete")),
             "a death-truncated stream must never yield a completion chime, got {inner_types:?}"
         );
-        // And a subsequent success stream DOES complete — the edge is real, not disabled.
-        assert_eq!(
-            edge_of(&json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 })),
-            Some(AttentionEdge::TurnComplete)
+        // And a turn in flight IS owed — the death edge is real, not disabled.
+        ledger.arm(
+            "u".into(),
+            Some("r".into()),
+            crate::claude_turns::SendKind::Turn,
         );
+        assert!(ledger.eof(), "a turn in flight is owed at its death");
     }
 
     /// Task 5 (unified needs-attention signal): an UNREQUESTED sidecar death
@@ -9222,7 +9116,7 @@ pub(crate) mod tests {
             .collect();
         let expected = |at: i64| {
             (
-                Some("freshclaude/consumer-exit".to_string()),
+                Some("death".to_string()),
                 Some("freshclaude".to_string()),
                 Some(at.to_string()),
             )
@@ -9544,10 +9438,10 @@ rl.on('line', (line) => {
     if (msg.text === '__emit_result_error__') {
       console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution' }))
     } else if (!liveSessions.has(msg.sessionId)) {
-      // Task 4c (ep3-r2 F2): the provider-side session was DELETED (stream end)
-      // while stdout stayed open — the real sidecar answers with this lone
-      // signed frame and NOTHING after (no result, no idle, no EOF).
-      console.log(JSON.stringify({ type: 'sdk.error', sessionId: msg.sessionId, message: 'session not found', sessionNotFound: true }))
+      // A send to a session this sidecar does not host is refused before any
+      // CLI sees it, as the real sidecar refuses it (sdk.send.rejected): the
+      // server takes the send back.
+      console.log(JSON.stringify({ type: 'sdk.send.rejected', sessionId: msg.sessionId, uuid: msg.uuid ?? null, code: 'SESSION_NOT_FOUND', message: 'Claude session is no longer available.' }))
     } else if (msg.text === '__emit_assistant__') {
       console.log(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'noise' }] }))
     // Task 2 test hook: raise a canned pending permission the approve/deny flow can
@@ -9586,11 +9480,12 @@ rl.on('line', (line) => {
   } else if (msg.type === 'interrupt') {
     const interruptLog = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
     if (interruptLog) fs.appendFileSync(interruptLog, `${msg.sessionId}\n`)
-    // The control receipt is written BEFORE the interrupted turn's own result
-    // (sdk.d.ts:3760): the settle frame first, then the stopped turn's result
-    // (no trailing idle: the real sidecar sends none).
-    console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: true }))
-    console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, subtype: 'error', errors: ['interrupted'] }))
+    // The control receipt (echoing the Stop's id) is written BEFORE the
+    // interrupted turn's own result (sdk.d.ts:3760): the settle frame first,
+    // then the stopped turn's result in the pinned CLI's aborted shape (T11; no
+    // trailing idle: the real sidecar sends none).
+    console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, stopId: msg.stopId, ok: true }))
+    console.log(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution', subtype: 'error_during_execution', isError: true, terminalReason: 'aborted_streaming', numTurns: 1 }))
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
@@ -17093,7 +16988,7 @@ rl.on('line', (line) => {
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 ledger: crate::claude_turns::SharedLedger::default(),
-                last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+                clock: crate::attention::AttentionClock::default(),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 launch_genesis: None,
             },
@@ -17615,7 +17510,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
             crate::claude_turns::SharedLedger::default(),
-            Arc::new(std::sync::Mutex::new(None)),
+            crate::attention::AttentionClock::default(),
             None, // provenance: test lane is conn-less (D8)
         );
 
@@ -18565,6 +18460,11 @@ rl.on('line', (line) => {
             .await;
         let created = await_claude_created(&mut rx, "req-claude-interrupt").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
+        // C18: a Stop reaches the sidecar only while something runs. The fake
+        // answers no plain send, so the turn stays owed until the Stop.
+        st.handle_send(send_msg(&session_id, "a turn to stop"))
+            .await;
+        await_ledger_busy(&st, &session_id, true).await;
 
         st.handle_interrupt(FreshAgentInterrupt {
             provider: freshell_protocol::AgentProvider::Claude,
@@ -18589,12 +18489,15 @@ rl.on('line', (line) => {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Success is silent -- no `error` frame was broadcast for this interrupt. The
-        // fake sidecar also emits `sdk.session.init`/`sdk.status` after `created`
-        // (Task 1); those unrelated `freshAgent.event` frames are skipped rather than
-        // miscounted as an interrupt response.
-        while let Ok(raw) = rx.try_recv() {
+        // The stopped turn's own (aborted) result settles it, silently: no
+        // `error` frame, no banner and no edge for the user's own Stop.
+        await_ledger_busy(&st, &session_id, false).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Ok(raw)) = tokio::time::timeout_at(deadline, rx.recv()).await {
             let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.send.accepted" {
+                continue;
+            }
             assert_eq!(
                 frame["type"], "freshAgent.event",
                 "a successful interrupt must not broadcast: {frame}"
@@ -18603,7 +18506,58 @@ rl.on('line', (line) => {
                 frame["event"]["type"], "freshAgent.error",
                 "a successful interrupt must not broadcast an error: {frame}"
             );
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.turn.complete",
+                "the user's own Stop never rings: {frame}"
+            );
         }
+        // The interrupt carried the latched Stop's id.
+        let stops = env.interrupt_log_contents();
+        assert_eq!(stops.lines().count(), 1, "{stops:?}");
+    }
+
+    /// C18 (design §5.4): an idle session has nothing to stop, so nothing is
+    /// sent to the sidecar, and the next turn still rings.
+    #[tokio::test]
+    async fn handle_interrupt_of_an_idle_session_sends_nothing() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (log_events, _log_guard) = crate::claude_sidecar_io::test_capture::capture();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_create(dedup_create_msg("req-claude-idle-stop"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-claude-idle-stop").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            env.interrupt_log_contents(),
+            "",
+            "an idle Stop must not reach the sidecar"
+        );
+        let stops = crate::claude_sidecar_io::test_capture::with_message(
+            &log_events,
+            "freshagent.claude.stop",
+        );
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(stops[0].field("outcome"), Some("idle"));
+
+        // The next turn rings (no stray latch silences it).
+        while rx.try_recv().is_ok() {}
+        st.handle_send(send_msg(&session_id, "a turn")).await;
+        await_ledger_busy(&st, &session_id, true).await;
+        inject_raw_send(&st, &session_id, "__emit_result__").await;
+        let edge = await_frame_of_inner_type(&mut rx, "freshAgent.turn.complete").await;
+        assert!(edge["event"]["at"].as_i64().is_some(), "{edge}");
     }
 
     /// Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar death
@@ -18739,6 +18693,57 @@ rl.on('line', (line) => {
             st.live_snapshot_overlay(&old_pane_id).await,
             json!({}),
             "the old pane id no longer names an ended session"
+        );
+    }
+
+    /// Design §3.1 and §5.5 (C18): a session's attention clock survives its
+    /// death and the resume that follows, so an edge the resumed session rings
+    /// lands strictly above the death's edge even within one millisecond.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_session_keeps_the_attention_clock_of_its_death() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        // The fake sidecar's session reports this durable id.
+        const DURABLE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-clock-carry"), None)
+            .await;
+        let created = await_claude_created_and_session_init(&mut rx, "req-clock-carry").await;
+        let pane_id = created["sessionId"].as_str().unwrap().to_string();
+        // A turn in flight (the fake answers no plain send), so the death rings.
+        st.handle_send(send_msg(&pane_id, "a turn the death cuts off"))
+            .await;
+        await_ledger_busy(&st, &pane_id, true).await;
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&pane_id)
+            .expect("live session in map")
+            .child
+            .start_kill()
+            .expect("kill the sidecar");
+        let death = await_frame_of_inner_type(&mut rx, "freshAgent.turn.complete").await;
+        let death_at = death["event"]["at"].as_i64().expect("a numeric at");
+
+        let home = tempfile::tempdir().unwrap();
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        st.handle_attach(attach_msg_with_resume("pane-after-reload", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert!(st.has_live_session(DURABLE).await, "the attach resumed it");
+
+        let key = st.resolve_session_key(DURABLE).await.expect("live key");
+        let floor = st
+            .sessions
+            .lock()
+            .await
+            .get(&key)
+            .map(|session| session.clock.floor());
+        assert_eq!(
+            floor,
+            Some(Some(death_at)),
+            "the resumed session continues the dead one's clock"
         );
     }
 
@@ -18994,7 +18999,7 @@ rl.on('line', (line) => {
         let reader = BufReader::new(stdout).lines();
         let ledger = crate::claude_turns::SharedLedger::default();
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
+        let clock = crate::attention::AttentionClock::default();
         let turn_lock = Arc::new(TokioMutex::new(()));
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
         let consumer = st.spawn_consumer(
@@ -19006,7 +19011,7 @@ rl.on('line', (line) => {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&ledger),
-            Arc::clone(&last_synthesized_complete_at),
+            clock.clone(),
             None, // provenance: test lane is conn-less (D8)
         );
         st.sessions.lock().await.insert(
@@ -19025,7 +19030,7 @@ rl.on('line', (line) => {
                 broadcast_id,
                 pending,
                 ledger,
-                last_synthesized_complete_at,
+                clock,
                 turn_lock,
                 launch_genesis: None,
             },

@@ -33,7 +33,7 @@ const __dirname = path.dirname(__filename)
 const CRASH_PROBE = path.join(__dirname, 'fixtures', 'sidecar-crash-probe.mjs')
 
 // ── dependency stubs (the channel is dependency-injected; index.mjs passes its
-// own emit/nanoid/nextMonotonic, the tests pass equivalents) ─────────────────
+// own emit/nanoid, the tests pass equivalents) ───────────────────────────────
 type Frame = Record<string, any>
 
 function makeDeps(session: Record<string, any> = {}) {
@@ -44,8 +44,7 @@ function makeDeps(session: Record<string, any> = {}) {
   let n = 0
   // nanoid stub: exactly 21 url-safe chars, unique per call (real nanoid shape).
   const nanoid = () => `req-${String(++n).padStart(17, '0')}`
-  const nextMonotonic = (last: number | undefined, now: number) => (last != null && now <= last ? last + 1 : now)
-  return { frames, emit, nanoid, nextMonotonic, session }
+  return { frames, emit, nanoid, session }
 }
 
 async function settle<T>(p: Promise<T>, ms = 60): Promise<{ settled: boolean; value: T | undefined }> {
@@ -117,9 +116,9 @@ function resolvedAnswer(harness: RealSidecar, toolName: string, n: number, label
 }
 
 // ── case 1 ───────────────────────────────────────────────────────────────────
-describe('case 1: raisePermissionRequest parks, emits request + 0->>=1 waiting edge', () => {
-  it('emits sdk.permission.request (minted 21-char id + tool payload) then sdk.turn.waiting; a second park does NOT re-emit waiting', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+describe('case 1: raisePermissionRequest parks and emits the request (the waiting edge is the server\'s)', () => {
+  it('emits sdk.permission.request (minted 21-char id + tool payload) and no waiting edge; a second park emits its own request', async () => {
+    const { frames, emit, nanoid, session } = makeDeps()
     const options = {
       toolUseID: 'toolu_1',
       suggestions: [{ type: 'addRules', rules: [{ toolName: 'Bash' }], behavior: 'allow', destination: 'session' }],
@@ -127,11 +126,12 @@ describe('case 1: raisePermissionRequest parks, emits request + 0->>=1 waiting e
       decisionReason: 'needs approval',
     }
     const p1 = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'ls' }, options,
     })
 
-    expect(frames.map((f) => f.type)).toEqual(['sdk.permission.request', 'sdk.turn.waiting'])
+    // C18: the server folds this request and mints the 0 -> >=1 waiting edge.
+    expect(frames.map((f) => f.type)).toEqual(['sdk.permission.request'])
     const req = frames[0]
     expect(req.sessionId).toBe('s1')
     expect(req.requestId).toBe('req-00000000000000001')
@@ -142,24 +142,20 @@ describe('case 1: raisePermissionRequest parks, emits request + 0->>=1 waiting e
     expect(req.suggestions).toEqual(options.suggestions)
     expect(req.blockedPath).toBe('/tmp/blocked')
     expect(req.decisionReason).toBe('needs approval')
-    expect(typeof frames[1].at).toBe('number')
-    expect(frames[1].sessionId).toBe('s1')
     expect(session.pendingPermissions.size).toBe(1)
     // The returned promise is parked until respond/cancel.
     expect((await settle(p1)).settled).toBe(false)
 
-    // A second parked request emits its own request frame but NOT a second
-    // waiting edge (0 -> >=1 transition only).
+    // A second parked request emits its own request frame.
     const p2 = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Read', input: { file_path: '/x' }, options,
     })
     expect(frames.map((f) => f.type)).toEqual([
       'sdk.permission.request',
-      'sdk.turn.waiting',
       'sdk.permission.request',
     ])
-    expect(frames[2].requestId).toBe('req-00000000000000002')
+    expect(frames[1].requestId).toBe('req-00000000000000002')
     expect(session.pendingPermissions.size).toBe(2)
     expect((await settle(p2)).settled).toBe(false)
 
@@ -173,9 +169,9 @@ describe('case 1: raisePermissionRequest parks, emits request + 0->>=1 waiting e
 // ── case 2 ───────────────────────────────────────────────────────────────────
 describe('case 2: respondPermission resolves the parked promise VERBATIM', () => {
   it('resolves with the exact decision object (allow then deny), deletes entries, returns true; unknown id -> false, nothing emitted', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const p1 = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'ls' }, options: { toolUseID: 'toolu_1' },
     })
     const d1 = { behavior: 'allow' }
@@ -186,7 +182,7 @@ describe('case 2: respondPermission resolves the parked promise VERBATIM', () =>
     expect(frames.length).toBe(framesBeforeRespond) // respond emits no frames
 
     const p2 = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'rm -rf /' }, options: { toolUseID: 'toolu_2' },
     })
     const d2 = { behavior: 'deny', message: 'Denied by user', interrupt: false }
@@ -202,8 +198,8 @@ describe('case 2: respondPermission resolves the parked promise VERBATIM', () =>
 
 // ── case 3 ───────────────────────────────────────────────────────────────────
 describe('case 3: raiseQuestionRequest (AskUserQuestion) sanitizes; short-circuits unusable input', () => {
-  it('sanitizes questions ({question,header,options:[{label,description}],multiSelect} + spread extras), emits request + waiting edge, parks', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+  it('sanitizes questions ({question,header,options:[{label,description}],multiSelect} + spread extras), emits the request and no waiting edge, parks', async () => {
+    const { frames, emit, nanoid, session } = makeDeps()
     const input = {
       questions: [
         {
@@ -217,9 +213,9 @@ describe('case 3: raiseQuestionRequest (AskUserQuestion) sanitizes; short-circui
       ],
       marker: 'keep-me',
     }
-    const pending = raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, sessionId: 's1', input })
+    const pending = raiseQuestionRequest({ session, emit, nanoid, sessionId: 's1', input })
 
-    expect(frames.map((f) => f.type)).toEqual(['sdk.question.request', 'sdk.turn.waiting'])
+    expect(frames.map((f) => f.type)).toEqual(['sdk.question.request'])
     const req = frames[0]
     expect(req.sessionId).toBe('s1')
     expect(req.requestId).toBe('req-00000000000000001')
@@ -248,8 +244,8 @@ describe('case 3: raiseQuestionRequest (AskUserQuestion) sanitizes; short-circui
       { questions: [null, 7] }, // filters to empty
     ]
     for (const input of badInputs) {
-      const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
-      const result = await raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, sessionId: 's1', input })
+      const { frames, emit, nanoid, session } = makeDeps()
+      const result = await raiseQuestionRequest({ session, emit, nanoid, sessionId: 's1', input })
       expect(result).toEqual({ behavior: 'allow', updatedInput: input })
       expect(result.updatedInput).toBe(input) // untouched input object
       expect(frames).toEqual([])
@@ -262,14 +258,14 @@ describe('case 3: raiseQuestionRequest (AskUserQuestion) sanitizes; short-circui
 // ── case 4 ───────────────────────────────────────────────────────────────────
 describe('case 4: respondQuestion wraps answers into an allow decision', () => {
   it('resolves {behavior:allow, updatedInput:{...originalInput, questions, answers}}; unknown id -> false', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const input = {
       questions: [
         { question: 'Pick one', header: 'H', options: [{ label: 'A', description: 'a' }], multiSelect: false },
       ],
       marker: 'keep-me',
     }
-    const pending = raiseQuestionRequest({ session, emit, nanoid, nextMonotonic, sessionId: 's1', input })
+    const pending = raiseQuestionRequest({ session, emit, nanoid, sessionId: 's1', input })
     const sanitized = frames[0].questions
     const answers = { 'Pick one': 'A' }
     const framesBeforeRespond = frames.length
@@ -294,13 +290,13 @@ describe('case 4: respondQuestion wraps answers into an allow decision', () => {
 // ── case 5 (LB-04 cancel split) ──────────────────────────────────────────────
 describe('case 5: cancelPending splits by live state (LB-04: never a late resolve after close)', () => {
   it('resolveDeny:true (post-interrupt, transport open) emits cancel frames per entry and resolves each parked promise deny/Interrupted', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const pr = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'ls' }, options: { toolUseID: 't1' },
     })
     const qr = raiseQuestionRequest({
-      session, emit, nanoid, nextMonotonic, sessionId: 's1',
+      session, emit, nanoid, sessionId: 's1',
       input: { questions: [{ question: 'Q?', header: '', options: [], multiSelect: true }] },
     })
     frames.length = 0
@@ -319,13 +315,13 @@ describe('case 5: cancelPending splits by live state (LB-04: never a late resolv
   })
 
   it('resolveDeny:false (post-close/shutdown) emits cancel frames and NEVER resolves the parked promises', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const pr = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'ls' }, options: { toolUseID: 't1' },
     })
     const qr = raiseQuestionRequest({
-      session, emit, nanoid, nextMonotonic, sessionId: 's1',
+      session, emit, nanoid, sessionId: 's1',
       input: { questions: [{ question: 'Q?', header: '', options: [], multiSelect: true }] },
     })
     frames.length = 0
@@ -346,10 +342,10 @@ describe('case 5: cancelPending splits by live state (LB-04: never a late resolv
 // ── cases 6 & 7: canUseTool adapter routing ──────────────────────────────────
 describe('cases 6/7: canUseTool adapter preserves legacy ordering (sdk-bridge.ts:203-214)', () => {
   it('case 6: bypassPermissions -> immediate allow, nothing emitted, nothing parked', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps({ permissionMode: 'bypassPermissions' })
+    const { frames, emit, nanoid, session } = makeDeps({ permissionMode: 'bypassPermissions' })
     const input = { command: 'ls' }
     const result = await canUseTool({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input, options: { toolUseID: 't1' },
     })
     expect(result).toEqual({ behavior: 'allow', updatedInput: input })
@@ -360,15 +356,15 @@ describe('cases 6/7: canUseTool adapter preserves legacy ordering (sdk-bridge.ts
   })
 
   it('case 7: AskUserQuestion routes to the question path even under bypassPermissions', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps({ permissionMode: 'bypassPermissions' })
+    const { frames, emit, nanoid, session } = makeDeps({ permissionMode: 'bypassPermissions' })
     const input = {
       questions: [{ question: 'Q?', header: 'h', options: [{ label: 'A', description: 'a' }], multiSelect: false }],
     }
     const pending = canUseTool({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'AskUserQuestion', input, options: { toolUseID: 't2' },
     })
-    expect(frames.map((f) => f.type)).toEqual(['sdk.question.request', 'sdk.turn.waiting'])
+    expect(frames.map((f) => f.type)).toEqual(['sdk.question.request'])
     expect(session.pendingQuestions.size).toBe(1)
     expect(session.pendingPermissions?.size ?? 0).toBe(0)
     cancelPending(session, emit, 's1', { resolveDeny: false })
@@ -401,10 +397,10 @@ describe('case 8: no-guard invariant probe (reviewed guard design: crash loudly,
 // ── case 9: provider-originated cancellation (options.signal, round-2 F1) ────
 describe('case 9: options.signal subscription (provider cancellation removes the card without inventing a user decision)', () => {
   it('abort deletes the pending entry, emits sdk.permission.cancelled, resolves deny/Aborted by provider', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const ctrl = new AbortController()
     const pr = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'ls' }, options: { toolUseID: 't1', signal: ctrl.signal },
     })
     frames.length = 0
@@ -417,11 +413,11 @@ describe('case 9: options.signal subscription (provider cancellation removes the
   })
 
   it('abort after a respond is inert: no cancel frame, no second resolution', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const ctrl = new AbortController()
     const decision = { behavior: 'allow' }
     const pr = raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'ls' }, options: { toolUseID: 't1', signal: ctrl.signal },
     })
     expect(respondPermission(session, 'req-00000000000000001', decision)).toBe(true)
@@ -434,10 +430,10 @@ describe('case 9: options.signal subscription (provider cancellation removes the
   })
 
   it('a parked question aborts the same way: sdk.question.cancelled + deny/Aborted by provider', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const ctrl = new AbortController()
     const qr = raiseQuestionRequest({
-      session, emit, nanoid, nextMonotonic, sessionId: 's1',
+      session, emit, nanoid, sessionId: 's1',
       input: { questions: [{ question: 'Q?', header: '', options: [], multiSelect: false }] },
       signal: ctrl.signal,
     })
@@ -458,11 +454,11 @@ describe('case 9: options.signal subscription (provider cancellation removes the
 // payload at once — never a card for a dead request.
 describe('pre-aborted signal short-circuits: never park, never emit, resolve deny at once', () => {
   it('raisePermissionRequest with an already-aborted options.signal: no frames, nothing parked, resolves deny/Aborted by provider', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const ctrl = new AbortController()
     ctrl.abort()
     const result = await raisePermissionRequest({
-      session, emit, nanoid, nextMonotonic,
+      session, emit, nanoid,
       sessionId: 's1', toolName: 'Bash', input: { command: 'ls' },
       options: { toolUseID: 't1', signal: ctrl.signal },
     })
@@ -473,13 +469,13 @@ describe('pre-aborted signal short-circuits: never park, never emit, resolve den
   })
 
   it('raiseQuestionRequest with an already-aborted signal: no frames, nothing parked, resolves deny/Aborted by provider', async () => {
-    const { frames, emit, nanoid, nextMonotonic, session } = makeDeps()
+    const { frames, emit, nanoid, session } = makeDeps()
     const ctrl = new AbortController()
     ctrl.abort()
     // Usable questions, so the raise reaches the pre-aborted branch (:107) rather
     // than the empty/invalid allow short-circuits that precede it (:81-105).
     const result = await raiseQuestionRequest({
-      session, emit, nanoid, nextMonotonic, sessionId: 's1',
+      session, emit, nanoid, sessionId: 's1',
       input: { questions: [{ question: 'Q?', header: '', options: [], multiSelect: false }] },
       signal: ctrl.signal,
     })
@@ -500,7 +496,7 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
     expect(sessionId).toMatch(/^[A-Za-z0-9_-]{16,32}$/)
 
     // magic send -> the simulated CLI invokes options.canUseTool ->
-    // sdk.permission.request + waiting edge on stdout (order: request first).
+    // sdk.permission.request on stdout (the server mints the waiting edge).
     harness.send({ type: 'send', sessionId, text: '__raise_permission__' })
     const permReq = await harness.waitFor((f) => f.type === 'sdk.permission.request', 'sdk.permission.request')
     expect(permReq.sessionId).toBe(sessionId)
@@ -513,8 +509,6 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
     ])
     expect(permReq.blockedPath).toBe('/tmp/blocked')
     expect(permReq.decisionReason).toBe('needs approval')
-    const waiting1 = await harness.waitFor((f) => f.type === 'sdk.turn.waiting', 'sdk.turn.waiting')
-    expect(harness.frames.indexOf(permReq)).toBeLessThan(harness.frames.indexOf(waiting1))
 
     // permission.respond — the CLI's parked canUseTool call settles with the EXACT decision
     const decision = { behavior: 'allow', updatedInput: { command: 'ls -la' } }
@@ -560,12 +554,15 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
       (f) => f.type === 'sdk.permission.request' && f.requestId !== permReq.requestId,
       'second sdk.permission.request',
     )
-    harness.send({ type: 'interrupt', sessionId })
+    harness.send({ type: 'interrupt', sessionId, stopId: 'stop-1' })
     const cancelFrame = await harness.waitFor((f) => f.type === 'sdk.permission.cancelled', 'sdk.permission.cancelled')
     expect(cancelFrame.sessionId).toBe(sessionId)
     expect(cancelFrame.requestId).toBe(permReq2.requestId)
     const resolved2 = await resolvedAnswer(harness, 'Bash', 2, 'canUseTool answer: permission #2')
     expect(resolved2.decision).toEqual({ behavior: 'deny', message: 'Interrupted' })
+
+    // C18: no attention edge of any kind ever left the sidecar.
+    expect(harness.frames.filter((f) => f.type === 'sdk.turn.waiting' || f.type === 'sdk.turn.complete')).toEqual([])
 
     // clean teardown
     const exitP = harness.waitExit()
