@@ -1216,6 +1216,9 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
   const tab = page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
   await tab.dblclick({ timeout: RENAME_ACTION_TIMEOUT })
   const input = tab.locator('input')
+  // A failed session-owned tab rename renders its error as a role=alert
+  // sibling of the tab (TabBar) and keeps the editor open.
+  const renameError = tab.locator('xpath=following-sibling::*[@role="alert"]')
   await expect(input).toBeVisible({ timeout: 5_000 })
   await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
   await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
@@ -1223,12 +1226,23 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
   // the editor opened) keeps the editor open with the conflict folded and
   // a REFRESHED capture, and a transient 429 drains the shared bucket:
   // the user's resubmit from the still-open editor is the documented
-  // path (the shared pane-editor discipline).
+  // path (the shared pane-editor discipline). An open editor with NO shown
+  // error is an IN-FLIGHT commit (the session-owned rename keeps the editor
+  // open while its request runs): resubmitting then races the healthy
+  // request — it can close the editor between the visibility check and the
+  // resubmit's Enter, leaving the press waiting on a detached input until
+  // its 30s timeout. Resubmit ONLY on the shown error state, exactly like
+  // commitPaneRenameEditor.
   for (const backoff of RENAME_RESUBMIT_BACKOFFS) {
     await page.waitForTimeout(backoff)
     if (!(await input.isVisible().catch(() => false))) break
-    await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
-    await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
+    if (!(await renameError.isVisible().catch(() => false))) continue
+    try {
+      await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
+      await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
+    } catch (error) {
+      console.error(`[unified-agent-names] tab rename resubmit failed: ${String(error).slice(0, 200)}`)
+    }
   }
   await expect(input).toBeHidden({ timeout: 10_000 })
   await expect(tab).toContainText(name, { timeout: 10_000 })
