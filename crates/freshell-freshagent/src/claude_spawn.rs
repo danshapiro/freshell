@@ -17,8 +17,9 @@
 //! - **Unix** (Linux and macOS): the child leads its own process group
 //!   (`process_group(0)`); the SDK spawns the CLI non-detached, so the CLI
 //!   shares that group. Escalation signals the group, and "the tree is gone"
-//!   means no live process is left in it (on Linux zombies are not counted;
-//!   they hold no pipes and write nothing).
+//!   means no live process is left in it. On Linux a zombie is not counted
+//!   once its last thread has ended (it holds no pipes and writes nothing),
+//!   but one whose main thread alone ended still runs and is counted.
 //! - **Windows**: the child is created suspended, assigned to a
 //!   kill-on-close Job Object (`freshell_platform::process_job`), and only
 //!   then resumed, so every process it starts is born in the job.
@@ -732,7 +733,8 @@ impl Drop for SidecarTreeGuard {
     }
 }
 
-/// Whether any live (non-zombie) process remains in process group `pgid`.
+/// Whether any live process remains in process group `pgid` (on Linux a
+/// zombie is not live once its last thread has ended).
 #[cfg(unix)]
 fn process_group_alive(pgid: i32) -> bool {
     // SAFETY: signal 0 only probes for existence.
@@ -744,7 +746,7 @@ fn process_group_alive(pgid: i32) -> bool {
     {
         // The group exists; it is alive only if a member is not a zombie
         // (an orphan waiting for a reaper that may never come in a
-        // container without one).
+        // container without one) or is one that still has threads.
         linux_group_has_live_member(pgid)
     }
     #[cfg(not(target_os = "linux"))]
@@ -770,15 +772,28 @@ fn linux_group_has_live_member(pgid: i32) -> bool {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
-        // `comm` may hold spaces or parentheses: fields resume after the
-        // last ')' with field 3 (state), then ppid, then pgrp.
+        // `comm` may hold spaces or parentheses: the fields resume after
+        // the last ')' at field 3 (state). `proc(5)` numbers them from 1.
         let Some(rest) = stat.rsplit(')').next() else {
             continue;
         };
-        let mut fields = rest.split_whitespace();
-        let state = fields.next();
-        let group = fields.nth(1).and_then(|group| group.parse::<i32>().ok());
-        if group == Some(pgid) && !matches!(state, Some("Z") | Some("X")) {
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let field = |number: usize| fields.get(number - 3).copied();
+        if field(5).and_then(|group| group.parse::<i32>().ok()) != Some(pgid) {
+            continue;
+        }
+        let live = match field(3) {
+            Some("X" | "x") => false,
+            // `Z` is the main thread's state. The process has exited only
+            // once no other thread (field 20 counts them) is left: one
+            // whose main thread alone ended runs on, and a killed one's
+            // other threads may still be finishing their exit.
+            Some("Z") => field(20)
+                .and_then(|threads| threads.parse::<u32>().ok())
+                .is_none_or(|threads| threads > 1),
+            _ => true,
+        };
+        if live {
             return true;
         }
     }

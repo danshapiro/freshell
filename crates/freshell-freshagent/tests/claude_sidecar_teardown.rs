@@ -379,18 +379,46 @@ async fn the_probe_counts_a_killed_but_unreaped_process_as_exited() {
     }
 }
 
+/// Python code whose main thread ends alone (`pthread_exit`) while another
+/// thread runs on. Linux then reports the process's state as `Z` (zombie)
+/// although it still runs.
+#[cfg(target_os = "linux")]
+const MAIN_THREAD_ENDS_FIRST: &str = "
+import ctypes, threading, time
+threading.Thread(target=lambda: time.sleep(120)).start()
+ctypes.CDLL(None).pthread_exit(None)
+";
+
+/// Wait until `pid`'s main thread has ended (its state reads `Z`) and
+/// return its `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+async fn wait_until_main_thread_ended(pid: u32) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read its stat");
+        // The state follows the last ')' (the command name may hold one).
+        if stat
+            .rsplit(')')
+            .next()
+            .map(str::trim_start)
+            .is_some_and(|rest| rest.starts_with('Z'))
+        {
+            return stat;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the main thread never ended: {stat}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A process whose main thread ended while another thread still runs is
 /// still running, although Linux then reports its state as `Z` (zombie):
-/// the probe stays as strict as `kill(pid, 0)` for it. Python ends its main
-/// thread alone with `pthread_exit`.
+/// the probe stays as strict as `kill(pid, 0)` for it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_probe_sees_a_process_whose_main_thread_ended_as_running() {
-    const MAIN_THREAD_ENDS_FIRST: &str = "
-import ctypes, threading, time
-threading.Thread(target=lambda: time.sleep(300)).start()
-ctypes.CDLL(None).pthread_exit(None)
-";
     let mut command = std::process::Command::new("python3");
     command
         .args(["-c", MAIN_THREAD_ENDS_FIRST])
@@ -404,24 +432,7 @@ ctypes.CDLL(None).pthread_exit(None)
     let pid = child.id();
     let process = ProcessProbe::open(pid);
     let group = ProcessGroupProbe::new(pid as i32);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let stat = loop {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read its stat");
-        // The state follows the last ')' (the command name may hold one).
-        if stat
-            .rsplit(')')
-            .next()
-            .map(str::trim_start)
-            .is_some_and(|rest| rest.starts_with('Z'))
-        {
-            break stat;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the main thread never ended: {stat}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let stat = wait_until_main_thread_ended(pid).await;
 
     let running = process.running();
     let group_running = group.running();
@@ -482,6 +493,57 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
             "no group member survives"
         );
     }
+}
+
+/// [`FAKE_ORPHANS_GRANDCHILD`] with a grandchild whose main thread ends
+/// while another of its threads runs on (`PYTHON` stands for
+/// [`MAIN_THREAD_ENDS_FIRST`]): Linux reports it as a zombie although it
+/// still runs.
+#[cfg(target_os = "linux")]
+const FAKE_ORPHANS_A_GRANDCHILD_WHOSE_MAIN_THREAD_ENDED: &str = r#"
+const { spawn } = require('child_process')
+const grandchild = spawn('python3', ['-c', PYTHON], { stdio: 'ignore' })
+require('readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type === 'shutdown') process.exit(0)
+})
+setInterval(() => {}, 1000)
+grandchild.on('spawn', () => process.stdout.write(`ready ${grandchild.pid}\n`))
+"#;
+
+/// A tree member whose main thread has ended while another of its threads
+/// still runs is not gone, although Linux reports its state as `Z`: the
+/// guard waits for it and kills it like any other member left behind.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_graceful_exit_does_not_leave_a_member_whose_main_thread_ended_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.txt");
+    let script = FAKE_ORPHANS_A_GRANDCHILD_WHOSE_MAIN_THREAD_ENDED.replace(
+        "PYTHON",
+        &serde_json::to_string(MAIN_THREAD_ENDS_FIRST).expect("encode the Python code"),
+    );
+    let fake = spawn_fake(&script, &record).await;
+    let pid = grandchild_pid(&fake.ready);
+    let grandchild = ProcessProbe::open(pid);
+    let stat = wait_until_main_thread_ended(pid).await;
+    assert!(grandchild.running(), "its other thread runs: {stat}");
+    let grace = Duration::from_millis(500);
+
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
+
+    assert!(
+        exit.graceful(),
+        "node itself honored the shutdown line: {exit:?}"
+    );
+    assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
+    assert!(
+        exit.elapsed >= grace,
+        "the member counted as running, so it got the rest of the grace period: {exit:?}"
+    );
+    assert!(
+        grandchild.exited().await,
+        "the member whose main thread ended was killed: {exit:?}"
+    );
 }
 
 /// Exits 1 on the shutdown line WITHOUT stopping its grandchild: a sidecar
