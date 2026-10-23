@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { expect, type Browser } from './fixtures.js'
-import type { SessionNameRef } from '../../shared/session-names.js'
+import { expect } from './fixtures.js'
+import type { Browser } from '@playwright/test'
+import type { SessionNameRef } from '../../../shared/session-names.js'
 import {
   type UnifiedAgentMode,
   bootUnifiedNamesServer,
@@ -78,7 +79,7 @@ export async function bootJourney(mode: UnifiedAgentMode, opts: {
   env?: Record<string, string>
   setupHome?: (homeDir: string) => Promise<void>
 } = {}): Promise<Journey> {
-  const oneCliEnv = opts.oneCliGeminiProxy
+  const oneCliEnv: Record<string, string> = opts.oneCliGeminiProxy
     ? {
         FRESHELL_GEMINI_BASE_URL: 'http://generativelanguage.googleapis.com/v1beta',
         HTTP_PROXY: opts.oneCliGeminiProxy.proxyUrl,
@@ -209,7 +210,7 @@ export function resolveSessionIdOf(state: unknown, ref: SessionNameRef): string 
   // (the swap was silently refused, pre-M-4), and exposed the moment the
   // pinned swap made the contents genuinely exchange.
   const redirects = (state as { sessionNames?: { redirects?: Record<string, { toKey?: string }> } })?.sessionNames?.redirects
-  const entry = redirects?.[JSON.stringify(ref.kind === 'pending' ? ['pending', ref.id] : ['session', ref.provider, ref.sessionId])]
+  const entry = redirects?.[JSON.stringify(['pending', ref.id])]
   const toKey = entry?.toKey
   if (typeof toKey !== 'string') return null
   try {
@@ -250,7 +251,7 @@ export async function activityGeneratesOneSharedShortName(mode: UnifiedAgentMode
         await expectSharedName(harness, handle.nameRef!, AI_NAME, {
           page, server: journey.server, tabId: handle.tabId, sessionId: handle.sessionId,
         })
-        const record = await readRecord(journey, handle.nameRef)
+        const record = await readRecord(journey, handle.nameRef!)
         expect(record.source).toBe('freshell_ai')
         expect(record.name.length).toBeLessThanOrEqual(60)
         await context.close()
