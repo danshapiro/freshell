@@ -15,7 +15,10 @@
 // turn; its emissions run in order as the model's side of the turn:
 //
 //   text / activity  { text?, chunks?, delayMs? }   one streamed assistant text block
-//   tool             { name, input, id?, seconds?, output?, isError? }   a tool call and its result
+//   tool             { name, input, id?, seconds?, output?, isError?, inputStreamMs? }
+//                                                   a tool call and its result; with inputStreamMs
+//                                                   the model streams the call's input for that long
+//                                                   (a long Write) before the call completes
 //   approval         { tool, input, id?, suggestions?, blockedPath?, decisionReason? }
 //                    a tool call that asks canUseTool, with these fields; under
 //                    bypassPermissions (where the pinned CLI asks for no tool

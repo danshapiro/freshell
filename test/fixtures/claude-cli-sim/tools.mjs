@@ -76,6 +76,30 @@ function applyPermissionUpdates(cli, updates) {
   }
 }
 
+/** Pieces a streamed tool input arrives in (when it streams for a while). */
+const INPUT_STREAM_PIECES = 8
+
+/**
+ * The model streams the call's input as input_json_delta events. A large
+ * input (a Write of a long file) takes a while: with `streamMs` it arrives in
+ * pieces spread over that long, the call completing only after the last.
+ * Returns true when the turn was aborted meanwhile.
+ */
+async function streamToolInput(cli, turn, input, streamMs) {
+  const json = JSON.stringify(input)
+  if (streamMs <= 0) {
+    cli.emitStream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: json } })
+    return false
+  }
+  const pieces = Math.min(INPUT_STREAM_PIECES, json.length)
+  const size = Math.ceil(json.length / pieces)
+  for (let offset = 0; offset < json.length; offset += size) {
+    cli.emitStream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: json.slice(offset, offset + size) } })
+    if (await cli.wait(streamMs / pieces, turn)) return true
+  }
+  return false
+}
+
 /** A tool call: its streamed tool_use block, permission, execution and result. */
 export async function toolCall(cli, turn, step) {
   const data = step.data ?? {}
@@ -99,7 +123,10 @@ export async function toolCall(cli, turn, step) {
   }
   cli.emitStream(cli.messageStart())
   cli.emitStream({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: toolUseId, name, input: {} } })
-  cli.emitStream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } })
+  if (await streamToolInput(cli, turn, input, Number(data.inputStreamMs ?? 0) || 0)) {
+    await cli.abortStreaming(turn, '')
+    return 'aborted'
+  }
   cli.assistant([{ type: 'tool_use', id: toolUseId, name, input }])
 
   if (step.kind === 'agent') return launchAgent(cli, turn, toolUseId, input)

@@ -384,6 +384,33 @@ describe('Claude CLI simulator programs', () => {
     const toolUses = s.messages.filter((m) => m.type === 'assistant').flatMap((m) => m.message.content).filter((b: any) => b.type === 'tool_use')
     expect(toolUses.map((b: any) => b.id)).toEqual(['toolu_fake_1', 'toolu_fake_2'])
   })
+
+  it('a tool step with inputStreamMs streams the model\'s tool input in pieces for that long before the call completes', async () => {
+    const input = { file_path: '/workspace/notes.md', content: 'a long file\n'.repeat(40) }
+    const s = await open({ includePartialMessages: true }, {
+      ...program([{ on: 'msg:prompt', emit: [{ kind: 'tool', data: { name: 'Write', input, inputStreamMs: 800 } }] }]),
+      FRESHELL_CLAUDE_SIM_TIME_SCALE: '1',
+    })
+    const receivedAt = new Map<any, number>()
+    const done = s.until(() => {
+      for (const message of s.messages) if (!receivedAt.has(message)) receivedAt.set(message, Date.now())
+      return results(s.messages).length === 1
+    })
+    s.prompt.push('write the notes')
+    await done
+
+    const events = s.messages.filter((m) => m.type === 'stream_event').map((m) => m.event)
+    const start = s.messages.find((m) => m.type === 'stream_event' && m.event.type === 'content_block_start' && m.event.content_block?.type === 'tool_use')
+    const call = s.messages.find((m) => m.type === 'assistant' && m.message.content.some((b: any) => b.type === 'tool_use'))
+    expect(start.event.content_block).toMatchObject({ name: 'Write', input: {} })
+    const pieces = events.filter((e) => e.type === 'content_block_delta' && e.delta.type === 'input_json_delta').map((e) => e.delta.partial_json)
+    expect(pieces.length).toBeGreaterThan(1)
+    expect(JSON.parse(pieces.join(''))).toEqual(input)
+    expect(call.message.content.find((b: any) => b.type === 'tool_use').input).toEqual(input)
+    // The block started well before the model finished the call.
+    expect(receivedAt.get(call)! - receivedAt.get(start)!).toBeGreaterThanOrEqual(700)
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'success', is_error: false })
+  })
 })
 
 describe('Claude CLI simulator api_retry steps', () => {
