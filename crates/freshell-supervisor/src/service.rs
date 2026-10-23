@@ -1047,9 +1047,13 @@ impl Supervisor {
                     ),
                 })
                 .await
-                .map_err(map_backend)
                 .map_err(|error| {
-                    self.activation_failure(&prepared, state, "create_stopped_runtime", error)
+                    self.activation_failure_from_backend(
+                        &prepared,
+                        state,
+                        "create_stopped_runtime",
+                        error,
+                    )
                 })?;
             append_event(
                 &self.config.lifecycle_log,
@@ -1333,10 +1337,36 @@ impl Supervisor {
         stage: &'static str,
         error: RuntimeError,
     ) -> RuntimeError {
+        self.record_activation_failure(prepared, state, stage, error, None)
+    }
+
+    fn activation_failure_from_backend(
+        &self,
+        prepared: &PreparedLaunch,
+        state: LaunchState,
+        stage: &'static str,
+        error: BackendError,
+    ) -> RuntimeError {
+        let diagnostic = backend_failure_diagnostic(&error);
+        self.record_activation_failure(prepared, state, stage, map_backend(error), Some(diagnostic))
+    }
+
+    fn record_activation_failure(
+        &self,
+        prepared: &PreparedLaunch,
+        state: LaunchState,
+        stage: &'static str,
+        error: RuntimeError,
+        backend_failure: Option<serde_json::Value>,
+    ) -> RuntimeError {
+        let mut data = activation_failure_data(prepared, state, stage, &error);
+        if let Some(backend_failure) = backend_failure {
+            data["backendFailure"] = backend_failure;
+        }
         append_event(
             &self.config.lifecycle_log,
             "supervisor.activation_failed",
-            activation_failure_data(prepared, state, stage, &error),
+            data,
         );
         error
     }
@@ -4088,10 +4118,11 @@ mod host_command_budget_tests {
 #[cfg(test)]
 mod release_scope_tests {
     use super::{
-        activation_failure_data, append_event, classify_fresh_agent_fork_transition,
-        classify_fresh_agent_operation_identity, lifecycle_secrets, release_qualified_workload,
-        FreshAgentNativeIdentityUpdate,
+        activation_failure_data, append_event, backend_failure_diagnostic,
+        classify_fresh_agent_fork_transition, classify_fresh_agent_operation_identity,
+        lifecycle_secrets, release_qualified_workload, FreshAgentNativeIdentityUpdate,
     };
+    use crate::backend::BackendError;
     use crate::registry::PreparedLaunch;
     use freshell_runtime_protocol::{
         FreshAgentForkResult, IncarnationId, LaunchNonce, LaunchState, RuntimeError,
@@ -4268,6 +4299,59 @@ mod release_scope_tests {
         assert!(event["data"].get("errorMessage").is_none());
         assert!(!contents.contains("prepare provider bootstrap failed"));
     }
+
+    #[test]
+    fn backend_create_failure_records_bounded_redacted_backend_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("backend-create-failure.jsonl");
+        let process_secret = "supervisor-control-secret";
+        lifecycle_secrets()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(log.clone(), process_secret.into());
+        let prepared = PreparedLaunch {
+            soul_id: SoulId::new(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: LaunchNonce::new(),
+            state: LaunchState::Prepared,
+            intent_revision: 3,
+            existing_request: false,
+        };
+        let provider_secret = "sk-abcdefghijklmnopqrstuvwx";
+        let backend_error = BackendError::DockerHttp {
+            status: 400,
+            body: format!(
+                r#"{{"message":"invalid mount config","token":"{provider_secret}"}}"#
+            ),
+        };
+        let error = RuntimeError::new(
+            RuntimeErrorCode::BackendUnavailable,
+            backend_error.to_string(),
+        );
+        let mut data = activation_failure_data(
+            &prepared,
+            LaunchState::Prepared,
+            "create_stopped_runtime",
+            &error,
+        );
+        data["backendFailure"] = backend_failure_diagnostic(&backend_error);
+
+        append_event(&log, "supervisor.activation_failed", data);
+
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(!contents.contains(process_secret));
+        assert!(!contents.contains(provider_secret));
+        let event: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(event["data"]["stage"], "create_stopped_runtime");
+        assert_eq!(event["data"]["backendFailure"]["kind"], "docker_http");
+        assert_eq!(event["data"]["backendFailure"]["httpStatus"], 400);
+        let detail = event["data"]["backendFailure"]["detail"]
+            .as_str()
+            .unwrap();
+        assert!(detail.contains("invalid mount config"));
+        assert!(detail.contains("***REDACTED***"));
+        assert!(detail.chars().count() <= 512);
+    }
 }
 
 fn semantic_launch_digest(
@@ -4342,6 +4426,30 @@ fn map_backend(error: BackendError) -> RuntimeError {
         _ => RuntimeErrorCode::BackendUnavailable,
     };
     RuntimeError::new(code, error.to_string())
+}
+
+fn backend_failure_diagnostic(error: &BackendError) -> serde_json::Value {
+    let (kind, http_status, detail) = match error {
+        BackendError::Unavailable(detail) => ("unavailable", None, detail.as_str()),
+        BackendError::OwnershipMismatch(detail) => ("ownership_mismatch", None, detail.as_str()),
+        BackendError::DockerHttp { status, body } => ("docker_http", Some(*status), body.as_str()),
+        BackendError::Malformed(detail) => ("malformed", None, detail.as_str()),
+        BackendError::InvalidConfig(detail) => ("invalid_config", None, detail.as_str()),
+    };
+    const MAX_DETAIL_CHARS: usize = 512;
+    let redacted = freshell_runtime_observability::scrub(detail, "");
+    let detail_truncated = redacted.chars().count() > MAX_DETAIL_CHARS;
+    let detail = redacted
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .take(MAX_DETAIL_CHARS)
+        .collect::<String>();
+    serde_json::json!({
+        "kind": kind,
+        "httpStatus": http_status,
+        "detail": detail,
+        "detailTruncated": detail_truncated,
+    })
 }
 
 fn io_runtime(error: std::io::Error) -> RuntimeError {
