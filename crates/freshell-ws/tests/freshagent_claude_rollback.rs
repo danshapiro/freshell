@@ -994,3 +994,158 @@ async fn a_fresh_replacement_whose_sidecar_died_resumes_through_the_create() {
     converse(&rig, &mut conn, &resumed, &["a new first prompt"]).await;
     assert_eq!(conn.init_session_id(&resumed), c, "the CLI ran under C");
 }
+
+// ── §3.3: configure and /compact serialize behind an undo on its turn lock ───
+
+/// A frame sent while an undo holds the session's turn lock (the replacement's
+/// boot is parked), so its handler is parked on that lock when the undo
+/// replaces the runtime. Returns the replacement's id and how many frames the
+/// connection had read before the parked frame was sent.
+async fn park_behind_an_undo(
+    rig: &ClaudeRig,
+    conn: &mut RigConnection,
+    pane: &str,
+    a: &str,
+    frame: Value,
+) -> (String, usize) {
+    let hold = rig.fresh_claude.hold_rollback_boot();
+    request_rollback(conn, "undo", pane, a, "undo-1", None).await;
+    hold.parked().await;
+    let seen = conn.frames.len();
+    conn.send(frame).await;
+    // The handler resolves the session and waits on the undo's turn lock.
+    conn.read_for(Duration::from_millis(300)).await;
+    hold.release();
+    let ack = rollback_answer(conn, "undo-1").await;
+    assert_eq!(ack["type"], "freshAgent.rolledBack", "{ack}");
+    let c = ack["newSessionId"]
+        .as_str()
+        .expect("the replacement")
+        .to_string();
+    (c, seen)
+}
+
+/// The first frame matching `predicate` among those read after the first
+/// `seen` (an answer to a request sent then, never an older frame).
+async fn frame_after(
+    conn: &mut RigConnection,
+    seen: usize,
+    what: &str,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+    loop {
+        if let Some(hit) = conn.frames[seen..].iter().find(|v| predicate(v)) {
+            return hit.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {what}; frames: {:?}",
+            &conn.frames[seen..]
+        );
+        conn.read_for(Duration::from_millis(50)).await;
+    }
+}
+
+fn lost_frames(conn: &RigConnection) -> Vec<Value> {
+    conn.frames
+        .iter()
+        .filter(|v| {
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == "freshAgent.error"
+                && matches!(
+                    v["event"]["code"].as_str(),
+                    Some("INVALID_SESSION_ID" | "CLAUDE_SETTINGS_FAILED")
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+/// A model change sent while an undo boots its replacement waits on the
+/// session's turn lock (design §3.3), then applies to the replacement C the
+/// pane now shows: the CLI behind C takes the model, C's binding records it
+/// and the pane gets C's metadata. It is never dropped against the retired A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configure_parked_behind_an_undo_applies_to_the_replacement() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let configure = json!({
+        "type": "freshAgent.configure",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": pane,
+        "requestId": "configure-1",
+        "settings": { "model": "claude-opus-parked" },
+    });
+    let (c, seen) = park_behind_an_undo(&rig, &mut conn, &pane, &a, configure).await;
+
+    let answer = frame_after(
+        &mut conn,
+        seen,
+        "the configure's metadata or its failure",
+        |v| {
+            v["type"] == "freshAgent.event"
+                && ((v["event"]["type"] == "freshAgent.session.metadata"
+                    && v["event"]["model"] == "claude-opus-parked")
+                    || v["event"]["type"] == "freshAgent.error")
+        },
+    )
+    .await;
+    assert_eq!(
+        answer["event"]["type"], "freshAgent.session.metadata",
+        "{answer}"
+    );
+    assert_eq!(answer["event"]["sessionId"], c.as_str(), "{answer}");
+    assert!(lost_frames(&conn).is_empty(), "{:?}", lost_frames(&conn));
+    assert_eq!(
+        ledger(&rig)
+            .load_binding("claude", &c)
+            .expect("C's row")
+            .model
+            .as_deref(),
+        Some("claude-opus-parked")
+    );
+}
+
+/// A /compact sent while an undo boots its replacement waits on the session's
+/// turn lock, then compacts the replacement C the pane now shows (its turn
+/// runs under C), never answered with a lost-session frame for the retired A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compact_parked_behind_an_undo_runs_on_the_replacement() {
+    let rig = rollback_rig().await;
+    let mut conn = rig.connect().await;
+    let (pane, a, _) = two_turns(&rig, &mut conn).await;
+    let results = conn.events_seen("freshAgent.result");
+    let compact = json!({
+        "type": "freshAgent.compact",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": pane,
+        "requestId": "compact-1",
+    });
+    let (c, seen) = park_behind_an_undo(&rig, &mut conn, &pane, &a, compact).await;
+
+    assert_eq!(
+        conn.events_seen("freshAgent.result"),
+        results,
+        "nothing ran while the undo held the lock"
+    );
+    let answer = frame_after(
+        &mut conn,
+        seen,
+        "the compact's result or its failure",
+        |v| {
+            v["type"] == "freshAgent.event"
+                && matches!(
+                    v["event"]["type"].as_str(),
+                    Some("freshAgent.result" | "freshAgent.error")
+                )
+        },
+    )
+    .await;
+    assert_eq!(answer["event"]["type"], "freshAgent.result", "{answer}");
+    assert_eq!(answer["sessionId"], c.as_str(), "{answer}");
+    assert!(lost_frames(&conn).is_empty(), "{:?}", lost_frames(&conn));
+}

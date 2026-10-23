@@ -514,7 +514,13 @@ impl FreshClaudeState {
         turn_lock: &Arc<TokioMutex<()>>,
     ) -> Option<ForkParent> {
         let live_key = self
-            .live_key_after_turn_wait(map_key, wire_id, Some(durable), turn_lock)
+            .live_key_after_turn_wait(
+                TurnLockedRequest::Fork,
+                map_key,
+                wire_id,
+                Some(durable),
+                turn_lock,
+            )
             .await?;
         let sessions = self.sessions.lock().await;
         let session = sessions.get(&live_key)?;

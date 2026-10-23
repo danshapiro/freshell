@@ -4184,15 +4184,18 @@ impl FreshClaudeState {
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
 
-    /// The live session a send resolved before it waited on `turn_lock`,
-    /// after the wait (design §4.5 and §4.8): the same map key while it is
-    /// still registered; else, when an undo or redo replaced that runtime
-    /// while the send waited, the live end of the durable ledger chain from
-    /// the session's durable id (`durable`), then the wire id's own
-    /// resolution. Only a session that took this very lock over counts: a
-    /// send never lands on a runtime it did not serialize behind.
-    async fn live_key_after_turn_wait(
+    /// The live session a request (`op`) resolved before it waited on
+    /// `turn_lock`, after the wait (design §3.3, §4.5 and §4.8): the same map
+    /// key while it is still registered; else, when an undo or redo replaced
+    /// that runtime while the request waited, the live end of the durable
+    /// ledger chain from the session's durable id (`durable`), then the wire
+    /// id's own resolution. Only a session that took this very lock over
+    /// counts: a request never lands on a runtime it did not serialize behind.
+    /// Every request the turn lock serializes (send, configure, compact, fork)
+    /// re-resolves through here.
+    pub(super) async fn live_key_after_turn_wait(
         &self,
+        op: TurnLockedRequest,
         map_key: &str,
         wire_id: &str,
         durable: Option<&str>,
@@ -4218,12 +4221,12 @@ impl FreshClaudeState {
                 .is_some_and(|session| Arc::ptr_eq(&session.turn_lock, turn_lock));
             if same_lock {
                 tracing::info!(target: "freshell_freshagent::claude",
-                    event = "freshagent.claude.send_followed_replacement",
+                    event = op.followed_replacement_event(),
                     session_id = %wire_id,
                     replaced = %map_key,
                     replacement = %key,
                     through_ledger_chain = terminus.as_deref() == Some(candidate),
-                    "a send that waited behind a rollback goes to the replacement runtime"
+                    "a request that waited behind a rollback goes to the replacement runtime"
                 );
                 return Some(key);
             }
@@ -4309,6 +4312,7 @@ impl FreshClaudeState {
         // original and never to a revived one.
         let Some(map_key) = self
             .live_key_after_turn_wait(
+                TurnLockedRequest::Send,
                 &map_key,
                 &session_id,
                 durable_before_wait.as_deref(),
@@ -4693,11 +4697,13 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = msg.request_id.clone();
 
-        let (map_key, turn_lock) = loop {
+        let (map_key, turn_lock, durable_before_wait) = loop {
             let handles = match self.resolve_session_key(&session_id).await {
                 Some(key) => {
                     let guard = self.sessions.lock().await;
-                    guard.get(&key).map(|s| (key, s.turn_lock.clone()))
+                    guard
+                        .get(&key)
+                        .map(|s| (key, s.turn_lock.clone(), s.cli_session_id.clone()))
                 }
                 None => None,
             };
@@ -4711,6 +4717,30 @@ impl FreshClaudeState {
             tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
         };
         let _turn = turn_lock.lock().await;
+        // An undo or redo that held this lock may have replaced the runtime
+        // (C13): the setting applies to the replacement the pane now shows,
+        // never to the retired original.
+        let Some(live_key) = self
+            .live_key_after_turn_wait(
+                TurnLockedRequest::Configure,
+                &map_key,
+                &session_id,
+                durable_before_wait.as_deref(),
+                &turn_lock,
+            )
+            .await
+        else {
+            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            return;
+        };
+        // The pane follows a replacement through its `materialized` re-key, so
+        // it then knows the session by the replacement's id.
+        let session_id = if live_key == map_key {
+            session_id
+        } else {
+            live_key.clone()
+        };
+        let map_key = live_key;
 
         // kata z7j7: sandbox has NO claude-side concept — log observably
         // (id + boolean flag only), mirroring the send path's arm.
@@ -4964,7 +4994,7 @@ impl FreshClaudeState {
         // membership and re-resolve (the compact then serializes BEHIND the rollback
         // on the carried-over turn lock). This handler never ACQUIRES
         // `rollback_in_flight` (no circular wait exists): it only polls membership.
-        let (map_key, turn_lock, in_turn, turn_tracker) = loop {
+        let (map_key, turn_lock, in_turn, turn_tracker, durable_before_wait) = loop {
             let handles = match self.resolve_session_key(&session_id).await {
                 Some(key) => {
                     let guard = self.sessions.lock().await;
@@ -4974,6 +5004,7 @@ impl FreshClaudeState {
                             s.turn_lock.clone(),
                             s.in_turn.clone(),
                             s.turn_tracker.clone(),
+                            s.cli_session_id.clone(),
                         )
                     })
                 }
@@ -4992,6 +5023,28 @@ impl FreshClaudeState {
         // serialization discipline) — a rollback holding this lock observes either
         // no-compact or a fully-marked in-flight compact turn.
         let _turn = turn_lock.lock().await;
+        // An undo or redo that held this lock may have replaced the runtime
+        // (C13): the compact runs on the replacement the pane now shows, which
+        // took over this lock and the busy truth (`in_turn`, `turn_tracker`).
+        let Some(live_key) = self
+            .live_key_after_turn_wait(
+                TurnLockedRequest::Compact,
+                &map_key,
+                &session_id,
+                durable_before_wait.as_deref(),
+                &turn_lock,
+            )
+            .await
+        else {
+            self.broadcast(&lost_session_frame(&session_id, msg.session_type));
+            return;
+        };
+        let session_id = if live_key == map_key {
+            session_id
+        } else {
+            live_key.clone()
+        };
+        let map_key = live_key;
         // ep1-r3 F3 (the arm/await race): with a prior turn active this compact is
         // QUEUED — arm the tracker NOW, BEFORE the sidecar write await. The stdout
         // consumer's terminal-edge fold NEVER takes the turn lock, so an arm
@@ -8036,6 +8089,30 @@ enum ResumeClaudeError {
     /// Spawn/pipe/`created` failure -- the session may be perfectly resumable;
     /// NEVER declared lost (opencode_ws.rs discipline).
     Transient(String),
+}
+
+/// A request the session's turn lock serializes (design §3.3). Each one that
+/// waited on the lock re-resolves its session afterwards
+/// ([`FreshClaudeState::live_key_after_turn_wait`]): an undo or redo holding
+/// the lock may have replaced the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TurnLockedRequest {
+    Send,
+    Configure,
+    Compact,
+    Fork,
+}
+
+impl TurnLockedRequest {
+    /// The event logged when the request follows a replacement.
+    fn followed_replacement_event(self) -> &'static str {
+        match self {
+            Self::Send => "freshagent.claude.send_followed_replacement",
+            Self::Configure => "freshagent.claude.configure_followed_replacement",
+            Self::Compact => "freshagent.claude.compact_followed_replacement",
+            Self::Fork => "freshagent.claude.fork_followed_replacement",
+        }
+    }
 }
 
 fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMessage {
