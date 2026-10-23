@@ -16,7 +16,7 @@ use freshell_freshagent::identity_sink::SinkCloseError;
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
     ProvenanceUpdate, RollbackRecord, SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite,
-    SinkWrite,
+    SinkMarkTurnInterruptedWrite, SinkTakeTurnInterruptedWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{
     ClaimCommitOutcome, CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger, ProvenancePolicy,
@@ -199,6 +199,39 @@ impl PaneIdentitySink for LedgerSink {
                 let _ = ledger.delete_pending(p);
             }
             Ok(())
+        })
+    }
+
+    fn mark_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+        at_ms: i64,
+    ) -> SinkMarkTurnInterruptedWrite {
+        let ledger = self.ledger.clone();
+        let (provider, session_id) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.mark_fresh_agent_turn_interrupted(&provider, &session_id, at_ms)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
+    fn take_turn_interrupted(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> SinkTakeTurnInterruptedWrite {
+        let ledger = self.ledger.clone();
+        let (provider, session_id) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.take_fresh_agent_turn_interrupted(&provider, &session_id)
+            })
+            .await
+            .map_err(std::io::Error::other)?
         })
     }
 
