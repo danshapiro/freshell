@@ -490,6 +490,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         cliSessionId: event.cliSessionId as string | undefined,
         model: event.model as string | null | undefined,
         effort: event.effort as string | null | undefined,
+        // Absent = no statement (as for model/effort); only a mode name states one.
+        ...(typeof event.permissionMode === 'string' && event.permissionMode ? { permissionMode: event.permissionMode } : {}),
         cwd: event.cwd as string | undefined,
         tools: event.tools as Array<{ name: string }> | undefined,
       }))

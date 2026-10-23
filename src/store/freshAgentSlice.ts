@@ -214,6 +214,7 @@ const freshAgentSlice = createSlice({
       cliSessionId?: string
       model?: string | null
       effort?: string | null
+      permissionMode?: string
       cwd?: string
       tools?: Array<{ name: string }>
     }>) {
@@ -237,6 +238,7 @@ const freshAgentSlice = createSlice({
       // and the effort tooltip track the live session exactly.
       if (action.payload.model !== undefined) session.model = action.payload.model
       if (action.payload.effort !== undefined) session.effort = action.payload.effort
+      if (action.payload.permissionMode !== undefined) session.permissionMode = action.payload.permissionMode
       session.cwd = action.payload.cwd ?? session.cwd
       session.tools = action.payload.tools ?? session.tools
       if (metadataCliSessionId && !wouldDowngradeSnapshotIdentity) {

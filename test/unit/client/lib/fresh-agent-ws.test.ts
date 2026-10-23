@@ -802,6 +802,25 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('folds a stated permission mode; metadata that states none keeps it (transcript-live D7)', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-permission-mode'
+    const key = `freshclaude:claude:${sessionId}`
+    const metadata = (fields: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.session.metadata', sessionId, ...fields },
+    })
+    metadata({ permissionMode: 'bypassPermissions' })
+    expect(store.getState().freshAgent.sessions[key].permissionMode).toBe('bypassPermissions')
+    metadata({ model: 'claude-sonnet-4-6', effort: null })
+    expect(store.getState().freshAgent.sessions[key].permissionMode).toBe('bypassPermissions')
+    metadata({ permissionMode: 'default' })
+    expect(store.getState().freshAgent.sessions[key].permissionMode).toBe('default')
+  })
+
   it('does not let delayed metadata downgrade newer snapshot identity', () => {
     const store = createFreshAgentStore()
     const sessionId = 'claude-thread-metadata-order'

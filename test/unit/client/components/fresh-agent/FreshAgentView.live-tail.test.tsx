@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { appReducers } from '@/store/appReducers'
-import { initLayout } from '@/store/panesSlice'
+import { initLayout, mergePaneContent } from '@/store/panesSlice'
 import { setStatus } from '@/store/connectionSlice'
 import { useAppSelector } from '@/store/hooks'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
@@ -397,5 +397,68 @@ describe('provider notices (transcript-live D6)', () => {
 
     deliver(store, notice)
     expect(screen.getByRole('alert')).toHaveTextContent('Hook feedback: lint failed')
+  })
+})
+
+describe('the CLI\'s own permission mode (transcript-live D7)', () => {
+  function setPanePermissionMode(store: Store, permissionMode: string) {
+    store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { permissionMode } }))
+  }
+
+  function paneContent(store: Store) {
+    const layout = store.getState().panes.layouts['tab-1']
+    if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('missing pane')
+    return layout.content
+  }
+
+  function sends() {
+    return wsMock.send.mock.calls.map(([message]) => message as Record<string, any>).filter((message) => message?.type === 'freshAgent.send')
+  }
+
+  it('adopts a mode change the CLI reports and keeps it on the next send', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'plan it')]))
+    const store = createStore()
+    setPanePermissionMode(store, 'plan')
+    await mount(store)
+
+    // ExitPlanMode was approved: the CLI left plan mode on its own.
+    deliver(store, { type: 'freshAgent.session.metadata', permissionMode: 'default' })
+    await advance(0)
+    expect(paneContent(store).permissionMode).toBe('default')
+
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    act(() => {
+      fireEvent.change(composer, { target: { value: 'now build it' } })
+    })
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    })
+    expect(sends().at(-1)?.settings?.permissionMode).toBe('default')
+  })
+
+  it('leaves the pane\'s own later choice alone when unrelated metadata repeats the session\'s mode', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'hi')]))
+    const store = createStore()
+    setPanePermissionMode(store, 'plan')
+    await mount(store)
+    deliver(store, { type: 'freshAgent.session.metadata', permissionMode: 'default' })
+    await advance(0)
+
+    // The user picks a mode in the pane; a model-only statement must not undo it.
+    act(() => setPanePermissionMode(store, 'acceptEdits'))
+    deliver(store, { type: 'freshAgent.session.metadata', model: 'claude-sonnet-4-6', permissionMode: 'default' })
+    deliver(store, { type: 'freshAgent.session.metadata', model: 'claude-opus-4-6' })
+    await advance(0)
+    expect(paneContent(store).permissionMode).toBe('acceptEdits')
+  })
+
+  it('ignores a mode the pane cannot represent', async () => {
+    serve(() => claudeSnapshot([userTurn('u-user', 'hi')]))
+    const store = createStore()
+    setPanePermissionMode(store, 'plan')
+    await mount(store)
+    deliver(store, { type: 'freshAgent.session.metadata', permissionMode: 'someFutureMode' })
+    await advance(0)
+    expect(paneContent(store).permissionMode).toBe('plan')
   })
 })

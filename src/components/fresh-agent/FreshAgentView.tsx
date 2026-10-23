@@ -109,7 +109,7 @@ import {
   getFreshAgentSnapshotThreadId,
   getManagedBootstrapHistoryThreadId,
 } from '@/lib/fresh-agent-snapshot-thread'
-import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
+import { CLAUDE_PERMISSION_MODE_VALUES, DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   pickCheckpointForTurn,
   type CheckpointEntry,
@@ -3971,6 +3971,28 @@ export function FreshAgentView({
     shownNoticeSeqRef.current = liveNotice.seq
     setNotice(formatFreshAgentNotice(liveNotice))
   }, [liveNotice])
+  // The session's permission mode converges onto the pane (transcript-live
+  // §4.4): when the server states a new mode — the CLI left plan mode after an
+  // approved ExitPlanMode, or another device changed it — the pane adopts it,
+  // so its next send does not put the CLI back. Only a change of the stated
+  // mode acts, so a mode the user just picked here is never undone.
+  const sessionPermissionMode = agentSession?.permissionMode
+  const adoptedPermissionModeRef = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (!sessionPermissionMode || sessionPermissionMode === adoptedPermissionModeRef.current) return
+    adoptedPermissionModeRef.current = sessionPermissionMode
+    const current = paneContentRef.current
+    if (current.provider === 'opencode' || current.permissionMode === sessionPermissionMode) return
+    if (!(CLAUDE_PERMISSION_MODE_VALUES as readonly string[]).includes(sessionPermissionMode)) {
+      log.warn('the session reports a permission mode the pane cannot represent; keeping the pane\'s', {
+        event: 'fresh_agent.permission_mode_unknown',
+        provider: current.provider,
+        permissionMode: sessionPermissionMode,
+      })
+      return
+    }
+    dispatch(mergePaneContent({ tabId, paneId, updates: { permissionMode: sessionPermissionMode } }))
+  }, [dispatch, paneId, sessionPermissionMode, tabId])
   const isLiveSessionBusyNow = useCallback(() => {
     const status = liveSessionKey ? appStore.getState().freshAgent.sessions[liveSessionKey]?.status : undefined
     return BUSY_STATES.has(status ?? paneContentRef.current.status)

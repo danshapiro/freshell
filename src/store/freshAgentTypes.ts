@@ -107,6 +107,11 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
    * it. The status-strip tooltip prefers it over the REST snapshot's
    * settings.effort: the event is fresher by construction. */
   effort?: string | null
+  /** The LIVE session's permission mode as the server last stated it
+   * (`freshAgent.session.metadata`): after a configure, or when the CLI
+   * changed it itself (an approved ExitPlanMode leaves plan mode). Absent
+   * while no metadata ever stated it. */
+  permissionMode?: string
   tools?: Array<{ name: string }>
   turns: FreshAgentTurn[]
   historyItems: FreshAgentTurn[]
