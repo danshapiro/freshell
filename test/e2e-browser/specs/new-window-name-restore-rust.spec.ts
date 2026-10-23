@@ -125,52 +125,91 @@ async function bootWindow(
   return { page, harness }
 }
 
-/** The single leaf pane id of `tabId`. */
-async function onlyPaneId(harness: TestHarness, tabId: string): Promise<string> {
-  const state = await harness.getState()
-  const layout = state?.panes?.layouts?.[tabId]
-  expect(layout?.type, `tab ${tabId} is a single pane`).toBe('leaf')
-  return layout.id as string
+type LayoutNode = { type: 'leaf'; id: string; content?: { kind?: string; terminalId?: unknown } }
+  | { type: 'split'; children: [LayoutNode, LayoutNode] }
+
+function findLeaf(node: LayoutNode | undefined, paneId: string): Extract<LayoutNode, { type: 'leaf' }> | undefined {
+  if (!node) return undefined
+  if (node.type === 'leaf') return node.id === paneId ? node : undefined
+  return findLeaf(node.children[0], paneId) ?? findLeaf(node.children[1], paneId)
 }
 
-/** Wait until the pane of `tabId` is attached to a live terminal. */
-async function terminalIdOf(harness: TestHarness, tabId: string): Promise<string> {
+/** Wait until pane `paneId` of `tabId` is attached to a terminal. */
+async function terminalIdOf(harness: TestHarness, tabId: string, paneId: string): Promise<string> {
   let terminalId = ''
   await expect.poll(async () => {
     const state = await harness.getState()
-    const content = state?.panes?.layouts?.[tabId]?.content
+    const content = findLeaf(state?.panes?.layouts?.[tabId], paneId)?.content
     terminalId = content?.kind === 'terminal' && typeof content.terminalId === 'string' ? content.terminalId : ''
     return terminalId.length > 0
-  }, { timeout: 30_000, message: `tab ${tabId} has a terminal` }).toBe(true)
+  }, { timeout: 30_000, message: `pane ${paneId} has a terminal` }).toBe(true)
   return terminalId
 }
 
-/** Rename the active shell tab and its pane through the UI inline editors. */
-async function renameShellTabAndPane(page: Page, harness: TestHarness, tabId: string): Promise<string> {
-  const paneId = await onlyPaneId(harness, tabId)
-  await renameThroughTabEdit(page, tabId, TAB_NAME)
-  await renameThroughPaneHeader(page, PANE_NAME)
+/**
+ * Split the active shell tab into two shell panes, then rename the tab and
+ * its FIRST pane through the UI inline editors. (In a single-pane tab a tab
+ * rename and a pane rename mirror each other, so distinct tab and pane names
+ * need a split.) The second pane stays unrenamed. Returns both pane ids.
+ */
+async function renameSplitShellTab(page: Page, harness: TestHarness, tabId: string): Promise<{ renamedPaneId: string; plainPaneId: string }> {
   const state = await harness.getState()
-  expect(state.tabs.tabs.find((tab: { id: string }) => tab.id === tabId)?.titleSetByUser).toBe(true)
-  expect(state.panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
-  return paneId
+  const layout = state?.panes?.layouts?.[tabId]
+  expect(layout?.type, `tab ${tabId} starts as a single pane`).toBe('leaf')
+  const renamedPaneId = layout.id as string
+  const plainPaneId = `${tabId}-plain`
+  await page.evaluate(({ tabId, plainPaneId }) => {
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'panes/addPane',
+      payload: { tabId, newPaneId: plainPaneId, newContent: { kind: 'terminal', mode: 'shell' } },
+    })
+  }, { tabId, plainPaneId })
+  await terminalIdOf(harness, tabId, plainPaneId)
+
+  await renameThroughTabEdit(page, tabId, TAB_NAME)
+  // The first visible pane header is the original (left) pane's.
+  await renameThroughPaneHeader(page, PANE_NAME)
+  const renamed = await harness.getState()
+  expect(renamed.tabs.tabs.find((tab: { id: string }) => tab.id === tabId)?.title).toBe(TAB_NAME)
+  expect(renamed.tabs.tabs.find((tab: { id: string }) => tab.id === tabId)?.titleSetByUser).toBe(true)
+  expect(renamed.panes.paneTitles?.[tabId]?.[renamedPaneId]).toBe(PANE_NAME)
+  expect(renamed.panes.paneTitleSetByUser?.[tabId]?.[renamedPaneId]).toBe(true)
+  expect(renamed.panes.paneTitleSetByUser?.[tabId]?.[plainPaneId]).toBeFalsy()
+  return { renamedPaneId, plainPaneId }
 }
 
-/** Type a command that sets the window title to INTRUDER, then wait for its
- * computed marker (the marker text never appears in the typed command, so
- * seeing it proves the printf already ran). */
-async function sendIntruderTitle(page: Page, harness: TestHarness, tabId: string, terminalId: string, marker: number): Promise<void> {
+/** Wait until the server persisted the renamed split tab. */
+async function waitForRenamedSplitTab(
+  page: Page,
+  serverInfo: { homeDir: string },
+  tabId: string,
+  renamedPaneId: string,
+  plainPaneId: string,
+): Promise<void> {
+  await waitForPersistedRecords(serverInfo.homeDir, await clientInstanceIdOf(page), (records) => {
+    const record = records.find((candidate) => candidate.tabId === tabId)
+    return record?.tabName === TAB_NAME
+      && hasPaneTitle(records, tabId, renamedPaneId, PANE_NAME)
+      && !!record.panes?.some((pane) => pane.paneId === plainPaneId)
+  })
+}
+
+/** Type a command that sets the window title to INTRUDER into pane `paneId`,
+ * then wait for its computed marker (the marker text never appears in the
+ * typed command, so seeing it proves the printf already ran). */
+async function sendIntruderTitle(page: Page, harness: TestHarness, tabId: string, paneId: string, marker: number): Promise<void> {
+  const terminalId = await terminalIdOf(harness, tabId, paneId)
   await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click()
   // TerminalView ignores title changes less than 2 s after the previous one
   // (spinner throttle); let any earlier title settle first.
   await page.waitForTimeout(2_500)
-  await page.locator(`[data-context="pane"][data-tab-id="${tabId}"] .xterm`).first().click()
+  await page.locator(`[data-context="pane"][data-pane-id="${paneId}"] .xterm`).first().click()
   await page.keyboard.type(`printf '\\033]0;${INTRUDER}\\007'; echo osc-$((${marker}+1))-done`)
   await page.keyboard.press('Enter')
   const expected = `osc-${marker + 1}-done`
   await expect.poll(async () => (await harness.getTerminalBuffer(terminalId)) ?? '', {
     timeout: 20_000,
-    message: `the shell in ${tabId} ran the title command`,
+    message: `the shell in pane ${paneId} ran the title command`,
   }).toContain(expected)
 }
 
@@ -179,20 +218,20 @@ test.describe('new-window name restore', () => {
 
   test('a renamed shell tab and pane keep their names in a new window', async ({ freshellPage: page, harness, serverInfo, context }) => {
     const tabId = (await harness.getActiveTabId())!
-    const paneId = await renameShellTabAndPane(page, harness, tabId)
-    await waitForPersistedRecords(serverInfo.homeDir, await clientInstanceIdOf(page), (records) =>
-      hasPaneTitle(records, tabId, paneId, PANE_NAME)
-      && records.some((record) => record.tabId === tabId && record.tabName === TAB_NAME))
+    const { renamedPaneId, plainPaneId } = await renameSplitShellTab(page, harness, tabId)
+    await waitForRenamedSplitTab(page, serverInfo, tabId, renamedPaneId, plainPaneId)
 
     await page.close()
     const { page: page2, harness: harness2 } = await bootWindow(context, serverInfo, [tabId])
     try {
       await expect(page2.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)).toContainText(TAB_NAME)
-      await expect(page2.locator(`[data-context="pane-header"][data-pane-id="${paneId}"]`)).toContainText(PANE_NAME, { timeout: 15_000 })
+      await expect(page2.locator(`[data-context="pane-header"][data-pane-id="${renamedPaneId}"]`)).toContainText(PANE_NAME, { timeout: 15_000 })
       const state = await harness2.getState()
       expect(state.tabs.tabs.find((tab: { id: string }) => tab.id === tabId)?.titleSetByUser).toBe(true)
-      expect(state.panes.paneTitles?.[tabId]?.[paneId]).toBe(PANE_NAME)
-      expect(state.panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
+      expect(state.panes.paneTitles?.[tabId]?.[renamedPaneId]).toBe(PANE_NAME)
+      expect(state.panes.paneTitleSetByUser?.[tabId]?.[renamedPaneId]).toBe(true)
+      // The pane nobody renamed comes back unprotected.
+      expect(state.panes.paneTitleSetByUser?.[tabId]?.[plainPaneId]).toBeFalsy()
     } finally {
       await harness2.killAllTerminals(serverInfo)
     }
@@ -200,49 +239,33 @@ test.describe('new-window name restore', () => {
 
   test('the restored names stay protected from OSC titles', async ({ freshellPage: page, harness, serverInfo, context }) => {
     const tabId = (await harness.getActiveTabId())!
-    const paneId = await renameShellTabAndPane(page, harness, tabId)
-    // A second shell tab nobody renamed: the control that proves this window
-    // does apply OSC titles (so the protected tab's unchanged name means
-    // something).
-    const controlTabId = 'osc-control-tab'
-    await page.evaluate((id) => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/addTab', payload: { id } })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/initLayout',
-        payload: { tabId: id, paneId: `${id}-pane`, content: { kind: 'terminal', mode: 'shell' } },
-      })
-    }, controlTabId)
-    await terminalIdOf(harness, controlTabId)
-    await waitForPersistedRecords(serverInfo.homeDir, await clientInstanceIdOf(page), (records) =>
-      hasPaneTitle(records, tabId, paneId, PANE_NAME)
-      && records.some((record) => record.tabId === controlTabId))
+    const { renamedPaneId, plainPaneId } = await renameSplitShellTab(page, harness, tabId)
+    await waitForRenamedSplitTab(page, serverInfo, tabId, renamedPaneId, plainPaneId)
 
     await page.close()
-    const { page: page2, harness: harness2 } = await bootWindow(context, serverInfo, [tabId, controlTabId])
+    const { page: page2, harness: harness2 } = await bootWindow(context, serverInfo, [tabId])
     try {
-      const terminalId = await terminalIdOf(harness2, tabId)
-      const controlTerminalId = await terminalIdOf(harness2, controlTabId)
-
-      await sendIntruderTitle(page2, harness2, tabId, terminalId, 40)
-      await sendIntruderTitle(page2, harness2, controlTabId, controlTerminalId, 50)
+      await sendIntruderTitle(page2, harness2, tabId, renamedPaneId, 40)
+      await sendIntruderTitle(page2, harness2, tabId, plainPaneId, 50)
+      // Control: the pane nobody renamed takes the OSC title, so this window
+      // does apply OSC titles and the protected names below mean something.
       await expect(
-        page2.locator(`[data-context="tab"][data-tab-id="${controlTabId}"]`),
-        'control: an unprotected restored tab takes the OSC title',
+        page2.locator(`[data-context="pane-header"][data-pane-id="${plainPaneId}"]`),
+        'control: an unprotected restored pane takes the OSC title',
       ).toContainText(INTRUDER, { timeout: 15_000 })
 
-      await page2.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click()
       const tab = page2.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
       await expect(tab).toContainText(TAB_NAME)
       await expect(tab).not.toContainText(INTRUDER)
-      const header = page2.locator(`[data-context="pane-header"][data-pane-id="${paneId}"]`)
+      const header = page2.locator(`[data-context="pane-header"][data-pane-id="${renamedPaneId}"]`)
       await expect(header).toContainText(PANE_NAME)
       await expect(header).not.toContainText(INTRUDER)
       const state = await harness2.getState()
       const restoredTab = state.tabs.tabs.find((candidate: { id: string }) => candidate.id === tabId)
       expect(restoredTab?.title).toBe(TAB_NAME)
       expect(restoredTab?.titleSetByUser).toBe(true)
-      expect(state.panes.paneTitles?.[tabId]?.[paneId]).toBe(PANE_NAME)
-      expect(state.panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
+      expect(state.panes.paneTitles?.[tabId]?.[renamedPaneId]).toBe(PANE_NAME)
+      expect(state.panes.paneTitleSetByUser?.[tabId]?.[renamedPaneId]).toBe(true)
     } finally {
       await harness2.killAllTerminals(serverInfo)
     }
@@ -276,6 +299,8 @@ test.describe('new-window name restore', () => {
       const state = await harness2.getState()
       expect(state.panes.paneTitles?.[tabId]?.[paneId]).toBe(BROWSER_PANE_NAME)
       expect(state.panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
+      // Renaming the only pane of a tab renames the tab too; both stay protected.
+      expect(state.tabs.tabs.find((tab: { id: string }) => tab.id === tabId)?.titleSetByUser).toBe(true)
     } finally {
       await otherContext.close().catch(() => {})
     }
