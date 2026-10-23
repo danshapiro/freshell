@@ -320,12 +320,14 @@ async fn an_attach_resume_hands_the_cli_the_freshell_mcp_for_the_attaching_pane(
     assert_mcp_for_pane(&rig, &resumed, Some(("tab-9", "pane-1")), "attach-resume");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handoff_resume_hands_the_cli_the_freshell_mcp() {
+/// A terminal-to-agent switch or a stop-and-reopen posts the handoff for the
+/// pane that adopts the session (the client always names it); the resumed CLI
+/// runs for that pane.
+async fn a_handoff_resume_runs_for_the_adopting_pane(session_type: &str) {
     let (rig, _) = rig_with(resolved(), false).await;
     let mut conn = rig.connect().await;
     let session_id =
-        create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
+        create_for_pane(&mut conn, "create-1", session_type, ("tab-1", "pane-1")).await;
     let durable = converse(&rig, &mut conn, &session_id, &["first prompt"]).await;
     kill_the_sidecar(&rig, &mut conn).await;
 
@@ -336,16 +338,31 @@ async fn a_handoff_resume_hands_the_cli_the_freshell_mcp() {
                 "provider": "claude",
                 "sessionId": durable,
                 "targetKind": "fresh-agent",
-                "sessionType": "freshclaude",
+                "sessionType": session_type,
                 "cwd": rig.workspace.to_str().expect("utf-8 path"),
+                "tabId": "tab-7",
+                "paneId": "pane-7",
             }),
         )
         .await;
     assert_eq!(status, 200, "the handoff resumes the session: {answer}");
-    // A handoff names no pane: the pane that adopts the session is not known
-    // yet, so the CLI reaches the server without a pane of its own.
     let resumed = wait_for_query(&rig, "the handoff resume", |o| o["resume"] == durable).await;
-    assert_mcp_for_pane(&rig, &resumed, None, "handoff resume");
+    assert_mcp_for_pane(
+        &rig,
+        &resumed,
+        Some(("tab-7", "pane-7")),
+        &format!("{session_type} handoff resume"),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_freshclaude_handoff_resume_runs_for_the_adopting_pane() {
+    a_handoff_resume_runs_for_the_adopting_pane("freshclaude").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kilroy_handoff_resume_runs_for_the_adopting_pane() {
+    a_handoff_resume_runs_for_the_adopting_pane("kilroy").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

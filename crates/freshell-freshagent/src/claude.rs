@@ -1427,11 +1427,17 @@ impl FreshClaudeState {
     /// vs kilroy, so a kilroy session resumes AS kilroy (the created/snapshot
     /// frames keep the flavor; never map by provider alone). Registers under
     /// the durable id itself and returns the constructed owner identity.
+    /// `tab_id`/`pane_id` name the pane that adopts the session (the client
+    /// names it on every handoff); the resumed CLI runs for that pane, so its
+    /// Freshell MCP defaults to it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resume_for_handoff(
         &self,
         session_type: &str,
         session_id: &str,
         cwd: Option<&str>,
+        tab_id: Option<&str>,
+        pane_id: Option<&str>,
         operation_id: &str,
         generation: u64,
     ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
@@ -1481,8 +1487,8 @@ impl FreshClaudeState {
             }
         };
         let msg = FreshAgentAttach {
-            tab_id: None,
-            pane_id: None,
+            tab_id: tab_id.map(str::to_string),
+            pane_id: pane_id.map(str::to_string),
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: flavor,
