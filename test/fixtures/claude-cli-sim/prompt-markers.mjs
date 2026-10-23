@@ -15,6 +15,8 @@
 //                             (the CLI retries each), then answers as for no marker
 //   HANG                      the model request never completes
 //   MCP:hang                  a call to the hung stdio MCP tool (mcp__hang__wait)
+//   MCP:call=<tool>           a call of the MCP tool <tool> (qualified, mcp__<server>__<name>)
+//                             with no arguments, then a text reply
 //   AGENT:async               a background Agent; its completion starts a CLI-initiated turn
 //   PLAN:exit                 an ExitPlanMode tool call carrying PLAN_TEXT
 //
@@ -35,10 +37,11 @@ export const PLAN_TEXT = '# Plan\n\n1. Edit the file\n2. Run the tests'
 const TOOL_RE = /\bTOOL:sleep=(\d+(?:\.\d+)?)(?:,timeout=(\d+))?/
 const APIERR_RE = /\bAPIERR:(\d{3})\b/
 const RETRY_RE = /\bRETRY:(\d{3})x(\d+)\b/
+const MCP_CALL_RE = /\bMCP:call=(mcp__[A-Za-z0-9_-]+)/
 
 /**
  * @param {string} text the text of the last user message
- * @returns {{kind:'text'}|{kind:'slow',chunks:number,delayMs:number}|{kind:'tool',command:string,seconds:number,timeoutMs?:number}|{kind:'api_error',status:number}|{kind:'retry',status:number,attempts:number}|{kind:'hang'}|{kind:'mcp_hang'}|{kind:'agent_async'}|{kind:'exit_plan'}}
+ * @returns {{kind:'text'}|{kind:'slow',chunks:number,delayMs:number}|{kind:'tool',command:string,seconds:number,timeoutMs?:number}|{kind:'api_error',status:number}|{kind:'retry',status:number,attempts:number}|{kind:'hang'}|{kind:'mcp_hang'}|{kind:'mcp_call',tool:string}|{kind:'agent_async'}|{kind:'exit_plan'}}
  */
 export function parsePromptMarkers(text) {
   const value = String(text ?? '')
@@ -47,6 +50,8 @@ export function parsePromptMarkers(text) {
   const retry = RETRY_RE.exec(value)
   if (retry) return { kind: 'retry', status: Number(retry[1]), attempts: Number(retry[2]) }
   if (/\bMCP:hang\b/.test(value)) return { kind: 'mcp_hang' }
+  const mcpCall = MCP_CALL_RE.exec(value)
+  if (mcpCall) return { kind: 'mcp_call', tool: mcpCall[1] }
   if (/\bAGENT:async\b/.test(value)) return { kind: 'agent_async' }
   if (/\bPLAN:exit\b/.test(value)) return { kind: 'exit_plan' }
   if (/\bTOOL:touch\b/.test(value)) return { kind: 'tool', seconds: 0, command: `touch ${TOUCH_FILE}` }

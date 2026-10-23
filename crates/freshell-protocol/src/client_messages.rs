@@ -900,6 +900,11 @@ pub struct FreshAgentCreate {
     /// optional; conn-less (REST/MCP) creates omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// G19: the creating pane's id. With `tab_id` it is the pane context the
+    /// agent's Freshell MCP acts for (`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`).
+    /// Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
     /// Unified agent names (Task 1 wire / Task 2 Rust side): the pane's
     /// pre-durable naming handle — see `TerminalCreate::naming_handle`.
     /// Additive optional.
@@ -942,6 +947,12 @@ pub struct FreshAgentAttach {
     pub resume_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// G19: the attaching pane. An attach that resumes the session hands the
+    /// agent's Freshell MCP this pane context. Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

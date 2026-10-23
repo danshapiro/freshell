@@ -867,6 +867,10 @@ export const FreshAgentCreateSchema = z.object({
   /** D8: the creating tab's client-side id; the server composes the ledger row's
    * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
+  /** G19: the creating pane's id. With `tabId` it is the pane context the
+   * agent's Freshell MCP acts for (FRESHELL_TAB_ID / FRESHELL_PANE_ID).
+   * Additive optional. */
+  paneId: z.string().min(1).optional(),
   /** Unified agent names (Task 1): the pane's pre-durable naming handle — see
    * `terminal.create.namingHandle`. Additive optional. */
   namingHandle: z.string().min(1).optional(),
@@ -886,6 +890,10 @@ export const FreshAgentAttachSchema = z.object({
   resumeSessionId: z.string().optional(),
   cwd: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
+  /** G19: the attaching pane. An attach that resumes the session hands the
+   *  agent's Freshell MCP this pane context. Additive optional. */
+  tabId: z.string().min(1).optional(),
+  paneId: z.string().min(1).optional(),
   /** kata b8ke delayed-request fence: attach can cold-resume an untracked
    *  session (registering a runtime), so it carries the observed
    *  (epoch, generation) pair. */

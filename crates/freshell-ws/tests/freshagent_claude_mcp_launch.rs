@@ -1,0 +1,364 @@
+//! G19 (api-hosted-ops plan §2.4): a freshclaude or kilroy pane's CLI gets the
+//! ordinary Freshell MCP server, the way a terminal pane's CLI does.
+//!
+//! Every sidecar launch (create, attach-resume, handoff resume, undo/redo
+//! respawn, fork) asks the lane's recipe provider, so the setting
+//! (`settings.codingCli.mcpServer`) applies to the next launch without a
+//! restart. The recipe travels in the `create` line as a command and its
+//! arguments only; the endpoint and token are in the sidecar's environment,
+//! which the server sets from its own bound port and token; the pane the
+//! session runs for travels as `freshellContext` and lands in the CLI's
+//! environment, from which the CLI hands all of it to the MCP child.
+//!
+//! Each test runs the real sidecar over the CLI simulator (RealSidecarSim),
+//! whose ledger records the options of every `query()` call, including the
+//! Freshell context values of the CLI environment and a digest of the token.
+
+mod common;
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions};
+use common::AUTH_TOKEN;
+use freshell_freshagent::claude_freshell_mcp::{ClaudeFreshellMcp, ClaudeFreshellMcpResolution};
+
+/// The recipe the rig's provider resolves (the simulator records it as given).
+fn recipe() -> ClaudeFreshellMcp {
+    ClaudeFreshellMcp {
+        command: "node".into(),
+        args: vec!["/srv/freshell/dist/tools/freshell-mcp/server.js".into()],
+    }
+}
+
+fn resolved() -> ClaudeFreshellMcpResolution {
+    ClaudeFreshellMcpResolution::Resolved(recipe())
+}
+
+/// A RealSidecarSim rig wired the way main.rs wires the default server, with
+/// a durable ledger (resumes read the session back) and the handoff route.
+async fn rig_with(
+    resolution: ClaudeFreshellMcpResolution,
+    hosted: bool,
+) -> (
+    ClaudeRig,
+    Arc<std::sync::Mutex<ClaudeFreshellMcpResolution>>,
+) {
+    let cell = Arc::new(std::sync::Mutex::new(resolution));
+    let rig = ClaudeRig::start_with_options(
+        RigKind::Sim,
+        RigOptions {
+            durable_ledger: true,
+            handoff: true,
+            hosted_claude: hosted,
+            env: vec![("KILROY_ENABLED".into(), "1".into())],
+            freshell_mcp: Some(Arc::clone(&cell)),
+        },
+    )
+    .await;
+    (rig, cell)
+}
+
+/// The simulator's digest of a credential value (`query.mjs`).
+fn digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))[..12].to_string()
+}
+
+/// The launch handed the CLI the ordinary recipe (command and arguments, no
+/// environment) and an environment that reaches the rig's server for `pane`.
+fn assert_mcp_for_pane(rig: &ClaudeRig, options: &Value, pane: Option<(&str, &str)>, launch: &str) {
+    assert_eq!(
+        options["mcpServers"],
+        json!({ "freshell": { "command": "node", "args": ["/srv/freshell/dist/tools/freshell-mcp/server.js"] } }),
+        "the {launch} hands the CLI the Freshell MCP recipe and nothing else: {options}"
+    );
+    let mut context = json!({ "FRESHELL": "1", "FRESHELL_URL": rig.http_url });
+    if let Some((tab, pane)) = pane {
+        context["FRESHELL_TAB_ID"] = json!(tab);
+        context["FRESHELL_PANE_ID"] = json!(pane);
+    }
+    assert_eq!(
+        options["envContext"], context,
+        "the {launch}'s CLI reaches this server for its pane: {options}"
+    );
+    assert_eq!(
+        options["envDigests"]["FRESHELL_TOKEN"],
+        json!(digest(AUTH_TOKEN)),
+        "the {launch}'s CLI carries this server's token: {options}"
+    );
+}
+
+/// Create a session for `pane` (`tabId`, `paneId`); returns the session id.
+async fn create_for_pane(
+    conn: &mut RigConnection,
+    request_id: &str,
+    session_type: &str,
+    pane: (&str, &str),
+) -> String {
+    let created = conn
+        .request_create(
+            request_id,
+            json!({ "sessionType": session_type, "tabId": pane.0, "paneId": pane.1 }),
+        )
+        .await;
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    created["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_string()
+}
+
+/// The owner pair (epoch, generation) of the session's runtime owner record,
+/// once the server has broadcast it (it can trail the first turn's result).
+async fn owner_pair(conn: &mut RigConnection, durable: &str) -> (u64, u64) {
+    conn.wait_for("the session's owner record", |v| {
+        v["type"] == "session.runtimeOwner"
+            && v["provider"] == "claude"
+            && v["sessionId"] == durable
+    })
+    .await;
+    conn.owner_pair(durable)
+        .expect("the session's owner record names its pair")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_freshclaude_and_a_kilroy_create_hand_the_cli_the_freshell_mcp_for_their_pane() {
+    let (rig, _) = rig_with(resolved(), false).await;
+    let mut conn = rig.connect().await;
+    create_for_pane(
+        &mut conn,
+        "create-claude",
+        "freshclaude",
+        ("tab-1", "pane-1"),
+    )
+    .await;
+    create_for_pane(&mut conn, "create-kilroy", "kilroy", ("tab-2", "pane-2")).await;
+
+    let options = rig.query_options();
+    assert_eq!(options.len(), 2, "two sidecars booted: {options:?}");
+    assert_mcp_for_pane(
+        &rig,
+        &options[0],
+        Some(("tab-1", "pane-1")),
+        "freshclaude create",
+    );
+    assert_mcp_for_pane(
+        &rig,
+        &options[1],
+        Some(("tab-2", "pane-2")),
+        "kilroy create",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_setting_applies_to_the_next_launch_without_a_restart() {
+    let (rig, setting) = rig_with(ClaudeFreshellMcpResolution::Disabled, false).await;
+    let mut conn = rig.connect().await;
+    create_for_pane(&mut conn, "create-off", "freshclaude", ("tab-1", "pane-1")).await;
+    *setting.lock().unwrap() = resolved();
+    create_for_pane(&mut conn, "create-on", "freshclaude", ("tab-1", "pane-2")).await;
+    *setting.lock().unwrap() =
+        ClaudeFreshellMcpResolution::Unavailable("no MCP server build".into());
+    create_for_pane(
+        &mut conn,
+        "create-unresolved",
+        "freshclaude",
+        ("tab-1", "pane-3"),
+    )
+    .await;
+
+    let options = rig.query_options();
+    assert_eq!(options.len(), 3, "three sidecars booted: {options:?}");
+    assert!(
+        options[0].get("mcpServers").is_none(),
+        "with the setting off the CLI gets no MCP server: {}",
+        options[0]
+    );
+    assert_mcp_for_pane(
+        &rig,
+        &options[1],
+        Some(("tab-1", "pane-2")),
+        "create after the setting turned on",
+    );
+    assert!(
+        options[2].get("mcpServers").is_none(),
+        "a command that cannot be resolved starts the pane without it: {}",
+        options[2]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hosted_lane_keeps_its_fixed_recipe_and_never_gets_the_ordinary_one() {
+    let (rig, _) = rig_with(resolved(), true).await;
+    let mut conn = rig.connect().await;
+    create_for_pane(
+        &mut conn,
+        "create-hosted",
+        "freshclaude",
+        ("tab-1", "pane-1"),
+    )
+    .await;
+
+    let options = rig.query_options();
+    assert_eq!(
+        options[0]["mcpServers"],
+        json!({ "freshell": { "command": "node", "args": ["/opt/freshell-mcp/server.js"] } }),
+        "{}",
+        options[0]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_resume_hands_the_cli_the_freshell_mcp_for_the_attaching_pane() {
+    let (rig, _) = rig_with(resolved(), false).await;
+    let mut conn = rig.connect().await;
+    let session_id =
+        create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt"])
+        .await;
+    rig.kill_first_sidecar(&mut conn).await;
+
+    // The pane, moved to another tab meanwhile, attaches again (a reload).
+    conn.send(json!({
+        "type": "freshAgent.attach",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": session_id,
+        "sessionRef": { "provider": "claude", "sessionId": durable },
+        "tabId": "tab-9",
+        "paneId": "pane-1",
+    }))
+    .await;
+    let resumed = rig
+        .wait_for_query("the attach-resume", |o| o["resume"] == durable)
+        .await;
+    assert_mcp_for_pane(&rig, &resumed, Some(("tab-9", "pane-1")), "attach-resume");
+}
+
+/// A terminal-to-agent switch or a stop-and-reopen posts the handoff for the
+/// pane that adopts the session (the client always names it); the resumed CLI
+/// runs for that pane.
+async fn a_handoff_resume_runs_for_the_adopting_pane(session_type: &str) {
+    let (rig, _) = rig_with(resolved(), false).await;
+    let mut conn = rig.connect().await;
+    let session_id =
+        create_for_pane(&mut conn, "create-1", session_type, ("tab-1", "pane-1")).await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt"])
+        .await;
+    rig.kill_first_sidecar(&mut conn).await;
+
+    let (status, answer) = rig
+        .post_json(
+            "/api/sessions/handoff",
+            &json!({
+                "provider": "claude",
+                "sessionId": durable,
+                "targetKind": "fresh-agent",
+                "sessionType": session_type,
+                "cwd": rig.workspace.to_str().expect("utf-8 path"),
+                "tabId": "tab-7",
+                "paneId": "pane-7",
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "the handoff resumes the session: {answer}");
+    let resumed = rig
+        .wait_for_query("the handoff resume", |o| o["resume"] == durable)
+        .await;
+    assert_mcp_for_pane(
+        &rig,
+        &resumed,
+        Some(("tab-7", "pane-7")),
+        &format!("{session_type} handoff resume"),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_freshclaude_handoff_resume_runs_for_the_adopting_pane() {
+    a_handoff_resume_runs_for_the_adopting_pane("freshclaude").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kilroy_handoff_resume_runs_for_the_adopting_pane() {
+    a_handoff_resume_runs_for_the_adopting_pane("kilroy").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undo_respawn_runs_for_the_same_pane() {
+    let (rig, _) = rig_with(resolved(), false).await;
+    let mut conn = rig.connect().await;
+    let session_id =
+        create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt", "second prompt"])
+        .await;
+
+    let (epoch, generation) = owner_pair(&mut conn, &durable).await;
+    conn.send(json!({
+        "type": "freshAgent.undo",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": session_id,
+        "requestId": "undo-1",
+        "mode": "step",
+        "observedEpoch": epoch,
+        "observedGeneration": generation,
+    }))
+    .await;
+    let ack = conn
+        .wait_for("the undo's ack", |v| {
+            v["type"] == "freshAgent.event" && v["event"]["requestId"] == "undo-1"
+        })
+        .await;
+    assert_eq!(ack["event"]["type"], "freshAgent.rolledBack", "{ack}");
+    let undone = rig
+        .wait_for_query("the undo's respawn", |o| {
+            o["forkSession"] == true && o["resume"] == durable
+        })
+        .await;
+    assert_mcp_for_pane(&rig, &undone, Some(("tab-1", "pane-1")), "undo respawn");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_child_runs_for_the_forking_pane() {
+    let (rig, _) = rig_with(resolved(), false).await;
+    let mut conn = rig.connect().await;
+    let session_id =
+        create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt"])
+        .await;
+
+    let (epoch, generation) = owner_pair(&mut conn, &durable).await;
+    conn.send(json!({
+        "type": "freshAgent.fork",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "sessionId": session_id,
+        "requestId": "fork-1",
+        "tabId": "tab-1",
+        "observedEpoch": epoch,
+        "observedGeneration": generation,
+    }))
+    .await;
+    let forked = conn
+        .wait_for("the fork's answer", |v| {
+            (v["type"] == "freshAgent.forked" && v["requestId"] == "fork-1")
+                || (v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == "freshAgent.error"
+                    && v["event"]["sessionId"] == session_id.as_str())
+        })
+        .await;
+    assert_eq!(forked["type"], "freshAgent.forked", "{forked}");
+    let child = forked["sessionId"]
+        .as_str()
+        .expect("forked names the child");
+    let options = rig
+        .wait_for_query("the fork's child", |o| o["sessionId"] == child)
+        .await;
+    assert_mcp_for_pane(&rig, &options, Some(("tab-1", "pane-1")), "fork child");
+}

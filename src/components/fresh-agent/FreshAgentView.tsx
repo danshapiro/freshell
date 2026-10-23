@@ -617,6 +617,7 @@ function captureAttachmentAttempt(
 
 function buildFreshAgentAttachMessage(
   content: FreshAgentPaneContent,
+  pane: { tabId: string, paneId: string },
   cwd?: string,
   observedFence?: ObservedOwnerFence,
 ) {
@@ -628,6 +629,10 @@ function buildFreshAgentAttachMessage(
     provider: content.provider,
     ...(sessionRef ? { sessionRef } : {}),
     ...(cwd ? { cwd } : {}),
+    // G19: an attach that resumes the session hands the agent's Freshell MCP
+    // this pane as its context.
+    tabId: pane.tabId,
+    paneId: pane.paneId,
     ...(observedFence
       ? { observedEpoch: observedFence.epoch, observedGeneration: observedFence.generation }
       : {}),
@@ -1783,9 +1788,9 @@ export function FreshAgentView({
     if (attachmentAttemptKey(state, content, attachDecisionSerialRef.current) !== attempt.key) return false
     if (isLifecycleStartSuperseded(state, 'fresh-agent', content, attempt.fence)) return false
     const cwd = getFreshOpenCodeRouteCwd(attempt.content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-    sendFreshAgentMessage(buildFreshAgentAttachMessage(attempt.content, cwd, attempt.fence))
+    sendFreshAgentMessage(buildFreshAgentAttachMessage(attempt.content, { tabId, paneId }, cwd, attempt.fence))
     return true
-  }, [appStore, sendFreshAgentMessage])
+  }, [appStore, paneId, sendFreshAgentMessage, tabId])
 
   // kata b8ke: the opened-as-CLI-elsewhere attach action — THIS pane adopts
   // the committed terminal owner (keeping its sessionRef + createRequestId,
@@ -2028,6 +2033,8 @@ export function FreshAgentView({
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
+      // G19: with tabId, the pane the agent's Freshell MCP acts for.
+      paneId,
       ...(namingHandle ? { namingHandle } : {}),
       // kata b8ke delayed-request fence (round-2 review: the fence is the
       // (epoch, generation) PAIR from the runtime-owner record observed when
@@ -2037,7 +2044,7 @@ export function FreshAgentView({
         ? { observedEpoch: observedFence.epoch, observedGeneration: observedFence.generation }
         : {}),
     } as const
-  }, [providerDefaults, tabId])
+  }, [paneId, providerDefaults, tabId])
 
   const startNewConversation = useCallback(async () => {
     const current = paneContentRef.current

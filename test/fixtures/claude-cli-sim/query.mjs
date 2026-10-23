@@ -20,7 +20,9 @@
 //   - tool heartbeats every 30 s, Bash task promotion and the
 //     BASH_MAX_TIMEOUT_MS cap, background agents and the CLI-initiated turn
 //     their completion starts, API errors, canUseTool with suggestions and
-//     ExitPlanMode.
+//     ExitPlanMode;
+//   - stdio MCP servers started with the CLI's environment, listed once
+//     connected, and called for their tools (mcp.mjs).
 //
 // The model's side of each turn comes from prompt markers
 // (prompt-markers.mjs, shared with the real-CLI loopback provider) or from a
@@ -48,7 +50,8 @@
 //                                       `query`, the ordinal of its query() call in
 //                                       this process. Rows: `query` (the options, env
 //                                       reduced to key names plus short sha256
-//                                       digests of credential values), `boot` (the session id
+//                                       digests of credential values and the
+//                                       Freshell context values), `boot` (the session id
 //                                       and the stand-in CLI's pid), `prompt` (each
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
@@ -83,6 +86,7 @@ import {
   usage,
 } from './sdk-shapes.mjs'
 import { toolCall } from './tools.mjs'
+import { McpServers } from './mcp.mjs'
 import {
   claudeConfigDir,
   CLI_VERSION,
@@ -126,6 +130,7 @@ function markerSteps(text) {
     case 'retry': return [{ kind: 'api_retry', data: { status: marker.status, attempts: marker.attempts } }, { kind: 'text', data: { text: 'ok' } }]
     case 'hang': return [{ kind: 'hang', data: {} }]
     case 'mcp_hang': return [{ kind: 'tool', data: { name: HANG_MCP_QUALIFIED_TOOL, input: {}, hang: true } }]
+    case 'mcp_call': return [{ kind: 'tool', data: { name: marker.tool, input: {} } }]
     case 'agent_async': return [{ kind: 'agent', data: {} }]
     case 'exit_plan': return [{ kind: 'exit_plan', data: { plan: PLAN_TEXT } }]
     default: return [{ kind: 'text', data: { text: 'ok' } }]
@@ -224,6 +229,9 @@ class SimulatedCli {
   constructor({ prompt, options = {} }) {
     this.options = options
     this.env = { ...process.env, ...(options.env ?? {}) }
+    // What the CLI process itself (and so its MCP servers) gets: the SDK's
+    // `env` option in place of this process's environment, as the SDK does.
+    this.cliEnv = options.env ?? process.env
     this.scale = Math.max(0, Number(this.env.FRESHELL_CLAUDE_SIM_TIME_SCALE ?? 1) || 0)
     this.channel = createChannel()
     this.program = new ProgramEngine(loadProgram(this.env))
@@ -254,6 +262,8 @@ class SimulatedCli {
 
     this.sessionId = options.forkSession ? (options.sessionId ?? randomUUID()) : (options.resume ?? options.sessionId ?? randomUUID())
     this.spawnCli()
+    // The CLI starts its stdio MCP servers with its own environment (mcp.mjs).
+    this.mcp = new McpServers(options.mcpServers, { env: this.cliEnv, cwd: this.cwd })
     this.background(this.pumpInput(prompt))
     this.background(this.boot())
 
@@ -379,6 +389,7 @@ class SimulatedCli {
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
     this.turn?.abort()
+    this.mcp?.stop()
     this.init.reject(error ?? new Error('Query closed before the CLI booted'))
     this.channel.end(error)
     if (!this.cliExited) {
@@ -473,7 +484,7 @@ class SimulatedCli {
   }
 
   systemInit() {
-    const mcpServers = Object.keys(this.options.mcpServers ?? {}).map((name) => ({ name, status: 'connected' }))
+    const mcpServers = this.mcp.statuses()
     const plugins = (this.options.plugins ?? []).map((plugin) => ({ name: path.basename(plugin.path ?? String(plugin)), path: plugin.path ?? String(plugin) }))
     return {
       type: 'system',
@@ -484,6 +495,7 @@ class SimulatedCli {
       ...(this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS === undefined
         ? {}
         : { terminal_slash_commands: this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS.split(',').filter(Boolean) }),
+      tools: [...CATALOG.init.tools, ...this.mcp.toolNames()],
       mcp_servers: mcpServers,
       plugins,
       model: this.model,
@@ -590,6 +602,8 @@ class SimulatedCli {
   async runModelTurn(turn) {
     const { cmd } = turn
     await this.sleep(T.startedToInit)
+    // A turn's request waits for the MCP servers to connect (or fail).
+    await this.mcp.settled()
     this.emit(this.systemInit())
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
@@ -620,6 +634,7 @@ class SimulatedCli {
     // origin task-notification: no prompt of its own, and no SDK message.
     this.transcript.append({ type: 'user', message: { role: 'user', content: taskNotificationXml(task) }, origin: { kind: 'task-notification' } })
     this.transcript.append({ type: 'attachment', attachment: { type: 'total_tokens_reminder', text: '<total_tokens>15000000 tokens left</total_tokens>' } })
+    await this.mcp.settled()
     this.emit(this.systemInit())
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
@@ -728,7 +743,10 @@ class SimulatedCli {
 
   /** One streamed text block. Returns false when the turn was aborted (and has been ended). */
   async streamText(turn, data) {
-    const pieces = data.chunks ? Array.from({ length: data.chunks }, (_, i) => `chunk${i} `) : [data.text ?? 'ok']
+    // A model that repeats what its last tool call returned (`echoToolResult`,
+    // after an optional `text` prefix).
+    const reply = data.echoToolResult ? `${data.text ?? ''}${turn.lastToolResultText ?? ''}` : (data.text ?? 'ok')
+    const pieces = data.chunks ? Array.from({ length: data.chunks }, (_, i) => `chunk${i} `) : [reply]
     const pace = data.chunks ? (data.delayMs ?? SLOW_DELAY_MS) : 0
     this.emitStream(this.messageStart())
     this.emitStream({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
@@ -764,6 +782,7 @@ class SimulatedCli {
   toolResult(toolUseId, content, { isError = false, toolUseResult, extra = {} } = {}) {
     const uuid = randomUUID()
     const block = { tool_use_id: toolUseId, type: 'tool_result', content, ...(isError ? { is_error: true } : { is_error: false }) }
+    if (this.turn) this.turn.lastToolResultText = Array.isArray(content) ? content.map((part) => part?.text ?? '').join('') : String(content ?? '')
     this.emit({ type: 'user', message: { role: 'user', content: [block] }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), tool_use_result: toolUseResult, ...extra })
     this.transcript.append({ type: 'user', uuid, message: { role: 'user', content: [block] }, toolUseResult })
     // Sends absorbed while the tool ran join the turn as queued_command
@@ -1013,7 +1032,7 @@ class SimulatedCli {
   }
 
   async mcpServerStatus() {
-    return this.control(() => Object.keys(this.options.mcpServers ?? {}).map((name) => ({ name, status: 'connected' })))
+    return this.control(() => this.mcp.statuses())
   }
 
   async initializationResult() {
@@ -1022,14 +1041,18 @@ class SimulatedCli {
 }
 
 /** The credentials whose value a test may need to tell apart (as a digest, never the value). */
-const DIGESTED_CREDENTIALS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN']
+const DIGESTED_CREDENTIALS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'FRESHELL_TOKEN']
+
+/** The non-secret Freshell context names whose values the ledger records (the token is digested). */
+const RECORDED_CONTEXT = ['FRESHELL', 'FRESHELL_URL', 'FRESHELL_TERMINAL_ID', 'FRESHELL_TAB_ID', 'FRESHELL_PANE_ID']
 
 /** A short sha256 digest of a credential value: enough to compare, useless to read. */
 const credentialDigest = (value) => createHash('sha256').update(String(value)).digest('hex').slice(0, 12)
 
 /**
  * The options as a ledger row: functions and controllers by kind, env by key
- * names only, plus a short digest of each credential the child got.
+ * names only, plus a short digest of each credential the child got and the
+ * values of the non-secret Freshell context names.
  */
 function describeOptions(options) {
   const out = {}
@@ -1038,6 +1061,7 @@ function describeOptions(options) {
       const env = value ?? {}
       out.envKeys = Object.keys(env).sort()
       out.envDigests = Object.fromEntries(DIGESTED_CREDENTIALS.filter((name) => env[name] !== undefined).map((name) => [name, credentialDigest(env[name])]))
+      out.envContext = Object.fromEntries(RECORDED_CONTEXT.filter((name) => env[name] !== undefined).map((name) => [name, env[name]]))
     } else if (key === 'abortController') out.abortController = Boolean(value)
     else if (typeof value === 'function') out[key] = '[function]'
     else out[key] = value

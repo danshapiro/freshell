@@ -453,6 +453,36 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(cliTurn).toEqual(['lifecycle u1 completed', 'idle', 'task_notification', 'running', 'init', 'result', 'idle'])
     expect(messagesOf(r, 'S').filter((m) => m.type === 'command_lifecycle').every((m) => m.command_uuid === 'u1')).toBe(true)
   }, SCENARIO_TIMEOUT)
+
+  it('G19: a stdio MCP server starts with the CLI\'s environment and its tools are listed and called; an MCP tool no server offers is an error result', async () => {
+    const r = await real('mcp')
+    const environment = {
+      FRESHELL: '1',
+      FRESHELL_URL: 'http://127.0.0.1:9/probe',
+      FRESHELL_TOKEN_SHA256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      FRESHELL_TAB_ID: 'tab-s',
+      FRESHELL_PANE_ID: 'pane-s',
+      FRESHELL_TERMINAL_ID: null,
+    }
+    expect(r.observations.serverEnvironment).toEqual(environment)
+    expect(r.observations.connected).toEqual({
+      mcpServers: [{ name: 'freshell', status: 'connected' }],
+      mcpTools: ['mcp__freshell__context'],
+      toolResults: [{ isError: false, content: ['text'], text: environment, toolUseResult: ['text'] }],
+    })
+    expect(r.observations.missing).toEqual({
+      mcpServers: [],
+      mcpTools: [],
+      toolResults: [{
+        isError: true,
+        content: 'string',
+        text: '<tool_use_error>Error: No such tool available: mcp__freshell__freshell</tool_use_error>',
+        toolUseResult: 'string',
+      }],
+    })
+    expect(results(r, 'S').map((m) => m.subtype)).toEqual(['success'])
+    expect(results(r, 'M').map((m) => m.subtype)).toEqual(['success'])
+  }, SCENARIO_TIMEOUT)
 })
 
 describeSimulatorConformance(real)

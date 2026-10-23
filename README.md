@@ -262,6 +262,13 @@ are separate resources. Claude fresh-agent panes use the isolated
 `crates/freshell-claude-sidecar` package, which wraps the Claude SDK over
 newline-delimited JSON on stdin/stdout. The sidecar is not a network service.
 
+Freshclaude and Kilroy panes give their agent the same Freshell MCP server, so
+the agent can list and drive tabs and panes; its default target is the pane it
+runs in. The **Agent MCP server** switch (Settings → Advanced) controls this:
+turning it off removes the server from Freshclaude and Kilroy agents started or
+resumed after the change, with no restart. Terminal panes do not follow the
+switch yet.
+
 ### Rust server scope
 
 The Rust server supports the browser UI, terminal and session workflows, the

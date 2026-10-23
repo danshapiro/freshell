@@ -12580,6 +12580,7 @@ pub(crate) mod tests {
         let sink = crate::naming::test_support::RecordingSink::new();
         st.set_session_naming(sink.clone());
         let create = FreshAgentCreate {
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             naming_handle: Some("handle-codex-early".to_string()),
@@ -14560,6 +14561,7 @@ pub(crate) mod tests {
         let create = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -14735,6 +14737,7 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -14895,6 +14898,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -22075,6 +22079,7 @@ pub(crate) mod tests {
             let (st, mut rx) = state_with_bus();
             st.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -22132,6 +22137,8 @@ pub(crate) mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
@@ -22587,6 +22594,8 @@ pub(crate) mod tests {
             .await;
 
             st.handle_attach(FreshAgentAttach {
+                tab_id: None,
+                pane_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Codex,
@@ -22766,6 +22775,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -22819,6 +22829,7 @@ pub(crate) mod tests {
     /// `request_id`.
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            pane_id: None,
             naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
@@ -23164,6 +23175,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -23234,6 +23246,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -23315,6 +23328,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -23384,6 +23398,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -24012,6 +24027,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -24063,6 +24079,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 naming_handle: Some(naming_handle.to_string()),
@@ -24259,6 +24276,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -24328,6 +24346,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -24410,6 +24429,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -24839,6 +24859,8 @@ pub(crate) mod tests {
 
         configure_fake_codex_cmd("{}");
         st.handle_attach(FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
@@ -24934,6 +24956,7 @@ pub(crate) mod tests {
         let create_task = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    pane_id: None,
                     naming_handle: None,
                     observed_epoch: None,
                     observed_generation: None,
@@ -25094,6 +25117,8 @@ pub(crate) mod tests {
         let attach_task = tokio::spawn(async move {
             st_attach
                 .handle_attach(FreshAgentAttach {
+                    tab_id: None,
+                    pane_id: None,
                     observed_epoch: None,
                     observed_generation: None,
                     provider: freshell_protocol::AgentProvider::Codex,
@@ -25190,6 +25215,8 @@ pub(crate) mod tests {
 
         configure_fake_codex_cmd("{}");
         st.handle_attach(FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
@@ -27868,6 +27895,8 @@ pub(crate) mod tests {
         // THE STALE ATTACH: observed generation is the PRE-advance value —
         // typed refusal (SESSION_RESERVED), never a recreation.
         st.handle_attach(FreshAgentAttach {
+            tab_id: None,
+            pane_id: None,
             observed_epoch: Some(before.epoch),
             observed_generation: Some(before.generation),
             provider: freshell_protocol::AgentProvider::Codex,
@@ -28720,6 +28749,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
                         observed_generation: None,
@@ -28830,6 +28860,7 @@ pub(crate) mod tests {
             task_st
                 .handle_create(
                     FreshAgentCreate {
+                        pane_id: None,
                         naming_handle: None,
                         observed_epoch: None,
                         observed_generation: None,
@@ -28945,6 +28976,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -29358,6 +29390,7 @@ pub(crate) mod tests {
         // adopted without consulting the coordinator.
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: None,
                 observed_generation: None,
@@ -29448,6 +29481,7 @@ pub(crate) mod tests {
         // observed generation — the fence discipline refuses typed.
         st.handle_create(
             FreshAgentCreate {
+                pane_id: None,
                 naming_handle: None,
                 observed_epoch: Some(registry.boot_epoch()),
                 observed_generation: Some(stale_generation),

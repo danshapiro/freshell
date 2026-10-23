@@ -376,6 +376,8 @@ export async function startLocalProvider({ replyText = 'ok', respond } = {}) {
       toolUse('Bash', { command: marker.command, description: 'local provider command', ...(marker.timeoutMs ? { timeout: marker.timeoutMs } : {}) })
     } else if (marker.kind === 'mcp_hang') {
       toolUse(HANG_MCP_QUALIFIED_TOOL, {})
+    } else if (marker.kind === 'mcp_call' && !afterTool) {
+      toolUse(marker.tool, {})
     } else if (marker.kind === 'exit_plan') {
       toolUse('ExitPlanMode', { plan: PLAN_TEXT })
     } else if (marker.kind === 'agent_async') {

@@ -14,11 +14,18 @@
 // there. A matching prompt rule replaces the prompt-marker behavior for that
 // turn; its emissions run in order as the model's side of the turn:
 //
-//   text / activity  { text?, chunks?, delayMs? }   one streamed assistant text block
+//   text / activity  { text?, chunks?, delayMs?, echoToolResult? }
+//                                                   one streamed assistant text block; with
+//                                                   echoToolResult it repeats what the turn's last
+//                                                   tool call returned, after `text`
 //   tool             { name, input, id?, seconds?, output?, isError?, inputStreamMs? }
 //                                                   a tool call and its result; with inputStreamMs
 //                                                   the model streams the call's input for that long
-//                                                   (a long Write) before the call completes
+//                                                   (a long Write) before the call completes. An
+//                                                   MCP tool (`mcp__<server>__<tool>`) is called on
+//                                                   the session's stdio server, and its answer is the
+//                                                   result; a tool no connected server lists is the
+//                                                   CLI's "No such tool available" error (mcp.mjs)
 //   approval         { tool, input, id?, suggestions?, blockedPath?, decisionReason? }
 //                    a tool call that asks canUseTool, with these fields; under
 //                    bypassPermissions (where the pinned CLI asks for no tool
