@@ -85,6 +85,7 @@ mod rest_lane_sync;
 mod rename_response;
 mod rename_target_cwd;
 pub mod rollback_record;
+mod scoped_name_rename;
 pub mod session_handoff;
 pub mod session_lease;
 pub mod session_metadata;
@@ -5861,8 +5862,16 @@ pub(crate) fn resolve_pane_name_target(
             target: None,
         });
     }
-    // Unified agent names (Task 8, the T6-R3 sender-repair consequence): the
-    // pane's canonical binding rungs — `nameRef`, then the PRE-DURABLE
+    // The terminal's current naming binding is authoritative while the
+    // browser layout catches up with an in-pane conversation switch.
+    if let Some(target) = scoped_name_rename::terminal_binding(state, content) {
+        return Some(PaneNameResolution {
+            scoped: true,
+            target: Some(target),
+        });
+    }
+    // Without a live terminal binding, use the client's canonical rungs
+    // (including fresh-agent panes): `nameRef`, then the PRE-DURABLE
     // `namingHandle`, then the durable `sessionRef`, then the create-lane
     // stash — in EXACTLY the client's approved order
     // (`resolvePaneNameRef`, sessionNameSelectors). The pre-durable handle
@@ -6124,7 +6133,23 @@ pub(crate) async fn rename_scoped_session(
     if let Some(expected) = body.get("expectedNameRef") {
         let expected_ref: Option<freshell_protocol::session_names::SessionNameRef> =
             serde_json::from_value(expected.clone()).ok();
-        if expected_ref.as_ref() != Some(&target) {
+        let capture_matches = match scoped_name_rename::capture_matches(
+            state,
+            expected_ref.as_ref(),
+            &target,
+        )
+        .await
+        {
+            Ok(matches) => matches,
+            Err(error) => {
+                naming::log_name_error("rename_capture", &target, &error);
+                return scoped_name_error_response(
+                    &error,
+                    &serde_json::to_value(&target).unwrap_or(Value::Null),
+                );
+            }
+        };
+        if !capture_matches {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -6187,64 +6212,22 @@ pub(crate) async fn rename_scoped_session(
     };
     // Name-reliability Task 4 (LB-B8): the pane's best-known folder.
     let cwd = pane_id.and_then(|pane_id| rename_target_cwd::pane_rename_cwd(state, pane_id));
-    match sink
-        .rename(naming::RenameNameInput {
+    match scoped_name_rename::rename(
+        state,
+        sink.as_ref(),
+        pane_id,
+        naming::RenameNameInput {
             target: target.clone(),
             name: name.clone(),
             intent,
             if_revision,
             cwd: cwd.clone(),
-        })
-        .await
+        },
+    )
+    .await
     {
         Ok(update) => rename_response::scoped_rename_response(tab_id, pane_id, &update),
         Err(error) => {
-            // Unified agent names (Task 8 acceptance): the pre-bind
-            // fallback. A fresh claude pane's content carries the
-            // PROSPECTIVE preallocated sessionRef (both create doors put
-            // it there before any transcript exists), so the primary
-            // session-target rename answers NotFound until the first
-            // message materializes the identity. The pane's own naming
-            // binding pre-bind is its PENDING handle — resolve that and
-            // retry once. The `expectedNameRef` capture guard already
-            // passed against the pane's visible binding, and the 404
-            // itself proves no established record exists to have switched
-            // conversations from, so the retry needs no second guard.
-            if matches!(error, naming::NameError::NotFound(_))
-                && matches!(
-                    target,
-                    freshell_protocol::session_names::SessionNameRef::Session { .. }
-                )
-            {
-                if let Some(pane_id) = pane_id {
-                    if let Some(pending) = resolve_pane_pending_binding(state, pane_id) {
-                        match sink
-                            .rename(naming::RenameNameInput {
-                                target: pending.clone(),
-                                name,
-                                intent,
-                                if_revision,
-                                cwd,
-                            })
-                            .await
-                        {
-                            Ok(update) => {
-                                return rename_response::scoped_rename_response(
-                                    tab_id,
-                                    Some(pane_id),
-                                    &update,
-                                );
-                            }
-                            Err(retry_error) => {
-                                naming::log_name_error("rename", &pending, &retry_error);
-                                let target_value =
-                                    serde_json::to_value(&pending).unwrap_or(Value::Null);
-                                return scoped_name_error_response(&retry_error, &target_value);
-                            }
-                        }
-                    }
-                }
-            }
             naming::log_name_error("rename", &target, &error);
             let target_value = serde_json::to_value(&target).unwrap_or(Value::Null);
             scoped_name_error_response(&error, &target_value)
