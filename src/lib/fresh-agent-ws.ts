@@ -7,7 +7,7 @@ import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from 
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
-import { applyFreshAgentCompletion, applyFreshAgentWaiting, observeFreshAgentSession } from '@/store/turnCompletionThunks'
+import { applyFreshAgentCompletion, applyFreshAgentWaiting, observeFreshAgentSession, rekeyFreshAgentAttention } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
@@ -233,6 +233,7 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.session.materialized': {
       const materialized = msg as FreshAgentSessionMaterializedMessage
+      dispatch(rekeyFreshAgentAttention(materialized))
       // Stream events queued under the old id land before the re-key moves them.
       streamBatcherFor(dispatch).flush({
         sessionId: materialized.previousSessionId,

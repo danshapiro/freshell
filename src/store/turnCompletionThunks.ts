@@ -29,6 +29,17 @@ export function observeFreshAgentSession(payload: { provider: string; sessionId:
   }
 }
 
+/** Materialization changes the envelope, not what this page has witnessed. */
+export function rekeyFreshAgentAttention(payload: { provider: string; previousSessionId: string; sessionId: string }) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    for (const keyFor of [completionDedupeKey, waitingDedupeKey]) {
+      const previousKey = keyFor(payload.provider, payload.previousSessionId)
+      const at = getState().turnCompletion?.lastAtByTerminalId[previousKey] ?? 0
+      dispatch(advanceCompletionBaseline({ terminalId: keyFor(payload.provider, payload.sessionId), at }))
+    }
+  }
+}
+
 /** First observation seeds silently; a same-page reconnect replays unseen edges. */
 export function foldReadyFreshAgentAttention(marks: ReadyMessage['freshAgentAttention']) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {

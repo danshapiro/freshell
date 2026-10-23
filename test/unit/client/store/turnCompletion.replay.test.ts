@@ -118,6 +118,21 @@ describe('fresh-agent reconnect attention', () => {
     expect(store.getState().turnCompletion.pendingEvents[1]).toMatchObject({ terminalId: 'claude:session-1#waiting', at: 110 })
   })
 
+  it('carries observed baselines through a materialized id before replaying new edges', () => {
+    const { store, dispatch } = createStore()
+    dispatch(foldReadyFreshAgentAttention([{ ...mark(100, 110)[0], sessionId: 'old-id' }]))
+    handleFreshAgentMessage(dispatch, {
+      type: 'freshAgent.session.materialized', previousSessionId: 'old-id', sessionId: 'session-1',
+      sessionType: 'freshclaude', provider: 'claude',
+    })
+    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:session-1']).toBe(100)
+    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:session-1#waiting']).toBe(110)
+    dispatch(foldReadyFreshAgentAttention(mark(100, 110)))
+    expect(store.getState().turnCompletion.seq).toBe(0)
+    dispatch(foldReadyFreshAgentAttention(mark(101, 111)))
+    expect(store.getState().turnCompletion.seq).toBe(2)
+  })
+
   it('records live edges without a local pane, preventing later replay', () => {
     const { store, dispatch } = createStore()
     const payload = { provider: 'claude', sessionId: 'remote-only', at: 100 }
