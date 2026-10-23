@@ -59,7 +59,9 @@ exceptions (the rules live in
   scoped rename response carries `outcome`: `{applied: true}`;
   `{applied: true, reason: "unchanged"}` when the saved name already is
   that text; or `{applied: false, reason: "protected_name" | "default_label"}`.
-  Broadcasts never carry it. The CLI reports a refusal on stderr as
+  Broadcasts never carry it. The fresh-agent pane and tab routes' `message`
+  follows it (`session name not applied: <reason>` for a refusal, else
+  `session renamed`). The CLI reports a refusal on stderr as
   `name not applied: <reason>`, and the MCP tool adds it as a `warning`.
 - **The self-heal rule.** An unprotected saved name (`directory`,
   `first_message`, `provider_ai`) that the shared classifier recognizes as
