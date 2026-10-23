@@ -1302,6 +1302,7 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
     // exactly what the unconditional materialization write produces for a
     // default create) still answers `lookup_by_create_request_id`.
     sink.record_binding(FreshAgentBindingUpsert {
+        genesis: crate::identity_sink::GenesisUpdate::Keep,
         name_transition: None,
         provider: "opencode".into(),
         session_id: "ses_placeholder_resumed".into(),

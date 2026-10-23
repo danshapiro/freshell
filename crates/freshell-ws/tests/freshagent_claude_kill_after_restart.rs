@@ -159,7 +159,12 @@ impl PaneIdentitySink for TestLedgerSink {
         let now = Self::now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                let stored_genesis = upsert.genesis.stored_value();
                 let w = freshell_ws::pane_ledger::FreshAgentBindingWrite {
+                    genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
+                        stored_genesis.as_ref(),
+                        upsert.genesis.is_clear(),
+                    ),
                     provider: &upsert.provider,
                     session_id: &upsert.session_id,
                     mode: &upsert.mode,
@@ -198,6 +203,36 @@ impl PaneIdentitySink for TestLedgerSink {
             plugins: row.plugins,
         })
     }
+    fn load_genesis(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> Option<freshell_freshagent::RecordedGenesis> {
+        let row = self.ledger.load_binding(provider, session_id)?;
+        if row.pane_kind.as_deref() != Some("fresh-agent") {
+            return None;
+        }
+        freshell_freshagent::RecordedGenesis::from_row(
+            provider,
+            session_id,
+            row.genesis.as_ref(),
+            row.updated_at,
+        )
+    }
+
+    fn clear_genesis(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = Self::now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.clear_binding_genesis(&p, &s, now).map(|_| ())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
         self.ledger.load_binding(provider, session_id).is_some()
     }

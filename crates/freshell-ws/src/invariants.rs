@@ -1433,6 +1433,7 @@ mod tests {
         state
             .pane_ledger
             .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
+                genesis: crate::pane_ledger::GenesisWrite::Keep,
                 provider: "opencode",
                 session_id: "ses_freshagent",
                 mode: "freshopencode",

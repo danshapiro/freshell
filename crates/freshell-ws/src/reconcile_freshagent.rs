@@ -27,6 +27,13 @@
 //!   succeed (validated: the real CLI prompt-exits on unresumable ids), the
 //!   pane converges to the honest, bounded dead_session{respawn_exhausted}
 //!   via the respawn cap instead of a false session_not_on_disk.
+//! - Zero-turn and pending-fork CLAUDE fresh-agent sessions have no
+//!   transcript until their first prompt either, but unlike codex they are
+//!   minted with a genesis in their binding row (claude core design §4.1):
+//!   a disk miss for a bound claude id with a genesis and no on-disk
+//!   observation reads as present (`respawn`), so a restart brings the
+//!   session back instead of declaring it dead (§4.4,
+//!   [`claude_pending_genesis`]).
 //! - WATCH: codex `.jsonl.zst` cold-rollout compression (vendor feature,
 //!   default-OFF today) would hide ≥7-day-old sessions from the `.jsonl`-only
 //!   index walk ⇒ false Absent. Revisit if the vendor flag graduates.
@@ -63,6 +70,39 @@ fn respawn_burn_skipped(state: &freshell_ownership::OwnershipState) -> bool {
             // arm — never burn the counter toward a false respawn_exhausted.
             | OwnershipState::Fenced { .. }
     )
+}
+
+/// Claude core design §4.4 (the restart fix; the fresh-agent twin of the
+/// terminal claude carve-out in `reconcile.rs`): a claude session whose
+/// transcript does not exist yet but whose binding row records a genesis (a
+/// zero-turn session, a pending fork after an undo) is pending, not dead — its
+/// next launch boots it from the genesis — so a disk miss for it reads as
+/// present (`respawn`, under the respawn cap). Only while the transcript has
+/// never been seen on disk: the genesis is cleared lazily after the transcript
+/// is observed, so a seen-then-gone transcript whose genesis survived is
+/// deleted, not pending, and stays `dead_session`.
+fn claude_pending_genesis(state: &crate::WsState, provider: &str, session_id: &str) -> bool {
+    if provider != "claude"
+        || state
+            .pane_ledger
+            .binding_genesis(provider, session_id)
+            .is_none()
+    {
+        return false;
+    }
+    if state
+        .session_existence
+        .ever_observed_on_disk(provider, session_id)
+    {
+        return false;
+    }
+    tracing::debug!(
+        target: "freshell_ws::reconcile_freshagent",
+        event = "freshagent.claude.reconcile_pending_genesis",
+        session_id = %session_id,
+        "a bound claude session with a genesis and no transcript yet reads as present"
+    );
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +226,9 @@ pub async fn build_snapshot(
                 E::Present => FreshAgentPresence::OnDisk,
                 E::ProviderUnavailable => FreshAgentPresence::Unknown,
                 E::Absent => {
-                    if state
+                    if claude_pending_genesis(state, &sref.provider, &session_id) {
+                        FreshAgentPresence::OnDisk
+                    } else if state
                         .session_existence
                         .ever_observed(&sref.provider, &session_id)
                     {

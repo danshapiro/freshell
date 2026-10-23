@@ -86,9 +86,10 @@ pub use claude_snapshot::{
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
-    BindProvenance, ClaimCommit, CloseAnswer, FreshAgentBindingUpsert, FreshAgentSettings,
-    PaneIdentitySink, ProvenanceUpdate, SharedPaneIdentitySink, SinkAliasClearWrite,
-    SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkWrite,
+    BindProvenance, ClaimCommit, ClaudeGenesis, CloseAnswer, FreshAgentBindingUpsert,
+    FreshAgentSettings, GenesisUpdate, PaneIdentitySink, ProvenanceUpdate, RecordedGenesis,
+    SharedPaneIdentitySink, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
+    SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rollback_record::{
@@ -5516,6 +5517,7 @@ async fn resume_session_ref_tab(
     if let Some(sink) = state.identity_sink() {
         if let Err(e) = sink
             .record_binding(identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
                 mode: SESSION_TYPE.into(),
@@ -6574,6 +6576,7 @@ async fn send_keys(
         if let Some(sink) = state.identity_sink() {
             if let Err(e) = sink
                 .record_binding(identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: durable_id.clone(),
                     mode: SESSION_TYPE.into(),

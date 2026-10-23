@@ -4,8 +4,8 @@
 
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
-    SinkWrite,
+    RecordedGenesis, RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite,
+    SinkCommitWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -330,7 +330,12 @@ impl PaneIdentitySink for LedgerIdentitySink {
                         freshell_ws::pane_ledger::ProvenancePolicy::Clear
                     }
                 };
+                let stored_genesis = upsert.genesis.stored_value();
                 let w = FreshAgentBindingWrite {
+                    genesis: freshell_ws::pane_ledger::GenesisWrite::from_update(
+                        stored_genesis.as_ref(),
+                        upsert.genesis.is_clear(),
+                    ),
                     provider: &upsert.provider,
                     session_id: &upsert.session_id,
                     mode: &upsert.mode,
@@ -430,6 +435,29 @@ impl PaneIdentitySink for LedgerIdentitySink {
             return None;
         }
         Some(s)
+    }
+
+    fn load_genesis(&self, provider: &str, session_id: &str) -> Option<RecordedGenesis> {
+        // Memory-only against the write-through index, gated like
+        // `load_settings` (only fresh-agent rows carry a genesis).
+        let row = self.ledger.load_binding(provider, session_id)?;
+        if row.pane_kind.as_deref() != Some("fresh-agent") {
+            return None;
+        }
+        RecordedGenesis::from_row(provider, session_id, row.genesis.as_ref(), row.updated_at)
+    }
+
+    fn clear_genesis(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.clear_binding_genesis(&p, &s, now).map(|_| ())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
     }
 
     fn load_provenance(&self, provider: &str, session_id: &str) -> Option<BindProvenance> {
@@ -763,6 +791,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "codex".into(),
             session_id: "t1".into(),
@@ -810,6 +839,7 @@ mod tests {
         let plugins = vec!["/workspace/.claude/plugins/local".to_string()];
         let sink = LedgerIdentitySink::new(ledger, None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "s1".into(),
@@ -849,6 +879,89 @@ mod tests {
                 .plugins,
             Some(plugins)
         );
+    }
+
+    /// Claude core design §4.1: the genesis rides the binding write, survives
+    /// a restart, is kept by a later settings write, and is dropped by the
+    /// lazy clear once the transcript is on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genesis_writes_through_reads_back_and_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger, None);
+        let fork = freshell_freshagent::ClaudeGenesis::Fork {
+            parent: "p-1".into(),
+            at: Some("a-1".into()),
+            drops_turn: Some("u-2".into()),
+        };
+        let upsert = |genesis, model: Option<&str>| FreshAgentBindingUpsert {
+            genesis,
+            name_transition: None,
+            provider: "claude".into(),
+            session_id: "s-pending".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            settings: FreshAgentSettings {
+                model: model.map(str::to_string),
+                ..FreshAgentSettings::default()
+            },
+        };
+        sink.record_binding(upsert(
+            freshell_freshagent::GenesisUpdate::Set(fork.clone()),
+            None,
+        ))
+        .await
+        .expect("awaited write succeeds");
+        let recorded = sink
+            .load_genesis("claude", "s-pending")
+            .expect("the genesis is recorded");
+        assert_eq!(recorded.genesis, fork);
+
+        // A settings write (a model change before the first send) keeps it.
+        sink.record_binding(upsert(
+            freshell_freshagent::GenesisUpdate::Keep,
+            Some("sonnet"),
+        ))
+        .await
+        .expect("awaited write succeeds");
+        let restarted = LedgerIdentitySink::new(
+            Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+                tmp.path().to_path_buf(),
+            ))),
+            None,
+        );
+        let kept = restarted
+            .load_genesis("claude", "s-pending")
+            .expect("the genesis survives a settings write and a restart");
+        assert_eq!(kept.genesis, fork);
+        assert!(kept.updated_at_ms >= recorded.updated_at_ms);
+
+        restarted
+            .clear_genesis("claude", "s-pending")
+            .await
+            .expect("awaited clear succeeds");
+        assert_eq!(restarted.load_genesis("claude", "s-pending"), None);
+        assert_eq!(
+            restarted
+                .load_settings("claude", "s-pending")
+                .and_then(|s| s.model)
+                .as_deref(),
+            Some("sonnet"),
+            "the clear keeps the rest of the row"
+        );
+        // Clearing an identity with no row is a no-op.
+        restarted
+            .clear_genesis("claude", "s-none")
+            .await
+            .expect("a no-op clear succeeds");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -917,6 +1030,7 @@ mod tests {
         );
         // The identity lanes keep their silent-degrade policy on a disabled store.
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "s".into(),
@@ -967,6 +1081,7 @@ mod tests {
             plugins: None,
         };
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "fork-new-uuid".into(),
@@ -994,6 +1109,7 @@ mod tests {
         );
 
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "codex".into(),
             session_id: "new-thread".into(),
@@ -1039,6 +1155,7 @@ mod tests {
 
         // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: SESSION.into(),
@@ -1062,6 +1179,7 @@ mod tests {
         // The handoff target's binding write carries the SUPPLIED handoff
         // pair (the new owner: gen 4) — the row's fence baseline advances.
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: SESSION.into(),
@@ -1086,6 +1204,7 @@ mod tests {
         // upsert, carrying its PRE-handoff pair) — refused typed.
         let err = sink
             .record_binding(FreshAgentBindingUpsert {
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
                 name_transition: None,
                 provider: "opencode".into(),
                 session_id: SESSION.into(),
@@ -1142,6 +1261,7 @@ mod tests {
 
         // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: SESSION.into(),
@@ -1182,6 +1302,7 @@ mod tests {
         // carrying its OBSERVED pre-handoff pair) — refused typed.
         let err = sink
             .record_binding(FreshAgentBindingUpsert {
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
                 name_transition: None,
                 provider: "opencode".into(),
                 session_id: SESSION.into(),
@@ -1293,6 +1414,7 @@ mod tests {
             authoritative: bool,
         ) -> FreshAgentBindingUpsert {
             FreshAgentBindingUpsert {
+                genesis: freshell_freshagent::GenesisUpdate::Keep,
                 name_transition: None,
                 provider: "claude".into(),
                 session_id: SID.into(),
@@ -2039,6 +2161,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2086,6 +2209,7 @@ mod tests {
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let asserted = now_ms() - 30_000; // "provenance captured 30s before the write"
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_late".into(),
@@ -2146,6 +2270,7 @@ mod tests {
 
         // A stamped LINEAGE-ONLY row (blank settings) answers its stamps.
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2179,6 +2304,7 @@ mod tests {
         // A conn-less refresh (all-`None` stamps) keeps them — the REAL
         // ledger's `Inherit` preserve, end to end.
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -2202,6 +2328,7 @@ mod tests {
 
         // A genuinely unattributed row answers None — never Some(default).
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_unstamped".into(),
@@ -2268,6 +2395,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |provenance: freshell_freshagent::ProvenanceUpdate| FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
@@ -2327,6 +2455,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_lookup".into(),
@@ -2373,6 +2502,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "ses-to-kill".into(),
@@ -2463,6 +2593,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let bind = |id: &str, cr: &str| FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: id.into(),
@@ -2589,6 +2720,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger, None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "ses-rb".into(),
@@ -2639,6 +2771,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "ses-comp".into(),
@@ -2706,6 +2839,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: "d-alias".into(),
@@ -2804,6 +2938,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: session_id.into(),
@@ -2900,6 +3035,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: session_id.into(),
@@ -3025,6 +3161,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            genesis: freshell_freshagent::GenesisUpdate::Keep,
             name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_lineage".into(),

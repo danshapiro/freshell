@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::claude_snapshot::{LocateError, TranscriptLocation};
@@ -85,6 +86,58 @@ impl ClaudeBoot {
                 }
                 Value::Object(boot)
             }
+        }
+    }
+}
+
+/// How a session that has no transcript yet came to be (design §4.1). The
+/// session's binding row records it (`BindingRow.genesis`, opaque to the
+/// ledger) until the transcript has been observed on disk, so a launch before
+/// then boots the same conversation again, a snapshot shows what the session
+/// holds, and reconcile restarts the session instead of declaring it dead.
+///
+/// Wire shape: `{"kind":"fresh"}`, or
+/// `{"kind":"fork","parent":P,"at":U?,"dropsTurn":D?}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ClaudeGenesis {
+    /// A new conversation, booted under the session's own id (T3).
+    Fresh,
+    /// A lazy fork of `parent` holding its conversation through `at` (all of
+    /// it when `None`), booted under the session's own id (T6). `drops_turn`
+    /// arms the SDK's guard that the discarded part starts with that turn's
+    /// prompt.
+    Fork {
+        parent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drops_turn: Option<String>,
+    },
+}
+
+impl ClaudeGenesis {
+    /// The genesis as the binding row stores it.
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("a claude genesis always serializes")
+    }
+
+    /// The genesis a binding row stores, or `None` for a shape this server does
+    /// not know (a newer server's kind): the caller then treats the session as
+    /// having no genesis, which is what an older server does.
+    pub fn from_value(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    /// The genesis's kind as the logs name it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Fork { .. } => "fork",
         }
     }
 }
@@ -258,6 +311,56 @@ mod tests {
             }
             .wire(),
             json!({ "kind": "fork", "resume": "P" })
+        );
+    }
+
+    /// The stored genesis is the one the binding row keeps: it reads back as
+    /// written, and the ledger rows other crates seed (`{"kind":"fresh"}`,
+    /// `{"kind":"fork",...}`) read as the genesis they name.
+    #[test]
+    fn a_genesis_reads_back_from_the_shape_the_binding_row_stores() {
+        let fork = ClaudeGenesis::Fork {
+            parent: "P".into(),
+            at: Some("a1".into()),
+            drops_turn: Some("u2".into()),
+        };
+        for genesis in [
+            ClaudeGenesis::Fresh,
+            fork.clone(),
+            ClaudeGenesis::Fork {
+                parent: "P".into(),
+                at: None,
+                drops_turn: None,
+            },
+        ] {
+            assert_eq!(
+                ClaudeGenesis::from_value(&genesis.to_value()),
+                Some(genesis)
+            );
+        }
+        assert_eq!(
+            ClaudeGenesis::from_value(&json!({ "kind": "fresh" })),
+            Some(ClaudeGenesis::Fresh)
+        );
+        assert_eq!(
+            ClaudeGenesis::from_value(
+                &json!({ "kind": "fork", "parent": "P", "at": "a1", "dropsTurn": "u2" })
+            ),
+            Some(fork)
+        );
+        // A kind this server does not know reads as no genesis.
+        assert_eq!(
+            ClaudeGenesis::from_value(&json!({ "kind": "clone", "parent": "P" })),
+            None
+        );
+        assert_eq!(
+            crate::identity_sink::RecordedGenesis::from_row(
+                "claude",
+                "S",
+                Some(&json!({ "kind": "clone" })),
+                1
+            ),
+            None
         );
     }
 

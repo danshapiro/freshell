@@ -39,7 +39,11 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 #[derive(Default)]
 struct StubProbe {
     answers: std::sync::Mutex<std::collections::HashMap<(String, String), SessionExistence>>,
+    /// Identities this process saw on disk (the index or a locator hit).
     observed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// Identities only the ledger remembers (production's `ever_observed`
+    /// counts ledger bindings; `ever_observed_on_disk` does not).
+    minted: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 }
 impl freshell_ws::existence::SessionExistenceProbe for StubProbe {
     fn exists(&self, provider: &str, session_id: &str) -> SessionExistence {
@@ -51,6 +55,10 @@ impl freshell_ws::existence::SessionExistenceProbe for StubProbe {
             .unwrap_or(SessionExistence::Unknown)
     }
     fn ever_observed(&self, provider: &str, session_id: &str) -> bool {
+        let key = (provider.to_string(), session_id.to_string());
+        self.observed.lock().unwrap().contains(&key) || self.minted.lock().unwrap().contains(&key)
+    }
+    fn ever_observed_on_disk(&self, provider: &str, session_id: &str) -> bool {
         self.observed
             .lock()
             .unwrap()
@@ -714,6 +722,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
     server
         .pane_ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "codex",
             session_id: "old-t",
             mode: "freshcodex",
@@ -736,6 +745,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
     server
         .pane_ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: freshell_ws::pane_ledger::GenesisWrite::Keep,
             provider: "codex",
             session_id: "new-t",
             mode: "freshcodex",
@@ -769,6 +779,119 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
         "answer from the chain terminus"
     );
     assert_eq!(verdicts[0]["corrected"], true);
+}
+
+/// A claude fresh-agent binding row for `session_id`, written the way a lane
+/// records it, with `genesis` (claude core design §4.1) when given.
+fn seed_claude_binding(ledger: &PaneLedger, session_id: &str, genesis: Option<&Value>) {
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: genesis.map_or(freshell_ws::pane_ledger::GenesisWrite::Keep, |genesis| {
+                freshell_ws::pane_ledger::GenesisWrite::Set(genesis)
+            }),
+            provider: "claude",
+            session_id,
+            mode: "freshclaude",
+            cwd: Some("/w"),
+            create_request_id: None,
+            model: Some("opus"),
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            plugins: None,
+            supersedes: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            now_ms: 1_000,
+        })
+        .unwrap();
+}
+
+/// Claude core design §4.4 (the restart fix): a bound claude session whose
+/// transcript does not exist yet but whose binding row carries a genesis (a
+/// zero-turn session, a pending fork after an undo) is restarted after a
+/// reboot: Absent on disk, never seen there, genesis set => `respawn`. The
+/// same miss with no genesis stays `dead_session` (the ledger remembers the
+/// id), and so does a genesis-bearing id whose transcript was once seen and is
+/// now gone (its genesis is stale: deleted, not pending).
+#[tokio::test]
+async fn a_bound_claude_session_with_a_genesis_and_no_transcript_yet_answers_respawn() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    for id in ["zero-turn", "pending-fork", "no-genesis", "deleted"] {
+        probe
+            .answers
+            .lock()
+            .unwrap()
+            .insert(("claude".into(), id.into()), SessionExistence::Absent);
+        probe
+            .minted
+            .lock()
+            .unwrap()
+            .insert(("claude".into(), id.into()));
+    }
+    probe
+        .observed
+        .lock()
+        .unwrap()
+        .insert(("claude".into(), "deleted".into()));
+    let server = spawn_server_with_probe(probe).await;
+    let fresh = serde_json::json!({ "kind": "fresh" });
+    let fork = serde_json::json!({ "kind": "fork", "parent": "parent-id", "at": "a-1" });
+    seed_claude_binding(&server.pane_ledger, "zero-turn", Some(&fresh));
+    seed_claude_binding(&server.pane_ledger, "pending-fork", Some(&fork));
+    seed_claude_binding(&server.pane_ledger, "no-genesis", None);
+    seed_claude_binding(&server.pane_ledger, "deleted", Some(&fresh));
+
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "z", "kind": "fresh-agent", "sessionRef": {"provider": "claude", "sessionId": "zero-turn"} },
+            { "paneKey": "f", "kind": "fresh-agent", "sessionRef": {"provider": "claude", "sessionId": "pending-fork"} },
+            { "paneKey": "n", "kind": "fresh-agent", "sessionRef": {"provider": "claude", "sessionId": "no-genesis"} },
+            { "paneKey": "d", "kind": "fresh-agent", "sessionRef": {"provider": "claude", "sessionId": "deleted"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "respawn", "{verdicts}");
+    assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "zero-turn");
+    assert_eq!(verdicts[1]["verdict"], "respawn", "{verdicts}");
+    assert_eq!(verdicts[1]["sessionRef"]["sessionId"], "pending-fork");
+    assert_eq!(verdicts[2]["verdict"], "dead_session", "{verdicts}");
+    assert_eq!(verdicts[2]["reason"], "session_not_on_disk");
+    assert_eq!(verdicts[3]["verdict"], "dead_session", "{verdicts}");
+    assert_eq!(verdicts[3]["reason"], "session_not_on_disk");
+}
+
+/// The genesis-backed respawn is subject to the existing respawn cap: a
+/// pending session that never comes back live converges to
+/// `dead_session{respawn_exhausted}` instead of looping.
+#[tokio::test]
+async fn a_pending_claude_session_that_never_comes_back_exhausts_the_respawn_cap() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("claude".into(), "never-back".into()),
+        SessionExistence::Absent,
+    );
+    let server = spawn_server_with_probe(probe).await;
+    seed_claude_binding(
+        &server.pane_ledger,
+        "never-back",
+        Some(&serde_json::json!({ "kind": "fresh" })),
+    );
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let pane = serde_json::json!([
+        { "paneKey": "p", "kind": "fresh-agent", "sessionRef": {"provider": "claude", "sessionId": "never-back"} }
+    ]);
+    for attempt in 0..freshell_ws::reconcile_freshagent::FRESH_AGENT_RESPAWN_CAP {
+        let verdicts = reconcile_request(&mut ws, pane.clone()).await;
+        assert_eq!(verdicts[0]["verdict"], "respawn", "attempt {attempt}");
+    }
+    let verdicts = reconcile_request(&mut ws, pane).await;
+    assert_eq!(verdicts[0]["verdict"], "dead_session");
+    assert_eq!(verdicts[0]["reason"], "respawn_exhausted");
 }
 
 // ── dead_session verdict observability (WARN log at the result choke point) ──

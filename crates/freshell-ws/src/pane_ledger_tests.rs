@@ -283,6 +283,7 @@ fn write_provenance_at(
 
 fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAgentBindingWrite<'a> {
     FreshAgentBindingWrite {
+        genesis: GenesisWrite::Keep,
         provider,
         session_id,
         mode: provider,
@@ -312,6 +313,7 @@ fn fa_write_fenced<'a>(
     generation: u64,
 ) -> FreshAgentBindingWrite<'a> {
     FreshAgentBindingWrite {
+        genesis: GenesisWrite::Keep,
         provider,
         session_id,
         mode: provider,
@@ -344,6 +346,7 @@ fn fa_write_target<'a>(
     generation: u64,
 ) -> FreshAgentBindingWrite<'a> {
     FreshAgentBindingWrite {
+        genesis: GenesisWrite::Keep,
         provider,
         session_id,
         mode: provider,
@@ -2957,6 +2960,7 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
     // The other lanes keep their existing disabled policy (silent no-op).
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Keep,
             provider: "claude",
             session_id: "sid",
             mode: "freshclaude",
@@ -4166,6 +4170,197 @@ fn a_fresh_agent_binding_keeps_the_panes_plugins_across_a_restart() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Claude core design §4.1: a session with no transcript yet records its
+/// genesis in its binding row, so a restart can boot the same conversation
+/// again (`ClaudeGenesis` owns the shape; the ledger keeps it opaque).
+#[test]
+fn a_fresh_agent_binding_keeps_its_genesis_across_a_restart() {
+    let root = temp_root("fa-genesis-round-trip");
+    let fork = serde_json::json!({
+        "kind": "fork", "parent": "p-1", "at": "a-1", "dropsTurn": "u-2",
+    });
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Set(&fork),
+            ..fa_write("claude", "s-pending", 1_000)
+        })
+        .unwrap();
+    assert_eq!(
+        ledger.load_binding("claude", "s-pending").unwrap().genesis,
+        Some(fork.clone())
+    );
+    assert_eq!(
+        ledger.binding_genesis("claude", "s-pending"),
+        Some(fork.clone())
+    );
+
+    // A new ledger over the same root (a server restart) reads it back.
+    let reloaded = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        reloaded.binding_genesis("claude", "s-pending"),
+        Some(fork.clone())
+    );
+    assert_eq!(reloaded.binding_genesis("claude", "s-unknown"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Rows written before the genesis existed (every transcript-backed session)
+/// parse with none, so they resume from their transcript exactly as before.
+#[test]
+fn a_row_written_before_the_genesis_field_parses_with_none() {
+    let root = temp_root("fa-genesis-legacy-parse");
+    let ledger_dir = root.join("bindings").join("claude");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("s-legacy.json"),
+        serde_json::json!({
+            "ledgerVersion": LEDGER_VERSION,
+            "provider": "claude",
+            "sessionId": "s-legacy",
+            "mode": "freshclaude",
+            "cwd": "/w",
+            "createdAt": 1_000i64,
+            "updatedAt": 1_000i64,
+            "lastObservedAt": 1_000i64,
+            "state": "bound",
+            "paneKind": "fresh-agent",
+            "model": "opus",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let legacy = ledger
+        .load_binding("claude", "s-legacy")
+        .expect("a legacy row parses");
+    assert_eq!(legacy.genesis, None);
+    assert_eq!(legacy.model.as_deref(), Some("opus"));
+    assert_eq!(ledger.binding_genesis("claude", "s-legacy"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The genesis is cleared only once the transcript is on disk (§4.1): a write
+/// that records settings (a model change before the first send, T7), a
+/// provenance refresh or an ownership refresh keeps it; only an explicit
+/// clear drops it.
+#[test]
+fn only_an_explicit_clear_drops_a_rows_genesis() {
+    let root = temp_root("fa-genesis-lazy");
+    let fresh = serde_json::json!({ "kind": "fresh" });
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Set(&fresh),
+            ..fa_write("claude", "s-zero-turn", 1_000)
+        })
+        .unwrap();
+    // A settings write (the configure before the first send) keeps it.
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            model: Some("sonnet"),
+            permission_mode: Some("plan"),
+            ..fa_write("claude", "s-zero-turn", 2_000)
+        })
+        .unwrap();
+    let row = ledger.load_binding("claude", "s-zero-turn").unwrap();
+    assert_eq!(row.model.as_deref(), Some("sonnet"));
+    assert_eq!(
+        row.genesis,
+        Some(fresh.clone()),
+        "a settings write keeps it"
+    );
+
+    // The lazy clear drops only the genesis, durably.
+    assert!(ledger
+        .clear_binding_genesis("claude", "s-zero-turn", 3_000)
+        .unwrap());
+    let cleared = ledger.load_binding("claude", "s-zero-turn").unwrap();
+    assert_eq!(cleared.genesis, None);
+    assert_eq!(cleared.model.as_deref(), Some("sonnet"));
+    assert_eq!(cleared.permission_mode.as_deref(), Some("plan"));
+    assert_eq!(cleared.state, RowState::Bound);
+    assert_eq!(cleared.updated_at, 3_000);
+    assert_eq!(
+        PaneLedger::new(Some(root.clone())).binding_genesis("claude", "s-zero-turn"),
+        None,
+        "the clear is durable"
+    );
+    // Clearing again, or clearing a row that never had one, writes nothing.
+    assert!(!ledger
+        .clear_binding_genesis("claude", "s-zero-turn", 4_000)
+        .unwrap());
+    assert_eq!(
+        ledger
+            .load_binding("claude", "s-zero-turn")
+            .unwrap()
+            .updated_at,
+        3_000
+    );
+    assert!(!ledger
+        .clear_binding_genesis("claude", "s-no-row", 4_000)
+        .unwrap());
+    assert!(ledger.load_binding("claude", "s-no-row").is_none());
+
+    // A binding write can also clear it outright.
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Set(&fresh),
+            ..fa_write("claude", "s-write-clear", 1_000)
+        })
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Clear,
+            ..fa_write("claude", "s-write-clear", 2_000)
+        })
+        .unwrap();
+    assert_eq!(ledger.binding_genesis("claude", "s-write-clear"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A fork-chain write (a rollback's child, `supersedes` the parent) starts its
+/// own genesis: the child's row carries only what its own write sets, never the
+/// parent's.
+#[test]
+fn a_superseding_binding_carries_only_its_own_genesis() {
+    let root = temp_root("fa-genesis-supersede");
+    let parent_genesis = serde_json::json!({ "kind": "fresh" });
+    let child_genesis = serde_json::json!({ "kind": "fork", "parent": "s-parent", "at": "a-1" });
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Set(&parent_genesis),
+            ..fa_write("claude", "s-parent", 1_000)
+        })
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            supersedes: Some("s-parent"),
+            ..fa_write("claude", "s-plain-child", 2_000)
+        })
+        .unwrap();
+    assert_eq!(ledger.binding_genesis("claude", "s-plain-child"), None);
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Set(&child_genesis),
+            supersedes: Some("s-plain-child"),
+            ..fa_write("claude", "s-fork-child", 3_000)
+        })
+        .unwrap();
+    assert_eq!(
+        ledger.binding_genesis("claude", "s-fork-child"),
+        Some(child_genesis)
+    );
+    // The retired parent keeps the genesis it had (a stale pane's snapshot of
+    // a superseded pending session still shows what it held).
+    assert_eq!(
+        ledger.binding_genesis("claude", "s-parent"),
+        Some(parent_genesis)
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn stamped_marker_retention_keys_on_creation_time_never_assertion_time() {
     // The stamps are payload, not lifetime: retention reads only
@@ -4605,6 +4800,7 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
     // index load sees the forged rows — the actual post-crash boot shape.
     for (sid, at) in [("th-old", 1_000i64), ("th-new", 2_000i64)] {
         let row = BindingRow {
+            genesis: None,
             ledger_version: LEDGER_VERSION,
             provider: "codex".into(),
             session_id: sid.into(),
@@ -4734,6 +4930,7 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Keep,
             provider: "codex",
             session_id: "thread-1",
             mode: "freshcodex",
@@ -4769,6 +4966,7 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
     let root = temp_root("fresh-agent-upsert");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        genesis: GenesisWrite::Keep,
         provider: "opencode",
         session_id: "ses_abc",
         mode: "freshopencode",
@@ -4819,6 +5017,7 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
     let root = temp_root("fresh-agent-supersedes");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        genesis: GenesisWrite::Keep,
         provider: "codex",
         session_id: "old-thread",
         mode: "freshcodex",
@@ -4885,6 +5084,7 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
     let root = temp_root("fresh-agent-req-id");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        genesis: GenesisWrite::Keep,
         provider: "codex",
         session_id: "thread-1",
         mode: "freshcodex",
@@ -4934,6 +5134,7 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
     let root = temp_root("fresh-agent-settings-recorded");
     let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
+        genesis: GenesisWrite::Keep,
         provider: "opencode",
         session_id: "ses_full",
         mode: "freshopencode",
@@ -4985,6 +5186,7 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            genesis: GenesisWrite::Keep,
             provider: "codex",
             session_id: "new-thread",
             mode: "freshcodex",
@@ -8257,6 +8459,7 @@ fn close_record_covers_row_is_the_shared_recovery_predicate() {
         live_terminal_id: Option<&str>,
     ) -> BindingRow {
         BindingRow {
+            genesis: None,
             ledger_version: LEDGER_VERSION,
             provider: "claude".to_string(),
             session_id: "sess-shared".to_string(),

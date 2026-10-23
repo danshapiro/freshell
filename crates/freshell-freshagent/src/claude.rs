@@ -4945,21 +4945,17 @@ impl FreshClaudeState {
         session_type: SessionType,
         thread_id: &str,
     ) -> Result<Value, String> {
-        let rollback = self.load_rollback_record(thread_id).await;
-        let mut snapshot = crate::claude_snapshot::get_claude_snapshot(
-            session_type_str(session_type),
-            thread_id,
-            rollback.as_ref(),
-        )
-        .await
-        .map_err(|error| match error {
-            crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
-                "claude session not found".to_string()
-            }
-            crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
-                "claude snapshot unavailable".to_string()
-            }
-        })?;
+        let mut snapshot = self
+            .disk_snapshot(session_type_str(session_type), thread_id)
+            .await
+            .map_err(|error| match error {
+                crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                    "claude session not found".to_string()
+                }
+                crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
+                    "claude snapshot unavailable".to_string()
+                }
+            })?;
         let (approvals, questions) = self.snapshot_pending_overlay(thread_id).await;
         crate::claude_snapshot::apply_pending_overlay(&mut snapshot, approvals, questions);
         self.apply_snapshot_metadata(thread_id, &mut snapshot).await;
@@ -4967,9 +4963,8 @@ impl FreshClaudeState {
     }
 
     /// Test seam (`test-support`, C09 rigs): the live-state overlay the snapshot
-    /// route applies ([`Self::apply_snapshot_metadata`]), over an empty snapshot. A
-    /// rig cannot read a transcript through its server (the store root comes from
-    /// this process's environment), so it reads the overlay directly.
+    /// route applies ([`Self::apply_snapshot_metadata`]), over an empty snapshot,
+    /// for a test that checks the overlay alone (no transcript needed).
     #[cfg(any(test, feature = "test-support"))]
     pub async fn live_snapshot_overlay(&self, any_id: &str) -> Value {
         let mut snapshot = json!({});
@@ -5039,16 +5034,7 @@ impl FreshClaudeState {
         &self,
         any_id: &str,
     ) -> Option<crate::rollback_record::RollbackRecord> {
-        let durable = match self.resolve_session_key(any_id).await {
-            Some(map_key) => self
-                .sessions
-                .lock()
-                .await
-                .get(&map_key)
-                .and_then(|s| s.cli_session_id.clone())
-                .unwrap_or(map_key),
-            None => any_id.to_string(),
-        };
+        let durable = self.durable_session_id(any_id).await;
         self.identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, &durable))
     }
@@ -7706,6 +7692,7 @@ impl FreshClaudeState {
         if let Some(sink) = &identity_sink {
             if let Err(e) = sink
                 .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: cli_id.to_string(),
                     mode: session_type.to_string(),
@@ -10026,6 +10013,7 @@ mod create_outcome;
 pub use create_outcome::ClaudeCreateOutcome;
 
 mod establish;
+mod genesis;
 use establish::{
     BootedSidecar, DurableClaim, EstablishError, EstablishLane, EstablishPlan, RegisterUnder,
 };
@@ -17709,6 +17697,7 @@ rl.on('line', (line) => {
         // The lineage-only seed: a binding row exists, with an all-blank
         // settings snapshot (load_settings answers None).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "claude".into(),
             session_id: DURABLE.into(),
