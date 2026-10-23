@@ -221,21 +221,23 @@ impl FreshClaudeState {
 
     /// After a result of the session `session_key` names: when its binding row
     /// still records a genesis, clear it once the transcript is flushed (the
-    /// lazy clear, design §4.1). Detached; a session with no genesis costs one
-    /// memory read.
-    pub(super) async fn clear_genesis_after_result(&self, session_key: &str) {
+    /// lazy clear, design §4.1). Detached from the caller (the sidecar's output
+    /// reader) entirely: resolving the durable id takes the session locks, which
+    /// the reader must never wait on. A session with no genesis costs one memory
+    /// read.
+    pub(super) fn spawn_genesis_clear_after_result(&self, session_key: &str) {
         let Some(sink) = self.identity_sink() else {
             return;
         };
-        let durable = self.durable_session_id(session_key).await;
-        let Some(recorded) = sink.load_genesis(PROVIDER, &durable) else {
-            return;
-        };
-        let roots = self.transcript_roots();
+        let (state, session_key) = (self.clone(), session_key.to_string());
         tokio::spawn(async move {
+            let durable = state.durable_session_id(&session_key).await;
+            let Some(recorded) = sink.load_genesis(PROVIDER, &durable) else {
+                return;
+            };
             let outcome = clear_genesis_once_observed(
                 &sink,
-                roots,
+                state.transcript_roots(),
                 &durable,
                 GENESIS_CLEAR_ATTEMPTS,
                 GENESIS_CLEAR_INTERVAL,

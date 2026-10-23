@@ -6474,7 +6474,8 @@ impl FreshClaudeState {
     /// | untracked, durable id already in `cli_index`, aliased session LIVE | REBIND + ACK (Task 10b): flip the live session's envelope stamp to the durable id and answer with the `freshAgent.session.snapshot` stamped with the durable and the session's TRACKED status (the consumer's turn-lifecycle + sdk.status fold, never a hardcoded idle) -- the attaching client must observe success, never silence. The map is never re-keyed (alias, don't move) |
     /// | untracked, durable id in `cli_index` but aliased session GONE (stale row, eviction in flight) | fall through to the resume path below (the session is dead; resuming converges the client) |
     /// | untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit a `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID -- NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) -- carrying the session's tracked status ("idle" for a fresh resume, by construction) |
-    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable) | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
+    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable), binding row records a genesis (core design §4.2/§4.3: a zero-turn session, a pending fork) | boot it from the genesis under the durable id (`Fresh`, or the lazy fork of its parent), register and acknowledge exactly like the resume row above |
+    /// | untracked, transcript ABSENT in EVERY candidate root (every root fully readable), no genesis | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
     /// | untracked, store UNREADABLE (no store root, or an IO error other than NotFound/NotADirectory while scanning) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- cannot check, so NEVER the lost frame (G28) |
     /// | untracked, spawn/pipe/created failure | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
@@ -8143,7 +8144,7 @@ impl FreshClaudeState {
                         // Core design §4.1: a session booted from its genesis
                         // writes its transcript around its first result; clear
                         // the genesis once the transcript is on disk.
-                        state.clear_genesis_after_result(&session_id).await;
+                        state.spawn_genesis_clear_after_result(&session_id);
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("idle") =>
