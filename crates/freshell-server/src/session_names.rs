@@ -128,6 +128,8 @@ mod session_name_store_view;
 // Name-reliability Task 12: the `session_names.name_changed` event log.
 #[path = "session_name_events.rs"]
 mod session_name_events;
+#[path = "session_name_publish.rs"]
+mod session_name_publish;
 use session_name_apply::{indexed_key, replace_automatic, wire_source, with_outcome};
 use session_name_events::{AdoptedChanges, NameChangeCause, NameChangeEvent, UncertainCommits};
 use session_name_first_message::{first_message_fallback, InputRefusals, RefusalSite, SeriesPlan};
@@ -1861,6 +1863,7 @@ where
             Ok(value)
         }
         Decision::Write { value, publish } => {
+            let prior = core.current_view();
             document.document_generation += 1;
             let bytes = serialize_document(&document)?;
             let digest = digest_bytes(&bytes);
@@ -1886,7 +1889,8 @@ where
             );
             meta.input_refusals.log_committed();
             // Publish while the lock is still held: local generation order.
-            let updates = materialize_publish(&document, &publish);
+            let updates =
+                session_name_publish::committed_updates(&prior.document, &document, &publish);
             core.publish(updates);
             Ok(value)
         }
