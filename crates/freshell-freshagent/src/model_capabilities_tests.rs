@@ -677,7 +677,7 @@ export function query() {
     // The killed grandchild may still be a zombie its adopter has not reaped
     // yet; `kill(pid, 0)` would find that, the probe does not.
     assert!(
-        grandchild.exited().await,
+        grandchild.exited(),
         "the probe's grandchild did not outlive the timeout"
     );
 }

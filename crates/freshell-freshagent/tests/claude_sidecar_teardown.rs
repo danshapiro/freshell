@@ -286,12 +286,9 @@ async fn the_probe_sees_a_running_process_as_running_until_it_is_killed() {
     child.kill().expect("kill the idle node");
     child.wait().expect("reap the idle node");
 
-    assert!(
-        process.exited().await,
-        "a killed, reaped process has exited"
-    );
+    assert!(process.exited(), "a killed, reaped process has exited");
     #[cfg(unix)]
-    assert!(group.exited().await, "its group has no member left");
+    assert!(group.exited(), "its group has no member left");
 }
 
 /// Block until `pid`, a child of this process, has exited, WITHOUT reaping
@@ -355,24 +352,26 @@ async fn the_probe_counts_a_killed_but_unreaped_process_as_exited() {
             "and kill(-pgid, 0) finds the group it is still a member of"
         );
         // Linux tells the zombie apart at once: no reaper is needed.
-        let process_running = process.running();
-        let group_running = group.running();
-        let (process_exited, group_exited) = tokio::join!(process.exited(), group.exited());
+        let process_exited = process.exited();
+        let group_exited = group.exited();
         child.wait().expect("reap the zombie");
-        assert!(!process_running, "an unreaped zombie is not running");
-        assert!(!group_running, "nor is a group holding only a zombie");
         assert!(process_exited, "an unreaped zombie has exited");
         assert!(group_exited, "so has a group holding only a zombie");
     }
     // Without /proc a zombie cannot be told from a running process, so the
-    // probes wait for it to be reaped; reap it shortly, as its adopter would.
+    // probes see it exit once it is reaped; reap it shortly, as its adopter
+    // would.
     #[cfg(not(target_os = "linux"))]
     {
+        const REAPED_WITHIN: Duration = Duration::from_secs(5);
         let reaper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             child.wait().expect("reap the zombie");
         });
-        let (process_exited, group_exited) = tokio::join!(process.exited(), group.exited());
+        let (process_exited, group_exited) = tokio::join!(
+            process.exits_within(REAPED_WITHIN),
+            group.exits_within(REAPED_WITHIN)
+        );
         reaper.join().expect("the reaper thread");
         assert!(process_exited, "a zombie reaped shortly after has exited");
         assert!(group_exited, "so has the group that held only it");
@@ -473,7 +472,7 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
         "node itself honored the shutdown line: {exit:?}"
     );
     assert!(
-        grandchild.exited().await,
+        grandchild.exited(),
         "the grandchild node left behind was killed: {exit:?}"
     );
     assert_eq!(
@@ -489,7 +488,7 @@ async fn a_graceful_exit_does_not_leave_the_grandchild_running() {
         );
         let pgid = pgid.expect("the sidecar ran in its own process group");
         assert!(
-            ProcessGroupProbe::new(pgid).exited().await,
+            ProcessGroupProbe::new(pgid).exited(),
             "no group member survives"
         );
     }
@@ -541,7 +540,7 @@ async fn a_graceful_exit_does_not_leave_a_member_whose_main_thread_ended_running
         "the member counted as running, so it got the rest of the grace period: {exit:?}"
     );
     assert!(
-        grandchild.exited().await,
+        grandchild.exited(),
         "the member whose main thread ended was killed: {exit:?}"
     );
 }
@@ -589,10 +588,7 @@ async fn an_abnormal_exit_is_not_graceful_and_the_tree_is_killed_at_once() {
         exit.elapsed < SIDECAR_GRACEFUL_EXIT / 2,
         "the orphaned tree did not get the rest of the grace period: {exit:?}"
     );
-    assert!(
-        grandchild.exited().await,
-        "the grandchild was killed: {exit:?}"
-    );
+    assert!(grandchild.exited(), "the grandchild was killed: {exit:?}");
     assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
 }
 
@@ -635,7 +631,7 @@ async fn an_abnormal_exit_is_confirmed_only_once_a_slow_exiting_grandchild_has_e
     assert_eq!(exit.stop, SidecarStop::AbnormalExit, "{exit:?}");
     assert_eq!(exit.tree, TreeConfirmation::Confirmed, "{exit:?}");
     assert!(
-        grandchild.exited().await,
+        grandchild.exited(),
         "the grandchild had exited when the tree was confirmed gone: {exit:?}"
     );
 }
@@ -653,7 +649,7 @@ async fn terminating_the_guard_is_confirmed_only_once_a_slow_exiting_grandchild_
 
     assert_eq!(confirmation, TreeConfirmation::Confirmed);
     assert!(
-        grandchild.exited().await,
+        grandchild.exited(),
         "the grandchild had exited when the tree was confirmed gone"
     );
 }
@@ -674,7 +670,7 @@ async fn terminating_the_guard_empties_the_job() {
     assert_eq!(confirmation, TreeConfirmation::Confirmed);
     assert_eq!(fake.guard.active_processes(), Some(0), "the job is empty");
     assert!(
-        grandchild.exited().await,
+        grandchild.exited(),
         "the grandchild was in the job and died"
     );
 }
@@ -747,11 +743,11 @@ async fn terminating_the_guard_kills_every_member_of_the_process_group() {
 
     assert_eq!(confirmation, TreeConfirmation::Confirmed);
     assert!(
-        member.exited().await,
+        member.exited(),
         "the background member of the group was killed"
     );
     assert!(
-        ProcessGroupProbe::new(leader as i32).exited().await,
+        ProcessGroupProbe::new(leader as i32).exited(),
         "no group member survives"
     );
 }
@@ -783,8 +779,12 @@ async fn dropping_the_guard_kills_the_process_group() {
         Some(9),
         "the drop sent SIGKILL: {status:?}"
     );
+    // Nothing confirms a drop's kill, so the member gets time to finish
+    // exiting.
     assert!(
-        ProcessGroupProbe::new(pgid).exited().await,
+        ProcessGroupProbe::new(pgid)
+            .exits_within(Duration::from_secs(5))
+            .await,
         "the background member of the group survived the drop"
     );
 }
@@ -928,7 +928,7 @@ async fn a_session_stop_confirms_the_whole_sidecar_tree_gone() {
         "{logged:?}"
     );
     assert!(
-        grandchild.exited().await,
+        grandchild.exited(),
         "the grandchild the sidecar left behind was killed"
     );
 }

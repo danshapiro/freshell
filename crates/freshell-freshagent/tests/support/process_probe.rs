@@ -13,35 +13,27 @@
 //! - **Linux**: [`ProcessProbe::running`] is exact, from `/proc/<pid>/stat`.
 //!   A process runs until it is gone, dead (`X`), or a zombie (`Z`) with no
 //!   other thread left. A `Z` process that still has threads is either one
-//!   whose main thread ended while another thread runs on (it is running),
-//!   or one a signal killed whose other threads are still finishing their
-//!   exit, which takes a moment on a loaded machine.
+//!   whose main thread ended while another thread runs on, or one a signal
+//!   killed whose other threads are still finishing their exit.
 //! - **Other Unix** (macOS): without `/proc` a zombie cannot be told from a
 //!   running process, so a zombie counts as running until it is reaped.
 //! - **Windows**: exact, from a process handle opened while the process ran.
 //!   Windows has no zombies.
 //!
-//! So on Unix, [`ProcessProbe::exited`] gives a killed process up to
-//! [`EXIT_ALLOWANCE`] to finish exiting and, where that is the only way to
-//! tell, to be reaped. That never hides a process left running: nothing ends
-//! one in the meantime, so it is still running when the allowance ends.
-//!
-//! On Windows it answers at once. The tree guard confirms a tree only once
-//! every member's process handle is signaled, so a member must have exited
-//! by then. A wait would also be unsound there: dropping the guard closes
-//! its kill-on-close job, which would end a process the guard had wrongly
-//! reported gone while the probe was still waiting.
+//! These are the tree guard's own tests of a member being gone
+//! (`claude_spawn`: on Linux the same `/proc` rule; on macOS nothing left in
+//! the process group, zombies included; on Windows every member's handle
+//! signaled). So once the guard has confirmed a tree gone, every member it
+//! held has exited by then, and [`ProcessProbe::exited`] asks at once: a
+//! guard that confirmed too early fails it even when the member would have
+//! died a moment later. Only a kill nothing confirms (dropping the guard, a
+//! test reaping its own zombie later) is given time, with `exits_within`.
 //!
 //! Shared by the `claude_sidecar_teardown` integration test and the crate's
 //! unit tests (`lib.rs` includes this file under `cfg(all(test, unix))`).
 #![allow(dead_code)] // each including test crate uses a different subset
 
 use std::time::{Duration, Instant};
-
-/// How long a killed process gets to finish exiting (and, off Linux, to be
-/// reaped by whoever adopted it) before it counts as still running.
-#[cfg(unix)]
-pub const EXIT_ALLOWANCE: Duration = Duration::from_secs(5);
 
 const POLL: Duration = Duration::from_millis(20);
 
@@ -102,17 +94,10 @@ impl ProcessProbe {
         }
     }
 
-    /// Whether the process has exited (a zombie has). Returns as soon as it
-    /// has; on Unix a process still exiting gets [`EXIT_ALLOWANCE`].
-    pub async fn exited(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.exits_within(EXIT_ALLOWANCE).await
-        }
-        #[cfg(windows)]
-        {
-            !self.running()
-        }
+    /// Whether the process has exited by now (a zombie has; see the module
+    /// docs for why a check after a confirmed stop asks at once).
+    pub fn exited(&self) -> bool {
+        !self.running()
     }
 
     /// Whether the process exits within `budget`.
@@ -150,10 +135,9 @@ impl ProcessGroupProbe {
         }
     }
 
-    /// Whether every member of the group has exited (zombies have). Returns
-    /// as soon as they have; members still exiting get [`EXIT_ALLOWANCE`].
-    pub async fn exited(&self) -> bool {
-        self.exits_within(EXIT_ALLOWANCE).await
+    /// Whether every member of the group has exited by now (zombies have).
+    pub fn exited(&self) -> bool {
+        !self.running()
     }
 
     /// Whether every member of the group exits within `budget`.
