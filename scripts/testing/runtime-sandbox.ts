@@ -313,6 +313,21 @@ export class RuntimeHarness {
         }
       } catch (error) { errors.push(`indexed volume ${volume}: ${String(error)}`) }
     }
+    // A candidate read whose supervisor was removed mid-read, or before its
+    // background cleanup ran, leaves its scratch volume. The broker knows
+    // exactly which ones this run created; every helper that mounted one is
+    // gone by now, so delete each through the broker's ownership check.
+    const candidateVolumes = this.broker?.candidateVolumeNames?.() ?? []
+    for (const volume of candidateVolumes) {
+      try {
+        const url = `/v1.47/volumes/${volume}`
+        const deleted = await brokerRequestStatus(this.broker.proxySocketPath, 'DELETE', url)
+        if (deleted !== 204 && deleted !== 404) throw new Error('owned candidate volume deletion unavailable')
+        if (await brokerRequestStatus(this.broker.proxySocketPath, 'GET', url) !== 404) {
+          throw new Error('owned candidate volume absence unconfirmed')
+        }
+      } catch (error) { errors.push(`candidate volume ${volume}: ${String(error)}`) }
+    }
     for (const volume of [...this.trackedVolumes]) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`volume ${volume}: ${String(error)}`) }
     }
@@ -333,7 +348,7 @@ export class RuntimeHarness {
         ...this.trackedContainers,
         ...this.broker?.receiptIds?.() ?? [],
       ])],
-      volumes: [...new Set([...this.trackedVolumes, ...providerVolumes, ...indexedVolumes])],
+      volumes: [...new Set([...this.trackedVolumes, ...providerVolumes, ...indexedVolumes, ...candidateVolumes])],
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
       completedAt: new Date().toISOString(),
     }

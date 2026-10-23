@@ -400,6 +400,13 @@ export class RestrictedDockerBroker {
     return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values(),...this.inputPublishers.values(),...this.claudeSourceHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
+  /** Every Claude candidate scratch volume this proxy forwarded a create
+    * for (a lost acknowledgement included). Its proxied DELETE keeps the
+    * exact ownership check, so cleanup can remove what a supervisor left. */
+  candidateVolumeNames(): string[] {
+    return [...this.candidateVolumes]
+  }
+
   eventsSnapshot(): BrokerEvent[] {
     return [...this.events]
   }
