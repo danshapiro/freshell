@@ -55,7 +55,6 @@ async fn rig_with(
             hosted_claude: hosted,
             env: vec![("KILROY_ENABLED".into(), "1".into())],
             freshell_mcp: Some(Arc::clone(&cell)),
-            ..RigOptions::default()
         },
     )
     .await;
