@@ -85,7 +85,10 @@ async fn claude_recovery(budgets: ProviderCallbackBudgets) -> RecoveryFixture {
         .unwrap();
     let mut supervisor = Supervisor::new(
         registry,
-        default_backend(root.path().join("absent-docker.sock")),
+        default_backend(
+            root.path().join("absent-docker.sock"),
+            root.path().join("lifecycle.jsonl"),
+        ),
         SupervisorConfig {
             runtime_root: root.path().join("runtime"),
             control_socket_path: root.path().join("control.sock"),

@@ -43,6 +43,7 @@ mod uncertain_launch {
             _: &ClaudeSourceOwner,
             request: &ObserveClaudeSourcesRequest,
             _: &str,
+            _: tokio::time::Instant,
         ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError>
         {
             let r = &request.observation_request;

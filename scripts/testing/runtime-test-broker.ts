@@ -209,6 +209,29 @@ type DockerResponse = {
   body: Buffer
 }
 
+/** The short-lived helpers whose create can be held by a test. */
+const DELAYABLE_HELPER_PREFIXES = ['freshell-claude-source-', 'freshell-claude-candidate-reader-', 'freshell-mountpoints-'] as const
+
+export type HelperCreateDelay = { prefix: typeof DELAYABLE_HELPER_PREFIXES[number]; delayMs: number; count: number }
+
+/**
+ * Parse `FRESHELL_TEST_BROKER_DELAY_HELPER_CREATE` (`<prefix>:<delayMs>[:<count>]`,
+ * e.g. `freshell-claude-source-:30000:1`): hold that many helper creates for
+ * that long before forwarding them, as a Docker create stalled behind a
+ * host-wide writeback is answered late.
+ */
+export function parseHelperCreateDelay(value: string | undefined): HelperCreateDelay | undefined {
+  if (value === undefined || value.trim() === '') return undefined
+  const [prefix, delay, count = '1', ...rest] = value.trim().split(':')
+  const delayMs = Number(delay), times = Number(count)
+  if (rest.length > 0 || !DELAYABLE_HELPER_PREFIXES.includes(prefix as HelperCreateDelay['prefix'])
+    || !Number.isInteger(delayMs) || delayMs < 1 || delayMs > 600_000
+    || !Number.isInteger(times) || times < 1 || times > 100) {
+    throw new Error(`invalid helper create delay ${JSON.stringify(value)}: expected <${DELAYABLE_HELPER_PREFIXES.join('|')}>:<delayMs>[:<count>]`)
+  }
+  return { prefix: prefix as HelperCreateDelay['prefix'], delayMs, count: times }
+}
+
 export class RestrictedDockerBroker {
   private readonly claudeCandidates = new Map<string, ClaudeCandidateAuthorization>()
   private readonly candidateVolumes = new Set<string>()
@@ -229,6 +252,8 @@ export class RestrictedDockerBroker {
   private server?: http.Server
   private stopFailuresRemaining = 0
   private inputPublicationBeforeCreateFailure = false
+  private readonly helperCreateDelays: HelperCreateDelay[] = []
+  private readonly inFlight = new Set<Promise<void>>()
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
@@ -375,6 +400,13 @@ export class RestrictedDockerBroker {
     return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values(),...this.inputPublishers.values(),...this.claudeSourceHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
+  /** Every Claude candidate scratch volume this proxy forwarded a create
+    * for (a lost acknowledgement included). Its proxied DELETE keeps the
+    * exact ownership check, so cleanup can remove what a supervisor left. */
+  candidateVolumeNames(): string[] {
+    return [...this.candidateVolumes]
+  }
+
   eventsSnapshot(): BrokerEvent[] {
     return [...this.events]
   }
@@ -393,19 +425,57 @@ export class RestrictedDockerBroker {
     this.stopFailuresRemaining = Math.max(0, count)
   }
 
+  /** Hold the next `count` creates of helpers named `prefix*` for `delayMs`
+    * before forwarding them, so Docker makes each helper after its caller's
+    * deadline, as a create stalled behind a host-wide writeback does. */
+  delayHelperCreates(delay: HelperCreateDelay): void {
+    this.helperCreateDelays.push({ ...delay })
+  }
+
+  private async holdHelperCreate(method: string, url: string, name: string): Promise<void> {
+    const delay = this.helperCreateDelays.find(candidate => candidate.count > 0 && name.startsWith(candidate.prefix))
+    if (!delay) return
+    delay.count -= 1
+    this.record({ method, url, decision: 'inject_failure', reason: `configured slow helper create (${delay.delayMs}ms)`,
+      destructive: false, unsafeAttempt: false, helperName: name })
+    await new Promise(resolve => setTimeout(resolve, delay.delayMs))
+  }
+
   async start(): Promise<void> {
     fs.mkdirSync(path.dirname(this.policy.proxySocketPath), { recursive: true, mode: 0o700 })
     fs.mkdirSync(path.dirname(this.policy.logPath), { recursive: true, mode: 0o700 })
     fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
-      void this.handle(request, response)
+      const handled = this.handle(request, response)
+      this.inFlight.add(handled)
+      void handled.finally(() => this.inFlight.delete(handled))
     })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
       this.server!.listen(this.policy.proxySocketPath, () => resolve())
     })
     fs.chmodSync(this.policy.proxySocketPath, 0o600)
+  }
+
+  /** Wait until every request this proxy accepted has its Docker answer
+    * recorded, at most `timeoutMs`. A helper create Docker answers after the
+    * supervisor stopped waiting, or after the supervisor container was
+    * removed, still makes the helper; once settled, receiptIds() names it.
+    * False when requests are still unanswered at the deadline. */
+  async settleForwarded(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (this.inFlight.size > 0) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return false
+      let timer: NodeJS.Timeout | undefined
+      await Promise.race([
+        Promise.allSettled([...this.inFlight]),
+        new Promise(resolve => { timer = setTimeout(resolve, remaining) }),
+      ])
+      clearTimeout(timer)
+    }
+    return true
   }
 
   async close(): Promise<void> {
@@ -704,6 +774,7 @@ export class RestrictedDockerBroker {
         }
         const helper: { expected: Record<string, any>; containerId?: string } = { expected: JSON.parse(body.toString()) }
         this.claudeSourceHelpers.set(name, helper)
+        await this.holdHelperCreate(method, url, name)
         try {
           const forwarded = await this.forward(request, body)
           if (forwarded.statusCode === 201) {
@@ -735,6 +806,7 @@ export class RestrictedDockerBroker {
         }
         const publisher:{input:PreparedInputAuthorization;expected:Record<string,any>;containerId?:string}={input,expected:JSON.parse(body.toString())}
         this.inputPublishers.set(name,publisher)
+        await this.holdHelperCreate(method, url, name)
         try {
           const forwarded=await this.forward(request,body)
           if (forwarded.statusCode===201) {

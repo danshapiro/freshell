@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
 import { authorizeFreshAgentParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes, readProviderParitySource, type ProviderParitySource } from '../../helpers/provider-parity-broker.js'
-import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots } from '../../helpers/provider-parity-environment.js'
+import { makeProviderParityResourcesReadable, prepareProviderParityUserRoots, supervisorRegistrySecretScan } from '../../helpers/provider-parity-environment.js'
 import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from '../../../scripts/testing/runtime-test-broker.js'
 
@@ -318,9 +318,7 @@ describe('hosted fresh-agent provider inputs', () => {
     const evidenceDir = process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR
     if (evidenceDir) {
       const sentinel = 'fixture-secret-byte'
-      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
-        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){if(fs.readFileSync(p+'/'+f).includes('${sentinel}'))process.exit(4)}`,
-      ])
+      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, supervisorRegistrySecretScan([sentinel]))
       for (const material of [
         JSON.stringify(rig.runtime.inspectContainer(view.containerId!)),
         rig.runtime.containerLogs(view.containerId!),

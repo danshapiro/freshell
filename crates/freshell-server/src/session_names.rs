@@ -32,7 +32,9 @@
 //! document fences every operation instead of silently reinitializing over
 //! accepted names. The executing blocking-IO owner retains its guard until
 //! completion even if an outer caller stops waiting (transactions run on
-//! detached `spawn_blocking` tasks).
+//! detached `spawn_blocking` tasks), and releasing the guard unlocks the
+//! sidecar explicitly, so a child process forked mid-transaction (which
+//! holds an inherited descriptor until it execs) never keeps it locked.
 //!
 //! `session.name.updated` publishes only after successful commit/adoption,
 //! in local generation order (publication happens while the lock is held).
@@ -571,7 +573,43 @@ pub struct SessionNames {
 // Tasks 3–4 seam: no caller until the background worker lands.
 #[allow(dead_code)]
 pub(crate) struct BackgroundGuard {
-    _file: std::fs::File,
+    _lock: HeldSidecarLock,
+}
+
+/// A held `flock` on one of the store's sidecar lock files.
+///
+/// The lock belongs to the open file description, and every descriptor that
+/// shares that description keeps it alive. A child process forked by ANY
+/// thread of this server (PTYs, provider sidecars, Git) while the lock is
+/// held inherits such a descriptor and keeps it until the child execs, so
+/// closing only this process's descriptor would leave the lock held after
+/// the transaction (or worker hold) has ended — another participant, or
+/// this store's own next transaction, would find it busy. Dropping the
+/// guard therefore unlocks the description explicitly, which releases it
+/// for every descriptor that shares it, and only then closes the handle.
+struct HeldSidecarLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for HeldSidecarLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            // Closing the handle below still releases the lock once every
+            // inherited descriptor is gone; report the slower path.
+            tracing::warn!(
+                target: "freshell_server::session_names",
+                op = "unlock_sidecar",
+                name_ref = "-",
+                revision = 0,
+                class = "sidecar_unlock_failed",
+                lock_path = %self.path.display(),
+                error = %error,
+                "session_names.sidecar_unlock_failed: explicit unlock failed; the lock \
+                 releases when the last inherited descriptor closes"
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for BackgroundGuard {
@@ -640,7 +678,12 @@ impl SessionNames {
     pub(crate) fn try_background_guard(&self) -> Result<Option<BackgroundGuard>, NameError> {
         let file = open_lock_file(&self.core.worker_lock_path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(BackgroundGuard { _file: file })),
+            Ok(()) => Ok(Some(BackgroundGuard {
+                _lock: HeldSidecarLock {
+                    file,
+                    path: self.core.worker_lock_path.clone(),
+                },
+            })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(e)) => Err(NameError::LockUnavailable(format!(
                 "worker lock error: {e}"
@@ -1778,14 +1821,21 @@ fn open_lock_file(path: &Path) -> Result<std::fs::File, NameError> {
 /// retrying contention for at most one monotonic second. Callers hold their
 /// store's [`LocalTurn`], so contention seen here comes from another
 /// participant (another process, or another store opened on the same
-/// directory), never from this store's own queue. The sidecar is never
-/// replaced or unlinked — its inode lives as long as the data dir.
-fn acquire_document_lock(path: &Path) -> Result<std::fs::File, NameError> {
+/// directory), never from this store's own queue — nor from a child process
+/// forked during an earlier transaction, because every release unlocks
+/// explicitly ([`HeldSidecarLock`]). The sidecar is never replaced or
+/// unlinked — its inode lives as long as the data dir.
+fn acquire_document_lock(path: &Path) -> Result<HeldSidecarLock, NameError> {
     let file = open_lock_file(path)?;
     let deadline = Instant::now() + LOCK_RETRY_BUDGET;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => {
+                return Ok(HeldSidecarLock {
+                    file,
+                    path: path.to_path_buf(),
+                })
+            }
             Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(NameError::LockUnavailable(

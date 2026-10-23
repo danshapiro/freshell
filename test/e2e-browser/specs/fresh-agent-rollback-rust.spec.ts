@@ -850,6 +850,17 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       expect(reverts[0].params?.beforeTurnId).toBeTruthy()
       expect(ops.map((o) => o.method)).not.toContain('thread/rollback') // deprecated path never used
 
+      // The undo's CLIENT-side completion: this pane's rolledBack ack refills
+      // the composer with the first removed prompt (decision 4) and posts the
+      // refill notice. The REST snapshot above can show the reverted thread
+      // before the pane processes that ack; a /redo typed in that window is
+      // overwritten by the late refill, whose notice then REPLACES the redo
+      // notice (the observed "Redo is not available" timeouts). Wait for the
+      // refill — the claude undo test's same gate — before typing.
+      await expect
+        .poll(() => composerLocator(page).inputValue(), { timeout: 15_000 })
+        .toBe('codex turn one')
+
       // Typed /redo never reaches the wire: the composer's reserved-name
       // interception answers with the pinned codex undo-only copy.
       await typeSlash(page, '/redo')

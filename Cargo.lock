@@ -1445,6 +1445,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "ctor",
  "dotenvy",
  "freshell-agent-runtime",
  "freshell-api",

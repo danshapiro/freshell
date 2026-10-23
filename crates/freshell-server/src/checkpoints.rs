@@ -493,6 +493,9 @@ pub struct CheckpointService {
     test_capture_calls: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     test_capture_entered: tokio::sync::Notify,
+    /// When the latest automatic attempt finished resolving its workspace.
+    #[cfg(test)]
+    test_workspace_resolved_at: StdMutex<Option<Instant>>,
 }
 
 tokio::task_local! {
@@ -899,6 +902,8 @@ impl CheckpointService {
             test_capture_calls: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             test_capture_entered: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            test_workspace_resolved_at: StdMutex::new(None),
         }
     }
 
@@ -2352,6 +2357,13 @@ impl CheckpointService {
                 return record;
             }
         };
+        #[cfg(test)]
+        {
+            *self
+                .test_workspace_resolved_at
+                .lock()
+                .expect("workspace resolution timestamp mutex poisoned") = Some(Instant::now());
+        }
         if let Some(remaining) = self.active_cooldown(&workspace.path) {
             log_automatic_checkpoint_failure(
                 Some(request_id),
@@ -9046,16 +9058,32 @@ mod tests {
             .is_empty());
     }
 
+    /// During a timeout cooldown an automatic attempt answers
+    /// `capture_timeout_cooldown` as soon as its workspace is known, and the
+    /// message is forwarded: the attempt neither waits for the workspace's
+    /// capture lock nor starts a capture, so it never repeats the capture
+    /// wait. The test holds that lock throughout, so an attempt that waited
+    /// for it (or captured under it) would settle as `workspace_lock_timeout`
+    /// instead. The answer's latency is measured from the moment workspace
+    /// resolution returns: every automatic attempt resolves its workspace
+    /// (which runs Git) before it can look up the cooldown, so that part
+    /// follows machine load, not the cooldown policy.
     #[tokio::test]
     async fn cooldown_sends_immediately_without_capture() {
         let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        // The cooldown and the capture lock are keyed by the resolved path.
+        let workspace = std::fs::canonicalize(workspace_dir.path()).unwrap();
         let service = checkpoint_test_service(home.path());
-        service.establish_cooldown(workspace.path());
+        service.establish_cooldown(&workspace);
+        let _capture_lock = service
+            .lock_workspace(&workspace, Duration::from_secs(1))
+            .await
+            .expect("the test holds the workspace's capture lock");
 
-        let (outcome, dispatches, elapsed) = run_checkpoint_policy_send(
+        let (outcome, dispatches, _) = run_checkpoint_policy_send(
             Arc::clone(&service),
-            checkpoint_policy_send(workspace.path(), "cooldown-send", "cooldown-attempt"),
+            checkpoint_policy_send(&workspace, "cooldown-send", "cooldown-attempt"),
         )
         .await;
 
@@ -9063,9 +9091,32 @@ mod tests {
         assert_eq!(outcome["code"], "capture_timeout_cooldown");
         assert_eq!(dispatches, 1);
         assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+
+        // Time the cooldown answer itself, from the resolved workspace on.
+        *service.test_workspace_resolved_at.lock().unwrap() = None;
+        let send = checkpoint_policy_send(&workspace, "cooldown-timed", "cooldown-timed-attempt");
+        let record = service
+            .capture_automatic(&send, "cooldown-timed", "cooldown-timed-attempt")
+            .await;
+        let answered_at = Instant::now();
+        let resolved_at = service
+            .test_workspace_resolved_at
+            .lock()
+            .unwrap()
+            .expect("the attempt resolved its workspace");
+        assert_eq!(
+            record.outcome.code.as_deref(),
+            Some("capture_timeout_cooldown")
+        );
         assert!(
-            elapsed < Duration::from_secs(1),
-            "cooldown should not repeat the capture wait: {elapsed:?}"
+            record.capture_settled,
+            "a cooldown answer forwards the send"
+        );
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+        let answer = answered_at.duration_since(resolved_at);
+        assert!(
+            answer < Duration::from_secs(1),
+            "cooldown should answer without waiting once the workspace is known: {answer:?}"
         );
     }
 
