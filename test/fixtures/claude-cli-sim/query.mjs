@@ -359,6 +359,9 @@ class SimulatedCli {
 
   emit(message) {
     if (this.dead || this.closing) return
+    // Fault injection for consumers that must follow an init identity even
+    // when the reset announcement is missing. The default trace is intact.
+    if (message.type === 'conversation_reset' && this.env.FRESHELL_CLAUDE_SIM_DROP_CONVERSATION_RESET === '1') return
     this.channel.push({ ...message, uuid: message.uuid ?? randomUUID(), session_id: message.session_id ?? this.sessionId })
   }
 

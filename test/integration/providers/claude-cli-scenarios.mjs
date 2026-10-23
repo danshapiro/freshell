@@ -670,7 +670,13 @@ const SCENARIOS = {
     const inits = s.messages((m) => m.type === 'system' && m.subtype === 'init')
     const B = ctx.need(inits.at(-1)?.session_id, 'post-reset session id')
     ctx.label(B, 'B')
-    ctx.observe('afterClear', { files: await ctx.files() })
+    const cleared = ctx.need(await ctx.fixture.readTranscript(B), 'post-reset transcript exists')
+    ctx.observe('afterClear', {
+      files: await ctx.files(),
+      newSessionLineTypes: cleared.map((row) => row.type),
+      newSessionMessages: cleared.filter((row) => row.type === 'user' || row.type === 'assistant')
+        .map((row) => ({ type: row.type, isMeta: row.isMeta === true, content: row.message?.content })),
+    })
     s.push('after clear', 'u3')
     await s.waitForResults(3)
     await sleep(500)

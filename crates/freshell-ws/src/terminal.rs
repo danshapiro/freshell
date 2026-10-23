@@ -1582,6 +1582,7 @@ async fn handle_client_text(
                         freshell_ownership::AttachGuardOutcome::StaleGeneration {
                             current_epoch,
                             current_generation,
+                            ..
                         } => {
                             tracing::warn!(target: "freshell_ws::terminal",
                                 terminal_id = %attach.terminal_id,
@@ -1973,8 +1974,9 @@ async fn handle_client_text(
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
+                    let reply = conn_sink.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_attach(attach).await }
+                        async move { fresh_claude.handle_attach(attach, reply).await }
                             .instrument(tracing::Span::current()),
                     );
                 }
@@ -5284,6 +5286,7 @@ pub(crate) async fn handle_create(
                         freshell_ownership::AttachGuardOutcome::StaleGeneration {
                             current_epoch,
                             current_generation,
+                            ..
                         } => {
                             tracing::warn!(
                                 target: "freshell_ws::terminal",

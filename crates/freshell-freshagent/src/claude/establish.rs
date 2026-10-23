@@ -51,8 +51,6 @@ impl EstablishLane {
 
 /// The map key a new session registers under.
 pub(super) enum RegisterUnder {
-    /// The id the sidecar minted (`created.sessionId`): a create.
-    Minted,
     /// The attaching pane's id: an attach-resume (the client routes the pane's
     /// frames by it).
     Pane(String),
@@ -183,6 +181,8 @@ pub(super) enum EstablishError {
     Spawn(String),
     /// The `create` line could not be written.
     Write(String),
+    /// The create-time identity could not be made durable.
+    Binding(String),
     /// The sidecar did not answer `created` (a typed refusal, a protocol
     /// mismatch, or no answer).
     Boot(CreateFailure),
@@ -200,7 +200,7 @@ impl EstablishError {
     /// What went wrong, in words.
     pub(super) fn message(&self, lane: EstablishLane) -> String {
         match self {
-            Self::Spawn(detail) | Self::Write(detail) => detail.clone(),
+            Self::Spawn(detail) | Self::Write(detail) | Self::Binding(detail) => detail.clone(),
             Self::Boot(failure) => failure.message().to_string(),
             Self::ClosedInFlight => {
                 "session closed while the resume was in flight; torn down".to_string()
@@ -224,6 +224,7 @@ impl EstablishError {
         match self {
             Self::Spawn(_) => "CLAUDE_SIDECAR_START_FAILED",
             Self::Write(_) => "CLAUDE_SIDECAR_WRITE_FAILED",
+            Self::Binding(_) => "LEDGER_WRITE_FAILED",
             Self::Boot(failure) => failure.code(),
             Self::ClosedInFlight
             | Self::LeaseRevoked
@@ -244,6 +245,7 @@ impl EstablishError {
         match self {
             Self::Spawn(_) => "spawn",
             Self::Write(_) => "write",
+            Self::Binding(_) => "binding",
             Self::Boot(_) => "boot",
             Self::ClosedInFlight => "closed_in_flight",
             Self::LeaseRevoked => "lease_revoked",
@@ -273,6 +275,43 @@ pub(super) struct StartWatch<'a> {
 }
 
 impl FreshClaudeState {
+    /// A completed lease belongs to its exact sidecar incarnation until the
+    /// process tree is confirmed gone. This continuation runs even on hosted
+    /// lanes without an ownership coordinator; a replacement's lease is fenced
+    /// by its map key and ownership tag.
+    pub(super) fn release_leases_after_teardown(
+        &self,
+        teardown: LoggedTeardown,
+        durables: Vec<String>,
+        map_key: String,
+        ownership_id: Option<String>,
+    ) -> LoggedTeardown {
+        let leases = self.leases.clone();
+        let release = move || {
+            if let Some(ownership_id) = ownership_id.as_deref() {
+                for durable in &durables {
+                    leases.clear_binding_if_matches(PROVIDER, durable, &map_key, ownership_id);
+                }
+            }
+        };
+        match teardown {
+            LoggedTeardown::Confirmed => {
+                release();
+                LoggedTeardown::Confirmed
+            }
+            LoggedTeardown::NotConfirmed { escalation } => LoggedTeardown::NotConfirmed {
+                escalation: tokio::spawn(async move {
+                    let confirmed = escalation.await.unwrap_or(false);
+                    if confirmed {
+                        release();
+                    }
+                    confirmed
+                }),
+            },
+            other => other,
+        }
+    }
+
     /// Claim the provider lease on `durable` for the launch `request_id`, the
     /// one claim every launch of a durable id makes (create-resume, attach,
     /// handoff resume, rollback). A holder whose lease expired with a recorded
@@ -296,7 +335,14 @@ impl FreshClaudeState {
                     ));
                 }
                 crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
-                    return LaunchLease::BoundLive { live_session_key };
+                    return if self.sessions.lock().await.contains_key(&live_session_key) {
+                        LaunchLease::BoundLive { live_session_key }
+                    } else {
+                        // Teardown still owns the completed lease. It releases
+                        // only after confirmed death; do not acknowledge its
+                        // absent runtime as an adopted live session.
+                        LaunchLease::Held
+                    };
                 }
                 crate::session_lease::FreshSessionClaim::Held { .. } => return LaunchLease::Held,
                 crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
@@ -606,7 +652,6 @@ impl FreshClaudeState {
         let sidecar_pid = child.id();
         let minted = created.session_id;
         let (map_key, adopted) = match register_under {
-            RegisterUnder::Minted => (minted.clone(), None),
             RegisterUnder::Pane(pane) => (pane, None),
             RegisterUnder::Adopted(id) => (id.clone(), Some(id)),
         };
@@ -614,9 +659,9 @@ impl FreshClaudeState {
         // Unified agent names (Task 2): a create's pending handle is admitted with
         // the minted id BEFORE any failure arm, so no failure strands a handle the
         // pane already carries (retries re-ensure the same handle idempotently).
-        let naming_projection = match naming {
+        let mut naming_projection = match naming {
             Some(msg) => {
-                self.admit_create_handle(msg, &spec.session_type, &minted)
+                self.admit_create_handle(msg, &spec.session_type, &map_key)
                     .await
             }
             None => None,
@@ -701,22 +746,27 @@ impl FreshClaudeState {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         // A resume after an unrequested death continues the dead session's
         // attention clock (design §5.5): its edges stay above the death's.
-        let resumed_clock = || {
+        let resumed_runtime = || {
             [Some(map_key.as_str()), durable.as_deref()]
                 .into_iter()
                 .flatten()
                 .find_map(|id| self.dead_sessions.find(id))
-                .map(|dead| dead.clock)
         };
         let InheritedRuntime {
             turn_lock,
             ledger,
             // The session's attention clock (see the field doc).
             clock,
-        } = inherit.unwrap_or_else(|| InheritedRuntime {
-            turn_lock: Arc::new(TokioMutex::new(())),
-            ledger: crate::claude_turns::SharedLedger::default(),
-            clock: resumed_clock().unwrap_or_default(),
+        } = inherit.unwrap_or_else(|| {
+            let dead = resumed_runtime();
+            InheritedRuntime {
+                turn_lock: dead
+                    .as_ref()
+                    .map(|dead| dead.turn_lock.clone())
+                    .unwrap_or_else(|| Arc::new(TokioMutex::new(()))),
+                ledger: crate::claude_turns::SharedLedger::default(),
+                clock: dead.map(|dead| dead.clock).unwrap_or_default(),
+            }
         });
         let (stdin, fault) = crate::claude_sidecar_io::SidecarWriter::spawn(
             stdin,
@@ -729,6 +779,7 @@ impl FreshClaudeState {
             let consumer = self.spawn_consumer(
                 reader,
                 map_key.clone(),
+                ownership_id.clone(),
                 spec.session_type.clone(),
                 minted.clone(),
                 recorded_settings,
@@ -736,7 +787,8 @@ impl FreshClaudeState {
                 Arc::clone(&pending),
                 Arc::clone(&ledger),
                 clock.clone(),
-                provenance,
+                provenance.clone(),
+                naming.is_some(),
             );
             self.test_holds.registration().await;
             sessions.insert(
@@ -798,7 +850,11 @@ impl FreshClaudeState {
             }
         }
         // Round 6 (Finding 2): the seat→durable mapping is durable at registration.
-        if let Some(durable) = claim.as_ref().map(|claim| claim.durable.as_str()) {
+        if let Some(durable) = claim
+            .as_ref()
+            .map(|claim| claim.durable.as_str())
+            .filter(|durable| *durable != map_key)
+        {
             if let Some(sink) = self.identity_sink() {
                 if let Err(e) = sink
                     .record_alias_tombstone(
@@ -844,6 +900,46 @@ impl FreshClaudeState {
                 }
                 return Err(EstablishError::ClosedInFlight);
             }
+        }
+
+        // A created session is already a durable identity, including before
+        // its first prompt. Write lineage/genesis while the ownership claim
+        // still fences the registration, before Live or the acknowledgement.
+        if let Some(create) = naming {
+            if let Err(error) = self
+                .record_create_binding(&map_key, create, provenance.as_ref(), own_ticket)
+                .await
+            {
+                if let Some(session) = { self.sessions.lock().await.remove(&map_key) } {
+                    let _teardown: LoggedTeardown =
+                        self.teardown_removed_session_logged(session).await;
+                }
+                self.evict_cli_index_aliases(&map_key).await;
+                if let Some(mut guard) = lease_guard.take() {
+                    guard.fail();
+                }
+                if let Some(claim) = claim.as_ref().filter(|claim| claim.dead_state.is_some()) {
+                    self.rollback_session_claim(&claim.durable).await;
+                }
+                return Err(EstablishError::Binding(error.to_string()));
+            }
+            if let Some(claim) = claim.as_ref() {
+                if self.claim_dead_state_advanced(&claim.durable, claim.dead_state) {
+                    if let Some(session) = { self.sessions.lock().await.remove(&map_key) } {
+                        let _teardown: LoggedTeardown =
+                            self.teardown_removed_session_logged(session).await;
+                    }
+                    self.evict_cli_index_aliases(&map_key).await;
+                    if let Some(mut guard) = lease_guard.take() {
+                        guard.fail();
+                    }
+                    return Err(EstablishError::ClosedInFlight);
+                }
+            }
+            naming_projection = self
+                .bind_create_name(&map_key, &spec.session_type)
+                .await
+                .or(naming_projection);
         }
 
         // Task 12/13: bind the durable id to the live session and release the

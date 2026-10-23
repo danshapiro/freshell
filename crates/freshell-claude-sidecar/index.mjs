@@ -36,8 +36,10 @@
 //   sidecar → Rust (stdout, one JSON per line):
 //     { type:'created',                 requestId, sessionId, protocol:2, cliPid }
 //                                  — sent only once the CLI booted (initializationResult() resolved,
-//                                    T2); sessionId is the SDK bridge's BARE nanoid placeholder and
-//                                    cliPid the CLI's pid. The command catalog follows it.
+//                                    T2); sessionId is the bridge's control id (the requested UUID
+//                                    when provided), and cliPid the CLI's pid. The command catalog
+//                                    follows it. Control messages keep using this bridge id after
+//                                    a conversation reset; Rust follows the new durable id below.
 //     { type:'create.failed',           requestId, code, message }
 //                                  — the CLI refused the boot (boot.mjs names the codes) or the
 //                                    request is not protocol v2. Nothing from the refused boot is
@@ -46,6 +48,9 @@
 //     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
 //     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools, capabilities? }  // durable Claude UUID;
 //                                  capabilities: the CLI's (msg_lifecycle_v1 says it reports every sent command's lifecycle)
+//     { type:'sdk.session.rekeyed',     sessionId, newSessionId, reason:'conversation_reset' }
+//                                  — before the post-reset init, names its actual durable UUID.
+//                                    conversation_reset.new_conversation_id is only a reset nonce.
 //     { type:'sdk.assistant',           sessionId, content, model, uuid, messageId, parentToolUseId }
 //                                  — one per completed content block (blocks of one API message share
 //                                    messageId); parentToolUseId is set inside a subagent, else null
@@ -109,10 +114,9 @@
 //     ({ severity, component, event, ...ids }, log.mjs). Rust re-emits each
 //     through `tracing` at its severity (claude_sidecar_io.rs).
 //
-// The Rust side normalizes `sdk.* -> freshAgent.*` (a port of
-// server/fresh-agent/sdk-events.ts) and wraps each in a `freshAgent.event`
-// envelope — so this sidecar is the faithful analog of server/sdk-bridge.ts's
-// SdkBridge (it emits the SAME `sdk.*` shapes SdkBridge broadcasts).
+// Rust maps content facts into `freshAgent.event` envelopes. Its per-session
+// turn ledger owns busy status, single-command Stop targets, and attention
+// edges; process EOF owns death and recovery. This bridge forwards CLI facts.
 //
 // This sidecar makes no turn or attention decision (design §3.1, C18): it
 // forwards facts, and the server owns busy, the user's Stop, and every
@@ -286,6 +290,12 @@ function handleSdkMessage(sessionId, msg) {
   for (const frame of lifecycleFrames(sessionId, msg, st.lifecycle)) emit(frame)
 
   switch (msg.type) {
+    case 'conversation_reset': {
+      // The reset's new_conversation_id is a nonce, not the next session UUID
+      // (pinned CLI T16). Its next init identifies the conversation to follow.
+      st.pendingConversationReset = true
+      break
+    }
     case 'user': {
       // The SDK replays actual persisted user messages when this query opts in.
       // Only the unique UUID that this sidecar supplied for a checkpointed send
@@ -296,6 +306,10 @@ function handleSdkMessage(sessionId, msg) {
     }
     case 'system': {
       if (msg.subtype === 'init') {
+        if (st.pendingConversationReset && isUuid(msg.session_id)) {
+          st.pendingConversationReset = false
+          emit({ type: 'sdk.session.rekeyed', sessionId, newSessionId: msg.session_id, reason: 'conversation_reset' })
+        }
         st.cliSessionId = msg.session_id
         st.settings.cwd ??= msg.cwd
         st.terminalCommandNames = Array.isArray(msg.terminal_slash_commands) ? msg.terminal_slash_commands : []
@@ -439,12 +453,15 @@ function handleCreate(req) {
     return
   }
 
-  const sessionId = nanoid()
+  // Rust assigns the durable identity before create. Retain the bare-id
+  // fallback for an older host that has not adopted create-time UUIDs yet.
+  const sessionId = isUuid(req.sessionId) ? req.sessionId : nanoid()
   const abort = new AbortController()
   const state = {
     abort,
     permissionMode: req.permissionMode,
     settings: { model: req.model, effort: req.effort, permissionMode: req.permissionMode, cwd: req.cwd },
+    pendingConversationReset: false,
     // False until `created` is sent; until then nothing reaches Rust and
     // bootEvidence collects what a refusal is named from (boot.mjs).
     booted: false,

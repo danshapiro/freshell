@@ -41,6 +41,7 @@
 pub(crate) mod attention;
 pub mod attention_ledger;
 pub mod claude;
+pub mod claude_create_defaults;
 pub(crate) mod claude_dead_sessions;
 pub(crate) mod claude_edges;
 pub mod claude_freshell_mcp;
@@ -50,6 +51,7 @@ pub(crate) mod claude_live_events;
 pub(crate) mod claude_permission_update;
 pub(crate) mod claude_projection;
 pub(crate) mod claude_projection_cache;
+pub mod claude_rest_lane;
 pub(crate) mod claude_sidecar_exit;
 pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
@@ -59,7 +61,6 @@ pub(crate) mod claude_turns;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
 pub(crate) mod delegation;
-pub mod hosted_rest;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
@@ -77,6 +78,9 @@ mod process_probe;
 /// The wedged-runtime quiet deadman shared by the fresh-agent lanes (design
 /// 2026-10-22 §3.2, §5.6).
 pub(crate) mod quiet_deadman;
+pub mod rest_lane;
+pub(crate) mod rest_lane_create;
+mod rest_lane_sync;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;
@@ -468,7 +472,10 @@ pub mod ownership_lane {
         /// `Live{FreshAgent}` (a terminal owner or a vacated/crashed
         /// shape), or the supplied observed pair is stale. Every arm
         /// answers the lanes' typed `SESSION_RESERVED` surface.
-        Refused { message: String },
+        Refused {
+            message: String,
+            owner: Option<TerminalOwnerFields>,
+        },
     }
 
     /// Arm the reclaim-less op guard (see [`LaneOpGuard`]). The
@@ -509,6 +516,7 @@ pub mod ownership_lane {
                      pre-restart epoch) — the operation aborts typed");
                 return LaneOpGuard::Refused {
                     message: STALE_OP_GUARD_MESSAGE.to_string(),
+                    owner: terminal_owner_fields_from_snapshot(&snap),
                 };
             }
         }
@@ -576,9 +584,11 @@ pub mod ownership_lane {
                          the operation aborts typed; the client re-observes and \
                          retries with the pair"
                     );
+                    let owner = terminal_owner_fields_from_snapshot(&under);
                     drop(guard);
                     return LaneOpGuard::Refused {
                         message: FENCE_REQUIRED_OP_GUARD_MESSAGE.to_string(),
+                        owner,
                     };
                 }
                 // Verify `Live{FreshAgent}` UNDER the guard — stable now
@@ -587,7 +597,7 @@ pub mod ownership_lane {
                 // completed handoff) refuses typed here, never mutating
                 // another kind's session.
                 let under = registry.observe(provider, session_id);
-                match under.state {
+                match &under.state {
                     freshell_ownership::OwnershipState::Live { owner, .. }
                         if owner.kind == RuntimeOwnerKind::FreshAgent =>
                     {
@@ -602,9 +612,11 @@ pub mod ownership_lane {
                             outcome = "refused", failure_reason = "NOT_FRESH_AGENT_LIVE",
                             "the op guard armed over a non-fresh-agent owner — the \
                              operation aborts typed and the guard releases");
+                        let owner = terminal_owner_fields_from_snapshot(&under);
                         drop(guard);
                         LaneOpGuard::Refused {
                             message: KIND_OP_GUARD_MESSAGE.to_string(),
+                            owner,
                         }
                     }
                 }
@@ -621,11 +633,13 @@ pub mod ownership_lane {
                      nothing is mutated");
                 LaneOpGuard::Refused {
                     message: LIFECYCLE_OP_GUARD_MESSAGE.to_string(),
+                    owner: owner_fields_from_state(&state, registry.boot_epoch()),
                 }
             }
             freshell_ownership::AttachGuardOutcome::StaleGeneration {
-                current_epoch: _,
+                current_epoch,
                 current_generation,
+                current_state,
             } => {
                 tracing::warn!(target: "freshell_ownership",
                     operation_id = %operation_id, provider = %provider,
@@ -637,6 +651,7 @@ pub mod ownership_lane {
                      stale) — the operation aborts typed, nothing is mutated");
                 LaneOpGuard::Refused {
                     message: STALE_OP_GUARD_MESSAGE.to_string(),
+                    owner: owner_fields_from_state(&current_state, current_epoch),
                 }
             }
         }
@@ -1728,6 +1743,7 @@ pub mod ownership_lane {
             freshell_ownership::AttachGuardOutcome::StaleGeneration {
                 current_epoch,
                 current_generation,
+                ..
             } => {
                 tracing::warn!(target: "freshell_ownership",
                     operation_id = %operation_id, provider = %provider,
@@ -1789,6 +1805,7 @@ pub mod ownership_lane {
             freshell_ownership::AttachGuardOutcome::StaleGeneration {
                 current_epoch,
                 current_generation,
+                ..
             } => {
                 tracing::warn!(target: "freshell_ownership",
                     operation_id = %operation_id, provider = %provider,
@@ -1915,6 +1932,9 @@ pub mod ownership_lane {
                     owner_epoch: registry.boot_epoch(),
                 })
             }
+            BeginOutcome::Blocked { state, .. } => {
+                owner_fields_from_state(state, registry.as_ref()?.boot_epoch())
+            }
             _ => terminal_owner_fields_from_outcome(registry, outcome),
         }
     }
@@ -1924,7 +1944,14 @@ pub mod ownership_lane {
     pub fn terminal_owner_fields_from_snapshot(
         snapshot: &freshell_ownership::OwnershipSnapshot,
     ) -> Option<TerminalOwnerFields> {
-        match &snapshot.state {
+        owner_fields_from_state(&snapshot.state, snapshot.epoch)
+    }
+
+    fn owner_fields_from_state(
+        state: &freshell_ownership::OwnershipState,
+        epoch: u64,
+    ) -> Option<TerminalOwnerFields> {
+        match state {
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
             } => Some(TerminalOwnerFields {
@@ -1933,7 +1960,7 @@ pub mod ownership_lane {
                     RuntimeOwnerKind::FreshAgent => "fresh-agent",
                 },
                 owner_generation: *generation,
-                owner_epoch: snapshot.epoch,
+                owner_epoch: epoch,
             }),
             _ => None,
         }
@@ -2061,7 +2088,9 @@ pub struct FreshAgentState {
     opencode: SharedOpencodeManagerHandle,
     /// Opt-in durable host gateway. When installed, REST/MCP fresh-agent
     /// requests never touch this web process's legacy provider manager.
-    hosted_rest: Arc<std::sync::OnceLock<hosted_rest::SharedHostedFreshAgentRestGateway>>,
+    hosted_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
+    local_claude_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
+    rest_create_settings: Arc<std::sync::OnceLock<rest_lane::RestCreateSettingsReader>>,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
     /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): the SAME
@@ -2400,6 +2429,8 @@ impl FreshAgentState {
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             hosted_rest: Arc::new(std::sync::OnceLock::new()),
+            local_claude_rest: Arc::new(std::sync::OnceLock::new()),
+            rest_create_settings: Arc::new(std::sync::OnceLock::new()),
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
             session_identity: None,
@@ -2525,15 +2556,34 @@ impl FreshAgentState {
 
     pub fn set_hosted_rest_gateway(
         &self,
-        gateway: hosted_rest::SharedHostedFreshAgentRestGateway,
+        gateway: rest_lane::SharedFreshAgentRestLane,
     ) -> Result<(), &'static str> {
         self.hosted_rest
             .set(gateway)
             .map_err(|_| "hosted fresh-agent REST gateway is already installed")
     }
 
-    fn hosted_rest_gateway(&self) -> Option<hosted_rest::SharedHostedFreshAgentRestGateway> {
+    fn hosted_rest_gateway(&self) -> Option<rest_lane::SharedFreshAgentRestLane> {
         self.hosted_rest.get().cloned()
+    }
+
+    pub fn set_claude_rest_lane(
+        &self,
+        lane: rest_lane::SharedFreshAgentRestLane,
+    ) -> Result<(), &'static str> {
+        self.local_claude_rest
+            .set(lane)
+            .map_err(|_| "local Claude REST lane is already installed")
+    }
+
+    fn rest_lane_for(&self, provider: &str) -> Option<rest_lane::SharedFreshAgentRestLane> {
+        self.hosted_rest_gateway().or_else(|| {
+            if provider == "claude" {
+                self.local_claude_rest.get().cloned()
+            } else {
+                None
+            }
+        })
     }
 
     /// Install a scripted model-catalog probe (tests) — the registry's
@@ -4708,6 +4758,31 @@ fn fail_json(status: StatusCode, message: String) -> Response {
         .into_response()
 }
 
+fn rest_lane_failure(error: rest_lane::RestLaneError) -> Response {
+    use rest_lane::RestLaneErrorKind;
+    let status = match error.kind {
+        RestLaneErrorKind::BadRequest => StatusCode::BAD_REQUEST,
+        RestLaneErrorKind::Forbidden => StatusCode::FORBIDDEN,
+        RestLaneErrorKind::NotFound => StatusCode::NOT_FOUND,
+        RestLaneErrorKind::Conflict => StatusCode::CONFLICT,
+        RestLaneErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        RestLaneErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let mut body = json!({ "status": "error", "code": error.code, "message": error.message });
+    if let Some(retryable) = error.retryable {
+        body["retryable"] = json!(retryable);
+    }
+    if let Some(retry_after_ms) = error.retry_after_ms {
+        body["retryAfterMs"] = json!(retry_after_ms);
+    }
+    if let Some(owner) = error.owner {
+        body["ownerKind"] = json!(owner.owner_kind);
+        body["ownerGeneration"] = json!(owner.owner_generation);
+        body["ownerEpoch"] = json!(owner.owner_epoch);
+    }
+    (status, Json(body)).into_response()
+}
+
 /// `fail_json` + a machine-readable code, matching how the WS side keys
 /// errors (`error["code"] == "RESTORE_UNAVAILABLE"`). Envelope is additive:
 /// `{status:"error", code, message}`.
@@ -4837,49 +4912,19 @@ async fn create_tab(
         .map(str::to_string);
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
-    if let Some(gateway) = state.hosted_rest_gateway() {
-        let provider_inputs = match hosted_rest::provider_inputs(&body) {
-            Ok(inputs) => inputs,
-            Err(error) => return fail_json(StatusCode::BAD_REQUEST, error),
+    if let Some(gateway) = state.rest_lane_for(provider) {
+        let request = match state
+            .build_rest_lane_create(provider, session_type, &body)
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return rest_lane_failure(error),
         };
-        let native_session_id = match body.get("sessionRef") {
-            None => None,
-            Some(value) => match serde_json::from_value::<SessionLocator>(value.clone()) {
-                Ok(locator) if locator.provider == provider && !locator.session_id.is_empty() => {
-                    Some(locator.session_id)
-                }
-                _ => {
-                    return fail_json(
-                        StatusCode::BAD_REQUEST,
-                        format!("sessionRef must identify a {provider} session"),
-                    )
-                }
-            },
-        };
-        return create_hosted_agent_tab(
-            &state,
-            gateway,
-            hosted_rest::HostedRestCreate {
-                request_id: Uuid::new_v4().simple().to_string(),
-                provider: provider.into(),
-                session_type: session_type.into(),
-                cwd,
-                model,
-                effort,
-                native_session_id,
-                plugins: provider_inputs.plugins,
-                model_selection: provider_inputs.model_selection,
-                permission_mode: provider_inputs.permission_mode,
-                sandbox: provider_inputs.sandbox,
-            },
-            name,
-        )
-        .await;
+        return create_lane_agent_tab(&state, gateway, request, name).await;
     }
 
-    // The retained in-process implementation is OpenCode-only. Every hosted
-    // mode above uses the common supervisor gateway; never silently fall back
-    // to a web-owned Claude/Codex provider.
+    // OpenCode retains its existing implementation. Codex REST creation needs
+    // the opt-in hosted gateway; the local lane drives Claude modes only.
     if agent != "opencode" {
         return fail_json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5027,23 +5072,24 @@ async fn create_tab(
     )
 }
 
-async fn create_hosted_agent_tab(
+async fn create_lane_agent_tab(
     state: &FreshAgentState,
-    gateway: hosted_rest::SharedHostedFreshAgentRestGateway,
-    request: hosted_rest::HostedRestCreate,
+    gateway: rest_lane::SharedFreshAgentRestLane,
+    mut request: rest_lane::RestLaneCreate,
     name: Option<String>,
 ) -> Response {
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
+    request.tab_id = Some(tab_id.clone());
+    request.pane_id = Some(pane_id.clone());
     let created = match gateway.create_agent(request.clone()).await {
         Ok(created) => created,
-        Err(()) => {
-            return fail_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "durable fresh-agent host could not be created".to_string(),
-            )
+        Err(error) => {
+            state.layout.close_tab(&tab_id);
+            return rest_lane_failure(error);
         }
     };
-    let hosted_rest::HostedRestCreate {
-        request_id,
+    let pane_content = rest_lane_create::pane_content(&request, &created);
+    let rest_lane::RestLaneCreate {
         provider,
         session_type,
         cwd,
@@ -5051,24 +5097,6 @@ async fn create_hosted_agent_tab(
         effort,
         ..
     } = request;
-    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
-    let mut pane_content = json!({
-        "kind": "fresh-agent",
-        "sessionType": session_type,
-        "provider": provider,
-        "sessionId": created.session_id,
-        "createRequestId": request_id,
-        "status": "connected",
-    });
-    if let Some(value) = &cwd {
-        pane_content["initialCwd"] = json!(value);
-    }
-    if let Some(value) = &model {
-        pane_content["model"] = json!(value);
-    }
-    if let Some(value) = &effort {
-        pane_content["effort"] = json!(value);
-    }
     register_fresh_agent_tab(
         state,
         &tab_id,
@@ -5082,14 +5110,21 @@ async fn create_hosted_agent_tab(
             cwd,
             model,
             effort,
-            durable_id: Some(created.session_id.clone()),
+            durable_id: Some(
+                created
+                    .session_ref
+                    .as_ref()
+                    .map(|reference| reference.session_id.clone())
+                    .unwrap_or_else(|| created.session_id.clone()),
+            ),
         },
     );
     broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
-    ok_json(
-        json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id}),
-        "fresh-agent pane created",
-    )
+    let mut data = json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id});
+    if let Some(reference) = created.session_ref {
+        data["sessionRef"] = json!(reference);
+    }
+    ok_json(data, "fresh-agent pane created")
 }
 
 /// The registration every fresh-agent pane-minting path needs: attach the pane
@@ -5126,16 +5161,41 @@ fn register_fresh_agent_tab(
         .insert(pane_id.to_string(), tab_id.to_string());
 }
 
-/// A web restart drops the REST pane map while the shared layout and hosted
-/// runtime survive. Resolve hosted panes from the persisted layout on a miss;
-/// the gateway still checks the session against the supervisor inventory.
+/// Browser-created panes and a restored layout need not have a REST pane row.
+/// Resolve them when their provider has a lane; that lane owns the live-session
+/// checks and transcript lookup.
 fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
-    if let Some(pane) = state.panes.lock().expect("panes mutex").get(pane_id) {
-        return Some(pane.clone());
+    let cached = state
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .get(pane_id)
+        .cloned();
+    let Some(snapshot) = state.layout.get_pane_snapshot(pane_id) else {
+        return cached;
+    };
+    // An existing snapshot is authoritative even when its current content
+    // cannot be controlled by this route. A retired cache row must not make
+    // a browser, shell or unsupported provider address the previous session.
+    let current = pane_entry_from_content(snapshot.pane_content.as_ref()?)?;
+    if state.rest_lane_for(&current.provider).is_some() {
+        return Some(current);
     }
-    state.hosted_rest_gateway()?;
-    let snapshot = state.layout.get_pane_snapshot(pane_id)?;
-    let content = snapshot.pane_content?;
+    // Local OpenCode predates the generic lane and keeps its materialized
+    // identity in the cache while the layout can still show its placeholder.
+    // Retain that path only for the same, still-visible OpenCode identity.
+    let cached = cached?;
+    (current.provider == PROVIDER
+        && current.session_type == SESSION_TYPE
+        && cached.provider == PROVIDER
+        && cached.session_type == SESSION_TYPE
+        && current.placeholder_id == cached.placeholder_id
+        && (current.durable_id.as_ref() == Some(&current.placeholder_id)
+            || current.durable_id == cached.durable_id))
+        .then_some(cached)
+}
+
+fn pane_entry_from_content(content: &Value) -> Option<PaneEntry> {
     if content.get("kind")?.as_str()? != "fresh-agent" {
         return None;
     }
@@ -5150,10 +5210,18 @@ fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<Pane
     ) {
         return None;
     }
-    let session_id = content.get("sessionId")?.as_str()?.to_string();
-    if session_id.is_empty() {
-        return None;
-    }
+    let durable_id = content
+        .get("sessionRef")
+        .and_then(|value| serde_json::from_value::<SessionLocator>(value.clone()).ok())
+        .filter(|locator| locator.provider == provider && !locator.session_id.is_empty())
+        .map(|locator| locator.session_id);
+    let session_id = content
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| durable_id.clone())?;
+    let durable_id = durable_id.unwrap_or_else(|| session_id.clone());
     Some(PaneEntry {
         placeholder_id: session_id.clone(),
         provider: provider.to_string(),
@@ -5170,7 +5238,7 @@ fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<Pane
             .get("effort")
             .and_then(Value::as_str)
             .map(str::to_string),
-        durable_id: Some(session_id),
+        durable_id: Some(durable_id),
     })
 }
 
@@ -6350,48 +6418,59 @@ async fn send_keys(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_TURN_TIMEOUT);
 
-    if let Some(gateway) = state.hosted_rest_gateway() {
+    if let Some(gateway) = state.rest_lane_for(&pane.provider) {
+        let (observed_epoch, observed_generation) = match rest_lane::observed_fence(&body) {
+            Ok(fence) => fence,
+            Err(error) => return rest_lane_failure(error),
+        };
         let request_id = body
             .get("requestId")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let addressed_session_id = pane
+            .durable_id
+            .clone()
+            .unwrap_or_else(|| pane.placeholder_id.clone());
         let result = gateway
-            .send_agent(hosted_rest::HostedRestSend {
+            .send_agent(rest_lane::RestLaneSend {
                 request_id: request_id.clone(),
-                session_id: pane.placeholder_id.clone(),
+                session_id: addressed_session_id.clone(),
                 provider: pane.provider.clone(),
                 session_type: pane.session_type.clone(),
                 text,
                 timeout_ms: u64::try_from(turn_timeout.as_millis()).unwrap_or(u64::MAX),
+                observed_epoch,
+                observed_generation,
             })
             .await;
         return match result {
-            Ok(result) if result.completed => ok_json(
-                json!({
+            Ok(result) => {
+                state.reconcile_rest_send_session(
+                    &pane_id,
+                    &pane,
+                    &addressed_session_id,
+                    &result.session_id,
+                );
+                let mut data = json!({
                     "paneId":pane_id,
                     "sessionId":result.session_id,
-                    "submittedTurnId":request_id,
                     "sessionRef":{"provider":pane.provider,"sessionId":result.session_id},
-                    "status":"idle",
-                }),
-                "prompt sent",
-            ),
-            Ok(result) => approx_json(
-                json!({
-                    "paneId":pane_id,
-                    "sessionId":result.session_id,
-                    "submittedTurnId":request_id,
-                    "sessionRef":{"provider":pane.provider,"sessionId":result.session_id},
-                    "status":"approx",
-                }),
-                "prompt sent; turn did not complete within deadline",
-            ),
-            Err(()) => fail_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "durable fresh-agent input was not accepted".to_string(),
-            ),
+                    "status":if result.noop { "noop" } else if result.completed { "idle" } else { "approx" },
+                });
+                if !result.noop {
+                    data["submittedTurnId"] = json!(result.submitted_turn_id.unwrap_or(request_id));
+                }
+                if result.noop {
+                    ok_json(data, "no input sent")
+                } else if result.completed {
+                    ok_json(data, "prompt sent")
+                } else {
+                    approx_json(data, "prompt sent; turn did not complete within deadline")
+                }
+            }
+            Err(error) => rest_lane_failure(error),
         };
     }
 
@@ -7051,7 +7130,7 @@ async fn capture(
             return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
         }
     };
-    if let Some(gateway) = state.hosted_rest_gateway() {
+    if let Some(gateway) = state.rest_lane_for(&pane.provider) {
         let session_id = pane
             .durable_id
             .clone()
@@ -7062,7 +7141,7 @@ async fn capture(
             .unwrap_or(256 * 1024)
             .clamp(1, 256 * 1024);
         return match gateway
-            .capture(hosted_rest::HostedRestCapture {
+            .capture(rest_lane::RestLaneCapture {
                 session_id,
                 provider: pane.provider.clone(),
                 session_type: pane.session_type.clone(),
@@ -7071,13 +7150,17 @@ async fn capture(
             .await
         {
             Ok(capture) => text_plain(capture.text),
-            Err(hosted_rest::HostedRestCaptureError::Unsupported) => fail_json(
+            Err(rest_lane::RestLaneCaptureError::Unsupported) => fail_json(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "hosted fresh-agent provider does not support transcript capture".to_string(),
+                "fresh-agent provider does not support transcript capture".to_string(),
             ),
-            Err(hosted_rest::HostedRestCaptureError::Unavailable) => fail_json(
+            Err(rest_lane::RestLaneCaptureError::Unavailable) => fail_json(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "hosted fresh-agent transcript is temporarily unavailable".to_string(),
+                "fresh-agent transcript is temporarily unavailable".to_string(),
+            ),
+            Err(rest_lane::RestLaneCaptureError::NotFound) => fail_json(
+                StatusCode::NOT_FOUND,
+                "fresh-agent transcript was not found".to_string(),
             ),
         };
     }
@@ -9246,40 +9329,41 @@ mod tests {
     // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
 
     #[derive(Default)]
-    struct RecordingHostedRestGateway {
-        sends: Mutex<Vec<hosted_rest::HostedRestSend>>,
-        captures: Mutex<Vec<hosted_rest::HostedRestCapture>>,
+    struct RecordingRestLaneGateway {
+        sends: Mutex<Vec<rest_lane::RestLaneSend>>,
+        captures: Mutex<Vec<rest_lane::RestLaneCapture>>,
     }
 
     #[async_trait::async_trait]
-    impl hosted_rest::HostedFreshAgentRestGateway for RecordingHostedRestGateway {
+    impl rest_lane::FreshAgentRestLane for RecordingRestLaneGateway {
         async fn create_agent(
             self: Arc<Self>,
-            _request: hosted_rest::HostedRestCreate,
-        ) -> Result<hosted_rest::HostedRestCreated, ()> {
-            Ok(hosted_rest::HostedRestCreated {
+            _request: rest_lane::RestLaneCreate,
+        ) -> Result<rest_lane::RestLaneCreated, rest_lane::RestLaneError> {
+            Ok(rest_lane::RestLaneCreated {
                 session_id: "managed-kilroy-recovered".into(),
+                ..Default::default()
             })
         }
 
         async fn send_agent(
             &self,
-            request: hosted_rest::HostedRestSend,
-        ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+            request: rest_lane::RestLaneSend,
+        ) -> Result<rest_lane::RestLaneSendResult, rest_lane::RestLaneError> {
             self.sends.lock().expect("sends mutex").push(request);
-            Ok(hosted_rest::HostedRestSendResult {
+            Ok(rest_lane::RestLaneSendResult {
                 session_id: "managed-kilroy-recovered".into(),
                 completed: true,
+                ..Default::default()
             })
         }
 
         async fn capture(
             &self,
-            request: hosted_rest::HostedRestCapture,
-        ) -> Result<hosted_rest::HostedRestCaptureResult, hosted_rest::HostedRestCaptureError>
-        {
+            request: rest_lane::RestLaneCapture,
+        ) -> Result<rest_lane::RestLaneCaptureResult, rest_lane::RestLaneCaptureError> {
             self.captures.lock().expect("captures mutex").push(request);
-            Ok(hosted_rest::HostedRestCaptureResult {
+            Ok(rest_lane::RestLaneCaptureResult {
                 session_id: "managed-kilroy-recovered".into(),
                 native_session_id: "kilroy-native".into(),
                 text: "recovered transcript".into(),
@@ -9292,7 +9376,7 @@ mod tests {
     async fn hosted_rest_send_and_capture_recover_pane_from_persisted_layout_after_web_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout.json");
-        let gateway = Arc::new(RecordingHostedRestGateway::default());
+        let gateway = Arc::new(RecordingRestLaneGateway::default());
         let first = state().with_layout(layout_store::LayoutStore::with_persistence(path.clone()));
         first.set_hosted_rest_gateway(gateway.clone()).unwrap();
         let mut headers = HeaderMap::new();

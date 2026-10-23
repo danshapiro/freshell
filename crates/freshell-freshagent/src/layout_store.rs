@@ -1105,6 +1105,87 @@ impl LayoutStore {
         }
     }
 
+    /// Remove an unannounced split leaf after its runtime failed to launch.
+    /// Preserve the surrounding split IDs, direction, sizes and any content
+    /// updates that arrived while creation awaited the provider.
+    pub(crate) fn rollback_split(&self, pane_id: &str) -> bool {
+        let mut inner = self.lock();
+        let mut removed = false;
+        for snapshot in inner.snapshots_mut() {
+            let tab_id = snapshot.layouts.iter_mut().find_map(|(tab_id, root)| {
+                collapse_split_leaf(root, pane_id).then(|| tab_id.clone())
+            });
+            if let Some(tab_id) = tab_id {
+                remove_pane_metadata(snapshot, &tab_id, pane_id);
+                removed = true;
+            }
+        }
+        if removed {
+            inner.recovery_stamps.remove(pane_id);
+            persist_locked(&inner);
+        }
+        removed
+    }
+
+    /// A settled send can change its live conversation (/clear). Update only
+    /// the pane that still names the accepted conversation; a concurrent
+    /// replacement owns its newer content. The same lock guards that check
+    /// and the write, and the recovery stamp protects an old client mirror.
+    pub(crate) fn rekey_agent_pane_if_current(
+        &self,
+        pane_id: &str,
+        provider: &str,
+        session_type: &str,
+        before: &str,
+        after: &str,
+    ) -> bool {
+        let matches = |content: &Value| {
+            let identity = content
+                .get("sessionRef")
+                .filter(|reference| reference["provider"].as_str() == Some(provider))
+                .and_then(|reference| reference["sessionId"].as_str())
+                .filter(|id| !id.is_empty())
+                .or_else(|| content["sessionId"].as_str());
+            content["kind"] == "fresh-agent"
+                && content["provider"].as_str() == Some(provider)
+                && content["sessionType"].as_str() == Some(session_type)
+                && identity == Some(before)
+        };
+        let mut inner = self.lock();
+        let Some(pre_recovery) = inner
+            .snapshots()
+            .find_map(|snapshot| pane_content_in_snapshot(snapshot, pane_id))
+        else {
+            return false;
+        };
+        if !matches(&pre_recovery) {
+            return false;
+        }
+        for snapshot in inner.snapshots_mut() {
+            for root in snapshot.layouts.values_mut() {
+                let Some(PaneNode::Leaf { content, .. }) = root.find_leaf(pane_id) else {
+                    continue;
+                };
+                if !matches(content) {
+                    continue;
+                }
+                let mut current = content.clone();
+                current["sessionId"] = json!(after);
+                current["sessionRef"] = json!({ "provider":provider, "sessionId":after });
+                root.replace_leaf_content(pane_id, current);
+                break;
+            }
+        }
+        inner.recovery_stamps.insert(
+            pane_id.to_string(),
+            RecoveryStamp {
+                pre_recovery_content: pre_recovery,
+            },
+        );
+        persist_locked(&inner);
+        true
+    }
+
     /// Re-seeds the derived title (non-sticky). Runs the legacy content
     /// migration first (`attachPaneContent`, `layout-store.ts:680-694`).
     pub fn attach_pane_content(
@@ -1685,6 +1766,19 @@ fn close_pane_in(snapshot: &mut UiSnapshot, pane_id: &str) -> Option<Result<Stri
         return Some(Ok(tab_id));
     }
     None
+}
+
+fn collapse_split_leaf(root: &mut PaneNode, pane_id: &str) -> bool {
+    let PaneNode::Split { children, .. } = root else {
+        return false;
+    };
+    for removed in 0..2 {
+        if matches!(&children[removed], PaneNode::Leaf { id, .. } if id == pane_id) {
+            *root = children[1 - removed].clone();
+            return true;
+        }
+    }
+    collapse_split_leaf(&mut children[0], pane_id) || collapse_split_leaf(&mut children[1], pane_id)
 }
 
 fn find_pane_tab(snapshot: &UiSnapshot, pane_id: &str) -> Option<String> {

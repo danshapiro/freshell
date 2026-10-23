@@ -23,6 +23,39 @@ fn split(id: &str, direction: &str, sizes: [i64; 2], a: Value, b: Value) -> Valu
     })
 }
 
+#[test]
+fn failed_split_rollback_preserves_the_surrounding_tree_and_later_content_updates() {
+    let store = LayoutStore::default();
+    let original = split(
+        "existing-split",
+        "vertical",
+        [30, 70],
+        leaf("p1", json!({"kind":"terminal", "terminalId":"old"})),
+        leaf("p2", json!({"kind":"browser", "url":"https://example.com"})),
+    );
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs":[{"id":"tab"}], "activeTabId":"tab", "layouts":{"tab":original},
+            "activePane":{"tab":"p1"}, "timestamp":1,
+        })),
+        "client",
+    );
+    let (_, temporary) = store.split_pane("p1", "horizontal").unwrap();
+    store.attach_pane_content(
+        "tab",
+        "p1",
+        json!({"kind":"terminal", "terminalId":"replacement"}),
+    );
+    assert!(store.rollback_split(&temporary));
+    let mut expected = original;
+    expected["children"][0]["content"]["terminalId"] = json!("replacement");
+    let snapshot = store.get_normalized_snapshot(None);
+    assert_eq!(snapshot["layouts"]["tab"], expected);
+    assert_eq!(snapshot["activePane"]["tab"], "p1");
+    assert!(store.get_pane_snapshot(&temporary).is_none());
+    assert!(!store.rollback_split(&temporary));
+}
+
 /// One tab `t1`, single claude-terminal leaf `p1`.
 fn single_pane_sync(
     pane_titles: Option<Value>,

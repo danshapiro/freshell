@@ -2679,12 +2679,28 @@ impl PaneLedger {
             }
         }
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
+        // A superseding conversation keeps its pane's create lineage, so a
+        // replay after reset or rollback still finds the current session.
+        let superseded_parent = w
+            .supersedes
+            .filter(|old| *old != w.session_id)
+            .and_then(|old| {
+                index
+                    .bindings
+                    .get(&(w.provider.to_string(), old.to_string()))
+                    .cloned()
+            });
         // Advisory field: keep the existing row's value when the new write
         // has none (latest-observed semantics, D4).
         let create_request_id = w
             .create_request_id
             .map(str::to_string)
-            .or_else(|| existing.and_then(|r| r.create_request_id.clone()));
+            .or_else(|| existing.and_then(|r| r.create_request_id.clone()))
+            .or_else(|| {
+                superseded_parent
+                    .as_ref()
+                    .and_then(|r| r.create_request_id.clone())
+            });
         // Lineage (delta-r7-round-3, F1): the fresh-agent row's origin
         // mirrors its pane key — the same computed value — so the coverage
         // join against either key is identical to the pre-F1 crid arm on
@@ -2738,15 +2754,6 @@ impl PaneLedger {
         // documented in the terminal body (focused-ep4-r5 Finding 2a); no
         // sequence counter is built for it. The retire/link below is
         // unchanged by the policy; this block is stamps+time only.
-        let superseded_parent = w
-            .supersedes
-            .filter(|old| *old != w.session_id)
-            .and_then(|old| {
-                index
-                    .bindings
-                    .get(&(w.provider.to_string(), old.to_string()))
-                    .cloned()
-            });
         let inherit = existing.or(superseded_parent.as_ref());
         let prior_attribution = inherit.and_then(|r| r.last_attributed_at);
         let apply = match w.provenance {

@@ -1,6 +1,6 @@
 //! Actual initial controller callers with synthetic authenticated control transport.
 use super::*;
-use freshell_freshagent::hosted_rest::{HostedFreshAgentRestGateway, HostedRestCreate};
+use freshell_freshagent::rest_lane::{FreshAgentRestLane, RestLaneCreate};
 use freshell_runtime_protocol::*;
 use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
 use tokio::net::UnixListener;
@@ -364,7 +364,7 @@ mod uncertain_launch {
             .unwrap()
             .unwrap();
             fresh
-                .create_agent(HostedRestCreate {
+                .create_agent(RestLaneCreate {
                     request_id: seed.clone(),
                     provider: if provider == "kilroy" {
                         "claude"
@@ -385,6 +385,7 @@ mod uncertain_launch {
                     model_selection: None,
                     permission_mode: None,
                     sandbox: None,
+                    ..Default::default()
                 })
                 .await
                 .map(|_| ())
@@ -714,7 +715,7 @@ fn managed_provider_initial_opencode_callers_replan_changed_selection_with_two_r
                 let prior_stage=control.join("provider-roots").join(&prior_grant);
                 let prior_manifest=std::fs::read(prior_stage.join(".freshell/input-manifest.json")).unwrap();
                 let result=if fresh_route {
-                    fresh.clone().create_agent(HostedRestCreate {request_id:seed.clone(),provider:"opencode".into(),session_type:"freshopencode".into(),cwd:Some(workspace.to_string_lossy().into_owned()),model:None,effort:None,native_session_id:None,plugins:None,model_selection:None,permission_mode:None,sandbox:None}).await.map(|_|()).map_err(|_|"fresh refusal".to_string())
+                    fresh.clone().create_agent(RestLaneCreate {request_id:seed.clone(),provider:"opencode".into(),session_type:"freshopencode".into(),cwd:Some(workspace.to_string_lossy().into_owned()),model:None,effort:None,native_session_id:None,plugins:None,model_selection:None,permission_mode:None,sandbox:None,..Default::default()}).await.map(|_|()).map_err(|_|"fresh refusal".to_string())
                 } else {
                     controller.launch(ManagedTerminalLaunch {spec:freshell_platform::SpawnSpec {program:"opencode".into(),args:vec![],env_overrides:BTreeMap::new(),cwd:Some(workspace.to_string_lossy().into_owned()),cols:80,rows:24},env:BTreeMap::new(),terminal_id:seed.clone(),stream_id:seed.clone(),mode:"opencode".into(),resume_session_id:None,provider_model:None,provider_reasoning_effort:None,provider_sandbox:None,provider_permission_mode:None,view_tab_id:None,view_pane_id:None,create_request_id:Some(seed.clone())}).await.map(|_|()).map_err(|error| error.to_string())
                 };

@@ -375,7 +375,7 @@ async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over
     })
     .await;
 
-    assert_eq!(frame["sessionId"], "gone-after-restart");
+    assert_eq!(frame["sessionId"], durable);
     assert_eq!(frame["sessionType"], "freshclaude");
     assert_eq!(frame["event"]["status"], "idle");
     assert_eq!(frame["event"]["timelineSessionId"], durable);
@@ -439,21 +439,19 @@ async fn claude_attach_with_an_unreadable_store_is_transient_not_lost() {
     )
     .await;
 
-    // The FIRST answer is decisive: either the lost frame for this pane or the
-    // transient top-level error.
+    // A transient failure stays scoped to this pane and is distinct from
+    // the permanent INVALID_SESSION_ID lost-session response.
     let frame = await_frame(&mut ws, Duration::from_secs(15), |v| {
         (v["type"] == "freshAgent.event" && v["sessionId"] == "pane-with-unreadable-store")
             || v["type"] == "error"
     })
     .await;
     assert_eq!(
-        frame["type"], "error",
+        frame["event"]["type"], "freshAgent.error",
         "an unreadable store must not mark the session lost: {frame}"
     );
     assert!(
-        frame["message"]
-            .as_str()
-            .is_some_and(|m| m.starts_with("CLAUDE_ATTACH_RESUME_FAILED")),
+        frame["event"]["code"] == "CLAUDE_ATTACH_RESUME_FAILED",
         "the attach answers with the transient resume failure: {frame}"
     );
 

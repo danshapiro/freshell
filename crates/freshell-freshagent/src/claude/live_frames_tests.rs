@@ -25,7 +25,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
   if (msg.type === 'create') {
     const sessionId = 'live-frames-session'
     out({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
-    out({ type: 'sdk.session.init', sessionId, cliSessionId: DURABLE, model: 'fake-model', cwd: '/tmp', tools: [] })
+    out({ type: 'sdk.session.init', sessionId, cliSessionId: msg.sessionId || DURABLE, model: 'fake-model', cwd: '/tmp', tools: [] })
   } else if (msg.type === 'send') {
     for (const frame of JSON.parse(msg.text)) out({ ...frame, sessionId: msg.sessionId })
   } else if (msg.type === 'configure') {

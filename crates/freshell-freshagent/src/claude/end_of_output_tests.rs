@@ -50,7 +50,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
   if (msg.type === 'create') {
     const sessionId = 'ending-sidecar-session'
     out({ type: 'created', requestId: msg.requestId, sessionId, protocol: 2 })
-    out({ type: 'sdk.session.init', sessionId, cliSessionId: DURABLE, model: 'fake-model', cwd: '/tmp', tools: [] })
+    out({ type: 'sdk.session.init', sessionId, cliSessionId: msg.sessionId || DURABLE, model: 'fake-model', cwd: '/tmp', tools: [] })
     out({ type: 'sdk.status', sessionId, status: 'idle' })
   } else if (msg.type === 'send') {
     if (MODE === 'stream-ends') {
@@ -610,7 +610,7 @@ async fn a_requested_stop_kills_the_same_tree_and_reports_nothing() {
     assert_eq!(session.count(is_exit_report), 0, "{:?}", session.frames);
     assert_eq!(session.count(is_turn_complete), 0, "{:?}", session.frames);
     assert!(session.st.dead_sessions.find(&session.pane).is_none());
-    assert!(session.st.dead_sessions.find(DURABLE).is_none());
+    assert!(session.st.dead_sessions.find(&session.pane).is_none());
     assert!(records(&events, "freshagent.claude.sidecar_exit").is_empty());
     let teardowns = capture::teardown_events(&events);
     assert_eq!(teardowns.len(), 1, "{teardowns:?}");
