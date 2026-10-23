@@ -1,9 +1,10 @@
 //! Applying a decided automatic name (name-reliability plan, Task 4): the
 //! small document mutations the store's decisions use once
 //! `session_name_policy` has decided an offer applies — install the name
-//! exactly as planned (never re-offered through the strict raise), log a
-//! self-heal, and attach a rename outcome. (A record's native baseline is
-//! read through `session_name_sweep_batch::StagedNativeBaselines`.)
+//! exactly as planned (never re-offered through the strict raise) and
+//! attach a rename outcome. (A record's native baseline is read through
+//! `session_name_sweep_batch::StagedNativeBaselines`; every accepted change,
+//! self-heals included, is logged by `session_name_events`.)
 
 use freshell_protocol::session_names::{
     NameSource, RenameOutcome, SessionNameRecord, SessionNameRef, SessionNameUpdate,
@@ -43,33 +44,6 @@ pub(super) fn replace_automatic(
             legacy_origin: None,
         },
     );
-    Ok(())
-}
-
-/// [`replace_automatic`] plus, when `heal` (the replacement exists only
-/// because of the self-heal rule — not an ordinary rank raise), the
-/// structured INFO `session_names.self_heal_applied` (sources only: the new
-/// name can be a user's first message and is never logged).
-pub(super) fn replace_heal(
-    document: &mut StoredDocument,
-    key: &str,
-    name: String,
-    source: NameSource,
-    op: &'static str,
-    heal: bool,
-) -> Result<(), NameError> {
-    let old_source = document.record_at(key).map(|record| record.source);
-    replace_automatic(document, key, name, source)?;
-    if let (true, Some(old_source)) = (heal, old_source) {
-        tracing::info!(
-            target: "freshell_server::session_names",
-            op = op,
-            name_ref = %key,
-            old_source = %wire_source(old_source),
-            new_source = %wire_source(source),
-            "session_names.self_heal_applied"
-        );
-    }
     Ok(())
 }
 

@@ -718,9 +718,11 @@ async fn a_default_label_moved_past_its_install_keeps_the_rank_rule() {
     );
 }
 
-/// The decision log spells sources the way the stored document, the wire
-/// and the other naming logs do (`provider_ai`, `directory`), so a log
-/// search for a source finds these lines too.
+/// The import-owned label's loss is logged once the bind commits, as the
+/// name-change event of the session's record (name-reliability Task 12): a
+/// bind collision that healed a junk label, with the sources spelled the way
+/// the stored document, the wire and the other naming logs do
+/// (`provider_ai`, `directory`), so a log search for a source finds it.
 #[tokio::test]
 async fn bind_collision_log_spells_sources_as_the_wire_does() {
     let events = crate::test_trace_capture::captured_trace_events();
@@ -736,24 +738,28 @@ async fn bind_collision_log_spells_sources_as_the_wire_does() {
         .snapshot()
         .into_iter()
         .filter(|event| {
-            event.message == "session_names.bind_collision_import_label_lost"
+            event.message == "session_names.name_changed"
                 && event.fields.get("name_ref") == Some(&key)
+                && event.fields.get("cause").map(String::as_str) == Some("bind_collision")
         })
         .collect();
-    assert_eq!(lines.len(), 1, "one decision line: {lines:?}");
+    assert_eq!(lines.len(), 1, "one bind-collision change: {lines:?}");
     let line = &lines[0];
     assert_eq!(line.level, tracing::Level::INFO);
+    let field = |name: &str| line.fields.get(name).map(String::as_str);
+    assert_eq!(field("old_name"), Some("Tab 4"));
+    assert_eq!(field("old_source"), Some("provider_ai"));
+    assert_eq!(field("new_name"), Some("work"));
+    assert_eq!(field("new_source"), Some("directory"));
+    assert_eq!(field("self_heal"), Some("true"));
     assert_eq!(
-        line.fields.get("op").map(String::as_str),
-        Some("bind_pending")
-    );
-    assert_eq!(
-        line.fields.get("loser_source").map(String::as_str),
-        Some("provider_ai")
-    );
-    assert_eq!(
-        line.fields.get("winner_source").map(String::as_str),
-        Some("directory")
+        field("from_ref"),
+        Some(
+            name_ref_key(&SessionNameRef::Pending {
+                id: "P".to_string()
+            })
+            .as_str()
+        )
     );
 }
 

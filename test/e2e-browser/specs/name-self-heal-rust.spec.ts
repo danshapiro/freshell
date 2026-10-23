@@ -10,6 +10,7 @@ import {
 } from '../helpers/unified-agent-names.js'
 import { startRefusingGemini } from '../helpers/native-title-journeys.js'
 import { writeClaudeTranscript, writeSessionNamesDocument } from '../helpers/session-names-fixture.js'
+import { nameRefLogKey, readNameChangedEvents } from '../helpers/name-change-events.js'
 
 /**
  * Name-reliability Task 4 (the self-heal rule): a saved name that is
@@ -113,6 +114,21 @@ test.describe('saved names self-heal', () => {
       await openFromSidebar(page, JUNK_ID, JUNK_FIRST_MESSAGE)
       await openFromSidebar(page, MANUAL_ID, 'Tab 8')
       expect(await readName(server, claudeRef(MANUAL_ID))).toEqual({ name: 'Tab 8', source: 'manual' })
+
+      // Name-reliability Task 12: the heal is one logged change, marked as a
+      // self-heal; the manual "Tab 8" never changes, so it logs nothing.
+      const eventsFor = async (sessionId: string) => (await readNameChangedEvents(server.info.logsDir))
+        .filter((event) => event.name_ref === nameRefLogKey(claudeRef(sessionId)))
+      await expect.poll(() => eventsFor(JUNK_ID), { timeout: 10_000 }).toEqual([
+        expect.objectContaining({
+          old_name: 'Tab 7',
+          old_source: 'provider_ai',
+          new_name: JUNK_FIRST_MESSAGE,
+          new_source: 'first_message',
+          self_heal: true,
+        }),
+      ])
+      expect(await eventsFor(MANUAL_ID)).toEqual([])
       await context.close()
     } finally {
       await server.stop()
