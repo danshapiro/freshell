@@ -2392,7 +2392,7 @@ impl FreshClaudeState {
 
         // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
         // 4+5): an explicit create-with-resume GENUINELY CLAIMS the durable
-        // identity — but the claim COMMITS only further down, once the
+        // identity — but the claim COMMITS only in `establish_runtime`, once the
         // replacement session is established (sidecar created + `created`
         // answered). Clearing the fence before the spawn (round 2's
         // placement) left a failed create's identity UNFENCED — an older
@@ -2403,8 +2403,8 @@ impl FreshClaudeState {
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
         // SNAPSHOT is taken here — at claim start, after the lease and
         // before the spawn — so a kill that lands while the resume awaits
-        // `created` advances the durable tombstone past it and the commit
-        // below REFUSES instead of undoing the newer close.
+        // `created` advances the durable tombstone past it and the commit in
+        // `establish_runtime` REFUSES instead of undoing the newer close.
         let claim_dead_state = resume_sid
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
