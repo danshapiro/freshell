@@ -1138,12 +1138,13 @@ fn inert_generation(
     dir: &std::path::Path,
 ) -> Arc<crate::session_name_generation::SessionNameGenerator> {
     struct NeverTransport;
-    impl crate::ai_title::GeminiTransport for NeverTransport {
+    impl crate::session_name_capability::SessionNameTransport for NeverTransport {
         fn generate_content(
             &self,
             _p: String,
             _m: u32,
-        ) -> crate::ai_title::BoxFuture<Result<String, String>> {
+        ) -> crate::ai_title::BoxFuture<Result<String, crate::gemini_failure::GeminiFailure>>
+        {
             Box::pin(std::future::pending())
         }
     }
@@ -2013,12 +2014,13 @@ async fn started_shared_titled_manager(
 #[tokio::test]
 async fn an_opencode_native_series_resumes_when_the_shared_serve_arrives_after_boot() {
     struct NeverGemini;
-    impl crate::ai_title::GeminiTransport for NeverGemini {
+    impl crate::session_name_capability::SessionNameTransport for NeverGemini {
         fn generate_content(
             &self,
             _prompt: String,
             _max_output_tokens: u32,
-        ) -> crate::ai_title::BoxFuture<Result<String, String>> {
+        ) -> crate::ai_title::BoxFuture<Result<String, crate::gemini_failure::GeminiFailure>>
+        {
             Box::pin(std::future::pending())
         }
     }
@@ -2072,7 +2074,7 @@ async fn an_opencode_native_series_resumes_when_the_shared_serve_arrives_after_b
         crate::ai_title::GeminiSessionNameAuth::direct_for_test(crate::ai_title::AiKeyCell::init(
             None, None,
         )),
-        Arc::new(NeverGemini) as Arc<dyn crate::ai_title::GeminiTransport>,
+        Arc::new(NeverGemini) as Arc<dyn crate::session_name_capability::SessionNameTransport>,
     ));
     let worker = super::SessionNameWorker::start(Arc::clone(&store), dispatch, generator);
 

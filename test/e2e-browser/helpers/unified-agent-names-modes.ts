@@ -70,7 +70,11 @@ export interface Journey {
 export async function bootJourney(mode: UnifiedAgentMode, opts: {
   gemini?: FakeGemini | null
   oneCliGeminiProxy?: FakeOneCliGeminiProxy | null
-  directFallbackKey?: string
+  /** An env Gemini key for a OneCLI journey. Unset (the default) leaves the
+   * server with NO key, so it uses the inherited OneCLI route: a configured
+   * key always wins and goes direct past a OneCLI proxy (name-reliability
+   * Task 6). */
+  key?: string
   env?: Record<string, string>
   setupHome?: (homeDir: string) => Promise<void>
 } = {}): Promise<Journey> {
@@ -81,7 +85,7 @@ export async function bootJourney(mode: UnifiedAgentMode, opts: {
         http_proxy: opts.oneCliGeminiProxy.proxyUrl,
         NO_PROXY: '',
         no_proxy: '',
-        GOOGLE_GENERATIVE_AI_API_KEY: opts.directFallbackKey ?? 'unified-names-direct-fallback-sentinel',
+        GOOGLE_GENERATIVE_AI_API_KEY: opts.key ?? '',
       }
     : {}
   const server = await bootUnifiedNamesServer({
@@ -262,10 +266,9 @@ export async function activityGeneratesOneSharedShortNameViaOneCliProxy(
 ): Promise<void> {
   const expectedFirstMessage = 'Repair the sardine factory line'
   const proxy = await startFakeOneCliGeminiProxy(AI_NAME, expectedFirstMessage)
-  const journey = await bootJourney(mode, {
-    oneCliGeminiProxy: proxy,
-    directFallbackKey: 'synthetic-direct-fallback-key',
-  })
+  // No key configured: the server borrows the inherited OneCLI identity and
+  // sends the request through the proxy without a key.
+  const journey = await bootJourney(mode, { oneCliGeminiProxy: proxy })
   try {
     const { page, harness, context } = await connect(journey, browser)
     let handle = await createNamedAgent(harness, mode, { entry: 'ui', page, server: journey.server })

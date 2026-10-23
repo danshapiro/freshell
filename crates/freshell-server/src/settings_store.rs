@@ -2104,6 +2104,13 @@ pub struct SettingsRouterState {
     /// `AI_CONFIG.applySettingsKey(key, { force: true })` on the settings
     /// save path (`ai-prompts.ts:17-23`). A blank/absent key never clears.
     pub ai_key: crate::ai_title::AiKeyCell,
+    /// Name-reliability Task 6: the log writer's live secrets; a saved key
+    /// joins them before anything can log it.
+    pub log_secrets: freshell_runtime_observability::LiveSecrets,
+    /// Name-reliability Task 6: the naming generator, told when the saved
+    /// key changes (it clears the naming pause and wakes the worker).
+    /// `None` when naming is not wired.
+    pub naming_generation: Option<Arc<crate::session_name_generation::SessionNameGenerator>>,
 }
 
 /// `GET`/`PATCH`/`PUT` `/api/settings` (R1: PUT === PATCH, matching
@@ -2139,9 +2146,14 @@ async fn patch_settings(
             // Task 2: force-re-apply the settings key on EVERY successful save
             // (Node's `AI_CONFIG.applySettingsKey(key, { force: true })`,
             // `ai-prompts.ts:17-23`); blank/absent never clears the cell.
-            state
-                .ai_key
-                .apply_settings_key_forced(merged.ai.gemini_api_key.as_deref());
+            // Name-reliability Task 6: the value becomes a live log secret,
+            // and a changed key resets the naming pause.
+            crate::session_name_capability::apply_saved_gemini_key(
+                &state.ai_key,
+                &state.log_secrets,
+                state.naming_generation.as_deref(),
+                merged.ai.gemini_api_key.as_deref(),
+            );
             if let Ok(frame) =
                 serde_json::to_string(&json!({ "type": "settings.updated", "settings": &merged }))
             {
@@ -2212,6 +2224,8 @@ mod tests {
             fresh_codex,
             registry: freshell_terminal::TerminalRegistry::new(),
             ai_key: crate::ai_title::AiKeyCell::default(),
+            log_secrets: freshell_runtime_observability::LiveSecrets::default(),
+            naming_generation: None,
         }
     }
 
@@ -3774,6 +3788,8 @@ mod tests {
                 json!({}),
             ),
             registry: freshell_terminal::TerminalRegistry::new(),
+            log_secrets: freshell_runtime_observability::LiveSecrets::default(),
+            naming_generation: None,
         };
 
         let resp = patch_settings(

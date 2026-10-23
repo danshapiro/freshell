@@ -103,6 +103,10 @@ mod session_name_sweep_batch;
 // and the prompt-input guard.
 #[path = "session_name_first_message.rs"]
 mod session_name_first_message;
+// Name-reliability Task 6: claim/fold attempt accounting (refunds, fold-side
+// exhaustion).
+#[path = "session_name_generation_series.rs"]
+mod session_name_generation_series;
 use session_name_apply::{indexed_key, replace_automatic, replace_heal, wire_source, with_outcome};
 use session_name_first_message::{first_message_fallback, RefusalSite, SeriesPlan};
 use session_name_sweep_batch::StagedNativeBaselines;
@@ -845,8 +849,9 @@ impl SessionNames {
     }
 
     /// Durable generation work-claim seam (Task 4's worker dispatches through
-    /// this): persist an attempt's start before any provider call, consuming
-    /// one of the bounded three starts and exhausting the series at the cap.
+    /// this): persist an attempt's start before any provider call, charging
+    /// one of the bounded three starts. The claim never exhausts the series
+    /// or drops its input — the fold decides (name-reliability Task 6).
     /// `Ok(None)` = the series is not claimable right now (absent, not yet
     /// due, already in flight, exhausted, or the record's accepted source
     /// is protected) — nothing was consumed.
@@ -870,7 +875,9 @@ impl SessionNames {
     /// answer generated from older input must not be accepted), and the
     /// accepted source is below Freshell AI; empty/failed outcomes schedule
     /// the bounded retry (30s after failure 1, five minutes after failure
-    /// 2) without consuming another start.
+    /// 2) without consuming another start, or exhaust the series at the
+    /// cap; capability and quota outcomes refund the start
+    /// (name-reliability Task 6).
     // Tasks 3–4 seam: the generation worker lands next.
     #[allow(dead_code)]
     pub(crate) fn fold_generation_outcome(
@@ -3451,22 +3458,12 @@ fn claim_generation_start_decision(
             publish: Vec::new(),
         });
     }
-    // Persist the start before dispatch; empty/invalid answers and
-    // interrupted starts consume it.
+    // Persist the start before dispatch; the fold decides whether it
+    // counted (name-reliability Task 6).
     let series_id = series.series_id.clone();
     let input_fingerprint = series.input_fingerprint.clone();
     let excerpt = series.excerpt.clone();
-    series.consumed += 1;
-    series.attempt_ids.push(attempt_id.to_string());
-    series.attempt_starts.push(meta.now_ms);
-    let consumed = series.consumed;
-    if series.consumed >= MAX_GENERATION_STARTS {
-        series.status = GenerationStatus::Exhausted;
-        series.exhausted_at = Some(meta.now_ms);
-        series.excerpt = None;
-    } else {
-        series.status = GenerationStatus::InFlight;
-    }
+    let consumed = session_name_generation_series::charge_start(series, attempt_id, meta.now_ms);
     // The persisted alternating class cursor: this claim served generation.
     document.scheduling_cursor.last_class = Some("generation".to_string());
     let _value = update_after_commit(document, &key, false, RedirectScope::ToRecord)
@@ -3556,21 +3553,21 @@ fn fold_generation_outcome_decision(
             }
         }
         GenerationOutcome::Empty | GenerationOutcome::Failed(_) => {
-            // The attempt was charged at the claim; schedule the remaining
-            // delay from this fold. At the cap the series stays exhausted
-            // (the claim already exhausted it) — nothing more to schedule.
-            if series.status == GenerationStatus::Exhausted
-                || series.consumed >= MAX_GENERATION_STARTS
-            {
-                series.status = GenerationStatus::Exhausted;
-                series.next_due = None;
-                series.excerpt = None;
-            } else {
-                series.status = GenerationStatus::Eligible;
-                series.next_due =
-                    Some(meta.now_ms + generation_retry_delay_ms(series.consumed).unwrap_or(0));
-            }
+            // The attempt was charged at the claim and counted: exhaust at
+            // the cap, else schedule the remaining delay from this fold.
+            session_name_generation_series::settle_consumed_start(series, meta.now_ms);
             Ok(commit_decision(document, &key, false))
+        }
+        GenerationOutcome::CapabilityUnavailable { attempt_id }
+        | GenerationOutcome::Throttled { attempt_id } => {
+            // Name-reliability Task 6: the request never had a fair chance
+            // (refused credential, permission, proxy or quota): give the
+            // start back and keep the input.
+            if session_name_generation_series::refund_start(series, &attempt_id) {
+                Ok(commit_decision(document, &key, false))
+            } else {
+                Ok(Decision::Read(read_update(document, &key)))
+            }
         }
     }
 }

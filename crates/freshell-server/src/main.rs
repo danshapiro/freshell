@@ -32,6 +32,7 @@ mod files;
 mod fresh_agent_extras;
 #[cfg(feature = "managed-runtime-v1")]
 mod fresh_agent_proxy;
+mod gemini_failure;
 mod host_stats;
 mod identity_sink;
 mod instance_id;
@@ -70,6 +71,7 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod session_metadata;
+mod session_name_capability;
 mod session_name_generation;
 mod session_name_migration;
 mod session_name_native;
@@ -829,9 +831,14 @@ async fn main() -> ExitCode {
     // here (e.g. an unwritable log dir) must never prevent boot -- the
     // pre-existing stderr "listening on" line below still gets the
     // operator to a running server either way.
+    // Name-reliability Task 6: secret values learned later (the configured
+    // Gemini key below, keys saved in Settings) are redacted from the first
+    // line that could carry them.
+    let log_secrets = freshell_runtime_observability::LiveSecrets::default();
     let logging_config = logging::resolve_config(
         home.as_deref(),
         auth_token.as_str().to_string(),
+        log_secrets.clone(),
         app_version.as_str().to_string(),
     );
     if let Err(err) = logging::init(logging_config) {
@@ -965,6 +972,12 @@ async fn main() -> ExitCode {
             .filter(|v| !v.is_empty()),
         settings.ai.gemini_api_key.clone(),
     );
+    for key in [ai_key.get(), settings.ai.gemini_api_key.clone()]
+        .into_iter()
+        .flatten()
+    {
+        log_secrets.insert(&key);
+    }
     // `FRESHELL_GEMINI_BASE_URL` is a Rust-only test seam for the e2e
     // fake-Gemini server (Task 21) — Node has NO env base-URL override (its
     // default is hardcoded), a deliberate documented superset (validator-A1).
@@ -978,28 +991,31 @@ async fn main() -> ExitCode {
             ai_key.clone(),
             gemini_base_url.clone(),
         ));
-    // Session naming alone uses the OneCLI proxy credential route when the
-    // effective reqwest proxy is marked as OneCLI. The generic transport above
-    // remains direct-key-only for summaries and other AI features.
+    // Session naming's own credential route (name-reliability Task 6): a
+    // configured key always wins (sent direct past a OneCLI ambient proxy,
+    // through any other ambient proxy); with no key, the inherited OneCLI
+    // proxy. The generic transport above stays direct-key-only for
+    // summaries and other AI features.
     let session_name_auth =
         ai_title::GeminiSessionNameAuth::from_environment(ai_key.clone(), &gemini_base_url);
+    let session_name_http = std::sync::Arc::new(ai_title::GeminiSessionNameHttp::new(
+        reqwest::Client::new(),
+        session_name_auth.clone(),
+        gemini_base_url,
+    ));
     let session_name_gemini: std::sync::Arc<dyn ai_title::GeminiTransport> =
-        std::sync::Arc::new(ai_title::GeminiSessionNameHttp::new(
-            reqwest::Client::new(),
-            session_name_auth.clone(),
-            gemini_base_url,
-        ));
+        session_name_http.clone();
     // Unified agent names (Task 4): the generation participant of the ONE
     // shared serial naming worker — execution only, never another loop.
-    // Capability (the naming toggle + the OneCLI/direct credential route) is
-    // checked before selection, so disabled naming pauses without consuming
-    // anything.
+    // Capability (the naming toggle, the credential route and the naming
+    // pause) is checked before selection, so paused naming consumes nothing.
     let session_name_generator =
         std::sync::Arc::new(session_name_generation::SessionNameGenerator::new(
             settings_store.clone(),
             session_name_auth.clone(),
-            session_name_gemini.clone(),
+            session_name_http,
         ));
+    session_name_generator.log_boot_route();
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -3152,6 +3168,10 @@ async fn main() -> ExitCode {
                 // Task 2: the SAME process-local AI key cell constructed at
                 // boot, so every settings save force-re-applies the key.
                 ai_key: ai_key.clone(),
+                // Name-reliability Task 6: a saved key becomes a live log
+                // secret, and a changed key resets the naming pause.
+                log_secrets: log_secrets.clone(),
+                naming_generation: Some(session_name_generator.clone()),
             },
         ))
         .merge(boot::router(boot_state))

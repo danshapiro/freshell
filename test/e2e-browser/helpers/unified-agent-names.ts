@@ -59,9 +59,19 @@ export interface FakeGemini {
   release: () => void
 }
 
+/** How the fake OneCLI gateway answers a request that carries NO key:
+ * `ok` answers as the gateway's own credential would (the AI reply);
+ * `access_restricted` is the real gateway's refusal when the agent has no
+ * access (403 + its JSON body). Mutable while the proxy runs. */
+export type FakeOneCliProxyMode = 'ok' | 'access_restricted'
+
 export interface FakeOneCliGeminiProxy {
   /** Ephemeral fixture setting used only to configure the owned test server. */
   proxyUrl: string
+  /** The loopback port (so a spec can check logs never name it). */
+  port: number
+  mode: FakeOneCliProxyMode
+  /** Every request it received, keyed or not. */
   requests: Array<{
     destinationHostname: string
     path: string
@@ -71,10 +81,23 @@ export interface FakeOneCliGeminiProxy {
   close: () => Promise<void>
 }
 
+/** The real gateway's refusal body (name-reliability V1), URLs removed. */
+const ONECLI_ACCESS_RESTRICTED_BODY = JSON.stringify({
+  error: 'access_restricted',
+  message: 'credentials exist in OneCLI but this agent does not have access',
+  manage_url: 'http://onecli.invalid/manage',
+  provider: 'generativelanguage.googleapis.com',
+})
+
 /** A local fake Gemini answering the Rust-only FRESHELL_GEMINI_BASE_URL seam
  * (auto-title-rust.spec.ts's pattern): deterministic short names, an
- * optional hold for the late-generation races. */
-export async function startFakeGemini(replyText: string, opts?: { hold?: boolean }): Promise<FakeGemini> {
+ * optional hold for the late-generation races. With `validKey` it checks
+ * the key as Google does: no key → 403 `PERMISSION_DENIED`, any other key →
+ * 400 `API_KEY_INVALID`. */
+export async function startFakeGemini(
+  replyText: string,
+  opts?: { hold?: boolean; validKey?: string },
+): Promise<FakeGemini> {
   const requests: FakeGemini['requests'] = []
   let held = opts?.hold === true
   const server = http.createServer((req, res) => {
@@ -85,6 +108,24 @@ export async function startFakeGemini(replyText: string, opts?: { hold?: boolean
         apiKey: typeof req.headers['x-goog-api-key'] === 'string' ? req.headers['x-goog-api-key'] : undefined,
         body,
       })
+      const apiKey = typeof req.headers['x-goog-api-key'] === 'string' ? req.headers['x-goog-api-key'] : undefined
+      if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH && opts?.validKey !== undefined && apiKey !== opts.validKey) {
+        if (apiKey === undefined) {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: { code: 403, message: 'unregistered caller', status: 'PERMISSION_DENIED' } }))
+        } else {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            error: {
+              code: 400,
+              message: 'API key not valid. Please pass a valid API key.',
+              status: 'INVALID_ARGUMENT',
+              details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID' }],
+            },
+          }))
+        }
+        return
+      }
       if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH) {
         const answer = () => {
           res.writeHead(200, { 'content-type': 'application/json' })
@@ -117,14 +158,20 @@ export async function startFakeGemini(replyText: string, opts?: { hold?: boolean
   }
 }
 
-/** Local HTTP proxy with a synthetic OneCLI authorization marker. It records
- * only safe request observations; request bodies and authorization values are
- * discarded after checking the expected prompt. */
+/** Local HTTP proxy with a synthetic OneCLI authorization marker, behaving
+ * like the real gateway (name-reliability V1): a request with NO key is
+ * answered per `mode` (see {@link FakeOneCliProxyMode}); a request WITH a
+ * key is forwarded-equivalent when the key is `validKey` (the AI reply) and
+ * refused with 400 + the gateway body otherwise. It records every request
+ * (keyed or not) as safe observations only; request bodies and
+ * authorization values are discarded after checking the expected prompt. */
 export async function startFakeOneCliGeminiProxy(
   replyText: string,
   expectedFirstMessage: string,
+  opts?: { mode?: FakeOneCliProxyMode; validKey?: string },
 ): Promise<FakeOneCliGeminiProxy> {
   const requests: FakeOneCliGeminiProxy['requests'] = []
+  const state = { mode: opts?.mode ?? 'ok' as FakeOneCliProxyMode }
   const server = http.createServer((req, res) => {
     let body = ''
     req.on('data', (chunk: Buffer) => { body += chunk.toString() })
@@ -156,6 +203,14 @@ export async function startFakeOneCliGeminiProxy(
       })
 
       if (req.method === 'POST' && destination?.pathname === GEMINI_GENERATE_PATH) {
+        const apiKey = req.headers['x-goog-api-key']
+        const keyed = typeof apiKey === 'string'
+        const refused = keyed ? apiKey !== opts?.validKey : state.mode === 'access_restricted'
+        if (refused) {
+          res.writeHead(keyed ? 400 : 403, { 'content-type': 'application/json' })
+          res.end(ONECLI_ACCESS_RESTRICTED_BODY)
+          return
+        }
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: replyText }] } }] }))
       } else {
@@ -168,6 +223,9 @@ export async function startFakeOneCliGeminiProxy(
   const port = (server.address() as AddressInfo).port
   return {
     proxyUrl: `http://%61oc_test_marker@127.0.0.1:${port}`,
+    port,
+    get mode() { return state.mode },
+    set mode(next: FakeOneCliProxyMode) { state.mode = next },
     requests,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }

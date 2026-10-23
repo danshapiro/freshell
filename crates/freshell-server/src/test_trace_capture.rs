@@ -276,3 +276,51 @@ mod tests {
         );
     }
 }
+
+/// A capture for the CURRENT THREAD only: a scoped default subscriber that
+/// keeps every event (any level) whose target starts with `target_prefix`,
+/// until the returned guard drops. Tests that count log lines use it so a
+/// test running in parallel cannot add lines to their count; everything the
+/// test drives must run on its own thread (a current-thread runtime).
+pub(crate) fn scoped_trace_capture(
+    target_prefix: &'static str,
+) -> (tracing::subscriber::DefaultGuard, CapturedTraceEvents) {
+    use tracing_subscriber::prelude::*;
+
+    let events = CapturedTraceEvents::default();
+    let subscriber = tracing_subscriber::registry().with(ScopedCaptureLayer {
+        target_prefix,
+        events: events.clone(),
+    });
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    (guard, events)
+}
+
+struct ScopedCaptureLayer {
+    target_prefix: &'static str,
+    events: CapturedTraceEvents,
+}
+
+impl<S> tracing_subscriber::Layer<S> for ScopedCaptureLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let metadata = event.metadata();
+        if !metadata.target().starts_with(self.target_prefix) {
+            return;
+        }
+        let mut visitor = TraceFieldVisitor::default();
+        event.record(&mut visitor);
+        self.events.0.lock().unwrap().push(CapturedTraceEvent {
+            level: *metadata.level(),
+            message: visitor.message,
+            fields: visitor.fields,
+        });
+    }
+}
