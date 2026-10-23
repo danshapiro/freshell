@@ -10,11 +10,11 @@ import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from
 import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
+import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
+import type { LiveBlockKind, LiveStreamOp } from '@/store/freshAgentLiveTypes'
 import {
-  addAssistantMessage,
   addPermissionRequest,
   addQuestionRequest,
-  appendStreamDelta,
   applyRuntimeOwner,
   clearPendingCreateFailure,
   createFailed,
@@ -32,7 +32,7 @@ import {
   sessionMetadataReceived,
   sessionSnapshotReceived,
   setSessionStatus,
-  setStreaming,
+  streamOpened,
   turnResult,
 } from '@/store/freshAgentSlice'
 
@@ -230,6 +230,12 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.session.materialized': {
       const materialized = msg as FreshAgentSessionMaterializedMessage
+      // Stream events queued under the old id land before the re-key moves them.
+      streamBatcherFor(dispatch).flush({
+        sessionId: materialized.previousSessionId,
+        sessionType: materialized.sessionType,
+        provider: materialized.provider,
+      })
       dispatch(materializeFreshAgentSessionState({
         previousSessionId: materialized.previousSessionId,
         sessionId: materialized.sessionId,
@@ -251,6 +257,11 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.killed': {
       const killed = msg as FreshAgentKilledMessage
+      streamBatcherFor(dispatch).flush({
+        sessionId: killed.sessionId,
+        sessionType: killed.sessionType,
+        provider: killed.provider,
+      })
       foldFreshAgentKilled(dispatch, {
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
@@ -344,6 +355,49 @@ export function foldReadyRuntimeOwners(
   }
 }
 
+const LIVE_BLOCK_KINDS: ReadonlySet<string> = new Set<LiveBlockKind>(['text', 'thinking', 'tool_use'])
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * The part of a `freshAgent.stream` frame the live tail renders: a text,
+ * thinking or tool block opening, or a text/thinking delta, of the main
+ * thread (the sidecar already drops subagent events; a frame that still
+ * names a parent tool use is ignored). Anything else maps to nothing.
+ */
+function parseLiveStreamOp(frame: Record<string, unknown>): LiveStreamOp | undefined {
+  if (typeof frame.parentToolUseId === 'string' && frame.parentToolUseId) return undefined
+  const event = frame.event
+  if (!isObject(event) || typeof event.index !== 'number') return undefined
+  const messageId = typeof frame.messageId === 'string' && frame.messageId ? frame.messageId : null
+  const index = event.index
+  if (event.type === 'content_block_start') {
+    const block = event.content_block
+    if (!isObject(block) || typeof block.type !== 'string' || !LIVE_BLOCK_KINDS.has(block.type)) return undefined
+    const kind = block.type as LiveBlockKind
+    if (kind === 'tool_use') {
+      return {
+        op: 'start',
+        messageId,
+        index,
+        kind,
+        ...(typeof block.name === 'string' ? { name: block.name } : {}),
+        ...(typeof block.id === 'string' ? { toolUseId: block.id } : {}),
+      }
+    }
+    return { op: 'start', messageId, index, kind }
+  }
+  if (event.type === 'content_block_delta' && isObject(event.delta)) {
+    const delta = event.delta
+    const text = delta.type === 'text_delta' ? delta.text : delta.type === 'thinking_delta' ? delta.thinking : undefined
+    if (typeof text !== 'string' || text.length === 0) return undefined
+    return { op: 'delta', messageId, index, text }
+  }
+  return undefined
+}
+
 export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: FreshAgentEventMessage): boolean {
   const event = msg.event
   const sessionId = typeof msg.sessionId === 'string'
@@ -357,6 +411,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     provider: msg.provider,
   }
 
+  // Stream events are batched; every other event of the session first
+  // applies the ones still waiting, so the store sees them in arrival order.
+  if (event.type !== 'freshAgent.stream') streamBatcherFor(dispatch).flush(locator)
+
   switch (event.type) {
     case 'freshAgent.session.snapshot':
       dispatch(sessionSnapshotReceived({
@@ -366,7 +424,6 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         historySessionId: event.timelineSessionId as string | undefined,
         revision: event.revision as number | undefined,
         streamingActive: event.streamingActive as boolean | undefined,
-        streamingText: event.streamingText as string | undefined,
       }))
       return true
     case 'freshAgent.session.changed':
@@ -425,29 +482,16 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       return true
     }
     case 'freshAgent.assistant':
-      dispatch(addAssistantMessage({
-        ...locator,
-        content: Array.isArray(event.content) ? event.content as Record<string, unknown>[] : [],
-        model: event.model as string | undefined,
-      }))
+      // Durable content comes from the snapshot (transcript-live P1); the
+      // pending stream events were applied above.
       return true
     case 'freshAgent.stream': {
-      const streamEvent = event.event as Record<string, unknown> | undefined
-      if (streamEvent?.type === 'content_block_start') {
-        dispatch(setStreaming({ ...locator, active: true }))
-      }
-      if (streamEvent?.type === 'content_block_delta') {
-        const delta = streamEvent.delta as Record<string, unknown> | undefined
-        if (delta?.type === 'text_delta') {
-          dispatch(appendStreamDelta({
-            ...locator,
-            text: delta.text as string,
-          }))
-        }
-      }
-      if (streamEvent?.type === 'content_block_stop') {
-        dispatch(setStreaming({ ...locator, active: false }))
-      }
+      const op = parseLiveStreamOp(event)
+      if (!op) return true
+      // The first block of a turn marks the session streaming (busy) at once;
+      // the block's text follows with the next batch.
+      if (op.op === 'start') dispatch(streamOpened(locator))
+      streamBatcherFor(dispatch).enqueue(locator, op)
       return true
     }
     case 'freshAgent.result':

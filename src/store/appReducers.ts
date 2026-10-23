@@ -19,6 +19,7 @@ import claudeActivityReducer from './claudeActivitySlice'
 import amplifierActivityReducer from './amplifierActivitySlice'
 import opencodeActivityReducer from './opencodeActivitySlice'
 import freshAgentReducer from './freshAgentSlice'
+import freshAgentLiveReducer from './freshAgentLiveSlice'
 import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
 import hostStatsReducer from './hostStatsSlice'
 import { networkReducer } from './networkSlice'
@@ -49,6 +50,10 @@ export const appReducers = {
   amplifierActivity: amplifierActivityReducer,
   opencodeActivity: opencodeActivityReducer,
   freshAgent: freshAgentReducer,
+  // The live tail of running turns (streamed blocks, retries, notices): its
+  // own root key so token-rate updates never touch freshAgent.sessions.
+  // Ephemeral — never persisted (allowlist rule).
+  freshAgentLive: freshAgentLiveReducer,
   paneRuntimeActivity: paneRuntimeActivityReducer,
   // Ephemeral live host metrics — never persisted (allowlist rule)
   hostStats: hostStatsReducer,

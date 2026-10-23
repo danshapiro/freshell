@@ -114,7 +114,7 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   nextHistoryCursor?: string | null
   historyLoading?: boolean
   historyError?: string
-  streamingText: string
+  /** A streamed content block opened this turn (cleared when the turn ends). */
   streamingActive: boolean
   pendingPermissions: Record<string, FreshAgentPermissionRequest>
   pendingQuestions: Record<string, FreshAgentQuestionRequest>

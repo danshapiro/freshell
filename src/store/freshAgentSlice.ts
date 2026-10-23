@@ -7,7 +7,6 @@ import {
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import type {
-  FreshAgentContentBlock,
   FreshAgentPermissionRequest,
   FreshAgentQuestionRequest,
   FreshAgentSessionState,
@@ -70,7 +69,6 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
     turns: [],
     historyItems: [],
     historyBodies: {},
-    streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
     pendingQuestions: {},
@@ -121,51 +119,11 @@ function resetHydratedHistoryState(session: FreshAgentSessionState): void {
   session.historyError = undefined
   session.historyLoaded = false
   session.restoreFailureMessage = undefined
-  session.streamingText = ''
   session.streamingActive = false
 }
 
 function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {
   session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
-}
-
-function normalizeLegacyContentBlock(block: Record<string, unknown>, index: number): FreshAgentContentBlock | undefined {
-  const id = typeof block.id === 'string' && block.id.length > 0
-    ? block.id
-    : `legacy-${index}`
-
-  switch (block.type) {
-    case 'text':
-      return {
-        id,
-        kind: 'text',
-        text: typeof block.text === 'string' ? block.text : '',
-      }
-    case 'thinking':
-      return {
-        id,
-        kind: 'thinking',
-        text: typeof block.thinking === 'string' ? block.thinking : String(block.text ?? ''),
-      }
-    case 'tool_use':
-      return {
-        id,
-        kind: 'tool_use',
-        toolUseId: typeof block.id === 'string' ? block.id : id,
-        name: typeof block.name === 'string' ? block.name : 'Tool',
-        input: block.input,
-      }
-    case 'tool_result':
-      return {
-        id,
-        kind: 'tool_result',
-        toolUseId: typeof block.tool_use_id === 'string' ? block.tool_use_id : id,
-        content: block.content ?? '',
-        isError: Boolean(block.is_error),
-      }
-    default:
-      return undefined
-  }
 }
 
 const freshAgentSlice = createSlice({
@@ -292,7 +250,6 @@ const freshAgentSlice = createSlice({
       historySessionId?: string
       revision?: number
       streamingActive?: boolean
-      streamingText?: string
     }>) {
       const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
       if (!session) return
@@ -316,7 +273,6 @@ const freshAgentSlice = createSlice({
       session.historySessionId = action.payload.historySessionId ?? session.historySessionId
       session.historyRevision = action.payload.revision ?? session.historyRevision
       session.streamingActive = action.payload.streamingActive ?? false
-      session.streamingText = action.payload.streamingText ?? ''
       session.restoreFailureCode = undefined
       session.restoreFailureMessage = undefined
       session.snapshotRefreshRequestId = undefined
@@ -595,66 +551,18 @@ const freshAgentSlice = createSlice({
       session.totalInputTokens += action.payload.usage?.input_tokens ?? 0
       session.totalOutputTokens += action.payload.usage?.output_tokens ?? 0
     },
-    addUserMessage(state, action: PayloadAction<SessionMutationPayload & { text: string }>) {
+    /**
+     * The turn opened a streamed content block: the session is streaming
+     * (busy follows `streamingActive`) until its result, an idle/exited/stuck
+     * status or an error clears it. A turn opens several blocks; only the
+     * first changes anything, so the sessions map is written once per turn,
+     * never per block or token (transcript-live P3).
+     */
+    streamOpened(state, action: PayloadAction<SessionMutationPayload>) {
       const session = resolveOrEnsureSession(state, action.payload, 'running')
       if (!session) return
-      const turnId = `live-user-${session.turns.length + 1}`
-      session.turns.push({
-        id: turnId,
-        turnId,
-        role: 'user',
-        summary: action.payload.text,
-        items: [{ id: `${turnId}-text`, kind: 'text', text: action.payload.text }],
-      })
-      session.historyItems = session.turns
-    },
-    addAssistantMessage(state, action: PayloadAction<SessionMutationPayload & {
-      content: Record<string, unknown>[]
-      model?: string
-    }>) {
-      const session = resolveOrEnsureSession(state, action.payload, 'idle')
-      if (!session) return
-      const items = action.payload.content
-        .map((block, index) => normalizeLegacyContentBlock(block, index))
-        .filter((item): item is FreshAgentContentBlock => item !== undefined)
-      const turnId = `live-assistant-${session.turns.length + 1}`
-      session.turns.push({
-        id: turnId,
-        turnId,
-        role: 'assistant',
-        model: action.payload.model,
-        // Server-authoritative provenance: the client no longer summarizes
-        // fresh-agent items (the write-only summarizer was deleted); the
-        // Rust server tags every turn's summaryKind itself.
-        summary: '',
-        items,
-      })
-      session.historyItems = session.turns
-      session.streamingText = ''
-      session.streamingActive = false
-    },
-    setStreaming(state, action: PayloadAction<SessionMutationPayload & { active: boolean }>) {
-      const session = resolveOrEnsureSession(state, action.payload, action.payload.active ? 'running' : 'idle')
-      if (!session) return
-      session.streamingActive = action.payload.active
-      if (action.payload.active && session.status === 'idle') {
-        writeSessionStatus(session, 'running')
-      }
-    },
-    appendStreamDelta(state, action: PayloadAction<SessionMutationPayload & { text: string }>) {
-      const session = resolveOrEnsureSession(state, action.payload, 'running')
-      if (!session) return
-      session.streamingActive = true
-      session.streamingText += action.payload.text
-      if (session.status === 'idle') {
-        writeSessionStatus(session, 'running')
-      }
-    },
-    clearStreaming(state, action: PayloadAction<SessionMutationPayload>) {
-      const session = resolveOrEnsureSession(state, action.payload)
-      if (!session) return
-      session.streamingText = ''
-      session.streamingActive = false
+      if (!session.streamingActive) session.streamingActive = true
+      if (session.status === 'idle') writeSessionStatus(session, 'running')
     },
     clearPendingCreateFailureForSession() {},
     sessionExited(state, action: PayloadAction<SessionMutationPayload>) {
@@ -760,11 +668,8 @@ const freshAgentSlice = createSlice({
 })
 
 export const {
-  addAssistantMessage,
   addPermissionRequest,
   addQuestionRequest,
-  addUserMessage,
-  appendStreamDelta,
   applyRuntimeOwner,
   applyRuntimeOwnerFenceRefresh,
   applyRefusalFence,
@@ -774,7 +679,6 @@ export const {
   clearRestoreFailure,
   clearSessionError,
   clearSessionLost,
-  clearStreaming,
   createFailed,
   freshAgentSnapshotReceived,
   materializeSession,
@@ -793,7 +697,7 @@ export const {
   sessionSnapshotReceived,
   setAvailableModels,
   setSessionStatus,
-  setStreaming,
+  streamOpened,
   historyLoadFailed,
   historyLoadStarted,
   historyPageReceived,
