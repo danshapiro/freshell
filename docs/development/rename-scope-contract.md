@@ -157,6 +157,16 @@ the Kilroy first-message name, unscoped terminal renames) may write a
 session-owned tab's title: each asks `canWriteLegacyTabTitle`
 (`src/lib/tab-title-ownership.ts`) first.
 
+**A tab stops taking its name from a session.** When a tab's last
+Claude/Codex/OpenCode pane is closed or replaced by other content (for
+example `[Claude | shell]` with the Claude pane closed), the tab goes back to
+the non-agent title rules. If its stored title is still the saved name the
+mirror copied, it returns to the `Tab N` placeholder, so the tab shows its
+own derived label (and later window titles from its shell), never the old
+session's name. The mirror takes back only the name it copied: a title that
+changed in the same update, or a user-renamed tab, is kept. The session
+keeps its own saved name.
+
 **Conversation switch.** When a conversation switch (Claude's `/clear` or
 `/resume`, an OpenCode session switch, a new Codex thread) moves a pane's
 terminal onto another session, the pane, the terminal row and the tab
