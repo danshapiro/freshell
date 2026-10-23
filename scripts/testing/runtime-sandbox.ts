@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
-import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
+import { parseHelperCreateDelay, RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
 export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
@@ -250,6 +250,11 @@ export class RuntimeHarness {
       testRunId: this.runId,
       logPath: path.join(this.evidenceDir, 'broker.jsonl'),
     })
+    const helperCreateDelay = parseHelperCreateDelay(process.env.FRESHELL_TEST_BROKER_DELAY_HELPER_CREATE)
+    if (helperCreateDelay) {
+      this.broker.delayHelperCreates(helperCreateDelay)
+      this.recordLifecycle('gate.broker.helper_create_delay', helperCreateDelay)
+    }
     await this.broker.start()
     this.brokerStarted = true
 
