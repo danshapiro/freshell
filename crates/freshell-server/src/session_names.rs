@@ -126,6 +126,8 @@ mod session_name_generation_series;
 #[path = "session_name_store_view.rs"]
 mod session_name_store_view;
 // Name-reliability Task 12: the `session_names.name_changed` event log.
+#[path = "session_name_continuation.rs"]
+mod session_name_continuation;
 #[path = "session_name_events.rs"]
 mod session_name_events;
 #[path = "session_name_publish.rs"]
@@ -147,6 +149,10 @@ mod tests;
 #[cfg(test)]
 #[path = "session_name_plan_activity_tests.rs"]
 mod plan_activity_tests;
+
+#[cfg(test)]
+#[path = "session_name_continuation_tests.rs"]
+mod continuation_tests;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1498,6 +1504,26 @@ impl SessionNaming for SessionNames {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, meta| {
             bind_pending_decision(doc, meta, input)
+        }))
+    }
+
+    fn ensure_session(
+        &self,
+        target: SessionNameRef,
+        cwd: Option<String>,
+    ) -> NameFuture<SessionNameUpdate> {
+        Box::pin(spawn_txn(Arc::clone(&self.core), move |doc, _meta| {
+            session_name_continuation::ensure_session(doc, target, cwd)
+        }))
+    }
+
+    fn continue_session(
+        &self,
+        source: SessionNameRef,
+        target: SessionNameRef,
+    ) -> NameFuture<Option<SessionNameUpdate>> {
+        Box::pin(spawn_txn(Arc::clone(&self.core), move |doc, meta| {
+            session_name_continuation::continue_session(doc, meta.now_ms, source, target)
         }))
     }
 

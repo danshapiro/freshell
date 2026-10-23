@@ -75,6 +75,10 @@ pub(super) enum NameChangeCause {
     BindCollision,
     /// A new terminal got its pending record (the folder name).
     EnsurePending,
+    /// A known session was named before its index row arrived.
+    EnsureSession,
+    /// An undo/redo replacement inherited its source's name once.
+    InternalContinuation,
     /// The session index created or healed the session's record.
     Hydrate,
     /// Another process committed the change; this store adopted it.
@@ -93,6 +97,8 @@ impl NameChangeCause {
             Self::Bind => "bind",
             Self::BindCollision => "bind_collision",
             Self::EnsurePending => "ensure_pending",
+            Self::EnsureSession => "ensure_session",
+            Self::InternalContinuation => "internal_continuation",
             Self::Hydrate => "hydrate",
             Self::AdoptedExternal => "adopted_external",
         }
