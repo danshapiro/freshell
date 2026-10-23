@@ -3322,24 +3322,35 @@ impl HostCommandBudgets {
     }
 }
 
-/// Bound on one Claude source observation: the fixed reader's whole bounded
-/// retry ([`crate::backend::CLAUDE_SOURCE_READER_RETRY`]: every attempt, the
-/// waits between them and their owned cleanup), with slack for the reply.
-pub(crate) const CLAUDE_SOURCE_OBSERVATION_BUDGET: Duration =
-    Duration::from_secs(crate::backend::CLAUDE_SOURCE_READER_RETRY.total.as_secs() + 5);
+/// Room between the end of a Claude source read, its owned cleanup included,
+/// and the end of the supervisor's wait for it: the reply's slack. Outside a
+/// recovery an observation therefore waits the fixed reader's whole bounded
+/// retry ([`crate::backend::CLAUDE_SOURCE_READER_RETRY`], 90s) plus this.
+pub(crate) const CLAUDE_SOURCE_REPLY_SLACK: Duration = Duration::from_secs(5);
+
+/// One Claude source observation whose fixed reader succeeds on its first
+/// attempt: that attempt, its owned cleanup and the reply slack (35s).
+pub(crate) const CLAUDE_SOURCE_FIRST_ATTEMPT_BUDGET: Duration = Duration::from_secs(
+    crate::backend::CLAUDE_SOURCE_READER_RETRY.attempt.as_secs()
+        + crate::backend::CLAUDE_SOURCE_READER_RETRY.cleanup.as_secs()
+        + CLAUDE_SOURCE_REPLY_SLACK.as_secs(),
+);
 
 /// Wait for one provider-preparation callback to the web server, covering the
 /// web server's own work for it (selecting and copying the provider's inputs).
 pub(crate) const PROVIDER_CALLBACK_BUDGET: Duration = Duration::from_secs(35);
 
-/// Wait for a Claude recovery's `issue` callback. Before it answers, the web
-/// server observes the current Claude sources and then the candidate
-/// projection, back to back, each through this supervisor and each bounded by
-/// [`CLAUDE_SOURCE_OBSERVATION_BUDGET`]. The callback's wait covers its own
-/// work plus both observations, so an observation that finishes inside its
-/// own bound is never cut off by the callback around it.
+/// Wait for a Claude recovery's `issue` callback (105s). Before it answers,
+/// the web server observes the current Claude sources and then the candidate
+/// projection, back to back, each through this supervisor. The wait covers
+/// the callback's own work plus two observations whose readers succeed on
+/// their first attempt ([`CLAUDE_SOURCE_FIRST_ATTEMPT_BUDGET`]). A reader
+/// that needs a retry runs inside what is left of the recovery scope, which
+/// lives exactly as long as this wait: the supervisor ends every recovery
+/// observation, its owned cleanup included, a reply slack before the scope
+/// does, so a retry never outlives the callback it serves.
 pub(crate) const CLAUDE_RECOVERY_CALLBACK_BUDGET: Duration = Duration::from_secs(
-    PROVIDER_CALLBACK_BUDGET.as_secs() + 2 * CLAUDE_SOURCE_OBSERVATION_BUDGET.as_secs(),
+    PROVIDER_CALLBACK_BUDGET.as_secs() + 2 * CLAUDE_SOURCE_FIRST_ATTEMPT_BUDGET.as_secs(),
 );
 
 /// How long the supervisor waits for a provider-preparation callback. The

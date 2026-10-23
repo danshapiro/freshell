@@ -535,12 +535,14 @@ impl DockerEngineBackend {
     /// Run `attempt` until it succeeds, fails finally, or `policy` leaves no
     /// room for another attempt. An attempt runs only after the previous
     /// one's helpers were removed, so retries never pile creates onto a
-    /// stalled daemon. `context` identifies the read in every event.
+    /// stalled daemon. Every attempt and its cleanup end by `until` (and
+    /// inside `policy.total`). `context` identifies the read in every event.
     pub(super) async fn retry_helper<T, F, Fut>(
         &self,
         policy: &HelperRetryPolicy,
         helper: &'static str,
         context: Value,
+        until: Instant,
         mut attempt: F,
     ) -> Result<T, BackendError>
     where
@@ -549,8 +551,12 @@ impl DockerEngineBackend {
     {
         let started = Instant::now();
         // Every attempt's work and cleanup wait end here, which leaves the
-        // last cleanup inside the total.
-        let reserve = started + policy.total.saturating_sub(policy.cleanup);
+        // last cleanup inside the total and before the caller's end.
+        let end = (started + policy.total).min(until);
+        let reserve = end
+            .checked_sub(policy.cleanup)
+            .unwrap_or(started)
+            .max(started);
         let mut number = 1;
         loop {
             let deadlines = HelperDeadlines {

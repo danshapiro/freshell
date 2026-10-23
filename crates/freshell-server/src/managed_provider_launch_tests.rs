@@ -504,11 +504,12 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
         owner: &freshell_supervisor::backend::ClaudeSourceOwner,
         request: &ObserveClaudeSourcesRequest,
         test_run_id: &str,
+        until: tokio::time::Instant,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
         self.authorize_claude_candidate(owner, request).await?;
         let reply = match self
             .real()
-            .observe_claude_sources(owner, request, test_run_id)
+            .observe_claude_sources(owner, request, test_run_id, until)
             .await
         {
             Ok(reply) => reply,

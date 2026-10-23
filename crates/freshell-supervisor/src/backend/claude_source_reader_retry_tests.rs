@@ -339,6 +339,16 @@ fn named<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+/// The end the supervisor gives a read with no recovery scope around it.
+fn production_until() -> tokio::time::Instant {
+    tokio::time::Instant::now() + helper_lifecycle::CLAUDE_SOURCE_READER_RETRY.total
+}
+
+/// A caller's end far beyond any test policy's total.
+fn far() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(3600)
+}
+
 /// Wait until the background reaper reports how its removal ended.
 async fn reaper_outcome(path: &Path) -> Vec<Value> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -371,7 +381,7 @@ async fn claude_source_reader_retries_a_create_the_daemon_refused_transiently() 
         DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        backend.observe_claude_sources(&owner, &request, "synthetic-run"),
+        backend.observe_claude_sources(&owner, &request, "synthetic-run", production_until()),
     )
     .await
     .unwrap();
@@ -420,7 +430,7 @@ async fn claude_source_reader_keeps_final_failures_final() {
             DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
         let result = tokio::time::timeout(
             Duration::from_secs(20),
-            backend.observe_claude_sources(&owner, &request, "synthetic-run"),
+            backend.observe_claude_sources(&owner, &request, "synthetic-run", production_until()),
         )
         .await
         .unwrap();
@@ -506,7 +516,7 @@ async fn claude_source_reader_retries_after_a_stalled_create_answers_and_removes
     let backend =
         DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
     let result = backend
-        .observe_claude_sources_with(&QUICK, &owner, &request, "synthetic-run")
+        .observe_claude_sources_with(&QUICK, &owner, &request, "synthetic-run", far())
         .await;
     let creates = daemon.creates();
     let removed = daemon.removed();
@@ -540,7 +550,7 @@ async fn claude_source_reader_reports_exhaustion_after_its_bounded_attempts() {
     let backend =
         DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
     let result = backend
-        .observe_claude_sources_with(&QUICK, &owner, &request, "synthetic-run")
+        .observe_claude_sources_with(&QUICK, &owner, &request, "synthetic-run", far())
         .await;
     daemon.finish().await;
     assert!(result.is_err());
@@ -582,7 +592,7 @@ async fn claude_source_reader_stays_inside_its_total_budget_and_reaps_what_outli
     };
     let started = tokio::time::Instant::now();
     let result = backend
-        .observe_claude_sources_with(&policy, &owner, &request, "synthetic-run")
+        .observe_claude_sources_with(&policy, &owner, &request, "synthetic-run", far())
         .await;
     let elapsed = started.elapsed();
     assert!(result.is_err());
@@ -645,4 +655,49 @@ async fn a_helper_create_docker_answers_slowly_is_logged_with_its_latency() {
     assert_eq!(slow["name"], json!(creates[0]));
     assert_eq!(slow["status"], 201);
     assert!(slow["elapsedMs"].as_u64().unwrap() >= 5_000, "{slow}");
+}
+
+#[tokio::test]
+async fn claude_source_reader_ends_by_its_callers_deadline_inside_its_own_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon_id = DockerDaemonId::new();
+    let (owner, request) = initial_request(temp.path(), &daemon_id).await;
+    let mut daemon = ReaderDaemon::start(
+        &temp.path().join("docker.sock"),
+        daemon_id,
+        vec![Create::Late(Duration::from_secs(12))],
+        0,
+    );
+    let log = temp.path().join("lifecycle.jsonl");
+    let backend =
+        DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
+    // The policy alone would wait out the stalled create and retry; the
+    // caller's end (a recovery scope) leaves room for one attempt only.
+    let started = tokio::time::Instant::now();
+    let result = backend
+        .observe_claude_sources_with(
+            &QUICK,
+            &owner,
+            &request,
+            "synthetic-run",
+            started + Duration::from_secs(6),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert!(result.is_err(), "{result:?}");
+    assert!(
+        elapsed < Duration::from_secs(9),
+        "the read ends near its caller's deadline, not when Docker answers: {elapsed:?}"
+    );
+    let creates = daemon.creates();
+    assert_eq!(creates.len(), 1, "no retry past the caller's deadline");
+    let events = reaper_outcome(&log).await;
+    daemon.finish().await;
+    assert_eq!(
+        daemon.removed(),
+        creates,
+        "the reaper removes the late helper"
+    );
+    let exhausted = named(&events, "supervisor.helper.retry_exhausted");
+    assert_eq!(exhausted.len(), 1, "{events:?}");
 }

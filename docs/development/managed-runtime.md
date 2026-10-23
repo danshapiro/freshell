@@ -158,12 +158,16 @@ alike.
 
 Recovery also calls back to the web server to prepare the replacement's
 provider inputs. That callback waits 35s for the web server's own work; a
-Claude recovery's callback waits 225s, because before it answers the web
+Claude recovery's callback waits 105s, because before it answers the web
 server observes the current Claude sources and then the candidate projection,
-back to back, through the supervisor, and each observation is bounded at 95s
-(the fixed reader's bounded retry, 90s, plus reply slack). The recovery scope
-those nested lookups present lives exactly as long as the callback wait, so an
-observation that finishes inside its own bound never finds its scope expired.
+back to back, through the supervisor. The wait covers two observations whose
+reader succeeds on its first attempt (35s each: the reader's 25s attempt, its
+5s cleanup and 5s of reply slack). The recovery scope those nested lookups
+present lives exactly as long as the callback wait, and the supervisor ends
+every recovery observation, its cleanup included, 5s before that scope does:
+an observation never finds its scope expired, and a reader that needs a retry
+uses only what is left of the scope. Outside a recovery an observation waits
+up to 95s (the reader's bounded retry, 90s, plus the reply slack).
 
 A launch or recovery holds the soul's lifecycle lock for its whole
 activation, callback and grant included, and `stop` takes the same lock
@@ -219,10 +223,11 @@ created just before them is slow.
   `supervisor.helper.cleanup.unconfirmed` (error).
 - The Claude source reader retries a run whose create or start timed out, or
   that Docker refused with a server error or left unanswered. Each attempt
-  keeps the reader's 25s bound; the whole read gets 90s, three attempt
+  keeps the reader's 25s bound; the whole read gets up to 90s, three attempt
   lengths with their 5s cleanup: the attempt a stall times out, up to one
   more attempt length for Docker to answer that create, and one full retry;
-  a third attempt fits only after a fast refusal. Waits are 1s, then 2s, and a retry
+  a third attempt fits only after a fast refusal. Inside a recovery the read
+  also ends 5s before the recovery scope does (see above). Waits are 1s, then 2s, and a retry
   starts only after the previous attempt's helpers were removed, so retries
   never pile creates onto a stalled daemon. Every other failure (a client
   error, changed ownership or topology, a reader that exited without

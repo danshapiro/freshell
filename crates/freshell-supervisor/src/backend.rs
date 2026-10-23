@@ -140,11 +140,14 @@ pub enum ClaudeSourceOwner {
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    /// Observe Claude sources through the fixed reader. The read, its owned
+    /// cleanup included, ends by `until`.
     async fn observe_claude_sources(
         &self,
         _owner: &ClaudeSourceOwner,
         _request: &freshell_runtime_protocol::ObserveClaudeSourcesRequest,
         _test_run_id: &str,
+        _until: tokio::time::Instant,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
         Err(BackendError::Unavailable(
             "Claude native source reader unavailable; retain inputs and reprepare".into(),
@@ -721,12 +724,14 @@ impl RuntimeBackend for DockerEngineBackend {
         owner: &ClaudeSourceOwner,
         request: &freshell_runtime_protocol::ObserveClaudeSourcesRequest,
         test_run_id: &str,
+        until: tokio::time::Instant,
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, BackendError> {
         self.observe_claude_sources_with(
             &helper_lifecycle::CLAUDE_SOURCE_READER_RETRY,
             owner,
             request,
             test_run_id,
+            until,
         )
         .await
     }

@@ -1263,13 +1263,15 @@ async fn exchange(listener: &UnixListener, raw: &[u8]) -> Result<ObservationRepl
 
 impl DockerEngineBackend {
     /// Observe Claude sources through the fixed reader, retrying a reader
-    /// whose create or start timed out or was refused transiently.
+    /// whose create or start timed out or was refused transiently. The whole
+    /// read, every attempt's cleanup included, ends by `until`.
     pub(super) async fn observe_claude_sources_with(
         &self,
         policy: &helper_lifecycle::HelperRetryPolicy,
         owner: &ClaudeSourceOwner,
         request: &ObserveClaudeSourcesRequest,
         test_run_id: &str,
+        until: tokio::time::Instant,
     ) -> Result<ObservationReply, BackendError> {
         let helper = if request.candidate.is_some() {
             "claude_candidate_reader"
@@ -1278,7 +1280,7 @@ impl DockerEngineBackend {
         };
         let context = json!({"soulId":request.soul_id,"provider":request.provider,
             "requestId":request.observation_request.request_id});
-        self.retry_helper(policy, helper, context, |deadlines| {
+        self.retry_helper(policy, helper, context, until, |deadlines| {
             self.read_claude_source_helper(owner, request, test_run_id, deadlines)
         })
         .await

@@ -79,6 +79,9 @@ impl Supervisor {
         }
         };
         let mut recovery = None;
+        // A recovery's observation serves its callback; it must end inside
+        // the recovery scope that callback carries.
+        let mut scope_expires = None;
         let owner = match &request.authority {
             ClaudeSourceAuthority::InitialReservation { reservation_id } => {
                 let (reservation, expected) = self
@@ -126,6 +129,7 @@ impl Supervisor {
                         .cloned()
                         .ok_or_else(|| denied("recovery attempt scope is absent or expired"))?
                 };
+                scope_expires = Some(authority.expires);
                 if authority.start.context.soul_id != request.soul_id
                     || authority.start.context.provider != request.provider
                     || authority.start.context.prior_handle.image_ref() != self.config.image_ref
@@ -172,11 +176,22 @@ impl Supervisor {
         .map_err(|_| denied("observation request exceeds its metadata profile"))?;
         let digest = format!("{:x}", Sha256::digest(&raw));
         // The backend owns a bounded retry of the fixed reader, its owned
-        // cleanup included. This outer deadline lets it finish before returning.
-        let reply = tokio::time::timeout(
-            CLAUDE_SOURCE_OBSERVATION_BUDGET,
+        // cleanup included, and ends it by `until`: the reader's whole retry,
+        // or a reply slack before a recovery's scope ends, whichever is first.
+        // A retry inside a recovery therefore uses only what is left of the
+        // callback it serves. The outer wait adds the reply slack.
+        let mut until = Instant::now() + crate::backend::CLAUDE_SOURCE_READER_RETRY.total;
+        if let Some(expires) = scope_expires {
+            until = until.min(
+                expires
+                    .checked_sub(CLAUDE_SOURCE_REPLY_SLACK)
+                    .unwrap_or_else(Instant::now),
+            );
+        }
+        let reply = tokio::time::timeout_at(
+            until + CLAUDE_SOURCE_REPLY_SLACK,
             self.backend
-                .observe_claude_sources(&owner, &request, &self.config.test_run_id),
+                .observe_claude_sources(&owner, &request, &self.config.test_run_id, until),
         )
         .await
         .map_err(|_| unavailable("source reader timed out".into()))?
@@ -261,6 +276,8 @@ mod tests {
         StdMutex<Option<Box<dyn FnOnce() + Send>>>,
         StdMutex<Option<ClaudeRecoverySourceBinding>>,
         std::sync::atomic::AtomicUsize,
+        // When the supervisor asked the read to end.
+        StdMutex<Option<Instant>>,
     );
     #[async_trait]
     impl RuntimeBackend for ReplyBackend {
@@ -269,8 +286,10 @@ mod tests {
             owner: &ClaudeSourceOwner,
             request: &ObserveClaudeSourcesRequest,
             _: &str,
+            until: Instant,
         ) -> Result<ObservationReply, BackendError> {
             self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.3.lock().unwrap() = Some(until);
             let ClaudeSourceOwner::Retained {
                 handle,
                 recovery_source,
@@ -367,6 +386,7 @@ mod tests {
     async fn provider_claude_nested_source_reply_requires_live_scope_after_private_ipc() {
         for mode in [
             "live",
+            "short-scope",
             "dropped",
             "expired",
             "candidate",
@@ -443,6 +463,7 @@ mod tests {
                 StdMutex::new(None),
                 StdMutex::new(None),
                 std::sync::atomic::AtomicUsize::new(0),
+                StdMutex::new(None),
             ));
             let supervisor = Supervisor::new(
                 registry,
@@ -461,7 +482,15 @@ mod tests {
             .unwrap();
             let lock = supervisor.lifecycle_lock(&soul).await;
             let _held = lock.lock().await;
-            let scope = supervisor.auth_lookup_scope(&start, CLAUDE_RECOVERY_CALLBACK_BUDGET);
+            // A scope shorter than the reader's whole retry bounds the read.
+            let lifetime = if mode == "short-scope" {
+                Duration::from_secs(40)
+            } else {
+                CLAUDE_RECOVERY_CALLBACK_BUDGET
+            };
+            let scope = supervisor.auth_lookup_scope(&start, lifetime);
+            let scope_expires =
+                supervisor.auth_lookup_authorities.lock().unwrap()[&scope.key].expires;
             if matches!(
                 mode,
                 "dropped" | "expired" | "candidate-dropped" | "candidate-expired"
@@ -533,6 +562,7 @@ mod tests {
             .await
             .expect("nested Claude source lookup must not reacquire the held soul lifecycle lock")
             .result;
+            let returned = Instant::now();
             assert_eq!(
                 backend.2.load(std::sync::atomic::Ordering::SeqCst),
                 usize::from(mode != "candidate-unrecorded-prior"),
@@ -540,9 +570,22 @@ mod tests {
             );
             assert_eq!(
                 result.is_ok(),
-                matches!(mode, "live" | "candidate"),
+                matches!(mode, "live" | "short-scope" | "candidate"),
                 "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
+            if let Some(until) = *backend.3.lock().unwrap() {
+                // The read serves its recovery callback: it ends, its owned
+                // cleanup included, a reply slack before the scope does, and
+                // never later than the reader's whole retry.
+                assert!(
+                    until + CLAUDE_SOURCE_REPLY_SLACK <= scope_expires,
+                    "{mode}: the read outlives its recovery scope"
+                );
+                assert!(
+                    until <= returned + crate::backend::CLAUDE_SOURCE_READER_RETRY.total,
+                    "{mode}: the read outlives the reader's own retry"
+                );
+            }
             let failures = std::fs::read_to_string(owned.path().join("lifecycle.jsonl"))
                 .unwrap_or_default()
                 .lines()
