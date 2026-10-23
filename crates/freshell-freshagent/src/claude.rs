@@ -2577,6 +2577,32 @@ impl FreshClaudeState {
     /// `ws-handler.ts:3673`), then broadcast `freshAgent.killed`. Idempotent for an
     /// unknown session id, matching the codex/opencode `success:true` pattern.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        self.handle_kill_inner(msg, None).await;
+    }
+
+    /// Release a runtime allocated by a create whose destination disappeared.
+    /// The receipt is authority only for the incarnation that create allocated.
+    pub async fn abandon_created_runtime(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        ownership_id: &str,
+    ) {
+        self.handle_kill_inner(
+            FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: session_id.to_string(),
+                session_type,
+                observed_epoch: None,
+                observed_generation: None,
+                cwd: None,
+            },
+            Some(ownership_id),
+        )
+        .await;
+    }
+
+    async fn handle_kill_inner(&self, msg: FreshAgentKill, expected_owner: Option<&str>) {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -2672,6 +2698,7 @@ impl FreshClaudeState {
         // envelope writes next), and a Clean failure simply releases the
         // gate with the session untouched.
         let mut retire_ids = vec![session_id.clone()];
+        let mut expected_stop_stamp = None;
         {
             let index = self.cli_index.lock().await;
             let sessions = self.sessions.lock().await;
@@ -2691,6 +2718,36 @@ impl FreshClaudeState {
             };
             if let Some(current_map_key) = current_map_key {
                 map_key = current_map_key;
+            }
+            if let Some(expected_owner) = expected_owner {
+                let Some(session) = sessions
+                    .get(&map_key)
+                    .filter(|session| session.ownership_id == expected_owner)
+                else {
+                    tracing::info!(target: "freshell_freshagent::claude",
+                        event = "freshagent.claude.abandoned_create_already_released",
+                        session_id, expected_owner,
+                        "the create receipt no longer owns this runtime; cleanup is complete");
+                    return;
+                };
+                if self.ownership.is_some() {
+                    let durable = session.cli_session_id.as_deref().unwrap_or(&map_key);
+                    let Some(stamp) =
+                        crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, durable)
+                            .filter(|stamp| {
+                                stamp.owner.ownership_id.as_deref() == Some(expected_owner)
+                            })
+                    else {
+                        tracing::warn!(target: "freshell_freshagent::claude",
+                            event = "freshagent.claude.abandoned_create_stamp_missing",
+                            session_id, expected_owner,
+                            "the create receipt has no matching retained ownership stamp");
+                        return;
+                    };
+                    // Capture authority while inspecting that exact runtime. A
+                    // later stop must never borrow a replacement's stamp.
+                    expected_stop_stamp = Some((durable.to_string(), stamp));
+                }
             }
             if sessions.contains_key(&map_key) {
                 let mut gates = self.close_pending.lock().expect("close-pending lock");
@@ -2742,30 +2799,34 @@ impl FreshClaudeState {
         // progressing stop is not stale; never fenced on age alone).
         let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
         if let Some(registry) = self.ownership.as_ref() {
-            let stop_stamp = match crate::ownership_lane::peek_retained_stamp(
-                &self.ownership_stamps,
-                &session_id,
-            ) {
-                Some(stamp) => Some((session_id.clone(), stamp)),
-                None => {
-                    let map_key = self.resolve_session_key(&session_id).await;
-                    match map_key {
-                        Some(map_key) => {
-                            let durable = self
-                                .sessions
-                                .lock()
-                                .await
-                                .get(&map_key)
-                                .and_then(|s| s.cli_session_id.clone());
-                            durable.and_then(|d| {
-                                crate::ownership_lane::peek_retained_stamp(
-                                    &self.ownership_stamps,
-                                    &d,
-                                )
-                                .map(|st| (d, st))
-                            })
+            let stop_stamp = if expected_owner.is_some() {
+                expected_stop_stamp
+            } else {
+                match crate::ownership_lane::peek_retained_stamp(
+                    &self.ownership_stamps,
+                    &session_id,
+                ) {
+                    Some(stamp) => Some((session_id.clone(), stamp)),
+                    None => {
+                        let map_key = self.resolve_session_key(&session_id).await;
+                        match map_key {
+                            Some(map_key) => {
+                                let durable = self
+                                    .sessions
+                                    .lock()
+                                    .await
+                                    .get(&map_key)
+                                    .and_then(|s| s.cli_session_id.clone());
+                                durable.and_then(|d| {
+                                    crate::ownership_lane::peek_retained_stamp(
+                                        &self.ownership_stamps,
+                                        &d,
+                                    )
+                                    .map(|st| (d, st))
+                                })
+                            }
+                            None => None,
                         }
-                        None => None,
                     }
                 }
             };
@@ -3310,7 +3371,22 @@ impl FreshClaudeState {
         // synchronous (the minter channel closes).
         // C09: a closed session is not an ended one waiting to be resumed.
         self.dead_sessions.forget(&retire_ids, "killed");
-        let removed = self.sessions.lock().await.remove(&map_key);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if expected_owner.is_some_and(|owner| {
+                sessions
+                    .get(&map_key)
+                    .is_some_and(|session| session.ownership_id != owner)
+            }) {
+                tracing::error!(target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.abandoned_create_replacement_preserved",
+                    session_id,
+                    "a replacement appeared during the close; its runtime is preserved");
+                None
+            } else {
+                sessions.remove(&map_key)
+            }
+        };
         // The gate entry dies with the session (the map rule was the gate's
         // whole meaning; an aborted session adopts nothing more).
         self.close_pending
@@ -8099,6 +8175,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::naming::SessionNaming as _;
 
+    mod abandoned_create_tests;
     mod control_tests;
     mod create_binding_tests;
     mod deadman_tests;
