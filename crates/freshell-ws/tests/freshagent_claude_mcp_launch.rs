@@ -21,7 +21,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions, RIG_FRAME_BUDGET};
+use common::claude_rig::{ClaudeRig, RigConnection, RigKind, RigOptions};
 use common::AUTH_TOKEN;
 use freshell_freshagent::claude_freshell_mcp::{ClaudeFreshellMcp, ClaudeFreshellMcpResolution};
 
@@ -59,30 +59,6 @@ async fn rig_with(
     )
     .await;
     (rig, cell)
-}
-
-/// The options of the `query()` calls the simulator recorded, in order.
-fn query_options(rig: &ClaudeRig) -> Vec<Value> {
-    rig.ledger_rows("query")
-        .into_iter()
-        .map(|row| row["options"].clone())
-        .collect()
-}
-
-/// The first recorded `query()` options matching `predicate`, once recorded.
-async fn wait_for_query(rig: &ClaudeRig, what: &str, predicate: impl Fn(&Value) -> bool) -> Value {
-    let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
-    loop {
-        if let Some(options) = query_options(rig).into_iter().find(|o| predicate(o)) {
-            return options;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no query() call for {what}; recorded: {:?}",
-            query_options(rig)
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
 }
 
 /// The simulator's digest of a credential value (`query.mjs`).
@@ -134,52 +110,6 @@ async fn create_for_pane(
         .to_string()
 }
 
-/// One finished turn per prompt, each on disk before the next (the CLI flushes
-/// a transcript line 95-200 ms after its SDK frame, and the resumes, undo and
-/// fork read the transcript); returns the durable id the first turn reported.
-async fn converse(
-    rig: &ClaudeRig,
-    conn: &mut RigConnection,
-    session_id: &str,
-    prompts: &[&str],
-) -> String {
-    for (n, prompt) in prompts.iter().enumerate() {
-        let results_before = conn.events_seen("freshAgent.result");
-        conn.send_text(session_id, &format!("send-{n}"), prompt)
-            .await;
-        let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
-        while conn.events_seen("freshAgent.result") == results_before {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "turn {n} never finished"
-            );
-            conn.read_for(std::time::Duration::from_millis(50)).await;
-        }
-        let path = rig
-            .wait_for_transcript(&conn.init_session_id(session_id))
-            .await;
-        loop {
-            let lines: Vec<Value> = std::fs::read_to_string(&path)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
-            let at = lines.iter().rposition(|line| {
-                line["type"] == "user" && line["message"]["content"][0]["text"] == *prompt
-            });
-            if at.is_some_and(|at| lines[at..].iter().any(|line| line["type"] == "assistant")) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the turn for {prompt:?} never reached disk"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-    conn.init_session_id(session_id)
-}
-
 /// The owner pair (epoch, generation) of the session's runtime owner record,
 /// once the server has broadcast it (it can trail the first turn's result).
 async fn owner_pair(conn: &mut RigConnection, durable: &str) -> (u64, u64) {
@@ -191,22 +121,6 @@ async fn owner_pair(conn: &mut RigConnection, durable: &str) -> (u64, u64) {
     .await;
     conn.owner_pair(durable)
         .expect("the session's owner record names its pair")
-}
-
-/// The session's sidecar dies on its own: the session is untracked, the state a
-/// reload or a handoff resumes from.
-async fn kill_the_sidecar(rig: &ClaudeRig, conn: &mut RigConnection) {
-    let pid = rig.ledger_rows("boot")[0]["pid"]
-        .as_i64()
-        .expect("the boot row names the sidecar's pid") as i32;
-    // SAFETY: a plain signal to the sidecar this rig spawned.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    conn.wait_for("the sidecar's exit", |v| {
-        v["type"] == "freshAgent.event"
-            && v["event"]["type"] == "freshAgent.error"
-            && v["event"]["code"] == "SIDECAR_EXITED"
-    })
-    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -222,7 +136,7 @@ async fn a_freshclaude_and_a_kilroy_create_hand_the_cli_the_freshell_mcp_for_the
     .await;
     create_for_pane(&mut conn, "create-kilroy", "kilroy", ("tab-2", "pane-2")).await;
 
-    let options = query_options(&rig);
+    let options = rig.query_options();
     assert_eq!(options.len(), 2, "two sidecars booted: {options:?}");
     assert_mcp_for_pane(
         &rig,
@@ -255,7 +169,7 @@ async fn the_setting_applies_to_the_next_launch_without_a_restart() {
     )
     .await;
 
-    let options = query_options(&rig);
+    let options = rig.query_options();
     assert_eq!(options.len(), 3, "three sidecars booted: {options:?}");
     assert!(
         options[0].get("mcpServers").is_none(),
@@ -287,7 +201,7 @@ async fn a_hosted_lane_keeps_its_fixed_recipe_and_never_gets_the_ordinary_one() 
     )
     .await;
 
-    let options = query_options(&rig);
+    let options = rig.query_options();
     assert_eq!(
         options[0]["mcpServers"],
         json!({ "freshell": { "command": "node", "args": ["/opt/freshell-mcp/server.js"] } }),
@@ -302,8 +216,10 @@ async fn an_attach_resume_hands_the_cli_the_freshell_mcp_for_the_attaching_pane(
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
-    let durable = converse(&rig, &mut conn, &session_id, &["first prompt"]).await;
-    kill_the_sidecar(&rig, &mut conn).await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt"])
+        .await;
+    rig.kill_first_sidecar(&mut conn).await;
 
     // The pane, moved to another tab meanwhile, attaches again (a reload).
     conn.send(json!({
@@ -316,7 +232,9 @@ async fn an_attach_resume_hands_the_cli_the_freshell_mcp_for_the_attaching_pane(
         "paneId": "pane-1",
     }))
     .await;
-    let resumed = wait_for_query(&rig, "the attach-resume", |o| o["resume"] == durable).await;
+    let resumed = rig
+        .wait_for_query("the attach-resume", |o| o["resume"] == durable)
+        .await;
     assert_mcp_for_pane(&rig, &resumed, Some(("tab-9", "pane-1")), "attach-resume");
 }
 
@@ -328,8 +246,10 @@ async fn a_handoff_resume_runs_for_the_adopting_pane(session_type: &str) {
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", session_type, ("tab-1", "pane-1")).await;
-    let durable = converse(&rig, &mut conn, &session_id, &["first prompt"]).await;
-    kill_the_sidecar(&rig, &mut conn).await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt"])
+        .await;
+    rig.kill_first_sidecar(&mut conn).await;
 
     let (status, answer) = rig
         .post_json(
@@ -346,7 +266,9 @@ async fn a_handoff_resume_runs_for_the_adopting_pane(session_type: &str) {
         )
         .await;
     assert_eq!(status, 200, "the handoff resumes the session: {answer}");
-    let resumed = wait_for_query(&rig, "the handoff resume", |o| o["resume"] == durable).await;
+    let resumed = rig
+        .wait_for_query("the handoff resume", |o| o["resume"] == durable)
+        .await;
     assert_mcp_for_pane(
         &rig,
         &resumed,
@@ -371,13 +293,9 @@ async fn an_undo_respawn_runs_for_the_same_pane() {
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
-    let durable = converse(
-        &rig,
-        &mut conn,
-        &session_id,
-        &["first prompt", "second prompt"],
-    )
-    .await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt", "second prompt"])
+        .await;
 
     let (epoch, generation) = owner_pair(&mut conn, &durable).await;
     conn.send(json!({
@@ -397,10 +315,11 @@ async fn an_undo_respawn_runs_for_the_same_pane() {
         })
         .await;
     assert_eq!(ack["event"]["type"], "freshAgent.rolledBack", "{ack}");
-    let undone = wait_for_query(&rig, "the undo's respawn", |o| {
-        o["forkSession"] == true && o["resume"] == durable
-    })
-    .await;
+    let undone = rig
+        .wait_for_query("the undo's respawn", |o| {
+            o["forkSession"] == true && o["resume"] == durable
+        })
+        .await;
     assert_mcp_for_pane(&rig, &undone, Some(("tab-1", "pane-1")), "undo respawn");
 }
 
@@ -410,7 +329,9 @@ async fn a_fork_child_runs_for_the_forking_pane() {
     let mut conn = rig.connect().await;
     let session_id =
         create_for_pane(&mut conn, "create-1", "freshclaude", ("tab-1", "pane-1")).await;
-    let durable = converse(&rig, &mut conn, &session_id, &["first prompt"]).await;
+    let durable = rig
+        .converse(&mut conn, &session_id, &["first prompt"])
+        .await;
 
     let (epoch, generation) = owner_pair(&mut conn, &durable).await;
     conn.send(json!({
@@ -436,6 +357,8 @@ async fn a_fork_child_runs_for_the_forking_pane() {
     let child = forked["sessionId"]
         .as_str()
         .expect("forked names the child");
-    let options = wait_for_query(&rig, "the fork's child", |o| o["sessionId"] == child).await;
+    let options = rig
+        .wait_for_query("the fork's child", |o| o["sessionId"] == child)
+        .await;
     assert_mcp_for_pane(&rig, &options, Some(("tab-1", "pane-1")), "fork child");
 }
