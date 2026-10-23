@@ -9046,16 +9046,32 @@ mod tests {
             .is_empty());
     }
 
+    /// During a timeout cooldown an automatic attempt answers
+    /// `capture_timeout_cooldown` at once and forwards the message: it neither
+    /// waits for the workspace's capture lock nor starts a capture, so it never
+    /// repeats the capture wait. The test holds that lock for the whole send,
+    /// so an attempt that waited for it (or captured under it) would spend the
+    /// full automatic budget and settle as `workspace_lock_timeout`; the
+    /// elapsed time is bounded by that budget — the wait the cooldown skips —
+    /// rather than by a wall-clock guess. (Workspace resolution, which runs
+    /// Git, precedes the cooldown check; its duration follows machine load,
+    /// not the cooldown policy.)
     #[tokio::test]
     async fn cooldown_sends_immediately_without_capture() {
         let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        // The cooldown and the capture lock are keyed by the resolved path.
+        let workspace = std::fs::canonicalize(workspace_dir.path()).unwrap();
         let service = checkpoint_test_service(home.path());
-        service.establish_cooldown(workspace.path());
+        service.establish_cooldown(&workspace);
+        let _capture_lock = service
+            .lock_workspace(&workspace, Duration::from_secs(1))
+            .await
+            .expect("the test holds the workspace's capture lock");
 
         let (outcome, dispatches, elapsed) = run_checkpoint_policy_send(
             Arc::clone(&service),
-            checkpoint_policy_send(workspace.path(), "cooldown-send", "cooldown-attempt"),
+            checkpoint_policy_send(&workspace, "cooldown-send", "cooldown-attempt"),
         )
         .await;
 
@@ -9063,9 +9079,10 @@ mod tests {
         assert_eq!(outcome["code"], "capture_timeout_cooldown");
         assert_eq!(dispatches, 1);
         assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+        let capture_wait = service.automatic_capture_budget();
         assert!(
-            elapsed < Duration::from_secs(1),
-            "cooldown should not repeat the capture wait: {elapsed:?}"
+            elapsed < capture_wait,
+            "cooldown should not repeat the capture wait ({capture_wait:?}): {elapsed:?}"
         );
     }
 
