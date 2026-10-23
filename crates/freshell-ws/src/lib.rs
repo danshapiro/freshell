@@ -613,7 +613,18 @@ pub fn stuck_window_ms_from_env() -> i64 {
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false, false, false, false, false).await
+    build_handshake_with_capabilities(state, HandshakeCapabilities::default()).await
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct HandshakeCapabilities {
+    pub pane_reconcile_v1: bool,
+    pub pane_reconcile_fresh_agent_v1: bool,
+    pub terminal_interest_v1: bool,
+    pub paced_terminal_replay_v1: bool,
+    pub terminal_lifetime_claim_v1: bool,
+    pub managed_runtime_v1: bool,
+    pub fresh_agent_attention_replay_v1: bool,
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -633,14 +644,24 @@ pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
 /// the NEXT connection.
 pub async fn build_handshake_with_capabilities(
     state: &WsState,
-    pane_reconcile_v1: bool,
-    pane_reconcile_fresh_agent_v1: bool,
-    terminal_interest_v1: bool,
-    paced_terminal_replay_v1: bool,
-    terminal_lifetime_claim_v1: bool,
-    managed_runtime_v1: bool,
+    capabilities: HandshakeCapabilities,
 ) -> Vec<ServerMessage> {
+    let HandshakeCapabilities {
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        terminal_interest_v1,
+        paced_terminal_replay_v1,
+        terminal_lifetime_claim_v1,
+        managed_runtime_v1,
+        fresh_agent_attention_replay_v1,
+    } = capabilities;
     let boot_id = state.boot_id.as_ref().clone();
+    let fresh_agent_attention = fresh_agent_attention_replay_v1
+        .then(|| state.fresh_claude.attention_marks())
+        .filter(|marks| !marks.is_empty());
+    if let Some(marks) = fresh_agent_attention.as_ref() {
+        tracing::debug!(count = marks.len(), "ws.handshake.attention_marks");
+    }
     // kata b8ke Task 4 (reconnect-owner discovery, T1 rec A3): replay current
     // runtime-owner state on EVERY handshake — a device that missed a
     // handoff broadcast (offline during handoff, lag-4008 disconnect, page
@@ -685,6 +706,7 @@ pub async fn build_handshake_with_capabilities(
         });
     let mut messages = vec![
         ServerMessage::Ready(Ready {
+            fresh_agent_attention,
             runtime_owners,
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
@@ -695,8 +717,11 @@ pub async fn build_handshake_with_capabilities(
                 || terminal_interest_v1
                 || paced_terminal_replay_v1
                 || terminal_lifetime_claim_v1
-                || managed_runtime_v1)
+                || managed_runtime_v1
+                || fresh_agent_attention_replay_v1)
                 .then_some(freshell_protocol::ReadyCapabilities {
+                    fresh_agent_attention_replay_v1: fresh_agent_attention_replay_v1
+                        .then_some(true),
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
                     terminal_interest_v1: terminal_interest_v1.then_some(true),
@@ -952,17 +977,26 @@ async fn handle_socket(
         .unwrap_or(false)
         && state.registry.has_managed_controller();
 
+    let fresh_agent_attention_replay_v1 = value
+        .get("capabilities")
+        .and_then(|caps| caps.get("freshAgentAttentionReplayV1"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
     for msg in build_handshake_with_capabilities(
         &state,
-        pane_reconcile_v1,
-        pane_reconcile_fresh_agent_v1,
-        terminal_interest_v1,
-        paced_terminal_replay_v1,
-        terminal_lifetime_claim_v1,
-        managed_runtime_v1,
+        HandshakeCapabilities {
+            pane_reconcile_v1,
+            pane_reconcile_fresh_agent_v1,
+            terminal_interest_v1,
+            paced_terminal_replay_v1,
+            terminal_lifetime_claim_v1,
+            managed_runtime_v1,
+            fresh_agent_attention_replay_v1,
+        },
     )
     .await
     {
@@ -1212,8 +1246,14 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated =
-            build_handshake_with_capabilities(&s, true, false, false, false, false, false).await;
+        let negotiated = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                pane_reconcile_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1228,7 +1268,7 @@ mod tests {
         );
         // Same shape as an explicit `false` negotiation.
         let unnegotiated =
-            build_handshake_with_capabilities(&s, false, false, false, false, false, false).await;
+            build_handshake_with_capabilities(&s, HandshakeCapabilities::default()).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
     }
@@ -1240,8 +1280,14 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_paced_terminal_replay_only_when_negotiated() {
         let s = state();
-        let negotiated =
-            build_handshake_with_capabilities(&s, false, false, false, true, false, false).await;
+        let negotiated = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                paced_terminal_replay_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1250,8 +1296,14 @@ mod tests {
 
         // Non-paced negotiations keep the capabilities object byte-identical
         // to today's output — no paced key is invented.
-        let pane_only =
-            build_handshake_with_capabilities(&s, true, false, false, false, false, false).await;
+        let pane_only = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                pane_reconcile_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let ready = serde_json::to_value(&pane_only[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1275,8 +1327,15 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_terminal_lifetime_claim_only_when_negotiated() {
         let s = state();
-        let negotiated =
-            build_handshake_with_capabilities(&s, false, false, true, false, true, false).await;
+        let negotiated = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                terminal_interest_v1: true,
+                terminal_lifetime_claim_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1284,8 +1343,14 @@ mod tests {
         );
 
         // A claim-less negotiation must not invent the key.
-        let interest_only =
-            build_handshake_with_capabilities(&s, false, false, true, false, false, false).await;
+        let interest_only = build_handshake_with_capabilities(
+            &s,
+            HandshakeCapabilities {
+                terminal_interest_v1: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let ready = serde_json::to_value(&interest_only[0]).unwrap();
         assert_eq!(
             ready["capabilities"],

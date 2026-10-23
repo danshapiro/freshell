@@ -285,8 +285,8 @@ async function renderApp(store: ReturnType<typeof createStore>) {
 
 const READY_BASE = { type: 'ready', timestamp: '2026-07-25T00:00:00.000Z' }
 
-function sendReady(extra: Record<string, unknown>) {
-  act(() => { messageHandler?.({ ...READY_BASE, ...extra }) })
+function sendReady(extra: Record<string, unknown>, handler = messageHandler) {
+  act(() => { handler?.({ ...READY_BASE, ...extra }) })
 }
 
 function baselines(store: any) {
@@ -433,6 +433,43 @@ describe('App restart signals (bootId + serverInstanceId fallback)', () => {
       store.dispatch(recordTurnComplete({ tabId: 't1', paneId: 'p1', terminalId: 'codex:ses-resumed', at: 1_000 }))
     })
     expect(baselines(store)['codex:ses-resumed']).toBe(1_000)
+  })
+
+  it('replays missed Claude attention on reconnect, while first connect and restart seed silently', async () => {
+    const store = createStore({
+      tabs: [{ id: 'tab-1', mode: 'shell' }, { id: 'tab-claude', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: { 'tab-claude': { type: 'leaf', id: 'pane-claude', content: {
+          kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+          sessionId: 'session-claude', createRequestId: 'create-claude', status: 'connected',
+        } } },
+        activePane: { 'tab-claude': 'pane-claude' },
+      },
+    })
+    await renderApp(store)
+    // Open-pane reassertions subscribe for their own acknowledgements. Keep
+    // driving App's registered listener rather than that temporary subscriber.
+    const appHandler = messageHandler
+    const attention = (at: number) => [{ provider: 'claude', sessionId: 'session-claude', lastTurnCompleteAt: at }]
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', freshAgentAttention: attention(100) }, appHandler)
+    expect(store.getState().panes.layouts['tab-claude']).toMatchObject({ content: { sessionId: 'session-claude' } })
+    expect(baselines(store)['claude:session-claude']).toBe(100)
+    expect(store.getState().turnCompletion.seq).toBe(0)
+    expect(store.getState().turnCompletion.attentionByTab['tab-claude']).toBeUndefined()
+
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', freshAgentAttention: attention(101) }, appHandler)
+    expect(store.getState().connection).toMatchObject({ serverInstanceId: 'srv-1', bootId: 'boot-1', serverRestarted: false })
+    expect(store.getState().panes.layouts['tab-claude']).toMatchObject({ content: { sessionId: 'session-claude' } })
+    expect(baselines(store)['claude:session-claude']).toBe(101)
+    expect(store.getState().turnCompletion.seq).toBe(1)
+    expect(store.getState().turnCompletion.attentionByTab['tab-claude']).toBe(true)
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', freshAgentAttention: attention(101) }, appHandler)
+    expect(store.getState().turnCompletion.seq).toBe(1)
+
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-2', freshAgentAttention: attention(102) }, appHandler)
+    expect(store.getState().turnCompletion.seq).toBe(1)
+    expect(baselines(store)['claude:session-claude']).toBe(102)
   })
 
   it('a malformed ready frame neither wipes identity nor fakes a restart', async () => {

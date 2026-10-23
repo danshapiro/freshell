@@ -216,6 +216,9 @@ pub struct HelloCapabilities {
     /// managed-runtime controller is actually installed for the current boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_runtime_v1: Option<bool>,
+    /// Replay attention missed during a same-page disconnect, seeded on reload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_attention_replay_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
