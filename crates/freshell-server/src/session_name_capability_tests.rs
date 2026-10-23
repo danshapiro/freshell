@@ -187,11 +187,8 @@ pub(crate) fn session_name_http(
     let environment = GeminiProxyEnvironment::literal(None, http_proxy, None, None, false);
     let auth = GeminiSessionNameAuth::from_proxy_environment(key, gemini_base_url, &environment);
     let client = match http_proxy {
-        Some(proxy) => reqwest::Client::builder()
-            .proxy(reqwest::Proxy::http(proxy).unwrap())
-            .build()
-            .unwrap(),
-        None => reqwest::Client::builder().no_proxy().build().unwrap(),
+        Some(proxy) => reqwest::Client::builder().proxy(reqwest::Proxy::http(proxy).unwrap()),
+        None => reqwest::Client::builder().no_proxy(),
     };
     let http = Arc::new(GeminiSessionNameHttp::new(
         client,

@@ -333,7 +333,7 @@ impl GeminiSessionNameAuth {
 /// Failures come back classified ([`crate::gemini_failure`]) and never carry
 /// reqwest's error text, which can name the proxy.
 pub struct GeminiSessionNameHttp {
-    /// Honors the ambient proxy environment (`reqwest::Client::new()`).
+    /// Honors the ambient proxy environment (`reqwest::Client::builder()`).
     client: reqwest::Client,
     /// Ignores it.
     direct_client: reqwest::Client,
@@ -341,19 +341,34 @@ pub struct GeminiSessionNameHttp {
     base_url: String,
 }
 
+/// How long either session-name client waits for a connection (name
+/// resolution, TCP, the proxy and the TLS handshake). Shorter than the
+/// worker's 20-second request bound, so a route whose packets are silently
+/// dropped fails as a connect error, which pauses naming and uses no
+/// attempt, instead of timing out and using one.
+pub const SESSION_NAME_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl GeminiSessionNameHttp {
-    pub fn new(client: reqwest::Client, auth: GeminiSessionNameAuth, base_url: String) -> Self {
-        // Fails only when the TLS backend cannot initialize, which
-        // `reqwest::Client::new()` (the normal client) would already have
-        // panicked on. Never fall back to the proxy-honoring client: the
-        // direct route must not reach a OneCLI proxy.
-        let direct_client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("the TLS backend initializes, as for reqwest::Client::new()");
+    /// `client` is the normal (proxy-honoring) client's builder; both
+    /// clients get [`SESSION_NAME_CONNECT_TIMEOUT`].
+    pub fn new(
+        client: reqwest::ClientBuilder,
+        auth: GeminiSessionNameAuth,
+        base_url: String,
+    ) -> Self {
+        // A build fails only when the TLS backend cannot initialize, which
+        // `reqwest::Client::new()` would panic on too. Never fall back to
+        // the proxy-honoring client: the direct route must not reach a
+        // OneCLI proxy.
+        let build = |builder: reqwest::ClientBuilder| {
+            builder
+                .connect_timeout(SESSION_NAME_CONNECT_TIMEOUT)
+                .build()
+                .expect("the TLS backend initializes, as for reqwest::Client::new()")
+        };
         Self {
-            client,
-            direct_client,
+            client: build(client),
+            direct_client: build(reqwest::Client::builder().no_proxy()),
             auth,
             base_url,
         }
@@ -947,7 +962,7 @@ mod tests {
             auth.route(),
             NamingRoute::Key(KeyRouteTransport::AmbientProxy)
         );
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = reqwest::Client::builder().no_proxy();
         let http = GeminiSessionNameHttp::new(client, auth, format!("http://{addr}/v1beta"));
         let title = SessionNameTransport::generate_content(
             &http,
