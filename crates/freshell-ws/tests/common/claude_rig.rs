@@ -998,7 +998,13 @@ async fn spawn_rig_server(
 
     // The ONE ownership coordinator, wired into the WS state and the claude lane
     // the way main.rs wires it.
-    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let epoch = pane_ledger.as_ref().and_then(|ledger| {
+        ledger.reserve_boot_epoch().expect("reserve the rig server's durable boot epoch")
+    });
+    let ownership = Arc::new(match epoch {
+        Some(epoch) => freshell_ownership::RuntimeOwnershipRegistry::with_epoch(epoch),
+        None => freshell_ownership::RuntimeOwnershipRegistry::new(),
+    });
     let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx))
         .with_sidecar_environment(environment)
         .with_hosted_mcp(options.hosted_claude);
