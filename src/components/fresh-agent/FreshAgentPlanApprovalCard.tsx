@@ -22,7 +22,8 @@ const APPROVALS: Array<{ choice: Exclude<PlanApprovalChoice, 'keep-planning'>; l
  * one) rendered as markdown, the file it lives in, and four answers. A plain
  * approval lets the CLI return to the mode it had before plan mode; the other
  * two set the mode for the rest of the conversation; "Keep planning" denies
- * with the user's optional note.
+ * with the user's optional note, and a typed note holds the approvals back so
+ * it is never dropped.
  */
 export function FreshAgentPlanApprovalCard({
   approval,
@@ -34,7 +35,12 @@ export function FreshAgentPlanApprovalCard({
   onRespond: (decision: FreshAgentApprovalDecision) => void
 }) {
   const feedbackId = useId()
+  const noteHintId = useId()
   const [feedback, setFeedback] = useState('')
+  // A note is answered only by "Keep planning" (an approval carries no
+  // message), so while one is typed the approvals wait: clicking one would
+  // drop the note and run the plan unchanged.
+  const hasNote = feedback.trim().length > 0
   const input = approval.input ?? {}
   const plan = typeof input.plan === 'string' && input.plan.trim() ? input.plan : null
   const planFilePath = typeof input.planFilePath === 'string' ? input.planFilePath : null
@@ -70,7 +76,8 @@ export function FreshAgentPlanApprovalCard({
           <button
             key={choice}
             type="button"
-            disabled={disabled}
+            disabled={disabled || hasNote}
+            aria-describedby={hasNote ? noteHintId : undefined}
             onClick={() => answer(choice)}
             className={primary
               ? `${BUTTON} bg-primary font-medium text-primary-foreground`
@@ -102,6 +109,11 @@ export function FreshAgentPlanApprovalCard({
             Keep planning
           </button>
         </div>
+        {hasNote ? (
+          <p id={noteHintId} className="fresh-agent-plan-note-hint text-xs text-muted-foreground">
+            Your note is sent only with Keep planning. Clear it to approve the plan.
+          </p>
+        ) : null}
       </div>
     </div>
   )

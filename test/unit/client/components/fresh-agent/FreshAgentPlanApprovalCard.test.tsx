@@ -57,6 +57,31 @@ describe('FreshAgentPlanApprovalCard', () => {
     ])
   })
 
+  it('a typed note is sent only by "Keep planning", so the approvals wait until it is cleared', () => {
+    const { onRespond } = renderPlan({ plan: PLAN })
+    const note = screen.getByRole('textbox', { name: 'What should change? (optional)' })
+    const approvals = ['Approve plan', 'Approve and auto-accept edits', 'Approve and stop asking for permission']
+
+    fireEvent.change(note, { target: { value: 'Skip step 2' } })
+    for (const name of approvals) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toBeDisabled()
+      expect(button).toHaveAccessibleDescription(/keep planning/i)
+      fireEvent.click(button)
+    }
+    expect(onRespond).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Keep planning' })).toBeEnabled()
+
+    fireEvent.change(note, { target: { value: '   ' } })
+    for (const name of approvals) {
+      const button = screen.getByRole('button', { name })
+      expect(button).toBeEnabled()
+      expect(button).not.toHaveAccessibleDescription()
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Approve plan' }))
+    expect(onRespond).toHaveBeenCalledWith({ behavior: 'allow' })
+  })
+
   it('a request with no plan says so and can still be answered', () => {
     const { card, onRespond } = renderPlan({})
 
