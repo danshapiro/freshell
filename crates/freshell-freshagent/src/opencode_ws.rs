@@ -3473,6 +3473,8 @@ impl FreshOpencodeState {
         // dispatch/condemn gate, exactly like quiesce_rest_opencode_turn.
         let rest_turn = {
             let gate = self.fresh_agent.rest_turn_gate(session_id);
+            #[cfg(test)]
+            self.fresh_agent.note_rest_turn_gate_wait_for_test(&gate);
             let _gate = gate.lock().await;
             let rest_turn = self
                 .fresh_agent
@@ -3536,6 +3538,8 @@ impl FreshOpencodeState {
         // Bind before the await: the guard must never live across it.
         let witness = {
             let gate = self.fresh_agent.rest_turn_gate(canonical);
+            #[cfg(test)]
+            self.fresh_agent.note_rest_turn_gate_wait_for_test(&gate);
             let _gate = gate.lock().await;
             let witness = self
                 .fresh_agent
