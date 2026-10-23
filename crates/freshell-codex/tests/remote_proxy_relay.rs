@@ -13,6 +13,8 @@
 //! (`transport.rs` is gated the same way).
 #![cfg(feature = "real-transport")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -1816,5 +1818,155 @@ async fn canary_warning_does_not_suppress_the_first_over_cap_capacity_trigger() 
         "the below-threshold frame must relay"
     );
 
+    proxy.close().await;
+}
+
+// ── 14. the live repair-trigger loop stays fixed (name-reliability plan
+//         2026-10-21, Task 12 Step 0) ────────────────────────────────────────────
+
+/// The live log's repair-trigger flood (~1.6 lines per second per codex pane,
+/// "upstream connection errored." then "client connection errored.") was one
+/// loop per pane: the TUI polls `plugin/list`, whose ~17.8 MB response
+/// exceeded the proxy's old 16 MiB transport default, so the upstream read
+/// failed, the hub tore the connection down, and the TUI reconnected and
+/// polled again. This is the size of that response.
+const INCIDENT_PLUGIN_LIST_BYTES: usize = 17_800_000;
+
+/// How long the reconnecting TUI runs. The old caps looped roughly every
+/// second on loopback, so this window would have seen several cycles.
+const RECONNECT_LOOP_WINDOW: Duration = Duration::from_secs(5);
+
+/// An upstream app-server that answers EVERY request on EVERY connection with
+/// the incident-sized `plugin/list` response (its sockets read at the proxy
+/// caps, like a real app-server's uncapped reader). Counts accepted
+/// connections.
+async fn start_plugin_list_upstream() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let response = Arc::new(
+        json!({"id": 1, "result": {"data": huge_string(INCIDENT_PLUGIN_LIST_BYTES)}}).to_string(),
+    );
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let response = Arc::clone(&response);
+            tokio::spawn(async move {
+                let Ok(mut ws) = accept_async_with_config(stream, Some(proxy_ws_config())).await
+                else {
+                    return;
+                };
+                while let Some(Ok(message)) = ws.next().await {
+                    if matches!(message, Message::Text(_))
+                        && ws
+                            .send(Message::Text(response.as_ref().clone()))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("ws://{}:{}", addr.ip(), addr.port()), accepted)
+}
+
+/// What the reconnecting TUI saw by the end of its window.
+struct TuiLoopReport {
+    connects: usize,
+    responses: usize,
+    /// The connection open at the deadline (closed by the caller after it has
+    /// drained the proxy's events, so the test's own teardown is not counted).
+    open: Option<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+}
+
+/// The incident TUI: poll `plugin/list` every 500 ms and reconnect at once
+/// whenever the socket ends, until `window` elapses.
+async fn run_reconnecting_plugin_list_tui(proxy_url: &str, window: Duration) -> TuiLoopReport {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut report = TuiLoopReport {
+        connects: 0,
+        responses: 0,
+        open: None,
+    };
+    let poll = json!({"id": 1, "method": "plugin/list", "params": {}}).to_string();
+    while tokio::time::Instant::now() < deadline {
+        let mut ws = connect_tui_with_ws_config(proxy_url, proxy_ws_config()).await;
+        report.connects += 1;
+        let mut next_poll = tokio::time::Instant::now();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                report.open = Some(ws);
+                return report;
+            }
+            if tokio::time::Instant::now() >= next_poll {
+                if ws.send(Message::Text(poll.clone())).await.is_err() {
+                    break;
+                }
+                next_poll += Duration::from_millis(500);
+            }
+            let wake = next_poll.min(deadline);
+            match tokio::time::timeout_at(wake, ws.next()).await {
+                Err(_) => continue,
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if text.len() >= INCIDENT_PLUGIN_LIST_BYTES {
+                        report.responses += 1;
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+            }
+        }
+    }
+    report
+}
+
+#[tokio::test]
+async fn incident_shaped_polling_tui_keeps_one_connection_and_logs_no_repair_trigger() {
+    // Production-default options (no cap injection): the 17.8 MB response
+    // relays, so the TUI is never disconnected, never reconnects, and the
+    // proxy reports nothing. With the old 16 MiB transport cap the same
+    // TUI reconnected every cycle (the loop the live log recorded).
+    let (upstream_url, accepted) = start_plugin_list_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream_url, true))
+            .await
+            .unwrap();
+
+    let report = run_reconnecting_plugin_list_tui(proxy.ws_url(), RECONNECT_LOOP_WINDOW).await;
+
+    let mut triggers = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let RemoteProxyEvent::RepairTrigger(trigger) = event {
+            triggers.push(trigger);
+        }
+    }
+    assert_eq!(
+        (report.connects, accepted.load(Ordering::SeqCst)),
+        (1, 1),
+        "the TUI keeps one connection (and the proxy one upstream dial) for the whole window \
+         (repair triggers seen: {triggers:?})"
+    );
+    assert!(
+        report.responses >= 2,
+        "the TUI must actually receive the incident-sized response (got {} in {:?})",
+        report.responses,
+        RECONNECT_LOOP_WINDOW
+    );
+    assert_eq!(
+        triggers,
+        Vec::<RemoteProxyRepairTrigger>::new(),
+        "an incident-sized response must not produce repair triggers"
+    );
+
+    if let Some(mut ws) = report.open {
+        let _ = ws.close(None).await;
+    }
     proxy.close().await;
 }
