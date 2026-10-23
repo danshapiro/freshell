@@ -69,6 +69,10 @@ export type FreshAgentQualificationBuildRecord = {
   sessionHostBinary: string
 }
 
+/** How long cleanup waits for Docker to answer requests the broker forwarded:
+  * a create can wait tens of seconds for the host to flush its disk. */
+const BROKER_SETTLE_MS = 90_000
+
 export function phase2BootstrapFiles(
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
@@ -268,6 +272,13 @@ export class RuntimeHarness {
     const errors: string[] = []
     for (const id of [...this.trackedSupervisorContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`supervisor ${id}: ${String(error)}`) }
+    }
+    // A helper create Docker answers after the supervisor stopped waiting, or
+    // after the supervisor container above was removed with its background
+    // cleanup, still makes the helper. Let every forwarded request finish so
+    // the receipt removals below include that helper.
+    if (this.brokerStarted && !(await this.broker.settleForwarded(BROKER_SETTLE_MS))) {
+      errors.push(`docker requests forwarded by the broker were still unanswered after ${BROKER_SETTLE_MS / 1000}s`)
     }
     for (const id of [...this.broker?.receiptIds?.() ?? []]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`managed runtime ${id}: ${String(error)}`) }

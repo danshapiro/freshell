@@ -920,6 +920,30 @@ describe('scoped Claude source observer broker', () => {
       expect(Date.now() - quick, 'only the configured count is held').toBeLessThan(250)
     })
   })
+  it('lets cleanup wait until a helper create Docker answers late is recorded', async () => {
+    await withHttpBroker(async ({ request, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.delayHelperCreates({ prefix: 'freshell-claude-source-', delayMs: 300, count: 1 })
+      // The supervisor has stopped waiting; the proxy still owes Docker's answer.
+      const owed = request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(instance.receiptIds().has(helperId)).toBe(false)
+      expect(await instance.settleForwarded(5_000)).toBe(true)
+      expect(instance.receiptIds().has(helperId), 'cleanup now knows the late helper').toBe(true)
+      expect((await owed).status).toBe(201)
+    })
+  })
+  it('reports requests that are still unanswered at the settle deadline', async () => {
+    await withHttpBroker(async ({ request, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      instance.delayHelperCreates({ prefix: 'freshell-claude-source-', delayMs: 1_000, count: 1 })
+      const owed = request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(await instance.settleForwarded(100)).toBe(false)
+      expect((await owed).status).toBe(201)
+      expect(await instance.settleForwarded(100)).toBe(true)
+    })
+  })
   it('parses the slow helper create setting and refuses anything but the fixed helpers', () => {
     expect(parseHelperCreateDelay(undefined)).toBeUndefined()
     expect(parseHelperCreateDelay('')).toBeUndefined()

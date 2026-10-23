@@ -253,6 +253,7 @@ export class RestrictedDockerBroker {
   private stopFailuresRemaining = 0
   private inputPublicationBeforeCreateFailure = false
   private readonly helperCreateDelays: HelperCreateDelay[] = []
+  private readonly inFlight = new Set<Promise<void>>()
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
@@ -439,13 +440,35 @@ export class RestrictedDockerBroker {
     fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
-      void this.handle(request, response)
+      const handled = this.handle(request, response)
+      this.inFlight.add(handled)
+      void handled.finally(() => this.inFlight.delete(handled))
     })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
       this.server!.listen(this.policy.proxySocketPath, () => resolve())
     })
     fs.chmodSync(this.policy.proxySocketPath, 0o600)
+  }
+
+  /** Wait until every request this proxy accepted has its Docker answer
+    * recorded, at most `timeoutMs`. A helper create Docker answers after the
+    * supervisor stopped waiting, or after the supervisor container was
+    * removed, still makes the helper; once settled, receiptIds() names it.
+    * False when requests are still unanswered at the deadline. */
+  async settleForwarded(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (this.inFlight.size > 0) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return false
+      let timer: NodeJS.Timeout | undefined
+      await Promise.race([
+        Promise.allSettled([...this.inFlight]),
+        new Promise(resolve => { timer = setTimeout(resolve, remaining) }),
+      ])
+      clearTimeout(timer)
+    }
+    return true
   }
 
   async close(): Promise<void> {
