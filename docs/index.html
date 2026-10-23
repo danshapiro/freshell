@@ -499,6 +499,23 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .fresh-action { width: 38px; height: 38px; border: 1px solid hsl(var(--border)); border-radius: 6px; display: flex; align-items: center; justify-content: center; color: hsl(var(--foreground)); }
 .fresh-action.send { background: hsl(var(--foreground)); color: hsl(var(--background)); border-color: hsl(var(--foreground)); }
 .fresh-rail { min-width: 0; border-left: 1px solid hsl(var(--border) / .6); background: hsl(var(--muted) / .2); padding: 12px; overflow: auto; }
+/* Freshclaude live transcript: activity rows, a subagent's ↳ rows, the
+   Retrying row, and the live response's streaming caret */
+.fresh-mock--solo { grid-template-columns: minmax(0, 1fr); }
+.fresh-diff-row { display: flex; justify-content: space-between; gap: 12px; }
+.fresh-diff-row span:last-child { color: hsl(var(--muted-foreground)); }
+.fresh-tools { display: grid; gap: 3px; font: 11px 'JetBrains Mono', monospace; color: hsl(var(--muted-foreground)); margin-bottom: 6px; }
+.fresh-tool-row { display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
+.fresh-tool-row--child { padding-left: 16px; }
+.fresh-tool-ok { color: hsl(142 71% 45%); }
+.fresh-tool-name { padding: 0 4px; border-radius: 3px; background: hsl(var(--muted)); color: hsl(var(--foreground)); font-weight: 600; }
+.fresh-tool-title { color: hsl(var(--foreground)); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+.fresh-tool-preview { overflow: hidden; text-overflow: ellipsis; }
+.fresh-retry { font-style: italic; }
+.fresh-spin { animation: fresh-spin 1s linear infinite; }
+@keyframes fresh-spin { to { transform: rotate(360deg); } }
+.fresh-turn--live { border-left-style: dashed; }
+.fresh-stream-caret { display: inline-block; width: 7px; height: 1em; margin-left: 2px; vertical-align: text-bottom; background: hsl(var(--foreground) / .6); animation: blink 1s step-end infinite; }
 .fresh-rail-section + .fresh-rail-section { margin-top: 14px; }
 .fresh-rail-line { font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; color: hsl(var(--foreground)); }
 .fresh-style-control { display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid hsl(var(--border)); border-radius: 6px; background: hsl(var(--background) / .78); padding: 6px 8px; }
@@ -741,6 +758,12 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <span class="tab-label">Fresh Agent</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
+        <!-- Freshclaude panes render the running turn live. -->
+        <div class="tab" data-tab="freshclaude">
+          <span class="tab-dot busy"></span>
+          <span class="tab-label">Freshclaude</span>
+          <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
+        </div>
         <!-- Existing agent panes keep their conversations and placement. -->
         <div class="tab" data-tab="recovered">
           <span class="tab-icons">
@@ -975,6 +998,69 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
               <div class="fresh-rail-section"><div class="fresh-rail-title">Fork lineage</div><div class="fresh-rail-line">parent-thread-with-long-identifier</div></div>
               <div class="fresh-rail-section"><div class="fresh-rail-title">Worktrees</div><div class="fresh-rail-line">codex/fresh-client-responsive-display</div></div>
             </aside>
+          </div>
+        </div>
+      </div>
+
+      <!-- Freshclaude live transcript: a running turn shows as it happens.
+           Streamed text appears token by token in the live response and is
+           replaced in place (never duplicated) when the turn's transcript
+           lands; a tool shows as soon as the model starts the call; a
+           subagent's delegation lists its calls while it runs; an API retry
+           shows a Retrying row until the answer streams. -->
+      <div class="tab-panel" id="panel-freshclaude">
+        <div class="split-h">
+          <div class="pane" style="flex:.6">
+            <div class="pane-header pane-header--fresh-agent active"><span class="pane-header-icon" title="Repo: freshell"><i data-lucide="git-branch" class="icon"></i></span><span class="pane-header-icon" title="Claude (freshclaude pane)"><svg class="icon" viewBox="0 0 24 24" fill="none"><path fill="currentColor" fill-rule="evenodd" d="M12 0.2A11.8 11.8 0 1 1 11.99 0.2Z M12.000 3.000Q14.587 0.666 15.905 3.891Q19.249 2.911 19.036 6.389Q22.474 6.956 20.774 9.997Q23.626 12.000 20.774 14.003Q22.474 17.044 19.036 17.611Q19.249 21.089 15.905 20.109Q14.587 23.334 12.000 21.000Q9.413 23.334 8.095 20.109Q4.751 21.089 4.964 17.611Q1.526 17.044 3.226 14.003Q0.374 12.000 3.226 9.997Q1.526 6.956 4.964 6.389Q4.751 2.911 8.095 3.891Q9.413 0.666 12.000 3.000Z"/><g transform="translate(2.42302 2.64068) scale(0.0187102)"><path fill="currentColor" d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2 104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></g></svg></span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="settings" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="fresh-mock fresh-mock--solo">
+              <div class="fresh-main">
+                <div class="fresh-diffs"><div class="fresh-diffs-title">Diffs</div><div class="fresh-diff-row"><span>src/store/sessionsSlice.ts</span><span>+3 −3</span></div><div class="fresh-diff-row"><span>src/store/store.ts</span><span>+1 −1</span></div></div>
+                <div class="fresh-transcript">
+                  <article class="fresh-turn user" aria-label="You transcript turn"><div class="fresh-role">You</div><div class="fresh-copy">Rename sessionsSlice to sessionStore and update everything that uses it.</div></article>
+                  <article class="fresh-turn" aria-label="Freshclaude transcript turn">
+                    <div class="fresh-role">Freshclaude</div>
+                    <div class="fresh-tools" role="region" aria-label="Activity strip">
+                      <div class="fresh-tool-row"><span class="fresh-tool-ok" aria-label="complete">✓</span><span class="fresh-tool-name">Edit</span><span class="fresh-tool-preview">src/store/sessionsSlice.ts</span></div>
+                      <div class="fresh-tool-row"><span class="fresh-tool-ok" aria-label="complete">✓</span><span class="fresh-tool-title">General-purpose Task — find other uses</span><span class="fresh-tool-preview">1.4s</span></div>
+                      <div class="fresh-tool-row fresh-tool-row--child"><span aria-hidden="true">↳</span><span class="fresh-tool-name">Grep</span><span class="fresh-tool-preview">sessionsSlice</span></div>
+                      <div class="fresh-tool-row fresh-tool-row--child"><span aria-hidden="true">↳</span><span class="fresh-tool-name">Read</span><span class="fresh-tool-preview">src/store/store.ts</span></div>
+                      <div class="fresh-tool-row"><span class="fresh-tool-ok" aria-label="complete">✓</span><span class="fresh-tool-name">Edit</span><span class="fresh-tool-preview">src/store/store.ts</span></div>
+                    </div>
+                  </article>
+                  <article class="fresh-turn fresh-turn--live" aria-label="Freshclaude live response" aria-busy="true">
+                    <div class="fresh-copy">Renamed the slice and its two imports. Running the store tests next, so nothing still points at the old name<span class="fresh-stream-caret" aria-hidden="true"></span></div>
+                  </article>
+                </div>
+                <div class="fresh-composer">
+                  <div class="fresh-thinking"><span></span></div>
+                  <div class="fresh-input">Agent is working — sends queue for the next turn</div>
+                  <div class="fresh-actions"><div class="fresh-action"><i data-lucide="paperclip" class="icon-xs"></i></div><div class="fresh-action" title="Stop"><i data-lucide="square" class="icon-xs"></i></div><div class="fresh-action send"><i data-lucide="send" class="icon-xs"></i></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="divider-v"><div class="dots"><span></span><span></span><span></span></div></div>
+          <div class="pane" style="flex:.4">
+            <div class="pane-header pane-header--fresh-agent inactive"><span class="pane-header-icon" title="Repo: freshell"><i data-lucide="git-branch" class="icon"></i></span><span class="pane-header-icon" title="Claude (freshclaude pane)"><svg class="icon" viewBox="0 0 24 24" fill="none"><path fill="currentColor" fill-rule="evenodd" d="M12 0.2A11.8 11.8 0 1 1 11.99 0.2Z M12.000 3.000Q14.587 0.666 15.905 3.891Q19.249 2.911 19.036 6.389Q22.474 6.956 20.774 9.997Q23.626 12.000 20.774 14.003Q22.474 17.044 19.036 17.611Q19.249 21.089 15.905 20.109Q14.587 23.334 12.000 21.000Q9.413 23.334 8.095 20.109Q4.751 21.089 4.964 17.611Q1.526 17.044 3.226 14.003Q0.374 12.000 3.226 9.997Q1.526 6.956 4.964 6.389Q4.751 2.911 8.095 3.891Q9.413 0.666 12.000 3.000Z"/><g transform="translate(2.42302 2.64068) scale(0.0187102)"><path fill="currentColor" d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2 104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></g></svg></span><span class="pane-header-meta">~/code/freshell-web</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="settings" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="fresh-mock fresh-mock--solo">
+              <div class="fresh-main">
+                <div class="fresh-transcript">
+                  <article class="fresh-turn user" aria-label="You transcript turn"><div class="fresh-role">You</div><div class="fresh-copy">Summarize the open pull request.</div></article>
+                  <article class="fresh-turn fresh-turn--live" aria-label="Freshclaude live response" aria-busy="true">
+                    <div class="fresh-role">Freshclaude</div>
+                    <div class="fresh-tools" role="region" aria-label="Activity strip">
+                      <div class="fresh-tool-row"><span class="fresh-tool-ok" aria-label="complete">✓</span><span class="fresh-tool-name">Bash</span><span class="fresh-tool-preview">gh pr view 812</span></div>
+                      <div class="fresh-tool-row fresh-retry"><i data-lucide="loader-2" class="icon-xs fresh-spin" aria-label="running"></i><span>Retrying (attempt 2) — overloaded (529) · retrying in 2s</span></div>
+                    </div>
+                  </article>
+                </div>
+                <div class="fresh-composer">
+                  <div class="fresh-thinking"><span></span></div>
+                  <div class="fresh-input">Send a message — / commands, @ files, ! shell</div>
+                  <div class="fresh-actions"><div class="fresh-action" title="Stop"><i data-lucide="square" class="icon-xs"></i></div><div class="fresh-action send"><i data-lucide="send" class="icon-xs"></i></div></div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>

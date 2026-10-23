@@ -390,29 +390,12 @@ fn build_terminal_base_env(
     tab_id: Option<&str>,
     pane_id: Option<&str>,
 ) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    out.insert("FRESHELL".to_string(), "1".to_string());
-    let port_raw = env
-        .get("PORT")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "3001".to_string());
-    let url = env
-        .get("FRESHELL_URL")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| format!("http://localhost:{}", js_number_string(&port_raw)));
-    out.insert("FRESHELL_URL".to_string(), url);
-    out.insert(
-        "FRESHELL_TOKEN".to_string(),
-        env.get("AUTH_TOKEN").unwrap_or_default(),
-    );
-    out.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.to_string());
-    if let Some(t) = tab_id.filter(|s| !s.is_empty()) {
-        out.insert("FRESHELL_TAB_ID".to_string(), t.to_string());
-    }
-    if let Some(p) = pane_id.filter(|s| !s.is_empty()) {
-        out.insert("FRESHELL_PANE_ID".to_string(), p.to_string());
-    }
-    out
+    freshell_platform::freshell_context_env::freshell_context_env(
+        &freshell_platform::freshell_context_env::FreshellEndpoint::from_env(env),
+        Some(terminal_id),
+        tab_id,
+        pane_id,
+    )
 }
 
 /// One value-safe managed Codex rendering for this terminal tab's TUI and a
@@ -461,25 +444,6 @@ fn build_codex_managed_launch_setup(
             env: sidecar_env,
         },
     })
-}
-
-/// JS `String(Number(s))` for the `PORT` template slot (mirrored from
-/// `crates/freshell-ws/src/terminal.rs:1313`).
-fn js_number_string(s: &str) -> String {
-    let t = s.trim();
-    if t.is_empty() {
-        return "0".to_string();
-    }
-    match t.parse::<f64>() {
-        Ok(n) if n.is_finite() => {
-            if n.fract() == 0.0 && n.abs() < 1e15 {
-                format!("{}", n as i64)
-            } else {
-                format!("{n}")
-            }
-        }
-        _ => "NaN".to_string(),
-    }
 }
 
 /// `wrapTerminalSpawnError` (`terminal-registry.ts:450-481`, mirrored from

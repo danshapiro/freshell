@@ -4110,6 +4110,8 @@ impl SessionHandoffRunner {
                         "freshclaude",
                         &req.session_id,
                         req.cwd.as_deref(),
+                        req.tab_id.as_deref(),
+                        req.pane_id.as_deref(),
                         operation_id,
                         generation,
                     )
@@ -4121,6 +4123,8 @@ impl SessionHandoffRunner {
                         "kilroy",
                         &req.session_id,
                         req.cwd.as_deref(),
+                        req.tab_id.as_deref(),
+                        req.pane_id.as_deref(),
                         operation_id,
                         generation,
                     )

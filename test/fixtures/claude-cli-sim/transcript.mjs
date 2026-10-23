@@ -93,6 +93,16 @@ export class Transcript {
     return uuid
   }
 
+  /**
+   * Append a line exactly as given (a replayed real-CLI line, replay.mjs).
+   * A line with a uuid extends the chain like any other.
+   */
+  appendVerbatim(line) {
+    this.pending.push(line)
+    if (typeof line.uuid === 'string') this.lastUuid = line.uuid
+    this.schedule()
+  }
+
   /** Append a bookkeeping line with no uuid (queue operations). */
   appendRaw(fields) {
     this.pending.push({ ...fields, timestamp: new Date().toISOString(), sessionId: this.sessionId })

@@ -78,7 +78,6 @@ function makeLiveFreshSessionState(liveSessionId: string, status: 'idle' | 'runn
     turns: [],
     historyItems: [],
     historyBodies: {},
-    streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
     pendingQuestions: {},

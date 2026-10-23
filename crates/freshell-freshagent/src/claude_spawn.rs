@@ -170,6 +170,7 @@ pub struct ClaudeNodeCommand {
     ownership_tag: Option<String>,
     closed_stdin: bool,
     complete_environment: Option<Vec<(String, String)>>,
+    freshell_endpoint: Option<freshell_platform::freshell_context_env::FreshellEndpoint>,
 }
 
 impl ClaudeNodeCommand {
@@ -201,6 +202,7 @@ impl ClaudeNodeCommand {
             ownership_tag: None,
             closed_stdin: false,
             complete_environment: None,
+            freshell_endpoint: None,
         }
     }
 
@@ -231,6 +233,20 @@ impl ClaudeNodeCommand {
     /// secrets still layer over it. `None` keeps the inherited environment.
     pub fn with_complete_environment(mut self, environment: Option<&[(String, String)]>) -> Self {
         self.complete_environment = environment.map(<[(String, String)]>::to_vec);
+        self
+    }
+
+    /// When `Some`, the child reaches this server through `endpoint` (G19):
+    /// it gets `FRESHELL=1`, `FRESHELL_URL` and `FRESHELL_TOKEN`, and none of
+    /// the pane-scoped names (`FRESHELL_TERMINAL_ID`, `FRESHELL_TAB_ID`,
+    /// `FRESHELL_PANE_ID`) it would otherwise inherit, for example from a
+    /// server that itself runs inside a Freshell terminal: its session's pane
+    /// arrives with the `create` line. `None` leaves those names alone.
+    pub fn with_freshell_endpoint(
+        mut self,
+        endpoint: Option<&freshell_platform::freshell_context_env::FreshellEndpoint>,
+    ) -> Self {
+        self.freshell_endpoint = endpoint.cloned();
         self
     }
 
@@ -277,6 +293,13 @@ impl ClaudeNodeCommand {
         if let Some(environment) = &self.complete_environment {
             command.env_clear();
             command.envs(environment.iter().map(|(key, value)| (key, value)));
+        }
+        if let Some(endpoint) = &self.freshell_endpoint {
+            use freshell_platform::freshell_context_env as context;
+            for name in context::FRESHELL_PANE_CONTEXT_ENV_VARS {
+                command.env_remove(name);
+            }
+            command.envs(context::freshell_context_env(endpoint, None, None, None));
         }
         if let Some(ownership_id) = &self.ownership_tag {
             command.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, ownership_id);
@@ -1012,6 +1035,70 @@ mod tests {
             .expect("run env");
         assert!(output.status.success(), "{output:?}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "HOME=/rig/home\0");
+    }
+
+    /// G19: a sidecar reaches this server through the endpoint it is given,
+    /// never through an inherited one, and inherits no other pane's ids (here
+    /// `env -0` stands in for node and prints what the child got).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_gets_this_servers_endpoint_and_no_other_panes_ids() {
+        let env = env_from(&[("FRESHELL_CLAUDE_NODE", "/usr/bin/env")]);
+        let inherited = [
+            ("HOME".to_string(), "/rig/home".to_string()),
+            (
+                "FRESHELL_URL".to_string(),
+                "http://localhost:3001".to_string(),
+            ),
+            ("FRESHELL_TOKEN".to_string(), "outer-token".to_string()),
+            (
+                "FRESHELL_TERMINAL_ID".to_string(),
+                "outer-terminal".to_string(),
+            ),
+            ("FRESHELL_TAB_ID".to_string(), "outer-tab".to_string()),
+            ("FRESHELL_PANE_ID".to_string(), "outer-pane".to_string()),
+        ];
+        let endpoint =
+            freshell_platform::freshell_context_env::FreshellEndpoint::local(4100, "this-token");
+        let output = ClaudeNodeCommand::from_parts("-0", &env, None)
+            .with_complete_environment(Some(&inherited))
+            .with_freshell_endpoint(Some(&endpoint))
+            .with_closed_stdin()
+            .command()
+            .output()
+            .await
+            .expect("run env");
+        assert!(output.status.success(), "{output:?}");
+        let mut got: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "FRESHELL=1",
+                "FRESHELL_TOKEN=this-token",
+                "FRESHELL_URL=http://localhost:4100",
+                "HOME=/rig/home",
+            ]
+        );
+    }
+
+    /// Without an endpoint the child's Freshell names are left as inherited.
+    #[test]
+    fn a_child_without_an_endpoint_keeps_its_freshell_names() {
+        let env = env_from(&[]);
+        let inherited = [("FRESHELL_TAB_ID".to_string(), "tab".to_string())];
+        let command = ClaudeNodeCommand::from_parts("/srv/sidecar/index.mjs", &env, None)
+            .with_complete_environment(Some(&inherited))
+            .command();
+        assert_eq!(
+            envs(&command).get("FRESHELL_TAB_ID"),
+            Some(&Some("tab".to_string()))
+        );
+        assert!(!envs(&command).contains_key("FRESHELL_URL"));
     }
 
     #[test]

@@ -39,7 +39,7 @@ export interface LedgerRow {
   pid: number
   /** The ordinal of the query() call that wrote the row (1 = the first in this sidecar). */
   query: number
-  kind: 'query' | 'boot' | 'prompt' | 'can_use_tool' | 'emission' | string
+  kind: 'query' | 'boot' | 'prompt' | 'can_use_tool' | 'control' | 'emission' | string
   [key: string]: any
 }
 

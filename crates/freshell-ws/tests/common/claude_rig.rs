@@ -13,7 +13,8 @@
 //!   key. It never contacts the real API.
 //!
 //! Each rig's server is wired like production: one ownership coordinator shared by
-//! the WS state and the claude lane (main.rs does the same).
+//! the WS state and the claude lane (main.rs does the same), and the fresh-agent
+//! snapshot REST route ([`ClaudeRig::snapshot`]) beside the WS endpoint.
 //!
 //! Each rig gets a throwaway HOME / CLAUDE_CONFIG_DIR / workspace, and its server's
 //! [`freshell_freshagent::FreshClaudeState`] gives every sidecar exactly the rig's
@@ -31,7 +32,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -77,7 +78,16 @@ pub struct RigOptions {
     /// The session handoff route (`POST /api/sessions/handoff`) on the rig's
     /// server, driven by a runner over the same lanes (main.rs's wiring).
     pub handoff: bool,
+    /// The ordinary Freshell MCP wiring main.rs installs (G19): the claude lane
+    /// gets the rig server's own endpoint (its bound loopback port and
+    /// [`AUTH_TOKEN`]) and a recipe provider answering what this cell holds at
+    /// each sidecar launch (a test changes it to flip the setting).
+    pub freshell_mcp: Option<RigFreshellMcp>,
 }
+
+/// What the rig's Freshell MCP recipe provider answers, changeable mid-test.
+pub type RigFreshellMcp =
+    Arc<std::sync::Mutex<freshell_freshagent::claude_freshell_mcp::ClaudeFreshellMcpResolution>>;
 
 pub struct ClaudeRig {
     pub kind: RigKind,
@@ -376,8 +386,46 @@ impl ClaudeRig {
         }
     }
 
+    /// `GET /api/fresh-agent/threads/freshclaude/claude/<thread_id>` (the route the
+    /// browser's pane fetches its transcript from): the status and the JSON body.
+    pub async fn snapshot(&self, thread_id: &str) -> (u16, Value) {
+        let host = self
+            .http_url
+            .strip_prefix("http://")
+            .expect("the rig serves http");
+        let mut stream = tokio::net::TcpStream::connect(host)
+            .await
+            .expect("connect to the rig's HTTP address");
+        let request = format!(
+            "GET /api/fresh-agent/threads/freshclaude/claude/{thread_id} HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\nx-auth-token: {AUTH_TOKEN}\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the snapshot request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read the snapshot response");
+        let text = String::from_utf8(response).expect("a utf-8 response");
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .expect("an HTTP response with a body");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("an HTTP status code");
+        (
+            status,
+            serde_json::from_str(body.trim()).unwrap_or(Value::Null),
+        )
+    }
+
     /// The simulator's ledger rows of one kind (`query`, `boot`, `prompt`,
-    /// `can_use_tool`, `emission`); see `test/fixtures/claude-cli-sim/query.mjs`.
+    /// `can_use_tool`, `control`, `emission`); see `test/fixtures/claude-cli-sim/query.mjs`.
     pub fn ledger_rows(&self, kind: &str) -> Vec<Value> {
         assert_eq!(
             self.kind,
@@ -490,6 +538,94 @@ impl ClaudeRig {
             probe
         });
         RuntimeProcesses { pids, probes }
+    }
+
+    /// The options of the `query()` calls the simulator recorded, in order.
+    pub fn query_options(&self) -> Vec<Value> {
+        self.ledger_rows("query")
+            .into_iter()
+            .map(|row| row["options"].clone())
+            .collect()
+    }
+
+    /// The first recorded `query()` options matching `predicate`, once recorded.
+    pub async fn wait_for_query(&self, what: &str, predicate: impl Fn(&Value) -> bool) -> Value {
+        let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+        loop {
+            if let Some(options) = self.query_options().into_iter().find(|o| predicate(o)) {
+                return options;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no query() call for {what}; recorded: {:?}",
+                self.query_options()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// One finished turn per prompt (each `freshAgent.result`), each on disk
+    /// before the next: the CLI flushes a transcript line 95-200 ms after its
+    /// SDK frame (T3), and resumes, undo and fork read the transcript. Returns
+    /// the durable id the first turn reported.
+    pub async fn converse(
+        &self,
+        conn: &mut RigConnection,
+        session_id: &str,
+        prompts: &[&str],
+    ) -> String {
+        for (n, prompt) in prompts.iter().enumerate() {
+            let results_before = conn.events_seen("freshAgent.result");
+            conn.send_text(session_id, &format!("send-{n}"), prompt)
+                .await;
+            let deadline = tokio::time::Instant::now() + RIG_FRAME_BUDGET;
+            while conn.events_seen("freshAgent.result") == results_before {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "turn {n} never finished"
+                );
+                conn.read_for(Duration::from_millis(50)).await;
+            }
+            let path = self
+                .wait_for_transcript(&conn.init_session_id(session_id))
+                .await;
+            loop {
+                let lines: Vec<Value> = std::fs::read_to_string(&path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                let at = lines.iter().rposition(|line| {
+                    line["type"] == "user" && line["message"]["content"][0]["text"] == *prompt
+                });
+                if at.is_some_and(|at| lines[at..].iter().any(|line| line["type"] == "assistant")) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the turn for {prompt:?} never reached disk"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        conn.init_session_id(session_id)
+    }
+
+    /// The first sidecar this rig booted dies on its own (SIGKILL of the Node
+    /// process): its session is untracked, the state a reload or a handoff
+    /// resumes from. Returns once `conn` has read the exit.
+    pub async fn kill_first_sidecar(&self, conn: &mut RigConnection) {
+        let pid = self.ledger_rows("boot")[0]["pid"]
+            .as_i64()
+            .expect("the boot row names the sidecar's pid") as i32;
+        // SAFETY: a plain signal to the sidecar this rig spawned.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        conn.wait_for("the sidecar's exit", |v| {
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == "freshAgent.error"
+                && v["event"]["code"] == "SIDECAR_EXITED"
+        })
+        .await;
     }
 }
 
@@ -932,7 +1068,18 @@ async fn spawn_rig_server(
         ownership: Some(Arc::clone(&ownership)),
     };
 
-    let mut router = freshell_ws::router(state.clone());
+    // The snapshot REST route (`GET /api/fresh-agent/threads/...`) the pane reads.
+    let snapshots = freshell_freshagent::SnapshotState::new(
+        Arc::clone(&auth_token),
+        state.fresh_codex.clone(),
+        freshell_freshagent::FreshAgentState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+        ),
+        lane.clone(),
+    );
+    let mut router =
+        freshell_ws::router(state.clone()).merge(freshell_freshagent::snapshot::router(snapshots));
     if options.handoff {
         let runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
             Arc::clone(&auth_token),
@@ -954,6 +1101,21 @@ async fn spawn_rig_server(
         .await
         .expect("bind an ephemeral loopback port");
     let addr = listener.local_addr().expect("local addr");
+    if let Some(resolution) = options.freshell_mcp.clone() {
+        // main.rs wires the same two pieces from its bound port and token.
+        assert!(lane.set_freshell_endpoint(
+            freshell_freshagent::claude_freshell_mcp::FreshellEndpoint {
+                url: format!("http://{addr}"),
+                token: AUTH_TOKEN.to_string(),
+            }
+        ));
+        let provider: freshell_freshagent::claude_freshell_mcp::ClaudeFreshellMcpProvider =
+            Arc::new(move || {
+                let answer = resolution.lock().expect("rig mcp resolution").clone();
+                Box::pin(async move { answer })
+            });
+        assert!(lane.set_freshell_mcp_provider(provider));
+    }
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

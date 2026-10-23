@@ -125,6 +125,8 @@ The service is standalone and independent of Electron.
 
 Freshclaude, Freshcodex, and Freshopencode share a chat interface with tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
 
+In Freshclaude, “Allow and don't ask again” saves the rule Claude suggests, listed on the card before you click (project rules go to `.claude/settings.local.json` in the project), and when Claude finishes planning it shows the plan with choices to approve it, approve and auto-accept edits, approve and stop asking for permission, or keep planning. In Freshcodex, “Always allow” lasts until the pane reloads.
+
 You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
 
 ### Session switching and recovery
@@ -259,6 +261,13 @@ Rust server is under `resources/bin/`; the packaged Node runtime and MCP client
 are separate resources. Claude fresh-agent panes use the isolated
 `crates/freshell-claude-sidecar` package, which wraps the Claude SDK over
 newline-delimited JSON on stdin/stdout. The sidecar is not a network service.
+
+Freshclaude and Kilroy panes give their agent the same Freshell MCP server, so
+the agent can list and drive tabs and panes; its default target is the pane it
+runs in. The **Agent MCP server** switch (Settings → Advanced) controls this:
+turning it off removes the server from Freshclaude and Kilroy agents started or
+resumed after the change, with no restart. Terminal panes do not follow the
+switch yet.
 
 ### Rust server scope
 

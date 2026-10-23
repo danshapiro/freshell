@@ -30,6 +30,9 @@ import {
 } from './claude-local-provider.mjs'
 import { HANG_MCP_SERVER_NAME } from '../../fixtures/claude-cli-sim/prompt-markers.mjs'
 
+/** The stdio MCP server the `mcp` scenario connects (it stands in for tools/freshell-mcp). */
+const FRESHELL_MCP_PROBE_SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-freshell-mcp-probe-server.mjs')
+
 export const SIM_QUERY_MODULE = path.join(DEFAULT_REPO_ROOT, 'test/fixtures/claude-cli-sim/query.mjs')
 const SESSION_STATE_ENV = { CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -321,6 +324,32 @@ const isStateIdle = (m) => m.type === 'system' && m.subtype === 'session_state_c
 
 async function sha256(file) {
   return createHash('sha256').update(await fs.readFile(file)).digest('hex')
+}
+
+/**
+ * What a turn that called an MCP tool showed: the servers and MCP tools its
+ * init listed, and each tool result (its error flag and text; a JSON text
+ * without the reporting process's pid).
+ */
+function mcpTurnShape(session) {
+  const init = session.messages((m) => m.type === 'system' && m.subtype === 'init')[0]
+  const results = session.messages((m) => m.type === 'user' && Array.isArray(m.message?.content))
+    .flatMap((m) => m.message.content.filter((block) => block?.type === 'tool_result').map((block) => {
+      const text = Array.isArray(block.content) ? block.content.map((part) => part?.text ?? '').join('') : String(block.content ?? '')
+      let parsed
+      try { parsed = JSON.parse(text); delete parsed.pid } catch { parsed = text }
+      return {
+        isError: block.is_error === true,
+        content: Array.isArray(block.content) ? block.content.map((part) => part?.type) : typeof block.content,
+        text: parsed,
+        toolUseResult: Array.isArray(m.tool_use_result) ? m.tool_use_result.map((part) => part?.type) : typeof m.tool_use_result,
+      }
+    }))
+  return {
+    mcpServers: init?.mcp_servers ?? null,
+    mcpTools: (init?.tools ?? []).filter((name) => String(name).startsWith('mcp__')),
+    toolResults: results,
+  }
 }
 
 /** The chain entries of a transcript (lines that carry a uuid), in file order, without their payloads. */
@@ -671,6 +700,32 @@ const SCENARIOS = {
     await Promise.all([mcp.close(), bash.close()])
   },
 
+  /**
+   * G19: the CLI starts a stdio MCP server with its own environment, lists the
+   * server's tools once it connected, and returns a tool call's text result;
+   * a call of an MCP tool no configured server offers is an error result.
+   */
+  async mcp(ctx) {
+    const report = path.join(ctx.fixture.root, 'mcp-probe-report.json')
+    const s = ctx.open('S', {
+      options: { mcpServers: { freshell: { type: 'stdio', command: process.execPath, args: [FRESHELL_MCP_PROBE_SERVER, report] } } },
+      env: { FRESHELL: '1', FRESHELL_URL: 'http://127.0.0.1:9/probe', FRESHELL_TOKEN: 'probe-token', FRESHELL_TAB_ID: 'tab-s', FRESHELL_PANE_ID: 'pane-s' },
+    })
+    s.push('MCP:call=mcp__freshell__context', 'u1')
+    await s.waitForResults(1, 30_000)
+    ctx.observe('connected', mcpTurnShape(s))
+    const seen = JSON.parse(await fs.readFile(report, 'utf8'))
+    delete seen.pid
+    ctx.observe('serverEnvironment', seen)
+    await s.close()
+
+    const m = ctx.open('M')
+    m.push('MCP:call=mcp__freshell__freshell', 'u2')
+    await m.waitForResults(1, 30_000)
+    ctx.observe('missing', mcpTurnShape(m))
+    await m.close()
+  },
+
   /** T18: an API error ends the turn with a success-subtype error result. */
   async 'api-error'(ctx) {
     const X = ctx.uuid('X')
@@ -702,6 +757,34 @@ const SCENARIOS = {
     s.push('PLAN:exit', 'u3')
     await s.waitForResults(3, 30_000)
     await sleep(500)
+    await s.close()
+  },
+
+  /**
+   * An approved ExitPlanMode returns the CLI to the mode it had before plan
+   * mode: bypassPermissions here, not default (transcript-live B6).
+   */
+  async 'plan-return'(ctx) {
+    const s = ctx.open('S', {
+      options: { permissionMode: 'bypassPermissions' },
+      permissions: (toolName, input) => ({ behavior: 'allow', updatedInput: input }),
+    })
+    await s.init()
+    await s.call('setPermissionMode', 'plan')
+    s.push('PLAN:exit', 'u1')
+    await s.waitForResults(1, 30_000)
+    await s.waitForCount(isStateIdle, 1, 3000, 'idle')
+    await sleep(300)
+    await s.close()
+  },
+
+  /** F11: the API answers 529 twice; the CLI reports each retry (system/api_retry), then answers. */
+  async retry(ctx) {
+    const s = ctx.open('S')
+    s.push('RETRY:529x2', 'u1')
+    await s.waitForResults(1, 60_000)
+    await s.waitForCount(isStateIdle, 1, 3000, 'idle')
+    await sleep(300)
     await s.close()
   },
 

@@ -11,8 +11,8 @@ async fn managed_provider_claude_default_sdk_initializes_fixed_mcp_without_a_pro
         .unwrap();
     for (name, source) in [
         (
-            "hosted-mcp.mjs",
-            include_str!("../../freshell-claude-sidecar/hosted-mcp.mjs"),
+            "mcp-servers.mjs",
+            include_str!("../../freshell-claude-sidecar/mcp-servers.mjs"),
         ),
         (
             "exec-profile.mjs",

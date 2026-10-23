@@ -261,6 +261,40 @@ export const FreshAgentTurnSchema = z.object({
   restorable: z.boolean().optional(),
 }).strict()
 
+// Claude's permission update (the SDK's `PermissionUpdate`): what the CLI
+// suggests on an approval, and what "Allow and don't ask again" sends back as
+// `updatedPermissions`. Mirrors the server's normalizer
+// (crates/freshell-freshagent/src/claude_permission_update.rs), which drops
+// anything outside this shape before it reaches a snapshot.
+const FreshAgentPermissionUpdateDestinationSchema = z.enum(['userSettings', 'projectSettings', 'localSettings', 'session', 'cliArg'])
+const FreshAgentPermissionRulesSchema = z.array(z.object({
+  toolName: z.string(),
+  ruleContent: z.string().optional(),
+}).strict()).min(1)
+const FreshAgentPermissionRulesUpdateSchema = (type: 'addRules' | 'replaceRules' | 'removeRules') => z.object({
+  type: z.literal(type),
+  rules: FreshAgentPermissionRulesSchema,
+  behavior: z.enum(['allow', 'deny', 'ask']),
+  destination: FreshAgentPermissionUpdateDestinationSchema,
+}).strict()
+const FreshAgentPermissionDirectoriesUpdateSchema = (type: 'addDirectories' | 'removeDirectories') => z.object({
+  type: z.literal(type),
+  directories: z.array(z.string()).min(1),
+  destination: FreshAgentPermissionUpdateDestinationSchema,
+}).strict()
+export const FreshAgentPermissionUpdateSchema = z.discriminatedUnion('type', [
+  FreshAgentPermissionRulesUpdateSchema('addRules'),
+  FreshAgentPermissionRulesUpdateSchema('replaceRules'),
+  FreshAgentPermissionRulesUpdateSchema('removeRules'),
+  z.object({
+    type: z.literal('setMode'),
+    mode: z.enum(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto']),
+    destination: FreshAgentPermissionUpdateDestinationSchema,
+  }).strict(),
+  FreshAgentPermissionDirectoriesUpdateSchema('addDirectories'),
+  FreshAgentPermissionDirectoriesUpdateSchema('removeDirectories'),
+])
+
 export const FreshAgentPendingApprovalSchema = z.object({
   requestId: FreshAgentRequestIdSchema,
   toolName: z.string().optional(),
@@ -268,6 +302,8 @@ export const FreshAgentPendingApprovalSchema = z.object({
   blockedPath: z.string().optional(),
   decisionReason: z.string().optional(),
   input: z.record(z.string(), z.unknown()).optional(),
+  // Claude only: the CLI's own suggestions for not asking again.
+  suggestions: z.array(FreshAgentPermissionUpdateSchema).optional(),
   providerRequest: z.record(z.string(), z.unknown()).optional(),
 }).strict()
 
@@ -427,6 +463,7 @@ export type FreshAgentRequestId = z.infer<typeof FreshAgentRequestIdSchema>
 export type FreshAgentTranscriptItem = z.infer<typeof FreshAgentTranscriptItemSchema>
 export type FreshAgentTurn = z.infer<typeof FreshAgentTurnSchema>
 export type FreshAgentPendingApproval = z.infer<typeof FreshAgentPendingApprovalSchema>
+export type FreshAgentPermissionUpdate = z.infer<typeof FreshAgentPermissionUpdateSchema>
 export type FreshAgentPendingQuestion = z.infer<typeof FreshAgentPendingQuestionSchema>
 export type FreshAgentSessionCommand = z.infer<typeof FreshAgentSessionCommandSchema>
 export type FreshAgentSnapshot = z.infer<typeof FreshAgentSnapshotSchema>

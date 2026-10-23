@@ -10,11 +10,12 @@ import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from
 import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
+import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
+import type { LiveBlockKind, LiveNotice, LiveNoticeLevel, LiveRateLimit, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
+import { assistantBlockBound, liveNoticeReceived, liveRetrySet, transcriptAnnounced } from '@/store/freshAgentLiveSlice'
 import {
-  addAssistantMessage,
   addPermissionRequest,
   addQuestionRequest,
-  appendStreamDelta,
   applyRuntimeOwner,
   clearPendingCreateFailure,
   createFailed,
@@ -32,7 +33,8 @@ import {
   sessionMetadataReceived,
   sessionSnapshotReceived,
   setSessionStatus,
-  setStreaming,
+  streamOpened,
+  turnRequestRetried,
   turnResult,
 } from '@/store/freshAgentSlice'
 
@@ -230,6 +232,12 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.session.materialized': {
       const materialized = msg as FreshAgentSessionMaterializedMessage
+      // Stream events queued under the old id land before the re-key moves them.
+      streamBatcherFor(dispatch).flush({
+        sessionId: materialized.previousSessionId,
+        sessionType: materialized.sessionType,
+        provider: materialized.provider,
+      })
       dispatch(materializeFreshAgentSessionState({
         previousSessionId: materialized.previousSessionId,
         sessionId: materialized.sessionId,
@@ -251,6 +259,11 @@ export function handleFreshAgentMessage(
     }
     case 'freshAgent.killed': {
       const killed = msg as FreshAgentKilledMessage
+      streamBatcherFor(dispatch).flush({
+        sessionId: killed.sessionId,
+        sessionType: killed.sessionType,
+        provider: killed.provider,
+      })
       foldFreshAgentKilled(dispatch, {
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
@@ -261,6 +274,13 @@ export function handleFreshAgentMessage(
     case 'freshAgent.recovery.stopped': {
       const stopped = msg as FreshAgentRecoveryStoppedMessage
       if (stopped.success) {
+        // Stream events queued for the session land before it goes, so no
+        // later flush re-creates a tail for a session that is gone.
+        streamBatcherFor(dispatch).flush({
+          sessionId: stopped.sessionId,
+          sessionType: stopped.sessionType,
+          provider: stopped.provider,
+        })
         dispatch(removeSession({
           sessionId: stopped.sessionId,
           sessionType: stopped.sessionType,
@@ -344,6 +364,89 @@ export function foldReadyRuntimeOwners(
   }
 }
 
+const LIVE_BLOCK_KINDS: ReadonlySet<string> = new Set<LiveBlockKind>(['text', 'thinking', 'tool_use'])
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * The part of a `freshAgent.stream` frame the live tail renders: a text,
+ * thinking or tool block opening, or a text/thinking delta, of the main
+ * thread (the sidecar already drops subagent events; a frame that still
+ * names a parent tool use is ignored). Anything else maps to nothing.
+ */
+function hasParentToolUse(frame: Record<string, unknown>): boolean {
+  return typeof frame.parentToolUseId === 'string' && frame.parentToolUseId.length > 0
+}
+
+/** A `freshAgent.retry` frame (the sidecar's `sdk.retry`), or nothing if it is malformed. */
+function parseLiveRetry(frame: Record<string, unknown>): LiveRetry | undefined {
+  if (typeof frame.attempt !== 'number' || !Number.isInteger(frame.attempt) || frame.attempt < 1) return undefined
+  const optionalNumber = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined)
+  const maxRetries = optionalNumber(frame.maxRetries)
+  const delayMs = optionalNumber(frame.delayMs)
+  const errorStatus = frame.errorStatus === null ? null : optionalNumber(frame.errorStatus)
+  return {
+    attempt: frame.attempt,
+    ...(maxRetries !== undefined ? { maxRetries } : {}),
+    ...(delayMs !== undefined ? { delayMs } : {}),
+    ...(errorStatus !== undefined ? { errorStatus } : {}),
+    ...(typeof frame.error === 'string' && frame.error ? { error: frame.error } : {}),
+  }
+}
+
+const NOTICE_LEVELS: ReadonlySet<string> = new Set<LiveNoticeLevel>(['info', 'warning', 'error'])
+
+/** A `freshAgent.notice` frame (the sidecar's `sdk.notice`), or nothing if it is malformed. */
+function parseLiveNotice(frame: Record<string, unknown>): Omit<LiveNotice, 'seq'> | undefined {
+  if (typeof frame.code !== 'string' || !frame.code) return undefined
+  if (typeof frame.message !== 'string' || !frame.message.trim()) return undefined
+  const level = typeof frame.level === 'string' && NOTICE_LEVELS.has(frame.level) ? frame.level as LiveNoticeLevel : 'info'
+  let rateLimit: LiveRateLimit | undefined
+  if (isObject(frame.rateLimit)) {
+    const limit = frame.rateLimit
+    rateLimit = {
+      ...(typeof limit.status === 'string' ? { status: limit.status } : {}),
+      ...(typeof limit.resetsAt === 'number' && Number.isFinite(limit.resetsAt) ? { resetsAt: limit.resetsAt } : {}),
+      ...(typeof limit.rateLimitType === 'string' ? { rateLimitType: limit.rateLimitType } : {}),
+      ...(typeof limit.utilization === 'number' && Number.isFinite(limit.utilization) ? { utilization: limit.utilization } : {}),
+    }
+  }
+  return { level, code: frame.code, message: frame.message.trim(), ...(rateLimit ? { rateLimit } : {}) }
+}
+
+function parseLiveStreamOp(frame: Record<string, unknown>): LiveStreamOp | undefined {
+  if (hasParentToolUse(frame)) return undefined
+  const event = frame.event
+  if (!isObject(event) || typeof event.index !== 'number') return undefined
+  const messageId = typeof frame.messageId === 'string' && frame.messageId ? frame.messageId : null
+  const index = event.index
+  if (event.type === 'content_block_start') {
+    const block = event.content_block
+    if (!isObject(block) || typeof block.type !== 'string' || !LIVE_BLOCK_KINDS.has(block.type)) return undefined
+    const kind = block.type as LiveBlockKind
+    if (kind === 'tool_use') {
+      return {
+        op: 'start',
+        messageId,
+        index,
+        kind,
+        ...(typeof block.name === 'string' ? { name: block.name } : {}),
+        ...(typeof block.id === 'string' ? { toolUseId: block.id } : {}),
+      }
+    }
+    return { op: 'start', messageId, index, kind }
+  }
+  if (event.type === 'content_block_delta' && isObject(event.delta)) {
+    const delta = event.delta
+    const text = delta.type === 'text_delta' ? delta.text : delta.type === 'thinking_delta' ? delta.thinking : undefined
+    if (typeof text !== 'string' || text.length === 0) return undefined
+    return { op: 'delta', messageId, index, text }
+  }
+  return undefined
+}
+
 export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: FreshAgentEventMessage): boolean {
   const event = msg.event
   const sessionId = typeof msg.sessionId === 'string'
@@ -357,6 +460,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     provider: msg.provider,
   }
 
+  // Stream events are batched; every other event of the session first
+  // applies the ones still waiting, so the store sees them in arrival order.
+  if (event.type !== 'freshAgent.stream') streamBatcherFor(dispatch).flush(locator)
+
   switch (event.type) {
     case 'freshAgent.session.snapshot':
       dispatch(sessionSnapshotReceived({
@@ -366,10 +473,14 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         historySessionId: event.timelineSessionId as string | undefined,
         revision: event.revision as number | undefined,
         streamingActive: event.streamingActive as boolean | undefined,
-        streamingText: event.streamingText as string | undefined,
       }))
       return true
     case 'freshAgent.session.changed':
+      // A main-thread transcript line is on its way: the pane's landing check
+      // expects it in a snapshot (a subagent's lines refresh its delegation).
+      if (event.reason === 'transcript' && typeof event.uuid === 'string' && event.uuid && !hasParentToolUse(event)) {
+        dispatch(transcriptAnnounced({ ...locator, uuid: event.uuid }))
+      }
       return true
     case 'freshAgent.session.init':
       dispatch(sessionInit({
@@ -387,6 +498,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         cliSessionId: event.cliSessionId as string | undefined,
         model: event.model as string | null | undefined,
         effort: event.effort as string | null | undefined,
+        // Absent = no statement (as for model/effort); only a mode name states one.
+        ...(typeof event.permissionMode === 'string' && event.permissionMode ? { permissionMode: event.permissionMode } : {}),
         cwd: event.cwd as string | undefined,
         tools: event.tools as Array<{ name: string }> | undefined,
       }))
@@ -425,29 +538,41 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       return true
     }
     case 'freshAgent.assistant':
-      dispatch(addAssistantMessage({
-        ...locator,
-        content: Array.isArray(event.content) ? event.content as Record<string, unknown>[] : [],
-        model: event.model as string | undefined,
-      }))
+      // Durable content comes from the snapshot (transcript-live P1). The
+      // message only names the transcript line its streamed block becomes
+      // (the pending stream events were applied above).
+      if (typeof event.uuid === 'string' && event.uuid && !hasParentToolUse(event) && Array.isArray(event.content)) {
+        dispatch(assistantBlockBound({
+          ...locator,
+          uuid: event.uuid,
+          ...(typeof event.messageId === 'string' && event.messageId ? { messageId: event.messageId } : {}),
+          content: event.content.filter(isObject),
+        }))
+      }
       return true
+    case 'freshAgent.retry': {
+      const retry = parseLiveRetry(event)
+      if (!retry) return true
+      // A retry is a request of a running turn: the turn shows running from it
+      // (a new session's first request retries before anything says so).
+      dispatch(turnRequestRetried(locator))
+      dispatch(liveRetrySet({ ...locator, ...retry }))
+      return true
+    }
+    case 'freshAgent.notice': {
+      // Non-terminal (P4): a notice is shown, never folded into the error path.
+      const notice = parseLiveNotice(event)
+      if (notice) dispatch(liveNoticeReceived({ ...locator, ...notice }))
+      else log.warn('dropping malformed freshAgent.notice', { sessionId, code: event.code })
+      return true
+    }
     case 'freshAgent.stream': {
-      const streamEvent = event.event as Record<string, unknown> | undefined
-      if (streamEvent?.type === 'content_block_start') {
-        dispatch(setStreaming({ ...locator, active: true }))
-      }
-      if (streamEvent?.type === 'content_block_delta') {
-        const delta = streamEvent.delta as Record<string, unknown> | undefined
-        if (delta?.type === 'text_delta') {
-          dispatch(appendStreamDelta({
-            ...locator,
-            text: delta.text as string,
-          }))
-        }
-      }
-      if (streamEvent?.type === 'content_block_stop') {
-        dispatch(setStreaming({ ...locator, active: false }))
-      }
+      const op = parseLiveStreamOp(event)
+      if (!op) return true
+      // The first block of a turn marks the session streaming (busy) at once;
+      // the block's text follows with the next batch.
+      if (op.op === 'start') dispatch(streamOpened(locator))
+      streamBatcherFor(dispatch).enqueue(locator, op)
       return true
     }
     case 'freshAgent.result':

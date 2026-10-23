@@ -109,7 +109,7 @@ import {
   getFreshAgentSnapshotThreadId,
   getManagedBootstrapHistoryThreadId,
 } from '@/lib/fresh-agent-snapshot-thread'
-import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
+import { CLAUDE_PERMISSION_MODE_VALUES, DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   pickCheckpointForTurn,
   type CheckpointEntry,
@@ -121,6 +121,12 @@ import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
 import { FreshAgentOpenSessionContext } from './FreshAgentItemCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
+import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
+import { useTranscriptLandings } from './useTranscriptLandings'
+import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
+import { withSharedTurns } from '@/lib/fresh-agent-turn-sharing'
+import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
+import { buildAllowDecision, type FreshAgentApprovalDecision } from '@/lib/fresh-agent-permission-updates'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
@@ -611,6 +617,7 @@ function captureAttachmentAttempt(
 
 function buildFreshAgentAttachMessage(
   content: FreshAgentPaneContent,
+  pane: { tabId: string, paneId: string },
   cwd?: string,
   observedFence?: ObservedOwnerFence,
 ) {
@@ -622,6 +629,10 @@ function buildFreshAgentAttachMessage(
     provider: content.provider,
     ...(sessionRef ? { sessionRef } : {}),
     ...(cwd ? { cwd } : {}),
+    // G19: an attach that resumes the session hands the agent's Freshell MCP
+    // this pane as its context.
+    tabId: pane.tabId,
+    paneId: pane.paneId,
     ...(observedFence
       ? { observedEpoch: observedFence.epoch, observedGeneration: observedFence.generation }
       : {}),
@@ -1580,7 +1591,9 @@ export function FreshAgentView({
   // RebindQueue). Jobs check this ref so a pane closed while its create job
   // was queued does not spawn a server session no pane owns.
   const isMountedRef = useRef(true)
-  // Session-scoped "always allow" tool names; reset with the pane, never persisted.
+  // The pane-scoped "Always allow <Tool> in this pane" tool names (codex and
+  // opencode only: a claude pane answers through Claude's own suggestions and
+  // is never auto-answered here). Reset with the pane, never persisted.
   const alwaysAllowToolsRef = useRef<Set<string>>(new Set())
   // Auto-title state tracks four things:
   // 1. whether this mounted pane has already consumed first-message auto-title,
@@ -1775,9 +1788,9 @@ export function FreshAgentView({
     if (attachmentAttemptKey(state, content, attachDecisionSerialRef.current) !== attempt.key) return false
     if (isLifecycleStartSuperseded(state, 'fresh-agent', content, attempt.fence)) return false
     const cwd = getFreshOpenCodeRouteCwd(attempt.content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-    sendFreshAgentMessage(buildFreshAgentAttachMessage(attempt.content, cwd, attempt.fence))
+    sendFreshAgentMessage(buildFreshAgentAttachMessage(attempt.content, { tabId, paneId }, cwd, attempt.fence))
     return true
-  }, [appStore, sendFreshAgentMessage])
+  }, [appStore, paneId, sendFreshAgentMessage, tabId])
 
   // kata b8ke: the opened-as-CLI-elsewhere attach action — THIS pane adopts
   // the committed terminal owner (keeping its sessionRef + createRequestId,
@@ -2020,6 +2033,8 @@ export function FreshAgentView({
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
+      // G19: with tabId, the pane the agent's Freshell MCP acts for.
+      paneId,
       ...(namingHandle ? { namingHandle } : {}),
       // kata b8ke delayed-request fence (round-2 review: the fence is the
       // (epoch, generation) PAIR from the runtime-owner record observed when
@@ -2029,7 +2044,7 @@ export function FreshAgentView({
         ? { observedEpoch: observedFence.epoch, observedGeneration: observedFence.generation }
         : {}),
     } as const
-  }, [providerDefaults, tabId])
+  }, [paneId, providerDefaults, tabId])
 
   const startNewConversation = useCallback(async () => {
     const current = paneContentRef.current
@@ -3330,11 +3345,12 @@ export function FreshAgentView({
         autoTitleSentRef.current = true
       }
       const previousSnapshot = snapshotRef.current
-      const displaySnapshot = mergeSnapshotForDisplay(
+      // Unchanged turns keep their objects, so a refetch re-renders only what changed.
+      const displaySnapshot = withSharedTurns(previousSnapshot, mergeSnapshotForDisplay(
         previousSnapshot,
         resolved,
         isManagedRuntimeRecoveryPending(paneContentRef.current.recoverySummary),
-      )
+      ))
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
@@ -3942,6 +3958,88 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  // The live tail (transcript-live plan §4.4): what the running turn shows
+  // before its transcript lines land. This view never subscribes to the
+  // tail's text — only to whether it shows anything, so the transcript's own
+  // live strip yields to it and one live reel shows.
+  const liveSessionKey = paneContent.sessionId
+    ? makeFreshAgentSessionKey({ sessionId: paneContent.sessionId, sessionType: paneContent.sessionType, provider: paneContent.provider })
+    : undefined
+  const landedTranscript = useMemo(() => landedTranscriptOf(snapshot), [snapshot])
+  const liveTailActive = useAppSelector((state) => (
+    liveSessionKey ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript) : false
+  ))
+  // An ended turn's answer whose lines have not landed shows above a prompt
+  // sent after it (the echo), never below it.
+  const endedLiveTailShows = useAppSelector((state) => (
+    liveSessionKey && localEcho
+      ? liveTailShowsContent(state.freshAgentLive?.bySession[liveSessionKey], landedTranscript, 'ended')
+      : false
+  ))
+  const localEchoTurn = useMemo<FreshAgentTurn | undefined>(() => (localEcho ? {
+    id: `__local-echo:${localEcho.requestId}`,
+    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+    requestId: localEcho.requestId,
+    role: 'user',
+    summary: localEcho.text,
+    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
+  } as FreshAgentTurn : undefined), [localEcho])
+  const splitLiveTailAtEcho = Boolean(localEchoTurn && endedLiveTailShows)
+  // Provider notices (rate limits, a failed compaction, CLI banners) show in
+  // the pane's notice banner; they never end the turn (transcript-live P4).
+  // `seq` shows each notice once; one received before this mount is not replayed.
+  const liveNotice = useAppSelector((state) => (
+    liveSessionKey ? state.freshAgentLive?.bySession[liveSessionKey]?.notice : undefined
+  ))
+  const shownNoticeSeqRef = useRef(liveNotice?.seq ?? 0)
+  useEffect(() => {
+    if (!liveNotice || liveNotice.seq <= shownNoticeSeqRef.current) return
+    shownNoticeSeqRef.current = liveNotice.seq
+    setNotice(formatFreshAgentNotice(liveNotice))
+  }, [liveNotice])
+  // The session's permission mode converges onto the pane (transcript-live
+  // §4.4): when the server states a new mode — the CLI left plan mode after an
+  // approved ExitPlanMode, or another device changed it — the pane adopts it,
+  // so its next send does not put the CLI back. A mode the pane cannot show
+  // (the SDK's 'auto' or 'dontAsk') still replaces the pane's own: the pane
+  // lets go of its mode, so its sends state none and the CLI keeps its own.
+  // Only a change of the stated mode acts, so a mode the user just picked here
+  // is never undone.
+  const sessionPermissionMode = agentSession?.permissionMode
+  const adoptedPermissionModeRef = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (!sessionPermissionMode || sessionPermissionMode === adoptedPermissionModeRef.current) return
+    adoptedPermissionModeRef.current = sessionPermissionMode
+    const current = paneContentRef.current
+    if (current.provider === 'opencode' || current.permissionMode === sessionPermissionMode) return
+    if (!(CLAUDE_PERMISSION_MODE_VALUES as readonly string[]).includes(sessionPermissionMode)) {
+      if (current.permissionMode === undefined) return
+      log.info('the session is in a permission mode the pane cannot show; the pane stops stating its own', {
+        event: 'fresh_agent.permission_mode_released',
+        provider: current.provider,
+        permissionMode: sessionPermissionMode,
+        previousPermissionMode: current.permissionMode,
+      })
+      dispatch(mergePaneContent({ tabId, paneId, updates: { permissionMode: undefined } }))
+      return
+    }
+    dispatch(mergePaneContent({ tabId, paneId, updates: { permissionMode: sessionPermissionMode } }))
+  }, [dispatch, paneId, sessionPermissionMode, tabId])
+  const isLiveSessionBusyNow = useCallback(() => {
+    const status = liveSessionKey ? appStore.getState().freshAgent.sessions[liveSessionKey]?.status : undefined
+    return BUSY_STATES.has(status ?? paneContentRef.current.status)
+  }, [appStore, liveSessionKey])
+  const requestLandingRecheck = useCallback(() => {
+    if (!hiddenRef.current) requestSnapshotRefresh('event')
+  }, [requestSnapshotRefresh])
+  useTranscriptLandings({
+    sessionKey: liveSessionKey,
+    visible: !hidden,
+    landed: snapshot ? landedTranscript : null,
+    busy: isBusy,
+    isBusyNow: isLiveSessionBusyNow,
+    requestRefresh: requestLandingRecheck,
+  })
   // The durable conversation an ended session's Resume reopens (triggerRecovery
   // resolves the same id): codex threads, and claude/kilroy sessions whose
   // sidecar died (G05).
@@ -4123,13 +4221,13 @@ export function FreshAgentView({
     setQueuedMessages((queue) => queue.slice(1))
   }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, outgoingTurnVersion, ownerDivergence, queuedMessages, sendUserText])
 
-  // Session-scoped auto-approval: any pending approval whose tool the user
-  // marked "always allow" is answered immediately.
+  // Pane-scoped auto-approval (not claude): any pending approval whose tool
+  // the user marked "Always allow <Tool> in this pane" is answered at once.
   const pendingApprovalsFromSnapshot = snapshot?.pendingApprovals
   useEffect(() => {
     if (!pendingApprovalsFromSnapshot || pendingApprovalsFromSnapshot.length === 0) return
     const current = paneContentRef.current
-    if (!current.sessionId) return
+    if (!current.sessionId || current.provider === 'claude') return
     const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     for (const approval of pendingApprovalsFromSnapshot) {
       if (approval.toolName && alwaysAllowToolsRef.current.has(approval.toolName)) {
@@ -4140,9 +4238,7 @@ export function FreshAgentView({
           provider: current.provider,
           ...(cwd ? { cwd } : {}),
           requestId: approval.requestId,
-          // A defined updatedInput (even {}) wholesale REPLACES the tool input server-side
-          // (sdk-bridge resolves the decision verbatim). Omit the key entirely.
-          decision: { behavior: 'allow' },
+          decision: buildAllowDecision(),
         })
       }
     }
@@ -4381,7 +4477,7 @@ export function FreshAgentView({
         ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
       })
     }
-    const respondToApproval = (requestId: string | number, allow: boolean) => {
+    const respondToApproval = (requestId: string | number, decision: FreshAgentApprovalDecision) => {
       dispatch(dismissTabGreen(tabId))
       if (!paneContent.sessionId) return
       sendFreshAgentMessage({
@@ -4391,9 +4487,7 @@ export function FreshAgentView({
         provider: paneContent.provider,
         ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
         requestId,
-        decision: allow
-          ? { behavior: 'allow' }
-          : { behavior: 'deny', message: 'Denied by user', interrupt: false },
+        decision,
       })
     }
 
@@ -4641,12 +4735,11 @@ export function FreshAgentView({
                   key={String(approval.requestId)}
                   approval={approval}
                   disabled={!paneContent.sessionId}
-                  onAllow={() => respondToApproval(approval.requestId, true)}
-                  onAlwaysAllow={(toolName) => {
+                  onRespond={(decision) => respondToApproval(approval.requestId, decision)}
+                  onAlwaysAllow={paneContent.provider === 'claude' ? undefined : (toolName) => {
                     alwaysAllowToolsRef.current.add(toolName)
-                    respondToApproval(approval.requestId, true)
+                    respondToApproval(approval.requestId, buildAllowDecision())
                   }}
-                  onDeny={() => respondToApproval(approval.requestId, false)}
                 />
               ))}
               {pendingQuestions.map((question) => (
@@ -4709,16 +4802,8 @@ export function FreshAgentView({
                     ref={transcriptRef}
                     presentationPaused={revealRefreshBlocking}
                     paneId={paneId}
-                    turns={localEcho
-                      ? [...turns, {
-                          id: `__local-echo:${localEcho.requestId}`,
-                          turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
-                          requestId: localEcho.requestId,
-                          role: 'user',
-                          summary: localEcho.text,
-                          items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
-                        } as FreshAgentTurn]
-                      : turns}
+                    turns={turns}
+                    localEcho={localEchoTurn}
                     canFork={canFork}
                     canRollback={canRollback}
                     rollbackBusy={isBusy}
@@ -4735,7 +4820,29 @@ export function FreshAgentView({
                     expandTools={globalExpandTools}
                     showTimecodes={effectiveShowTimecodes}
                     showTranscriptMinimap={showTranscriptMinimap}
-                    isStreaming={isBusy}
+                    isStreaming={isBusy && !liveTailActive}
+                    // A background pane keeps its tail in the store but renders
+                    // none of it: no markdown re-parse per token while unseen.
+                    tail={liveSessionKey && !hidden ? (
+                      <FreshAgentLiveTail
+                        sessionKey={liveSessionKey}
+                        landed={landedTranscript}
+                        part={splitLiveTailAtEcho ? 'running' : 'all'}
+                        agentLabel={descriptor?.label}
+                        expandThinking={globalExpandThinking}
+                        expandTools={globalExpandTools}
+                      />
+                    ) : undefined}
+                    beforeLocalEcho={liveSessionKey && !hidden && splitLiveTailAtEcho ? (
+                      <FreshAgentLiveTail
+                        sessionKey={liveSessionKey}
+                        landed={landedTranscript}
+                        part="ended"
+                        agentLabel={descriptor?.label}
+                        expandThinking={globalExpandThinking}
+                        expandTools={globalExpandTools}
+                      />
+                    ) : undefined}
                     onForkFromTurn={(turnId) => sendFork(turnId)}
                     getRewindAvailability={getRewindAvailability}
                     onRollbackToTurn={(turnId) => {
@@ -4892,10 +4999,14 @@ export function FreshAgentView({
     getRewindAvailability,
     isBusy,
     isRestoring,
+    landedTranscript,
+    liveSessionKey,
+    liveTailActive,
     loadError,
     managedRecoveryPending,
     managedRecoveryActive,
-    localEcho,
+    localEchoTurn,
+    splitLiveTailAtEcho,
     modelDialogOpen,
     closeModelDialog,
     openModelDialog,

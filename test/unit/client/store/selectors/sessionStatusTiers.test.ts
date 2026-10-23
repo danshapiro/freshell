@@ -71,7 +71,6 @@ function makeLiveFreshSession(liveSessionId: string, busy: boolean) {
     turns: [],
     historyItems: [],
     historyBodies: {},
-    streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
     pendingQuestions: {},

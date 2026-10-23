@@ -7,6 +7,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PLAN_TEXT } from './prompt-markers.mjs'
 import { READ_ONLY_COMMANDS, T } from './sdk-shapes.mjs'
+import { noSuchToolResult } from './mcp.mjs'
 
 /** Whether the pinned CLI would ask canUseTool for this call in the current permission mode. */
 function needsPermission(cli, name, input) {
@@ -76,6 +77,30 @@ function applyPermissionUpdates(cli, updates) {
   }
 }
 
+/** Pieces a streamed tool input arrives in (when it streams for a while). */
+const INPUT_STREAM_PIECES = 8
+
+/**
+ * The model streams the call's input as input_json_delta events. A large
+ * input (a Write of a long file) takes a while: with `streamMs` it arrives in
+ * pieces spread over that long, the call completing only after the last.
+ * Returns true when the turn was aborted meanwhile.
+ */
+async function streamToolInput(cli, turn, input, streamMs) {
+  const json = JSON.stringify(input)
+  if (streamMs <= 0) {
+    cli.emitStream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: json } })
+    return false
+  }
+  const pieces = Math.min(INPUT_STREAM_PIECES, json.length)
+  const size = Math.ceil(json.length / pieces)
+  for (let offset = 0; offset < json.length; offset += size) {
+    cli.emitStream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: json.slice(offset, offset + size) } })
+    if (await cli.wait(streamMs / pieces, turn)) return true
+  }
+  return false
+}
+
 /** A tool call: its streamed tool_use block, permission, execution and result. */
 export async function toolCall(cli, turn, step) {
   const data = step.data ?? {}
@@ -99,10 +124,24 @@ export async function toolCall(cli, turn, step) {
   }
   cli.emitStream(cli.messageStart())
   cli.emitStream({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: toolUseId, name, input: {} } })
-  cli.emitStream({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } })
+  if (await streamToolInput(cli, turn, input, Number(data.inputStreamMs ?? 0) || 0)) {
+    await cli.abortStreaming(turn, '')
+    return 'aborted'
+  }
   cli.assistant([{ type: 'tool_use', id: toolUseId, name, input }])
 
   if (step.kind === 'agent') return launchAgent(cli, turn, toolUseId, input)
+
+  // An MCP tool no connected server lists does not exist for the CLI: it
+  // answers at once, before any permission check and before the rest of the
+  // model's message has streamed. (A scripted hang stands in for a hung
+  // server's call, configured or not.)
+  if (name.startsWith('mcp__') && data.hang !== true && !cli.mcp.offers(name)) {
+    const missing = noSuchToolResult(name)
+    cli.toolResult(toolUseId, missing.content, { isError: true, toolUseResult: missing.toolUseResult })
+    cli.trailingStream('tool_use')
+    return 'done'
+  }
 
   if (step.kind === 'approval' || step.kind === 'question' || needsPermission(cli, name, input)) {
     cli.emitState('requires_action')
@@ -121,7 +160,7 @@ export async function toolCall(cli, turn, step) {
     cli.trailingStream('tool_use')
   }
   if (name === 'ExitPlanMode') {
-    if (cli.permissionMode === 'plan') cli.setMode('default')
+    if (cli.permissionMode === 'plan') cli.setMode(cli.modeBeforePlan ?? 'default')
     cli.toolResult(toolUseId, 'User has approved exiting plan mode. You can now proceed.', { toolUseResult: { plan: null, isAgent: false } })
     return 'done'
   }
@@ -129,7 +168,35 @@ export async function toolCall(cli, turn, step) {
     cli.toolResult(toolUseId, `User has answered your questions: ${JSON.stringify(input.answers ?? {})}`, { toolUseResult: { questions: input.questions, answers: input.answers ?? {} } })
     return 'done'
   }
+  if (name.startsWith('mcp__') && data.hang !== true) return executeMcpTool(cli, turn, toolUseId, name, input)
   return executeTool(cli, turn, toolUseId, name, input, data)
+}
+
+/**
+ * Call a connected server's tool: its result is the tool result. A running
+ * call sends a heartbeat every 30 s like any tool; sends pushed meanwhile are
+ * absorbed into this turn (T10).
+ */
+async function executeMcpTool(cli, turn, toolUseId, name, input) {
+  turn.absorbing = true
+  const call = cli.mcp.call(name, input)
+  let beats = 0
+  for (;;) {
+    const next = (beats + 1) * T.heartbeat
+    const step = await Promise.race([
+      call.then(() => 'settled'),
+      cli.wait(next - beats * T.heartbeat, turn).then((aborted) => (aborted ? 'aborted' : 'beat')),
+    ])
+    if (step !== 'beat') break
+    cli.emit({ type: 'tool_progress', tool_use_id: `${toolUseId}-heartbeat-${beats}`, tool_name: name, parent_tool_use_id: toolUseId, elapsed_time_seconds: Math.floor(next / 1000), heartbeat: true })
+    beats += 1
+  }
+  turn.absorbing = false
+  if (turn.aborted) return cli.abortTool(turn, toolUseId)
+  const { content, isError } = await call
+  cli.toolResult(toolUseId, content, { isError, toolUseResult: content })
+  startAbsorbed(cli, turn)
+  return 'done'
 }
 
 /** Run a tool; sends pushed meanwhile are absorbed into this turn (T10). */

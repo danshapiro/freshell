@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { query } from '/opt/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs'
-import { hostedMcpServers } from './hosted-mcp.mjs'
+import { mcpServersFor } from './mcp-servers.mjs'
 import { managedSdkSpawn } from './exec-profile.mjs'
 
 const abort = new AbortController()
@@ -45,14 +45,14 @@ try {
   const launch = managedSdkSpawn(() => {})
   sdkQuery = query({ prompt, options: {
     cwd: process.cwd(), env, abortController: abort,
-    settingSources: ['user', 'project', 'local'], mcpServers: hostedMcpServers(true, env),
+    settingSources: ['user', 'project', 'local'], mcpServers: mcpServersFor({ hostedMcp: true }, env),
     spawnClaudeCodeProcess: options => {
       receipt.defaultChild = options.command.includes('@anthropic-ai/claude-agent-sdk-linux-x64/') && options.command.endsWith('/claude')
       const version = spawnSync(options.command, ['--version'], { env: options.env, encoding: 'utf8', timeout: 10_000 })
       receipt.nativeVersion = /^2\.1\.237(?:\s|$)/.test(version.stdout ?? '') ? '2.1.237' : 'unexpected'
       const index = options.args.indexOf('--mcp-config')
       const config = index < 0 ? {} : JSON.parse(options.args[index + 1])
-      receipt.fixedRecipe = JSON.stringify(config) === JSON.stringify({ mcpServers: hostedMcpServers(true, env) })
+      receipt.fixedRecipe = JSON.stringify(config) === JSON.stringify({ mcpServers: mcpServersFor({ hostedMcp: true }, env) })
         && !options.args.some(arg => arg.includes(token))
       nativeChild = launch(options)
       const write = nativeChild.stdin.write

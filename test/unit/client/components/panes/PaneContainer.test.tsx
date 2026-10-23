@@ -330,7 +330,6 @@ function createFreshClaudeSession(
     turns: [],
     historyItems: [],
     historyBodies: {},
-    streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
     pendingQuestions: {},

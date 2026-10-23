@@ -57,6 +57,7 @@ pub mod cli_launch;
 pub mod clock;
 pub mod codex_inputs;
 pub mod detect;
+pub mod freshell_context_env;
 pub mod git_meta;
 pub mod host_stats_readers;
 pub mod managed_child_secrets;
