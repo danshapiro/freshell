@@ -7,6 +7,11 @@
 //   - claude-checkpoint-uuid-replay.mjs (checkpoint UUID replay contract)
 //   - claude-cli-scenarios.mjs (the T1-T19 contract suite and the simulator
 //     conformance suite)
+//   - claude-sidecar-shutdown.mjs (the real sidecar's shutdown contract; it
+//     brings its own streaming provider)
+//   - claude-capture-fixtures.mjs (resolvePinnedClaude only: the manual
+//     transcript-fixture capture keeps its own `ws` workspace, which the
+//     committed fixtures' paths depend on)
 //
 // The model's behavior is chosen by prompt markers (see
 // test/fixtures/claude-cli-sim/prompt-markers.mjs), the same language the CLI
