@@ -56,10 +56,16 @@ vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => ({ type: 'settings/saveServerSettingsPatch', payload: patch }),
 }))
 
+/** Every markdown body rendered, by its source text. */
+const markdownRenders = vi.hoisted(() => ({ contents: [] as string[] }))
+
 vi.mock('@/components/markdown/LazyMarkdown', async () => {
   const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
   return {
-    LazyMarkdown: ({ content }: { content: string }) => <MarkdownRenderer content={content} />,
+    LazyMarkdown: ({ content }: { content: string }) => {
+      markdownRenders.contents.push(content)
+      return <MarkdownRenderer content={content} />
+    },
   }
 })
 
@@ -495,5 +501,51 @@ describe('the CLI\'s own permission mode (transcript-live D7)', () => {
     })
     expect(sends().at(-1)?.settings).toBeDefined()
     expect(sends().at(-1)?.settings).not.toHaveProperty('permissionMode')
+  })
+})
+
+describe('snapshot commits re-render only what changed (transcript-live risk 1)', () => {
+  // A long session: every committed snapshot is a fresh parse of the whole transcript.
+  function longTranscript(turnPairs: number): Turn[] {
+    const turns: Turn[] = []
+    for (let i = 0; i < turnPairs; i += 1) {
+      turns.push(userTurn(`u-${i}`, `question ${i}`))
+      turns.push(assistantText(`a-${i}`, `## Answer ${i}\n\nSome **markdown** with \`code\`.`))
+    }
+    return turns
+  }
+
+  it('re-renders no markdown when a refetched snapshot holds the same transcript', async () => {
+    const turns = longTranscript(40)
+    serve(() => JSON.parse(JSON.stringify(claudeSnapshot(turns))))
+    const store = createStore()
+    await mount(store)
+    expect(markdownRenders.contents.length).toBeGreaterThanOrEqual(40)
+    const before = fetchCount()
+    markdownRenders.contents = []
+
+    for (let i = 0; i < 3; i += 1) {
+      deliver(store, { type: 'freshAgent.session.changed', reason: 'transcript', uuid: 'a-39', parentToolUseId: null })
+      await settleRefetches(1)
+    }
+
+    expect(fetchCount()).toBe(before + 3)
+    expect(markdownRenders.contents).toEqual([])
+  })
+
+  it('renders only the new turn\'s markdown when a refetched snapshot adds one', async () => {
+    const turns = longTranscript(40)
+    serve(() => JSON.parse(JSON.stringify(claudeSnapshot(turns))))
+    const store = createStore()
+    await mount(store)
+    markdownRenders.contents = []
+
+    const grown = [...turns, userTurn('u-40', 'one more'), assistantText('a-40', 'The **new** answer')]
+    serve(() => JSON.parse(JSON.stringify(claudeSnapshot(grown))))
+    deliver(store, { type: 'freshAgent.session.changed', reason: 'transcript', uuid: 'a-40', parentToolUseId: null })
+    await settleRefetches(2)
+
+    expect(screen.getByText('new', { selector: 'strong' })).toBeInTheDocument()
+    expect(new Set(markdownRenders.contents)).toEqual(new Set(['The **new** answer']))
   })
 })

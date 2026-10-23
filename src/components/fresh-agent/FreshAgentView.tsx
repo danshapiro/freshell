@@ -124,6 +124,7 @@ import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAg
 import { FreshAgentLiveTail, liveTailShowsContent } from './FreshAgentLiveTail'
 import { useTranscriptLandings } from './useTranscriptLandings'
 import { landedTranscriptOf } from '@/lib/fresh-agent-landed-transcript'
+import { withSharedTurns } from '@/lib/fresh-agent-turn-sharing'
 import { formatFreshAgentNotice } from '@/lib/fresh-agent-notice'
 import type { FreshAgentTurnRewindAvailability } from './FreshAgentTurnActions'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
@@ -3334,11 +3335,12 @@ export function FreshAgentView({
         autoTitleSentRef.current = true
       }
       const previousSnapshot = snapshotRef.current
-      const displaySnapshot = mergeSnapshotForDisplay(
+      // Unchanged turns keep their objects, so a refetch re-renders only what changed.
+      const displaySnapshot = withSharedTurns(previousSnapshot, mergeSnapshotForDisplay(
         previousSnapshot,
         resolved,
         isManagedRuntimeRecoveryPending(paneContentRef.current.recoverySummary),
-      )
+      ))
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
       const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'

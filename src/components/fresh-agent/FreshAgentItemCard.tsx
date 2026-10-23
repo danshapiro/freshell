@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, useState } from 'react'
+import { createContext, memo, useContext, useMemo, useState } from 'react'
 import { Check, ChevronRight, Loader2, X } from 'lucide-react'
 import DiffView from '@/components/fresh-agent/shared/DiffView'
 import { formatThoughtDuration } from '@/components/fresh-agent/shared/format-duration'
@@ -335,9 +335,9 @@ function renderText(text: string, markdown = false) {
 /** Markdown-rendered body for agent-authored text that lives outside item
  * cards (turn-summary fallbacks, expanded thinking). Keeps every assistant
  * text path on the same renderer so backticks never show literally. */
-export function FreshAgentMarkdownBody({ text }: { text: string }) {
+export const FreshAgentMarkdownBody = memo(function FreshAgentMarkdownBody({ text }: { text: string }) {
   return <>{renderText(text, true)}</>
-}
+})
 
 function FreshAgentThinkingDisclosure({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false)
@@ -358,7 +358,12 @@ function FreshAgentThinkingDisclosure({ text }: { text: string }) {
   )
 }
 
-export function FreshAgentItemCard({
+/**
+ * One transcript item. Memoized: snapshot commits keep an unchanged item's
+ * object (fresh-agent-turn-sharing), so history never re-renders (or
+ * re-parses its markdown) when only the newest turns change.
+ */
+export const FreshAgentItemCard = memo(function FreshAgentItemCard({
   item,
   markdown = false,
 }: {
@@ -478,4 +483,4 @@ export function FreshAgentItemCard({
       Context compaction
     </div>
   )
-}
+})
