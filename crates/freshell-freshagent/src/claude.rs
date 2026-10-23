@@ -80,6 +80,29 @@ use turn_status::LedgerStep;
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 pub(crate) const PROVIDER: &str = "claude";
 
+#[derive(Debug)]
+pub struct ClaudeCleanupError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for ClaudeCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClaudeCleanupError {}
+
+impl ClaudeCleanupError {
+    fn unconfirmed() -> Self {
+        Self {
+            code: "CLAUDE_CLEANUP_UNCONFIRMED",
+            message: "Claude could not confirm cleanup of this cancelled pane. Try again.".into(),
+        }
+    }
+}
+
 /// Build the sidecar-only correlation record for one checkpointed Claude
 /// send. The send's UUID is supplied on SDKUserMessage and the attempt is
 /// later accepted only when the SDK replays the persisted user row carrying
@@ -2540,7 +2563,7 @@ impl FreshClaudeState {
     /// `ws-handler.ts:3673`), then broadcast `freshAgent.killed`. Idempotent for an
     /// unknown session id, matching the codex/opencode `success:true` pattern.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
-        self.handle_kill_inner(msg, None).await;
+        let _ = self.handle_kill_inner(msg, None).await;
     }
 
     /// Release a runtime allocated by a create whose destination disappeared.
@@ -2550,7 +2573,7 @@ impl FreshClaudeState {
         session_id: &str,
         session_type: SessionType,
         ownership_id: &str,
-    ) {
+    ) -> Result<(), ClaudeCleanupError> {
         self.handle_kill_inner(
             FreshAgentKill {
                 provider: freshell_protocol::AgentProvider::Claude,
@@ -2562,10 +2585,14 @@ impl FreshClaudeState {
             },
             Some(ownership_id),
         )
-        .await;
+        .await
     }
 
-    async fn handle_kill_inner(&self, msg: FreshAgentKill, expected_owner: Option<&str>) {
+    async fn handle_kill_inner(
+        &self,
+        msg: FreshAgentKill,
+        expected_owner: Option<&str>,
+    ) -> Result<(), ClaudeCleanupError> {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -2588,7 +2615,7 @@ impl FreshClaudeState {
                         code: Some(err.code().to_string()),
                         message: Some(err.message().to_string()),
                     }));
-                    return;
+                    return Err(ClaudeCleanupError::unconfirmed());
                 }
             };
 
@@ -2691,21 +2718,28 @@ impl FreshClaudeState {
                         event = "freshagent.claude.abandoned_create_already_released",
                         session_id, expected_owner,
                         "the create receipt no longer owns this runtime; cleanup is complete");
-                    return;
+                    return Ok(());
                 };
                 if self.ownership.is_some() {
                     let durable = session.cli_session_id.as_deref().unwrap_or(&map_key);
                     let Some(stamp) =
                         crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, durable)
                             .filter(|stamp| {
-                                stamp.owner.ownership_id.as_deref() == Some(expected_owner)
+                                // The receipt names the process-tree tag; the
+                                // coordinator names a lifecycle operation. The
+                                // exact runtime record ties them together.
+                                stamp.owner.kind
+                                    == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    && stamp.owner.live_session_key.as_deref()
+                                        == Some(map_key.as_str())
+                                    && stamp.owner.pid == session.child.id()
                             })
                     else {
                         tracing::warn!(target: "freshell_freshagent::claude",
                             event = "freshagent.claude.abandoned_create_stamp_missing",
                             session_id, expected_owner,
                             "the create receipt has no matching retained ownership stamp");
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     };
                     // Capture authority while inspecting that exact runtime. A
                     // later stop must never borrow a replacement's stamp.
@@ -2907,7 +2941,7 @@ impl FreshClaudeState {
                         code: Some(refusal_code.to_string()),
                         message: Some(refusal_message),
                     }));
-                    return;
+                    return Err(ClaudeCleanupError::unconfirmed());
                 }
             } else {
                 // b8ke delta round-3 F1: NO retained stamp — the kill STILL
@@ -2969,7 +3003,7 @@ impl FreshClaudeState {
                                         .to_string(),
                                 ),
                             }));
-                            return;
+                            return Err(ClaudeCleanupError::unconfirmed());
                         }
                         // e3r1 F1: honor the REQUEST'S fence — a delayed
                         // kill carrying a stale observed pair is refused by
@@ -3102,7 +3136,7 @@ impl FreshClaudeState {
                                         message: Some(refusal_message),
                                     },
                                 ));
-                                return;
+                                return Err(ClaudeCleanupError::unconfirmed());
                             }
                         }
                     }
@@ -3143,7 +3177,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     }
                     freshell_ownership::OwnershipState::Starting { .. }
                     | freshell_ownership::OwnershipState::Stopping { .. } => {
@@ -3174,7 +3208,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
                         tracing::warn!(target: "freshell_freshagent::claude",
@@ -3205,7 +3239,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return Err(ClaudeCleanupError::unconfirmed());
                     }
                     _ => {
                         // Genuinely Vacant (or this-lane rekey residue):
@@ -3324,7 +3358,7 @@ impl FreshClaudeState {
                     "the pane-ledger close failed; nothing was killed — retry".to_string(),
                 ),
             }));
-            return;
+            return Err(ClaudeCleanupError::unconfirmed());
         }
         let main_close_reported_failure =
             close_answer == crate::identity_sink::CloseAnswer::Persisted;
@@ -3437,6 +3471,8 @@ impl FreshClaudeState {
         // confirmation (non-Linux) fences the key typed — never a Vacant
         // over an unverifiable descendant tree. NEVER before the reap
         // (round-1 review), never unconfirmed (round-2 review).
+        let cleanup_confirmed =
+            expected_owner.is_none() || matches!(&teardown, LoggedTeardown::Confirmed);
         let mut kill_failure: Option<(&'static str, String)> = None;
         if let (Some(registry), Some(generation), Some(op_id), Some(key)) = (
             self.ownership.as_ref(),
@@ -3558,15 +3594,24 @@ impl FreshClaudeState {
             }
         }
 
+        let success = !main_close_reported_failure
+            && !invariant_broken
+            && kill_failure.is_none()
+            && cleanup_confirmed;
         self.edges.forgotten(&session_id);
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: session_type.to_string(),
-            success: !main_close_reported_failure && !invariant_broken && kill_failure.is_none(),
+            success,
             code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
             message: kill_failure.as_ref().map(|(_, message)| message.clone()),
         }));
+        if success {
+            Ok(())
+        } else {
+            Err(ClaudeCleanupError::unconfirmed())
+        }
     }
 
     /// Round 5 (focused-ep5-r4 Finding 1): for every id this kill retired

@@ -93,7 +93,7 @@ pub mod terminal_tabs;
 #[cfg(test)]
 mod test_environment;
 
-pub use claude::{ClaudeCreateOutcome, ClaudeSendOutcome, FreshClaudeState};
+pub use claude::{ClaudeCleanupError, ClaudeCreateOutcome, ClaudeSendOutcome, FreshClaudeState};
 pub use claude_edges::{AttentionObserver, ClaudeTurnEvent};
 pub use claude_turns::TurnOutcome;
 // Kata 09v1 + SYNC-06 + G28: the claude_snapshot items visible outside this

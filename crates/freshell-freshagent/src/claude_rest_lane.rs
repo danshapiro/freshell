@@ -64,6 +64,7 @@ impl ClaudeRestLane {
             ClaudeCreateOutcome::Created {
                 session_id,
                 session_ref,
+                ..
             } => Ok(RestLaneCreated {
                 session_id,
                 session_ref,
