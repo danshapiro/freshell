@@ -712,115 +712,105 @@ impl RuntimeBackend for BrokerAuthorizedBackend {
     }
 }
 
+/// Collect the failure classes of fresh-agent launch errors from every
+/// thread, through the test binary's process-wide capture subscriber (one is
+/// installed before `main`, so this observes rather than installs).
 fn capture_fresh_launch_failure_classes() -> std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> {
-    use tracing_subscriber::prelude::*;
-    #[derive(Clone)]
-    struct FailureLayer(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FailureLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if !event.metadata().target().contains("fresh_agent_proxy")
-                && !event.metadata().target().contains("managed_mcp_capability")
-            {
-                return;
-            }
-            struct Classes(Vec<&'static str>);
-            impl tracing::field::Visit for Classes {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() != "error" {
-                        return;
-                    }
-                    let text = format!("{value:?}");
-                    for label in [
-                        "Claude native source selection changed",
-                        "HostUnreachable",
-                        "InvalidRequest",
-                        "ProviderInputsChanged",
-                        "prepare hosted provider config",
-                        "prepare hosted fresh-agent provider state",
-                        "prepare hosted OneCLI provider files",
-                        "open hosted",
-                        "OneCLI",
-                        "profile",
-                        "credential",
-                        "unsafe or mismatched",
-                        "MCP",
-                        "sidecar",
-                        "source",
-                        "manifest",
-                        "copy",
-                        "Permission",
-                        "unavailable",
-                        "initialization",
-                        "timed out",
-                        "Claude",
-                        "kilroy",
-                        "environment",
-                        "grant",
-                        "provider",
-                        "configuration",
-                        "refresh",
-                        "input bind",
-                        "trusted uid/group",
-                        "provider home",
-                        "resource",
-                        "destination",
-                        "projection",
-                        "stage",
-                        "metadata",
-                        "path",
-                        "readable",
-                        "preparation",
-                        "version",
-                        "changed",
-                        "rootless",
-                        "directory",
-                        "filesystem",
-                        "temporary",
-                        "failed to start",
-                        "failed with status",
-                        "original",
-                        "origins",
-                        "No such file",
-                        "resolve",
-                        "root",
-                        "budget",
-                        "bound",
-                        "pending",
-                        "committed",
-                        "publication",
-                        "source evidence",
-                        "source selection",
-                        "source provenance",
-                    ] {
-                        if text.contains(label) {
-                            self.0.push(label);
-                        }
+    let classes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = classes.clone();
+    crate::test_trace_capture::observe_all_events(move |event| {
+        if !event.metadata().target().contains("fresh_agent_proxy")
+            && !event.metadata().target().contains("managed_mcp_capability")
+        {
+            return;
+        }
+        struct Classes(Vec<&'static str>);
+        impl tracing::field::Visit for Classes {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() != "error" {
+                    return;
+                }
+                let text = format!("{value:?}");
+                for label in [
+                    "Claude native source selection changed",
+                    "HostUnreachable",
+                    "InvalidRequest",
+                    "ProviderInputsChanged",
+                    "prepare hosted provider config",
+                    "prepare hosted fresh-agent provider state",
+                    "prepare hosted OneCLI provider files",
+                    "open hosted",
+                    "OneCLI",
+                    "profile",
+                    "credential",
+                    "unsafe or mismatched",
+                    "MCP",
+                    "sidecar",
+                    "source",
+                    "manifest",
+                    "copy",
+                    "Permission",
+                    "unavailable",
+                    "initialization",
+                    "timed out",
+                    "Claude",
+                    "kilroy",
+                    "environment",
+                    "grant",
+                    "provider",
+                    "configuration",
+                    "refresh",
+                    "input bind",
+                    "trusted uid/group",
+                    "provider home",
+                    "resource",
+                    "destination",
+                    "projection",
+                    "stage",
+                    "metadata",
+                    "path",
+                    "readable",
+                    "preparation",
+                    "version",
+                    "changed",
+                    "rootless",
+                    "directory",
+                    "filesystem",
+                    "temporary",
+                    "failed to start",
+                    "failed with status",
+                    "original",
+                    "origins",
+                    "No such file",
+                    "resolve",
+                    "root",
+                    "budget",
+                    "bound",
+                    "pending",
+                    "committed",
+                    "publication",
+                    "source evidence",
+                    "source selection",
+                    "source provenance",
+                ] {
+                    if text.contains(label) {
+                        self.0.push(label);
                     }
                 }
             }
-            let mut classes = Classes(Vec::new());
-            event.record(&mut classes);
-            self.0.lock().unwrap().extend(classes.0);
         }
-    }
-    let classes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::registry().with(FailureLayer(classes.clone())),
-    )
-    .unwrap();
+        let mut found = Classes(Vec::new());
+        event.record(&mut found);
+        sink.lock().unwrap().extend(found.0);
+    });
     classes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_amplifier_terminal_native_startup_consumes_prepared_inputs() {
+    // Live qualification mutates provider env for its whole run: own it
+    // through the crate-wide `TestEnv`, which restores everything at the end.
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     use freshell_supervisor::{
         admission::AdmissionPolicy,
         registry::Registry,
@@ -1048,7 +1038,7 @@ async def on_session_ready(coordinator):
     )
     .unwrap();
     std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::env::set_var("FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE", &env_file);
+    env.set("FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE", &env_file);
     let registry = Registry::open(
         fixture.join("registry"),
         Some(
@@ -1057,7 +1047,7 @@ async def on_session_ready(coordinator):
         ),
     )
     .unwrap();
-    std::env::set_var("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "amplifier");
+    env.set("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "amplifier");
     let socket = control.join("control.sock");
     let secret_file = control.join("secret");
     std::fs::write(&secret_file, "closed-synthetic-control-secret").unwrap();
@@ -1127,11 +1117,11 @@ async def on_session_ready(coordinator):
         "FRESHELL_MANAGED_RUNTIME_V1",
         "FRESHELL_MANAGED_FRESH_AGENT_V1",
     ] {
-        std::env::set_var(name, "1");
+        env.set(name, "1");
     }
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
-    std::env::set_var("HOME", &home);
+    env.set("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
+    env.set("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
+    env.set("HOME", &home);
     let controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
         .await
         .unwrap()
@@ -1144,7 +1134,7 @@ async def on_session_ready(coordinator):
         "bundle:\n  active: ./missing-ambient-decoy\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &ambient_home);
+    env.set("HOME", &ambient_home);
     let terminal = controller
         .launch(ManagedTerminalLaunch {
             spec: freshell_platform::spawn::SpawnSpec {
@@ -1843,6 +1833,9 @@ async def on_session_ready(coordinator):
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_claude_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
+    // Live qualification mutates provider env for its whole run: own it
+    // through the crate-wide `TestEnv`, which restores everything at the end.
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     let failure_classes = capture_fresh_launch_failure_classes();
     use freshell_supervisor::{
         admission::AdmissionPolicy,
@@ -2060,8 +2053,8 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     )
     .unwrap();
     std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::env::set_var("FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE", &env_file);
-    std::env::set_var("CLAUDE_CONFIG_DIR", &selected_config);
+    env.set("FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE", &env_file);
+    env.set("CLAUDE_CONFIG_DIR", &selected_config);
     let registry = Registry::open(
         fixture.join("registry"),
         Some(
@@ -2070,7 +2063,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         ),
     )
     .unwrap();
-    std::env::set_var("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "claude");
+    env.set("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "claude");
     let socket = control.join("control.sock");
     let secret_file = control.join("secret");
     std::fs::write(&secret_file, "closed-synthetic-control-secret").unwrap();
@@ -2142,11 +2135,11 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         "FRESHELL_MANAGED_RUNTIME_V1",
         "FRESHELL_MANAGED_FRESH_AGENT_V1",
     ] {
-        std::env::set_var(name, "1");
+        env.set(name, "1");
     }
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
-    std::env::set_var("HOME", &home);
+    env.set("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
+    env.set("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
+    env.set("HOME", &home);
     let controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
         .await
         .unwrap()
@@ -2283,7 +2276,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         "@missing-ambient-decoy.md\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &ambient_home);
+    env.set("HOME", &ambient_home);
     async fn consumed(path: &Path) -> Option<Value> {
         tokio::time::timeout(Duration::from_secs(45), async {
             loop {
@@ -2443,7 +2436,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         std::fs::remove_file(&disabled_project_settings).unwrap();
         let (broadcast, _) = tokio::sync::broadcast::channel(256);
         let mut events = broadcast.subscribe();
-        std::env::set_var("HOME", &home);
+        env.set("HOME", &home);
         let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
             Some(client.clone()),
             Arc::new(broadcast),
@@ -2798,7 +2791,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     .unwrap();
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
     let mut events = broadcast.subscribe();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let proxy = crate::fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
         Some(client.clone()),
         Arc::new(broadcast),
@@ -3127,6 +3120,9 @@ try {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_codex_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
+    // Live qualification mutates provider env for its whole run: own it
+    // through the crate-wide `TestEnv`, which restores everything at the end.
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     use freshell_supervisor::{
         admission::AdmissionPolicy,
         registry::Registry,
@@ -3268,7 +3264,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
         ),
     )
     .unwrap();
-    std::env::set_var("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "codex");
+    env.set("FRESHELL_MANAGED_PROVIDER_QUALIFICATION", "codex");
     let socket = control.join("control.sock");
     let secret_file = control.join("secret");
     std::fs::write(&secret_file, "closed-synthetic-control-secret").unwrap();
@@ -3341,11 +3337,11 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
         ("FRESHELL_MANAGED_RUNTIME_V1", "1"),
         ("FRESHELL_MANAGED_FRESH_AGENT_V1", "1"),
     ] {
-        std::env::set_var(name, value);
+        env.set(name, value);
     }
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
-    std::env::set_var("HOME", &home);
+    env.set("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
+    env.set("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
+    env.set("HOME", &home);
     let controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
         .await
         .unwrap()
@@ -3512,6 +3508,9 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_prepared_inputs() {
+    // Live qualification mutates provider env for its whole run: own it
+    // through the crate-wide `TestEnv`, which restores everything at the end.
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     use freshell_supervisor::{
         admission::AdmissionPolicy,
         registry::Registry,
@@ -3623,10 +3622,10 @@ async fn managed_provider_opencode_terminal_and_fresh_native_startup_consumes_pr
     crate::managed_mcp_capability::spawn_callback_server()
         .await
         .unwrap();
-    std::env::set_var("FRESHELL_MANAGED_RUNTIME_V1", "1");
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
-    std::env::set_var("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
-    std::env::set_var("FRESHELL_MANAGED_FRESH_AGENT_V1", "1");
+    env.set("FRESHELL_MANAGED_RUNTIME_V1", "1");
+    env.set("FRESHELL_RUNTIME_CONTROL_SOCKET", &socket);
+    env.set("FRESHELL_RUNTIME_CONTROL_SECRET_FILE", &secret_file);
+    env.set("FRESHELL_MANAGED_FRESH_AGENT_V1", "1");
     let controller = crate::managed_runtime::ServerManagedRuntimeController::from_env()
         .await
         .unwrap()
@@ -4021,8 +4020,8 @@ export default {{id:'closed-directory-discovery',async server(){{
     // cwd. Native project discovery must stay in the workspace while provider
     // HOME remains its independent physical volume.
     let terminal_home = fixture.join("workspace");
-    std::env::set_var("XDG_CONFIG_HOME", fixture.join("source-home/.config"));
-    std::env::set_var("HOME", &terminal_home);
+    env.set("XDG_CONFIG_HOME", fixture.join("source-home/.config"));
+    env.set("HOME", &terminal_home);
     let request: ManagedTerminalLaunch = ManagedTerminalLaunch {
         spec: freshell_platform::spawn::SpawnSpec {
             program: "opencode".into(),
@@ -4349,12 +4348,12 @@ export default {{id:'closed-directory-discovery',async server(){{
     std::fs::write(fixture.join("grants/auth.json"), serde_json::to_vec(&json!({well_known_url: {
         "type":"wellknown", "key":"OPENAI_API_KEY", "token":"AUTH_PREFIX{file:~/home rule with spaces.txt}AUTH_SUFFIX"
     }, inline_auth_url: {"type":"wellknown", "key":"INLINE_VALUE", "token":"AUTH_INLINE_SHADOW_NO_FILE"}})).unwrap()).unwrap();
-    std::env::set_var("HOME", &fixture);
-    std::env::set_var("OPENCODE_CONFIG", &explicit_config);
-    std::env::set_var("OPENCODE_CONFIG_DIR", &explicit_directory);
-    std::env::set_var("OPENCODE_TUI_CONFIG", &selected_tui);
-    std::env::set_var("OPENCODE_CONFIG_CONTENT", inline_source);
-    std::env::set_var("INLINE_VALUE", inline_value);
+    env.set("HOME", &fixture);
+    env.set("OPENCODE_CONFIG", &explicit_config);
+    env.set("OPENCODE_CONFIG_DIR", &explicit_directory);
+    env.set("OPENCODE_TUI_CONFIG", &selected_tui);
+    env.set("OPENCODE_CONFIG_CONTENT", inline_source);
+    env.set("INLINE_VALUE", inline_value);
     let mut fresh_expected = expected.clone();
     fresh_expected["snapshotDisabled"] = json!(true);
     let (broadcast, _) = tokio::sync::broadcast::channel(256);
