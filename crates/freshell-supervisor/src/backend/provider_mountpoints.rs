@@ -1,7 +1,7 @@
 //! Fixed helper for descriptor-owned placeholders in the exact soul volume.
 use super::helper_lifecycle::{
-    Deferred, HelperContainer, HelperDeadlines, HelperFailure, HelperKind, HelperObjects,
-    HELPER_CLEANUP_BUDGET,
+    AttemptStep, Deferred, HelperContainer, HelperDeadlines, HelperFailure, HelperKind,
+    HelperObjects, HELPER_CLEANUP_BUDGET,
 };
 use super::*;
 use freshell_platform::provider_mountpoints::Mountpoint;
@@ -236,7 +236,13 @@ impl DockerEngineBackend {
     ) -> Result<(), BackendError> {
         let mut owned = None;
         let result = self
-            .run_provider_mountpoint_helper(target, selected, deadlines, &mut owned)
+            .run_provider_mountpoint_helper(
+                target,
+                selected,
+                deadlines,
+                &AttemptStep::new(),
+                &mut owned,
+            )
             .await;
         // The run still owns a helper Docker has not created yet, or one whose
         // removal it could not confirm: either is still ours to remove.
@@ -255,13 +261,15 @@ impl DockerEngineBackend {
     /// `owned` holds the helper from its create until its removal is
     /// confirmed; it is still set on return when the removal is unconfirmed or
     /// Docker has not answered the create yet, and the caller then owns the
-    /// helper's removal. A create or start that timed out or was refused
-    /// transiently is reported as a transient failure.
+    /// helper's removal. A run that timed out, or whose create or start was
+    /// refused transiently, is reported as a transient failure; `step` records
+    /// the `mountpoints_*` step the run is in.
     pub(super) async fn run_provider_mountpoint_helper(
         &self,
         target: MountpointHelperTarget<'_>,
         selected: Vec<Mountpoint>,
         deadlines: HelperDeadlines,
+        step: &AttemptStep,
         owned: &mut Option<HelperContainer>,
     ) -> Result<(), HelperFailure> {
         if owned.is_some() {
@@ -298,6 +306,7 @@ impl DockerEngineBackend {
                     {"Type":"bind","Source":directory.0,"Target":"/run/freshell-input-exchange","ReadOnly":true}]}
         });
         let operation = async {
+            step.enter("mountpoints_create");
             let created = owned
                 .insert(HelperContainer::new(
                     HelperKind::ProviderMountpoints,
@@ -308,13 +317,13 @@ impl DockerEngineBackend {
                 .await
                 .map_err(|_| {
                     HelperFailure::unanswered(
-                        "create",
+                        "mountpoints_create",
                         fail("provider mountpoint helper creation unanswered"),
                     )
                 })?;
             if created.status != 201 {
                 return Err(HelperFailure::answered(
-                    "create",
+                    "mountpoints_create",
                     created.status,
                     fail("provider mountpoint helper creation failed"),
                 ));
@@ -344,22 +353,24 @@ impl DockerEngineBackend {
                     fail("provider mountpoint helper namespace changed before start").into(),
                 );
             }
+            step.enter("mountpoints_start");
             let started = self
                 .request("POST", &format!("{DOCKER_API}/containers/{id}/start"), None)
                 .await
                 .map_err(|_| {
                     HelperFailure::unanswered(
-                        "start",
+                        "mountpoints_start",
                         fail("provider mountpoint helper start unanswered"),
                     )
                 })?;
             if started.status != 204 {
                 return Err(HelperFailure::answered(
-                    "start",
+                    "mountpoints_start",
                     started.status,
                     fail("provider mountpoint helper start failed"),
                 ));
             }
+            step.enter("mountpoints_read");
             let exchange = async {
                 let (mut stream, _) = listener
                     .accept()
@@ -378,6 +389,7 @@ impl DockerEngineBackend {
                     .read_exact(&mut acknowledgement)
                     .await
                     .map_err(|_| fail("provider mountpoint acknowledgement unavailable"))?;
+                step.enter("mountpoints_exit");
                 match &acknowledgement {
                     b"ok" => Ok(()),
                     b"er" => {
@@ -423,6 +435,7 @@ impl DockerEngineBackend {
             let (exchange_result, wait_result) = tokio::join!(exchange, wait);
             exchange_result?;
             wait_result?;
+            step.enter("mountpoints_verify");
             if self.daemon_id().await? != *target.daemon {
                 return Err(fail("provider mountpoint daemon changed before main create").into());
             }
@@ -431,9 +444,10 @@ impl DockerEngineBackend {
         let result = tokio::time::timeout_at(deadline, operation)
             .await
             .unwrap_or_else(|_| {
-                Err(HelperFailure::timed_out(fail(
-                    "provider mountpoint preparation timed out",
-                )))
+                Err(HelperFailure::timed_out(
+                    fail("provider mountpoint preparation timed out"),
+                    step,
+                ))
             });
         // A create Docker has not answered by the settle deadline stays in
         // `owned`: the caller owns removing the helper it may still make.
@@ -643,10 +657,11 @@ mod tests {
             }
             // The cancel mode drops the helper once it reaches its private
             // exchange; every other mode runs it to completion.
+            let step = AttemptStep::new();
             let outcome = tokio::time::timeout(Duration::from_secs(3), async {
                 tokio::select! {
                     result = backend.run_provider_mountpoint_helper(
-                target,selected,HelperDeadlines::after(Duration::from_millis(250),Duration::from_millis(250)),&mut helper
+                target,selected,HelperDeadlines::after(Duration::from_millis(250),Duration::from_millis(250)),&step,&mut helper
             ) => Some(result),
                     _ = exchange_reached.notified(), if mode == "cancel-private-exchange" => None,
                 }

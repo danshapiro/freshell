@@ -27,6 +27,15 @@ struct Inventory {
     removed: Vec<String>,
 }
 
+/// What the synthetic reader does once Docker starts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// Reply over the private exchange and exit with this status.
+    Exits(i64),
+    /// Accept the exchange, never reply and never exit.
+    Hangs,
+}
+
 struct ReaderDaemon {
     inventory: Arc<Mutex<Inventory>>,
     late: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -36,6 +45,15 @@ struct ReaderDaemon {
 
 impl ReaderDaemon {
     fn start(socket: &Path, daemon: DockerDaemonId, script: Vec<Create>, exit_code: i64) -> Self {
+        Self::with_reader(socket, daemon, script, Reader::Exits(exit_code))
+    }
+
+    fn with_reader(
+        socket: &Path,
+        daemon: DockerDaemonId,
+        script: Vec<Create>,
+        reader: Reader,
+    ) -> Self {
         let inventory = Arc::new(Mutex::new(Inventory::default()));
         let late = Arc::new(Mutex::new(Vec::new()));
         let listener = UnixListener::bind(socket).unwrap();
@@ -50,7 +68,7 @@ impl ReaderDaemon {
                         let (stream, _) = accepted.unwrap();
                         let (state, late_jobs, daemon, script) =
                             (state.clone(), late_jobs.clone(), daemon.clone(), script.clone());
-                        jobs.spawn(answer(stream, state, late_jobs, daemon, script, exit_code));
+                        jobs.spawn(answer(stream, state, late_jobs, daemon, script, reader));
                     }
                     result = jobs.join_next(), if !jobs.is_empty() => { result.unwrap().unwrap(); }
                 }
@@ -69,16 +87,24 @@ impl ReaderDaemon {
     async fn finish(&mut self) {
         let late = std::mem::take(&mut *self.late.lock().unwrap());
         for job in late {
-            tokio::time::timeout(Duration::from_secs(30), job)
-                .await
-                .unwrap()
-                .unwrap();
+            match tokio::time::timeout(Duration::from_secs(30), job).await {
+                Ok(joined) => joined.unwrap(),
+                // A hung reader holds its exchange until the daemon stops.
+                Err(_) => panic!("a late create never finished"),
+            }
         }
         let _ = self.stop.take().unwrap().send(());
         tokio::time::timeout(Duration::from_secs(5), self.server.take().unwrap())
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// Stop every hung reader the daemon is holding.
+    fn abort_readers(&self) {
+        for job in std::mem::take(&mut *self.late.lock().unwrap()) {
+            job.abort();
+        }
     }
 
     fn creates(&self) -> Vec<String> {
@@ -106,7 +132,7 @@ async fn answer(
     late: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     daemon: DockerDaemonId,
     script: Vec<Create>,
-    exit_code: i64,
+    reader: Reader,
 ) {
     let mut header = Vec::new();
     let mut byte = [0];
@@ -221,6 +247,24 @@ async fn answer(
         let mut channel = UnixStream::connect(Path::new(&exchange).join("reply.sock"))
             .await
             .unwrap();
+        if reader == Reader::Hangs {
+            // Started promptly; the reader itself never answers.
+            late.lock().unwrap().push(tokio::spawn(async move {
+                let _held = channel;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }));
+            let response = "{}";
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 204 fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            return;
+        }
         let length = channel.read_u32().await.unwrap() as usize;
         let mut raw = vec![0; length];
         channel.read_exact(&mut raw).await.unwrap();
@@ -253,7 +297,14 @@ async fn answer(
         channel.shutdown().await.unwrap();
         (204, json!({}))
     } else if line.starts_with("POST") && line.contains("/wait?") {
-        (200, json!({"StatusCode":exit_code}))
+        match reader {
+            Reader::Exits(code) => (200, json!({"StatusCode":code})),
+            Reader::Hangs => {
+                // A running reader never reports an exit.
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                return;
+            }
+        }
     } else if line.starts_with("DELETE") && line.contains("/containers/") {
         let key = key(&line);
         let mut inventory = state.lock().unwrap();
@@ -531,6 +582,10 @@ async fn claude_source_reader_retries_after_a_stalled_create_answers_and_removes
     let retries = named(&events, "supervisor.helper.retry");
     assert_eq!(retries.len(), 1, "{events:?}");
     assert_eq!(retries[0]["data"]["cause"], "timed_out");
+    assert_eq!(
+        retries[0]["data"]["step"], "create",
+        "the retry names the step the deadline hit"
+    );
     assert!(named(&events, "supervisor.helper.cleanup.deferred").is_empty());
     assert_eq!(named(&events, "supervisor.helper.recovered").len(), 1);
 }
@@ -700,4 +755,48 @@ async fn claude_source_reader_ends_by_its_callers_deadline_inside_its_own_budget
     );
     let exhausted = named(&events, "supervisor.helper.retry_exhausted");
     assert_eq!(exhausted.len(), 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn claude_source_reader_names_a_hung_read_apart_from_a_docker_stall() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon_id = DockerDaemonId::new();
+    let (owner, request) = initial_request(temp.path(), &daemon_id).await;
+    let mut daemon = ReaderDaemon::with_reader(
+        &temp.path().join("docker.sock"),
+        daemon_id,
+        vec![],
+        Reader::Hangs,
+    );
+    let log = temp.path().join("lifecycle.jsonl");
+    let backend =
+        DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
+    let result = backend
+        .observe_claude_sources_with(&QUICK, &owner, &request, "synthetic-run", far())
+        .await;
+    let creates = daemon.creates();
+    let removed = daemon.removed();
+    daemon.abort_readers();
+    daemon.finish().await;
+    assert!(result.is_err(), "{result:?}");
+    // A timeout is retried wherever it hit: the same disk flush that stalls a
+    // create also stalls a reader's writes and Docker's report of its exit.
+    // The log tells the reader's own step apart from Docker's.
+    assert_eq!(
+        creates.len(),
+        3,
+        "a timed-out read is retried within its bound"
+    );
+    assert_eq!(removed, creates, "every hung reader is removed");
+    let events = lifecycle_events(&log);
+    let mut steps = named(&events, "supervisor.helper.retry")
+        .iter()
+        .map(|event| event["data"]["step"].clone())
+        .collect::<Vec<_>>();
+    steps.extend(
+        named(&events, "supervisor.helper.retry_exhausted")
+            .iter()
+            .map(|event| event["data"]["step"].clone()),
+    );
+    assert_eq!(steps, vec![json!("read"); 3], "{events:?}");
 }

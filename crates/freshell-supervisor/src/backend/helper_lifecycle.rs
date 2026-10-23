@@ -19,9 +19,15 @@
 //!    caller's wait ends, or a removal that runs out of time or fails, goes to
 //!    a background reaper that keeps removing them
 //!    ([`DockerEngineBackend::reap_helper_objects`]).
-//! 3. A helper run whose create or start timed out, or that Docker refused or
+//! 3. A helper run that timed out, or whose create or start Docker refused or
 //!    dropped transiently, is retried within a bounded budget
 //!    ([`DockerEngineBackend::retry_helper`]). Every other failure is final.
+//!    A timeout is retried whichever step it hit: the same flush that stalls
+//!    a create stalls a start, the helper's own writes and Docker's report of
+//!    its exit. On the development host a candidate read whose create and
+//!    start answered at once timed out while 2 GB of unwritten data drained,
+//!    and its retry succeeded. The retry log names the step
+//!    ([`AttemptStep`]), so a Docker stall can be told from a hung helper.
 use super::*;
 use std::future::Future;
 use std::time::Duration;
@@ -94,10 +100,39 @@ impl TransientCause {
     }
 }
 
-/// A failed helper attempt. It is transient only where a create or start
-/// timed out, or Docker refused or dropped it without judging the request.
-/// Every other failure stays final: changed ownership or topology, a helper
-/// that exited without evidence, a client error, an unconfirmed cleanup.
+/// Where one helper attempt stands, so a timed-out attempt's retry log names
+/// the step its deadline hit: `prepare` (checks and inspections before the
+/// create), `create`, `start`, `read` (the helper's own work, until it
+/// replies over its private exchange), `exit` (Docker reporting the helper's
+/// exit) or `verify` (checks after the reply). The candidate read adds
+/// `scratch_create` and its mountpoint helper's `mountpoints_*` steps.
+pub(super) struct AttemptStep(std::sync::Mutex<&'static str>);
+
+impl AttemptStep {
+    pub(super) fn new() -> Self {
+        Self(std::sync::Mutex::new("prepare"))
+    }
+
+    pub(super) fn enter(&self, step: &'static str) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = step;
+    }
+
+    fn current(&self) -> &'static str {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A failed helper attempt. It is transient only where the attempt timed
+/// out, or Docker refused or dropped a create or start without judging the
+/// request. Every other failure stays final: changed ownership or topology, a
+/// helper that exited without evidence, a client error, an unconfirmed
+/// cleanup.
 #[derive(Debug)]
 pub(super) struct HelperFailure {
     pub(super) error: BackendError,
@@ -114,11 +149,11 @@ impl From<BackendError> for HelperFailure {
 }
 
 impl HelperFailure {
-    /// The attempt's work outlasted its deadline.
-    pub(super) fn timed_out(error: BackendError) -> Self {
+    /// The attempt's work outlasted its deadline during `step`.
+    pub(super) fn timed_out(error: BackendError, step: &AttemptStep) -> Self {
         Self {
             error,
-            transient: Some((TransientCause::TimedOut, "operation")),
+            transient: Some((TransientCause::TimedOut, step.current())),
         }
     }
 

@@ -5,7 +5,7 @@ use freshell_platform::claude_inputs::observation::{
     ObservationReply, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 use freshell_runtime_protocol::ObserveClaudeSourcesRequest;
-use helper_lifecycle::{HelperContainer, HelperDeadlines, HelperFailure, HelperKind};
+use helper_lifecycle::{AttemptStep, HelperContainer, HelperDeadlines, HelperFailure, HelperKind};
 use tokio::net::UnixListener;
 
 fn fail(reason: &'static str) -> BackendError {
@@ -322,6 +322,7 @@ impl DockerEngineBackend {
         let mut directory = None::<native_auth::ExchangeDirectory>;
         let mut input_view = None::<CandidateInputView>;
         let mut retained_view = None::<CandidateInputView>;
+        let step = AttemptStep::new();
         let operation = async {
             let projection = qualify_candidate_stage(root, owner, request)?;
             let raw = bounded_json_bytes(&projection, MAX_CONTROL_FRAME_BYTES)
@@ -413,6 +414,7 @@ impl DockerEngineBackend {
                 create: Default::default(),
             });
             let backing = scratch.as_mut().unwrap();
+            step.enter("scratch_create");
             self.create_claude_candidate_scratch(backing).await?;
             self.run_provider_mountpoint_helper(
                 provider_mountpoints::MountpointHelperTarget {
@@ -424,9 +426,11 @@ impl DockerEngineBackend {
                 },
                 provider_mountpoints::selections(&mounts)?,
                 deadlines,
+                &step,
                 &mut mountpoint_helper,
             )
             .await?;
+            step.enter("prepare");
             directory = Some(native_auth::ExchangeDirectory::create_input()?);
             let exchange_directory = directory.as_ref().unwrap();
             let socket = exchange_directory.0.join("reply.sock");
@@ -472,6 +476,7 @@ impl DockerEngineBackend {
                 "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"CapAdd":["CHOWN","SETGID","SETUID"],
                     "SecurityOpt":["no-new-privileges"],"Memory":256*1024*1024,"MemorySwap":256*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
                     "LogConfig":{"Type":"none","Config":{}},"Tmpfs":{},"Mounts":descriptors}});
+            step.enter("create");
             let created = reader
                 .insert(HelperContainer::new(
                     HelperKind::ClaudeCandidateReader,
@@ -538,6 +543,7 @@ impl DockerEngineBackend {
                 retained_volume.as_ref(),
             )?;
             let supervision = async {
+                step.enter("start");
                 let started = self
                     .request_bounded(
                         "POST",
@@ -559,6 +565,7 @@ impl DockerEngineBackend {
                         fail("Claude candidate reader start failed"),
                     ));
                 }
+                step.enter("read");
                 let waited = self
                     .request_bounded(
                         "POST",
@@ -577,9 +584,14 @@ impl DockerEngineBackend {
                 Ok::<_, HelperFailure>(())
             };
             let (reply, ()) = tokio::try_join!(
-                async { exchange(&listener, &raw).await.map_err(HelperFailure::from) },
+                async {
+                    let reply = exchange(&listener, &raw).await?;
+                    step.enter("exit");
+                    Ok::<_, HelperFailure>(reply)
+                },
                 supervision
             )?;
+            step.enter("verify");
             let source_raw = bounded_json_bytes(&request.observation_request, MAX_REQUEST_BYTES)
                 .map_err(|_| fail("Claude candidate source metadata exceeds profile"))?;
             reply
@@ -636,9 +648,10 @@ impl DockerEngineBackend {
         let result = tokio::time::timeout_at(deadline, operation)
             .await
             .unwrap_or_else(|_| {
-                Err(HelperFailure::timed_out(fail(
-                    "Claude candidate reader timed out; retain inputs and reprepare",
-                )))
+                Err(HelperFailure::timed_out(
+                    fail("Claude candidate reader timed out; retain inputs and reprepare"),
+                    &step,
+                ))
             });
         // One release covers both helpers and the ordinary backing. Any
         // uncertain helper removal prevents deleting its still-mounted HOME.
@@ -1263,8 +1276,9 @@ async fn exchange(listener: &UnixListener, raw: &[u8]) -> Result<ObservationRepl
 
 impl DockerEngineBackend {
     /// Observe Claude sources through the fixed reader, retrying a reader
-    /// whose create or start timed out or was refused transiently. The whole
-    /// read, every attempt's cleanup included, ends by `until`.
+    /// run that timed out (in whichever step; see [`helper_lifecycle`]) or
+    /// whose create or start Docker refused transiently. The whole read,
+    /// every attempt's cleanup included, ends by `until`.
     pub(super) async fn observe_claude_sources_with(
         &self,
         policy: &helper_lifecycle::HelperRetryPolicy,
@@ -1349,6 +1363,7 @@ impl DockerEngineBackend {
         let name = format!("freshell-claude-source-{}", uuid::Uuid::new_v4());
         let mut helper = None::<HelperContainer>;
         let mut directory = None::<native_auth::ExchangeDirectory>;
+        let step = AttemptStep::new();
         let operation = async {
             let mut retained_volume = None::<Value>;
             let (daemon, rootless) = self
@@ -1523,6 +1538,7 @@ impl DockerEngineBackend {
                 MAX_REQUEST_BYTES,
             )
             .map_err(|_| fail("Claude source request exceeds metadata profile"))?;
+            step.enter("create");
             let created = helper
                 .insert(HelperContainer::new(
                     HelperKind::ClaudeSource,
@@ -1573,6 +1589,7 @@ impl DockerEngineBackend {
                 verify_retained_claude_mount_reports(&actual, &body, volume)?;
             }
             let supervision = async {
+                step.enter("start");
                 let started = self
                     .request_bounded(
                         "POST",
@@ -1594,6 +1611,7 @@ impl DockerEngineBackend {
                         fail("Claude source helper start failed"),
                     ));
                 }
+                step.enter("read");
                 let waited = self
                     .request_bounded(
                         "POST",
@@ -1612,9 +1630,14 @@ impl DockerEngineBackend {
                 Ok::<_, HelperFailure>(())
             };
             let (reply, ()) = tokio::try_join!(
-                async { exchange(&listener, &raw).await.map_err(HelperFailure::from) },
+                async {
+                    let reply = exchange(&listener, &raw).await?;
+                    step.enter("exit");
+                    Ok::<_, HelperFailure>(reply)
+                },
                 supervision
             )?;
+            step.enter("verify");
             reply
                 .validate_for_request(
                     &request.observation_request,
@@ -1651,9 +1674,10 @@ impl DockerEngineBackend {
         let result = tokio::time::timeout_at(deadlines.operation, operation)
             .await
             .unwrap_or_else(|_| {
-                Err(HelperFailure::timed_out(fail(
-                    "Claude source helper timed out; retain inputs and reprepare",
-                )))
+                Err(HelperFailure::timed_out(
+                    fail("Claude source helper timed out; retain inputs and reprepare"),
+                    &step,
+                ))
             });
         let result = match helper {
             Some(helper) => {

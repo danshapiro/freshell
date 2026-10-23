@@ -221,8 +221,12 @@ created just before them is slow.
   (warn, with `reason` `create_unanswered` or `removal_unconfirmed`), then
   `supervisor.helper.cleanup.removed` (info) or
   `supervisor.helper.cleanup.unconfirmed` (error).
-- The Claude source reader retries a run whose create or start timed out, or
-  that Docker refused with a server error or left unanswered. Each attempt
+- The Claude source reader retries a run that timed out, or whose create or
+  start Docker refused with a server error or left unanswered. A timeout is
+  retried whichever step it hit: the same flush that stalls a create also
+  stalls a start, the reader's own writes and Docker's report of its exit (a
+  candidate read whose create and start answered at once timed out while 2 GB
+  of unwritten data drained, and its retry succeeded). Each attempt
   keeps the reader's 25s bound; the whole read gets up to 90s, three attempt
   lengths with their 5s cleanup: the attempt a stall times out, up to one
   more attempt length for Docker to answer that create, and one full retry;
@@ -233,7 +237,12 @@ created just before them is slow.
   error, changed ownership or topology, a reader that exited without
   evidence, an unconfirmed cleanup) is final, as before. Events:
   `supervisor.helper.retry` (warn, per retry), `supervisor.helper.recovered`
-  (info) and `supervisor.helper.retry_exhausted` (error).
+  (info) and `supervisor.helper.retry_exhausted` (error). Their `step` names
+  where a timed-out attempt's deadline hit: `prepare`, `create`, `start`,
+  `read` (the reader's own work, until it replies), `exit` (Docker reporting
+  its exit) or `verify`; a candidate read adds `scratch_create` and its
+  mountpoint helper's `mountpoints_*` steps. A reader that hangs in `read`
+  while Docker answers promptly is therefore visible as such.
 
 ## Launch transaction
 
