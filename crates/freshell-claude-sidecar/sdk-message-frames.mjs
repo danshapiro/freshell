@@ -79,12 +79,13 @@ export function resultFrames(sessionId, result, { userStopped }) {
 // ── content kinds (docs/plans/2026-10-22-freshclaude-transcript-live.md §4.2) ──
 //
 // framesForSdkMessage maps the SDK messages whose content reaches the server:
-// assistant and user messages, stream events, the compaction status frames,
-// and the provider events that never end a turn (an API retry becomes
-// `sdk.retry`; a rate limit or an informational message becomes
-// `sdk.notice`). Every other kind maps to no frame here: `result`,
-// `system/init`, `commands_changed` and the checkpoint replay binding carry
-// side effects, so index.mjs handles them itself.
+// assistant and user messages, stream events, the status frames (compacting,
+// a compaction's outcome, the CLI's permission mode), and the provider events
+// that never end a turn (an API retry becomes `sdk.retry`; a rate limit, an
+// informational message or a failed compaction becomes `sdk.notice`). Every
+// other kind maps to no frame here: `result`, `system/init`,
+// `commands_changed` and the checkpoint replay binding carry side effects, so
+// index.mjs handles them itself.
 //
 // Transcript announcements: the CLI writes each assistant and user message,
 // each compaction boundary and each local command's output to its transcript
@@ -105,7 +106,9 @@ export function createFrameState() {
 /**
  * The frames for one SDK message of a content kind (none for any other kind).
  * `session` is what the sidecar knows about the session when the message
- * arrives: `{ stream }`, the session's createFrameState().
+ * arrives: `{ stream, permissionMode, turnPending }` — the session's
+ * createFrameState(), the permission mode it believes the CLI is in, and
+ * whether a send still waits for its result.
  */
 export function framesForSdkMessage(sessionId, msg, session) {
   switch (msg?.type) {
@@ -115,7 +118,11 @@ export function framesForSdkMessage(sessionId, msg, session) {
     case 'rate_limit_event': return rateLimitFrames(sessionId, msg)
     case 'system':
       switch (msg.subtype) {
-        case 'status': return statusFrames(sessionId, msg)
+        case 'status': return [
+          ...statusFrames(sessionId, msg),
+          ...compactionOutcomeFrames(sessionId, msg, session),
+          ...permissionModeFrames(sessionId, msg, session),
+        ]
         case 'compact_boundary': return compactBoundaryFrames(sessionId, msg)
         case 'local_command_output': return transcriptAnnouncement(sessionId, msg)
         case 'api_retry': return apiRetryFrames(sessionId, msg)
@@ -195,6 +202,39 @@ export function statusFrames(sessionId, msg) {
   return msg.status === 'compacting' ? [{ type: 'sdk.status', sessionId, status: 'compacting' }] : []
 }
 
+const COMPACTION_FAILED_COPY = 'Claude could not compact the conversation.'
+
+/**
+ * A compaction ended (`status:null` with `compact_result`, T15). A failed one
+ * is a notice with the CLI's reason (the transcript keeps the same reason as
+ * a command error); it never ends the turn. Either way, while a send still
+ * waits for its result the session is running again, not compacting.
+ * (Interim: core's turn ledger will compute this itself, docs/plans/
+ * 2026-10-22-freshclaude-core-runtime.md §9.1 N2.)
+ */
+export function compactionOutcomeFrames(sessionId, msg, { turnPending }) {
+  if (msg.status !== null || msg.compact_result === undefined) return []
+  const frames = []
+  if (msg.compact_result === 'failed') {
+    const reason = typeof msg.compact_error === 'string' ? msg.compact_error.trim() : ''
+    frames.push({ type: 'sdk.notice', sessionId, level: 'error', code: 'COMPACTION_FAILED', message: reason || COMPACTION_FAILED_COPY })
+  }
+  if (turnPending) frames.push({ type: 'sdk.status', sessionId, status: 'running' })
+  return frames
+}
+
+/**
+ * The CLI reports the permission mode it is in now (after an ExitPlanMode
+ * approval, F12, or a mode suggestion the user accepted). A mode that differs
+ * from the session's becomes `sdk.session.metadata {permissionMode}`; index.mjs
+ * adopts it as the session's mode, so a later configure to that mode applies
+ * nothing.
+ */
+export function permissionModeFrames(sessionId, msg, { permissionMode }) {
+  if (typeof msg.permissionMode !== 'string' || msg.permissionMode === permissionMode) return []
+  return [{ type: 'sdk.session.metadata', sessionId, permissionMode: msg.permissionMode }]
+}
+
 /**
  * A compaction finished: its trigger. kata 1wxv ep3-r1 F1: the bare
  * compacting STATUS frame carries no trigger — the SDK fires it for an
@@ -272,7 +312,9 @@ export function frameLogRecord(frame) {
   }
   if (frame?.type === 'sdk.notice') {
     const fields = { sessionId: frame.sessionId, code: frame.code }
-    if (frame.rateLimit) {
+    if (frame.code === 'COMPACTION_FAILED') {
+      fields.error = frame.message
+    } else if (frame.rateLimit) {
       fields.rateLimitStatus = frame.rateLimit.status
       if (frame.rateLimit.rateLimitType !== undefined) fields.rateLimitType = frame.rateLimit.rateLimitType
       if (frame.rateLimit.resetsAt !== undefined) fields.resetsAt = frame.rateLimit.resetsAt
@@ -280,6 +322,9 @@ export function frameLogRecord(frame) {
       fields.bytes = Buffer.byteLength(frame.message ?? '')
     }
     return { severity: NOTICE_SEVERITY[frame.level] ?? 'info', event: 'notice', fields }
+  }
+  if (frame?.type === 'sdk.session.metadata' && frame.permissionMode !== undefined) {
+    return { severity: 'info', event: 'permission_mode.changed', fields: { sessionId: frame.sessionId, permissionMode: frame.permissionMode } }
   }
   return undefined
 }

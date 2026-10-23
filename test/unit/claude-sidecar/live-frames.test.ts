@@ -29,6 +29,13 @@ function transcriptUuids(sidecar: RealSidecar, cliSessionId: string): Set<string
   return uuids
 }
 
+/** The sidecar's structured log records so far (stderr, one JSON object per line). */
+function logRecords(sidecar: RealSidecar): Array<Record<string, any>> {
+  return sidecar.stderr().split('\n').flatMap((line) => {
+    try { return [JSON.parse(line)] } catch { return [] }
+  })
+}
+
 const isAnnouncement = (frame: SidecarFrame) => frame.type === 'sdk.session.changed' && frame.reason === 'transcript'
 
 describe('a live turn\'s frames', () => {
@@ -90,5 +97,72 @@ describe('a live turn\'s frames', () => {
     const streamed = streams.filter((frame) => frame.messageId === slowId && frame.event.type === 'content_block_delta').map((frame) => frame.event.delta.text).join('')
     const reply = sidecar.frames.find((frame) => frame.type === 'sdk.assistant' && frame.messageId === slowId)
     expect(streamed).toBe(reply?.content[0].text)
+  })
+})
+
+describe('what a compaction and a permission mode change send', () => {
+  const resultsOf = (sidecar: RealSidecar) => sidecar.frames.filter((frame) => frame.type === 'sdk.result')
+
+  it('a failed /compact: a COMPACTION_FAILED notice, then running until its result, and no error frame', async () => {
+    const sidecar = await startRealSidecar({ timeScale: 0.1 })
+    const sessionId = await sidecar.create()
+    sidecar.send({ type: 'send', sessionId, text: '/compact APIERR:400' })
+    await sidecar.waitFor('sdk.result', 'the compaction result')
+    const types = sidecar.frames.map((frame) => frame.type)
+    const compacting = sidecar.frames.findIndex((frame) => frame.type === 'sdk.status' && frame.status === 'compacting')
+    const notice = sidecar.frames.findIndex((frame) => frame.type === 'sdk.notice')
+    const running = sidecar.frames.findIndex((frame) => frame.type === 'sdk.status' && frame.status === 'running')
+    expect(compacting).toBeGreaterThanOrEqual(0)
+    expect(notice).toBeGreaterThan(compacting)
+    expect(running).toBeGreaterThan(notice)
+    expect(types.indexOf('sdk.result')).toBeGreaterThan(running)
+    expect(sidecar.frames[notice]).toEqual({
+      type: 'sdk.notice',
+      sessionId,
+      level: 'error',
+      code: 'COMPACTION_FAILED',
+      message: 'Error during compaction: API Error: 400 local provider error',
+    })
+    expect(types).not.toContain('sdk.error')
+    // The failure is on the sidecar's log (stderr, its own pipe), with its reason.
+    await expect.poll(() => logRecords(sidecar).find((record) => record.code === 'COMPACTION_FAILED'))
+      .toMatchObject({ severity: 'error', event: 'notice', sessionId, error: 'Error during compaction: API Error: 400 local provider error' })
+  })
+
+  it('a successful /compact: running again once compacting ends, then its result, and no notice', async () => {
+    const sidecar = await startRealSidecar({ timeScale: 0.1 })
+    const sessionId = await sidecar.create()
+    sidecar.send({ type: 'send', sessionId, text: 'something to compact' })
+    await sidecar.waitFor('sdk.result')
+    sidecar.send({ type: 'send', sessionId, text: '/compact' })
+    await sidecar.waitFor(() => resultsOf(sidecar).length === 2, 'the compaction result')
+    const statuses = sidecar.frames.filter((frame) => frame.type === 'sdk.status' || frame.type === 'sdk.result').map((frame) => frame.status ?? frame.type)
+    expect(statuses).toEqual(['sdk.result', 'compacting', 'running', 'sdk.result'])
+    expect(sidecar.frames.some((frame) => frame.type === 'sdk.notice')).toBe(false)
+  })
+
+  it('approving ExitPlanMode: the new mode is stated once, and configuring that mode afterwards calls nothing on the CLI', async () => {
+    const sidecar = await startRealSidecar({ timeScale: 0.1 })
+    const sessionId = await sidecar.create({ permissionMode: 'plan' })
+    sidecar.send({ type: 'send', sessionId, text: 'PLAN:exit' })
+    const request = await sidecar.waitFor('sdk.permission.request')
+    expect(request.tool.name).toBe('ExitPlanMode')
+    sidecar.send({ type: 'permission.respond', sessionId, requestId: request.requestId, decision: { behavior: 'allow', updatedInput: request.tool.input } })
+    expect(await sidecar.waitFor('sdk.session.metadata')).toEqual({ type: 'sdk.session.metadata', sessionId, permissionMode: 'default' })
+    await sidecar.waitFor('sdk.result')
+
+    // The server asks for the mode the CLI is already in: nothing to apply.
+    sidecar.send({ type: 'configure', sessionId, requestId: 'same-mode', settings: { permissionMode: 'default' } })
+    expect(await sidecar.waitFor((frame) => frame.type === 'sdk.configured' && frame.requestId === 'same-mode'))
+      .toMatchObject({ ok: true, settings: { permissionMode: 'default' } })
+    // Another mode is applied (and the CLI's report of it states nothing new).
+    sidecar.send({ type: 'configure', sessionId, requestId: 'other-mode', settings: { permissionMode: 'acceptEdits' } })
+    await sidecar.waitFor((frame) => frame.type === 'sdk.configured' && frame.requestId === 'other-mode' && frame.ok === true)
+    sidecar.send({ type: 'send', sessionId, text: 'after the mode change' })
+    await sidecar.waitFor(() => resultsOf(sidecar).length === 2, 'the next turn result')
+    expect((await sidecar.waitForPrompt(2)).permissionMode).toBe('acceptEdits')
+    expect(sidecar.ledger().filter((row) => row.kind === 'control').map((row) => [row.name, ...row.args]))
+      .toEqual([['setPermissionMode', 'acceptEdits']])
+    expect(sidecar.frames.filter((frame) => frame.type === 'sdk.session.metadata')).toHaveLength(1)
   })
 })

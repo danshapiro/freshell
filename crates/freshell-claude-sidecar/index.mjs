@@ -51,7 +51,8 @@
 //     { type:'sdk.notice',              sessionId, level:'info'|'warning'|'error', code, message, rateLimit? }
 //                                  — a non-terminal provider notice: RATE_LIMIT_WARNING / RATE_LIMITED
 //                                    (rateLimit {status, resetsAt?, rateLimitType?, utilization?}),
-//                                    INFORMATIONAL (the CLI's own banner text); never a turn end
+//                                    INFORMATIONAL (the CLI's own banner text), COMPACTION_FAILED (the
+//                                    CLI's reason); never a turn end
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
 //     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
 //                                  the stopped turn's own aborted result (an accepted user interrupt's mark
@@ -69,8 +70,11 @@
 //                                    local command output) to its transcript under `uuid`, about 100 ms
 //                                    later; sent right after the message's own frames
 //                                    (sdk-message-frames.mjs)
-//     { type:'sdk.status',              sessionId, status }               // compacting (an ended stream sends
-//                                  no status: the server reports the session as exited)
+//     { type:'sdk.status',              sessionId, status }               // compacting; running when a
+//                                  compaction ends while a send still waits for its result (interim, core
+//                                  N2); an ended stream sends no status: the server reports it as exited
+//     { type:'sdk.session.metadata',    sessionId, permissionMode }       // the CLI changed its own
+//                                  permission mode (an ExitPlanMode approval); the session adopts it first
 //     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
 //                                  (sanitized text, no [ede_diagnostic] lines); never for the user's own Stop
 //     { type:'sdk.stream.ended',        sessionId, reason, message }      // the session's SDK stream ended
@@ -365,10 +369,22 @@ function handleSdkMessage(sessionId, msg) {
     default:
       break
   }
-  // The content kinds (assistant, user, stream events, compaction, retries
-  // and notices): a pure mapping, sdk-message-frames.mjs. Any kind it does
-  // not map is dropped there.
-  for (const frame of framesForSdkMessage(sessionId, msg, { stream: st.frameState })) {
+  // The content kinds (assistant, user, stream events, status, retries and
+  // notices): a pure mapping, sdk-message-frames.mjs. Any kind it does not
+  // map is dropped there.
+  const frames = framesForSdkMessage(sessionId, msg, {
+    stream: st.frameState,
+    permissionMode: st.settings.permissionMode,
+    turnPending: st.pendingResults > 0,
+  })
+  for (const frame of frames) {
+    // The CLI changed its own permission mode (an ExitPlanMode approval): the
+    // session adopts it before saying so, so a configure to that mode applies
+    // nothing and the permission channel sees the mode the CLI is in.
+    if (frame.type === 'sdk.session.metadata' && frame.permissionMode !== undefined) {
+      st.settings.permissionMode = frame.permissionMode
+      st.permissionMode = frame.permissionMode
+    }
     emit(frame)
     const record = frameLogRecord(frame)
     if (record) log(record.severity, record.event, record.fields)

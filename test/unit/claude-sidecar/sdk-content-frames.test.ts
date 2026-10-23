@@ -300,3 +300,45 @@ describe('frameLogRecord', () => {
     }
   })
 })
+
+describe('framesForSdkMessage: what a status frame reports besides compacting', () => {
+  const compactEnd = (scenario: string) => recorded(scenario).find((msg) => msg.type === 'system' && msg.subtype === 'status' && msg.status === null && msg.compact_result)!
+
+  it('a failed compaction is a notice with the CLI\'s reason; the turn that ran it is running again', () => {
+    expect(framesForSdkMessage('s1', compactEnd('compact-fail'), session(undefined, { turnPending: true }))).toEqual([
+      { type: 'sdk.notice', sessionId: 's1', level: 'error', code: 'COMPACTION_FAILED', message: 'Error during compaction: API Error: 400 compaction refused by fake' },
+      { type: 'sdk.status', sessionId: 's1', status: 'running' },
+    ])
+  })
+
+  it('a finished compaction reports running only while a send is still waiting for its result', () => {
+    expect(framesForSdkMessage('s1', compactEnd('compact-ok'), session(undefined, { turnPending: true })))
+      .toEqual([{ type: 'sdk.status', sessionId: 's1', status: 'running' }])
+    expect(framesForSdkMessage('s1', compactEnd('compact-ok'), session(undefined, { turnPending: false }))).toEqual([])
+    expect(framesForSdkMessage('s1', compactEnd('compact-fail'), session(undefined, { turnPending: false })).map((frame: Msg) => frame.type)).toEqual(['sdk.notice'])
+  })
+
+  it('a failed compaction with no reason still says what failed', () => {
+    const [notice] = framesForSdkMessage('s1', { type: 'system', subtype: 'status', status: null, compact_result: 'failed', uuid: 'x' }, session())
+    expect(notice).toMatchObject({ code: 'COMPACTION_FAILED', level: 'error', message: expect.stringMatching(/\S/) })
+  })
+
+  it('a permission mode the CLI reports that differs from the session\'s becomes sdk.session.metadata (F12: after ExitPlanMode)', () => {
+    const planExit = { type: 'system', subtype: 'status', status: null, permissionMode: 'default', uuid: '27298f9c-df16-4cbd-a017-e33c7b518c0b', session_id: 'c1' }
+    expect(framesForSdkMessage('s1', planExit, session(undefined, { permissionMode: 'plan' }))).toEqual([
+      { type: 'sdk.session.metadata', sessionId: 's1', permissionMode: 'default' },
+    ])
+    // The mode the session already has, or none at all, states nothing; a
+    // status frame that ends no compaction is no reason to say running.
+    expect(framesForSdkMessage('s1', planExit, session(undefined, { permissionMode: 'default' }))).toEqual([])
+    expect(framesForSdkMessage('s1', { ...planExit, permissionMode: undefined }, session(undefined, { permissionMode: 'plan' }))).toEqual([])
+  })
+
+  it('logs a failed compaction as an error with its reason, and a permission mode change at info', () => {
+    const [notice] = framesForSdkMessage('s1', compactEnd('compact-fail'), session())
+    expect(frameLogRecord(notice)).toEqual({ severity: 'error', event: 'notice', fields: { sessionId: 's1', code: 'COMPACTION_FAILED', error: 'Error during compaction: API Error: 400 compaction refused by fake' } })
+    expect(frameLogRecord({ type: 'sdk.session.metadata', sessionId: 's1', permissionMode: 'default' }))
+      .toEqual({ severity: 'info', event: 'permission_mode.changed', fields: { sessionId: 's1', permissionMode: 'default' } })
+    expect(frameLogRecord({ type: 'sdk.status', sessionId: 's1', status: 'running' })).toBeUndefined()
+  })
+})

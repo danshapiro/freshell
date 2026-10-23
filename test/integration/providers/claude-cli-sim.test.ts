@@ -338,6 +338,25 @@ describe('Claude CLI simulator programs', () => {
     ])
   })
 
+  it('records every settings call the CLI handles in the ledger, in order, including a refused one', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sim-ledger-'))
+    cleanups.push(() => fs.rm(dir, { recursive: true, force: true }))
+    const ledger = path.join(dir, 'ledger.jsonl')
+    const s = await open({ permissionMode: 'default' }, { FRESHELL_CLAUDE_SIM_LEDGER: ledger })
+    await s.q.initializationResult()
+    await s.q.setPermissionMode('plan')
+    await s.q.setModel('opus')
+    await s.q.applyFlagSettings({ effortLevel: 'low' })
+    await expect(s.q.setPermissionMode('no-such-mode')).rejects.toThrow()
+    const rows = (await fs.readFile(ledger, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    expect(rows.filter((row) => row.kind === 'control').map(({ name, args }) => ({ name, args }))).toEqual([
+      { name: 'setPermissionMode', args: ['plan'] },
+      { name: 'setModel', args: ['opus'] },
+      { name: 'applyFlagSettings', args: [{ effortLevel: 'low' }] },
+      { name: 'setPermissionMode', args: ['no-such-mode'] },
+    ])
+  })
+
   it('a program chooses the tool_use id the model gives a tool call and the whole input of an AskUserQuestion call', async () => {
     const seen: any[] = []
     const s = await open({

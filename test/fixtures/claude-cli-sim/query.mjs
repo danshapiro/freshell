@@ -51,7 +51,10 @@
 //                                       command as it starts: uuid, text, content and
 //                                       the model, effort and permission mode it runs
 //                                       under), `can_use_tool` (each answer the host's
-//                                       canUseTool gave) and `emission` (program steps)
+//                                       canUseTool gave), `control` (each settings call
+//                                       the CLI handles: setModel, setPermissionMode,
+//                                       applyFlagSettings, with its arguments) and
+//                                       `emission` (program steps)
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -887,6 +890,7 @@ class SimulatedCli {
 
   async setModel(model) {
     return this.control(async () => {
+      this.ledger('control', { name: 'setModel', args: [model] })
       this.model = model ?? FAKE_MODEL
       const text = `<local-command-stdout>Set model to ${this.model}</local-command-stdout>`
       this.emit({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, timestamp: new Date().toISOString(), isReplay: true })
@@ -899,6 +903,7 @@ class SimulatedCli {
 
   async setPermissionMode(mode) {
     return this.control(() => {
+      this.ledger('control', { name: 'setPermissionMode', args: [mode] })
       // The only settings call the CLI validates (any model or effort name is accepted).
       if (!PERMISSION_MODES.includes(mode)) throw new Error(`Cannot set permission mode: must be one of ${PERMISSION_MODES.join(', ')}`)
       this.permissionMode = mode
@@ -909,6 +914,7 @@ class SimulatedCli {
 
   async applyFlagSettings(settings) {
     return this.control(() => {
+      this.ledger('control', { name: 'applyFlagSettings', args: [settings] })
       this.flagSettings = { ...(this.flagSettings ?? {}), ...(settings ?? {}) }
       if (settings && 'effortLevel' in settings) this.effort = settings.effortLevel ?? undefined
     })
