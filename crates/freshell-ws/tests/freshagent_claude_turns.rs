@@ -1335,14 +1335,21 @@ mod sim {
             .handle_send(send_msg("no-such-session", "send-2", "hello"))
             .await;
         assert!(
-            matches!(&refused, ClaudeSendOutcome::Refused { code, .. } if code == "SESSION_NOT_FOUND"),
+            matches!(&refused, ClaudeSendOutcome::Refused { code, .. } if code == "INVALID_SESSION_ID"),
             "{refused:?}"
         );
-        // The refusal reached the sender too.
-        conn.wait_for("the send-2 request error", |v| {
-            v["type"] == "error" && v["requestId"] == "send-2"
+        // The pane learns the conversation is missing, and its unsent prompt
+        // is returned to the sender with the same typed outcome.
+        conn.wait_for("the missing conversation", |v| {
+            v["event"]["code"] == "INVALID_SESSION_ID" && v["sessionId"] == "no-such-session"
         })
         .await;
+        let error = conn
+            .wait_for("the send-2 request error", |v| {
+                v["type"] == "error" && v["requestId"] == "send-2"
+            })
+            .await;
+        assert_eq!(error["code"], "INVALID_SESSION_ID");
         conn.kill(&session_id).await;
         assert_eq!(rig.fresh_claude.session_busy(&session_id).await, None);
     }

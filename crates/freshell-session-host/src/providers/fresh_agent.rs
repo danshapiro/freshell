@@ -798,6 +798,7 @@ impl FreshAgentTransport for HostedTransport {
             .clone()
             .ok_or_else(|| "fresh-agent session is not started".to_string())?;
         let message = FreshAgentInterrupt {
+            request_id: None,
             provider: self.provider_wire(),
             session_id,
             session_type: self.session_type(),
