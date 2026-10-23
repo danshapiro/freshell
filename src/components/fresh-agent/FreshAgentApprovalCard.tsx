@@ -14,6 +14,13 @@ import { FreshAgentPlanApprovalCard } from './FreshAgentPlanApprovalCard'
 // the full row width on narrow panes for easy thumbing.
 const BUTTON = 'fresh-agent-approval-button min-h-[2.75rem] flex-1 rounded-md px-4 text-sm disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs'
 
+type FreshAgentApprovalCardProps = {
+  approval: FreshAgentPendingApproval
+  disabled?: boolean
+  onRespond: (decision: FreshAgentApprovalDecision) => void
+  onAlwaysAllow?: (toolName: string) => void
+}
+
 /**
  * Approval card with an inline preview of what is being approved — the exact
  * Bash command, an Edit diff, or pretty-printed input for other tools. Every
@@ -30,29 +37,14 @@ const BUTTON = 'fresh-agent-approval-button min-h-[2.75rem] flex-1 rounded-md px
  * Claude's ExitPlanMode request is a plan to review, not a tool call: it gets
  * the plan card ({@link FreshAgentPlanApprovalCard}).
  */
-export function FreshAgentApprovalCard(props: {
-  approval: FreshAgentPendingApproval
-  disabled?: boolean
-  onRespond: (decision: FreshAgentApprovalDecision) => void
-  onAlwaysAllow?: (toolName: string) => void
-}) {
+export function FreshAgentApprovalCard(props: FreshAgentApprovalCardProps) {
   if (props.approval.toolName === 'ExitPlanMode') {
     return <FreshAgentPlanApprovalCard approval={props.approval} disabled={props.disabled} onRespond={props.onRespond} />
   }
   return <FreshAgentToolApprovalCard {...props} />
 }
 
-function FreshAgentToolApprovalCard({
-  approval,
-  disabled,
-  onRespond,
-  onAlwaysAllow,
-}: {
-  approval: FreshAgentPendingApproval
-  disabled?: boolean
-  onRespond: (decision: FreshAgentApprovalDecision) => void
-  onAlwaysAllow?: (toolName: string) => void
-}) {
+function FreshAgentToolApprovalCard({ approval, disabled, onRespond, onAlwaysAllow }: FreshAgentApprovalCardProps) {
   const suggestionsId = useId()
   const toolName = approval.toolName ?? 'Tool'
   const input = approval.input ?? {}
