@@ -1040,16 +1040,6 @@ pub(crate) fn provider_home() -> Option<PathBuf> {
     std::env::home_dir()
 }
 
-/// Serializes tests (crate-wide) that mutate the process-global
-/// `HOME`/`USERPROFILE`/`CLAUDE_HOME`/`FRESHELL_HOME` env vars: cargo runs
-/// tests in parallel THREADS within one process, so two tests racing to
-/// mutate the SAME vars would otherwise flake (one test's assertion
-/// observing the OTHER test's in-flight env state). Shared `pub(crate)` so
-/// `main.rs`'s resolve-wiring tests serialize with this module's
-/// `provider_home()` tests.
-#[cfg(test)]
-pub(crate) static HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Test-only oracle for the effective user's passwd-entry home directory
 /// (`getpwuid_r`) — the Node `os.homedir()` POSIX fallback when `HOME` is
 /// unset or empty. `pub(crate)` so `main.rs`'s resolve-wiring tests assert
@@ -2416,42 +2406,24 @@ mod tests {
 
     // `provider_home()` (FRESHELL_HOME root-alignment fix): coding-CLI provider
     // session sources must resolve against the REAL `HOME`, never the
-    // `FRESHELL_HOME`-overridden config root. Each test saves + restores both
-    // vars around itself since they're real process env (no injected `Env`
-    // plumbing exists at this call site), matching the existing convention in
-    // `files.rs` (`expand_tilde_uses_home` et al.) -- but ALSO serializes on
-    // `PROVIDER_HOME_ENV_LOCK` because cargo runs tests in parallel THREADS
-    // within one process: two tests racing to mutate the SAME process-global
-    // `HOME`/`FRESHELL_HOME` vars would otherwise flake (one test's assertion
-    // observing the OTHER test's in-flight env state). The lock itself is the
-    // crate-wide `HOME_ENV_TEST_LOCK` (module level, above) so `main.rs`'s
-    // resolve-wiring tests serialize with these.
-    use super::HOME_ENV_TEST_LOCK as PROVIDER_HOME_ENV_LOCK;
+    // `FRESHELL_HOME`-overridden config root. `provider_home()` reads real
+    // process env (no injected `Env` plumbing exists at this call site), so
+    // each test owns the environment through the crate-wide
+    // `crate::test_env_lock::TestEnv`, which restores what it changed.
 
     #[cfg(unix)]
     #[test]
     fn provider_home_ignores_freshell_home_uses_real_home() {
-        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
-        let saved_freshell_home = std::env::var("FRESHELL_HOME").ok();
-        let saved_home = std::env::var("HOME").ok();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
 
-        std::env::set_var("FRESHELL_HOME", "/tmp/freshell-isolated-config-root");
-        std::env::set_var("HOME", "/home/real-user-fixture");
+        env.set("FRESHELL_HOME", "/tmp/freshell-isolated-config-root");
+        env.set("HOME", "/home/real-user-fixture");
 
         assert_eq!(
             provider_home(),
             Some(PathBuf::from("/home/real-user-fixture")),
             "provider_home() must resolve the real HOME, ignoring FRESHELL_HOME"
         );
-
-        match saved_freshell_home {
-            Some(v) => std::env::set_var("FRESHELL_HOME", v),
-            None => std::env::remove_var("FRESHELL_HOME"),
-        }
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     // Node `os.homedir()` platform semantics (libuv `uv_os_homedir`): on
@@ -2463,14 +2435,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn provider_home_unix_uses_passwd_entry_when_home_and_userprofile_unset() {
-        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
-        let saved_freshell_home = std::env::var("FRESHELL_HOME").ok();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_userprofile = std::env::var("USERPROFILE").ok();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
 
-        std::env::set_var("FRESHELL_HOME", "/tmp/freshell-isolated-config-root-2");
-        std::env::remove_var("HOME");
-        std::env::remove_var("USERPROFILE");
+        env.set("FRESHELL_HOME", "/tmp/freshell-isolated-config-root-2");
+        env.remove("HOME");
+        env.remove("USERPROFILE");
 
         let resolved = provider_home();
         assert!(
@@ -2482,30 +2451,15 @@ mod tests {
             Some(super::passwd_entry_home()),
             "an unset HOME must fall back to the passwd-entry home (Node os.homedir() POSIX semantics)"
         );
-
-        match saved_freshell_home {
-            Some(v) => std::env::set_var("FRESHELL_HOME", v),
-            None => std::env::remove_var("FRESHELL_HOME"),
-        }
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match saved_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
     }
 
     #[cfg(unix)]
     #[test]
     fn provider_home_unix_ignores_userprofile_when_home_unset() {
-        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_userprofile = std::env::var("USERPROFILE").ok();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
 
-        std::env::remove_var("HOME");
-        std::env::set_var("USERPROFILE", "/Users/win-fixture");
+        env.remove("HOME");
+        env.set("USERPROFILE", "/Users/win-fixture");
 
         let resolved = provider_home();
         assert_ne!(
@@ -2518,15 +2472,6 @@ mod tests {
             Some(super::passwd_entry_home()),
             "with HOME unset, POSIX must resolve the passwd-entry home"
         );
-
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match saved_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
     }
 
     #[cfg(unix)]
@@ -2536,53 +2481,31 @@ mod tests {
         // an unset HOME — Node's `os.homedir()` never returns an empty
         // string; on POSIX it falls back to the passwd-entry home, never
         // USERPROFILE.
-        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_userprofile = std::env::var("USERPROFILE").ok();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
 
-        std::env::set_var("HOME", "");
-        std::env::set_var("USERPROFILE", "/Users/win-fixture-empty");
+        env.set("HOME", "");
+        env.set("USERPROFILE", "/Users/win-fixture-empty");
 
         assert_eq!(
             provider_home(),
             Some(super::passwd_entry_home()),
             "an EMPTY HOME must behave like unset HOME: passwd-entry fallback, never USERPROFILE"
         );
-
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match saved_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
     }
 
     #[cfg(unix)]
     #[test]
     fn provider_home_unix_prefers_home_and_never_consults_userprofile() {
-        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_userprofile = std::env::var("USERPROFILE").ok();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
 
-        std::env::set_var("HOME", "/home/real-user-fixture");
-        std::env::set_var("USERPROFILE", "/Users/win-fixture");
+        env.set("HOME", "/home/real-user-fixture");
+        env.set("USERPROFILE", "/Users/win-fixture");
 
         assert_eq!(
             provider_home(),
             Some(PathBuf::from("/home/real-user-fixture")),
             "a set, non-empty HOME must win on POSIX (USERPROFILE is never consulted)"
         );
-
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match saved_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
     }
 
     // Native Windows/Tauri parity: `os.homedir()` reads USERPROFILE on
@@ -2591,27 +2514,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn provider_home_windows_uses_userprofile_never_home() {
-        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_userprofile = std::env::var("USERPROFILE").ok();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
 
-        std::env::set_var("HOME", "C:\\never-consulted");
-        std::env::set_var("USERPROFILE", "C:\\Users\\win-fixture");
+        env.set("HOME", "C:\\never-consulted");
+        env.set("USERPROFILE", "C:\\Users\\win-fixture");
 
         assert_eq!(
             provider_home(),
             Some(PathBuf::from("C:\\Users\\win-fixture")),
             "Windows must read USERPROFILE and never consult HOME (Node os.homedir() parity)"
         );
-
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match saved_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
     }
 
     #[test]
@@ -2674,7 +2586,7 @@ mod tests {
         // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
         // while a same-binary mutator holds `CLAUDE_HOME`) — take the
         // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // Regression (bug #7 class, found by the 007 seeded-home differential):
         // Node reads transcripts with `fs.readFile(file,'utf8')` -> invalid
         // bytes become U+FFFD and the session IS indexed; `read_to_string`
@@ -2716,7 +2628,7 @@ mod tests {
         // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
         // while a same-binary mutator holds `CLAUDE_HOME`) — take the
         // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // `real-corrupted.jsonl` has a `cwd` and parses as non-interactive → the
         // default History browse (no includeNonInteractive) hides it → empty
         // page. `healthy.jsonl` has NO `cwd` anywhere → excluded entirely at
@@ -2741,7 +2653,7 @@ mod tests {
         // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
         // while a same-binary mutator holds `CLAUDE_HOME`) — take the
         // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
         let q = DirQuery {
@@ -2763,7 +2675,7 @@ mod tests {
         // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
         // while a same-binary mutator holds `CLAUDE_HOME`) — take the
         // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // `healthy.jsonl` has no `cwd` → excluded at discovery (R10b) even with
         // every include flag set; only the cwd-bearing `real-corrupted.jsonl`
         // (itself untitled-if-you-squint but DOES have a title) surfaces here.
@@ -2991,7 +2903,7 @@ mod tests {
         // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
         // while a same-binary mutator holds `CLAUDE_HOME`) — take the
         // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         // Byte-matched against a live probe of the ORIGINAL: seeding
         // `healthy.jsonl` (renamed to a canonical UUID filename, exactly as
         // `port/oracle/rest-parity/sweep.mjs#seedClaudeSessions` does) and
@@ -3032,7 +2944,7 @@ mod tests {
         // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
         // while a same-binary mutator holds `CLAUDE_HOME`) — take the
         // crate-wide lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = claude_home_with(&["real-corrupted.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
         let q = DirQuery {

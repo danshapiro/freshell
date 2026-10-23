@@ -920,44 +920,15 @@ async fn rollback_commands_keep_direction_target_and_request_fences() {
     }
 }
 
-static SNAPSHOT_OUTAGE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct SnapshotTestEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-impl SnapshotTestEnv {
-    fn isolate(root: &Path) -> Self {
-        let keys = [
-            "HOME",
-            "CODEX_HOME",
-            "CLAUDE_CONFIG_DIR",
-            "CLAUDE_HOME",
-            "XDG_DATA_HOME",
-            "CODEX_CMD",
-            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
-            "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
-        ];
-        let saved = Self(
-            keys.iter()
-                .map(|key| (*key, std::env::var_os(key)))
-                .collect(),
-        );
-        std::env::set_var("HOME", root.join("empty-home"));
-        std::env::set_var("CODEX_HOME", root.join("configured-codex"));
-        std::env::set_var("CLAUDE_CONFIG_DIR", root.join("configured-claude"));
-        std::env::remove_var("CLAUDE_HOME");
-        std::env::set_var("XDG_DATA_HOME", root.join("configured-xdg"));
-        std::env::set_var("CODEX_CMD", "/never-start-a-provider-for-saved-history");
-        saved
-    }
-}
-impl Drop for SnapshotTestEnv {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
+/// Point every provider home at `root` (and keep a real provider from
+/// starting) for the rest of the test, through the crate-wide `TestEnv`.
+fn isolate_snapshot_env(env: &mut crate::test_env_lock::TestEnv, root: &Path) {
+    env.set("HOME", root.join("empty-home"));
+    env.set("CODEX_HOME", root.join("configured-codex"));
+    env.set("CLAUDE_CONFIG_DIR", root.join("configured-claude"));
+    env.remove("CLAUDE_HOME");
+    env.set("XDG_DATA_HOME", root.join("configured-xdg"));
+    env.set("CODEX_CMD", "/never-start-a-provider-for-saved-history");
 }
 
 fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
@@ -1084,9 +1055,9 @@ async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_regi
 
 #[tokio::test]
 async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_wrong_local_store() {
-    let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let _env = SnapshotTestEnv::isolate(dir.path());
+    isolate_snapshot_env(&mut env, dir.path());
     let local_path = dir
         .path()
         .join("configured-codex/sessions/rollout-session-activity.jsonl");
@@ -1264,9 +1235,9 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
 
 #[tokio::test]
 async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_authority() {
-    let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let _env = SnapshotTestEnv::isolate(dir.path());
+    isolate_snapshot_env(&mut env, dir.path());
     let socket = dir.path().join("owned-supervisor.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     drop(listener);
@@ -1431,21 +1402,21 @@ async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_au
 
 #[tokio::test]
 async fn real_gateway_outage_keeps_a_registered_local_provider_snapshot_live() {
-    let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
+    let mut env = crate::test_env_lock::TestEnv::lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let _env = SnapshotTestEnv::isolate(dir.path());
-    std::env::set_var(
+    isolate_snapshot_env(&mut env, dir.path());
+    env.set(
         "CODEX_CMD",
         format!(
             "node {}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
             env!("CARGO_MANIFEST_DIR")
         ),
     );
-    std::env::set_var(
+    env.set(
         "FAKE_CODEX_APP_SERVER_BEHAVIOR",
         r#"{"threadStartThreadId":"local-owned-thread"}"#,
     );
-    std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+    env.set("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
     let (tx, mut rx) = broadcast::channel(64);
     let broadcast = Arc::new(tx);
     let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());

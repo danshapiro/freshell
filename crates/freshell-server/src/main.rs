@@ -4802,37 +4802,6 @@ mod tests {
         assert_eq!(second_epoch, first_epoch + 1);
     }
 
-    /// Save-and-restore guard for one env var (tests below mutate real
-    /// process env; the shared `HOME_ENV_TEST_LOCK` serializes them
-    /// crate-wide). Restores on drop, panic included.
-    struct EnvVarGuard {
-        name: &'static str,
-        saved: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(name: &'static str) -> Self {
-            let saved = std::env::var_os(name);
-            std::env::remove_var(name);
-            Self { name, saved }
-        }
-
-        fn set(name: &'static str, value: &str) -> Self {
-            let saved = std::env::var_os(name);
-            std::env::set_var(name, value);
-            Self { name, saved }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.saved.take() {
-                Some(v) => std::env::set_var(self.name, v),
-                None => std::env::remove_var(self.name),
-            }
-        }
-    }
-
     /// TERM-09 boot wiring (responsive-terminal-restore Workstream 3): the
     /// boot resolution must fail fast on a configuration that would restore
     /// the spill≥disconnect inversion, naming the offending env vars — and
@@ -4841,9 +4810,10 @@ mod tests {
     /// TERMINAL_* vars).
     #[test]
     fn term09_boot_resolution_fails_fast_on_inverted_env() {
-        let _queue = EnvVarGuard::unset("TERMINAL_CLIENT_QUEUE_MAX_BYTES");
-        let _catastrophic = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES");
-        let _stall = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_STALL_MS");
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        env.remove("TERMINAL_CLIENT_QUEUE_MAX_BYTES");
+        env.remove("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES");
+        env.remove("TERMINAL_WS_CATASTROPHIC_STALL_MS");
 
         // Defaults must boot and satisfy the strict ordering.
         let defaults = resolve_term09_config().expect("defaults must resolve");
@@ -4851,7 +4821,7 @@ mod tests {
 
         // An inverted override (disconnect below spill — the production
         // incident's shape) refuses to boot, naming both env vars.
-        let _inverted = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "1048576");
+        env.set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "1048576");
         let err = resolve_term09_config().expect_err("inverted env must refuse boot");
         let message = err.to_string();
         assert!(
@@ -4859,19 +4829,18 @@ mod tests {
                 && message.contains("TERMINAL_CLIENT_QUEUE_MAX_BYTES"),
             "the boot error must name the offending env vars: {message}"
         );
-        drop(_inverted);
+        env.remove("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES");
 
         // An equalized pair (disconnect == spill) also refuses.
-        let _equalized_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "268435456");
-        let _equalized_cat =
-            EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "268435456");
+        env.set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "268435456");
+        env.set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "268435456");
         resolve_term09_config().expect_err("equalized env must refuse boot");
-        drop(_equalized_queue);
-        drop(_equalized_cat);
+        env.remove("TERMINAL_CLIENT_QUEUE_MAX_BYTES");
+        env.remove("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES");
 
         // A correctly-ordered override boots.
-        let _ordered_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "2097152");
-        let _ordered_cat = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "8388608");
+        env.set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "2097152");
+        env.set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "8388608");
         let tuned = resolve_term09_config().expect("ordered env must boot");
         assert_eq!(tuned.queue_max_bytes, 2 * 1024 * 1024);
         assert_eq!(tuned.catastrophic_buffered_bytes, 8 * 1024 * 1024);
@@ -4950,11 +4919,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn wire_home_dir_unix_treats_empty_home_as_unset_using_passwd_entry() {
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _home = EnvVarGuard::set("HOME", "");
-        let _userprofile = EnvVarGuard::set("USERPROFILE", "/Users/win-fixture-wire");
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        env.set("HOME", "");
+        env.set("USERPROFILE", "/Users/win-fixture-wire");
         let resolved = resolve_wire_home_dir().map(|h| h.as_str().to_string());
         assert_ne!(
             resolved.as_deref(),
@@ -4975,11 +4942,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn wire_home_dir_windows_uses_userprofile_never_home() {
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _home = EnvVarGuard::set("HOME", "C:\\never-consulted");
-        let _userprofile = EnvVarGuard::set("USERPROFILE", "C:\\Users\\win-fixture-wire");
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        env.set("HOME", "C:\\never-consulted");
+        env.set("USERPROFILE", "C:\\Users\\win-fixture-wire");
         assert_eq!(
             resolve_wire_home_dir().map(|h| h.as_str().to_string()),
             Some("C:\\Users\\win-fixture-wire".to_string()),
@@ -4995,15 +4960,10 @@ mod tests {
         // cwd-less/subagent transcript omitted from the index produces a
         // healthy-looking ready-empty where Node (os.homedir()) finds it.
         const SESSION_ID: &str = "AB2AFDA6-A340-443E-BA60-024A1B3554B4";
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
-        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
-        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = env_test_temp_dir("claude-fallback");
-        let _home = EnvVarGuard::set("HOME", home.to_str().unwrap());
-        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
+        env.set("HOME", home.to_str().unwrap());
+        env.remove("CLAUDE_HOME");
 
         let project = home.join(".claude").join("projects").join("-repo-alpha");
         std::fs::create_dir_all(&project).expect("mkdir claude project dir");
@@ -5030,16 +4990,11 @@ mod tests {
         // transcript living ONLY under `USERPROFILE/.claude` must NOT be
         // surfaced (the pre-fix HOME||USERPROFILE approximation found it).
         const SESSION_ID: &str = "0C7B39D1-52E4-4F0F-9E7C-4E2B7A11D9AA";
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
-        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
-        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
         let profile = env_test_temp_dir("claude-fallback-userprofile");
-        let _home = EnvVarGuard::unset("HOME");
-        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
-        let _userprofile = EnvVarGuard::set("USERPROFILE", profile.to_str().unwrap());
+        env.remove("HOME");
+        env.remove("CLAUDE_HOME");
+        env.set("USERPROFILE", profile.to_str().unwrap());
 
         let project = profile.join(".claude").join("projects").join("-repo-beta");
         std::fs::create_dir_all(&project).expect("mkdir claude project dir");
@@ -5067,15 +5022,10 @@ mod tests {
         // USERPROFILE-backed on Windows). The exact-id fallback itself —
         // not just `provider_home()` — must find the transcript there.
         const SESSION_ID: &str = "AB2AFDA6-A340-443E-BA60-024A1B3554B4";
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
-        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
-        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = env_test_temp_dir("claude-fallback");
-        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
-        let _userprofile = EnvVarGuard::set("USERPROFILE", home.to_str().unwrap());
+        env.remove("CLAUDE_HOME");
+        env.set("USERPROFILE", home.to_str().unwrap());
 
         let project = home.join(".claude").join("projects").join("-repo-alpha");
         std::fs::create_dir_all(&project).expect("mkdir claude project dir");
@@ -5136,7 +5086,7 @@ mod tests {
         // Env-first reader (`claude_home` may resolve a FOREIGN root while a
         // same-binary mutator holds `CLAUDE_HOME`) — take the crate-wide
         // lock (see `crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = tempfile::tempdir().expect("tempdir");
         let proj = home.path().join(".claude").join("projects").join("-p");
         std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
@@ -5150,7 +5100,7 @@ mod tests {
     #[test]
     fn claude_empty_projects_tree_is_definitively_absent() {
         // Env-first reader — take the crate-wide lock (`crate::test_env_lock`).
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(home.path().join(".claude").join("projects"))
             .expect("mkdir empty projects");
@@ -5169,7 +5119,7 @@ mod tests {
         // concurrently running discovery test's CLAUDE_HOME (readable tree,
         // no sess-1.jsonl) flipped the gate to "definitively absent" and
         // failed the must-DEFER assert.
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = tempfile::tempdir().expect("tempdir");
         let projects = home.path().join(".claude").join("projects");
         std::fs::create_dir_all(&projects).expect("mkdir projects");
@@ -5191,7 +5141,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // Env-first reader — take the crate-wide lock (`crate::test_env_lock`):
         // the gate-flake twin of the projects-root case above.
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = tempfile::tempdir().expect("tempdir");
         let projects = home.path().join(".claude").join("projects");
         let proj = projects.join("-p");
@@ -5214,7 +5164,7 @@ mod tests {
         // Env-first reader — take the crate-wide lock (`crate::test_env_lock`):
         // a concurrent mutator's foreign CLAUDE_HOME HAS a projects root, so
         // the no-root defer branch would flip to "definitively absent".
-        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let _env = crate::test_env_lock::TestEnv::lock_blocking();
         let home = tempfile::tempdir().expect("tempdir");
         assert!(
             !transcript_definitively_absent(home.path(), "claude", "sess-1"),
@@ -5265,17 +5215,15 @@ mod tests {
     }
 
     /// `featureFlags.kilroy` under a given `KILROY_ENABLED` value (`None` = unset).
-    /// Serializes on the crate-wide `HOME_ENV_TEST_LOCK`; [`EnvVarGuard`] restores
-    /// the prior value on drop (panic included), so a real-world `KILROY_ENABLED`
-    /// never leaks across tests in either direction.
+    /// Owns the process env through the crate-wide `TestEnv`, which restores
+    /// the prior value on drop (panic included), so a real-world
+    /// `KILROY_ENABLED` never leaks across tests in either direction.
     fn kilroy_flag_for_env(value: Option<&str>) -> bool {
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _kilroy = match value {
-            Some(v) => EnvVarGuard::set("KILROY_ENABLED", v),
-            None => EnvVarGuard::unset("KILROY_ENABLED"),
-        };
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        match value {
+            Some(v) => env.set("KILROY_ENABLED", v),
+            None => env.remove("KILROY_ENABLED"),
+        }
         build_platform_payload(serde_json::json!({}), false)["featureFlags"]["kilroy"]
             .as_bool()
             .expect("featureFlags.kilroy is always a bool")
@@ -5351,10 +5299,8 @@ mod tests {
         // mirroring Node's `process.platform !== 'win32'`). `KILROY_ENABLED` is
         // pinned off under the shared lock so the assertion is
         // environment-independent.
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _kilroy = EnvVarGuard::unset("KILROY_ENABLED");
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        env.remove("KILROY_ENABLED");
         let cell = ai_title::AiKeyCell::init(Some("sk-live-abc123".into()), None);
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
@@ -5365,10 +5311,8 @@ mod tests {
 
     #[test]
     fn platform_payload_ai_enabled_false_without_key() {
-        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _kilroy = EnvVarGuard::unset("KILROY_ENABLED");
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        env.remove("KILROY_ENABLED");
         let cell = ai_title::AiKeyCell::init(None, None);
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
@@ -5392,51 +5336,48 @@ mod tests {
     }
 
     // `load_dotenv_from` (legacy parity: `import 'dotenv/config'`,
-    // `server/index.ts:2-3`). Each test uses its own temp dir + a uniquely-named
-    // sentinel var, so parallel test execution can't collide.
+    // `server/index.ts:2-3`). Each test writes its `.env` into a private temp
+    // dir (a fixed path under the shared temp root collided with another
+    // concurrently running copy of this binary deleting it) and owns the
+    // process env through `TestEnv`, which also undoes the variable that
+    // `load_dotenv_from` sets.
 
     #[test]
     fn load_dotenv_from_sets_var_absent_from_process_env() {
-        let dir = std::env::temp_dir().join("freshell-dotenv-test-unset");
-        std::fs::create_dir_all(&dir).unwrap();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join(".env"),
+            dir.path().join(".env"),
             "FRESHELL_TASK7_TEST_VAR_UNSET=from-dotenv\n",
         )
         .unwrap();
-        std::env::remove_var("FRESHELL_TASK7_TEST_VAR_UNSET");
+        env.remove("FRESHELL_TASK7_TEST_VAR_UNSET");
 
-        load_dotenv_from(&dir);
+        load_dotenv_from(dir.path());
 
         assert_eq!(
             std::env::var("FRESHELL_TASK7_TEST_VAR_UNSET").as_deref(),
             Ok("from-dotenv")
         );
-
-        std::env::remove_var("FRESHELL_TASK7_TEST_VAR_UNSET");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_dotenv_from_never_overrides_existing_process_env_var() {
-        let dir = std::env::temp_dir().join("freshell-dotenv-test-set");
-        std::fs::create_dir_all(&dir).unwrap();
+        let mut env = crate::test_env_lock::TestEnv::lock_blocking();
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join(".env"),
+            dir.path().join(".env"),
             "FRESHELL_TASK7_TEST_VAR_SET=from-dotenv\n",
         )
         .unwrap();
-        std::env::set_var("FRESHELL_TASK7_TEST_VAR_SET", "already-set");
+        env.set("FRESHELL_TASK7_TEST_VAR_SET", "already-set");
 
-        load_dotenv_from(&dir);
+        load_dotenv_from(dir.path());
 
         assert_eq!(
             std::env::var("FRESHELL_TASK7_TEST_VAR_SET").as_deref(),
             Ok("already-set")
         );
-
-        std::env::remove_var("FRESHELL_TASK7_TEST_VAR_SET");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // SAFE-01: startup token hardening (`server/auth.ts#validateStartupSecurity`).
