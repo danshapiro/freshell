@@ -38,6 +38,7 @@
 
 pub mod claude;
 pub(crate) mod claude_projection;
+pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
 pub mod claude_spawn;
 pub mod codex;

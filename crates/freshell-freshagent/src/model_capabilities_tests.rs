@@ -414,17 +414,59 @@ fn claude_catalog_keeps_live_effort_choices_and_deduplicates_models() {
     assert!(normalize_claude_catalog(json!([{"displayName": "No id"}])).is_err());
 }
 
+/// Stage a copy of the sidecar package in `directory` (the catalog helper
+/// imports its siblings), with a stub in place of the session entry and
+/// `sdk_source` as the SDK module named `sdk_name`, for
+/// `FRESHELL_CLAUDE_SDK_QUERY_MODULE=./<sdk_name>`. Returns the stub entry.
+fn stage_catalog_sidecar(directory: &std::path::Path, sdk_name: &str, sdk_source: &str) -> PathBuf {
+    let package = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../freshell-claude-sidecar"
+    ));
+    for module in std::fs::read_dir(&package).expect("read the sidecar package") {
+        let module = module.expect("sidecar package entry").path();
+        if module
+            .extension()
+            .is_some_and(|extension| extension == "mjs")
+        {
+            let name = module.file_name().expect("module file name");
+            std::fs::copy(&module, directory.join(name)).expect("copy a sidecar module");
+        }
+    }
+    assert!(
+        directory.join("model-catalog.mjs").is_file(),
+        "the catalog helper was copied"
+    );
+    let sidecar_entry = directory.join("index.mjs");
+    std::fs::write(&sidecar_entry, "export {}\n").expect("write sidecar entry");
+    std::fs::write(directory.join(sdk_name), sdk_source).expect("write fake SDK module");
+    sidecar_entry
+}
+
+/// Runs the catalog probe against a staged copy of the sidecar package
+/// ([`stage_catalog_sidecar`]) and returns the probe's answer.
+async fn probe_relocated_catalog(sdk_name: &str, sdk_source: &str) -> CatalogOut {
+    let directory = tempfile::tempdir().expect("temporary sidecar directory");
+    let sidecar_entry = stage_catalog_sidecar(directory.path(), sdk_name, sdk_source);
+
+    std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &sidecar_entry);
+    std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+    std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", format!("./{sdk_name}"));
+    let result = ClaudeCatalogProbe::default().probe(None).await;
+    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+    std::env::remove_var("FRESHELL_CLAUDE_NODE");
+    std::env::remove_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE");
+    result
+}
+
 /// The installed Electron runtime relocates the sidecar away from the source
 /// checkout. A relative SDK seam must therefore be resolved by the copied
 /// model-catalog helper, not by the source-tree helper baked into the binary.
 #[tokio::test]
 async fn claude_catalog_probe_uses_the_configured_sidecar_directory() {
     let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let directory = tempfile::tempdir().expect("temporary sidecar directory");
-    let sdk_name = "task-b-relocated-sdk.mjs";
-    let sidecar_entry = stage_catalog_sidecar(
-        directory.path(),
-        sdk_name,
+    let result = probe_relocated_catalog(
+        "task-b-relocated-sdk.mjs",
         r#"
 export function query() {
   return {
@@ -438,15 +480,8 @@ export function query() {
   }
 }
 "#,
-    );
-
-    std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &sidecar_entry);
-    std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
-    std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", format!("./{sdk_name}"));
-    let result = ClaudeCatalogProbe::default().probe(None).await;
-    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
-    std::env::remove_var("FRESHELL_CLAUDE_NODE");
-    std::env::remove_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE");
+    )
+    .await;
 
     let models = result.expect("configured sidecar catalog should be probed");
     assert_eq!(models.len(), 1);
@@ -456,22 +491,86 @@ export function query() {
     assert!(models[0].supports_adaptive_thinking);
 }
 
-/// Stage a relocated sidecar directory holding the real catalog helper (and
-/// the modules it imports) plus a fake SDK module; returns the index path.
-fn stage_catalog_sidecar(directory: &std::path::Path, sdk_name: &str, sdk_source: &str) -> PathBuf {
-    for module in ["model-catalog.mjs", "exec-profile.mjs", "sdk-env.mjs"] {
-        std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../freshell-claude-sidecar")
-                .join(module),
-            directory.join(module),
-        )
-        .unwrap_or_else(|error| panic!("copy {module}: {error}"));
-    }
-    std::fs::write(directory.join(sdk_name), sdk_source).expect("write fake SDK module");
-    let sidecar_entry = directory.join("index.mjs");
-    std::fs::write(&sidecar_entry, "export {}\n").expect("write sidecar entry");
-    sidecar_entry
+/// G14 / design §5.9 (review F7): the catalog probe's stderr is the
+/// sidecar's JSONL log, so it goes through the same stderr logger as a session
+/// sidecar: each record is re-emitted at its own severity, on success too.
+#[tokio::test]
+async fn claude_catalog_probe_re_emits_its_log_records_at_their_severity() {
+    use crate::claude_sidecar_io::test_capture::{capture, with_message};
+    let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let (events, _capture) = capture();
+    let result = probe_relocated_catalog(
+        "f7-logging-sdk.mjs",
+        r#"
+export function query({ options }) {
+  options.stderr('cli says hello\n')
+  return {
+    supportedModels: async () => [{ value: 'f7-model', displayName: 'F7 Model' }],
+    close: async () => { throw new Error('close failed for the test') },
+  }
+}
+"#,
+    )
+    .await;
+    assert_eq!(result.expect("the catalog is read")[0].id, "f7-model");
+
+    let records = with_message(&events, "freshagent.claude.sidecar_log");
+    let record = |event: &str| {
+        records
+            .iter()
+            .find(|record| record.fields.get("sidecar_event").map(String::as_str) == Some(event))
+            .unwrap_or_else(|| panic!("no {event} record among {records:?}"))
+    };
+    let cli = record("cli.stderr");
+    assert_eq!(cli.level, tracing::Level::INFO);
+    assert_eq!(
+        cli.fields.get("component").map(String::as_str),
+        Some("claude-model-catalog")
+    );
+    assert_eq!(record("catalog.close_failed").level, tracing::Level::WARN);
+}
+
+/// On failure the probe's records keep their own severity, and the failure
+/// warning gives the exit status and points to them, instead of carrying the
+/// whole stderr as one field.
+#[tokio::test]
+async fn claude_catalog_probe_failure_keeps_its_records_apart_from_the_warning() {
+    use crate::claude_sidecar_io::test_capture::{capture, with_message};
+    let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let (events, _capture) = capture();
+    let result = probe_relocated_catalog(
+        "f7-failing-sdk.mjs",
+        r#"
+export function query() {
+  return {
+    supportedModels: async () => { throw new Error('not signed in for the test') },
+    close: async () => {},
+  }
+}
+"#,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("the catalog is unavailable").code,
+        "CAPABILITY_PROBE_FAILED"
+    );
+
+    let unavailable = with_message(&events, "freshagent.claude.sidecar_log")
+        .into_iter()
+        .find(|record| {
+            record.fields.get("sidecar_event").map(String::as_str) == Some("catalog.unavailable")
+        })
+        .expect("the catalog.unavailable record is re-emitted");
+    assert_eq!(unavailable.level, tracing::Level::ERROR);
+
+    let warning = with_message(&events, "freshagent.claude.model_catalog_unavailable");
+    assert_eq!(warning.len(), 1, "one failure warning: {warning:?}");
+    assert_eq!(warning[0].level, tracing::Level::WARN);
+    assert!(warning[0].fields.contains_key("status"));
+    assert!(
+        !warning[0].fields.contains_key("stderr"),
+        "the warning does not carry the stderr blob: {warning:?}"
+    );
 }
 
 /// G30: in managed mode the session sidecar authenticates with the managed

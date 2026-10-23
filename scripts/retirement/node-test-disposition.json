@@ -1728,10 +1728,10 @@
     "subject": "re-homed shared/tool subject",
     "decision": "retained",
     "replacementRequired": true,
-    "survivingTest": "test/unit/claude-sidecar/fixtures/fake-query-module.mjs",
+    "survivingTest": "test/unit/claude-sidecar/harness.ts",
     "requiredLane": "default-vitest",
-    "selector": "test/unit/claude-sidecar/fixtures/fake-query-module.mjs",
-    "latestReceipt": "PASS task-006"
+    "selector": "test/unit/claude-sidecar/permission-channel.test.ts",
+    "latestReceipt": "PASS C03 (the scripted fake SDK is replaced by the real index.mjs over the CLI simulator, test/fixtures/claude-cli-sim)"
   },
   {
     "oldPath": "test/unit/server/claude-sidecar/fixtures/sidecar-crash-probe.mjs",

@@ -118,6 +118,13 @@ pub struct FreshClaudeState {
     /// Host-only selection of the fixed Freshell stdio MCP recipe. Its endpoint
     /// and grant remain in the child environment, never in create IPC.
     hosted_mcp: bool,
+    /// Test seam (`test-support` feature, C04 rigs): the complete environment of
+    /// every claude sidecar this state spawns, replacing the inherited one (the
+    /// ownership tag is still layered on). `None` in production: the sidecar
+    /// inherits the server's environment. Lets a rig point the real sidecar at
+    /// the CLI simulator or a local endpoint with an isolated HOME, without
+    /// mutating this process's environment.
+    sidecar_environment: Option<Arc<[(String, String)]>>,
     /// The shared WS broadcast bus (pre-serialized frames), fanned out by every
     /// `freshell-ws` connection so the oracle's capture socket records
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`.
@@ -788,6 +795,7 @@ impl FreshClaudeState {
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
             hosted_mcp: false,
+            sidecar_environment: None,
             broadcast_tx,
             checkpoint_event_sink: crate::CheckpointEventSink::default(),
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
@@ -825,6 +833,24 @@ impl FreshClaudeState {
     pub fn with_hosted_mcp(mut self, selected: bool) -> Self {
         self.hosted_mcp = selected;
         self
+    }
+
+    /// Test seam (see [`Self::sidecar_environment`]): every sidecar this state
+    /// spawns gets exactly `environment` (plus its ownership tag) instead of
+    /// inheriting the server's environment.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_sidecar_environment(
+        mut self,
+        environment: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.sidecar_environment = Some(environment.into_iter().collect());
+        self
+    }
+
+    /// Spawn one claude sidecar process (create, attach-resume and rollback all
+    /// come through here) for a session of `session_type`.
+    async fn spawn_sidecar_process(&self, session_type: &str) -> Result<SpawnedSidecar, String> {
+        spawn_sidecar(self.sidecar_environment.as_deref(), session_type).await
     }
 
     pub fn set_checkpoint_event_persister(
@@ -1119,31 +1145,59 @@ impl FreshClaudeState {
         &self.leases
     }
 
-    /// The coordinator key that fences an operation on the session behind
-    /// `map_key`, addressed on the wire as `wire_id`. The coordinator keys a
-    /// claude session by its durable id — the map key and a new pane's wire id
-    /// are the lane's own placeholder — so once the CLI has reported the
-    /// session, its durable id is the key (the rule `handle_attach` and
-    /// `handle_kill` follow). Before the report (`system/init`, which the CLI
-    /// emits only once a prompt runs) the wire id is the key if the
-    /// coordinator holds a record for it; otherwise nothing owns the session
-    /// yet and there is nothing to fence: `None`. Such a session has no
-    /// durable id to hand off, reattach or roll back, and a close removes it
-    /// from the sessions map.
-    async fn fence_owner_key(&self, map_key: &str, wire_id: &str) -> Option<String> {
-        let durable = self
-            .sessions
-            .lock()
-            .await
-            .get(map_key)
-            .and_then(|session| session.cli_session_id.clone());
-        if let Some(durable) = durable {
-            return Some(self.resolve_ownership_key(&durable));
+    /// The coordinator key a claude session is owned under. The coordinator
+    /// keys a claude session by its durable id (the map key and the pane's wire
+    /// id are the lane's own placeholder), so once the CLI has reported the
+    /// session (`system/init`, which it emits only once a prompt runs, T1) that
+    /// id is the key, as in `handle_attach`. Before the report, or when
+    /// `map_key` names no live session, the wire id is. Either resolves through
+    /// the coordinator's alias walk. Kill and send both address the owner
+    /// through this one rule. C23 (durable id minted at create) makes the
+    /// durable id known from the start and removes the wire-id fallback.
+    async fn claude_owner_key(&self, map_key: Option<&str>, wire_id: &str) -> ClaudeOwnerKey {
+        let durable = match map_key {
+            Some(map_key) => self
+                .sessions
+                .lock()
+                .await
+                .get(map_key)
+                .and_then(|session| session.cli_session_id.clone()),
+            None => None,
+        };
+        match durable {
+            Some(durable) => ClaudeOwnerKey {
+                key: self.resolve_ownership_key(&durable),
+                reported: true,
+            },
+            None => ClaudeOwnerKey {
+                key: self.resolve_ownership_key(wire_id),
+                reported: false,
+            },
         }
-        let key = self.resolve_ownership_key(wire_id);
-        match self.ownership_snapshot(PROVIDER, &key).state {
+    }
+
+    /// The coordinator key that fences a send to the session behind `map_key`,
+    /// or `None` when the send runs unfenced. A reported session is always
+    /// fenced on its durable id, and a supplied observed pair is always checked
+    /// (against a record the coordinator does not hold, it is stale and the
+    /// guard refuses it typed). The one unfenced case is a session the CLI has
+    /// not reported, with no record in the coordinator and no pair on the
+    /// send: a new pane's first message, which is what makes the CLI report
+    /// it. Such a session has no durable id to hand off, reattach or roll back,
+    /// and a close removes it from the map.
+    async fn send_owner_key(
+        &self,
+        map_key: &str,
+        wire_id: &str,
+        fence: Option<freshell_ownership::ObservedFence>,
+    ) -> Option<String> {
+        let owner = self.claude_owner_key(Some(map_key), wire_id).await;
+        if owner.reported || fence.is_some() {
+            return Some(owner.key);
+        }
+        match self.ownership_snapshot(PROVIDER, &owner.key).state {
             freshell_ownership::OwnershipState::Vacant => None,
-            _ => Some(key),
+            _ => Some(owner.key),
         }
     }
 
@@ -1903,6 +1957,45 @@ impl FreshClaudeState {
         }
     }
 
+    /// The one way a claude attention edge leaves the server: every site that
+    /// forwards or mints a `freshAgent.turn.complete` / `freshAgent.turn.waiting`
+    /// calls this (design §9.2 I-1; C18's `ClaudeEdgeHub::emit` replaces it).
+    /// It logs the edge at info (G14, design §5.5: ids, type, source and `at`;
+    /// never content), then broadcasts its client frame. `stamp` is the
+    /// envelope id clients address the session by; `sidecar_session_id` is the
+    /// id inside the event, as the sidecar names the session.
+    pub(crate) fn emit_attention_edge(
+        &self,
+        edge: AttentionEdge,
+        stamp: &str,
+        sidecar_session_id: &str,
+        session_type: &str,
+        at: i64,
+        source: AttentionEdgeSource,
+    ) {
+        let source = source.as_str();
+        match edge {
+            AttentionEdge::TurnComplete => tracing::info!(
+                provider = PROVIDER, session_id = %stamp, session_type = %session_type,
+                source, at, "freshagent.turn.complete"
+            ),
+            AttentionEdge::Waiting => tracing::info!(
+                provider = PROVIDER, session_id = %stamp, session_type = %session_type,
+                source, at, "freshagent.turn.waiting"
+            ),
+        }
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({
+                "type": edge.wire_type(),
+                "sessionId": sidecar_session_id,
+                "at": at,
+            }),
+            provider: PROVIDER.to_string(),
+            session_id: stamp.to_string(),
+            session_type: session_type.to_string(),
+        }));
+    }
+
     async fn broadcast_checkpoint_frame(
         &self,
         frame: String,
@@ -2318,8 +2411,15 @@ impl FreshClaudeState {
             .as_deref()
             .and_then(|sid| self.claim_dead_state_snapshot(sid));
 
-        let (mut child, mut stdin, stdout, ownership_id, tree_guard) = match spawn_sidecar().await {
-            Ok(parts) => parts,
+        let SpawnedSidecar {
+            mut child,
+            mut stdin,
+            stdout,
+            ownership_id,
+            log_labels,
+            tree_guard,
+        } = match self.spawn_sidecar_process(session_type).await {
+            Ok(spawned) => spawned,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -2524,6 +2624,7 @@ impl FreshClaudeState {
         // pending-set fold live here). `Some(settings)` => the consumer records a
         // binding row at `sdk.session.init`.
         let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
+        log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
@@ -3155,18 +3256,11 @@ impl FreshClaudeState {
                 // lane resolution the stamp path uses (placeholder wire
                 // ids resolve through the live session's recorded cli id;
                 // a durable wire id is itself).
-                let canonical = match self.resolve_session_key(&session_id).await {
-                    Some(mk) => {
-                        let durable = self
-                            .sessions
-                            .lock()
-                            .await
-                            .get(&mk)
-                            .and_then(|sess| sess.cli_session_id.clone());
-                        durable.unwrap_or_else(|| self.resolve_ownership_key(&session_id))
-                    }
-                    None => self.resolve_ownership_key(&session_id),
-                };
+                let live_key = self.resolve_session_key(&session_id).await;
+                let canonical = self
+                    .claude_owner_key(live_key.as_deref(), &session_id)
+                    .await
+                    .key;
                 let snap = registry.observe(PROVIDER, &canonical);
                 match snap.state.clone() {
                     freshell_ownership::OwnershipState::Live {
@@ -4435,16 +4529,20 @@ impl FreshClaudeState {
         // Arm the coordinator guard only after the send has waited behind any
         // earlier turn. A lifecycle transition during that wait advances the
         // generation, so the captured fence is checked against the owner that
-        // will actually receive this prompt. Checkpointed sends always require
-        // the fence when the coordinator is wired; ordinary legacy sends keep
-        // their existing unfenced behavior, while any supplied fence is honored.
-        // The fence keys on the record that owns the session (its durable id
-        // once reported), never on a new pane's placeholder wire id. A lane
-        // without a coordinator (the session host's) has nothing to fence.
+        // will actually receive this prompt. Checkpointed sends go through the
+        // guard when the coordinator is wired, and any supplied fence is
+        // honored; ordinary legacy sends keep their existing unfenced
+        // behavior. The fence keys on the record that owns the session (its
+        // durable id once reported), never on a new pane's placeholder wire id
+        // (`send_owner_key`). The one exception is `send_owner_key`'s: an
+        // unfenced send to a session the CLI has not reported and the
+        // coordinator holds no record for (a new pane's first message) runs
+        // unguarded. A lane without a coordinator (the session host's) has
+        // nothing to fence.
         let fenced = msg.checkpoint_intent.is_some() || send_fence.is_some();
         let ownership_guard = if fenced && self.ownership.is_some() {
-            match self.fence_owner_key(&map_key, &session_id).await {
-                Some(owner_key) => match crate::ownership_lane::arm_reclaimless_op_guard(
+            if let Some(owner_key) = self.send_owner_key(&map_key, &session_id, send_fence).await {
+                match crate::ownership_lane::arm_reclaimless_op_guard(
                     &self.ownership,
                     PROVIDER,
                     &owner_key,
@@ -4456,25 +4554,24 @@ impl FreshClaudeState {
                     crate::ownership_lane::LaneOpGuard::Unwired => None,
                     crate::ownership_lane::LaneOpGuard::Refused { message } => {
                         tracing::warn!(target: "freshell_freshagent::claude",
-                            session_id = %session_id, owner_key = %owner_key,
-                            request_id = ?request_id,
-                            "fresh_agent_send_refused: ownership guard refused");
+                        session_id = %session_id, owner_key = %owner_key,
+                        request_id = ?request_id,
+                        "fresh_agent_send_refused: ownership guard refused");
                         self.send_error(&request_id, "SESSION_RESERVED", &message);
                         return;
                     }
-                },
-                None => {
-                    // Nothing owns the session in the coordinator yet: the CLI
-                    // reports the session only once a prompt runs, and this
-                    // send is what makes it run. Refusing it would refuse
-                    // every new pane's first message.
-                    tracing::debug!(target: "freshell_freshagent::claude",
-                        session_id = %session_id, request_id = ?request_id,
-                        event = "freshagent.claude.send_before_session_report",
-                        "the send runs unfenced: the CLI has not reported the session \
-                         yet and the coordinator holds no record for it");
-                    None
                 }
+            } else {
+                // Nothing owns the session in the coordinator yet and the send
+                // names no owner: the CLI reports the session only once a
+                // prompt runs (T1), and this send is what makes it run.
+                // Refusing it would refuse every new pane's first message.
+                tracing::debug!(target: "freshell_freshagent::claude",
+                    session_id = %session_id, request_id = ?request_id,
+                    event = "freshagent.claude.send_before_session_report",
+                    "the send runs unfenced: the CLI has not reported the session yet \
+                     and the coordinator holds no record for it");
+                None
             }
         } else {
             None
@@ -6421,7 +6518,7 @@ impl FreshClaudeState {
             }
             let create_req = Value::Object(create_req);
             match self
-                .rollback_spawn_create(&create_req, lease_guard.as_mut())
+                .rollback_spawn_create(&create_req, session_type, lease_guard.as_mut())
                 .await
             {
                 Ok(ok) => break Ok(ok),
@@ -6455,6 +6552,7 @@ impl FreshClaudeState {
             stdin,
             reader,
             ownership_id,
+            log_labels,
             sidecar_session_id,
             preseeded_init,
             cli_id,
@@ -6479,6 +6577,7 @@ impl FreshClaudeState {
         // the SAME lock regardless of when it resolved its handle).
         let (adopted_tx, adopted_rx) = tokio::sync::oneshot::channel();
         let broadcast_id = Arc::new(std::sync::Mutex::new(op.session_id.clone()));
+        log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         // The respawn is fresh: nothing announced yet; the consumer's status
         // fold owns the tracked status from here.
@@ -7228,7 +7327,15 @@ impl FreshClaudeState {
         // advances the durable tombstone past it and the commit below
         // REFUSES instead of undoing the newer close.
         let claim_dead_state = self.claim_dead_state_snapshot(durable);
-        let (mut child, mut stdin, stdout, ownership_id, tree_guard) = spawn_sidecar()
+        let SpawnedSidecar {
+            mut child,
+            mut stdin,
+            stdout,
+            ownership_id,
+            log_labels,
+            tree_guard,
+        } = self
+            .spawn_sidecar_process(session_type_str(msg.session_type))
             .await
             .map_err(ResumeClaudeError::Transient)?;
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
@@ -7331,6 +7438,7 @@ impl FreshClaudeState {
         // attaches with the old id still resolve — no repeat-fire, V7 §4); `None`
         // records nothing (no laundered blank row under the new id, V7/A10).
         let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
+        log_labels.bind_session(&broadcast_id);
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
@@ -8792,7 +8900,26 @@ impl FreshClaudeState {
                 // Task 10b: stamp the envelope from the SHARED handle (not the captured
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
+                let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+                if let Some(edge) = AttentionEdge::from_sidecar_type(line_type) {
+                    // The sidecar's attention edges leave through the one edge
+                    // exit (logged there, G14).
+                    match value.get("at").and_then(Value::as_i64) {
+                        Some(at) => state.emit_attention_edge(
+                            edge,
+                            &stamp,
+                            &sidecar_session_id,
+                            &session_type,
+                            at,
+                            AttentionEdgeSource::Sidecar,
+                        ),
+                        // The client drops an edge without a numeric `at`; say so here.
+                        None => tracing::warn!(target: "freshell_freshagent::claude",
+                            provider = PROVIDER, session_id = %stamp,
+                            session_type = %session_type, edge = edge.wire_type(),
+                            "freshagent.claude.attention_edge_dropped_malformed_at"),
+                    }
+                } else if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
                     if value.get("type").and_then(Value::as_str)
                         == Some("sdk.checkpointTurnIdentity")
                     {
@@ -8924,21 +9051,14 @@ impl FreshClaudeState {
                         *guard = Some(at);
                         at
                     };
-                    // DIAG-01: the attention edge only — session id + source,
-                    // never the turn's text/response content.
-                    tracing::info!(provider = PROVIDER, session_id = %stamp,
-                        source = "freshclaude/consumer-exit", "freshagent.turn.complete");
-                    let frame = ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                        event: json!({
-                            "type": "freshAgent.turn.complete",
-                            "sessionId": sidecar_session_id,
-                            "at": at,
-                        }),
-                        provider: PROVIDER.to_string(),
-                        session_id: stamp.clone(),
-                        session_type: session_type.clone(),
-                    });
-                    state.broadcast(&frame);
+                    state.emit_attention_edge(
+                        AttentionEdge::TurnComplete,
+                        &stamp,
+                        &sidecar_session_id,
+                        &session_type,
+                        at,
+                        AttentionEdgeSource::ConsumerExit,
+                    );
                 }
             }
         })
@@ -9391,7 +9511,62 @@ fn frame_request_id(value: &Value) -> Option<String> {
         .or_else(|| value.as_i64().map(|n| n.to_string()))
 }
 
+/// The coordinator key a claude session is owned under
+/// ([`FreshClaudeState::claude_owner_key`]).
+struct ClaudeOwnerKey {
+    key: String,
+    /// The key is the durable id the CLI reported (else the pane's wire id).
+    reported: bool,
+}
+
 // ── sdk.* → freshAgent.event frame (port of sdk-events.ts normalizeFreshAgentProviderEvent) ─
+
+/// The two attention edges a claude session raises (AGENTS.md "Agent Status
+/// Indicators"): a turn ended that the user did not witness, or the agent waits
+/// on the user (a pending approval or question).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionEdge {
+    TurnComplete,
+    Waiting,
+}
+
+impl AttentionEdge {
+    /// The edge a sidecar stdout line carries, if it carries one.
+    fn from_sidecar_type(sdk_type: &str) -> Option<Self> {
+        match sdk_type {
+            "sdk.turn.complete" => Some(Self::TurnComplete),
+            "sdk.turn.waiting" => Some(Self::Waiting),
+            _ => None,
+        }
+    }
+
+    /// The client event type.
+    pub(crate) fn wire_type(self) -> &'static str {
+        match self {
+            Self::TurnComplete => "freshAgent.turn.complete",
+            Self::Waiting => "freshAgent.turn.waiting",
+        }
+    }
+}
+
+/// Where an attention edge was minted (logged as `source`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionEdgeSource {
+    /// The sidecar minted it (a result, a result-less stream end, a pending
+    /// card) and the stdout consumer forwarded it.
+    Sidecar,
+    /// The stdout consumer minted it for an unrequested sidecar death mid-turn.
+    ConsumerExit,
+}
+
+impl AttentionEdgeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sidecar => "freshclaude/sidecar",
+            Self::ConsumerExit => "freshclaude/consumer-exit",
+        }
+    }
+}
 
 /// Map an `sdk.*` event line from the sidecar to a `freshAgent.event` wire frame. Renames
 /// the inner `type` `sdk.X → freshAgent.X` (only the known set — matching sdk-events.ts,
@@ -9436,8 +9611,9 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         // provider-originated cancellation).
         "sdk.question.cancelled" => "freshAgent.question.cancelled",
         "sdk.status" => "freshAgent.status",
-        "sdk.turn.complete" => "freshAgent.turn.complete",
-        "sdk.turn.waiting" => "freshAgent.turn.waiting",
+        // `sdk.turn.complete` / `sdk.turn.waiting` are deliberately absent: the
+        // consumer routes them to `emit_attention_edge` (AttentionEdge), the one
+        // logged edge exit, so no other path can broadcast an edge.
         "sdk.error" => "freshAgent.error",
         "sdk.exit" => "freshAgent.exit",
         "sdk.killed" => "freshAgent.killed",
@@ -9581,6 +9757,8 @@ struct RollbackSpawned {
     /// The stdout line reader, positioned AFTER the preread `sdk.session.init`.
     reader: tokio::io::Lines<BufReader<ChildStdout>>,
     ownership_id: String,
+    /// The labels the respawn's stderr log carries (bound at registration).
+    log_labels: crate::claude_sidecar_io::SidecarLogLabels,
     /// The sidecar-keyed id (`created.sessionId`).
     sidecar_session_id: String,
     /// The preread `sdk.session.init` line (the consumer adopts it preseeded).
@@ -9615,10 +9793,20 @@ impl FreshClaudeState {
     async fn rollback_spawn_create(
         &self,
         create_req: &Value,
+        session_type: &str,
         lease_guard: Option<&mut crate::FreshSessionLeaseGuard>,
     ) -> Result<RollbackSpawned, RollbackSpawnError> {
-        let (mut child, mut stdin, stdout, ownership_id, tree_guard) =
-            spawn_sidecar().await.map_err(RollbackSpawnError::Other)?;
+        let SpawnedSidecar {
+            mut child,
+            mut stdin,
+            stdout,
+            ownership_id,
+            log_labels,
+            tree_guard,
+        } = self
+            .spawn_sidecar_process(session_type)
+            .await
+            .map_err(RollbackSpawnError::Other)?;
         if let Some(g) = lease_guard {
             if let Some(pid) = child.id() {
                 g.set_kill_handle(pid, &ownership_id);
@@ -9651,6 +9839,7 @@ impl FreshClaudeState {
                     stdin,
                     reader,
                     ownership_id,
+                    log_labels,
                     sidecar_session_id,
                     preseeded_init: init,
                     cli_id,
@@ -9718,6 +9907,19 @@ async fn read_session_init(
 
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
 
+/// A just-spawned claude sidecar: the owned child with its stdin and stdout, the
+/// ownership tag the reaper finds its tree by, the labels its stderr log carries
+/// (bound to the session once the sidecar names it), and the guard that owns the
+/// child's whole process tree (G31).
+struct SpawnedSidecar {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    ownership_id: String,
+    log_labels: crate::claude_sidecar_io::SidecarLogLabels,
+    tree_guard: crate::claude_spawn::SidecarTreeGuard,
+}
+
 /// The session sidecar's launch recipe (G30: the model-catalog probe uses the same
 /// builder, see `model_capabilities::catalog_node_command`): run-as wrapper, managed
 /// secrets plus the OneCLI key flag, and the `/proc` ownership tag.
@@ -9731,20 +9933,16 @@ pub(crate) fn sidecar_node_command(
         .with_ownership_tag(ownership_id)
 }
 
-/// Spawn `node <sidecar>/index.mjs`, ownership-tagged, inheriting the server's isolated HOME
-/// (so the SDK's `claude` CLI authenticates from + writes under `<isolatedHOME>/.claude`).
-/// Returns the owned child, its stdin, its stdout, the ownership tag, and the guard that
-/// owns the child's whole process tree (G31).
-async fn spawn_sidecar() -> Result<
-    (
-        Child,
-        ChildStdin,
-        ChildStdout,
-        String,
-        crate::claude_spawn::SidecarTreeGuard,
-    ),
-    String,
-> {
+/// Spawn `node <sidecar>/index.mjs` for a session of `session_type`, ownership-tagged,
+/// inheriting the server's isolated HOME (so the SDK's `claude` CLI authenticates from +
+/// writes under `<isolatedHOME>/.claude`), inside its process-tree guard (G31). Its
+/// stderr is re-emitted through `tracing` (`claude_sidecar_io::spawn_stderr_logger`, G14).
+/// `environment`: when set, the sidecar's complete environment (the
+/// `test-support` seam); otherwise it inherits this process's.
+async fn spawn_sidecar(
+    environment: Option<&[(String, String)]>,
+    session_type: &str,
+) -> Result<SpawnedSidecar, String> {
     let entry = sidecar_entry_path();
     if !entry.exists() {
         return Err(format!(
@@ -9756,11 +9954,13 @@ async fn spawn_sidecar() -> Result<
     // Inherit the parent env (HOME=<isolated>, CLAUDE_HOME=<isolated>/.claude) and layer the
     // ownership tag so the /proc reaper can find our sidecar AND the claude CLI grandchild
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
-    // CLAUDECODE + ANTHROPIC_API_KEY).
+    // CLAUDECODE + ANTHROPIC_API_KEY). A configured environment (test rigs) replaces the
+    // inherited one; the tag and the managed secrets still layer over it.
     let command = sidecar_node_command(
         crate::claude_spawn::ClaudeNodeCommand::new(&entry),
         &ownership_id,
-    );
+    )
+    .with_complete_environment(environment);
     let node = command.node().to_string();
     let (mut child, tree_guard) = command.spawn_guarded().map_err(|error| match error {
         crate::claude_spawn::ClaudeSpawnError::ExecProfile(classification) => classification,
@@ -9771,11 +9971,25 @@ async fn spawn_sidecar() -> Result<
     })?;
     let stdin = child.stdin.take().ok_or("sidecar stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("sidecar stdout unavailable")?;
-    // Drain stderr so verbose SDK/CLI logs can never fill the pipe and stall the sidecar.
-    if let Some(err) = child.stderr.take() {
-        drain_reader(err);
+    let log_labels =
+        crate::claude_sidecar_io::SidecarLogLabels::new(&ownership_id, session_type, child.id());
+    // Read stderr continuously (so verbose SDK/CLI output can never fill the pipe and
+    // stall the sidecar) and log it; the task ends when the sidecar does.
+    if let Some(stderr) = child.stderr.take() {
+        crate::claude_sidecar_io::spawn_stderr_logger(
+            stderr,
+            log_labels.clone(),
+            crate::claude_sidecar_io::hosted_sidecar(environment),
+        );
     }
-    Ok((child, stdin, stdout, ownership_id, tree_guard))
+    Ok(SpawnedSidecar {
+        child,
+        stdin,
+        stdout,
+        ownership_id,
+        log_labels,
+        tree_guard,
+    })
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -9797,8 +10011,8 @@ mod provider_exec_tests {
                     .collect(),
             )
             .unwrap();
-            let mut result = spawn_sidecar().await;
-            if let Ok((child, _, _, _, _)) = &mut result {
+            let mut result = spawn_sidecar(None, "freshclaude").await;
+            if let Ok(SpawnedSidecar { child, .. }) = &mut result {
                 let pid = child.id().unwrap();
                 child.kill().await.unwrap();
                 child.wait().await.unwrap();
@@ -9901,20 +10115,6 @@ async fn write_line(stdin: &mut ChildStdin, value: &Value) -> Result<(), String>
         .await
         .map_err(|e| e.to_string())?;
     stdin.flush().await.map_err(|e| e.to_string())
-}
-
-/// Drain an async child pipe to `/dev/null` so it never back-pressures the sidecar.
-fn drain_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(mut reader: R) {
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
 }
 
 // ── ownership / reaping (Linux /proc, mirrors freshell-codex) ───────────────────────────
@@ -11093,14 +11293,10 @@ pub(crate) mod tests {
         );
         assert_eq!(normalize_sdk_type("sdk.stream"), Some("freshAgent.stream"));
         assert_eq!(normalize_sdk_type("sdk.result"), Some("freshAgent.result"));
-        assert_eq!(
-            normalize_sdk_type("sdk.turn.complete"),
-            Some("freshAgent.turn.complete")
-        );
-        assert_eq!(
-            normalize_sdk_type("sdk.turn.waiting"),
-            Some("freshAgent.turn.waiting")
-        );
+        // The attention edges are not renamed here: the stdout consumer hands
+        // them to `emit_attention_edge`, the one edge exit (G14, design §9.2 I-1).
+        assert_eq!(normalize_sdk_type("sdk.turn.complete"), None);
+        assert_eq!(normalize_sdk_type("sdk.turn.waiting"), None);
         // Task 2 (g): the pending-state family is forwarded too — including
         // sdk.question.cancelled (fresh-eyes round-3 F3 REPLACED the earlier "keep it
         // dropped" plan: the client folds freshAgent.question.cancelled into
@@ -11153,16 +11349,108 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn turn_complete_frame_carries_the_success_edge() {
-        // The sidecar's unified turn-complete attention edge (minted for EVERY
-        // result subtype except a user-interrupted turn's own), normalized to
-        // freshAgent.turn.complete.
-        let line = json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 });
-        let frame = sdk_line_to_frame(&line, "s-1", "freshclaude").unwrap();
-        let wire: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(wire["type"], "freshAgent.event");
-        assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
-        assert_eq!(wire["event"]["at"], 42);
+    fn attention_edge_lines_leave_only_through_the_edge_exit() {
+        // The sidecar's attention edges are classified as edges, and the plain
+        // frame mapping refuses them: only `emit_attention_edge` (logged, G14)
+        // can put a freshAgent.turn.complete / turn.waiting on the wire. Its
+        // frame shape is pinned by
+        // `emit_attention_edge_logs_each_edge_and_broadcasts_its_frame`.
+        for (line, edge) in [
+            (
+                json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 }),
+                AttentionEdge::TurnComplete,
+            ),
+            (
+                json!({ "type": "sdk.turn.waiting", "sessionId": "s-1", "at": 43 }),
+                AttentionEdge::Waiting,
+            ),
+        ] {
+            let line_type = line["type"].as_str().unwrap();
+            assert_eq!(AttentionEdge::from_sidecar_type(line_type), Some(edge));
+            assert!(
+                sdk_line_to_frame(&line, "s-1", "freshclaude").is_none(),
+                "{line_type} must not become a plain frame"
+            );
+        }
+    }
+
+    /// G14 / design §9.2 I-1: every claude attention edge leaves through
+    /// `emit_attention_edge`, which logs it at info (provider, session, type,
+    /// source and `at`, never content) and broadcasts the client frame.
+    #[tokio::test]
+    async fn emit_attention_edge_logs_each_edge_and_broadcasts_its_frame() {
+        use crate::claude_sidecar_io::test_capture::{capture, with_message};
+        let (events, _guard) = capture();
+        let (st, mut rx) = state_with_bus();
+        st.emit_attention_edge(
+            AttentionEdge::TurnComplete,
+            "envelope-1",
+            "sidecar-1",
+            "kilroy",
+            41,
+            AttentionEdgeSource::Sidecar,
+        );
+        st.emit_attention_edge(
+            AttentionEdge::Waiting,
+            "envelope-1",
+            "sidecar-1",
+            "kilroy",
+            42,
+            AttentionEdgeSource::Sidecar,
+        );
+        st.emit_attention_edge(
+            AttentionEdge::TurnComplete,
+            "envelope-1",
+            "sidecar-1",
+            "kilroy",
+            43,
+            AttentionEdgeSource::ConsumerExit,
+        );
+
+        let frames: Vec<Value> = (0..3)
+            .map(|_| serde_json::from_str(&rx.try_recv().expect("an edge frame")).unwrap())
+            .collect();
+        for frame in &frames {
+            assert_eq!(frame["type"], "freshAgent.event");
+            assert_eq!(frame["provider"], "claude");
+            assert_eq!(frame["sessionId"], "envelope-1");
+            assert_eq!(frame["sessionType"], "kilroy");
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame["event"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({ "type": "freshAgent.turn.complete", "sessionId": "sidecar-1", "at": 41 }),
+                json!({ "type": "freshAgent.turn.waiting", "sessionId": "sidecar-1", "at": 42 }),
+                json!({ "type": "freshAgent.turn.complete", "sessionId": "sidecar-1", "at": 43 }),
+            ]
+        );
+
+        let completes = with_message(&events, "freshagent.turn.complete");
+        let waits = with_message(&events, "freshagent.turn.waiting");
+        assert_eq!(completes.len(), 2, "{completes:?}");
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        let logged: Vec<(Option<&str>, Option<&str>)> = completes
+            .iter()
+            .chain(&waits)
+            .map(|event| (event.field("source"), event.field("at")))
+            .collect();
+        assert_eq!(
+            logged,
+            vec![
+                (Some("freshclaude/sidecar"), Some("41")),
+                (Some("freshclaude/consumer-exit"), Some("43")),
+                (Some("freshclaude/sidecar"), Some("42")),
+            ]
+        );
+        for event in completes.iter().chain(&waits) {
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(event.field("provider"), Some("claude"));
+            assert_eq!(event.field("session_id"), Some("envelope-1"));
+            assert_eq!(event.field("session_type"), Some("kilroy"));
+        }
     }
 
     /// Delta-review round 5 (AGENT-06): the `sdk.question.request` →
@@ -11227,29 +11515,27 @@ pub(crate) mod tests {
             json!({ "type": "sdk.assistant", "sessionId": "s", "content": [{ "type": "text", "text": "part" }] }),
             // …process is SIGKILLed here — stdout ends. NO sdk.result, NO sdk.turn.complete.
         ];
-        let frames: Vec<Value> = death_stream
+        // The consumer's per-line split: an edge line goes to the edge exit,
+        // anything else through the plain frame mapping.
+        let edge_of = |line: &Value| AttentionEdge::from_sidecar_type(line["type"].as_str()?);
+        let edges: Vec<AttentionEdge> = death_stream.iter().filter_map(edge_of).collect();
+        assert!(
+            edges.is_empty(),
+            "a death-truncated stream must never yield an attention edge, got {edges:?}"
+        );
+        let inner_types: Vec<String> = death_stream
             .iter()
             .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude"))
-            .map(|f| serde_json::from_str(&f).unwrap())
-            .collect();
-        let inner_types: Vec<&str> = frames
-            .iter()
-            .map(|f| f["event"]["type"].as_str().unwrap())
+            .map(|f| serde_json::from_str::<Value>(&f).unwrap()["event"]["type"].to_string())
             .collect();
         assert!(
-            !inner_types.contains(&"freshAgent.turn.complete"),
+            !inner_types.iter().any(|t| t.contains("turn.complete")),
             "a death-truncated stream must never yield a completion chime, got {inner_types:?}"
         );
         // And a subsequent success stream DOES complete — the edge is real, not disabled.
-        let ok = sdk_line_to_frame(
-            &json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 }),
-            "s",
-            "freshclaude",
-        )
-        .unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&ok).unwrap()["event"]["type"],
-            "freshAgent.turn.complete"
+            edge_of(&json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 })),
+            Some(AttentionEdge::TurnComplete)
         );
     }
 
@@ -11264,6 +11550,7 @@ pub(crate) mod tests {
     /// same as Task 3).
     #[tokio::test]
     async fn sidecar_death_with_turn_in_flight_rings_the_unified_edge() {
+        let (log_events, _log_guard) = crate::claude_sidecar_io::test_capture::capture();
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
@@ -11336,6 +11623,29 @@ pub(crate) mod tests {
             second > first,
             "the second death cycle's at ({second}) must strictly exceed the first ({first})"
         );
+        // G14: each death edge is logged as it leaves, with its source and `at`.
+        let logged: Vec<(Option<String>, Option<String>, Option<String>)> =
+            crate::claude_sidecar_io::test_capture::with_message(
+                &log_events,
+                "freshagent.turn.complete",
+            )
+            .iter()
+            .map(|event| {
+                (
+                    event.field("source").map(str::to_string),
+                    event.field("session_type").map(str::to_string),
+                    event.field("at").map(str::to_string),
+                )
+            })
+            .collect();
+        let expected = |at: i64| {
+            (
+                Some("freshclaude/consumer-exit".to_string()),
+                Some("freshclaude".to_string()),
+                Some(at.to_string()),
+            )
+        };
+        assert_eq!(logged, vec![expected(first), expected(second)]);
         drop(env);
     }
 
@@ -11371,6 +11681,172 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shutdown_is_safe_with_no_sessions() {
         state().shutdown().await;
+    }
+
+    /// C04 (`test-support` seam): a configured sidecar environment REPLACES the
+    /// inherited one (only the ownership tag is layered on), so a test rig can
+    /// point the real sidecar at the CLI simulator and an isolated HOME without
+    /// touching this process's environment. Unconfigured, the sidecar inherits it.
+    #[tokio::test]
+    async fn a_configured_sidecar_environment_replaces_the_inherited_one() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("print-env.mjs");
+        std::fs::write(
+            &script,
+            "process.stdout.write(JSON.stringify(process.env) + '\\n')\n",
+        )
+        .unwrap();
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_TEST_INHERITED_MARKER", "inherited");
+
+        async fn child_env(state: &FreshClaudeState) -> (HashMap<String, String>, String) {
+            // The tree guard lives until the child is reaped: dropping it kills the tree.
+            let SpawnedSidecar {
+                mut child,
+                stdout,
+                ownership_id,
+                tree_guard: _tree_guard,
+                ..
+            } = state
+                .spawn_sidecar_process("freshclaude")
+                .await
+                .expect("spawn sidecar");
+            let line = BufReader::new(stdout)
+                .lines()
+                .next_line()
+                .await
+                .expect("read sidecar stdout")
+                .expect("the sidecar prints its environment");
+            let _ = child.wait().await;
+            (serde_json::from_str(&line).expect("env json"), ownership_id)
+        }
+        let configured = state().with_sidecar_environment([
+            (
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_default(),
+            ),
+            (
+                "FRESHELL_TEST_SIDECAR_ENV".to_string(),
+                "chosen".to_string(),
+            ),
+        ]);
+        let (env, ownership_id) = child_env(&configured).await;
+        let (inherited, _) = child_env(&state()).await;
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+        std::env::remove_var("FRESHELL_TEST_INHERITED_MARKER");
+
+        let mut keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                "FRESHELL_TEST_SIDECAR_ENV",
+                "PATH"
+            ],
+            "the configured environment replaces the inherited one: {env:?}"
+        );
+        assert_eq!(env[CLAUDE_SIDECAR_OWNERSHIP_ENV], ownership_id);
+        assert_eq!(
+            inherited
+                .get("FRESHELL_TEST_INHERITED_MARKER")
+                .map(String::as_str),
+            Some("inherited"),
+            "without a configured environment the sidecar inherits this process's"
+        );
+    }
+
+    /// G14: every spawned sidecar's stderr is logged, labelled with its
+    /// ownership id, pid and session type. A sidecar whose environment marks
+    /// it hosted (the session host sets FRESHELL_HOSTED_FRESH_AGENT, to
+    /// `claude` or `kilroy`) has its raw lines logged by size only.
+    #[tokio::test]
+    async fn a_spawned_sidecar_stderr_is_logged_and_redacted_when_hosted() {
+        use crate::claude_sidecar_io::test_capture::{capture, with_message};
+        let (events, _log_guard) = capture();
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("stderr-sidecar.mjs");
+        std::fs::write(
+            &script,
+            "process.stderr.write('secret raw output\\n')\n\
+             process.stderr.write(JSON.stringify({ severity: 'info', component: 'claude-sidecar', event: 'sidecar.ready' }) + '\\n')\n",
+        )
+        .unwrap();
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+
+        async fn spawn_and_log(
+            state: &FreshClaudeState,
+            events: &Arc<std::sync::Mutex<Vec<crate::claude_sidecar_io::test_capture::Captured>>>,
+        ) -> (String, Option<u32>) {
+            let before = with_message(events, "freshagent.claude.sidecar_log").len();
+            // The tree guard lives until the child is reaped: dropping it kills the tree.
+            let SpawnedSidecar {
+                mut child,
+                ownership_id,
+                tree_guard: _tree_guard,
+                ..
+            } = state
+                .spawn_sidecar_process("kilroy")
+                .await
+                .expect("spawn sidecar");
+            let pid = child.id();
+            let _ = child.wait().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while with_message(events, "freshagent.claude.sidecar_log").len() < before + 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the sidecar's two stderr lines were never logged"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            (ownership_id, pid)
+        }
+        let path = (
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        );
+        let ordinary = state().with_sidecar_environment([path.clone()]);
+        let hosted = state().with_sidecar_environment([
+            path,
+            (
+                "FRESHELL_HOSTED_FRESH_AGENT".to_string(),
+                "kilroy".to_string(),
+            ),
+        ]);
+        let (ordinary_owner, ordinary_pid) = spawn_and_log(&ordinary, &events).await;
+        let (hosted_owner, _) = spawn_and_log(&hosted, &events).await;
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+
+        let logs = with_message(&events, "freshagent.claude.sidecar_log");
+        let of = |owner: &str| -> Vec<_> {
+            logs.iter()
+                .filter(|event| event.field("ownership_id") == Some(owner))
+                .cloned()
+                .collect()
+        };
+        let ordinary_logs = of(&ordinary_owner);
+        assert_eq!(ordinary_logs.len(), 2, "{logs:?}");
+        assert_eq!(ordinary_logs[0].level, tracing::Level::WARN);
+        assert_eq!(ordinary_logs[0].field("raw"), Some("true"));
+        assert_eq!(ordinary_logs[0].field("text"), Some("secret raw output"));
+        assert_eq!(ordinary_logs[1].level, tracing::Level::INFO);
+        assert_eq!(
+            ordinary_logs[1].field("sidecar_event"),
+            Some("sidecar.ready")
+        );
+        let ordinary_pid = ordinary_pid.map(|pid| pid.to_string());
+        for event in &ordinary_logs {
+            assert_eq!(event.field("session_type"), Some("kilroy"));
+            assert_eq!(event.field("pid"), ordinary_pid.as_deref());
+        }
+        let hosted_logs = of(&hosted_owner);
+        assert_eq!(hosted_logs.len(), 2, "{logs:?}");
+        assert_eq!(hosted_logs[0].field("raw"), Some("true"));
+        assert_eq!(hosted_logs[0].field("bytes"), Some("17"));
+        assert_eq!(hosted_logs[0].field("text"), None, "hosted: size only");
+        assert_eq!(hosted_logs[1].field("sidecar_event"), Some("sidecar.ready"));
     }
 
     // ── freshAgent.create requestId dedup (parity gap fix) ──────────────────
@@ -11887,6 +12363,78 @@ rl.on('line', (line) => {
                 .expect("turn tracker mutex")
                 .busy(),
             "a refused stale prompt leaves the turn tracker idle"
+        );
+    }
+
+    /// F4 (PR-A review): before the CLI reports a new pane's session the
+    /// coordinator holds no record for it, and an unfenced (checkpointed)
+    /// send runs: refusing it would lose every new pane's first message
+    /// (827d9395d). A send that DOES carry an observed owner pair is still
+    /// checked: the pair names an owner the coordinator does not hold, so it
+    /// is stale and refused typed, never run unguarded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenced_send_before_the_session_report_is_checked_not_skipped() {
+        let (mut st, mut rx) = state_with_bus();
+        let session_id = "claude-send-before-report";
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fake_claude_session(&st, session_id).await;
+        let vacant = registry.observe(PROVIDER, session_id);
+        assert!(
+            matches!(vacant.state, freshell_ownership::OwnershipState::Vacant),
+            "fixture: nothing owns an unreported session"
+        );
+        let checkpointed = |request_id: &str| {
+            let mut send = send_msg(session_id, "first message");
+            send.request_id = Some(request_id.to_string());
+            send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: format!("{request_id}-attempt"),
+                workspace: None,
+            });
+            send
+        };
+        let drain = |rx: &mut tokio::sync::broadcast::Receiver<String>| {
+            let mut frames: Vec<Value> = Vec::new();
+            while let Ok(raw) = rx.try_recv() {
+                if let Ok(frame) = serde_json::from_str(&raw) {
+                    frames.push(frame);
+                }
+            }
+            frames
+        };
+
+        let mut fenced = checkpointed("fenced-before-report");
+        fenced.observed_epoch = Some(vacant.epoch);
+        fenced.observed_generation = Some(vacant.generation);
+        st.handle_send(fenced).await;
+        let frames = drain(&mut rx);
+        assert!(
+            frames.iter().any(|frame| {
+                frame["requestId"] == json!("fenced-before-report")
+                    && frame.to_string().contains("SESSION_RESERVED")
+            }),
+            "the supplied fence is honored and refuses typed: {frames:?}"
+        );
+        assert!(
+            !st.sessions.lock().await[session_id]
+                .in_turn
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the refused send never reaches the sidecar"
+        );
+
+        st.handle_send(checkpointed("unfenced-before-report")).await;
+        let frames = drain(&mut rx);
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.to_string().contains("SESSION_RESERVED")),
+            "an unfenced first send of a new pane runs: {frames:?}"
+        );
+        assert!(
+            st.sessions.lock().await[session_id]
+                .in_turn
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the unfenced first send reaches the sidecar"
         );
     }
 
@@ -20109,6 +20657,41 @@ rl.on('line', (line) => {
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         assert_eq!(create_req["effort"], "high");
+        drop(env);
+    }
+
+    /// G14: a sidecar spawned to resume a session on attach logs under the
+    /// attached session (its stderr log is bound to the envelope id the
+    /// client addresses), joined to the sidecar's ownership id.
+    #[tokio::test]
+    async fn an_attach_resumed_sidecar_logs_under_the_attached_session() {
+        use crate::claude_sidecar_io::test_capture::{capture, with_message};
+        let (events, _log_guard) = capture();
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "d1d1d1d1-dddd-4ddd-8ddd-d1d1d1d1d1d1";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, _rx) = state_with_bus();
+        let mut msg = attach_msg_with_resume("client-nanoid-logs", DURABLE);
+        msg.session_type = SessionType::Kilroy;
+        state.handle_attach(msg).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let ownership_id = state
+            .sessions
+            .lock()
+            .await
+            .get("client-nanoid-logs")
+            .map(|session| session.ownership_id.clone())
+            .expect("the attach resumed a session under the client's id");
+        let bound = with_message(&events, "freshagent.claude.sidecar_bound");
+        assert_eq!(bound.len(), 1, "{bound:?}");
+        assert_eq!(bound[0].field("session_id"), Some("client-nanoid-logs"));
+        assert_eq!(bound[0].field("session_type"), Some("kilroy"));
+        assert_eq!(bound[0].field("ownership_id"), Some(ownership_id.as_str()));
         drop(env);
     }
 

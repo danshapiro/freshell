@@ -4,6 +4,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { PINNED_CLI_VERSION, PINNED_SDK_VERSION } from './claude-local-provider.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '../../..')
@@ -65,8 +66,8 @@ describe('Claude sidecar shutdown against the pinned CLI and a local provider', 
     expect(receipt).toMatchObject({
       verdict: 'PASS',
       mode,
-      sdkVersion: '0.3.237',
-      bundledCliVersion: '2.1.237',
+      sdkVersion: PINNED_SDK_VERSION,
+      bundledCliVersion: PINNED_CLI_VERSION,
       sidecarExit: { code: 0, signal: null },
       fixtureRemoved: true,
     })

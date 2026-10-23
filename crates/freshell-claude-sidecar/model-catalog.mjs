@@ -1,17 +1,17 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { managedSdkSpawn } from './exec-profile.mjs'
+import { cliStderrLogger, createLog, errorText } from './log.mjs'
+import { isHostedSidecar } from './hosted.mjs'
 import { createClaudeSdkCleanEnv } from './sdk-env.mjs'
 
-const log = (message, details = {}) => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-model-catalog', message, ...details })}\n`)
+const catalogLog = createLog('claude-model-catalog')
 
 /** A short-lived SDK control query; an empty stream never starts an agent turn. */
-export async function probeModelCatalog(query, { env = process.env, timeoutMs = 10_000 } = {}) {
+export async function probeModelCatalog(query, { env = process.env, timeoutMs = 10_000, log = catalogLog } = {}) {
   const cleanEnv = createClaudeSdkCleanEnv(env)
   const abortController = new AbortController()
-  const stderr = env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
-    ? data => log('Claude capability probe stderr', { bytes: Buffer.byteLength(String(data)) })
-    : data => log('Claude capability probe stderr', { data: String(data).trimEnd() })
+  const stderr = cliStderrLogger(log, { hosted: isHostedSidecar(env) })
   const session = query({
     prompt: (async function* () {})(),
     options: {
@@ -36,7 +36,7 @@ export async function probeModelCatalog(query, { env = process.env, timeoutMs = 
     ])
   } finally {
     clearTimeout(timer)
-    try { await session.close() } catch (error) { log('Claude capability query close failed', { error: String(error) }) }
+    try { await session.close() } catch (error) { log('warn', 'catalog.close_failed', { error: errorText(error) }) }
   }
 }
 
@@ -60,7 +60,7 @@ if (isMainModule()) {
     const models = await probeModelCatalog(query)
     process.stdout.write(`${JSON.stringify(models)}\n`)
   } catch (error) {
-    log('Claude model catalog unavailable', { error: String(error) })
+    catalogLog('error', 'catalog.unavailable', { error: errorText(error) })
     process.exitCode = 1
   }
 }

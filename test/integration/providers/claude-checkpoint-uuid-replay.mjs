@@ -1,60 +1,32 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import http from 'node:http'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
+import {
+  createClaudeFixture,
+  FAKE_MODEL,
+  resolvePinnedClaude,
+  startLocalProvider,
+} from './claude-local-provider.mjs'
 
 const repoRoot = process.argv[2]
 if (!repoRoot) throw new Error('repository root argument is required')
 
-const sdkDir = path.join(repoRoot, 'crates/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk')
-const sdkPackage = JSON.parse(await fs.readFile(path.join(sdkDir, 'package.json'), 'utf8'))
-if (sdkPackage.version !== '0.3.237' || sdkPackage.claudeCodeVersion !== '2.1.237') {
-  throw new Error('the Claude checkpoint contract requires SDK 0.3.237 and CLI 2.1.237')
-}
+const pinned = await resolvePinnedClaude(repoRoot)
+const nativeCli = pinned.nativeCli
+const fixture = await createClaudeFixture({ prefix: 'freshell-claude-checkpoint-contract-' })
+const { home, cwd } = fixture
 
-const storeRoot = path.join(repoRoot, 'node_modules/.pnpm')
-const optionalStore = (await fs.readdir(storeRoot)).find(name =>
-  name.startsWith('@anthropic-ai+claude-agent-sdk-linux-x64@0.3.237'))
-if (!optionalStore) throw new Error('the pinned Linux x64 Claude CLI package is not installed')
-const bundleDir = path.join(storeRoot, optionalStore, 'node_modules/@anthropic-ai/claude-agent-sdk-linux-x64')
-const bundlePackage = JSON.parse(await fs.readFile(path.join(bundleDir, 'package.json'), 'utf8'))
-if (bundlePackage.version !== '0.3.237') throw new Error('the bundled Claude CLI package version is not pinned')
-const nativeCli = await fs.realpath(path.join(bundleDir, 'claude'))
-
-const fixture = await fs.mkdtemp(path.join(repoRoot, '.tmp-claude-checkpoint-contract-'))
-await fs.chmod(fixture, 0o700)
-const home = path.join(fixture, 'home')
-const cwd = path.join(fixture, 'workspace')
-for (const directory of [home, cwd, path.join(fixture, 'tmp')]) {
-  await fs.mkdir(directory, { recursive: true, mode: 0o700 })
-}
+// The checkpoint contract: a uuid supplied on an SDK user message is replayed
+// by the native CLI and persisted on the transcript's user line.
 
 const inputUuid = randomUUID()
 const promptText = randomUUID()
 const responseText = randomUUID()
-const apiKey = randomUUID()
-const childEnv = {
-  HOME: home,
-  PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
-  TMPDIR: path.join(fixture, 'tmp'),
-  XDG_CONFIG_HOME: path.join(home, '.config'),
-  XDG_CACHE_HOME: path.join(home, '.cache'),
-  XDG_DATA_HOME: path.join(home, '.local/share'),
-  CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
-  ANTHROPIC_API_KEY: apiKey,
-  FRESHELL_CLAUDE_ONECLI_API_KEY: '1',
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  DISABLE_TELEMETRY: '1',
-  DISABLE_ERROR_REPORTING: '1',
-  DISABLE_AUTOUPDATER: '1',
-  CLAUDE_CODE_DISABLE_METRICS: '1',
-  CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
-  LANG: 'C.UTF-8',
-}
 
-let server
+let provider
 let query
 let nativeChild
 let releasePrompt
@@ -84,23 +56,18 @@ const closeProvider = async () => {
     ])
   }
   nativeCliExited = !nativeChild || nativeCliExited
-  if (server) {
-    server.closeAllConnections()
-    await new Promise(resolve => server.close(resolve))
-  }
-  localProviderClosed = !server || !server.listening
+  if (provider) await provider.close()
+  localProviderClosed = !provider || !provider.listening
 }
 
 try {
-  const { stdout: nativeVersion } = await promisify(execFile)(nativeCli, ['--version'], {
-    cwd,
-    env: childEnv,
-    timeout: 10_000,
-    maxBuffer: 8192,
-  })
-  if (!/^2\.1\.237(?:\s|$)/.test(nativeVersion.trim())) {
-    throw new Error('native CLI did not report version 2.1.237')
-  }
+  failureStage = 'local provider'
+  provider = await startLocalProvider({ replyText: responseText })
+  const providerUrl = provider.url
+  const childEnv = fixture.env(providerUrl, { FRESHELL_CLAUDE_ONECLI_API_KEY: '1' })
+
+  // resolvePinnedClaude already checked the CLI's version.
+  failureStage = 'native CLI flags'
   const { stdout: nativeHelp } = await promisify(execFile)(nativeCli, ['--help'], {
     cwd,
     env: childEnv,
@@ -109,70 +76,10 @@ try {
   })
   if (!nativeHelp.includes('--replay-user-messages')) throw new Error('native CLI does not advertise replay-user-messages')
 
-  failureStage = 'local provider'
-  server = http.createServer(async (request, response) => {
-    const url = new URL(request.url ?? '/', 'http://127.0.0.1')
-    const chunks = []
-    let size = 0
-    for await (const chunk of request) {
-      size += chunk.length
-      if (size > 2 * 1024 * 1024) {
-        response.writeHead(413).end()
-        return
-      }
-      chunks.push(chunk)
-    }
-    if (chunks.length) {
-      try { JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch {
-        response.writeHead(400).end()
-        return
-      }
-    }
-    if (url.pathname === '/v1/messages/count_tokens') {
-      response.writeHead(200, { 'content-type': 'application/json' })
-        .end(JSON.stringify({ input_tokens: 1 }))
-      return
-    }
-    if (url.pathname !== '/v1/messages') {
-      response.writeHead(404).end()
-      return
-    }
-
-    const message = {
-      id: `msg_${randomUUID().replaceAll('-', '')}`,
-      type: 'message',
-      role: 'assistant',
-      model: 'claude-sonnet-4-5-20250929',
-      content: [{ type: 'text', text: responseText }],
-      stop_reason: 'end_turn',
-      stop_sequence: null,
-      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-    }
-    response.writeHead(200, {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-cache',
-      'request-id': randomUUID(),
-    })
-    const send = (type, data) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
-    send('message_start', { message: { ...message, content: [], stop_reason: null, usage: { ...message.usage, output_tokens: 0 } } })
-    send('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
-    send('content_block_delta', { index: 0, delta: { type: 'text_delta', text: responseText } })
-    send('content_block_stop', { index: 0 })
-    send('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } })
-    send('message_stop', {})
-    response.end()
-  })
-  await new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', resolve)
-  })
-  const providerUrl = `http://127.0.0.1:${server.address().port}`
-  childEnv.ANTHROPIC_BASE_URL = providerUrl
-
   // Match the production sidecar's clean child environment and SDK dependency.
   for (const name of Object.keys(process.env)) delete process.env[name]
   Object.assign(process.env, childEnv)
-  const { query: sdkQuery } = await import(path.join(sdkDir, 'sdk.mjs'))
+  const { query: sdkQuery } = await import(pathToFileURL(pinned.sdkEntry).href)
   const abortController = new AbortController()
   timer = setTimeout(() => {
     abortController.abort()
@@ -199,7 +106,7 @@ try {
       mcpServers: {},
       strictMcpConfig: true,
       tools: [],
-      model: 'claude-sonnet-4-5-20250929',
+      model: FAKE_MODEL,
       maxTurns: 1,
       systemPrompt: '',
       pathToClaudeCodeExecutable: nativeCli,
@@ -241,24 +148,15 @@ try {
   await closeProvider()
 
   failureStage = 'persisted transcript'
-  async function walk(directory) {
-    let entries
-    try { entries = await fs.readdir(directory, { withFileTypes: true }) } catch { return }
-    for (const entry of entries) {
-      const target = path.join(directory, entry.name)
-      if (entry.isDirectory()) await walk(target)
-      else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-        for (const line of (await fs.readFile(target, 'utf8')).split('\n').filter(Boolean)) {
-          let row
-          try { row = JSON.parse(line) } catch { continue }
-          if (row.type === 'user' && row.message?.role === 'user' && row.uuid === inputUuid) {
-            persistedUserUuid = row.uuid
-          }
-        }
+  for (const file of await fixture.transcripts()) {
+    for (const line of (await fs.readFile(path.join(fixture.claudeConfigDir, file), 'utf8')).split('\n').filter(Boolean)) {
+      let row
+      try { row = JSON.parse(line) } catch { continue }
+      if (row.type === 'user' && row.message?.role === 'user' && row.uuid === inputUuid) {
+        persistedUserUuid = row.uuid
       }
     }
   }
-  await walk(home)
   if (replayedUserUuid === inputUuid && persistedUserUuid === inputUuid
     && resultMessage?.subtype === 'success' && resultMessage?.is_error === false
     && replayFlagObservedByNativeCli && nativeCliExited && localProviderClosed) {
@@ -276,14 +174,14 @@ try {
 } finally {
   if (timer) clearTimeout(timer)
   await closeProvider()
-  await fs.rm(fixture, { recursive: true, force: true })
+  await fixture.cleanup()
 }
 
-const fixtureRemoved = !(await fs.stat(fixture).catch(() => null))
+const fixtureRemoved = !(await fs.stat(fixture.root).catch(() => null))
 process.stdout.write(`${JSON.stringify({
   verdict,
-  sdkVersion: sdkPackage.version,
-  bundledCliVersion: sdkPackage.claudeCodeVersion,
+  sdkVersion: pinned.sdkVersion,
+  bundledCliVersion: pinned.cliVersion,
   replayFlagObservedByNativeCli,
   replayedUserUuid,
   persistedUserUuid,
