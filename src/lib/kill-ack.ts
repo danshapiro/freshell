@@ -619,11 +619,16 @@ export function sendFreshAgentKillAndAwait(
   })
 }
 
-/** Stop a wedged Codex writer while preserving its durable thread for resume.
+/** Stop a wedged writer while preserving its durable conversation for resume.
  * Unlike a close, this requires the acknowledgement for this exact request:
  * another device closing the same session cannot satisfy a restart. */
+export type FreshAgentRecoveryStopRequest = Omit<FreshAgentKillRequest, 'cwd' | 'sessionType' | 'provider'> & (
+  | { sessionType: 'freshcodex'; provider: 'codex' }
+  | { sessionType: 'freshclaude' | 'kilroy'; provider: 'claude' }
+)
+
 export function sendFreshAgentRecoveryStopAndAwait(
-  req: Omit<FreshAgentKillRequest, 'cwd'> & { sessionType: 'freshcodex'; provider: 'codex' },
+  req: FreshAgentRecoveryStopRequest,
   opts?: { timeoutMs?: number; send?: (msg: unknown) => void },
 ): Promise<KillAck> {
   const requestId = nanoid()
