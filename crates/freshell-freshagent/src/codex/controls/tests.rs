@@ -200,6 +200,7 @@ async fn codex_user_controls_resolved_and_interrupted_requests_clear_without_com
         async move {
             state
                 .handle_interrupt(FreshAgentInterrupt {
+                    request_id: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: "thread-1".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,

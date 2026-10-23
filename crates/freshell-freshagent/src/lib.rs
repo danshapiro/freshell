@@ -39,6 +39,7 @@
 /// The per-session attention clock and edge builders shared by the fresh-agent
 /// lanes (design 2026-10-22 §3.2, §5.5).
 pub(crate) mod attention;
+pub mod attention_ledger;
 pub mod claude;
 pub mod claude_create_defaults;
 pub(crate) mod claude_dead_sessions;

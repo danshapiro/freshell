@@ -582,6 +582,8 @@ struct ResponseSession {
 
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
+    session_type: String,
+    quiet: deadman::QuietWatch,
     configuration: ClaudeConfiguration,
     /// Per-runtime stdin writer; await only after dropping the sessions map lock.
     stdin: crate::claude_sidecar_io::SidecarWriter,
@@ -691,10 +693,11 @@ impl ClaudeSession {
     /// The session's effective status (design §5.2) — the truth the attach
     /// acknowledgements and the snapshot overlay speak.
     fn current_status(&self) -> String {
+        let quiet = self.quiet.state.lock().expect("quiet deadman lock");
         self.ledger
             .lock()
             .expect("turn ledger lock")
-            .effective_status(false, false)
+            .effective_status(false, quiet.is_stuck())
             .as_str()
             .to_string()
     }
@@ -825,6 +828,11 @@ impl FreshClaudeState {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::claude_edges::ClaudeTurnEvent> {
         self.edges.subscribe()
+    }
+
+    /// Last attention marks retained for negotiated same-page reconnects.
+    pub fn attention_marks(&self) -> Vec<freshell_protocol::FreshAgentAttentionMark> {
+        self.edges.attention_marks()
     }
 
     /// Wire where every sidecar's CLI reaches this server (G19): its
@@ -1883,6 +1891,15 @@ impl FreshClaudeState {
         freshell_protocol::session_names::SessionNameRef,
         freshell_protocol::session_names::SessionNameRecord,
     )> {
+        if let Some(projection) = crate::naming::session_projection(
+            &self.naming(),
+            freshell_protocol::session_names::NamedProvider::Claude,
+            session_id,
+        )
+        .await
+        {
+            return Some(projection);
+        }
         let handle = self.naming_handles.lock().await.get(session_id).cloned()?;
         let sink = self.naming();
         let target = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
@@ -2560,6 +2577,32 @@ impl FreshClaudeState {
     /// `ws-handler.ts:3673`), then broadcast `freshAgent.killed`. Idempotent for an
     /// unknown session id, matching the codex/opencode `success:true` pattern.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        self.handle_kill_inner(msg, None).await;
+    }
+
+    /// Release a runtime allocated by a create whose destination disappeared.
+    /// The receipt is authority only for the incarnation that create allocated.
+    pub async fn abandon_created_runtime(
+        &self,
+        session_id: &str,
+        session_type: SessionType,
+        ownership_id: &str,
+    ) {
+        self.handle_kill_inner(
+            FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: session_id.to_string(),
+                session_type,
+                observed_epoch: None,
+                observed_generation: None,
+                cwd: None,
+            },
+            Some(ownership_id),
+        )
+        .await;
+    }
+
+    async fn handle_kill_inner(&self, msg: FreshAgentKill, expected_owner: Option<&str>) {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -2655,6 +2698,7 @@ impl FreshClaudeState {
         // envelope writes next), and a Clean failure simply releases the
         // gate with the session untouched.
         let mut retire_ids = vec![session_id.clone()];
+        let mut expected_stop_stamp = None;
         {
             let index = self.cli_index.lock().await;
             let sessions = self.sessions.lock().await;
@@ -2674,6 +2718,36 @@ impl FreshClaudeState {
             };
             if let Some(current_map_key) = current_map_key {
                 map_key = current_map_key;
+            }
+            if let Some(expected_owner) = expected_owner {
+                let Some(session) = sessions
+                    .get(&map_key)
+                    .filter(|session| session.ownership_id == expected_owner)
+                else {
+                    tracing::info!(target: "freshell_freshagent::claude",
+                        event = "freshagent.claude.abandoned_create_already_released",
+                        session_id, expected_owner,
+                        "the create receipt no longer owns this runtime; cleanup is complete");
+                    return;
+                };
+                if self.ownership.is_some() {
+                    let durable = session.cli_session_id.as_deref().unwrap_or(&map_key);
+                    let Some(stamp) =
+                        crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, durable)
+                            .filter(|stamp| {
+                                stamp.owner.ownership_id.as_deref() == Some(expected_owner)
+                            })
+                    else {
+                        tracing::warn!(target: "freshell_freshagent::claude",
+                            event = "freshagent.claude.abandoned_create_stamp_missing",
+                            session_id, expected_owner,
+                            "the create receipt has no matching retained ownership stamp");
+                        return;
+                    };
+                    // Capture authority while inspecting that exact runtime. A
+                    // later stop must never borrow a replacement's stamp.
+                    expected_stop_stamp = Some((durable.to_string(), stamp));
+                }
             }
             if sessions.contains_key(&map_key) {
                 let mut gates = self.close_pending.lock().expect("close-pending lock");
@@ -2725,30 +2799,34 @@ impl FreshClaudeState {
         // progressing stop is not stale; never fenced on age alone).
         let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
         if let Some(registry) = self.ownership.as_ref() {
-            let stop_stamp = match crate::ownership_lane::peek_retained_stamp(
-                &self.ownership_stamps,
-                &session_id,
-            ) {
-                Some(stamp) => Some((session_id.clone(), stamp)),
-                None => {
-                    let map_key = self.resolve_session_key(&session_id).await;
-                    match map_key {
-                        Some(map_key) => {
-                            let durable = self
-                                .sessions
-                                .lock()
-                                .await
-                                .get(&map_key)
-                                .and_then(|s| s.cli_session_id.clone());
-                            durable.and_then(|d| {
-                                crate::ownership_lane::peek_retained_stamp(
-                                    &self.ownership_stamps,
-                                    &d,
-                                )
-                                .map(|st| (d, st))
-                            })
+            let stop_stamp = if expected_owner.is_some() {
+                expected_stop_stamp
+            } else {
+                match crate::ownership_lane::peek_retained_stamp(
+                    &self.ownership_stamps,
+                    &session_id,
+                ) {
+                    Some(stamp) => Some((session_id.clone(), stamp)),
+                    None => {
+                        let map_key = self.resolve_session_key(&session_id).await;
+                        match map_key {
+                            Some(map_key) => {
+                                let durable = self
+                                    .sessions
+                                    .lock()
+                                    .await
+                                    .get(&map_key)
+                                    .and_then(|s| s.cli_session_id.clone());
+                                durable.and_then(|d| {
+                                    crate::ownership_lane::peek_retained_stamp(
+                                        &self.ownership_stamps,
+                                        &d,
+                                    )
+                                    .map(|st| (d, st))
+                                })
+                            }
+                            None => None,
                         }
-                        None => None,
                     }
                 }
             };
@@ -3293,7 +3371,22 @@ impl FreshClaudeState {
         // synchronous (the minter channel closes).
         // C09: a closed session is not an ended one waiting to be resumed.
         self.dead_sessions.forget(&retire_ids, "killed");
-        let removed = self.sessions.lock().await.remove(&map_key);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if expected_owner.is_some_and(|owner| {
+                sessions
+                    .get(&map_key)
+                    .is_some_and(|session| session.ownership_id != owner)
+            }) {
+                tracing::error!(target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.abandoned_create_replacement_preserved",
+                    session_id,
+                    "a replacement appeared during the close; its runtime is preserved");
+                None
+            } else {
+                sessions.remove(&map_key)
+            }
+        };
         // The gate entry dies with the session (the map rule was the gate's
         // whole meaning; an aborted session adopts nothing more).
         self.close_pending
@@ -4061,21 +4154,37 @@ impl FreshClaudeState {
     /// and the interrupt is written with the latch's `stopId`. The stopped turn's
     /// own result is then silent; every other turn end rings. A Stop that missed
     /// a command the CLI was still starting is sent again by the stdout consumer
-    /// ([`Self::reissue_stop`]). Success broadcasts nothing. A missing session
-    /// mirrors the `SESSION_NOT_FOUND` convention [`Self::handle_send`] uses.
+    /// ([`Self::reissue_stop`]). Success broadcasts nothing. A dead session
+    /// repeats its exited status; an unknown one reports a nested session error.
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_id = msg.session_id.clone();
-
-        // Task 10b: durable ids resolve through `cli_index` (same aliasing as send).
-        let Some(map_key) = self.resolve_session_key(&session_id).await else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
-            return;
-        };
-        if !self
-            .stop_live_session(&map_key, session_type_str(msg.session_type))
-            .await
-        {
-            self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
+        if let Some(map_key) = self.resolve_session_key(&session_id).await {
+            if self
+                .stop_live_session(
+                    &map_key,
+                    session_type_str(msg.session_type),
+                    &msg.request_id,
+                )
+                .await
+            {
+                return;
+            }
+        }
+        if self.dead_sessions.find(&session_id).is_some() {
+            self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                provider: PROVIDER.into(),
+                session_id: session_id.clone(),
+                session_type: session_type_str(msg.session_type).into(),
+                event: crate::claude_dead_sessions::exited_status_event(&session_id),
+            }));
+        } else {
+            self.emit_control_error(
+                &session_id,
+                msg.session_type,
+                &msg.request_id,
+                "INVALID_SESSION_ID",
+                "The Claude conversation for this session could not be found.",
+            );
         }
     }
 
@@ -4092,6 +4201,7 @@ impl FreshClaudeState {
         Arc<TokioMutex<()>>,
         crate::claude_turns::SharedLedger,
         Option<String>,
+        deadman::SharedQuiet,
     )> {
         let key = self.resolve_session_key(wire_id).await?;
         let sessions = self.sessions.lock().await;
@@ -4101,6 +4211,7 @@ impl FreshClaudeState {
             session.turn_lock.clone(),
             session.ledger.clone(),
             session.cli_session_id.clone(),
+            session.quiet.state.clone(),
         ))
     }
 
@@ -4201,7 +4312,7 @@ impl FreshClaudeState {
                 )
             }
         };
-        let Some((map_key, turn_lock, ledger, durable_before_wait)) =
+        let Some((map_key, turn_lock, ledger, durable_before_wait, quiet)) =
             self.turn_locked_handles(&resolved).await
         else {
             return self.refuse_send_after_runtime_stopped(
@@ -4374,11 +4485,18 @@ impl FreshClaudeState {
             request_id.clone(),
             crate::claude_turns::SendKind::Turn,
         );
-        self.publish_claude_status(&ledger, &stamp, session_type, false);
+        self.arm_claude_quiet(&map_key, &ledger).await;
+        self.publish_claude_status(&ledger, &quiet, &stamp, session_type, false);
         let guard = self.sessions.lock().await;
         let Some(session) = guard.get(&map_key) else {
             drop(guard);
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &submitted_turn_id);
+            self.take_back_unwritten_send(
+                &ledger,
+                &quiet,
+                &stamp,
+                session_type,
+                &submitted_turn_id,
+            );
             return self.refuse_send_after_runtime_stopped(
                 &request_id,
                 &session_id,
@@ -4405,7 +4523,13 @@ impl FreshClaudeState {
         if let Err(err) = writer.write(&send_req).await {
             // The write never went out: take back exactly this send (whatever
             // else is owed stays).
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &submitted_turn_id);
+            self.take_back_unwritten_send(
+                &ledger,
+                &quiet,
+                &stamp,
+                session_type,
+                &submitted_turn_id,
+            );
             return self.refuse_send(&request_id, "CLAUDE_SEND_FAILED", &err);
         }
         drop(ownership_guard);
@@ -4629,7 +4753,7 @@ impl FreshClaudeState {
                 return;
             }
         };
-        let Some((map_key, turn_lock, _, durable_before_wait)) =
+        let Some((map_key, turn_lock, _, durable_before_wait, _)) =
             self.turn_locked_handles(&resolved).await
         else {
             self.emit_control_error(
@@ -4955,7 +5079,7 @@ impl FreshClaudeState {
                 return;
             }
         };
-        let Some((map_key, turn_lock, ledger, durable_before_wait)) =
+        let Some((map_key, turn_lock, ledger, durable_before_wait, quiet)) =
             self.turn_locked_handles(&resolved).await
         else {
             self.emit_control_error(
@@ -5033,11 +5157,12 @@ impl FreshClaudeState {
             None,
             crate::claude_turns::SendKind::Compact,
         );
-        self.publish_claude_status(&ledger, &stamp, session_type, false);
+        self.arm_claude_quiet(&map_key, &ledger).await;
+        self.publish_claude_status(&ledger, &quiet, &stamp, session_type, false);
         let guard = self.sessions.lock().await;
         let Some(session) = guard.get(&map_key) else {
             drop(guard);
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
+            self.take_back_unwritten_send(&ledger, &quiet, &stamp, session_type, &uuid);
             self.emit_control_error(
                 &session_id,
                 msg.session_type,
@@ -5066,7 +5191,7 @@ impl FreshClaudeState {
         drop(guard);
         if let Err(err) = writer.write(&send_req).await {
             // The write never went out: take back exactly this compact.
-            self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
+            self.take_back_unwritten_send(&ledger, &quiet, &stamp, session_type, &uuid);
             self.emit_control_error(
                 &session_id,
                 msg.session_type,
@@ -6351,6 +6476,7 @@ impl FreshClaudeState {
         broadcast_id: Arc<std::sync::Mutex<String>>,
         pending: Arc<std::sync::Mutex<ClaudePending>>,
         ledger: crate::claude_turns::SharedLedger,
+        quiet: deadman::SharedQuiet,
         // The session's attention clock (see [`ClaudeSession::clock`]). Held by
         // the consumer (like the ledger above) so the unrequested-death arm
         // below can mint AFTER the eviction has already torn the session record
@@ -6375,12 +6501,21 @@ impl FreshClaudeState {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, None)
+                        .await;
                     continue;
                 }
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, None)
+                        .await;
                     continue;
                 };
                 if let Some(ended) = crate::claude_sidecar_exit::StreamEnded::from_line(&value) {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, Some(&value))
+                        .await;
                     stream_ended = Some(ended);
                     continue;
                 }
@@ -6409,6 +6544,11 @@ impl FreshClaudeState {
                 // §5.2) before anything else reads it: a gate, an attach
                 // acknowledgement or the status published below sees it.
                 let step = state.fold_into_ledger(&ledger, &value, &broadcast_id, &session_type);
+                if !is_pending_frame(&value) && value["type"] != "sdk.send.rejected" {
+                    state
+                        .note_claude_stdout(&session_id, &ownership_id, Some(&value))
+                        .await;
+                }
                 // C18: a latched Stop that missed a command the CLI was still
                 // starting is sent again now (design §5.4); a refused one is
                 // disarmed (the turn keeps running and rings when it ends).
@@ -6418,16 +6558,27 @@ impl FreshClaudeState {
                         state
                             .reissue_stop(
                                 &session_id,
-                                &sidecar_session_id,
+                                &ownership_id,
                                 &stamp,
                                 &session_type,
                                 reissue,
                             )
                             .await;
                     }
-                    LedgerStep::StopRefused { stop_id } => {
+                    LedgerStep::StopRefused {
+                        stop_id,
+                        request_id,
+                    } => {
                         let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                        state.log_stop_refused(&stamp, &session_type, stop_id);
+                        state.report_stop_refused(
+                            &stamp,
+                            &session_type,
+                            stop_id,
+                            request_id,
+                            value["message"]
+                                .as_str()
+                                .unwrap_or("Claude could not stop the current turn. Try again."),
+                        );
                     }
                     LedgerStep::Nothing | LedgerStep::Settled(_) => {}
                 }
@@ -6444,7 +6595,12 @@ impl FreshClaudeState {
                             .take_back_rejected_send(&ledger, &stamp, &session_type, &rejection),
                         fact => fact.log(&stamp, &session_type),
                     }
-                    state.publish_claude_status(&ledger, &stamp, &session_type, false);
+                    if value["type"] == "sdk.send.rejected" {
+                        state
+                            .note_claude_stdout(&session_id, &ownership_id, Some(&value))
+                            .await;
+                    }
+                    state.publish_claude_status(&ledger, &quiet, &stamp, &session_type, false);
                     continue;
                 }
                 if value.get("type").and_then(Value::as_str) == Some("sdk.status") {
@@ -6573,7 +6729,7 @@ impl FreshClaudeState {
                     LedgerStep::Settled(settled) => value["sessionBusy"] = json!(settled.busy),
                     _ => {
                         let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                        state.publish_claude_status(&ledger, &stamp, &session_type, false);
+                        state.publish_claude_status(&ledger, &quiet, &stamp, &session_type, false);
                     }
                 }
                 // Restart-parity (plan §2.8 item 2): record the durable Claude UUID
@@ -6669,7 +6825,7 @@ impl FreshClaudeState {
                 };
                 if let LedgerStep::Settled(settled) = step {
                     state.ring_settled_turn(&record, settled);
-                    state.publish_claude_status(&ledger, &stamp, &session_type, true);
+                    state.publish_claude_status(&ledger, &quiet, &stamp, &session_type, true);
                 }
             }
             // C17: the end of output ends whatever the CLI owed (its queue died
@@ -6679,6 +6835,7 @@ impl FreshClaudeState {
             // time the unrequested-death arm below runs the ledger is cleared
             // and the session record evicted (the clock and id handles it needs
             // are consumer-owned locals that survive the eviction).
+            quiet.lock().expect("quiet deadman lock").disarm();
             let turn_was_in_flight = ledger.lock().expect("turn ledger lock").eof();
             // Consumer exit == this sidecar's stdout closed == the sidecar ended
             // (ledger A9): it exits after reporting its SDK stream's end
@@ -7954,6 +8111,7 @@ fn log_claude_teardown(
 
 mod create_binding;
 mod create_outcome;
+mod deadman;
 mod recovery;
 pub use create_outcome::ClaudeCreateOutcome;
 
@@ -8017,7 +8175,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::naming::SessionNaming as _;
 
+    mod abandoned_create_tests;
+    mod control_tests;
     mod create_binding_tests;
+    mod deadman_tests;
     mod recovery_tests;
     mod refusal_tests;
 
@@ -8086,6 +8247,8 @@ pub(crate) mod tests {
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
+                session_type: "freshclaude".into(),
+                quiet: Default::default(),
                 configuration: ClaudeConfiguration::default(),
                 stdin: stdin.into(),
                 child,
@@ -16988,6 +17151,8 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
+                session_type: "freshclaude".into(),
+                quiet: Default::default(),
                 configuration: ClaudeConfiguration::default(),
                 stdin: stdin.into(),
                 child,
@@ -17652,6 +17817,7 @@ rl.on('line', (line) => {
         let st = state();
         insert_fake_claude_session(&st, "fold-session").await;
         let pending = st.sessions.lock().await["fold-session"].pending.clone();
+        let quiet = st.sessions.lock().await["fold-session"].quiet.state.clone();
         let consumer = st.spawn_consumer(
             reader,
             "fold-session".to_string(),
@@ -17662,6 +17828,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
             crate::claude_turns::SharedLedger::default(),
+            quiet,
             crate::attention::AttentionClock::default(),
             None, // provenance: test lane is conn-less (D8)
             false,
@@ -18605,15 +18772,15 @@ rl.on('line', (line) => {
 
     // ── freshAgent.interrupt (parity gap fix -- see terminal.rs's dispatch arm) ────
 
-    /// A missing session mirrors the `SESSION_NOT_FOUND` convention already
-    /// established by [`FreshClaudeState::handle_send`] (and codex/opencode's own
-    /// `handle_interrupt`): an `error` frame, never a silent drop.
+    /// An unknown interrupt is a visible session error, including for an
+    /// older client that supplies no request id.
     #[tokio::test]
     async fn handle_interrupt_errors_for_unknown_session() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "does-not-exist".to_string(),
             session_type: SessionType::Freshclaude,
@@ -18622,14 +18789,8 @@ rl.on('line', (line) => {
         .await;
 
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "error");
-        assert!(
-            frame["message"]
-                .as_str()
-                .unwrap()
-                .contains("claude session not found"),
-            "{frame}"
-        );
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID", "{frame}");
     }
 
     /// A known session's interrupt is forwarded to the sidecar (the Rust-side half of
@@ -18656,6 +18817,7 @@ rl.on('line', (line) => {
         await_ledger_busy(&st, &session_id, true).await;
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.clone(),
             session_type: SessionType::Freshclaude,
@@ -18721,6 +18883,7 @@ rl.on('line', (line) => {
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_interrupt(FreshAgentInterrupt {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.clone(),
             session_type: SessionType::Freshclaude,
@@ -19191,6 +19354,7 @@ rl.on('line', (line) => {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let clock = crate::attention::AttentionClock::default();
         let turn_lock = Arc::new(TokioMutex::new(()));
+        let quiet = deadman::QuietWatch::default();
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
         let consumer = st.spawn_consumer(
             reader,
@@ -19202,6 +19366,7 @@ rl.on('line', (line) => {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&ledger),
+            quiet.state.clone(),
             clock.clone(),
             None, // provenance: test lane is conn-less (D8)
             false,
@@ -19209,6 +19374,8 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             map_key.to_string(),
             ClaudeSession {
+                session_type: "freshclaude".into(),
+                quiet,
                 configuration: ClaudeConfiguration::default(),
                 stdin: stdin.into(),
                 child,

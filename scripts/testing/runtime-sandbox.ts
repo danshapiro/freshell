@@ -13,6 +13,70 @@ export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
 export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
 export const CONTROL_PROTOCOL_VERSION = 1
 
+type OwnedRuntimeImage = { tag: string; runId: string; candidateSha: string; digest?: string }
+
+const RUNTIME_IMAGE_LABELS = {
+  runId: 'org.freshell.runtime-test-run-id',
+  candidate: 'org.freshell.runtime-test-candidate',
+} as const
+
+function runOwnedRuntimeImageTag(runId: string, candidateSha: string): string {
+  const runToken = createHash('sha256').update(runId).digest('hex')
+  const repository = PHASE2_RUNTIME_IMAGE_TAG.slice(0, PHASE2_RUNTIME_IMAGE_TAG.indexOf(':'))
+  return `${repository}:phase2-${candidateSha.slice(0, 12)}-${runToken}`
+}
+
+function assertRunOwnedRuntimeImage(observed: unknown, context: OwnedRuntimeImage): void {
+  const images = Array.isArray(observed) ? observed : []
+  const image = images.length === 1 && images[0] && typeof images[0] === 'object'
+    ? images[0] as { Id?: unknown; RepoTags?: unknown; Config?: { Labels?: unknown } }
+    : undefined
+  const labels = image?.Config?.Labels
+  const repoTags = image?.RepoTags
+  if (!image || typeof image.Id !== 'string' || (context.digest && image.Id !== context.digest)
+    || !Array.isArray(repoTags) || !repoTags.includes(context.tag)
+    || !labels || typeof labels !== 'object'
+    || (labels as Record<string, unknown>)[RUNTIME_IMAGE_LABELS.runId] !== context.runId
+    || (labels as Record<string, unknown>)[RUNTIME_IMAGE_LABELS.candidate] !== context.candidateSha) {
+    throw new Error('runtime image is not the exact owned artifact')
+  }
+}
+
+function buildRunOwnedRuntimeImage(
+  repoRoot: string, context: OwnedRuntimeImage,
+): string {
+  execFileSync('docker', [
+    'build',
+    '--pull=false',
+    '--provenance=false',
+    '--sbom=false',
+    '--label', `${RUNTIME_IMAGE_LABELS.runId}=${context.runId}`,
+    '--label', `${RUNTIME_IMAGE_LABELS.candidate}=${context.candidateSha}`,
+    '-f',
+    'docker/runtime/Dockerfile',
+    '-t',
+    context.tag,
+    '.',
+  ], { cwd: repoRoot, stdio: 'inherit' })
+  const digest = String(execFileSync('docker', ['image', 'inspect', context.tag, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
+  if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('run-owned runtime image has no pinned digest')
+  const observed: unknown = JSON.parse(String(execFileSync('docker', ['image', 'inspect', context.tag], { encoding: 'utf8' })))
+  assertRunOwnedRuntimeImage(observed, { ...context, digest })
+  const addressed = String(execFileSync('docker', ['image', 'inspect', digest, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
+  if (addressed !== digest) throw new Error('run-owned runtime image digest is not locally addressable')
+  return digest
+}
+
+function removeRunOwnedRuntimeImage(context: OwnedRuntimeImage): void {
+  const imageTags = () => String(execFileSync('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'], { encoding: 'utf8' }))
+    .trim().split('\n').filter(Boolean)
+  if (!imageTags().includes(context.tag)) return
+  const observed: unknown = JSON.parse(String(execFileSync('docker', ['image', 'inspect', context.tag], { encoding: 'utf8' })))
+  assertRunOwnedRuntimeImage(observed, context)
+  execFileSync('docker', ['image', 'rm', context.tag], { encoding: 'utf8' })
+  if (imageTags().includes(context.tag)) throw new Error('exact owned runtime image tag remains after cleanup')
+}
+
 export type RuntimeLimits = {
   cpuMilli: number
   memoryBytes: number
@@ -161,6 +225,7 @@ export class RuntimeHarness {
   private readonly trackedForeignContainers = new Set<string>()
   private readonly trackedVolumes = new Set<string>()
   private readonly assertions: AssertionRecord[] = []
+  private ownedRuntimeImage: OwnedRuntimeImage | undefined
   private brokerStarted = false
   private readonly fixtureInputs: RuntimeFixtureInputs | undefined
 
@@ -335,6 +400,22 @@ export class RuntimeHarness {
       try { await this.broker.close() } catch (error) { errors.push(`broker close: ${String(error)}`) }
       this.brokerStarted = false
     }
+    let runtimeImageCleanup: { tag: string; digest?: string; removed?: boolean } | undefined
+    if (this.ownedRuntimeImage) {
+      runtimeImageCleanup = { tag: this.ownedRuntimeImage.tag, digest: this.ownedRuntimeImage.digest }
+      try {
+        removeRunOwnedRuntimeImage(this.ownedRuntimeImage)
+        runtimeImageCleanup.removed = true
+        this.recordLifecycle('runtime.owned_image_removed', runtimeImageCleanup)
+      } catch (error) {
+        runtimeImageCleanup.removed = false
+        errors.push(`runtime image ${this.ownedRuntimeImage.tag}: ${String(error)}`)
+        this.recordLifecycle('runtime.owned_image_cleanup_failed', {
+          ...runtimeImageCleanup,
+          error: String(error),
+        })
+      }
+    }
     // Build copies are unique to this run, so retries/concurrent gates never
     // overwrite an executable that another still-running container/process
     // has mapped. Remove them only after every receipt-owned runtime stopped.
@@ -349,6 +430,7 @@ export class RuntimeHarness {
         ...this.broker?.receiptIds?.() ?? [],
       ])],
       volumes: [...new Set([...this.trackedVolumes, ...providerVolumes, ...indexedVolumes, ...candidateVolumes])],
+      runtimeImage: runtimeImageCleanup,
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
       completedAt: new Date().toISOString(),
     }
@@ -1112,35 +1194,31 @@ export class RuntimeHarness {
   }
 
   private ensureRuntimeImage(): void {
-    const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : PHASE2_RUNTIME_IMAGE_TAG
-    let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
     if (this.phase === 1) {
+      const tag = PHASE1_RUNTIME_IMAGE_TAG
+      let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
       if (inspect.status !== 0) {
         docker(['pull', tag])
         inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
       }
-    } else {
-      // Always invoke the Phase 2 build so Docker validates the current
-      // Dockerfile/provider pins. Layer caching keeps unchanged rebuilds cheap.
-      // BuildKit provenance captures the whole context digest, including files
-      // the image never copies, and therefore changes the manifest-list ID for
-      // an otherwise identical workload image. Disable attestations here so
-      // the exact image identity is a reproducible digest of the image itself.
-      execFileSync('docker', [
-        'build',
-        '--pull=false',
-        '--provenance=false',
-        '--sbom=false',
-        '-f',
-        'docker/runtime/Dockerfile',
-        '-t',
-        tag,
-        '.',
-      ], { cwd: this.repoRoot, stdio: 'inherit' })
-      inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+      this.imageRef = inspect.stdout.trim()
+      if (!/^sha256:[0-9a-f]{64}$/.test(this.imageRef)) throw new Error(`runtime image is not pinned: ${this.imageRef}`)
+      return
     }
-    this.imageRef = inspect.stdout.trim()
-    if (!/^sha256:[0-9a-f]{64}$/.test(this.imageRef)) throw new Error(`runtime image is not pinned: ${this.imageRef}`)
+
+    // Always build the pinned provider workload image. Give each harness its
+    // own tag so another worktree cannot retag or remove our captured digest.
+    // BuildKit attestations include irrelevant build-context files in the
+    // image identity, so disable them to keep the workload digest reproducible.
+    const ownedImage: OwnedRuntimeImage = {
+      tag: runOwnedRuntimeImageTag(this.runId, this.candidateSha),
+      runId: this.runId,
+      candidateSha: this.candidateSha,
+    }
+    this.ownedRuntimeImage = ownedImage
+    ownedImage.digest = buildRunOwnedRuntimeImage(this.repoRoot, ownedImage)
+    this.imageRef = ownedImage.digest
+    this.recordLifecycle('runtime.owned_image_built', { tag: ownedImage.tag, digest: ownedImage.digest })
   }
 
   private phase2BootstrapFiles(): string[] {

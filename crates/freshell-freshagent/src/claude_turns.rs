@@ -453,7 +453,10 @@ pub(crate) enum Folded {
     Reissue(StopReissue),
     /// The CLI refused the latched Stop's interrupt (`ok: false`): the latch is
     /// disarmed, and the turn it targeted keeps running.
-    StopRefused { stop_id: String },
+    StopRefused {
+        stop_id: String,
+        request_id: Option<String>,
+    },
 }
 
 /// The busy truth of one claude session (design §5.2): every command the
@@ -707,7 +710,11 @@ impl ClaudeTurnLedger {
     /// runs by itself. Commands queued behind the running turn are not targets
     /// (decision 1): they run and ring. A Stop while another is latched keeps
     /// the earlier one's targets, so everything the user stopped stays silent.
-    pub(crate) fn stop(&mut self, stop_id: String) -> Option<StopArmed> {
+    pub(crate) fn stop(
+        &mut self,
+        stop_id: String,
+        request_id: Option<String>,
+    ) -> Option<StopArmed> {
         if !self.busy() {
             return None;
         }
@@ -731,6 +738,7 @@ impl ClaudeTurnLedger {
         let earlier = self.stop.take();
         let mut latch = StopLatch {
             stop_id: stop_id.clone(),
+            request_id,
             commands: Vec::new(),
             cli_turn: target == StopTargetKind::CliTurn,
             awaiting_start: awaiting_start.clone(),
@@ -777,9 +785,10 @@ impl ClaudeTurnLedger {
         self.stop.is_some()
     }
 
-    /// The CLI's receipt for an interrupt. Only the latch's own receipt counts
-    /// (a re-sent interrupt's, or an earlier Stop's, is not); a protocol fake
-    /// echoes no stop id, so its receipt is the pending latch's.
+    /// The original receipt advances the latch's targeting rules. A failed
+    /// reissue cancels that same Stop and reports its original user request;
+    /// a successful reissue leaves the targeting rules unchanged. Earlier
+    /// Stops are ignored. An id-less legacy receipt belongs to the pending latch.
     fn fold_receipt(
         &mut self,
         stop_id: Option<&str>,
@@ -789,17 +798,27 @@ impl ClaudeTurnLedger {
         let Some(stop) = self.stop.as_mut() else {
             return Folded::Applied;
         };
+        let reissued = stop_id.is_some_and(|id| {
+            stop.reissues > 0 && id == format!("{}:{}", stop.stop_id, stop.reissues)
+        });
         let ours = match stop_id {
             Some(id) => id == stop.stop_id,
             None => stop.receipt == StopReceipt::Pending,
         };
-        if !ours || stop.receipt != StopReceipt::Pending {
+        if !reissued && (!ours || stop.receipt != StopReceipt::Pending) {
             return Folded::Applied;
         }
         if !ok {
             let stop_id = stop.stop_id.clone();
+            let request_id = stop.request_id.clone();
             self.stop = None;
-            return Folded::StopRefused { stop_id };
+            return Folded::StopRefused {
+                stop_id,
+                request_id,
+            };
+        }
+        if reissued {
+            return Folded::Applied;
         }
         let lists_target = stop.awaiting_start.as_ref().is_some_and(|target| {
             still_queued.is_some_and(|queued| queued.iter().any(|uuid| uuid == target))
@@ -845,6 +864,7 @@ impl ClaudeTurnLedger {
         stop.awaiting_start = None;
         Folded::Reissue(StopReissue {
             stop_id: stop.stop_id.clone(),
+            request_id: stop.request_id.clone(),
             reissue_id: format!("{}:{}", stop.stop_id, stop.reissues),
             case,
             target,
@@ -967,6 +987,7 @@ impl ReissueCase {
 pub(crate) struct StopReissue {
     /// The latched Stop.
     pub(crate) stop_id: String,
+    pub(crate) request_id: Option<String>,
     /// The re-sent interrupt's own id (its receipt is not the latch's).
     pub(crate) reissue_id: String,
     pub(crate) case: ReissueCase,
@@ -980,6 +1001,7 @@ pub(crate) struct StopReissue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StopLatch {
     stop_id: String,
+    request_id: Option<String>,
     /// The commands it targets; a result that retires only these is silent.
     commands: Vec<String>,
     /// It targets a turn the CLI runs by itself (a result retiring nothing).

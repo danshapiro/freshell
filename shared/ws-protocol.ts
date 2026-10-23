@@ -436,6 +436,7 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    freshAgentAttentionReplayV1: z.literal(true).optional(),
     // Paced terminal restore (responsive-terminal-restore Workstream 1): the
     // client understands bounded, ascending paced replay batches with
     // continuation credit. Additive optional — declared, not just sent (same
@@ -947,6 +948,7 @@ export const FreshAgentSendSchema = z.object({
 
 export const FreshAgentInterruptSchema = z.object({
   type: z.literal('freshAgent.interrupt'),
+  requestId: z.string().optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
@@ -1202,6 +1204,7 @@ export const ReadyCapabilitiesSchema = z
     // client may send `terminal.interest.claimedTerminalIds`.
     terminalLifetimeClaimV1: z.literal(true).optional(),
     managedRuntimeV1: z.literal(true).optional(),
+    freshAgentAttentionReplayV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1307,6 +1310,14 @@ export type ReadyMessage = {
   buildId?: string
   /** Present iff the client's hello opted in via capabilities.paneReconcileV1. */
   capabilities?: ReadyCapabilities
+  /** Last known attention marks, negotiated by freshAgentAttentionReplayV1. */
+  freshAgentAttention?: Array<{
+    provider: string
+    sessionId: string
+    sessionType?: string
+    lastTurnCompleteAt?: number
+    lastWaitingAt?: number
+  }>
   /** kata b8ke: current runtime-owner state for every recorded
    *  (provider, sessionId) — replayed so a device that missed a handoff
    *  broadcast (offline, lag-4008, reload) learns the authoritative owner

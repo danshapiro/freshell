@@ -28,7 +28,10 @@ pub(super) enum LedgerStep {
     /// interrupt again (§5.4).
     Reissue(StopReissue),
     /// The CLI refused the latched Stop's interrupt; the turn keeps running.
-    StopRefused { stop_id: String },
+    StopRefused {
+        stop_id: String,
+        request_id: Option<String>,
+    },
 }
 
 /// One settled turn, as the consumer reports it.
@@ -75,16 +78,27 @@ impl FreshClaudeState {
     pub(super) fn take_back_unwritten_send(
         &self,
         ledger: &SharedLedger,
+        quiet: &super::deadman::SharedQuiet,
         session_id: &str,
         session_type: &str,
         uuid: &str,
     ) {
+        let mut quiet = quiet.lock().expect("quiet deadman lock");
         let mut ledger = ledger.lock().expect("turn ledger lock");
         // EOF may have cleared this command before its writer-failure receipt
         // reached the handler. Publish only for a command actually removed,
         // under this same guard so EOF cannot overtake its status update.
         if ledger.undo_arm(uuid).is_some() {
-            self.publish_locked_status(&mut ledger, session_id, session_type, false);
+            if !ledger.busy() {
+                quiet.disarm();
+            }
+            self.publish_locked_status(
+                &mut ledger,
+                session_id,
+                session_type,
+                false,
+                quiet.is_stuck(),
+            );
         }
     }
 
@@ -96,20 +110,19 @@ impl FreshClaudeState {
         let Some(key) = self.resolve_session_key(any_id).await else {
             return;
         };
-        let live = self.sessions.lock().await.get(&key).map(|session| {
-            let session_id = session
-                .broadcast_id
-                .lock()
-                .expect("broadcast id lock")
-                .clone();
-            (session.ledger.clone(), session_id)
-        });
-        let Some((ledger, session_id)) = live else {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(&key) else {
             return;
         };
-        let mut ledger = ledger.lock().expect("turn ledger lock");
+        let session_id = session
+            .broadcast_id
+            .lock()
+            .expect("broadcast id lock")
+            .clone();
+        let quiet = session.quiet.state.lock().expect("quiet deadman lock");
+        let mut ledger = session.ledger.lock().expect("turn ledger lock");
         let status = ledger
-            .take_status_change(false)
+            .take_status_change(quiet.is_stuck())
             .unwrap_or_else(|| ledger.published_status());
         tracing::debug!(target: TARGET, provider = PROVIDER, session_id = %session_id,
             session_type, status = status.as_str(), announced = true, "freshagent.claude.status");
@@ -151,7 +164,13 @@ impl FreshClaudeState {
                 LedgerStep::Nothing
             }
             Folded::Reissue(reissue) => LedgerStep::Reissue(reissue),
-            Folded::StopRefused { stop_id } => LedgerStep::StopRefused { stop_id },
+            Folded::StopRefused {
+                stop_id,
+                request_id,
+            } => LedgerStep::StopRefused {
+                stop_id,
+                request_id,
+            },
             Folded::Settled(settlement) => {
                 let command_ids: Vec<String> = settlement
                     .retired
@@ -223,22 +242,31 @@ impl FreshClaudeState {
     pub(super) fn publish_claude_status(
         &self,
         ledger: &SharedLedger,
+        quiet: &super::deadman::SharedQuiet,
         session_id: &str,
         session_type: &str,
         after_result: bool,
     ) {
+        let quiet = quiet.lock().expect("quiet deadman lock");
         let mut ledger = ledger.lock().expect("turn ledger lock");
-        self.publish_locked_status(&mut ledger, session_id, session_type, after_result);
+        self.publish_locked_status(
+            &mut ledger,
+            session_id,
+            session_type,
+            after_result,
+            quiet.is_stuck(),
+        );
     }
 
-    fn publish_locked_status(
+    pub(super) fn publish_locked_status(
         &self,
         ledger: &mut crate::claude_turns::ClaudeTurnLedger,
         session_id: &str,
         session_type: &str,
         after_result: bool,
+        stuck: bool,
     ) {
-        let (status, changed) = match ledger.take_status_change(false) {
+        let (status, changed) = match ledger.take_status_change(stuck) {
             Some(status) => (status, true),
             None if after_result && ledger.published_status() != EffectiveStatus::Idle => {
                 (ledger.published_status(), false)
@@ -267,11 +295,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
         let state = FreshClaudeState::new(Arc::new(tx));
         let ledger = SharedLedger::default();
+        let quiet = crate::quiet_deadman::QuietDeadman::new_shared();
         ledger
             .lock()
             .unwrap()
             .arm("send-uuid".into(), Some("request".into()), SendKind::Turn);
-        state.publish_claude_status(&ledger, "session", "freshclaude", false);
+        state.publish_claude_status(&ledger, &quiet, "session", "freshclaude", false);
         assert!(ledger.lock().unwrap().eof());
         state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
             provider: "claude".into(),
@@ -281,7 +310,7 @@ mod tests {
         }));
         // A delayed writer-failure handler wakes after stdout EOF has already
         // cleared the command and announced the ended runtime.
-        state.take_back_unwritten_send(&ledger, "session", "freshclaude", "send-uuid");
+        state.take_back_unwritten_send(&ledger, &quiet, "session", "freshclaude", "send-uuid");
         let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|raw| serde_json::from_str(&raw).unwrap())
             .collect();
@@ -293,12 +322,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
         let state = FreshClaudeState::new(Arc::new(tx));
         let ledger = SharedLedger::default();
+        let quiet = crate::quiet_deadman::QuietDeadman::new_shared();
         ledger
             .lock()
             .unwrap()
             .arm("send-uuid".into(), None, SendKind::Turn);
-        state.publish_claude_status(&ledger, "session", "freshclaude", false);
-        state.take_back_unwritten_send(&ledger, "session", "freshclaude", "send-uuid");
+        state.publish_claude_status(&ledger, &quiet, "session", "freshclaude", false);
+        state.take_back_unwritten_send(&ledger, &quiet, "session", "freshclaude", "send-uuid");
         let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|raw| serde_json::from_str(&raw).unwrap())
             .collect();

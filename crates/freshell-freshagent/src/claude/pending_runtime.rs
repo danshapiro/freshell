@@ -28,8 +28,8 @@ impl FreshClaudeState {
         request_id: &str,
         kind: PendingResponse,
     ) {
-        let sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get(&response.map_key).filter(|session| {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&response.map_key).filter(|session| {
             session.ownership_id == response.ownership_id
                 && Arc::ptr_eq(&session.pending, &response.pending)
         }) else {
@@ -49,6 +49,8 @@ impl FreshClaudeState {
                 .clone();
             self.edges.pending_drained(&stamp);
         }
+        drop(pending);
+        self.refresh_claude_quiet(session, &response.map_key, false);
     }
 
     pub(super) async fn publish_pending_frame(
@@ -58,9 +60,9 @@ impl FreshClaudeState {
         value: &Value,
         session_type: &str,
     ) {
-        let sessions = self.sessions.lock().await;
+        let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions
-            .get(map_key)
+            .get_mut(map_key)
             .filter(|session| Arc::ptr_eq(&session.pending, expected_pending))
         else {
             return;
@@ -70,7 +72,13 @@ impl FreshClaudeState {
             .lock()
             .expect("broadcast id lock")
             .clone();
-        self.publish_claude_status(&session.ledger, &stamp, session_type, false);
+        self.publish_claude_status(
+            &session.ledger,
+            &session.quiet.state,
+            &stamp,
+            session_type,
+            false,
+        );
         let mut pending = session.pending.lock().expect("pending lock");
         let change = pending.fold_frame(value);
         if let Some(frame) = sdk_line_to_frame(value, &stamp, session_type) {
@@ -89,5 +97,7 @@ impl FreshClaudeState {
             Some(PendingChange::Drained) => self.edges.pending_drained(&stamp),
             None => {}
         }
+        drop(pending);
+        self.refresh_claude_quiet(session, map_key, false);
     }
 }
