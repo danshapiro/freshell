@@ -1726,6 +1726,7 @@ impl FreshCodexState {
             permission_mode: permission_mode.map(Into::into),
             effort: effort.map(Into::into),
             cwd: cwd.map(Into::into),
+            plugins: None,
         };
         // No-laundering guard (V7/A10): never persist an all-blank snapshot --
         // it would mask a genuine record miss forever. Real creates always carry
@@ -1744,6 +1745,7 @@ impl FreshCodexState {
         }
         if let Err(e) = sink
             .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
                 provider: "codex".into(),
                 session_id: session_id.into(),
                 mode: "freshcodex".into(),
@@ -18242,6 +18244,7 @@ pub(crate) mod tests {
         // …but the parent's durable row knows the attribution (stamped by a
         // later merge — lineage-only payload so no settings change rides).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "codex".into(),
             session_id: parent_id.clone(),
@@ -18436,6 +18439,7 @@ pub(crate) mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         // A stamped LINEAGE-ONLY row (blank settings).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "codex".into(),
             session_id: "thread-lineage-adopt".into(),
@@ -18528,6 +18532,7 @@ pub(crate) mod tests {
         // (cwd must be a REAL directory — the fork below spawns the child's
         // sidecar with the parent's inherited cwd.)
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "codex".into(),
             session_id: "thread-row-seeded".into(),
@@ -18551,6 +18556,7 @@ pub(crate) mod tests {
                 permission_mode: None,
                 effort: None,
                 cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                plugins: None,
             },
         })
         .await
@@ -18636,6 +18642,7 @@ pub(crate) mod tests {
         // A settings-bearing row with NO stamps (recorded via an explicit
         // upsert, not the seed helper, so the row unambiguously has them unset).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "codex".into(),
             session_id: "thread-unattributed".into(),
@@ -18654,6 +18661,7 @@ pub(crate) mod tests {
                 permission_mode: None,
                 effort: None,
                 cwd: Some("/w".into()),
+                plugins: None,
             },
         })
         .await
@@ -22190,6 +22198,7 @@ pub(crate) mod tests {
         let thread = "historical-thread-lineage";
         // The lineage-only seed: a row exists with a blank settings snapshot.
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            genesis: crate::identity_sink::GenesisUpdate::Keep,
             name_transition: None,
             provider: "codex".into(),
             session_id: thread.into(),
@@ -22616,6 +22625,7 @@ pub(crate) mod tests {
                 permission_mode: Some("on-request".into()),
                 effort: Some("high".into()),
                 cwd: Some("/w".into()),
+                plugins: None,
             },
         );
         state.set_identity_sink(fake.clone());

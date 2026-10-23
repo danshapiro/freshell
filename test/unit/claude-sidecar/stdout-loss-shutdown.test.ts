@@ -17,7 +17,7 @@ import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { BOOT_FAILED_EXIT_CODE } from '../../../crates/freshell-claude-sidecar/boot.mjs'
 import { STREAM_ENDED_EXIT_CODE } from '../../../crates/freshell-claude-sidecar/stream-end.mjs'
-import { SIDECAR_INDEX, startRealSidecar } from './harness'
+import { SIDECAR_INDEX, startRealSidecar, type RealSidecar } from './harness'
 
 const children = new Set<ChildProcess>()
 const directories: string[] = []
@@ -87,12 +87,29 @@ function logRecords(stderr: string): Record<string, any>[] {
  * The production sidecar behind a slow stderr reader: its exit flush (the
  * wait of a sidecar exiting on its own) takes half a second, so the stdout
  * error of a write into a readerless pipe arrives while it is still exiting.
+ *
+ * Its stdout reader lives in a relay process (stdout-reader-relay.mjs), not
+ * in this test process: these cases need the ONE write the sidecar makes
+ * after losing its reader to fail with EPIPE, and a child this process spawns
+ * for another test file holds a copy of every descriptor here until it execs,
+ * long enough for that write to land in the copy instead.
  */
 function startWithSlowStderr() {
   return startRealSidecar({
-    entry: fileURLToPath(new URL('./fixtures/slow-stderr-flush-entry.mjs', import.meta.url)),
-    env: { SIDECAR_INDEX_PATH: SIDECAR_INDEX, STDERR_FLUSH_DELAY_MS: '500' },
+    entry: fileURLToPath(new URL('./fixtures/stdout-reader-relay.mjs', import.meta.url)),
+    env: {
+      RELAY_ENTRY: fileURLToPath(new URL('./fixtures/slow-stderr-flush-entry.mjs', import.meta.url)),
+      SIDECAR_INDEX_PATH: SIDECAR_INDEX,
+      STDERR_FLUSH_DELAY_MS: '500',
+    },
   })
+}
+
+/** Close the only reader of the sidecar's stdout, and wait until it is closed. */
+async function dropStdoutReader(sidecar: RealSidecar) {
+  await sidecar.waitFor('relay.ready', 'the relay to handle SIGUSR2')
+  sidecar.child.kill('SIGUSR2')
+  await sidecar.waitFor('relay.reader_dropped', 'the relay to close its stdout reader')
 }
 
 // A sidecar that is already exiting on its own (its SDK stream ended, exit 3;
@@ -107,7 +124,7 @@ describe('Claude sidecar losing its stdout reader while it exits on its own', ()
     // The boot catalog is the last line an idle session writes.
     await sidecar.waitFor((frame) => frame.type === 'sdk.session.changed', 'the boot catalog')
 
-    sidecar.child.stdout!.destroy()
+    await dropStdoutReader(sidecar)
     // The CLI dies under the idle session: sdk.stream.ended is the first write
     // into the readerless pipe, made by a sidecar already exiting with code 3.
     process.kill(cliPid, 'SIGKILL')
@@ -124,7 +141,7 @@ describe('Claude sidecar losing its stdout reader while it exits on its own', ()
 
   it('a boot refused after the reader went away still exits 2', async () => {
     const sidecar = await startWithSlowStderr()
-    sidecar.child.stdout!.destroy()
+    await dropStdoutReader(sidecar)
     // A create that does not speak protocol 2 is refused at once: create.failed
     // is the first write into the readerless pipe.
     sidecar.send({ type: 'create', protocol: 1, boot: { kind: 'fresh' }, requestId: 'create', cwd: sidecar.cwd })

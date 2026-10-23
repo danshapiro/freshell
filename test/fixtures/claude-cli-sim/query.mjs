@@ -80,6 +80,7 @@ import { toolCall } from './tools.mjs'
 import {
   claudeConfigDir,
   CLI_VERSION,
+  dropsTurnRefusal,
   findTranscript,
   forkPrefix,
   readTranscriptLines,
@@ -113,6 +114,19 @@ function markerSteps(text) {
     case 'exit_plan': return [{ kind: 'exit_plan', data: { plan: PLAN_TEXT } }]
     default: return [{ kind: 'text', data: { text: 'ok' } }]
   }
+}
+
+/** The `<task-notification>` a finished background task leaves in the transcript. */
+function taskNotificationXml(task) {
+  return [
+    '<task-notification>',
+    `<task-id>${task.task_id}</task-id>`,
+    ...(task.toolUseId ? [`<tool-use-id>${task.toolUseId}</tool-use-id>`] : []),
+    '<status>completed</status>',
+    `<summary>Agent "${task.description ?? 'background task'}" finished</summary>`,
+    `<result>${SUBAGENT_TEXT}</result>`,
+    '</task-notification>',
+  ].join('\n')
 }
 
 class AbortError extends Error {
@@ -411,11 +425,8 @@ class SimulatedCli {
       try { prefix = forkPrefix(parentLines, resumeSessionAt) } catch (error) { return { message: error.message } }
       if (resumeDropsTurn) {
         const discarded = parentLines.slice(prefix.length).filter((line) => typeof line.uuid === 'string')
-        const first = discarded[0]
-        if (!first || first.type !== 'user' || first.uuid !== resumeDropsTurn) {
-          const shown = first ? ` [type=${first.type}, uuid=${first.uuid}]` : ''
-          return { message: `Resume rejected by --resume-drops-turn: resuming at ${resumeSessionAt} would discard entries not attributable to turn ${resumeDropsTurn}: range does not start with the declared turn prompt; first discarded entry 0${shown}` }
-        }
+        const reason = dropsTurnRefusal(discarded, resumeDropsTurn)
+        if (reason) return { message: `Resume rejected by --resume-drops-turn: resuming at ${resumeSessionAt} would discard entries not attributable to turn ${resumeDropsTurn}: ${reason}` }
       }
       this.transcript = forkSession
         ? new Transcript({ configDir: this.configDir, cwd: this.cwd, sessionId: this.sessionId, flushMs: (ms) => this.ms(ms), prefix })
@@ -535,8 +546,9 @@ class SimulatedCli {
       this.background(this.runCommand(cmd))
       return
     }
-    if (this.cliTurns.shift()) {
-      this.background(this.runCliTurn())
+    const task = this.cliTurns.shift()
+    if (task) {
+      this.background(this.runCliTurn(task))
       return
     }
     if (this.busy) {
@@ -577,10 +589,14 @@ class SimulatedCli {
   }
 
   /** A turn the CLI starts by itself: a background task finished (T19). */
-  async runCliTurn() {
+  async runCliTurn(task) {
     const turn = new Turn(null)
     this.turn = turn
     await this.sleep(T.queuedToStarted)
+    // The CLI writes the completion into the transcript as a user line of
+    // origin task-notification: no prompt of its own, and no SDK message.
+    this.transcript.append({ type: 'user', message: { role: 'user', content: taskNotificationXml(task) }, origin: { kind: 'task-notification' } })
+    this.transcript.append({ type: 'attachment', attachment: { type: 'total_tokens_reminder', text: '<total_tokens>15000000 tokens left</total_tokens>' } })
     this.emit(this.systemInit())
     await this.sleep(T.initToStatus)
     this.emit({ type: 'system', subtype: 'status', status: 'requesting' })
@@ -705,6 +721,13 @@ class SimulatedCli {
     const block = { tool_use_id: toolUseId, type: 'tool_result', content, ...(isError ? { is_error: true } : { is_error: false }) }
     this.emit({ type: 'user', message: { role: 'user', content: [block] }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), tool_use_result: toolUseResult, ...extra })
     this.transcript.append({ type: 'user', uuid, message: { role: 'user', content: [block] }, toolUseResult })
+    // Sends absorbed while the tool ran join the turn as queued_command
+    // attachments, never as prompts of their own (T10).
+    for (const cmd of this.turn?.absorbed ?? []) {
+      if (cmd.started || cmd.recorded) continue
+      cmd.recorded = true
+      this.transcript.append({ type: 'attachment', attachment: { type: 'queued_command', prompt: cmd.content, ...(cmd.uuid ? { source_uuid: cmd.uuid } : {}), commandMode: 'prompt', timestamp: new Date().toISOString() } })
+    }
     this.transcript.append({ type: 'attachment', attachment: { type: 'total_tokens_reminder', text: '<total_tokens>15000000 tokens left</total_tokens>' } })
   }
 
@@ -714,7 +737,7 @@ class SimulatedCli {
     this.emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [] })
     this.emit({ type: 'system', subtype: 'task_updated', task_id: task.task_id, patch: { status: 'completed', end_time: Date.now() } })
     this.emit({ type: 'system', subtype: 'task_notification', task_id: task.task_id, tool_use_id: toolUseId ?? null, status: 'completed', output_file: '', summary: SUBAGENT_TEXT, usage: { total_tokens: 1, tool_uses: 0, duration_ms: T.subagent } })
-    this.cliTurns.push(task)
+    this.cliTurns.push({ ...task, toolUseId })
     if (!this.turn && !this.finishing) {
       if (!this.busy) {
         this.busy = true

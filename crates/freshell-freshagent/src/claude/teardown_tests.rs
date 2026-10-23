@@ -117,6 +117,7 @@ async fn fake_session(
         turn_lock: Arc::new(TokioMutex::new(())),
         rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
         last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+        launch_genesis: None,
     };
     (session, ready)
 }

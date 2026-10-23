@@ -744,15 +744,7 @@ pub(crate) fn parse_transcript_turn_indexed(
     // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
     // The compact summary (`isCompactSummary`) is the model-facing recap of the
     // compacted history; the visible marker comes from `system/compact_boundary`.
-    if [
-        "isMeta",
-        "isSidechain",
-        "isCompactSummary",
-        "isVisibleInTranscriptOnly",
-    ]
-    .iter()
-    .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
-    {
+    if is_synthetic_line(obj) {
         return None;
     }
     let line_uuid = obj
@@ -889,6 +881,20 @@ pub(crate) fn parse_transcript_turn_indexed(
         return None;
     }
     Some(turn_json(&turn_id, ordinal, role, items, None, obj))
+}
+
+/// A line the CLI writes for itself or for a subagent, never shown as a turn
+/// and never a rollback step: meta lines (the local-command caveat), sidechain
+/// lines, the compaction summary, transcript-only lines.
+fn is_synthetic_line(obj: &Value) -> bool {
+    [
+        "isMeta",
+        "isSidechain",
+        "isCompactSummary",
+        "isVisibleInTranscriptOnly",
+    ]
+    .iter()
+    .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
 }
 
 /// Display text for an image attachment or an image tool result.
@@ -1254,9 +1260,16 @@ fn parse_chain_candidates(transcript: &str) -> Vec<ChainLine> {
 /// never enter it.
 fn raw_chain(transcript: &str) -> Vec<ChainLine> {
     let candidates = parse_chain_candidates(transcript);
-    let Some(mut cur) = candidates.last().map(|l| l.uuid.clone()) else {
+    let Some(tip) = candidates.last().map(|l| l.uuid.clone()) else {
         return Vec::new();
     };
+    chain_ending_at(&candidates, &tip)
+}
+
+/// The raw parentUuid chain root→`end` over parsed `candidates` (the walk
+/// [`raw_chain`] runs from the tip): empty when `end` is not a candidate.
+fn chain_ending_at(candidates: &[ChainLine], end: &str) -> Vec<ChainLine> {
+    let mut cur = end.to_string();
     let by_uuid: std::collections::HashMap<&str, &ChainLine> =
         candidates.iter().map(|l| (l.uuid.as_str(), l)).collect();
     let mut reversed = Vec::new();
@@ -1273,6 +1286,38 @@ fn raw_chain(transcript: &str) -> Vec<ChainLine> {
     }
     reversed.reverse();
     reversed
+}
+
+/// The conversation a lazy fork of `parent` holds through `at` (inclusive; all
+/// of it when `None`), before the fork writes its own transcript (design §4.5,
+/// T6): `parent`'s lines on the raw parentUuid chain ending at `at`, verbatim
+/// and in file order. A fork keeps those lines' uuids, so the turns projected
+/// from this text keep their ids when the fork's transcript appears. `None`
+/// when `at` is not a line of `parent` (the CLI refuses that fork:
+/// `RESUME_POINT_NOT_FOUND`).
+pub(crate) fn fork_prefix_transcript(parent: &str, at: Option<&str>) -> Option<String> {
+    let chain = match at {
+        Some(at) => {
+            let candidates = parse_chain_candidates(parent);
+            if !candidates.iter().any(|line| line.uuid == at) {
+                return None;
+            }
+            chain_ending_at(&candidates, at)
+        }
+        None => raw_chain(parent),
+    };
+    let members: std::collections::HashSet<&str> =
+        chain.iter().map(|line| line.uuid.as_str()).collect();
+    let kept: Vec<&str> = parent
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line.trim())
+                .ok()
+                .and_then(|obj| obj.get("uuid").and_then(Value::as_str).map(str::to_string))
+                .is_some_and(|uuid| members.contains(uuid.as_str()))
+        })
+        .collect();
+    Some(kept.join("\n"))
 }
 
 /// The last uuid of the raw parentUuid chain (the "chain tip") — the redo
@@ -1307,48 +1352,68 @@ pub(crate) fn raw_lcp_end(current: &str, original: &str) -> Option<String> {
     end
 }
 
-/// The first raw-chain entry strictly AFTER `uuid` — the source of the
-/// `resumeDropsTurn` guard (the uuid of the first message the resume discards).
-/// `None` when `uuid` is the tip or absent: the guard is then OMITTED (a
-/// vacuous discard — never fabricated).
-pub(crate) fn raw_chain_successor(transcript: &str, uuid: &str) -> Option<String> {
+/// The `resumeDropsTurn` guard for a fork of `transcript` that keeps its raw
+/// chain through `keep` (core design §4.2, decision 2): the uuid of the one
+/// prompted turn the fork discards, so the CLI refuses the fork
+/// (`FORK_GUARD_REFUSED`) when that turn absorbed a send or a task
+/// notification the pane never showed as its own turn. `None` (no guard, the
+/// SDK's unvalidated truncation) when the fork discards nothing, starts its
+/// discard mid-turn, discards more than one turn (the CLI's guard declares
+/// exactly one: a second prompt in the range always refuses), discards a
+/// slash command's step (the CLI does not attribute the command's output line
+/// to it), or boots fresh (`keep` is `None`).
+pub(crate) fn drops_turn_guard(transcript: &str, keep: Option<&str>) -> Option<String> {
+    let keep = keep?;
     let chain = raw_chain(transcript);
-    let pos = chain.iter().position(|l| l.uuid == uuid)?;
-    chain.get(pos + 1).map(|l| l.uuid.clone())
+    let kept = chain.iter().position(|line| line.uuid == keep)?;
+    let (first, rest) = chain.get(kept + 1..)?.split_first()?;
+    (is_prompt_anchor(&first.obj) && !rest.iter().any(|line| is_rollback_anchor(&line.obj)))
+        .then(|| first.uuid.clone())
 }
 
-/// A user-ANCHOR line: a real user prompt (type `user`, not meta/sidechain,
-/// text-bearing content). A tool_result carrier is NEVER an anchor — steps
-/// split at prompts only.
-fn is_user_anchor(obj: &Value) -> bool {
-    if obj.get("type").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    if [
-        "isMeta",
-        "isSidechain",
-        "isCompactSummary",
-        "isVisibleInTranscriptOnly",
-    ]
-    .iter()
-    .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
+/// A rollback ANCHOR (core design §4.5, transcript plan N7): a line that
+/// starts a turn the pane renders as the user's. The one predicate every
+/// rollback step and the transcript projector share: a real prompt anchors,
+/// and so does a slash-command invocation (`<command-name>/x</command-name>`,
+/// rendered as what the user typed). The CLI's own lines never do: the
+/// local-command caveat and other meta lines, sidechain lines, the compaction
+/// summary ([`is_synthetic_line`], which the projector skips), a command's
+/// `<local-command-stdout|stderr>` output (projected as a system row), a task
+/// notification (folded into its delegation), and a tool-result carrier.
+pub(crate) fn is_rollback_anchor(obj: &Value) -> bool {
+    if obj.get("type").and_then(Value::as_str) != Some("user")
+        || is_synthetic_line(obj)
+        || is_task_notification_line(obj)
     {
         return false;
     }
-    match obj.get("message") {
-        Some(Value::String(text)) => !text.trim().is_empty(),
+    let blocks: Vec<Value> = match obj.get("message") {
+        Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
         Some(Value::Object(m)) => match m.get("content") {
-            Some(Value::String(text)) => !text.trim().is_empty(),
-            Some(Value::Array(blocks)) => blocks.iter().any(|b| {
-                b.get("type").and_then(Value::as_str) == Some("text")
-                    && b.get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|t| !t.trim().is_empty())
-            }),
-            _ => false,
+            Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+            Some(Value::Array(blocks)) => blocks.clone(),
+            _ => return false,
         },
-        _ => false,
+        _ => return false,
+    };
+    if local_command_user_turn(&blocks, "", 0, obj).is_some() {
+        return false;
     }
+    blocks
+        .iter()
+        .any(|b| match b.get("type").and_then(Value::as_str) {
+            Some("text") => b
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.trim().is_empty()),
+            Some("image") => true,
+            _ => false,
+        })
+}
+
+/// A rollback anchor that is a prompt to the model, not a slash command.
+fn is_prompt_anchor(obj: &Value) -> bool {
+    is_rollback_anchor(obj) && slash_command_text(&user_prompt_text(obj)).is_none()
 }
 
 /// The anchor line's plain prompt text (the composer-refill payload): a plain
@@ -1370,12 +1435,19 @@ fn user_prompt_text(obj: &Value) -> String {
     }
 }
 
-/// Chain positions of every user-anchor line, in chain order (the step starts).
-fn user_anchor_positions(chain: &[ChainLine]) -> Vec<usize> {
+/// What the user typed to start the anchor's step (the composer refill): the
+/// prompt text, or the slash command as typed (`/compact keep it short`).
+fn anchor_refill_text(obj: &Value) -> String {
+    let text = user_prompt_text(obj);
+    slash_command_text(&text).unwrap_or(text)
+}
+
+/// Chain positions of every rollback anchor, in chain order (the step starts).
+fn rollback_anchor_positions(chain: &[ChainLine]) -> Vec<usize> {
     chain
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| is_user_anchor(&l.obj).then_some(i))
+        .filter_map(|(i, l)| is_rollback_anchor(&l.obj).then_some(i))
         .collect()
 }
 
@@ -1398,16 +1470,13 @@ pub(crate) enum ResumeTarget {
 /// One resolved rollback: where the fork keeps (`resume_at_uuid`; `None` =
 /// "before the first message" — LEGAL per r2: the handler takes the
 /// fresh-conversation leg, never a refusal), the removed display-turn slice
-/// (the marker bucket + ack payload), and the composer-refill prompt.
-/// `guard_uuid` is the `resumeDropsTurn` guard sourced from the RAW chain entry
-/// at the first removed position (SDK-exact + cheaper than the display
-/// projection — task 4 review nit 4); `None` on the first-turn leg (no fork →
-/// no guard is ever armed).
+/// (the marker bucket + ack payload), and the composer-refill prompt. The
+/// fork's `resumeDropsTurn` guard comes from [`drops_turn_guard`] over the
+/// transcript the fork actually reads.
 pub(crate) struct ResumePoint {
     pub resume_at_uuid: Option<String>,
     pub removed_turns: Vec<Value>,
     pub prompt_text: String,
-    pub guard_uuid: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1435,7 +1504,7 @@ pub(crate) fn resolve_resume_point(
     if chain.is_empty() {
         return Err(ResumeResolveError::Empty);
     }
-    let anchors = user_anchor_positions(&chain);
+    let anchors = rollback_anchor_positions(&chain);
     if anchors.is_empty() {
         return Err(ResumeResolveError::Empty);
     }
@@ -1477,21 +1546,66 @@ pub(crate) fn resolve_resume_point(
                 .is_some_and(|id| removed_uuids.contains(id))
         })
         .collect();
-    let prompt_text = user_prompt_text(&chain[first_remove_pos].obj);
-    // The resumeDropsTurn guard = the RAW chain entry at the first removed
-    // position (task 4 review nit 4: SDK-exact + cheaper than re-deriving it
-    // from the first removed DISPLAY turn — the projection filters carriers).
-    // Omitted on the first-turn leg (`resume_at_uuid: None` = the fresh
-    // conversation — no fork, so no guard is ever armed).
-    let guard_uuid = resume_at_uuid
-        .as_ref()
-        .map(|_| chain[first_remove_pos].uuid.clone());
+    let prompt_text = anchor_refill_text(&chain[first_remove_pos].obj);
     Ok(ResumePoint {
         resume_at_uuid,
         removed_turns,
         prompt_text,
-        guard_uuid,
     })
+}
+
+/// Why a fork of a conversation has no point to keep through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForkPointError {
+    /// The conversation holds no chain lines: there is nothing to fork.
+    Empty,
+    /// The turn the fork was asked to start from is not in the conversation.
+    TurnNotFound,
+}
+
+/// Where a fork of `transcript` keeps through (core design §4.5 `handle_fork`):
+/// the last raw-chain entry of the step holding `at_turn_id`, so the fork keeps
+/// that whole turn (its answer and tool round trips), or the chain's tip when no
+/// turn is named. `at_turn_id` is a snapshot turn id (a line uuid); a client
+/// split-row id (`<turn>:row-<n>`) names its turn. A line before the first step
+/// keeps the lines before that step.
+pub(crate) fn fork_point(
+    transcript: &str,
+    at_turn_id: Option<&str>,
+) -> Result<String, ForkPointError> {
+    let chain = raw_chain(transcript);
+    let Some(tip) = chain.last() else {
+        return Err(ForkPointError::Empty);
+    };
+    let Some(at) = at_turn_id else {
+        return Ok(tip.uuid.clone());
+    };
+    let at = strip_split_row_suffix(at);
+    let pos = chain
+        .iter()
+        .position(|line| line.uuid == at)
+        .ok_or(ForkPointError::TurnNotFound)?;
+    let anchors = rollback_anchor_positions(&chain);
+    let end = match anchors.iter().rposition(|&anchor| anchor <= pos) {
+        Some(step) => step_group_end(chain.len(), &anchors, step),
+        None => anchors
+            .first()
+            .map(|first| first.saturating_sub(1))
+            .unwrap_or(chain.len() - 1),
+    };
+    Ok(chain[end].uuid.clone())
+}
+
+/// A turn id without the client's split-row suffix (`<turn>:row-<digits>`).
+fn strip_split_row_suffix(turn_id: &str) -> &str {
+    match turn_id.rsplit_once(":row-") {
+        Some((turn, digits))
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            turn
+        }
+        _ => turn_id,
+    }
 }
 
 /// The restored slice's display turns + the composer-refill prompt: the display
@@ -1536,11 +1650,11 @@ pub(crate) fn restored_slice_turns(
                 .is_some_and(|id| slice_uuids.contains(id))
         })
         .collect();
-    let anchors = user_anchor_positions(&orig);
+    let anchors = rollback_anchor_positions(&orig);
     let prompt_text = anchors
         .iter()
         .find(|&&a| a >= start_pos && a <= end_pos)
-        .map(|&a| user_prompt_text(&orig[a].obj))
+        .map(|&a| anchor_refill_text(&orig[a].obj))
         .unwrap_or_default();
     RestoredSlice { turns, prompt_text }
 }
@@ -1562,7 +1676,7 @@ pub(crate) fn redo_resume_target(
     use crate::rollback_record::RollbackModeReq;
     let orig = raw_chain(original);
     let cur = raw_chain(current);
-    let anchors = user_anchor_positions(&orig);
+    let anchors = rollback_anchor_positions(&orig);
     match op.mode {
         RollbackModeReq::Step => match cur.last() {
             // r2 first-turn case: the current chain is EMPTY; restore the first
@@ -1694,7 +1808,9 @@ pub(crate) fn build_claude_snapshot_from_projection(
             "interrupt": true,
             "approvals": false,
             "questions": false,
-            "fork": false,
+            // C14 (G09): a conversation forks (`FreshClaudeState::handle_fork`).
+            // The server refuses a fork while a turn runs (BUSY_TURN).
+            "fork": true,
             // The changed-files panel shows when the transcript edited files.
             "diffs": !diffs.is_empty(),
             // Kata 1wxv Task 5: STATIC stamps (freshclaude AND kilroy — no SDK
@@ -1742,29 +1858,56 @@ pub(crate) fn build_claude_snapshot_from_projection(
     snapshot
 }
 
-/// Locate + read + build. `revision` = transcript mtime in ms (monotonic as the file
-/// grows -- `mergeSnapshotForDisplay` DROPS revision regressions), fallback turn count;
-/// kata 1wxv Task 5 floors it at the rollback record's `lastOpAtMs`.
+/// Locate + read + build over this process's store roots, for a session with
+/// no genesis. The served snapshot goes through the claude lane
+/// (`FreshClaudeState::disk_snapshot`), which reads its own store and the
+/// session's genesis; tests use this one.
+#[cfg(test)]
 pub(crate) async fn get_claude_snapshot(
     session_type: &str,
     thread_id: &str,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, ClaudeSnapshotError> {
-    get_claude_snapshot_in(&claude_home_candidates(), session_type, thread_id, rollback).await
+    get_claude_snapshot_in(
+        &claude_home_candidates(),
+        session_type,
+        thread_id,
+        None,
+        rollback,
+    )
+    .await
 }
 
-/// [`get_claude_snapshot`] over explicit store roots (the production caller
-/// passes [`claude_home_candidates`]; tests pass temp roots, no env mutation).
-async fn get_claude_snapshot_in(
+/// A session's snapshot, from the conversation it holds (design §4.5's
+/// "effective transcript"): its own transcript when it has one; otherwise its
+/// genesis's (nothing for `Fresh`, the parent's prefix for a pending `Fork`); a
+/// clean miss with no genesis is gone (404 lost session), and a store that
+/// could not be checked is never gone (500).
+///
+/// `revision` = the transcript's mtime in ms (monotonic as the file grows --
+/// `mergeSnapshotForDisplay` DROPS revision regressions), fallback turn count;
+/// a pending session's is its binding row's last write. Kata 1wxv Task 5 floors
+/// either at the rollback record's `lastOpAtMs`.
+pub(crate) async fn get_claude_snapshot_in(
     roots: &[PathBuf],
     session_type: &str,
     thread_id: &str,
+    genesis: Option<&crate::identity_sink::RecordedGenesis>,
     rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, ClaudeSnapshotError> {
     let path = match locate_transcript_state_in(roots, thread_id) {
         TranscriptLocation::Found(path) => path,
-        // Clean miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
-        TranscriptLocation::Absent => return Err(ClaudeSnapshotError::NotFound),
+        // Clean miss in EVERY candidate root: the genesis, when the session has
+        // one, says what it holds before its transcript exists; without one the
+        // store positively does not know it => 404 (ledger A3/A4).
+        TranscriptLocation::Absent => {
+            return match genesis {
+                Some(recorded) => {
+                    pending_snapshot(roots, session_type, thread_id, recorded, rollback).await
+                }
+                None => Err(ClaudeSnapshotError::NotFound),
+            };
+        }
         // Cannot check => must not deny (the attach arm in claude.rs treats this
         // exact state as Transient): no store root, or a store read error, cannot
         // assert the session is gone, so this is Io (-> 500), never NotFound
@@ -1774,25 +1917,7 @@ async fn get_claude_snapshot_in(
             return Err(ClaudeSnapshotError::Io(error.to_string()));
         }
     };
-    // Reading the transcript and its subagent files, and projecting them, is
-    // blocking work: keep it off the async runtime.
-    let thread = thread_id.to_string();
-    let (mtime_ms, projection) = tokio::task::spawn_blocking(move || {
-        let mtime_ms = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64);
-        let content = std::fs::read_to_string(&path)?;
-        let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
-        let projection = crate::claude_projection::ClaudeTranscriptProjector::project_with(
-            &thread, &content, &subagents,
-        );
-        Ok::<_, std::io::Error>((mtime_ms, projection))
-    })
-    .await
-    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?
-    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
+    let (mtime_ms, projection) = project_transcript_file(path, thread_id, None).await?;
     let mut snapshot =
         build_claude_snapshot_from_projection(session_type, thread_id, projection, 0, rollback);
     let turn_count = snapshot["turns"]
@@ -1800,12 +1925,121 @@ async fn get_claude_snapshot_in(
         .map(|a| a.len() as i64)
         .unwrap_or(0);
     let basis = mtime_ms.unwrap_or(turn_count).max(0);
-    let floored = match rollback {
+    snapshot["revision"] = json!(rollback_floor(basis, rollback));
+    Ok(snapshot)
+}
+
+/// The snapshot of a session whose transcript does not exist yet (design §4.3,
+/// §4.5): a `Fresh` one holds nothing; a pending `Fork` holds its parent's
+/// conversation through the fork point, with the parent's turn ids (the fork
+/// keeps them, T6). A fork whose parent is gone, or no longer holds the fork
+/// point, cannot boot (the CLI refuses it), so its session is gone too.
+async fn pending_snapshot(
+    roots: &[PathBuf],
+    session_type: &str,
+    thread_id: &str,
+    recorded: &crate::identity_sink::RecordedGenesis,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+) -> Result<Value, ClaudeSnapshotError> {
+    use crate::claude_launch::ClaudeGenesis;
+    let projection = match &recorded.genesis {
+        ClaudeGenesis::Fresh => {
+            crate::claude_projection::ClaudeTranscriptProjector::project(thread_id, "")
+        }
+        ClaudeGenesis::Fork { parent, at, .. } => {
+            let parent_path = match locate_transcript_state_in(roots, parent) {
+                TranscriptLocation::Found(path) => path,
+                TranscriptLocation::Absent => {
+                    log_pending_fork_unservable(thread_id, parent, at.as_deref(), "parent_absent");
+                    return Err(ClaudeSnapshotError::NotFound);
+                }
+                TranscriptLocation::Unreadable(error) => {
+                    log_transcript_unreadable("pending_fork_snapshot", parent, &error);
+                    return Err(ClaudeSnapshotError::Io(error.to_string()));
+                }
+            };
+            match project_transcript_file(parent_path, thread_id, Some(at.clone())).await {
+                Ok((_, projection)) => projection,
+                Err(ClaudeSnapshotError::NotFound) => {
+                    log_pending_fork_unservable(
+                        thread_id,
+                        parent,
+                        at.as_deref(),
+                        "fork_point_absent",
+                    );
+                    return Err(ClaudeSnapshotError::NotFound);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    tracing::debug!(
+        component = "freshagent.claude",
+        event = "freshagent.claude.pending_snapshot",
+        session_id = %thread_id,
+        genesis = recorded.genesis.kind(),
+        turns = projection.turns.len(),
+        "served the snapshot of a session whose transcript does not exist yet from its genesis"
+    );
+    let mut snapshot =
+        build_claude_snapshot_from_projection(session_type, thread_id, projection, 0, rollback);
+    snapshot["revision"] = json!(rollback_floor(recorded.updated_at_ms.max(0), rollback));
+    Ok(snapshot)
+}
+
+/// Read and project the transcript at `path` as `thread_id`'s, with its
+/// subagent activity, off the async runtime. `fork_at` projects only the
+/// conversation a lazy fork of it holds ([`fork_prefix_transcript`]); a fork
+/// point the transcript does not hold answers `NotFound`.
+async fn project_transcript_file(
+    path: PathBuf,
+    thread_id: &str,
+    fork_at: Option<Option<String>>,
+) -> Result<(Option<i64>, crate::claude_projection::ClaudeProjection), ClaudeSnapshotError> {
+    let thread = thread_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mtime_ms = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        let content = std::fs::read_to_string(&path)
+            .map_err(|error| ClaudeSnapshotError::Io(error.to_string()))?;
+        let content = match fork_at {
+            None => content,
+            Some(at) => fork_prefix_transcript(&content, at.as_deref())
+                .ok_or(ClaudeSnapshotError::NotFound)?,
+        };
+        let subagents = crate::claude_projection::FsSubagents::for_transcript(&path);
+        let projection = crate::claude_projection::ClaudeTranscriptProjector::project_with(
+            &thread, &content, &subagents,
+        );
+        Ok((mtime_ms, projection))
+    })
+    .await
+    .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?
+}
+
+/// `basis` floored at the rollback record's last operation (kata 1wxv Task 5).
+fn rollback_floor(basis: i64, rollback: Option<&crate::rollback_record::RollbackRecord>) -> i64 {
+    match rollback {
         Some(record) => basis.max(record.last_op_at_ms),
         None => basis,
-    };
-    snapshot["revision"] = json!(floored);
-    Ok(snapshot)
+    }
+}
+
+/// One warn when a pending fork's snapshot cannot be served because the
+/// conversation it forks is not there to fork.
+fn log_pending_fork_unservable(thread_id: &str, parent: &str, at: Option<&str>, reason: &str) {
+    tracing::warn!(
+        component = "freshagent.claude",
+        event = "freshagent.claude.pending_fork_unservable",
+        session_id = %thread_id,
+        parent = %parent,
+        at = ?at,
+        reason,
+        "a pending fork's parent conversation does not hold the fork point; the session reads as gone"
+    );
 }
 
 /// Task 3 (reload-while-pending): overlay a session's LIVE pending approvals/questions
@@ -1840,7 +2074,8 @@ pub(crate) mod tests {
             assert_eq!(snapshot["sessionType"], session_type);
             assert_eq!(snapshot["capabilities"]["send"], true);
             assert_eq!(snapshot["capabilities"]["interrupt"], true);
-            assert_eq!(snapshot["capabilities"]["fork"], false);
+            // C14 (G09): a claude conversation forks (`FreshClaudeState::handle_fork`).
+            assert_eq!(snapshot["capabilities"]["fork"], true);
             assert_eq!(snapshot["capabilities"]["undo"], true);
             assert_eq!(snapshot["capabilities"]["redo"], true);
         }
@@ -2596,7 +2831,7 @@ pub(crate) mod tests {
         // Untouched gates and fields.
         assert_eq!(built["capabilities"]["send"], json!(true));
         assert_eq!(built["capabilities"]["interrupt"], json!(true));
-        assert_eq!(built["capabilities"]["fork"], json!(false));
+        assert_eq!(built["capabilities"]["fork"], json!(true));
         assert_eq!(built["sessionType"], json!("freshclaude"));
         assert_eq!(built["revision"], json!(7));
     }
@@ -2692,6 +2927,7 @@ pub(crate) mod tests {
             "freshclaude",
             "55555555-5555-4555-8555-555555555555",
             None,
+            None,
         )
         .await;
         assert!(
@@ -2716,6 +2952,7 @@ pub(crate) mod tests {
             &[home.path().to_path_buf()],
             "freshclaude",
             "55555555-5555-4555-8555-555555555555",
+            None,
             None,
         )
         .await;
@@ -2943,6 +3180,113 @@ pub(crate) mod tests {
         assert_eq!(to_anchor.prompt_text, "prompt two");
     }
 
+    /// The guard declares the one prompted turn a fork discards (the SDK's
+    /// `resumeDropsTurn`), and nothing when the fork discards nothing or
+    /// more than one turn, or when it boots fresh.
+    #[test]
+    fn the_drops_turn_guard_declares_the_one_prompted_turn_a_fork_discards() {
+        let transcript = uuid_transcript_with_carriers();
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("tr1")).as_deref(),
+            Some("u2")
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("a1")),
+            None,
+            "the discarded part starts with the kept turn's tool result"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("c1")),
+            None,
+            "the discarded part starts mid-turn"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("a2")),
+            None,
+            "nothing is discarded"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, None),
+            None,
+            "a fresh boot forks nothing"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("gone")),
+            None,
+            "an unknown keep point"
+        );
+        let three_turns = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"one"}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"text","text":"1"}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","message":{"role":"user","content":"two"}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","message":{"role":"assistant","content":[{"type":"text","text":"2"}]}}),
+            json!({"type":"user","uuid":"u3","parentUuid":"a2","message":{"role":"user","content":"three"}}),
+            json!({"type":"assistant","uuid":"a3","parentUuid":"u3","message":{"role":"assistant","content":[{"type":"text","text":"3"}]}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(
+            drops_turn_guard(&three_turns, Some("a2")).as_deref(),
+            Some("u3")
+        );
+        assert_eq!(
+            drops_turn_guard(&three_turns, Some("a1")),
+            None,
+            "two prompted turns: one guard declares one turn"
+        );
+    }
+
+    /// A fork keeps through the last chain entry of the step holding the turn it
+    /// was asked to fork at: a prompt, an answer, or a line inside the step (a
+    /// tool-result carrier) all keep the whole step.
+    #[test]
+    fn a_fork_at_a_turn_keeps_through_the_end_of_that_turns_step() {
+        let transcript = uuid_transcript_with_carriers();
+        for at in ["u1", "c1", "a1", "tr1"] {
+            assert_eq!(
+                fork_point(&transcript, Some(at)).as_deref(),
+                Ok("tr1"),
+                "fork at {at}"
+            );
+        }
+        assert_eq!(fork_point(&transcript, Some("u2")).as_deref(), Ok("a2"));
+        assert_eq!(fork_point(&transcript, Some("a2")).as_deref(), Ok("a2"));
+    }
+
+    /// With no turn named, a fork keeps the whole conversation (its chain tip).
+    #[test]
+    fn a_fork_with_no_turn_keeps_through_the_tip() {
+        assert_eq!(
+            fork_point(&uuid_transcript_with_carriers(), None).as_deref(),
+            Ok("a2")
+        );
+    }
+
+    /// The client's split-row ids (`<turn>:row-<n>`) name their turn.
+    #[test]
+    fn a_fork_at_a_split_row_id_forks_at_its_turn() {
+        assert_eq!(
+            fork_point(&uuid_transcript_with_carriers(), Some("u1:row-1")).as_deref(),
+            Ok("tr1")
+        );
+    }
+
+    #[test]
+    fn a_fork_at_a_turn_the_conversation_does_not_hold_is_refused() {
+        assert_eq!(
+            fork_point(&uuid_transcript(), Some("gone")),
+            Err(ForkPointError::TurnNotFound)
+        );
+    }
+
+    #[test]
+    fn an_empty_conversation_has_nothing_to_fork() {
+        assert_eq!(fork_point("", None), Err(ForkPointError::Empty));
+        assert_eq!(fork_point("", Some("u1")), Err(ForkPointError::Empty));
+    }
+
     #[test]
     fn resolve_resume_point_unknown_target_is_not_found() {
         assert!(resolve_resume_point(
@@ -3111,19 +3455,6 @@ pub(crate) mod tests {
         assert_eq!(slice.prompt_text, "prompt one");
     }
 
-    #[test]
-    fn raw_chain_successor_names_the_first_entry_after_a_keep_point() {
-        // The resumeDropsTurn guard uuid source: the first chain entry AFTER the
-        // keep point (the first-to-discard prompt), None when the keep point IS
-        // the tip (vacuous discard — the guard is omitted, never fabricated).
-        assert_eq!(
-            raw_chain_successor(&two_step_original(), "a1").as_deref(),
-            Some("u2")
-        );
-        assert_eq!(raw_chain_successor(&two_step_original(), "a2"), None);
-        assert_eq!(raw_chain_successor(&two_step_original(), "gone"), None);
-    }
-
     // ── kata 1wxv Task 5: snapshot rollback surfacing (claude/kilroy) ─────────
     //
     // Stamps are STATIC `{undo:true, redo:true}` (runtime failure classifies at
@@ -3168,6 +3499,243 @@ pub(crate) mod tests {
         );
         record.set_can_redo(true, 100);
         record
+    }
+
+    // ── Pending sessions: the snapshot of a session with no transcript yet
+    //    comes from its genesis (core design §4.3, §4.5). ──
+
+    const PENDING_ID: &str = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
+    const PARENT_ID: &str = "b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0";
+
+    /// A store root with an empty `projects/` dir, plus `transcripts` written
+    /// under `projects/-p/<id>.jsonl`.
+    fn pending_store(transcripts: &[(&str, &str)]) -> tempfile::TempDir {
+        let home = temp_home();
+        let dir = home.path().join("projects").join("-p");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, text) in transcripts {
+            std::fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+        }
+        home
+    }
+
+    fn recorded(
+        genesis: crate::claude_launch::ClaudeGenesis,
+        updated_at_ms: i64,
+    ) -> crate::identity_sink::RecordedGenesis {
+        crate::identity_sink::RecordedGenesis {
+            genesis,
+            updated_at_ms,
+        }
+    }
+
+    fn fork_of(parent: &str, at: Option<&str>) -> crate::claude_launch::ClaudeGenesis {
+        crate::claude_launch::ClaudeGenesis::Fork {
+            parent: parent.to_string(),
+            at: at.map(str::to_string),
+            drops_turn: None,
+        }
+    }
+
+    fn turn_ids(snapshot: &Value) -> Vec<String> {
+        snapshot["turns"]
+            .as_array()
+            .expect("turns")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    async fn pending(
+        home: &tempfile::TempDir,
+        id: &str,
+        genesis: Option<&crate::identity_sink::RecordedGenesis>,
+        rollback: Option<&crate::rollback_record::RollbackRecord>,
+    ) -> Result<Value, ClaudeSnapshotError> {
+        get_claude_snapshot_in(
+            &[home.path().to_path_buf()],
+            "freshclaude",
+            id,
+            genesis,
+            rollback,
+        )
+        .await
+    }
+
+    /// §4.3 "create, no send": the snapshot is 200 with no turns, and its
+    /// revision is the binding row's last write. Without a genesis the same miss
+    /// is a lost session.
+    #[tokio::test]
+    async fn a_fresh_pending_session_serves_an_empty_snapshot() {
+        let home = pending_store(&[]);
+        let fresh = recorded(crate::claude_launch::ClaudeGenesis::Fresh, 5_000);
+        let snapshot = pending(&home, PENDING_ID, Some(&fresh), None)
+            .await
+            .expect("a fresh pending session has a snapshot");
+        assert!(turn_ids(&snapshot).is_empty());
+        assert_eq!(snapshot["threadId"], PENDING_ID);
+        assert_eq!(snapshot["sessionId"], PENDING_ID);
+        assert_eq!(snapshot["latestTurnId"], Value::Null);
+        assert_eq!(snapshot["revision"], json!(5_000));
+
+        assert!(matches!(
+            pending(&home, PENDING_ID, None, None).await,
+            Err(ClaudeSnapshotError::NotFound)
+        ));
+    }
+
+    /// §4.5: a pending fork shows its parent's conversation through the fork
+    /// point, and the turn ids are the parent's line uuids, which the fork keeps
+    /// (T6): the snapshot does not change when the fork's transcript appears.
+    #[tokio::test]
+    async fn a_pending_fork_serves_its_parents_prefix_with_the_turn_ids_the_fork_keeps() {
+        let parent = uuid_transcript();
+        let home = pending_store(&[(PARENT_ID, &parent)]);
+        let fork = recorded(fork_of(PARENT_ID, Some("a1")), 6_000);
+        let pending_snapshot = pending(&home, PENDING_ID, Some(&fork), None)
+            .await
+            .expect("a pending fork has a snapshot");
+        assert_eq!(turn_ids(&pending_snapshot), vec!["u1", "a1"]);
+        assert_eq!(pending_snapshot["threadId"], PENDING_ID);
+        assert_eq!(pending_snapshot["sessionId"], PENDING_ID);
+        assert_eq!(
+            pending_snapshot["turns"][1]["items"][0]["text"],
+            "answer one"
+        );
+        assert_eq!(pending_snapshot["revision"], json!(6_000));
+
+        // The fork's first prompt writes its transcript: the kept prefix with the
+        // parent's uuids (session id rewritten) between the CLI's bookend lines.
+        let kept: Vec<String> = parent
+            .lines()
+            .take(2)
+            .map(|line| {
+                let mut obj: Value = serde_json::from_str(line).unwrap();
+                obj["sessionId"] = json!(PENDING_ID);
+                obj.to_string()
+            })
+            .collect();
+        let materialized = [
+            json!({"type":"mode","mode":"default","sessionId":PENDING_ID}).to_string(),
+            kept.join("\n"),
+            json!({"type":"last-prompt","lastPrompt":"prompt one","sessionId":PENDING_ID})
+                .to_string(),
+        ]
+        .join("\n");
+        std::fs::write(
+            home.path()
+                .join("projects/-p")
+                .join(format!("{PENDING_ID}.jsonl")),
+            materialized,
+        )
+        .unwrap();
+        let materialized_snapshot = pending(&home, PENDING_ID, Some(&fork), None)
+            .await
+            .expect("the materialized fork has a snapshot");
+        assert_eq!(
+            materialized_snapshot["turns"], pending_snapshot["turns"],
+            "the turns (ids included) are the same before and after the fork materializes"
+        );
+    }
+
+    /// A fork with no point holds the whole parent; the prefix follows the raw
+    /// parentUuid chain to the fork point, so a branch the parent abandoned (an
+    /// in-file rewind) and a sidechain line never enter it.
+    #[tokio::test]
+    async fn a_pending_forks_prefix_is_the_parents_chain_to_the_fork_point() {
+        let branched = [
+            uuid_transcript(),
+            json!({"type":"user","uuid":"u2b","parentUuid":"a1","timestamp":"t5","message":{"role":"user","content":[{"type":"text","text":"prompt two again"}]}}).to_string(),
+            json!({"type":"assistant","uuid":"s1","isSidechain":true,"parentUuid":"u2b","timestamp":"t5b","message":{"role":"assistant","content":[{"type":"text","text":"sidechain noise"}]}}).to_string(),
+            json!({"type":"assistant","uuid":"a2b","parentUuid":"u2b","timestamp":"t6","message":{"role":"assistant","content":[{"type":"text","text":"answer two again"}]}}).to_string(),
+        ]
+        .join("\n");
+        let home = pending_store(&[(PARENT_ID, &branched)]);
+
+        let whole = recorded(fork_of(PARENT_ID, None), 1);
+        let snapshot = pending(&home, PENDING_ID, Some(&whole), None)
+            .await
+            .expect("a whole-parent fork has a snapshot");
+        assert_eq!(turn_ids(&snapshot), vec!["u1", "a1", "u2b", "a2b"]);
+
+        let abandoned = recorded(fork_of(PARENT_ID, Some("a2")), 1);
+        let snapshot = pending(&home, PENDING_ID, Some(&abandoned), None)
+            .await
+            .expect("a fork on the abandoned branch has a snapshot");
+        assert_eq!(turn_ids(&snapshot), vec!["u1", "a1", "u2", "a2"]);
+    }
+
+    /// A fork the CLI would refuse (its parent is gone, or no longer holds the
+    /// fork point) reads as a lost session; an unreadable parent store is never
+    /// lost.
+    #[tokio::test]
+    async fn a_pending_fork_without_its_fork_point_reads_as_gone() {
+        let home = pending_store(&[(PARENT_ID, &uuid_transcript())]);
+        let orphan = recorded(fork_of("d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d0d0", None), 1);
+        assert!(matches!(
+            pending(&home, PENDING_ID, Some(&orphan), None).await,
+            Err(ClaudeSnapshotError::NotFound)
+        ));
+        let missing_point = recorded(fork_of(PARENT_ID, Some("no-such-uuid")), 1);
+        assert!(matches!(
+            pending(&home, PENDING_ID, Some(&missing_point), None).await,
+            Err(ClaudeSnapshotError::NotFound)
+        ));
+    }
+
+    /// G28 for pending sessions: a store that cannot be checked is Io (500)
+    /// whatever the genesis says, never a snapshot of the genesis (the
+    /// transcript may be there) and never lost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_store_is_io_for_a_pending_session_too() {
+        let home = pending_store(&[]);
+        let projects = home.path().join("projects");
+        let Some(_locked) = UnreadableDir::make(&projects) else {
+            return;
+        };
+        let fresh = recorded(crate::claude_launch::ClaudeGenesis::Fresh, 1);
+        let result = pending(&home, PENDING_ID, Some(&fresh), None).await;
+        assert!(
+            matches!(result, Err(ClaudeSnapshotError::Io(_))),
+            "expected Io, got {result:?}"
+        );
+    }
+
+    /// The transcript is the truth once it exists: a genesis not yet cleared
+    /// (the lazy clear runs after the first result) never hides it.
+    #[tokio::test]
+    async fn a_found_transcript_wins_over_a_genesis_not_yet_cleared() {
+        let home = pending_store(&[(PENDING_ID, &uuid_transcript())]);
+        let fresh = recorded(crate::claude_launch::ClaudeGenesis::Fresh, 1);
+        let snapshot = pending(&home, PENDING_ID, Some(&fresh), None)
+            .await
+            .expect("the transcript serves");
+        assert_eq!(turn_ids(&snapshot), vec!["u1", "a1", "u2", "a2"]);
+    }
+
+    /// A pending session after an undo carries the rollback record: its
+    /// markers ride the pending snapshot and its last operation floors the
+    /// revision, so the client's watermark never drops the post-undo snapshot.
+    #[tokio::test]
+    async fn a_pending_snapshots_revision_is_floored_by_the_rollback_record() {
+        let home = pending_store(&[(PARENT_ID, &uuid_transcript())]);
+        let mut record = claude_rollback_record(PARENT_ID, removed_slice_for(&["u2", "a2"]));
+        // No chain-root recheck: it reads this process's store, not the test's.
+        record.original_session_id = None;
+        let fork = recorded(fork_of(PARENT_ID, Some("a1")), 7);
+        let snapshot = pending(&home, PENDING_ID, Some(&fork), Some(&record))
+            .await
+            .expect("a pending fork has a snapshot");
+        assert_eq!(turn_ids(&snapshot), vec!["u1", "a1"]);
+        assert_eq!(snapshot["revision"], json!(record.last_op_at_ms));
+        let bucket: Vec<&str> = snapshot["rolledBackTurns"]
+            .as_array()
+            .expect("the marker bucket")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(bucket, vec!["u2", "a2"]);
     }
 
     /// Stage `<tmp>/projects/-p/{orig,cur}.jsonl` under CLAUDE_CONFIG_DIR and

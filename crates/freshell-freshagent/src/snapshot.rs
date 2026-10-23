@@ -43,9 +43,12 @@
 //! required, so snapshots survive a server restart. When the session is LIVE, the route
 //! overlays its folded pending approvals/questions onto the disk-built JSON and flips the
 //! presence-of-pending `capabilities` gates (reload-while-pending — Task 3, matching
-//! `normalize.ts:186-204, 226-232`). A missing transcript is a positive
+//! `normalize.ts:186-204, 226-232`). A session with no transcript yet whose binding
+//! row records a genesis (a zero-turn session, a pending fork) serves what the genesis
+//! holds (claude core design §4.3); any other missing transcript is a positive
 //! denial: 404 with `code:'FRESH_AGENT_LOST_SESSION'` (the codex/opencode convention); a
-//! read failure is a 500. An outright invalid enum member (e.g. `sessionType=bogus`) is a
+//! read failure is a 500. The claude reads go through the claude lane, which reads the
+//! transcript store its sidecars write. An outright invalid enum member (e.g. `sessionType=bogus`) is a
 //! 400, mirroring the reference's `ThreadParamsSchema.safeParse` failure (`router.ts:181-186`).
 
 use std::collections::HashMap;
@@ -124,14 +127,11 @@ impl SnapshotState {
                 .ok()
                 .flatten()?,
             ("freshclaude" | "kilroy", "claude") => {
-                let rollback = self.claude.load_rollback_record(native_id).await;
-                let saved = crate::claude_snapshot::get_claude_snapshot(
-                    session_type,
-                    native_id,
-                    rollback.as_ref(),
-                )
-                .await
-                .ok()?;
+                let saved = self
+                    .claude
+                    .disk_snapshot(session_type, native_id)
+                    .await
+                    .ok()?;
                 crate::native_history::readonly_snapshot(provider, saved).ok()?
             }
             ("freshopencode", "opencode") => {
@@ -324,14 +324,9 @@ async fn get_snapshot(
             // snapshot (marker bucket + `rollback{canRedo, undoneDepth}` + revision
             // floor). The record is ledger-sync (memory-fast) and resolves by the
             // DURABLE id even when no session is live (durable+multi-client truth).
-            let rollback = state.claude.load_rollback_record(&thread_id).await;
-            match crate::claude_snapshot::get_claude_snapshot(
-                &session_type,
-                &thread_id,
-                rollback.as_ref(),
-            )
-            .await
-            {
+            // Core design §4.3: a session with no transcript yet serves what its
+            // genesis holds (200), never the lost-session 404.
+            match state.claude.disk_snapshot(&session_type, &thread_id).await {
                 Ok(mut snapshot) => {
                     // Task 3 (reload-while-pending): overlay the session's LIVE pending
                     // approvals/questions and flip the presence-of-pending gates
@@ -680,6 +675,83 @@ mod tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "FRESH_AGENT_LOST_SESSION");
+    }
+
+    /// Core design §4.3: a bound session with no transcript yet (a zero-turn
+    /// session, or a pending fork after an undo) answers 200 with what its
+    /// genesis holds, never the lost-session 404 the client would recover from:
+    /// a `Fresh` one holds nothing, a pending `Fork` its parent's prefix.
+    #[tokio::test]
+    async fn claude_locator_serves_a_bound_pending_session_from_its_genesis() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let parent = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+        let zero_turn = "b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2";
+        let pending_fork = "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3";
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("projects").join("-p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent_text = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"prompt one"}]}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"t2","message":{"role":"assistant","content":[{"type":"text","text":"answer one"}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","timestamp":"t3","message":{"role":"user","content":[{"type":"text","text":"prompt two"}]}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","timestamp":"t4","message":{"role":"assistant","content":[{"type":"text","text":"answer two"}]}}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(dir.join(format!("{parent}.jsonl")), parent_text).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let claude = claude_state();
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        claude.set_identity_sink(fake.clone());
+        fake.seed_genesis("claude", zero_turn, crate::ClaudeGenesis::Fresh);
+        fake.seed_genesis(
+            "claude",
+            pending_fork,
+            crate::ClaudeGenesis::Fork {
+                parent: parent.to_string(),
+                at: Some("a1".to_string()),
+                drops_turn: Some("u2".to_string()),
+            },
+        );
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude,
+        );
+
+        let (status, zero) = get_json_with_state(state.clone(), "kilroy", zero_turn).await;
+        let (fork_status, fork) =
+            get_json_with_state(state.clone(), "freshclaude", pending_fork).await;
+        let (lost_status, lost) =
+            get_json_with_state(state, "freshclaude", "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4").await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert_eq!(status, StatusCode::OK, "{zero}");
+        assert_eq!(zero["sessionType"], "kilroy");
+        assert_eq!(zero["threadId"], zero_turn);
+        assert_eq!(zero["turns"], json!([]));
+
+        assert_eq!(fork_status, StatusCode::OK, "{fork}");
+        assert_eq!(fork["threadId"], pending_fork);
+        let ids: Vec<&str> = fork["turns"]
+            .as_array()
+            .expect("turns")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["u1", "a1"],
+            "the parent's prefix through the fork point"
+        );
+
+        // An unbound id with no transcript is still the lost session.
+        assert_eq!(lost_status, StatusCode::NOT_FOUND, "{lost}");
+        assert_eq!(lost["code"], "FRESH_AGENT_LOST_SESSION");
     }
 
     /// G28: an unreadable claude store is "cannot check", so the route answers

@@ -76,7 +76,7 @@ pub mod terminal_tabs;
 #[cfg(test)]
 mod test_environment;
 
-pub use claude::FreshClaudeState;
+pub use claude::{ClaudeCreateOutcome, FreshClaudeState};
 // Kata 09v1 + SYNC-06 + G28: the claude_snapshot items visible outside this
 // crate — the ONE shared claude store-root rule (`claude_home_candidates`,
 // also read by freshell-ws's PTY truth probe), the three-state transcript
@@ -91,9 +91,10 @@ pub use claude_snapshot::{
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
-    BindProvenance, ClaimCommit, CloseAnswer, FreshAgentBindingUpsert, FreshAgentSettings,
-    PaneIdentitySink, ProvenanceUpdate, SharedPaneIdentitySink, SinkAliasClearWrite,
-    SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkWrite,
+    BindProvenance, ClaimCommit, ClaudeGenesis, CloseAnswer, FreshAgentBindingUpsert,
+    FreshAgentSettings, GenesisUpdate, PaneIdentitySink, ProvenanceUpdate, RecordedGenesis,
+    SharedPaneIdentitySink, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
+    SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rollback_record::{
@@ -5555,6 +5556,7 @@ async fn resume_session_ref_tab(
     if let Some(sink) = state.identity_sink() {
         if let Err(e) = sink
             .record_binding(identity_sink::FreshAgentBindingUpsert {
+                genesis: crate::identity_sink::GenesisUpdate::Keep,
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
                 mode: SESSION_TYPE.into(),
@@ -5579,6 +5581,7 @@ async fn resume_session_ref_tab(
                     permission_mode: None,
                     effort: effort.clone(),
                     cwd: cwd.clone(),
+                    plugins: None,
                 },
             })
             .await
@@ -6612,6 +6615,7 @@ async fn send_keys(
         if let Some(sink) = state.identity_sink() {
             if let Err(e) = sink
                 .record_binding(identity_sink::FreshAgentBindingUpsert {
+                    genesis: crate::identity_sink::GenesisUpdate::Keep,
                     provider: PROVIDER.into(),
                     session_id: durable_id.clone(),
                     mode: SESSION_TYPE.into(),
@@ -6647,6 +6651,7 @@ async fn send_keys(
                         permission_mode: None,
                         effort: pane.effort.clone(),
                         cwd: pane.cwd.clone(),
+                        plugins: None,
                     },
                 })
                 .await
@@ -7291,17 +7296,6 @@ impl InFlightRegistry {
             held,
         })
     }
-
-    /// Snapshot membership check — never an acquisition. Claude's `handle_send`
-    /// parks while a rollback names this durable id (kata 1wxv task 4 review C1):
-    /// a session-map resolve miss inside the rollback's teardown→respawn window
-    /// must WAIT for the re-insert, never refuse with SESSION_NOT_FOUND.
-    pub(crate) fn contains(&self, key: &str) -> bool {
-        self.keys
-            .lock()
-            .expect("in-flight registry lock")
-            .contains(key)
-    }
 }
 
 /// RAII release for an [`InFlightRegistry`] acquisition: removes its held key(s)
@@ -7325,17 +7319,22 @@ mod in_flight_registry_tests {
     use super::*;
 
     #[test]
-    fn contains_tracks_acquire_and_drop_without_acquiring() {
+    fn an_acquisition_is_single_flight_until_its_guard_drops() {
         let registry = InFlightRegistry::new();
-        assert!(!registry.contains("dur-1"));
         let guard = registry.try_acquire("dur-1").expect("first acquire");
-        assert!(registry.contains("dur-1"));
-        // contains is a snapshot, NOT an acquisition: a second try_acquire still
-        // refuses (single-flight) while contains never blocks.
-        assert!(registry.try_acquire("dur-1").is_none());
-        assert!(registry.contains("dur-1"));
+        assert!(
+            registry.try_acquire("dur-1").is_none(),
+            "a second acquisition of a held key refuses"
+        );
+        assert!(
+            registry.try_acquire("dur-2").is_some(),
+            "another key is independent"
+        );
         drop(guard);
-        assert!(!registry.contains("dur-1"));
+        assert!(
+            registry.try_acquire("dur-1").is_some(),
+            "the key is free once the guard drops"
+        );
     }
 }
 
