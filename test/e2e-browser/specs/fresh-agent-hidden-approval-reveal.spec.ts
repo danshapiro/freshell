@@ -25,8 +25,8 @@
  * path (the overlay recorder) and a broken end-to-end journey.
  *
  * Trigger: the hidden pane's session gets a `freshAgent.send` written straight
- * to the socket (the pane's composer is hidden), and the fake Claude-SDK
- * sidecar's program answers it with one Bash approval: the turn parks on it.
+ * to the socket (the pane's composer is hidden), and the simulator causes the
+ * production sidecar's canUseTool callback to raise one Bash approval.
  * Then the client's own `freshAgent.interrupt` frame for the session — the
  * exact frame the Stream Deck "stop" sends to a pane in a background tab —
  * cancels it (the sidecar's interrupt-time pending cancellation, mirroring
@@ -39,24 +39,18 @@
  * held result and assert that the normal turn end still reaches the client.
  *
  * CLOUD-LEGALITY: no timing dependencies — every wait is a poll on observed
- * state (sidecar stdin/wire ledgers, received WS frames, DOM). This spec must
+ * state (simulator ledger, received WS frames, DOM). This spec must
  * NOT be added to CLOUD_SKIP_SPECS.
  */
 import fs from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fake-claude-sdk-sidecar.mjs')
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 const APPROVAL_REQUEST_ID = 'perm-raised-while-hidden'
 
@@ -64,10 +58,10 @@ const APPROVAL_REQUEST_ID = 'perm-raised-while-hidden'
 const RAISE_TEXT = 'raise an approval while hidden'
 
 /** The send raises one Bash approval; the Stop cancels it. */
-const FAKE_PROGRAM = {
+const SIMULATOR_PROGRAM = {
   rules: [
     {
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: RAISE_TEXT },
       once: true,
       emit: [
@@ -95,41 +89,6 @@ function findFreshAgentLeaf(node: any): any {
     }
   }
   return null
-}
-
-function readJsonl(file: string): any[] {
-  if (!existsSync(file)) return []
-  return readFileSync(file, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line)
-      } catch {
-        return null
-      }
-    })
-    .filter(Boolean)
-}
-
-/** Every outbound sidecar frame of `type` (the fixture's wire audit rows). */
-function wireFrames(eventsLog: string, type: string): any[] {
-  return readJsonl(eventsLog)
-    .filter((row) => row.kind === 'wire' && row.frame?.type === type)
-    .map((row) => row.frame)
-}
-
-/** Every raw stdin frame of `type` the server wrote to the sidecar. */
-function stdinFrames(stdinLog: string, type: string): any[] {
-  return readJsonl(stdinLog)
-    .map((row) => {
-      try {
-        return JSON.parse(row.line)
-      } catch {
-        return null
-      }
-    })
-    .filter((frame) => frame?.type === type)
 }
 
 async function receivedFreshAgentEvents(harness: TestHarness, eventType: string): Promise<any[]> {
@@ -170,8 +129,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
 
   test('an approval raised, then cancelled, while the pane is hidden is current on reveal, with no blocking overlay', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-hidden-approval-'))
-    const stdinLog = path.join(sharedRoot, 'sidecar-stdin.jsonl')
-    const eventsLog = path.join(sharedRoot, 'sidecar-events.jsonl')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     let server: RustServer | undefined
     let pauseAfterCancellation = false
     let deliveryPaused = false
@@ -203,14 +161,7 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       const projectDir = path.join(sharedRoot, 'project')
       await fs.mkdir(projectDir, { recursive: true })
       server = new RustServer({
-        env: {
-          FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR_FIXTURE,
-          FRESHELL_CLAUDE_NODE: process.execPath,
-          FRESHELL_FAKE_PROVIDER: 'freshclaude',
-          FRESHELL_FAKE_PROGRAM: JSON.stringify(FAKE_PROGRAM),
-          FRESHELL_FAKE_STDIN: stdinLog,
-          FRESHELL_FAKE_EVENTS: eventsLog,
-        },
+        env: claudeSimulatorServerEnv({ ledgerPath: simLedger, program: SIMULATOR_PROGRAM }),
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
           await fs.mkdir(freshellDir, { recursive: true })
@@ -296,9 +247,9 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       // ── 1. An approval RAISED while hidden appears on reveal ─────────────
       await sendToHiddenPane()
       await expect
-        .poll(() => wireFrames(eventsLog, 'sdk.permission.request').length, {
+        .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'approval').length, {
           timeout: 15_000,
-          message: 'the sidecar raises the approval',
+          message: 'the simulated CLI invokes the production canUseTool approval path',
         })
         .toBe(1)
       await expect
@@ -322,17 +273,11 @@ test.describe('hidden fresh-agent panes show current approvals on reveal without
       pauseAfterCancellation = true
       await interruptHiddenPane()
       await expect
-        .poll(() => stdinFrames(stdinLog, 'interrupt').length, {
+        .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'interrupt').length, {
           timeout: 15_000,
           message: 'the server forwards the Stop of the parked turn',
         })
         .toBe(1)
-      await expect
-        .poll(() => wireFrames(eventsLog, 'sdk.permission.cancelled').map((frame) => frame.requestId), {
-          timeout: 15_000,
-          message: 'the sidecar cancels the pending approval',
-        })
-        .toEqual([APPROVAL_REQUEST_ID])
       await expect
         .poll(async () => (await receivedFreshAgentEvents(harness, 'freshAgent.permission.cancelled')).length, {
           timeout: 15_000,

@@ -34,10 +34,9 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 
 // --- helpers (per-spec copies; donors named inline) ------------------------
 
@@ -313,7 +312,7 @@ test.describe('wave-A cross-lane interactions', () => {
 
   test('A2xA3: one restart restores BOTH claude identity stores with no cross-talk', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'wavea-a2a3-'))
-    // The fake sidecar mints a RANDOM canonical UUID per process (council
+    // The simulator mints a RANDOM canonical UUID per conversation (council
     // follow-up: the old static 44444444-... default was collision-blind),
     // so the fresh-agent durable id is CAPTURED from the run below.
     let FRESH_DURABLE = ''
@@ -321,14 +320,13 @@ test.describe('wave-A cross-lane interactions', () => {
     try {
       const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', 'fake-claude-cli.mjs')
       const argvLog = path.join(sharedRoot, 'claude-argv.jsonl')
-      const sidecarLog = path.join(sharedRoot, 'sidecar-requests.jsonl')
+      const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
       const seed = seedConfig({ providers: ['claude'], freshAgent: true })
       const server = new RustServer({
         env: {
           CLAUDE_CMD: fakeClaude,
           FAKE_CLAUDE_ARGV_LOG: argvLog,
-          FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
-          FAKE_CLAUDE_SIDECAR_LOG: sidecarLog,
+          ...claudeSimulatorServerEnv({ ledgerPath: simLedger }),
         },
         setupHome: async (homeDir: string) => {
           capturedHome = homeDir
@@ -417,22 +415,12 @@ test.describe('wave-A cross-lane interactions', () => {
         expect(rowsAfter.some((r) => r.sessionId === terminalSession)).toBe(true)
 
         // A2 path: the fresh-agent pane resumed in place — server-side proof
-        // is the sidecar create carrying a resume boot (UUID or transcript
+        // is the simulator query carrying a resume boot (UUID or transcript
         // path shape, claude.rs decision table).
         await expect
           .poll(async () => {
-            const log = await fs.readFile(sidecarLog, 'utf-8').catch(() => '')
-            return log
-              .split('\n')
-              .filter(Boolean)
-              .map((l) => JSON.parse(l))
-              .some(
-                (e) =>
-                  e.msg?.type === 'create' &&
-                  typeof e.msg?.boot?.resume === 'string' &&
-                  (e.msg.boot.resume === FRESH_DURABLE ||
-                    e.msg.boot.resume.endsWith(`/${FRESH_DURABLE}.jsonl`)),
-              )
+            return readClaudeSimLedger(simLedger)
+              .some((row) => row.kind === 'query' && (row.options as any)?.resume === FRESH_DURABLE)
           }, { timeout: 30_000 })
           .toBe(true)
         await expect

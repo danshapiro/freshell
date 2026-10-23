@@ -2,12 +2,12 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
 import { test, expect } from '@playwright/test'
 import { RustServer } from '../helpers/rust-server.js'
 import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-stdio-client.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { claudeSimulatorServerEnv } from '../helpers/claude-sim-lane.js'
 
 /**
  * MCP bridge pin -- Slice 2 of the agent-API + MCP parity spec
@@ -171,13 +171,6 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
  */
 test.describe('MCP bridge -- b8ke Task 10 respawn/attach ownership recovery', () => {
   test.setTimeout(180_000)
-
-  const __filename = fileURLToPath(import.meta.url)
-  const __dirname = path.dirname(__filename)
-  const FAKE_CLAUDE_SDK_SIDECAR = path.resolve(
-    __dirname,
-    '../fixtures/providers/fake-claude-sdk-sidecar.mjs',
-  )
 
   /** Flatten a pane layout tree into its leaf nodes. */
   function collectLeaves(node: any): any[] {
@@ -419,9 +412,9 @@ process.stdin.resume()
   test('ownership conflict through MCP returns typed owner info', async ({ page }) => {
     const { path: mcpBinPath } = ensureMcpServerBuilt(REPO_ROOT)
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-mcp-conflict-'))
-    // Both halves of the b8ke scenario on one server: the fake `claude` CLI
-    // (terminal panes) AND the fake SDK sidecar (the fresh-agent lane the
-    // handoff targets).
+    // The terminal Claude CLI and fresh-agent Claude sidecar are separate
+    // launch paths. The terminal fixture remains local to this ownership test;
+    // fresh-agent recovery uses the production sidecar and CLI simulator.
     const fake = await installFakeClaudeCli(sharedRoot)
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -429,9 +422,10 @@ process.stdin.resume()
     const server = new RustServer({
       env: {
         CLAUDE_CMD: fake.binPath,
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SDK_SIDECAR,
-        FRESHELL_CLAUDE_NODE: process.execPath,
-        FRESHELL_FAKE_PROVIDER: 'freshclaude',
+        ...claudeSimulatorServerEnv({
+          ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
+          program: { rules: [] },
+        }),
       },
       setupHome: seedConfig({ providers: ['claude'], freshAgent: true }),
     })

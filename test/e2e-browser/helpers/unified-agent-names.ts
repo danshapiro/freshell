@@ -12,6 +12,7 @@ import type { E2eServerInfo } from './server-fixture-support.js'
 import { selectShellFromPicker } from './test-harness.js'
 import { openPanePicker } from './pane-picker.js'
 import type { SessionNameRef } from '../../../shared/session-names.js'
+import { claudeSimulatorServerEnv } from './claude-sim-lane.js'
 
 /**
  * UNIFIED AGENT NAMES (plan Task 8) — the shared six-mode journey helper.
@@ -263,10 +264,9 @@ export async function modeFixture(mode: UnifiedAgentMode): Promise<ModeFixture> 
         provider: 'claude',
         fresh: true,
         pickerLabel: /^Freshclaude$/,
-        env: async () => ({
-          FRESHELL_CLAUDE_SIDECAR: path.join(providers, 'fake-claude-sdk-sidecar.mjs'),
-          FRESHELL_CLAUDE_NODE: process.execPath,
-          FRESHELL_FAKE_PROVIDER: 'freshclaude',
+        env: async (root) => claudeSimulatorServerEnv({
+          ledgerPath: path.join(root, 'claude-sim-ledger.jsonl'),
+          flavour: 'freshclaude',
         }),
       }
     case 'freshcodex':

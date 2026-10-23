@@ -10,7 +10,7 @@
  * - Test 1 (terminal): the replacement terminal is claimed in the hidden
  *   pane's terminal.interest snapshot without attaching. Reveal then attaches
  *   and proves that the replacement shell accepts input and has real geometry.
- * - Test 2 (fresh-agent): the sidecar request log records a resume using the
+ * - Test 2 (fresh-agent): the simulator ledger records a resume using the
  *   original durable session ID while the pane remains hidden, and the pane
  *   keeps its createRequestId instead of creating a duplicate session.
  *
@@ -24,6 +24,7 @@ import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -35,8 +36,6 @@ import { fileURLToPath } from 'node:url'
 // donor spec (e.g. restore-contract-wall-rust.spec.ts:39-40).
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- donor: restore-contract-wall-rust.spec.ts)
@@ -141,8 +140,7 @@ async function createTabViaRest(info: E2eServerInfo, body: object): Promise<stri
   return tabId as string
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
-// production env seam FRESHELL_CLAUDE_SIDECAR) ---
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator) ---
 
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -281,12 +279,11 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
   })
 
   test('hidden fresh-agent pane recovers after abrupt restart without reveal', async ({ page }) => {
-    // Sidecar REQUEST log (FAKE_CLAUDE_SIDECAR_LOG, fake-claude-sidecar.mjs
-    // Task 7 knob): the post-restart resume proof below reads it. NOT the
-    // terminal-CLI argv log -- the fresh-agent path never spawns the CLI.
-    const requestLog = path.join(os.tmpdir(), `freshell-e2e-claude-sidecar-${Date.now()}.jsonl`)
+    // The simulator query ledger proves the durable identity used after restart.
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-hidden-rebind-'))
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const { server, harness, info } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE, FAKE_CLAUDE_SIDECAR_LOG: requestLog },
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -299,7 +296,7 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       // Create a freshclaude pane in the current tab (helper copied from the wall).
       const freshTabId = (await harness.getActiveTabId())!
       // Helper signature is (page, harness, cwd) -- the wall spec's call sites
-      // pass a project dir; any existing directory works for the fake sidecar.
+      // pass a project dir; any existing directory works for the simulator.
       await createFreshclaudePane(page, harness, os.tmpdir())
       await expect
         .poll(async () => {
@@ -312,7 +309,7 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       // FreshAgentView.tsx mergePaneContent) -- the post-restart attach must
       // deterministically carry it so the server's restart-parity resume arm
       // (claude.rs handle_attach decision table) can engage.
-      // The fake sidecar mints a RANDOM canonical UUID per process (council
+      // The simulator mints a RANDOM canonical UUID per conversation (council
       // follow-up: the old static default was collision-blind), so gate on
       // the canonical-UUID SHAPE and capture what this run minted below.
       await expect
@@ -347,8 +344,8 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       // session recovers to a usable state. DISCRIMINATING evidence -- stale
       // pre-restart Redux state also shows `sessionId` + 'idle', so client
       // state alone proves nothing. The discriminator is SERVER-SIDE: the
-      // sidecar request log must contain a `create` carrying
-      // a resume boot of originalDurable, which only the restart-parity
+      // simulator query ledger must contain a boot resuming originalDurable,
+      // which only the restart-parity
       // resume arm emits, and it only runs when THIS hidden pane's
       // post-restart freshAgent.attach actually went out (the rebind queue
       // under test driving the attach arm). The initial pane create carries
@@ -359,22 +356,12 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
           const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
           const status = c?.status ?? ''
           const usable = c?.sessionId && ['connected', 'idle', 'running'].includes(status)
-          const log = await fs.readFile(requestLog, 'utf-8').catch(() => '')
           // The parity arm resumes by durable UUID when the session's original
           // cwd survives, or by the transcript's `.jsonl` PATH when it does
           // not (claude.rs decision table, ledger A15). Both carry the durable
           // UUID; accept either shape.
-          const resumed = log
-            .split('\n')
-            .filter(Boolean)
-            .map((l) => JSON.parse(l))
-            .some(
-              (e) =>
-                e.msg?.type === 'create' &&
-                typeof e.msg?.boot?.resume === 'string' &&
-                (e.msg.boot.resume === originalDurable ||
-                  e.msg.boot.resume.endsWith(`/${originalDurable}.jsonl`)),
-            )
+          const resumed = readClaudeSimLedger(simLedger)
+            .some((row) => row.kind === 'query' && (row.options as any)?.resume === originalDurable)
           return usable && resumed ? `resumed:${status}` : null
         }, { timeout: 30_000 })
         .not.toBeNull()
@@ -394,6 +381,7 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
         .toBe(true)
     } finally {
       await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 

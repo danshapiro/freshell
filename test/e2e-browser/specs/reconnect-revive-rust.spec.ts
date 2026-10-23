@@ -24,24 +24,15 @@
  *     transition while NO close frame exists (fresh-eyes F3); after thaw,
  *     a normal reconnect + input round trip proves recovery.
  *  6. fresh-agent pane reattaches and round-trips after a bare socket drop.
- *     FIXTURE LIMITATION (per Task 8 execution note): the fake claude
- *     sidecar's real scripted affordances (create/send/interrupt/shutdown +
- *     HOLD_TURN knobs) offer NO scriptable unsolicited post-creation
- *     emission, so there is no "server-side-only marker while the client is
- *     down" hook to use. The discriminator here is therefore the
- *     post-reconnect composer round trip itself, made non-vacuous two ways:
- *     (a) server-side the sidecar request log must gain a NEW send after
- *     the reconnect (the prompt genuinely crossed the new connection), and
- *     (b) client-side the pane must render a strictly GREATER count of the
- *     fixture's fixed reply text than before the drop (the response
- *     genuinely came back over the reattached subscription -- fresh-eyes
- *     F3-2: render-only assertions can pass on surviving local state with a
- *     fully broken reattach).
+ *     The production sidecar runs over the CLI simulator. Its ledger counts
+ *     prompts the simulated CLI actually started, and the pane must render a
+ *     new reply after reconnect; together those prove both directions of the
+ *     live round trip.
  *
  * (socket-drop/freeze revival; drives RustServer + forceDisconnect +
  * SIGSTOP). Not in CLOUD_SKIP_SPECS -- no real provider binaries needed
- * (every claude interaction uses the committed fakes via CLAUDE_CMD /
- * FRESHELL_CLAUDE_SIDECAR env seams).
+ * (terminal lanes use committed CLI fakes; fresh-agent lanes use the
+ * production sidecar and the committed Claude CLI simulator).
  *
  * Helpers are COPIED from the donor specs (hidden-pane-rebind-rust,
  * reconcile-client-adoption-rust, restore-contract-wall-rust,
@@ -53,6 +44,7 @@ import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -65,7 +57,6 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const FAKE_CLAUDE_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-cli.mjs')
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 
 const noDeadEndText = /still running on the server|\[Restore failed\]/
 
@@ -330,8 +321,8 @@ async function writeClaudeTranscript(input: {
   await fs.writeFile(path.join(projectDir, `${sessionId}.jsonl`), `${lines.join('\n')}\n`, 'utf8')
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via
-// the production env seam FRESHELL_CLAUDE_SIDECAR; donor: hidden-pane-rebind
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator;
+// donor: hidden-pane-rebind
 // :153-182 / freshclaude-identity-persistence :183-219) ---
 
 async function createFreshclaudePane(page: Page, cwd: string): Promise<void> {
@@ -394,22 +385,9 @@ async function fixtureReplyCount(page: Page): Promise<number> {
     .count()
 }
 
-/** Count `send` entries in the fake claude sidecar's request log. */
-async function sidecarSendCount(requestLogPath: string): Promise<number> {
-  const raw = await fs.readFile(requestLogPath, 'utf8').catch(() => '')
-  if (!raw) return 0
-  return raw
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as { msg?: { type?: string } }
-      } catch {
-        return {}
-      }
-    })
-    .filter((e) => e.msg?.type === 'send').length
+/** Count prompts the simulated CLI actually started. */
+function simulatedPromptCount(ledgerPath: string): number {
+  return readClaudeSimLedger(ledgerPath).filter((row) => row.kind === 'prompt').length
 }
 
 // ---------------------------------------------------------------------------
@@ -706,9 +684,9 @@ test.describe('reconnect revive (rust)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-rr-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
-    const requestLogPath = path.join(sharedRoot, 'claude-sidecar-requests.jsonl')
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const { server, harness } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE, FAKE_CLAUDE_SIDECAR_LOG: requestLogPath },
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -730,7 +708,7 @@ test.describe('reconnect revive (rust)', () => {
         .poll(async () => fixtureReplyCount(page), { timeout: 30_000 })
         .toBeGreaterThan(0)
         .then(() => fixtureReplyCount(page))
-      const sendsBeforeDrop = await sidecarSendCount(requestLogPath)
+      const sendsBeforeDrop = simulatedPromptCount(simLedger)
       expect(sendsBeforeDrop).toBe(1)
 
       const contentBeforeDrop = findFreshAgentLeaf(
@@ -759,16 +737,16 @@ test.describe('reconnect revive (rust)', () => {
         contentBeforeDrop.resumeSessionId,
       )
 
-      // Discriminating round trip (see this file's FIXTURE LIMITATION note):
+      // Discriminating round trip:
       // (a) the pane renders strictly MORE replies than survived the drop...
       await sendFreshAgentTurn(page, harness, freshTabId, 'rr fresh agent turn two')
       await expect
         .poll(async () => fixtureReplyCount(page), { timeout: 30_000 })
         .toBeGreaterThan(replyCountBeforeDrop)
-      // ...(b) and the sidecar request log proves the second send genuinely
+      // ...(b) and the simulator ledger proves the second prompt genuinely
       // crossed the (new) server connection to the still-live sidecar.
       await expect
-        .poll(async () => sidecarSendCount(requestLogPath), { timeout: 15_000 })
+        .poll(async () => simulatedPromptCount(simLedger), { timeout: 15_000 })
         .toBe(2)
       // ...and no dead-end text ever surfaces in the pane chrome.
       await expect(page.getByText(noDeadEndText)).toHaveCount(0)

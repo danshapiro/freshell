@@ -7,8 +7,7 @@
 // end the user WAS watching produces the tab-strip-only watched mark, no
 // sound, cleared on the next away-and-back. A user-initiated interrupt is
 // silent, full stop, and shows no error banner. The first test drives the
-// deterministic fake claude-SDK sidecar
-// (`fixtures/providers/fake-claude-sdk-sidecar.mjs`) end to end — composer →
+// production Claude sidecar over the CLI simulator end to end — composer →
 // Rust server → sidecar → unified `freshAgent.turn.complete` → client fold →
 // marks — through these lanes of that contract:
 //
@@ -23,11 +22,10 @@
 //      still folds the edge and sets the attention flag — the bell rings for
 //      any tab when the window is unfocused (the sound suppression split is
 //      unit-pinned; e2e asserts the fold partition);
-//   5. a mid-turn end of the SDK stream (sdk.stream.ended and the sidecar's
-//      exit) rings exactly one edge, resolves the pane to exited, reports the
-//      exit (SIDECAR_EXITED), and the sidecar process is gone: a stream end is
-//      a session end (G02). The server rings the cut-off turn once; the
-//      sidecar rings nothing (C18).
+//   5. a mid-turn CLI exit ends the production sidecar's SDK stream, rings
+//      exactly one edge, resolves the pane to exited, and reports
+//      SIDECAR_EXITED: a stream end is a session end (G02). The server rings
+//      the cut-off turn once; the sidecar rings nothing (C18).
 //
 // The user-Stop lane runs on the PRODUCTION sidecar
 // (crates/freshell-claude-sidecar/index.mjs) over the CLI simulator
@@ -36,8 +34,8 @@
 // `[ede_diagnostic]` error, T11) rings nothing, marks nothing and shows no
 // "Agent error" banner, and the next turn still rings.
 //
-// CLOUD-LEGALITY: everything is driven through the fake's deterministic
-// program lanes (`FRESHELL_FAKE_PROGRAM` text-matched rules with bounded
+// CLOUD-LEGALITY: everything is driven through the simulator's deterministic
+// program lanes (`FRESHELL_CLAUDE_SIM_PROGRAM` text-matched rules with bounded
 // `delayMs` emissions) — there are NO idle-grace-period or shade-transition
 // timing dependencies here (the patterns that put truly-idle-alerting.spec.ts
 // itself in CLOUD_SKIP_SPECS). The delayed emissions hand the spec a bounded
@@ -49,37 +47,26 @@
 // CLOUD_SKIP_SPECS.
 
 import fs from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const CLAUDE_SIDECAR_FIXTURE = path.resolve(__dirname, '../fixtures/providers/fake-claude-sdk-sidecar.mjs')
-// The production sidecar and the CLI simulator it loads through its
-// FRESHELL_CLAUDE_SDK_QUERY_MODULE seam (both are in the cloud image's source
-// tree; the simulator needs no CLI binary and no network).
-const CLAUDE_SIDECAR = path.resolve(__dirname, '../../../crates/freshell-claude-sidecar/index.mjs')
-const CLAUDE_CLI_SIMULATOR = path.resolve(__dirname, '../../fixtures/claude-cli-sim/query.mjs')
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 /**
- * Deterministic fake-sidecar program. The 3s emission delays are the ONLY
- * timing in this spec, and they are lane-controlled (the fake consumes the
+ * Deterministic CLI simulator program. The 3s emission delays are the ONLY
+ * timing in this spec, and they are lane-controlled (the simulator consumes the
  * delay BEFORE the emission fires): each send opens a bounded window in
  * which the spec moves the user's attention, then the scripted turn ends.
  */
-const FAKE_PROGRAM = {
+const SIMULATOR_PROGRAM = {
   rules: [
     {
       // Errored turn lane: error_max_turns is a turn end like any other.
-      on: 'msg:send',
+      on: 'msg:prompt',
       match: { text: 'ERROR_TURN' },
       emit: [
         {
@@ -90,30 +77,13 @@ const FAKE_PROGRAM = {
       ],
     },
     {
-      // Mid-turn end-of-stream lane: sdk.stream.ended and exit code 3, like
-      // the real sidecar; the server rings the cut-off turn. The separate
-      // `crash` lane (silent process death) belongs to the death lanes.
-      on: 'msg:send',
+      // The simulated CLI exits mid-turn. The production sidecar reports its
+      // ended SDK stream and exits; the server rings the cut-off turn.
+      on: 'msg:prompt',
       match: { text: 'STREAM_ERROR' },
-      emit: [{ kind: 'stream-error', delayMs: 3_000 }],
+      emit: [{ kind: 'crash', delayMs: 3_000 }],
     },
   ],
-}
-
-/** Read a JSONL fixture log (the fake's event/wire audit). */
-function readJsonl(filePath: string): any[] {
-  if (!existsSync(filePath)) return []
-  return readFileSync(filePath, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line)
-      } catch {
-        return null
-      }
-    })
-    .filter((row) => row !== null)
 }
 
 function findFreshAgentLeaf(node: any): any {
@@ -129,7 +99,7 @@ function findFreshAgentLeaf(node: any): any {
 }
 
 /**
- * Boot a server whose claude sidecar is the PRODUCTION sidecar over the CLI
+ * Boot a server whose Claude sidecar is the PRODUCTION sidecar over the CLI
  * simulator (with its ledger, and `extraEnv` such as a simulator program), and
  * open a freshclaude or kilroy pane on its boot tab.
  */
@@ -152,10 +122,7 @@ async function bootProductionClaudePane(
     await fs.mkdir(projectDir, { recursive: true })
     server = new RustServer({
       env: {
-        FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR,
-        FRESHELL_CLAUDE_NODE: process.execPath,
-        FRESHELL_CLAUDE_SDK_QUERY_MODULE: CLAUDE_CLI_SIMULATOR,
-        FRESHELL_CLAUDE_SIM_LEDGER: simLedger,
+        ...claudeSimulatorServerEnv({ ledgerPath: simLedger }),
         // Kilroy is behind its feature flag.
         ...(flavour === 'kilroy' ? { KILROY_ENABLED: '1' } : {}),
         ...extraEnv,
@@ -214,18 +181,13 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
 
   test('errored turns ring the unified signal; watched endings mark the tab strip only', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-error-turn-attention-'))
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     let server: RustServer | undefined
     try {
       const projectDir = path.join(sharedRoot, 'project')
-      await fs.mkdir(projectDir, { recursive: true })
       server = new RustServer({
         env: {
-          FRESHELL_CLAUDE_SIDECAR: CLAUDE_SIDECAR_FIXTURE,
-          FRESHELL_CLAUDE_NODE: process.execPath,
-          FRESHELL_FAKE_PROVIDER: 'freshclaude',
-          FRESHELL_FAKE_PROGRAM: JSON.stringify(FAKE_PROGRAM),
-          FRESHELL_FAKE_STDIN: path.join(sharedRoot, 'sidecar-stdin.jsonl'),
-          FRESHELL_FAKE_EVENTS: path.join(sharedRoot, 'sidecar-events.jsonl'),
+          ...claudeSimulatorServerEnv({ ledgerPath: simLedger, program: SIMULATOR_PROGRAM }),
         },
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
@@ -309,7 +271,7 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
       expect((await turnCompletionState()).seq ?? 0).toBe(0)
 
       // ── Step 1: an ERRORED turn ending in a BACKGROUND tab ──────────────
-      // Send, then move to a fresh shell tab inside the fake's 3s emission
+      // Send, then move to a fresh shell tab inside the simulator's 3s emission
       // window — the user is in another tab when the max-turns error lands.
       await composer.fill('ERROR_TURN')
       await sendButton.click()
@@ -420,7 +382,7 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
 
       // Restore the REAL focus signal before the away-and-back dismissal
       // (the click-mode dismiss requires the window to be focused), and
-      // clear the step-4 attention so the stream-error lane below starts
+      // clear the step-4 attention so the CLI-exit lane below starts
       // from a clean slate.
       await page.evaluate(() => {
         const original = (window as any).__FRESHELL_ORIGINAL_HAS_FOCUS__
@@ -438,10 +400,10 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
         .toBeNull()
       await paneStatus().toBe('idle')
 
-      // ── Step 5: the SDK stream ends mid-turn — the sidecar exits ───────
-      // The fake's stream-error lane models the real sidecar's end of stream:
-      // sdk.stream.ended as its last line and exit code 3. The server reports
-      // the exit and rings the cut-off turn, once (C18).
+      // ── Step 5: the CLI stream ends mid-turn — the sidecar exits ───────
+      // The simulated CLI exits while its turn is open. The production
+      // sidecar reports the ended stream and exits; the server reports the
+      // sidecar exit and rings the cut-off turn once (C18).
       await composer.fill('STREAM_ERROR')
       await sendButton.click()
       await page.locator(`[data-context="tab"][data-tab-id="${tabB}"]`).click()
@@ -469,33 +431,10 @@ test.describe('fresh-agent error-turn attention (unified needs-attention signal)
         }, { timeout: 30_000, message: 'the pane learns the sidecar exited (SIDECAR_EXITED)' })
         .toBe('SIDECAR_EXITED')
 
-      // The sidecar process is GONE: the wire rows carry its pid, the last
-      // one it wrote is the end report, and signal 0 finds no process.
-      const streamWires = readJsonl(path.join(sharedRoot, 'sidecar-events.jsonl'))
-        .filter((r) => r.kind === 'wire' && r.frame?.sessionId === bridgeSessionId)
-      expect(streamWires.length, 'the session produced wire rows to read the sidecar pid from').toBeGreaterThan(0)
-      const sidecarPid = streamWires[0].pid as number
-      expect(streamWires.at(-1)?.frame, 'the sidecar wrote sdk.stream.ended last').toMatchObject({ type: 'sdk.stream.ended', reason: 'stream_error' })
-      await expect
-        .poll(() => {
-          try {
-            process.kill(sidecarPid, 0)
-            return 'alive'
-          } catch {
-            return 'gone'
-          }
-        }, { timeout: 30_000, message: 'the sidecar process exited after its stream ended' })
-        .toBe('gone')
-      // The sidecar ended the turn with no result and minted no edge: the one
-      // edge for the lane is the server's.
-      const lastSendOpen = streamWires
-        .map((r) => r.frame?.type === 'sdk.status' && r.frame?.status === 'running')
-        .lastIndexOf(true)
-      expect(lastSendOpen, 'the ended turn opened with a running status').toBeGreaterThanOrEqual(0)
-      expect(
-        streamWires.slice(lastSendOpen).filter((r) => r.frame?.type === 'sdk.result' || r.frame?.type === 'sdk.turn.complete'),
-        'the stream ended with no result, and the sidecar minted no edge',
-      ).toEqual([])
+      // The simulator proves the CLI died during this prompt; the client
+      // observes the resulting sidecar exit, and the server supplies the one
+      // attention edge because no result arrived for the interrupted turn.
+      expect(readClaudeSimLedger(simLedger)).toContainEqual(expect.objectContaining({ kind: 'crash' }))
 
       // One edge total for the lane — stable across a settle window (the
       // cut-off turn rings exactly once).
@@ -527,7 +466,7 @@ test.describe('fresh-agent user Stop on the production claude sidecar', () => {
         }, { timeout: 30_000 })
         const turnCompletionState = () => harness.getState().then((s: any) => s?.turnCompletion ?? {})
         /** Prompts the simulated CLI has started, in order (its ledger's `prompt` rows). */
-        const startedPrompts = () => readJsonl(simLedger).filter((row) => row.kind === 'prompt').map((row) => String(row.text ?? ''))
+        const startedPrompts = () => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'prompt').map((row) => String(row.text ?? ''))
 
         // The CLI reports no session until a prompt (T1), so a new pane is
         // `connected` until its first turn.
@@ -693,7 +632,7 @@ test.describe('fresh-agent crash on the production claude sidecar', () => {
 
         // The same durable conversation boots again (a resume, not a new session)...
         await expect
-          .poll(() => readJsonl(simLedger).filter((row) => row.kind === 'query' && row.options?.resume === durable).length,
+          .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'query' && row.options?.resume === durable).length,
             { timeout: 30_000, message: 'Resume boots the CLI with resume: <the durable id>' })
           .toBe(1)
         await paneStatus().toMatch(/^(connected|idle)$/)
@@ -709,7 +648,7 @@ test.describe('fresh-agent crash on the production claude sidecar', () => {
         await composer.fill('after the resume')
         await sendButton.click()
         await expect
-          .poll(() => readJsonl(simLedger).filter((row) => row.kind === 'prompt').map((row) => String(row.text ?? '')),
+          .poll(() => readClaudeSimLedger(simLedger).filter((row) => row.kind === 'prompt').map((row) => String(row.text ?? '')),
             { timeout: 30_000, message: 'the resumed CLI ran the next prompt' })
           .toContain('after the resume')
         await expect

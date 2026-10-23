@@ -4,15 +4,11 @@
  * restart (RustServer.restartAbrupt(): SIGKILL + revive on the same
  * home/port/token) and resume in place -- never be adjudicated dead.
  *
- * Why this spec exists: the fake sidecar creates the transcript file AT
- * SESSION CREATE, before any turn -- a 0-byte .jsonl. (Validated: the REAL
- * CLI materializes the transcript only at first turn; the fixture's shape
- * stands in for any on-disk-but-R10b-excluded transcript, e.g. crash-window
- * partial writes.) That file fails the session index's R10b cwd gate, so pre-fix the
- * reconcile existence probe answered Absent while the attach arm's raw-file
- * check would happily resume it => DeadSession{session_not_on_disk} and the
- * 'Dead sessions' dialog. Every OTHER freshclaude-restart spec sends a turn
- * before restarting (which writes a cwd-bearing line and masks the bug);
+ * Why this spec exists: the real CLI does not materialize a transcript until
+ * the first turn. A create-time durable identity with no transcript must
+ * still survive restart without a false dead-session adjudication. Every
+ * OTHER freshclaude-restart spec sends a turn before restarting (which writes
+ * a cwd-bearing line and masks the no-transcript case);
  * hidden-pane-rebind-rust.spec.ts covers the HIDDEN zero-turn pane; this
  * spec covers the VISIBLE one. DO NOT add a turn before the restart --
  * zero-turn is the entire point.
@@ -31,15 +27,7 @@ import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-
-// ESM project ("type": "module" in package.json): __dirname does not exist in
-// ESM modules, so derive it -- same convention as every fixture-referencing
-// donor spec (e.g. restore-contract-wall-rust.spec.ts:39-40).
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
+import { claudeSimulatorServerEnv, readClaudeSimLedger } from '../helpers/claude-sim-lane.js'
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- donor: restore-contract-wall-rust.spec.ts)
@@ -124,8 +112,7 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
-// production env seam FRESHELL_CLAUDE_SIDECAR) ---
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator) ---
 
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -166,10 +153,10 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
   test.setTimeout(180_000)
 
   test('visible zero-turn freshclaude pane resumes after abrupt restart', async ({ page }) => {
-    // Sidecar REQUEST log: the post-restart resume proof reads it.
-    const requestLog = path.join(os.tmpdir(), `freshell-e2e-claude-sidecar-${Date.now()}.jsonl`)
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-zero-turn-'))
+    const simLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const { server, harness } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE, FAKE_CLAUDE_SIDECAR_LOG: requestLog },
+      env: claudeSimulatorServerEnv({ ledgerPath: simLedger }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -185,9 +172,9 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
           return c?.sessionId && c?.createRequestId ? true : null
         }, { timeout: 30_000 })
         .not.toBeNull()
-      // Wait for the DURABLE identity (sdk.session.init merge writes the
-      // canonical UUID to sessionRef.sessionId + resumeSessionId). The fake
-      // sidecar mints a RANDOM canonical UUID per process, so gate on the
+      // Wait for the durable identity assigned to this zero-turn pane. The
+      // production sidecar keeps the create-time identity until the CLI
+      // reports its session on a prompt, so gate on the
       // canonical-UUID SHAPE and capture what this run minted.
       await expect
         .poll(async () => {
@@ -207,9 +194,7 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
       await waitForWsReady(page)
 
       // Positive proof (same discriminator as the hidden-pane spec): the
-      // sidecar request log must contain a `create` whose resume boot names
-      // originalDurable -- only the restart-parity resume arm emits that, and
-      // the initial create boots fresh, so a match is unambiguous
+      // simulator ledger must contain a resumed CLI query naming originalDurable.
       // post-restart evidence.
       // The parity arm resumes by durable UUID or by the transcript's
       // .jsonl PATH; both carry the durable UUID -- accept either shape.
@@ -218,18 +203,8 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
           const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
           const status = c?.status ?? ''
           const usable = c?.sessionId && ['connected', 'idle', 'running'].includes(status)
-          const log = await fs.readFile(requestLog, 'utf-8').catch(() => '')
-          const resumed = log
-            .split('\n')
-            .filter(Boolean)
-            .map((l) => JSON.parse(l))
-            .some(
-              (e) =>
-                e.msg?.type === 'create' &&
-                typeof e.msg?.boot?.resume === 'string' &&
-                (e.msg.boot.resume === originalDurable ||
-                  e.msg.boot.resume.endsWith(`/${originalDurable}.jsonl`)),
-            )
+          const resumed = readClaudeSimLedger(simLedger)
+            .some((row) => row.kind === 'query' && (row.options as any)?.resume === originalDurable)
           return usable && resumed ? `resumed:${status}` : null
         }, { timeout: 30_000 })
         .not.toBeNull()
@@ -250,6 +225,7 @@ test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
       expect(contentAfter.createRequestId).toBe(createRequestIdBefore)
     } finally {
       await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 })

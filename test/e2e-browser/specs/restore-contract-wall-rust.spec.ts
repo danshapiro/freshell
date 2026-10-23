@@ -41,6 +41,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { claudeSimulatorServerEnv } from '../helpers/claude-sim-lane.js'
 
 // ESM project ("type": "module" in package.json): __dirname does not exist in
 // ESM modules, so derive it -- same convention as every fixture-referencing
@@ -58,7 +59,6 @@ const FAKE_CODEX_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-cl
 const FAKE_OPENCODE_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode-terminal.mjs')
 const FAKE_OPENCODE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
 const FAKE_CLAUDE_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-cli.mjs')
-const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
   __dirname,
   '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
@@ -479,8 +479,7 @@ async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
   })
 }
 
-// --- freshclaude fresh-agent helper (fixture: fake-claude-sidecar.mjs via the
-// production env seam FRESHELL_CLAUDE_SIDECAR) ---
+// --- freshclaude fresh-agent helper (production sidecar + CLI simulator) ---
 
 async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
@@ -1326,7 +1325,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     await fs.mkdir(projectDir, { recursive: true })
 
     const { server, harness, info, context, page } = await bootWall(browser, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      env: claudeSimulatorServerEnv({ ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl') }),
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -1621,6 +1620,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const codexArgLog = path.join(sharedRoot, 'codex-argv.jsonl')
     const opencodeArgLog = path.join(sharedRoot, 'opencode-argv.jsonl')
     const opencodeAuditLog = path.join(sharedRoot, 'opencode-audit.jsonl')
+    const claudeSimLedger = path.join(sharedRoot, 'claude-sim-ledger.jsonl')
     const binDir = path.join(sharedRoot, 'bin')
     const fakeClaudePath = await installFakeCli(FAKE_CLAUDE_CLI_SOURCE, 'claude', binDir)
     const fakeCodexPath = await installDualRoleCodex(binDir, codexArgLog)
@@ -1633,7 +1633,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         CODEX_CMD: fakeCodexPath,
         FAKE_CODEX_ARGV_LOG: codexArgLog,
         OPENCODE_CMD: fakeOpencodePath,
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
+        ...claudeSimulatorServerEnv({ ledgerPath: claudeSimLedger }),
       },
       setupHome: async (homeDir) => {
         await seedWallConfig({ providers: ['claude', 'codex', 'opencode'], freshAgent: true })(
@@ -2368,8 +2368,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     await fs.mkdir(projectDir, { recursive: true })
     const { server, harness, context, page } = await bootWall(browser, {
       env: {
-        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
-        FAKE_CLAUDE_SIDECAR_HOLD_TURN: '1',
+        ...claudeSimulatorServerEnv({
+          ledgerPath: path.join(sharedRoot, 'claude-sim-ledger.jsonl'),
+          program: {
+            rules: [{ on: 'msg:prompt', match: { text: 'busy turn' }, emit: [{ kind: 'hang' }] }],
+          },
+        }),
       },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
@@ -2381,7 +2385,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await createFreshclaudePane(page, harness, projectDir)
 
-      // Send a turn that NEVER completes (HOLD_TURN) -> status running.
+      // Send a turn that NEVER completes (the simulator hangs this prompt) -> status running.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       await expect
         .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
