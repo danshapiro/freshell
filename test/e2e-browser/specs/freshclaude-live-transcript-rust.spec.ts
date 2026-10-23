@@ -8,7 +8,9 @@
 //
 //   1. streamed text shows while the turn runs (Stop shown), then lands:
 //      on screen exactly once in every frame, with no gap;
-//   2. a tool's row shows before its turn ends;
+//   2. a tool's row shows as soon as the model starts the call (before its
+//      input is complete and before the transcript has it), and a running
+//      tool's row shows before its turn ends;
 //   3. an API retry shows "Retrying (attempt 1)" until the answer streams;
 //   4. /compact shows the compaction card and the pane returns to idle; a
 //      failed compaction shows the notice and the durable command error;
@@ -124,13 +126,23 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
     })
   }
 
-  test('freshclaude: a tool row shows before its turn ends', async ({ browser }) => {
-    const program = { rules: [onPrompt('run the slow tool', [
-      { kind: 'tool', data: { name: 'Bash', input: { command: 'sleep 5', description: 'Wait for the build' }, seconds: 5 } },
+  test('freshclaude: a tool row shows as soon as the model starts the call, and before its turn ends', async ({ browser }) => {
+    // The model takes 4 s to stream a long Write's input, then runs a 4 s Bash call.
+    const program = (workspace: string) => ({ rules: [onPrompt('write the notes, then build', [
+      { kind: 'tool', data: { name: 'Write', input: { file_path: path.join(workspace, 'notes.md'), content: 'a long line of notes\n'.repeat(200) }, inputStreamMs: 4_000, output: 'File created successfully' } },
+      { kind: 'tool', data: { name: 'Bash', input: { command: 'sleep 4', description: 'Wait for the build' }, seconds: 4 } },
       { kind: 'text', data: { text: 'The build finished.' } },
-    ])] }
+    ])] })
     await withLane(browser, { flavour: 'freshclaude', program }, async (lane, pane) => {
-      await lane.send(pane, 'run the slow tool')
+      await lane.send(pane, 'write the notes, then build')
+
+      // While the model still streams the Write's input, nothing of the
+      // response is in the transcript yet: the live response shows the call.
+      await expect(liveResponse(pane).getByRole('region', { name: 'Activity strip' })).toContainText('Write', { timeout: 30_000 })
+      await expect(agentTurns(pane), 'the call is not in the transcript yet').toHaveCount(0)
+      await expect(stopButton(pane)).toBeVisible()
+
+      // The running Bash call shows while its turn still runs.
       const strip = pane.paneRoot.getByRole('region', { name: 'Activity strip' }).filter({ hasText: 'Wait for the build' })
       await expect(strip).toBeVisible({ timeout: 30_000 })
       await expect(strip).toContainText('Bash')
@@ -139,14 +151,17 @@ test.describe('freshclaude live transcript (production sidecar over the CLI simu
 
       await lane.waitForIdle(pane)
       await expect(pane.paneRoot.getByText('The build finished.')).toHaveCount(1)
-      // The settled strip sums the turn up; its details show the tool call.
+      await expect(liveResponse(pane)).toHaveCount(0)
+      // The settled strip sums the turn up; its details show both calls, done.
       const settled = pane.paneRoot.getByRole('region', { name: 'Activity strip' })
       await expect(settled).toHaveCount(1)
-      await expect(settled).toContainText('1 tool used')
+      await expect(settled).toContainText('2 tools used')
       await settled.getByRole('button', { name: 'Toggle activity details', expanded: false }).click()
-      const toolCall = pane.paneRoot.getByRole('button', { name: 'Bash tool call' })
-      await expect(toolCall).toHaveCount(1)
-      await expect(toolCall.getByLabel('complete')).toBeVisible()
+      for (const name of ['Write tool call', 'Bash tool call']) {
+        const toolCall = pane.paneRoot.getByRole('button', { name })
+        await expect(toolCall).toHaveCount(1)
+        await expect(toolCall.getByLabel('complete')).toBeVisible()
+      }
     })
   })
 

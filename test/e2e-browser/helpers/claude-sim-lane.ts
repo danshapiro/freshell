@@ -49,8 +49,11 @@ export function onPrompt(text: string, emit: ClaudeSimEmission[]): ClaudeSimRule
 
 export interface ClaudeSimLaneOptions {
   flavour: ClaudeSimFlavour
-  /** The model's side of matching prompts; other prompts follow the prompt markers. */
-  program?: ClaudeSimProgram
+  /**
+   * The model's side of matching prompts (other prompts follow the prompt
+   * markers); a function gets the pane's workspace.
+   */
+  program?: ClaudeSimProgram | ((workspace: string) => ClaudeSimProgram)
   /** Saved provider defaults for this flavour (`settings.freshAgent.providers.<flavour>`). */
   providerDefaults?: Record<string, unknown>
   /** Prepare the pane's workspace (for example a git repository) before the server starts. */
@@ -92,6 +95,7 @@ export class ClaudeSimLane {
     try {
       await fs.mkdir(workspace, { recursive: true })
       await options.setupWorkspace?.(workspace)
+      const program = typeof options.program === 'function' ? options.program(workspace) : options.program
       server = new RustServer({
         verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
         env: {
@@ -99,7 +103,7 @@ export class ClaudeSimLane {
           FRESHELL_CLAUDE_NODE: process.execPath,
           FRESHELL_CLAUDE_SDK_QUERY_MODULE: CLAUDE_CLI_SIMULATOR,
           FRESHELL_CLAUDE_SIM_LEDGER: ledgerPath,
-          ...(options.program ? { FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify(options.program) } : {}),
+          ...(program ? { FRESHELL_CLAUDE_SIM_PROGRAM: JSON.stringify(program) } : {}),
           // Kilroy is behind its feature flag.
           ...(options.flavour === 'kilroy' ? { KILROY_ENABLED: '1' } : {}),
           ...options.env,
