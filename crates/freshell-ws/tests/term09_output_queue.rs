@@ -821,9 +821,22 @@ async fn incident_backlog_spills_instead_of_disconnecting() {
 /// and the stall window is widened to 5 s so a loaded runner's scheduling
 /// gaps cannot masquerade as a genuine >2 s send silence. Every assertion
 /// is unchanged; only the reachability margins were re-derived.
+///
+/// Even the minimal inversion needs production to outpace the drain by
+/// 2 MiB, and a loaded machine still slowed the PTY producer to the
+/// ~1 MiB/s drain rate often enough that the queue never overflowed (no gap,
+/// 1 run in 4 at load ~100). So, like the incident test, the client reads
+/// one frame per pause until the server reports its first spill for this
+/// terminal, and only then drains at ~1 MiB/s. It keeps reading the whole
+/// time, so every pause still ends in a successful send.
 #[tokio::test]
 async fn slow_but_progressing_client_survives_over_threshold_backlog() {
     let _flood_guard = flood_test_serial().await;
+    // Install the process-global capture BEFORE the server spawns: the
+    // server's own spill event is the signal that the queue has overflowed,
+    // and an event emitted before the subscriber exists is lost for good.
+    let events = global_capture();
+    let captured_from = events.lock().expect("capture lock").len();
     // Inverted ON PURPOSE (see doc comment): 2 MiB queue > 1 MiB threshold.
     // The 5 s stall window keeps the decision observable while a loaded
     // runner cannot fake a >2 s send silence; the harness's 30 s ping
@@ -862,9 +875,22 @@ async fn slow_but_progressing_client_survives_over_threshold_backlog() {
         .await
         .expect("send flood input");
 
+    let spilled = || {
+        events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .skip(captured_from)
+            .any(|event| {
+                event.message == "ws.terminal_stream.queue_overflow_spill"
+                    && event.fields.get("terminal_id") == Some(&terminal_id)
+            })
+    };
     // Deadline sized for a ~630 KB/s effective drain under CI load (the
     // per-frame JSON parsing contends with everything else on the runner):
-    // ~27 MB then needs ~45 s, so 75 s keeps >1.5x headroom.
+    // ~27 MB then needs ~45 s, so 75 s keeps >1.5x headroom. The trickle
+    // before the first spill only shortens what is left to drain, since the
+    // spill evicts what the client did not read.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
     let report = drain_throttled_until_marker(
         &mut victim,
@@ -872,7 +898,7 @@ async fn slow_but_progressing_client_survives_over_threshold_backlog() {
         128 * 1024,
         Duration::from_millis(125),
         deadline,
-        None,
+        Some(&spilled),
     )
     .await;
 
