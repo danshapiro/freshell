@@ -147,18 +147,16 @@ export function resolveCloudCompanionScope(forwardedArgs: string[], localOnlyDir
 
 export function buildCloudCompanionRun({
   mode,
-  clientWorkers,
   scope,
 }: {
   mode: StandardTestMode
-  clientWorkers: string
   scope: string[]
 }): StandardTestRun {
   return {
     name: 'client-local-only',
     runner: 'vitest',
     configPath: DEFAULT_VITEST_CONFIG,
-    maxWorkers: clientWorkers,
+    maxWorkers: '1',
     priority: mode === 'aggressive' ? 'normal' : 'background',
     pathFilters: scope,
   }
@@ -464,10 +462,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       } else if (companionScope.length === 0) {
         log('info', 'Local companion skipped: no requested selectors intersect the cloud-excluded tests', { localOnlyDirs })
       } else {
-        const workers = resolveDesktopWorkerPlan(availableParallelism())
         companionRun = buildCloudCompanionRun({
           mode: resolvedMode,
-          clientWorkers: workers.clientWorkers,
           scope: companionScope,
         })
         log('info', 'Starting local companion for cloud-excluded tests (runs in parallel with the cloud shards)', {
