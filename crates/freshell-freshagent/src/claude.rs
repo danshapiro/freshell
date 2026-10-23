@@ -856,6 +856,14 @@ impl FreshClaudeState {
         self.test_holds.hold_registration(hold);
     }
 
+    /// Test seam (see [`crate::claude_test_holds`]): park every later
+    /// end-of-output path after it recorded the dead session, before it reaps the
+    /// sidecar and reports the exit, until the returned hold is released.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_exit_reports(&self) -> Arc<crate::claude_test_holds::ExitReportHold> {
+        self.test_holds.hold_exit_report()
+    }
+
     /// Spawn one claude sidecar process (create, attach-resume and rollback all
     /// come through here) for a session of `session_type`.
     async fn spawn_sidecar_process(&self, session_type: &str) -> Result<SpawnedSidecar, String> {
@@ -9164,6 +9172,7 @@ impl FreshClaudeState {
                     &evicted,
                     reason,
                 );
+                state.test_holds.exit_report().await;
                 // Reap the sidecar for its exit status: the cause of a death that
                 // reported no stream end, and no zombie left behind.
                 let status = crate::claude_sidecar_exit::reap(&mut evicted.child).await;
@@ -9189,8 +9198,12 @@ impl FreshClaudeState {
                     rings,
                     "freshagent.claude.sidecar_exit");
                 // G05: every pane learns the session exited — a compacting or
-                // running pane stops being busy and offers Resume — unless a
-                // resume already brought it back during the reap.
+                // running pane stops being busy and offers Resume — and why
+                // (SIDECAR_EXITED, which also drops the pane to idle). The report
+                // belongs to the dead incarnation: a resume that registered the
+                // session again during the reap (an attach under the same pane
+                // id) or a close forgot the dead record, and then neither frame
+                // may reach the id, which names a live session or nothing now.
                 if state.dead_session(&stamp).is_some() {
                     state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
                         event: crate::claude_dead_sessions::exited_status_event(&stamp),
@@ -9198,15 +9211,24 @@ impl FreshClaudeState {
                         session_id: stamp.clone(),
                         session_type: session_type.clone(),
                     }));
+                    state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: crate::claude_sidecar_exit::sidecar_exited_event(&stamp, &cause),
+                        provider: PROVIDER.to_string(),
+                        session_id: stamp.clone(),
+                        session_type: session_type.clone(),
+                    }));
+                } else {
+                    tracing::info!(target: "freshell_freshagent::claude",
+                        provider = PROVIDER,
+                        session_id = %stamp,
+                        session_type = %session_type,
+                        reason = cause.reason(),
+                        "freshagent.claude.exit_report_skipped: the session was resumed or \
+                         closed while its dead sidecar was reaped");
                 }
-                state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                    event: crate::claude_sidecar_exit::sidecar_exited_event(&stamp, &cause),
-                    provider: PROVIDER.to_string(),
-                    session_id: stamp.clone(),
-                    session_type: session_type.clone(),
-                }));
                 // Task 5 (unified needs-attention signal): an UNREQUESTED end of a
-                // running turn is a turn end the user did not witness. Interim
+                // running turn is a turn end the user did not witness, even when a
+                // resume brought the session back during the reap. Interim
                 // rule (design §5.7, until C18): a sidecar that reported its
                 // stream's end already rang a result-less turn end itself, so the
                 // server rings only for a death that reported nothing (a Node
@@ -21198,6 +21220,78 @@ rl.on('line', (line) => {
             json!({}),
             "the old pane id no longer names an ended session"
         );
+    }
+
+    /// Review PRB-C09: an attach that resumes the session under its own pane id
+    /// while the dead sidecar is still being reaped (the reload and reconnect
+    /// path) makes that id live again, so the dead incarnation's exit report —
+    /// the `exited` status and the SIDECAR_EXITED banner, which also resets the
+    /// pane to idle — must not reach it. The turn the death cut short still
+    /// rings, once: it ended, and nobody saw it end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_during_the_reap_gets_no_exit_report_but_the_lost_turn_rings() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        // The fake sidecar's session reports this durable id.
+        const DURABLE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-reap-resume"), None)
+            .await;
+        let created = await_claude_created_and_session_init(&mut rx, "req-reap-resume").await;
+        let pane_id = created["sessionId"].as_str().unwrap().to_string();
+        // The fake never answers a plain send: the turn stays in flight.
+        st.handle_send(send_msg(&pane_id, "a turn the sidecar dies in"))
+            .await;
+        assert!(in_turn_of(&st, &pane_id).await);
+
+        let hold = st.hold_exit_reports();
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&pane_id)
+            .expect("live session in map")
+            .child
+            .start_kill()
+            .expect("kill the sidecar");
+        tokio::time::timeout(Duration::from_secs(15), hold.parked())
+            .await
+            .expect("the end-of-output path reached the exit report");
+
+        let home = tempfile::tempdir().unwrap();
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        st.handle_attach(attach_msg_with_resume(&pane_id, DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert!(st.has_live_session(DURABLE).await, "the attach resumed it");
+        while rx.try_recv().is_ok() {}
+
+        hold.release();
+        let mut frames = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Ok(raw)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            frames.push(serde_json::from_str::<Value>(&raw).unwrap());
+        }
+        let about_the_pane: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame["sessionId"] == pane_id.as_str())
+            .collect();
+        assert!(
+            about_the_pane
+                .iter()
+                .all(|frame| frame["event"]["status"] != "exited"
+                    && frame["event"]["code"] != "SIDECAR_EXITED"),
+            "no exit report reaches the resumed session: {about_the_pane:?}"
+        );
+        assert_eq!(
+            about_the_pane
+                .iter()
+                .filter(|frame| frame["event"]["type"] == "freshAgent.turn.complete")
+                .count(),
+            1,
+            "the lost turn rings once: {about_the_pane:?}"
+        );
+        assert_ne!(st.live_snapshot_overlay(&pane_id).await["status"], "exited");
     }
 
     /// C09: closing an ended session forgets it: its snapshot no longer says
