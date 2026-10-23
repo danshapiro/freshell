@@ -105,3 +105,33 @@ async fn ready_replays_waiting_only_until_the_last_control_is_answered() {
     );
     first.kill(&session_id).await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_retains_a_crashed_turn_but_not_its_dead_approval() {
+    let program = json!({ "rules": [{
+        "on": "msg:prompt", "match": { "text": "ask" },
+        "emit": [{ "kind": "approval", "data": { "tool": "Bash", "input": { "command": "ls" } } }],
+    }] })
+    .to_string();
+    let rig =
+        ClaudeRig::start_with_env(RigKind::Sim, &[("FRESHELL_CLAUDE_SIM_PROGRAM", &program)]).await;
+    let mut first = rig.connect().await;
+    let created = first
+        .request_create("create-crash", json!({ "permissionMode": "default" }))
+        .await;
+    let session_id = created["sessionId"].as_str().unwrap().to_string();
+    first.send_text(&session_id, "send-crash", "ask").await;
+    first.wait_for_event("freshAgent.turn.waiting").await;
+    assert!(mark(&ready(&rig, true).await, &session_id)
+        .get("lastWaitingAt")
+        .is_some());
+    rig.kill_first_sidecar(&mut first).await;
+    let edge = first.wait_for_event("freshAgent.turn.complete").await;
+    let reconnect = ready(&rig, true).await;
+    assert_eq!(
+        mark(&reconnect, &session_id)["lastTurnCompleteAt"],
+        edge["event"]["at"]
+    );
+    assert!(mark(&reconnect, &session_id).get("lastWaitingAt").is_none());
+}
