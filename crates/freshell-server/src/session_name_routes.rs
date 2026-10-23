@@ -41,6 +41,9 @@ use crate::session_names::{
     is_boot_import_id, SessionNames, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT,
 };
 
+#[path = "session_name_route_admission.rs"]
+mod admission;
+
 /// Client batch reads are chunked to this many references per request (plan
 /// rule 9 / the route contract).
 pub(crate) const READ_CHUNK_LIMIT: usize = 100;
@@ -106,22 +109,12 @@ pub(crate) fn name_error_response(error: &NameError, target: &SessionNameRef) ->
 /// already emitted).
 pub(crate) async fn rename_through_authority(
     sink: &dyn SessionNaming,
-    target: SessionNameRef,
-    name: String,
-    intent: NameIntent,
-    if_revision: Option<u64>,
-    cwd: Option<String>,
+    input: RenameNameInput,
+    identity: &TerminalIdentityRegistry,
+    index: Option<&freshell_sessions::directory_index::SessionIndex>,
 ) -> Result<freshell_protocol::session_names::SessionNameUpdate, Response> {
-    match sink
-        .rename(RenameNameInput {
-            target: target.clone(),
-            name,
-            intent,
-            if_revision,
-            cwd,
-        })
-        .await
-    {
+    let target = input.target.clone();
+    match admission::rename(sink, input, identity, index).await {
         Ok(update) => Ok(update),
         Err(error) => {
             // Structured failure log under this server's own target
@@ -364,11 +357,15 @@ async fn rename_session_name(
     let cwd = rename_target_cwd(&target, &state.identity, state.index.as_deref());
     match rename_through_authority(
         &*state.names,
-        target,
-        name,
-        intent,
-        request.if_revision,
-        cwd,
+        RenameNameInput {
+            target,
+            name,
+            intent,
+            if_revision: request.if_revision,
+            cwd,
+        },
+        &state.identity,
+        state.index.as_deref(),
     )
     .await
     {

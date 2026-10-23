@@ -181,7 +181,12 @@ treats as no title). Nothing is copied
 from the old session, whose name is untouched; the switch creates or
 changes no record. A rename immediately after the switch can admit the
 new session's directory fallback and rename it before the session index
-creates its record. A pending handle that resolves to the old session
+creates its record. Canonical and session rename routes also admit a
+durable target held by a live identity binding or the published session
+index; the terminal route admits its live binding. Unknown unindexed ids,
+prospective pending identities and retired-only unnamed targets remain
+missing-name responses; admission never bypasses revision checks.
+A pending handle that resolves to the old session
 cannot redirect that rename back to it. The retry pins the pending record's
 revision so a concurrent bind cannot change its target silently.
 For terminal pane and tab renames, the current registry binding takes
