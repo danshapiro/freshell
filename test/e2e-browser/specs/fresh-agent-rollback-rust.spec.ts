@@ -56,7 +56,7 @@
  * ../helpers/ws-capture.js (the shared helper — never re-declared).
  */
 import fs from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
@@ -310,6 +310,17 @@ function simBoots(simLedger: string): any[] {
 /** The simulated CLI's boots of forks (rollback replacements of a conversation). */
 function simForks(simLedger: string): any[] {
   return simBoots(simLedger).filter((options) => options.forkSession === true)
+}
+
+/** `<id>.jsonl` under the server home's `.claude/projects` tree, once written. */
+function findClaudeTranscript(homeDir: string, sessionId: string): string | null {
+  const projects = path.join(homeDir, '.claude', 'projects')
+  if (!existsSync(projects)) return null
+  for (const project of readdirSync(projects)) {
+    const candidate = path.join(projects, project, `${sessionId}.jsonl`)
+    if (existsSync(candidate)) return candidate
+  }
+  return null
 }
 
 /** Boot the claude lane: create a freshclaude/kilroy pane on an owned server. */
@@ -1096,6 +1107,67 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', SECOND)), { timeout: 15_000 })
         .toBe(2)
       expect(await durable()).toBe(SECOND)
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('claude: /undo of a turn Claude folded a background agent\'s notice into is refused honestly; the pane keeps its conversation and takes the next prompt (decision 2)', async ({ page }) => {
+    const lane = await bootClaudeLane(page, 'freshclaude')
+    try {
+      // A booted pane is `connected` until its first turn settles it `idle`.
+      await waitForPaneStatus(lane.harness, lane.tabId, ['idle', 'connected'])
+      await sendComposerText(page, 'prompt one')
+      const ORIG = await captureDurableId(lane.harness, lane.tabId, CANONICAL_UUID_RE)
+      await expect
+        .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG)), { timeout: 15_000 })
+        .toBe(1)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // A background agent: its completion notice is written into the turn
+      // that launched it (T19), so that turn holds a message the pane never
+      // showed as its own.
+      await sendComposerText(page, 'AGENT:async')
+      await expect
+        .poll(
+          () => {
+            const transcript = findClaudeTranscript(lane.info.homeDir, ORIG)
+            return transcript
+              ? readJsonl(transcript).some((line) => line?.origin?.kind === 'task-notification')
+              : false
+          },
+          { timeout: 30_000 },
+        )
+        .toBe(true)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const rowsBefore = userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG))
+      const bootsBefore = simBoots(lane.simLedger).length
+      await waitForRollbackCapability(page)
+
+      await typeSlash(page, '/undo')
+
+      // The CLI refused the guarded fork; the server's pinned reason renders
+      // verbatim on the notice banner, never a guard-less retry.
+      await expect(
+        page.getByText("Claude folded another message into that turn, so it can't be undone to that point."),
+        'the honest refusal renders on the notice banner',
+      ).toBeVisible({ timeout: 30_000 })
+      const boots = simBoots(lane.simLedger).slice(bootsBefore)
+      expect(boots, 'one guarded fork, never a guard-less retry').toHaveLength(1)
+      expect(boots[0].forkSession).toBe(true)
+      expect(typeof boots[0].resumeDropsTurn).toBe('string')
+      // Nothing moved: the pane keeps ORIG, its conversation and an empty
+      // composer (no refill: nothing was undone).
+      expect((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionRef?.sessionId).toBe(ORIG)
+      expect(userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG))).toBe(rowsBefore)
+      await expect(composerLocator(page)).toHaveValue('')
+
+      // The pane stays usable: the next prompt runs in ORIG.
+      await sendComposerText(page, 'still here?')
+      await expect
+        .poll(async () => userRows(await fetchSnapshot(lane.info, 'freshclaude', 'claude', ORIG)), { timeout: 15_000 })
+        .toBe(rowsBefore + 1)
+      expect((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionRef?.sessionId).toBe(ORIG)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
