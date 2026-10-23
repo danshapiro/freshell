@@ -380,7 +380,14 @@ const SCENARIOS = {
     await s.waitForResults(1)
     const resultAt = Date.now()
     const appeared = await ctx.pollTranscript(X, 4000)
-    ctx.observe('transcriptAfterFirstResult', { msAfterResult: appeared ? Date.now() - resultAt : null, shape: transcriptShape(appeared) })
+    const msAfterResult = appeared ? Date.now() - resultAt : null
+    const assistantUuid = s.messages((m) => m.type === 'assistant' && !m.parent_tool_use_id).at(-1)?.uuid
+    ctx.need(assistantUuid, 'first turn assistant UUID')
+    // Appearance can be a valid partial flush. Compare the first turn's
+    // shape only once the assistant we already observed is durable.
+    const completed = await ctx.pollTranscript(X, 4000, 1, (lines) => lines.some((line) => line.type === 'assistant' && line.uuid === assistantUuid))
+    ctx.need(completed, 'first turn assistant in durable transcript')
+    ctx.observe('transcriptAfterFirstResult', { msAfterResult, shape: transcriptShape(completed) })
     s.push('second prompt', 'u2')
     await s.waitForResults(2)
     await s.waitForCount(isStateIdle, 2, 3000, 'idle')

@@ -133,6 +133,10 @@ describe(`pinned Claude CLI ${PINNED_CLI_VERSION} contract (real CLI, loopback p
     expect(appeared.msAfterResult).not.toBeNull()
     const shape = appeared.shape as Array<{ type: string, uuid: string }>
     expect(shape.some((line) => line.type === 'user' && line.uuid === 'u1')).toBe(true)
+    const firstResult = messages.findIndex(isResult)
+    const assistant = messages.slice(0, firstResult).filter((m) => m.type === 'assistant' && !m.parent_tool_use_id).at(-1)
+    expect(assistant).toBeDefined()
+    expect(shape).toContainEqual(expect.objectContaining({ type: 'assistant', uuid: assistant.uuid }))
   }, SCENARIO_TIMEOUT)
 
   it('T4: a fresh boot with an id whose transcript exists is refused: "Session ID X is already in use." and exit code 1', async () => {
