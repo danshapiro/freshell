@@ -9,7 +9,8 @@ vi.mock('@/lib/api', () => ({
 }))
 
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
-import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
+import panesReducer, { initLayout, reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
+import { resolvePaneNameRef } from '@/store/selectors/sessionNameSelectors'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { updateTab } from '@/store/tabsSlice'
 import sessionActivityReducer, { updateSessionActivity } from '@/store/sessionActivitySlice'
@@ -58,6 +59,31 @@ function makeStateWithTerminalPane({
 }
 
 describe('terminal-session-association', () => {
+  it.each([
+    { kind: 'session', provider: 'claude', sessionId: 'session-b' },
+    { kind: 'pending', id: 'original-handle' },
+  ] as const)('folds the authoritative binding %j before redirects load', (nameRef) => {
+    let panes = panesReducer(undefined, initLayout({
+      tabId: 'tab-1', paneId: 'pane-1',
+      content: {
+        kind: 'terminal', mode: 'claude', createRequestId: 'req-1', terminalId: 'term-1',
+        sessionRef: { provider: 'claude', sessionId: 'session-a' },
+        namingHandle: 'original-handle', nameRef: { kind: 'pending', id: 'original-handle' },
+      },
+    }))
+    const dispatch = vi.fn((action) => { panes = panesReducer(panes, action) })
+    const getState = () => ({ ...createState({}), panes })
+
+    reconcileTerminalSessionAssociation({
+      dispatch, getState, terminalId: 'term-1', previousSessionId: 'session-a',
+      sessionRef: { provider: 'claude', sessionId: 'session-b' }, nameRef,
+    })
+
+    const layout = panes.layouts['tab-1']
+    if (layout.type !== 'leaf') throw new Error('expected a pane')
+    expect(resolvePaneNameRef(layout.content)).toEqual(nameRef)
+  })
+
   it('returns conflict and refuses to overwrite an existing canonical sessionRef', () => {
     const dispatch = vi.fn()
     const result = reconcileTerminalSessionAssociation({

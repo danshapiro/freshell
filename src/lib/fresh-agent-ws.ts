@@ -71,6 +71,7 @@ type FreshAgentSessionMaterializedMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   sessionRef?: SessionRef
+  nameRef?: unknown
 }
 
 type FreshAgentKilledMessage = {
@@ -253,6 +254,7 @@ export function handleFreshAgentMessage(
           provider: materialized.provider,
           sessionId: materialized.sessionId,
         },
+        nameRef: materialized.nameRef,
       }))
       dispatch(flushPersistedLayoutNow())
       return true

@@ -6236,6 +6236,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             terminalId: tid,
             sessionRef: msg.sessionRef,
             previousSessionId: (msg as { previousSessionId?: string }).previousSessionId,
+            nameRef: msg.nameRef,
           })
           if (debugRef.current && associationResult === 'reconciled') {
             log.debug('[TRACE resumeSessionId] terminal.session.associated reconciled', {

@@ -67,6 +67,27 @@ function content(state: PanesState): TerminalPaneContent {
 }
 
 describe('conversation switch moves the pane naming identity', () => {
+  it.each([
+    [{ kind: 'session', provider: 'claude', sessionId: 'session-b' }, undefined],
+    [{ kind: 'pending', id: 'nh-bound-to-a' }, 'nh-bound-to-a'],
+  ] as const)('adopts the server naming binding %j without a cached redirect', (nameRef, namingHandle) => {
+    const state = stateWithTerminalPane({
+      sessionRef: { provider: 'claude', sessionId: 'session-a' },
+      namingHandle: 'nh-bound-to-a',
+      nameRef: { kind: 'pending', id: 'nh-bound-to-a' },
+    })
+
+    const next = panesReducer(state, reconcileTerminalSessionRefByTerminalId({
+      terminalId: 'term-1',
+      sessionRef: { provider: 'claude', sessionId: 'session-b' },
+      previousSessionId: 'session-a',
+      nameRef,
+    }))
+
+    expect(resolvePaneNameRef(content(next))).toEqual(nameRef)
+    expect(content(next).namingHandle).toBe(namingHandle)
+  })
+
   it('a rebind from the previous session releases the old conversation handle', () => {
     const state = stateWithTerminalPane({
       sessionRef: { provider: 'claude', sessionId: 'session-a' },
@@ -153,5 +174,23 @@ describe('conversation switch moves the pane naming identity', () => {
     }))
 
     expect(content(next).namingHandle).toBe('nh-a')
+  })
+
+  it('a repeated association can correct a spent handle without changing session identity', () => {
+    const state = stateWithTerminalPane({
+      sessionRef: { provider: 'claude', sessionId: 'session-b' },
+      namingHandle: 'nh-spent-on-a',
+    })
+
+    const next = panesReducer(state, reconcileTerminalSessionRefByTerminalId({
+      terminalId: 'term-1',
+      sessionRef: { provider: 'claude', sessionId: 'session-b' },
+      nameRef: { kind: 'session', provider: 'claude', sessionId: 'session-b' },
+    }))
+
+    expect(resolvePaneNameRef(content(next))).toEqual({
+      kind: 'session', provider: 'claude', sessionId: 'session-b',
+    })
+    expect(content(next).namingHandle).toBeUndefined()
   })
 })

@@ -15,6 +15,7 @@ import { ReadyMessageSchema } from '@/lib/ready-message-schema'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
+import { resolvePaneNameRef } from '@/store/selectors/sessionNameSelectors'
 
 function createFreshAgentStore() {
   return configureStore({
@@ -60,6 +61,35 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
 describe('fresh-agent-ws', () => {
   beforeEach(() => {
     _resetCancelledCreates()
+  })
+
+  it('a continuation follows its authoritative child name instead of the original spent handle', () => {
+    const store = createFreshAgentPaneStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent', provider: 'claude', sessionType: 'freshclaude',
+        sessionId: 'original', sessionRef: { provider: 'claude', sessionId: 'original' },
+        namingHandle: 'spent-original-handle', nameRef: { kind: 'pending', id: 'spent-original-handle' },
+        createRequestId: 'req-1', status: 'running',
+      },
+    }))
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.session.materialized',
+      previousSessionId: 'original', sessionId: 'replacement',
+      provider: 'claude', sessionType: 'freshclaude',
+      sessionRef: { provider: 'claude', sessionId: 'replacement' },
+      nameRef: { kind: 'session', provider: 'claude', sessionId: 'replacement' },
+    })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    if (layout.type !== 'leaf') throw new Error('expected a pane')
+    expect(resolvePaneNameRef(layout.content)).toEqual({
+      kind: 'session', provider: 'claude', sessionId: 'replacement',
+    })
+    expect(layout.content).not.toHaveProperty('namingHandle', 'spent-original-handle')
   })
 
   it('registers resumed creates with history hydration and handles freshAgent.created', () => {
