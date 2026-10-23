@@ -7173,8 +7173,17 @@ impl FreshClaudeState {
                 }
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                 // G05 (C09): the ended session stays known as ended — its ids
-                // resolve to a dead record, not to nothing. Recorded before the
-                // reap's wait, so a resume that lands meanwhile forgets it.
+                // resolve to a dead record, not to nothing. It is recorded
+                // before the stop on purpose: a resume (an attach, which is a
+                // recovery verb, or a create that resumes) can land while the
+                // stop runs and forgets the record, which is how the report
+                // below knows to stay away from a session that is live again.
+                // So for as long as the stop runs, a snapshot already reads
+                // `exited` and a send already gets the lost-session frame.
+                // That is short: node has usually exited by now (it ended its
+                // stream, or it died), so the stop is the tree guard's kill and
+                // the confirmation; only a node that closed its output and kept
+                // running is given the whole grace period before it is killed.
                 let reason = stream_ended
                     .as_ref()
                     .map_or(crate::claude_sidecar_exit::PROCESS_ENDED_REASON, |ended| {
@@ -7196,9 +7205,10 @@ impl FreshClaudeState {
                 // Stop the ended sidecar through the one sidecar stop every
                 // teardown uses (G31): node is reaped for its exit status (the
                 // cause of a death that reported no stream end), whatever is
-                // left of its tree (the CLI) is killed and confirmed gone BEFORE
-                // the exit report offers Resume, and no zombie is left behind.
-                // It is not this consumer's to abort: the consumer is this task.
+                // left of its tree (the CLI) is killed and, within the stop's
+                // bounded confirmation window, confirmed gone before the exit
+                // report offers Resume, and no zombie is left behind. It is not
+                // this consumer's to abort: the consumer is this task.
                 let processes = SidecarProcesses {
                     child: evicted.child,
                     stdin: evicted.stdin,
@@ -7215,7 +7225,14 @@ impl FreshClaudeState {
                     )
                     .await;
                 let confirmed = confirmation.label();
-                // An unconfirmed tree keeps escalating detached (logged there).
+                // A tree the window could not confirm gone keeps being killed in
+                // the background (logged there), and the report does not wait
+                // for it. On Linux such a member has outlived SIGKILL: it runs
+                // no more code and is only slow to finish dying (or stuck in
+                // the kernel), so a resume cannot race it, while holding the
+                // report back would leave the pane busy for as long as the
+                // kernel keeps it. Off Linux an unconfirmed tree is the guard's
+                // typed platform limitation, logged by the stop.
                 let _ = escalate_unconfirmed_teardown(confirmation, stamp.clone());
                 // A node that outlived the grace period was killed by the stop:
                 // the signal it died of is ours, not the cause.
@@ -7249,7 +7266,7 @@ impl FreshClaudeState {
                 // running pane stops being busy and offers Resume — and why
                 // (SIDECAR_EXITED, which also drops the pane to idle). The report
                 // belongs to the dead incarnation: a resume that registered the
-                // session again during the reap (an attach under the same pane
+                // session again during the stop (an attach under the same pane
                 // id) or a close forgot the dead record, and then neither frame
                 // may reach the id, which names a live session or nothing now.
                 if state.dead_sessions.find(&stamp).is_some() {
@@ -7276,7 +7293,7 @@ impl FreshClaudeState {
                 }
                 // Task 5 (unified needs-attention signal): an UNREQUESTED end of a
                 // running turn is a turn end the user did not witness, even when a
-                // resume brought the session back during the reap. Interim
+                // resume brought the session back during the stop. Interim
                 // rule (design §5.7, until C18): a sidecar that reported its
                 // stream's end already rang a result-less turn end itself, so the
                 // server rings only for a death that reported nothing (a Node
@@ -8305,31 +8322,92 @@ fn escalate_unconfirmed_teardown(
 }
 
 /// The detached unconfirmed-tree escalation (b8ke focused round-2 review
-/// R2-2): SIGTERM→SIGKILL rounds until the captured tree is confirmed
-/// dead-by-starttime. Resolves `true` only on confirmed death — the
-/// deferred stop commit releases on exactly that.
+/// R2-2): SIGTERM→SIGKILL windows until the captured tree is confirmed
+/// dead-by-starttime ([`escalate_until_dead`]). Resolves `true` only on
+/// confirmed death — the deferred stop commit releases on exactly that.
 fn spawn_claude_tree_death_escalation(
     tree: Vec<(i32, u64)>,
     ownership_id: String,
     session_label: String,
 ) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
-        let mut tree = tree;
-        while !confirm_captured_claude_tree_dead(
-            &mut tree,
-            &ownership_id,
+        let mut captured = CapturedClaudeTree { tree, ownership_id };
+        escalate_until_dead(&mut captured, &session_label).await
+    })
+}
+
+/// One bounded kill-and-confirm window of the detached escalation.
+trait TreeDeathWindow {
+    /// Signal the tree and poll it for one window; `true` once every member
+    /// is confirmed dead.
+    async fn confirm_dead(&mut self) -> bool;
+    /// How many members were still alive after the last window.
+    fn lingering(&self) -> usize;
+}
+
+/// The captured ownership-tagged tree a stop could not confirm gone.
+struct CapturedClaudeTree {
+    tree: Vec<(i32, u64)>,
+    ownership_id: String,
+}
+
+impl TreeDeathWindow for CapturedClaudeTree {
+    async fn confirm_dead(&mut self) -> bool {
+        confirm_captured_claude_tree_dead(
+            &mut self.tree,
+            &self.ownership_id,
             TREE_DEATH_CONFIRM_ROUNDS,
         )
         .await
-        {
-            tracing::warn!(target: "freshell_freshagent::claude",
-                session_id = %session_label, lingering = tree.len(),
-                "freshagent.claude.teardown_escalation_continues: the detached tree-death \
-                 escalation re-armed its bounded window"
-            );
-        }
-        true
-    })
+    }
+
+    fn lingering(&self) -> usize {
+        self.tree.len()
+    }
+}
+
+/// The detached escalation's pause before the next window, after
+/// `failed_windows` windows that ended with the tree alive: half a second,
+/// doubling, at most a minute. A tree that outlives a whole window
+/// (SIGKILL included) is stuck in the kernel; retrying it at once would only
+/// rescan `/proc` every 25 ms and warn every 0.6 s for as long as it stays
+/// stuck.
+fn escalation_pause(failed_windows: u32) -> Duration {
+    const FIRST: Duration = Duration::from_millis(500);
+    const LONGEST: Duration = Duration::from_secs(60);
+    let doublings = failed_windows.saturating_sub(1).min(16);
+    FIRST.saturating_mul(1 << doublings).min(LONGEST)
+}
+
+/// Run `window` until it confirms the tree dead, pausing between windows
+/// ([`escalation_pause`]). It never gives up: an explicit kill's deferred
+/// stop commit waits on the confirmation. Each unconfirmed window logs
+/// `freshagent.claude.teardown_escalation_continues` (warn), the
+/// confirmation `freshagent.claude.teardown_escalation_confirmed` (info).
+async fn escalate_until_dead(window: &mut impl TreeDeathWindow, session_label: &str) -> bool {
+    let started = std::time::Instant::now();
+    let mut failed_windows: u32 = 0;
+    while !window.confirm_dead().await {
+        failed_windows = failed_windows.saturating_add(1);
+        let pause = escalation_pause(failed_windows);
+        tracing::warn!(target: "freshell_freshagent::claude",
+            session_id = %session_label,
+            lingering = window.lingering(),
+            windows = failed_windows,
+            next_window_in_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            "freshagent.claude.teardown_escalation_continues: the detached tree-death \
+             escalation's window ended with the tree still alive; it tries again after a pause"
+        );
+        tokio::time::sleep(pause).await;
+    }
+    tracing::info!(target: "freshell_freshagent::claude",
+        session_id = %session_label,
+        windows = failed_windows.saturating_add(1),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "freshagent.claude.teardown_escalation_confirmed: the detached escalation confirmed \
+         the runtime tree's death"
+    );
+    true
 }
 
 /// The bounded SIGTERM→SIGKILL confirmation round budget (24 × 25ms with
@@ -8579,6 +8657,9 @@ use establish::{DurableClaim, EstablishLane, EstablishPlan, RegisterUnder};
 
 #[cfg(test)]
 mod teardown_tests;
+
+#[cfg(test)]
+mod end_of_output_tests;
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {

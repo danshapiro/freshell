@@ -343,7 +343,7 @@ async function runDefaultModelJourney(page: Page, flavour: Flavour): Promise<voi
     await sidebarRow.click()
     const resumeCreate = await waitForStdinFrame(
       stdinLog,
-      (frame) => frame?.type === 'create' && frame?.boot?.resume === durableId,
+      (frame) => frame?.type === 'create' && frame?.boot?.kind === 'resume' && frame?.boot?.resume === durableId,
       `the resumed ${label} pane's sidecar create`,
       30_000,
     )
