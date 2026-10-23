@@ -431,6 +431,7 @@ pub(crate) fn broadcast_terminal_session_associated(
 ) {
     let associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
         terminal_id: terminal_id.to_string(),
+        name_ref: state.registry.name_ref_of(terminal_id),
         session_ref: SessionLocator {
             provider: provider.to_string(),
             session_id: session_id.to_string(),

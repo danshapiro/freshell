@@ -485,6 +485,7 @@ async fn broadcast_terminal_session_associated(
 ) {
     let associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
         terminal_id: terminal_id.to_string(),
+        name_ref: state.registry.name_ref_of(terminal_id),
         session_ref: SessionLocator {
             provider: "opencode".to_string(),
             session_id: session_id.to_string(),
