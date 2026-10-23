@@ -718,6 +718,12 @@ impl FreshClaudeState {
             ledger: crate::claude_turns::SharedLedger::default(),
             clock: resumed_clock().unwrap_or_default(),
         });
+        let (stdin, fault) = crate::claude_sidecar_io::SidecarWriter::spawn(
+            stdin,
+            log_labels,
+            crate::claude_sidecar_io::write_timeout(self.sidecar_environment.as_deref()),
+        );
+        self.watch_writer_failure(&map_key, &ownership_id, fault);
         {
             let mut sessions = self.sessions.lock().await;
             let consumer = self.spawn_consumer(

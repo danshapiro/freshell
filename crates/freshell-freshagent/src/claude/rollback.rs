@@ -205,15 +205,7 @@ impl FreshClaudeState {
             ));
             return;
         }
-        let (
-            durable_id,
-            ledger,
-            turn_lock,
-            session_type,
-            clock,
-            live_settings,
-            freshell_context,
-        ) = {
+        let (durable_id, ledger, turn_lock, session_type, clock, live_settings, freshell_context) = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(s) => (

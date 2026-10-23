@@ -23,10 +23,201 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 const PROVIDER: &str = "claude";
+
+const WRITE_TIMEOUT_ENV: &str = "FRESHELL_FRESHCLAUDE_WRITE_TIMEOUT_MS";
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A FIFO writer owned by one sidecar runtime. Callers clone this handle while
+/// holding the sessions map, release that lock, and await only their own write.
+/// Shutdown has a separate channel so it can cancel a stalled write promptly.
+#[derive(Clone)]
+pub(crate) struct SidecarWriter {
+    inner: Arc<WriterInner>,
+}
+
+struct WriterInner {
+    requests: mpsc::UnboundedSender<WriteRequest>,
+    shutdown: StdMutex<Option<oneshot::Sender<Instant>>>,
+    closed: watch::Receiver<bool>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for WriterInner {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct WriteRequest {
+    line: Vec<u8>,
+    answer: oneshot::Sender<Result<(), String>>,
+}
+
+impl SidecarWriter {
+    /// The fault receiver fires once on timeout or a broken pipe. Its runtime
+    /// owner kills only that incarnation without removing its map entry, letting
+    /// stdout EOF run the normal death, attention and recovery path.
+    pub(crate) fn spawn<W>(
+        stdin: W,
+        labels: SidecarLogLabels,
+        timeout: Duration,
+    ) -> (Self, oneshot::Receiver<String>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (requests, input) = mpsc::unbounded_channel();
+        let (shutdown, stop) = oneshot::channel();
+        let (closed_tx, closed) = watch::channel(false);
+        let (fault_tx, fault) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_writer(stdin, input, stop, labels, timeout, fault_tx).await;
+            let _ = closed_tx.send(true);
+        });
+        (
+            Self {
+                inner: Arc::new(WriterInner {
+                    requests,
+                    shutdown: StdMutex::new(Some(shutdown)),
+                    closed,
+                    task: task.abort_handle(),
+                }),
+            },
+            fault,
+        )
+    }
+
+    pub(crate) async fn write(&self, value: &Value) -> Result<(), String> {
+        let mut line = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+        line.push(b'\n');
+        let (answer, receipt) = oneshot::channel();
+        self.inner
+            .requests
+            .send(WriteRequest { line, answer })
+            .map_err(|_| "Claude sidecar writer is closed.".to_string())?;
+        receipt.await.unwrap_or_else(|_| {
+            Err("Claude sidecar writer stopped before the write finished.".into())
+        })
+    }
+
+    /// Ask the sidecar to shut down, then close stdin, within the teardown's
+    /// existing deadline. A concurrent write is cancelled instead of extending
+    /// that deadline by the normal (longer) write timeout.
+    pub(crate) async fn shutdown(&self, deadline: Instant) {
+        if let Some(stop) = self
+            .inner
+            .shutdown
+            .lock()
+            .expect("writer shutdown lock")
+            .take()
+        {
+            let _ = stop.send(deadline);
+        }
+        let mut closed = self.inner.closed.clone();
+        if tokio::time::timeout_at(deadline, closed.wait_for(|closed| *closed))
+            .await
+            .is_err()
+        {
+            self.inner.task.abort();
+        }
+    }
+}
+
+/// The isolated test environment follows the same selection as the child; in
+/// production the setting comes from the server environment.
+pub(crate) fn write_timeout(environment: Option<&[(String, String)]>) -> Duration {
+    let configured = match environment {
+        Some(environment) => environment
+            .iter()
+            .rev()
+            .find(|(key, _)| key == WRITE_TIMEOUT_ENV)
+            .map(|(_, value)| value.clone()),
+        None => std::env::var(WRITE_TIMEOUT_ENV).ok(),
+    };
+    configured
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(WRITE_TIMEOUT)
+}
+
+async fn write_bytes<W: AsyncWrite + Unpin>(stdin: &mut W, line: &[u8]) -> std::io::Result<()> {
+    stdin.write_all(line).await?;
+    stdin.flush().await
+}
+
+async fn writer_shutdown<W: AsyncWrite + Unpin>(stdin: &mut W, deadline: Instant) {
+    let _ =
+        tokio::time::timeout_at(deadline, write_bytes(stdin, b"{\"type\":\"shutdown\"}\n")).await;
+}
+
+async fn run_writer<W: AsyncWrite + Unpin>(
+    mut stdin: W,
+    mut requests: mpsc::UnboundedReceiver<WriteRequest>,
+    mut stop: oneshot::Receiver<Instant>,
+    labels: SidecarLogLabels,
+    timeout: Duration,
+    fault: oneshot::Sender<String>,
+) {
+    loop {
+        let request = tokio::select! {
+            biased;
+            deadline = &mut stop => {
+                if let Ok(deadline) = deadline { writer_shutdown(&mut stdin, deadline).await; }
+                return;
+            }
+            request = requests.recv() => match request { Some(request) => request, None => return },
+        };
+        let written = tokio::select! {
+            biased;
+            deadline = &mut stop => {
+                if let Ok(deadline) = deadline { writer_shutdown(&mut stdin, deadline).await; }
+                return;
+            }
+            result = tokio::time::timeout(timeout, write_bytes(&mut stdin, &request.line)) => result,
+        };
+        let error = match written {
+            Ok(Ok(())) => {
+                let _ = request.answer.send(Ok(()));
+                continue;
+            }
+            Ok(Err(error)) => format!("Claude sidecar write failed: {error}"),
+            Err(_) => format!(
+                "Claude sidecar write timed out after {} ms.",
+                timeout.as_millis()
+            ),
+        };
+        tracing::error!(provider = PROVIDER, session_id = labels.session_id().as_deref(),
+            ownership_id = %labels.ownership_id(), pid = labels.pid(),
+            timeout_ms = timeout.as_millis() as u64, cause = %error,
+            "freshagent.claude.sidecar_write_failed");
+        let _ = fault.send(error.clone());
+        let _ = request.answer.send(Err(error.clone()));
+        requests.close();
+        while let Some(request) = requests.recv().await {
+            let _ = request.answer.send(Err(error.clone()));
+        }
+        return;
+    }
+}
+
+/// Unit fixtures construct already-booted sessions directly; production always
+/// supplies the real runtime's labels and watches the failure receiver.
+#[cfg(test)]
+impl From<tokio::process::ChildStdin> for SidecarWriter {
+    fn from(stdin: tokio::process::ChildStdin) -> Self {
+        Self::spawn(
+            stdin,
+            SidecarLogLabels::new("test-fixture", "freshclaude", None),
+            WRITE_TIMEOUT,
+        )
+        .0
+    }
+}
 
 /// Set by the hosted session host in a hosted sidecar's environment (to the
 /// provider it hosts: `claude` or `kilroy`).
@@ -1015,5 +1206,107 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    fn labels() -> SidecarLogLabels {
+        SidecarLogLabels::new("writer-test", "freshclaude", None)
+    }
+
+    #[tokio::test]
+    async fn writes_are_flushed_in_fifo_order() {
+        let (stdin, stdout) = tokio::io::duplex(16);
+        let (writer, fault) = SidecarWriter::spawn(stdin, labels(), Duration::from_secs(1));
+        let reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            [
+                lines.next_line().await.unwrap(),
+                lines.next_line().await.unwrap(),
+            ]
+        });
+        let first = serde_json::json!({"text": "first"});
+        let second = serde_json::json!({"text": "second"});
+        let (a, b) = tokio::join!(writer.write(&first), writer.write(&second));
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(
+            reader.await.unwrap(),
+            [Some(first.to_string()), Some(second.to_string())]
+        );
+        drop(writer);
+        assert!(
+            fault.await.is_err(),
+            "dropping a writer is not a runtime fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_pipe_refuses_the_write_and_reports_one_runtime_fault() {
+        let (stdin, stdout) = tokio::io::duplex(16);
+        drop(stdout);
+        let (writer, fault) = SidecarWriter::spawn(stdin, labels(), Duration::from_secs(1));
+        let error = writer
+            .write(&serde_json::json!({"text":"first"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("write failed"), "{error}");
+        assert_eq!(fault.await.unwrap(), error);
+        assert!(writer
+            .write(&serde_json::json!({"text":"second"}))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_pipe_times_out_including_flush_and_reports_the_fault() {
+        let (stdin, _stdout) = tokio::io::duplex(16);
+        let (writer, fault) = SidecarWriter::spawn(stdin, labels(), Duration::from_millis(500));
+        let started = Instant::now();
+        let error = writer
+            .write(&serde_json::json!({"text":"x".repeat(1024)}))
+            .await
+            .unwrap_err();
+        assert_eq!(Instant::now() - started, Duration::from_millis(500));
+        assert!(error.contains("timed out after 500 ms"), "{error}");
+        assert_eq!(fault.await.unwrap(), error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requested_shutdown_preempts_a_write_without_reporting_a_fault() {
+        let (stdin, _stdout) = tokio::io::duplex(16);
+        let (writer, fault) = SidecarWriter::spawn(stdin, labels(), Duration::from_secs(10));
+        let pending = {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                writer
+                    .write(&serde_json::json!({"text":"x".repeat(1024)}))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+        writer.shutdown(started + Duration::from_millis(100)).await;
+        assert!(Instant::now() - started <= Duration::from_millis(100));
+        assert!(pending.await.unwrap().is_err());
+        assert!(
+            fault.await.is_err(),
+            "requested shutdown must remain silent"
+        );
+    }
+
+    #[test]
+    fn write_timeout_uses_the_runtime_environment_without_global_test_mutation() {
+        for (value, expected) in [("500", 500), ("0", 10_000), ("invalid", 10_000)] {
+            let environment = vec![(WRITE_TIMEOUT_ENV.into(), value.into())];
+            assert_eq!(
+                write_timeout(Some(&environment)),
+                Duration::from_millis(expected)
+            );
+        }
+        assert_eq!(write_timeout(Some(&[])), WRITE_TIMEOUT);
     }
 }

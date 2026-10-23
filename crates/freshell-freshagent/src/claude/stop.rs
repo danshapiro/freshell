@@ -10,7 +10,7 @@
 
 use serde_json::json;
 
-use super::{write_line, FreshClaudeState, PROVIDER};
+use super::{FreshClaudeState, PROVIDER};
 use crate::claude_turns::StopReissue;
 
 const TARGET: &str = "freshell_freshagent::claude";
@@ -53,13 +53,14 @@ impl FreshClaudeState {
             "sessionId": session.sidecar_session_id,
             "stopId": stop_id,
         });
-        if let Err(error) = write_line(&mut session.stdin, &request).await {
-            session
-                .ledger
+        let writer = session.stdin.clone();
+        let ledger = session.ledger.clone();
+        drop(sessions);
+        if let Err(error) = writer.write(&request).await {
+            ledger
                 .lock()
                 .expect("turn ledger lock")
                 .stop_unsent(&stop_id);
-            drop(sessions);
             tracing::warn!(target: TARGET, provider = PROVIDER, session_id = %stamp,
                 session_type, stop_id = %stop_id, outcome = "unsent", cause = %error,
                 "freshagent.claude.stop");
@@ -97,7 +98,9 @@ impl FreshClaudeState {
             "sessionId": sidecar_session_id,
             "stopId": reissue.reissue_id,
         });
-        if let Err(error) = write_line(&mut session.stdin, &request).await {
+        let writer = session.stdin.clone();
+        drop(sessions);
+        if let Err(error) = writer.write(&request).await {
             tracing::warn!(target: TARGET, provider = PROVIDER, session_id = %stamp,
                 session_type, stop_id = %reissue.stop_id, outcome = "unsent",
                 cause = %error,

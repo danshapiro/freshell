@@ -573,11 +573,19 @@ struct PendingQuestionEntry {
     questions: Value,
 }
 
+/// Handles a response needs after releasing the shared sessions-map lock.
+struct ResponseSession {
+    stdin: crate::claude_sidecar_io::SidecarWriter,
+    sidecar_session_id: String,
+    pending: Arc<std::sync::Mutex<ClaudePending>>,
+    broadcast_id: Arc<std::sync::Mutex<String>>,
+}
+
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
     configuration: ClaudeConfiguration,
-    /// stdin of the Node sidecar (write `create`/`send`/`shutdown` requests).
-    stdin: ChildStdin,
+    /// Per-runtime stdin writer; await only after dropping the sessions map lock.
+    stdin: crate::claude_sidecar_io::SidecarWriter,
     /// The owned Node sidecar child (SIGKILL backstop; `kill_on_drop`).
     child: Child,
     /// G31: owns the sidecar's whole process tree (node AND the SDK-spawned
@@ -4356,8 +4364,8 @@ impl FreshClaudeState {
             crate::claude_turns::SendKind::Turn,
         );
         self.publish_claude_status(&ledger, &stamp, session_type, false);
-        let mut guard = self.sessions.lock().await;
-        let Some(session) = guard.get_mut(&map_key) else {
+        let guard = self.sessions.lock().await;
+        let Some(session) = guard.get(&map_key) else {
             drop(guard);
             self.take_back_unwritten_send(&ledger, &stamp, session_type, &submitted_turn_id);
             return self.refuse_send_to_missing_session(&request_id, &session_id, msg.session_type);
@@ -4370,20 +4378,20 @@ impl FreshClaudeState {
             "uuid": submitted_turn_id,
             "text": msg.text,
         });
+        let writer = session.stdin.clone();
+        drop(guard);
         if let Some(attempt) = checkpoint_attempt_for_send(&msg) {
             send_req["checkpointAttempt"] = attempt;
         }
         if let Some(images) = msg.images {
             send_req["images"] = json!(images);
         }
-        if let Err(err) = write_line(&mut session.stdin, &send_req).await {
-            drop(guard);
+        if let Err(err) = writer.write(&send_req).await {
             // The write never went out: take back exactly this send (whatever
             // else is owed stays).
             self.take_back_unwritten_send(&ledger, &stamp, session_type, &submitted_turn_id);
             return self.refuse_send(&request_id, "CLAUDE_SEND_FAILED", &err);
         }
-        drop(guard);
         drop(ownership_guard);
 
         // Unified agent names (Task 4): the shared accepted-input callback —
@@ -4482,7 +4490,7 @@ impl FreshClaudeState {
         session_type: &str,
     ) -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4().to_string();
-        let (response, next) = {
+        let (response, next, writer, frame) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(map_key)
@@ -4522,12 +4530,21 @@ impl FreshClaudeState {
                     "permissionMode": next.permission_mode, "cwd": next.cwd,
                 },
             });
-            if let Err(err) = write_line(&mut session.stdin, &frame).await {
-                session.configuration.pending = None;
-                return Err(err);
-            }
-            (rx, next)
+            (rx, next, session.stdin.clone(), frame)
         };
+        if let Err(err) = writer.write(&frame).await {
+            if let Some(session) = self.sessions.lock().await.get_mut(map_key) {
+                if session
+                    .configuration
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &request_id)
+                {
+                    session.configuration.pending = None;
+                }
+            }
+            return Err(err);
+        }
         let applied = match tokio::time::timeout(SIDECAR_CREATE_BUDGET, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
@@ -4677,27 +4694,30 @@ impl FreshClaudeState {
 
     /// The shared Task 2 handler prologue: resolve the client-addressed id to the
     /// sessions-map key (`resolve_session_key` discipline — map key OR durable UUID via
-    /// `cli_index`) and take a session-scoped guard for the sidecar write. A miss at
+    /// `cli_index`) and clone session handles for the sidecar write. A miss at
     /// either step broadcasts the nested `INVALID_SESSION_ID` lost-session envelope
     /// (engaging the client's recovery) and yields `None`.
-    async fn respond_session_guard(
+    async fn response_session(
         &self,
         session_id: &str,
         session_type: SessionType,
-    ) -> Option<tokio::sync::MappedMutexGuard<'_, ClaudeSession>> {
+    ) -> Option<ResponseSession> {
         let Some(map_key) = self.resolve_session_key(session_id).await else {
             self.broadcast(&lost_session_frame(session_id, session_type));
             return None;
         };
         let guard = self.sessions.lock().await;
-        if !guard.contains_key(&map_key) {
+        let Some(session) = guard.get(&map_key) else {
             drop(guard);
             self.broadcast(&lost_session_frame(session_id, session_type));
             return None;
-        }
-        Some(tokio::sync::MutexGuard::map(guard, |map| {
-            map.get_mut(&map_key).expect("key checked above")
-        }))
+        };
+        Some(ResponseSession {
+            stdin: session.stdin.clone(),
+            sidecar_session_id: session.sidecar_session_id.clone(),
+            pending: session.pending.clone(),
+            broadcast_id: session.broadcast_id.clone(),
+        })
     }
 
     /// Handle a `freshAgent.approval.respond` for claude/kilroy: forward a
@@ -4717,8 +4737,8 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = request_id_string(&msg.request_id);
 
-        let Some(mut session) = self
-            .respond_session_guard(&session_id, msg.session_type)
+        let Some(session) = self
+            .response_session(&session_id, msg.session_type)
             .await
         else {
             return;
@@ -4792,7 +4812,7 @@ impl FreshClaudeState {
             "requestId": request_id,
             "decision": msg.decision,
         });
-        if let Err(err) = write_line(&mut session.stdin, &respond_req).await {
+        if let Err(err) = session.stdin.write(&respond_req).await {
             drop(session);
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
             return;
@@ -4822,8 +4842,8 @@ impl FreshClaudeState {
         let session_type = session_type_str(msg.session_type);
         let request_id = request_id_string(&msg.request_id);
 
-        let Some(mut session) = self
-            .respond_session_guard(&session_id, msg.session_type)
+        let Some(session) = self
+            .response_session(&session_id, msg.session_type)
             .await
         else {
             return;
@@ -4856,7 +4876,7 @@ impl FreshClaudeState {
             "requestId": request_id,
             "answers": Value::Object(answers),
         });
-        if let Err(err) = write_line(&mut session.stdin, &respond_req).await {
+        if let Err(err) = session.stdin.write(&respond_req).await {
             drop(session);
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
             return;
@@ -4935,8 +4955,8 @@ impl FreshClaudeState {
             crate::claude_turns::SendKind::Compact,
         );
         self.publish_claude_status(&ledger, &stamp, session_type, false);
-        let mut guard = self.sessions.lock().await;
-        let Some(session) = guard.get_mut(&map_key) else {
+        let guard = self.sessions.lock().await;
+        let Some(session) = guard.get(&map_key) else {
             drop(guard);
             self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
             self.broadcast(&lost_session_frame(&session_id, msg.session_type));
@@ -4957,8 +4977,9 @@ impl FreshClaudeState {
             "uuid": uuid,
             "text": text,
         });
-        if let Err(err) = write_line(&mut session.stdin, &send_req).await {
-            drop(guard);
+        let writer = session.stdin.clone();
+        drop(guard);
+        if let Err(err) = writer.write(&send_req).await {
             // The write never went out: take back exactly this compact.
             self.take_back_unwritten_send(&ledger, &stamp, session_type, &uuid);
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
@@ -8050,7 +8071,7 @@ async fn teardown_removed_session_within(
 /// tree (G31), and the ownership tag the `/proc` reaper finds that tree by.
 struct SidecarProcesses {
     child: Child,
-    stdin: ChildStdin,
+    stdin: crate::claude_sidecar_io::SidecarWriter,
     tree_guard: crate::claude_spawn::SidecarTreeGuard,
     ownership_id: String,
 }
@@ -8081,9 +8102,13 @@ impl SidecarProcesses {
         confirm_rounds: u8,
         grace: Duration,
     ) -> (crate::claude_spawn::SidecarExit, TeardownConfirmation) {
-        let exit =
-            crate::claude_spawn::graceful_then_kill(self.child, self.stdin, self.tree_guard, grace)
-                .await;
+        let exit = crate::claude_spawn::graceful_then_kill_with_writer(
+            self.child,
+            self.stdin,
+            self.tree_guard,
+            grace,
+        )
+        .await;
         reap_owned_claude_sidecars(&self.ownership_id);
         #[cfg(target_os = "linux")]
         let confirmation = {
@@ -8169,6 +8194,7 @@ mod fork;
 mod genesis;
 mod history;
 mod rollback;
+mod sidecar_writer;
 mod stop;
 mod turn_status;
 use establish::{
@@ -8278,7 +8304,7 @@ pub(crate) mod tests {
             session_id.to_string(),
             ClaudeSession {
                 configuration: ClaudeConfiguration::default(),
-                stdin,
+                stdin: stdin.into(),
                 child,
                 tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-{session_id}"),
@@ -17121,7 +17147,7 @@ rl.on('line', (line) => {
             session_id.to_string(),
             ClaudeSession {
                 configuration: ClaudeConfiguration::default(),
-                stdin,
+                stdin: stdin.into(),
                 child,
                 tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-{session_id}"),
@@ -19299,7 +19325,7 @@ rl.on('line', (line) => {
             map_key.to_string(),
             ClaudeSession {
                 configuration: ClaudeConfiguration::default(),
-                stdin,
+                stdin: stdin.into(),
                 child,
                 tree_guard: crate::claude_spawn::SidecarTreeGuard::unguarded(),
                 ownership_id: format!("test-{map_key}"),
@@ -19388,9 +19414,7 @@ rl.on('line', (line) => {
         let session = guard.get_mut(map_key).expect("tracked session");
         let frame =
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": text });
-        write_line(&mut session.stdin, &frame)
-            .await
-            .expect("raw stdin write");
+        session.stdin.write(&frame).await.expect("raw stdin write");
     }
 
     /// Mark a fixture session mid-turn: a send the CLI started, armed in the

@@ -100,7 +100,7 @@ async fn fake_session(
     });
     let session = ClaudeSession {
         configuration: ClaudeConfiguration::default(),
-        stdin,
+        stdin: stdin.into(),
         child,
         tree_guard,
         ownership_id: format!("test-teardown-{session_id}"),
