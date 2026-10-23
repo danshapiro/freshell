@@ -3449,7 +3449,7 @@ impl FreshCodexState {
             ) {
                 crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
                 crate::ownership_lane::LaneOpGuard::Unwired => None,
-                crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                crate::ownership_lane::LaneOpGuard::Refused { message, .. } => {
                     tracing::warn!(target: "freshell_freshagent::codex",
                         session_id = %session_id, request_id = ?request_id,
                         "fresh_agent_send_refused: ownership guard refused");
