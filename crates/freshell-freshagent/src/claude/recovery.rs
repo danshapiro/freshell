@@ -95,10 +95,7 @@ impl FreshClaudeState {
             crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
             crate::ownership_lane::LaneClaim::Unwired => None,
             crate::ownership_lane::LaneClaim::Adopt => {
-                return if self
-                    .try_rebind_to_live(durable, session_type_str(msg.session_type))
-                    .await
-                {
+                return if self.resolve_session_key(durable).await.is_some() {
                     Ok(())
                 } else {
                     Err(RuntimeResumeError::reserved(None))
@@ -121,9 +118,7 @@ impl FreshClaudeState {
             LaunchLease::Acquired(lease) => Some(lease),
             refused => {
                 return if matches!(refused, LaunchLease::BoundLive { .. })
-                    && self
-                        .try_rebind_to_live(durable, session_type_str(msg.session_type))
-                        .await
+                    && self.resolve_session_key(durable).await.is_some()
                 {
                     Ok(())
                 } else {
