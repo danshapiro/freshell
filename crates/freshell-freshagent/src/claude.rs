@@ -10703,6 +10703,9 @@ fn log_claude_teardown(
 #[cfg(test)]
 mod teardown_tests;
 
+#[cfg(test)]
+mod end_of_output_tests;
+
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
     let now = SystemTime::now()
