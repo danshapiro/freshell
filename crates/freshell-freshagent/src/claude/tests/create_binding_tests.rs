@@ -61,6 +61,15 @@ async fn create_binding_and_name_are_durable_before_live_and_created() {
         }
     );
     assert!(state.naming_handles.lock().await.get(&id).is_none());
+    let mut replay = dedup_create_msg("create-bound-before-live");
+    replay.naming_handle = Some("pre-create-name".into());
+    state.handle_create(replay, None).await;
+    let replayed = await_claude_created(&mut rx, "create-bound-before-live").await;
+    assert_eq!(
+        replayed["nameRef"], created["nameRef"],
+        "a replay adopts the durable name identity"
+    );
+    assert_eq!(replayed["sessionName"], created["sessionName"]);
     assert!(identity
         .geneses
         .lock()

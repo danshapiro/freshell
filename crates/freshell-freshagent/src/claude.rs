@@ -1891,6 +1891,15 @@ impl FreshClaudeState {
         freshell_protocol::session_names::SessionNameRef,
         freshell_protocol::session_names::SessionNameRecord,
     )> {
+        if let Some(projection) = crate::naming::session_projection(
+            &self.naming(),
+            freshell_protocol::session_names::NamedProvider::Claude,
+            session_id,
+        )
+        .await
+        {
+            return Some(projection);
+        }
         let handle = self.naming_handles.lock().await.get(session_id).cloned()?;
         let sink = self.naming();
         let target = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
