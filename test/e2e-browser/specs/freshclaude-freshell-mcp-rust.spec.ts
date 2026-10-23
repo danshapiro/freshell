@@ -88,10 +88,10 @@ test.describe('freshclaude Freshell MCP (production sidecar over the CLI simulat
         await api(lane, 'POST', '/api/tabs', { name: PROBE_TAB, mode: 'shell' })
 
         const turn = await reply(lane, pane)
-        // The real server's own tabs, read through the MCP server with the
-        // endpoint and token the server gave the sidecar.
+        // The real server's own tab list (GET /api/tabs), read through the MCP
+        // server with the endpoint and token the server gave the sidecar.
+        await expect(turn).toContainText('"status": "ok"')
         await expect(turn).toContainText(PROBE_TAB)
-        await expect(turn).toContainText(pane.tabId)
         await expect(turn).not.toContainText('No such tool')
 
         // The CLI got the recipe the server resolved, never with the token in it.
