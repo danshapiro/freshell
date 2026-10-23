@@ -195,16 +195,21 @@ describe('fresh-agent reconnect attention', () => {
       sessionRef: { provider: 'claude', sessionId: durableId },
     })
     const mark = (sessionId: string) => ({
-      provider: 'claude', sessionId, sessionType: 'freshclaude', lastWaitingAt: 200,
+      provider: 'claude', sessionId, sessionType: 'freshclaude', lastTurnCompleteAt: 200,
     })
 
-    dispatch(observeFreshAgentSession({ provider: 'claude', sessionId: durableId }))
-    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:runtime-id']).toBe(0)
+    dispatch(advanceCompletionBaseline({ terminalId: `claude:${durableId}`, at: 0 }))
+    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:durable-id']).toBe(0)
+    expect(store.getState().turnCompletion.lastAtByTerminalId['claude:runtime-id']).toBeUndefined()
     dispatch(foldReadyFreshAgentAttention([mark(runtimeId)]))
     expect(store.getState().turnCompletion.seq).toBe(1)
+    expect(store.getState().turnCompletion.pendingEvents).toMatchObject([
+      { terminalId: 'claude:runtime-id', at: 200 },
+    ])
 
     dispatch(foldReadyFreshAgentAttention([mark(durableId)]))
     expect(store.getState().turnCompletion.seq).toBe(1)
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(1)
   })
 
   it('keeps equal-time completions independent across different pane identities', () => {
