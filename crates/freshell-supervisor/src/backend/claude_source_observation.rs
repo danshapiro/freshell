@@ -732,7 +732,12 @@ impl DockerEngineBackend {
             json!({"Name":scratch.name,"Driver":"local","Labels":scratch.labels,"DriverOpts":{}});
         let created = scratch
             .create
-            .send(self, format!("{DOCKER_API}/volumes/create"), body)
+            .send(
+                self,
+                &scratch.name,
+                format!("{DOCKER_API}/volumes/create"),
+                body,
+            )
             .await
             .map_err(|_| {
                 HelperFailure::unanswered(

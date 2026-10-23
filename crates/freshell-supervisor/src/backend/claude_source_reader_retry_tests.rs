@@ -393,6 +393,10 @@ async fn claude_source_reader_retries_a_create_the_daemon_refused_transiently() 
         json!(request.observation_request.request_id)
     );
     assert_eq!(named(&events, "supervisor.helper.recovered").len(), 1);
+    assert!(
+        named(&events, "supervisor.helper.create_slow").is_empty(),
+        "prompt creates are not reported as slow"
+    );
 }
 
 #[tokio::test]
@@ -599,4 +603,42 @@ async fn claude_source_reader_stays_inside_its_total_budget_and_reaps_what_outli
     let exhausted = named(&events, "supervisor.helper.retry_exhausted");
     assert_eq!(exhausted.len(), 1, "{events:?}");
     assert_eq!(exhausted[0]["data"]["cause"], "timed_out");
+}
+
+#[tokio::test]
+async fn a_helper_create_docker_answers_slowly_is_logged_with_its_latency() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon_id = DockerDaemonId::new();
+    let (owner, request) = initial_request(temp.path(), &daemon_id).await;
+    let mut daemon = ReaderDaemon::start(
+        &temp.path().join("docker.sock"),
+        daemon_id,
+        vec![Create::Late(Duration::from_millis(5_300))],
+        0,
+    );
+    let log = temp.path().join("lifecycle.jsonl");
+    let backend =
+        DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
+    let result = backend
+        .read_claude_source_helper(
+            &owner,
+            &request,
+            "synthetic-run",
+            HelperDeadlines::after(Duration::from_secs(10), Duration::from_secs(1)),
+        )
+        .await;
+    let creates = daemon.creates();
+    daemon.finish().await;
+    assert!(
+        result.is_ok(),
+        "a slow create inside the budget still reads: {result:?}"
+    );
+    let events = lifecycle_events(&log);
+    let slow = named(&events, "supervisor.helper.create_slow");
+    assert_eq!(slow.len(), 1, "{events:?}");
+    let slow = &slow[0]["data"];
+    assert_eq!(slow["severity"], "warn");
+    assert_eq!(slow["name"], json!(creates[0]));
+    assert_eq!(slow["status"], 201);
+    assert!(slow["elapsedMs"].as_u64().unwrap() >= 5_000, "{slow}");
 }

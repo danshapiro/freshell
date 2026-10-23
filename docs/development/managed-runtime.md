@@ -208,8 +208,9 @@ created just before them is slow.
   waits for Docker's answer before it removes the helper by exact name. A
   create Docker answers only after the caller's window has passed goes to a
   background reaper that removes the helper (and, for a candidate read, the
-  scratch volume after it). Lifecycle events:
-  `supervisor.helper.late_create.deferred` (warn),
+  scratch volume after it). A create Docker answers after 5s or more is
+  logged as `supervisor.helper.create_slow` (warn) with its latency. Lifecycle
+  events: `supervisor.helper.late_create.deferred` (warn),
   `supervisor.helper.late_create.removed` (info) or
   `supervisor.helper.late_create.unconfirmed` (error).
 - The Claude source reader retries a run whose create or start timed out, or

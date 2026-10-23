@@ -34,6 +34,10 @@ pub(super) const HELPER_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 /// caller gave up, before it reports the helper's absence as unconfirmed.
 const LATE_CREATE_LIMIT: Duration = Duration::from_secs(600);
 
+/// A helper create Docker answers after this long is logged with its
+/// latency: a healthy create answers in well under a second.
+const SLOW_CREATE: Duration = Duration::from_secs(5);
+
 /// When one helper attempt's work and its cleanup wait end.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HelperDeadlines {
@@ -147,17 +151,31 @@ enum Settled {
 pub(super) struct InFlightCreate(Option<JoinHandle<CreateAnswer>>);
 
 impl InFlightCreate {
+    /// Send the create of the object called `name`. A slow answer is logged
+    /// with its latency when it arrives, whether or not anyone still waits.
     pub(super) async fn send(
         &mut self,
         backend: &DockerEngineBackend,
+        name: &str,
         path: String,
         body: Value,
     ) -> CreateAnswer {
         let backend = backend.clone();
+        let name = name.to_owned();
         let request = self.0.insert(tokio::spawn(async move {
-            backend
+            let sent = Instant::now();
+            let answer = backend
                 .request_bounded("POST", &path, Some(&body), 64 * 1024)
-                .await
+                .await;
+            let elapsed = sent.elapsed();
+            if elapsed >= SLOW_CREATE {
+                backend.helper_event(
+                    "supervisor.helper.create_slow",
+                    json!({"severity":"warn","name":name,"elapsedMs":millis(elapsed),
+                        "status":answer.as_ref().ok().map(|response| response.status)}),
+                );
+            }
+            answer
         }));
         let answer = joined(request.await);
         self.0 = None;
@@ -259,7 +277,10 @@ impl HelperContainer {
     pub(super) async fn create(&mut self, backend: &DockerEngineBackend) -> CreateAnswer {
         self.attempted = true;
         let path = format!("{DOCKER_API}/containers/create?name={}", self.name);
-        let answer = self.create.send(backend, path, self.expected.clone()).await;
+        let answer = self
+            .create
+            .send(backend, &self.name, path, self.expected.clone())
+            .await;
         if matches!(&answer, Ok(response) if response.status == 409) {
             self.attempted = false;
         }
