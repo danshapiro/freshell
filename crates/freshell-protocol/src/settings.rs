@@ -151,3 +151,13 @@ pub struct ServerSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_cwd: Option<String>,
 }
+
+impl ServerSettings {
+    /// Whether coding agents get the Freshell MCP server
+    /// (`settings.codingCli.mcpServer`, the Settings page's "Agent MCP server").
+    /// The one gate every lane reads: freshclaude/kilroy sidecars today, the
+    /// terminal CLIs next (GitHub #446).
+    pub fn agent_mcp_server_enabled(&self) -> bool {
+        self.coding_cli.mcp_server
+    }
+}

@@ -23,6 +23,7 @@ mod auto_title;
 mod auto_title_sweep;
 mod boot;
 mod checkpoints;
+mod claude_freshell_mcp;
 mod diag;
 mod existence;
 mod existence_by_id;
@@ -1058,6 +1059,22 @@ async fn main() -> ExitCode {
     fresh_claude_state
         .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
         .expect("Claude checkpoint event persister is installed once");
+    // G19: freshclaude/kilroy panes get the Freshell MCP server the way
+    // terminal panes do. Every sidecar's CLI reaches THIS server (its own port
+    // and token, never values inherited from the environment it was started
+    // in), and the recipe is resolved at each launch from the live
+    // `codingCli.mcpServer` setting, so the toggle needs no restart.
+    fresh_claude_state.set_freshell_endpoint(
+        freshell_freshagent::claude_freshell_mcp::FreshellEndpoint::local(
+            port,
+            auth_token.as_str(),
+        ),
+    );
+    fresh_claude_state.set_freshell_mcp_provider(claude_freshell_mcp::claude_mcp_provider(
+        settings_store.shared_settings_lock(),
+        Arc::new(freshell_platform::mcp_inject::RealMcpRuntime),
+        claude_freshell_mcp::host_native_target(),
+    ));
 
     // Task 12 (D8 for fresh agents): the ONE server-wide per-sessionRef create/resume
     // lease map, shared by every fresh-agent runtime (keys are provider-namespaced).
