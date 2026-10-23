@@ -193,7 +193,6 @@ function startAbsorbed(cli, turn) {
     cli.emit({ type: 'user', message: { role: 'user', content: cmd.content }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), isReplay: true })
     if (cmd.uuid) cli.emit({ type: 'command_lifecycle', command_uuid: cmd.uuid, state: 'started' })
     cli.recordPrompt(cmd)
-    cli.transcript.append({ type: 'user', uuid, message: { role: 'user', content: cmd.content }, promptSource: 'sdk', permissionMode: cli.permissionMode })
     turn.absorbedTexts.push(cmd.text)
   }
 }

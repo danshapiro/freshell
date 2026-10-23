@@ -80,6 +80,7 @@ import { toolCall } from './tools.mjs'
 import {
   claudeConfigDir,
   CLI_VERSION,
+  dropsTurnRefusal,
   findTranscript,
   forkPrefix,
   readTranscriptLines,
@@ -411,11 +412,8 @@ class SimulatedCli {
       try { prefix = forkPrefix(parentLines, resumeSessionAt) } catch (error) { return { message: error.message } }
       if (resumeDropsTurn) {
         const discarded = parentLines.slice(prefix.length).filter((line) => typeof line.uuid === 'string')
-        const first = discarded[0]
-        if (!first || first.type !== 'user' || first.uuid !== resumeDropsTurn) {
-          const shown = first ? ` [type=${first.type}, uuid=${first.uuid}]` : ''
-          return { message: `Resume rejected by --resume-drops-turn: resuming at ${resumeSessionAt} would discard entries not attributable to turn ${resumeDropsTurn}: range does not start with the declared turn prompt; first discarded entry 0${shown}` }
-        }
+        const reason = dropsTurnRefusal(discarded, resumeDropsTurn)
+        if (reason) return { message: `Resume rejected by --resume-drops-turn: resuming at ${resumeSessionAt} would discard entries not attributable to turn ${resumeDropsTurn}: ${reason}` }
       }
       this.transcript = forkSession
         ? new Transcript({ configDir: this.configDir, cwd: this.cwd, sessionId: this.sessionId, flushMs: (ms) => this.ms(ms), prefix })
@@ -705,6 +703,13 @@ class SimulatedCli {
     const block = { tool_use_id: toolUseId, type: 'tool_result', content, ...(isError ? { is_error: true } : { is_error: false }) }
     this.emit({ type: 'user', message: { role: 'user', content: [block] }, parent_tool_use_id: null, uuid, timestamp: new Date().toISOString(), tool_use_result: toolUseResult, ...extra })
     this.transcript.append({ type: 'user', uuid, message: { role: 'user', content: [block] }, toolUseResult })
+    // Sends absorbed while the tool ran join the turn as queued_command
+    // attachments, never as prompts of their own (T10).
+    for (const cmd of this.turn?.absorbed ?? []) {
+      if (cmd.started || cmd.recorded) continue
+      cmd.recorded = true
+      this.transcript.append({ type: 'attachment', attachment: { type: 'queued_command', prompt: cmd.content, ...(cmd.uuid ? { source_uuid: cmd.uuid } : {}), commandMode: 'prompt', timestamp: new Date().toISOString() } })
+    }
     this.transcript.append({ type: 'attachment', attachment: { type: 'total_tokens_reminder', text: '<total_tokens>15000000 tokens left</total_tokens>' } })
   }
 
