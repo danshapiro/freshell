@@ -1974,8 +1974,9 @@ async fn handle_client_text(
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
+                    let reply = conn_sink.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_attach(attach).await }
+                        async move { fresh_claude.handle_attach(attach, reply).await }
                             .instrument(tracing::Span::current()),
                     );
                 }
