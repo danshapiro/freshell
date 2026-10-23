@@ -76,12 +76,14 @@ impl HelperDeadlines {
     /// A stand-alone attempt: `budget` of work, then up to `settle_after` for
     /// a create Docker has not answered yet.
     pub(super) fn after(budget: Duration, settle_after: Duration) -> Self {
-        let operation = Instant::now() + budget;
+        let started = Instant::now();
+        let operation = started + budget;
         Self {
             operation,
             settle: operation + settle_after,
             cleanup: HELPER_CLEANUP_BUDGET,
-            reserved: operation,
+            // Nothing beyond the cleanup window itself.
+            reserved: started,
         }
     }
 

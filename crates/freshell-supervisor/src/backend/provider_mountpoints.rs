@@ -476,8 +476,32 @@ mod tests {
         ProviderConfigBind, ProviderResourceKind, ProviderResourceMount,
     };
 
-    #[tokio::test]
+    /// Holds the paused test clock still while real socket I/O runs: tokio
+    /// never auto-advances a paused clock while a blocking task is running.
+    /// A budget then expires only when the test advances the clock at the
+    /// exact stall it exercises, however loaded the machine is. The real-time
+    /// limit matters only if the code under test wedges: the hold ends, the
+    /// clock auto-advances, and the test's own bounds fail it instead of
+    /// letting it hang.
+    struct FrozenClock {
+        _release_on_drop: std::sync::mpsc::Sender<()>,
+    }
+
+    impl FrozenClock {
+        fn hold() -> Self {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            drop(tokio::task::spawn_blocking(move || {
+                let _ = held.recv_timeout(std::time::Duration::from_secs(60));
+            }));
+            Self {
+                _release_on_drop: release,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn provider_mountpoint_candidate_target_joins_owned_preparation_and_cleanup() {
+        use std::collections::BTreeSet;
         use std::sync::{Arc, Mutex};
         use tokio::task::JoinSet;
         for mode in [
@@ -490,9 +514,8 @@ mod tests {
             "timeout",
             "cancel-private-exchange",
             "slow-image",
-            "late-create",
-            "slow-cleanup",
         ] {
+            let _clock = FrozenClock::hold();
             let owned = tempfile::tempdir().unwrap();
             let home = owned.path().join("scratch-home");
             std::fs::create_dir(&home).unwrap();
@@ -517,18 +540,15 @@ mod tests {
             let expected = Arc::new(Mutex::new(None::<Value>));
             let requests = Arc::new(Mutex::new(Vec::<String>::new()));
             let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            // The helper reached its private exchange (the cancel point).
-            let exchange_reached = Arc::new(tokio::sync::Notify::new());
-            // The cleanup inspection that answers late has happened.
-            let slowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (body, seen, deleted, fixture_home, fixture_daemon, reached, fixture_slowed) = (
+            // The fixture reports where it parks the operation, so the test
+            // expires a budget exactly at the stall the mode exercises.
+            let (stalls, mut stalled) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+            let (body, seen, deleted, fixture_home, fixture_daemon) = (
                 expected.clone(),
                 requests.clone(),
                 removed.clone(),
                 home.clone(),
                 daemon.clone(),
-                exchange_reached.clone(),
-                slowed.clone(),
             );
             let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
             let server = tokio::spawn(async move {
@@ -539,26 +559,19 @@ mod tests {
                         _=&mut stopped=>break,
                         accepted=listener.accept()=>{
                             let (mut stream,_)=accepted.unwrap();
-                            let (body,seen,deleted,home,daemon,private_jobs,reached,slowed)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone(),reached.clone(),fixture_slowed.clone());
+                            let (body,seen,deleted,home,daemon,private_jobs,stalls)=(body.clone(),seen.clone(),deleted.clone(),fixture_home.clone(),fixture_daemon.clone(),private_jobs.clone(),stalls.clone());
                             jobs.spawn(async move {
                                 let mut header=Vec::new(); let mut byte=[0];
-                                // A caller may abandon a request it no longer waits for.
-                                while !header.ends_with(b"\r\n\r\n") {if stream.read_exact(&mut byte).await.is_err() {return;}header.push(byte[0]);assert!(header.len()<=32*1024);}
+                                while !header.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).await.unwrap();header.push(byte[0]);assert!(header.len()<=32*1024);}
                                 let header=String::from_utf8(header).unwrap();
                                 let line=header.lines().next().unwrap().to_string();
                                 let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
                                 assert!(length<=1024*1024);let mut raw=vec![0;length];stream.read_exact(&mut raw).await.unwrap();
                                 seen.lock().unwrap().push(line.clone());
-                                let (status,value)=if line.contains("/images/") {if mode=="slow-image" {tokio::time::sleep(Duration::from_secs(10)).await;} (200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_UNUSED_IMAGE_CREDENTIAL"]}}))}
+                                let (status,value)=if line.contains("/images/") {if mode=="slow-image" {stalls.send("image-withheld").unwrap();std::future::pending::<()>().await;} (200,json!({"Config":{"Env":["PATH=/usr/bin","ANTHROPIC_API_KEY=PRIVATE_UNUSED_IMAGE_CREDENTIAL"]}}))}
                                 else if line.contains("/info ") {(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
-                                else if line.contains("/containers/create?") {
-                                    // A stalled daemon makes the helper only after its caller's window.
-                                    if mode=="late-create" {tokio::time::sleep(Duration::from_millis(900)).await;}
-                                    *body.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(if mode=="lost-create-ack" {503} else {201},json!({"Id":"c".repeat(64)}))}
+                                else if line.contains("/containers/create?") { *body.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(if mode=="lost-create-ack" {503} else {201},json!({"Id":"c".repeat(64)}))}
                                 else if line.starts_with("GET") && line.contains("/containers/") {
-                                    // Cleanup's first inspection, by name, answers only after the
-                                    // cleanup window: the helper is still there and still ours.
-                                    if mode=="slow-cleanup" && line.contains("/containers/freshell-mountpoints-") && !slowed.swap(true,std::sync::atomic::Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(5_500)).await;}
                                     if deleted.load(std::sync::atomic::Ordering::SeqCst) && mode!="cleanup-still-present" {(404,json!({}))}
                                     else {
                                         let mut expected=body.lock().unwrap().as_ref().unwrap().clone();
@@ -569,10 +582,10 @@ mod tests {
                                 else if line.contains("/start ") {
                                     let expected=body.lock().unwrap().as_ref().unwrap().clone();
                                     let exchange=expected["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|mount|mount["Target"]=="/run/freshell-input-exchange").unwrap()["Source"].as_str().unwrap().to_owned();
+                                    let stalls=stalls.clone();
                                     private_jobs.lock().unwrap().push(tokio::spawn(async move {
                                         let mut channel=UnixStream::connect(Path::new(&exchange).join("reply.sock")).await.unwrap();
-                                        if mode=="cancel-private-exchange" {reached.notify_one();}
-                                        if matches!(mode,"timeout"|"cancel-private-exchange") {tokio::time::sleep(Duration::from_secs(10)).await;return;}
+                                        if matches!(mode,"timeout"|"cancel-private-exchange") {stalls.send("exchange-withheld").unwrap();std::future::pending::<()>().await;}
                                         let length=channel.read_u32().await.unwrap() as usize; assert!(length<=1024*1024);
                                         let mut raw=vec![0;length];channel.read_exact(&mut raw).await.unwrap();
                                         let selected:Vec<Mountpoint>=serde_json::from_slice(&raw).unwrap();
@@ -590,6 +603,7 @@ mod tests {
                                 else {(500,json!({}))};
                                 let raw=value.to_string();let response=format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",raw.len());
                                 let _=stream.write_all(response.as_bytes()).await;
+                                if line.contains("/wait?") {stalls.send("wait-answered").unwrap();}
                             });
                         },
                         result=jobs.join_next(),if !jobs.is_empty()=>{result.unwrap().unwrap();}
@@ -606,69 +620,42 @@ mod tests {
             });
             let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
             let mut helper = None;
-            let target = MountpointHelperTarget {
-                image: "synthetic-image",
-                volume: "owned-candidate-volume",
-                binary: &binary,
-                daemon: &daemon,
-                labels: json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"}),
-            };
-            if matches!(mode, "late-create" | "slow-cleanup") {
-                // A launch hands whatever its helper run still owns, a create
-                // Docker had not answered or a removal it could not confirm,
-                // to the background reaper.
-                let result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    backend.run_launch_mountpoint_helper(
-                        target,
-                        selected,
-                        HelperDeadlines::after(
-                            Duration::from_millis(250),
-                            Duration::from_millis(250),
-                        ),
-                    ),
-                )
-                .await
-                .expect("the launch's helper window is bounded");
-                if mode == "late-create" {
-                    assert!(result.is_err(), "{result:?}");
-                } else {
-                    assert!(
-                        format!("{result:?}").contains("cleanup timed out"),
-                        "an unconfirmed removal stays a failure: {result:?}"
-                    );
-                }
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-                while !removed.load(std::sync::atomic::Ordering::SeqCst)
-                    && tokio::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                let _ = stop.send(());
-                tokio::time::timeout(Duration::from_secs(2), server)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(
-                    removed.load(std::sync::atomic::Ordering::SeqCst),
-                    "{mode}: the helper the launch still owned is removed"
-                );
-                continue;
-            }
-            // The cancel mode drops the helper once it reaches its private
-            // exchange; every other mode runs it to completion.
             let step = AttemptStep::new();
-            let outcome = tokio::time::timeout(Duration::from_secs(3), async {
-                tokio::select! {
-                    result = backend.run_provider_mountpoint_helper(
-                target,selected,HelperDeadlines::after(Duration::from_millis(250),Duration::from_millis(250)),&step,&mut helper
-            ) => Some(result),
-                    _ = exchange_reached.notified(), if mode == "cancel-private-exchange" => None,
+            let budget = Duration::from_millis(250);
+            let caller_bound = if mode == "cancel-private-exchange" {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(3)
+            };
+            // Only the stalled modes move the clock, and only once every
+            // request before the stall has been answered: the private
+            // exchange (with the helper's exit already reported) or the image
+            // lookup is the one thing still pending when its bound expires.
+            let mut stall: BTreeSet<&str> = match mode {
+                "timeout" | "cancel-private-exchange" => {
+                    BTreeSet::from(["exchange-withheld", "wait-answered"])
                 }
-            })
-            .await;
+                "slow-image" => BTreeSet::from(["image-withheld"]),
+                _ => BTreeSet::new(),
+            };
+            let expire_at_stall = async {
+                if stall.is_empty() {
+                    return std::future::pending().await;
+                }
+                while !stall.is_empty() {
+                    stall.remove(stalled.recv().await.expect("fixture reports its stall"));
+                }
+                tokio::time::advance(caller_bound.min(budget)).await;
+                std::future::pending().await
+            };
+            let outcome = tokio::select! {
+                outcome = tokio::time::timeout(caller_bound,backend.run_provider_mountpoint_helper(
+                    MountpointHelperTarget {image:"synthetic-image",volume:"owned-candidate-volume",binary:&binary,daemon:&daemon,labels:json!({"com.freshell.soul-id":"synthetic-owner","com.freshell.source-request-id":"synthetic-request"})},selected,HelperDeadlines::after(budget,budget),&step,&mut helper
+                )) => outcome,
+                () = expire_at_stall => unreachable!("the stall clock never completes"),
+            };
             if mode == "cancel-private-exchange" {
-                assert!(matches!(outcome, Ok(None)), "dropped at the exchange");
+                assert!(outcome.is_err());
                 let owned = helper
                     .as_ref()
                     .expect("canceled private exchange must retain exact helper ownership");
@@ -692,8 +679,7 @@ mod tests {
                 continue;
             }
             let result = outcome
-                .expect("preparation and cleanup must both be bounded, including image lookup")
-                .expect("runs to completion");
+                .expect("preparation and cleanup must both be bounded, including image lookup");
             assert_eq!(
                 result.is_ok(),
                 matches!(mode, "prepared" | "empty"),
@@ -754,6 +740,130 @@ mod tests {
                 "owned-candidate-volume"
             );
             assert!(!body.to_string().contains("PRIVATE_UNUSED_IMAGE_CREDENTIAL"));
+        }
+    }
+
+    /// A launch has no later cleanup of its own: whatever its helper run
+    /// still owns when it returns (a create Docker had not answered, or a
+    /// removal it could not confirm) goes to the background reaper. Real time,
+    /// because the reaper's removal is real socket I/O after the run returns.
+    #[tokio::test]
+    async fn launch_mountpoint_helper_hands_what_it_still_owns_to_the_reaper() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::task::JoinSet;
+        for mode in ["late-create", "slow-cleanup"] {
+            let owned = tempfile::tempdir().unwrap();
+            let daemon = DockerDaemonId::new();
+            let binary = owned.path().join("host");
+            std::fs::write(&binary, b"synthetic helper artifact").unwrap();
+            let listener = UnixListener::bind(owned.path().join("docker.sock")).unwrap();
+            let created = Arc::new(Mutex::new(None::<Value>));
+            let deleted = Arc::new(AtomicBool::new(false));
+            // The cleanup inspection that answers late has happened.
+            let slowed = Arc::new(AtomicBool::new(false));
+            let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+            let (fixture_created, fixture_deleted, fixture_daemon) =
+                (created.clone(), deleted.clone(), daemon.clone());
+            let server = tokio::spawn(async move {
+                let mut jobs = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _=&mut stopped=>break,
+                        accepted=listener.accept()=>{
+                            let (mut stream,_)=accepted.unwrap();
+                            let (created,deleted,slowed,daemon)=(fixture_created.clone(),fixture_deleted.clone(),slowed.clone(),fixture_daemon.clone());
+                            jobs.spawn(async move {
+                                let mut header=Vec::new(); let mut byte=[0];
+                                // A caller may abandon a request it no longer waits for.
+                                while !header.ends_with(b"\r\n\r\n") {if stream.read_exact(&mut byte).await.is_err() {return;}header.push(byte[0]);}
+                                let header=String::from_utf8(header).unwrap();
+                                let line=header.lines().next().unwrap().to_string();
+                                let length=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().trim().parse::<usize>().unwrap();
+                                let mut raw=vec![0;length];if stream.read_exact(&mut raw).await.is_err() {return;}
+                                let (status,value)=if line.contains("/images/") {(200,json!({"Config":{"Env":["PATH=/usr/bin"]}}))}
+                                else if line.contains("/info ") {(200,json!({"ID":daemon,"SecurityOptions":["name=rootless"]}))}
+                                else if line.contains("/containers/create?") {
+                                    // A stalled daemon makes the helper well after the run gave up on it.
+                                    if mode=="late-create" {tokio::time::sleep(Duration::from_secs(9)).await;}
+                                    *created.lock().unwrap()=Some(serde_json::from_slice(&raw).unwrap());(201,json!({"Id":"c".repeat(64)}))}
+                                else if line.starts_with("GET") && line.contains("/containers/") {
+                                    // Cleanup's first inspection, by name, answers after the
+                                    // cleanup window: the helper is still there and still ours.
+                                    if mode=="slow-cleanup" && line.contains("/containers/freshell-mountpoints-") && !slowed.swap(true,Ordering::SeqCst) {tokio::time::sleep(Duration::from_secs(8)).await;}
+                                    let body=created.lock().unwrap().clone();
+                                    match body {Some(body) if !deleted.load(Ordering::SeqCst)=>(200,json!({"Id":"c".repeat(64),"Config":body,"HostConfig":body["HostConfig"],"State":{"Running":false}})),_=>(404,json!({}))}
+                                }
+                                else if line.contains("/start ") {
+                                    let body=created.lock().unwrap().clone().unwrap();
+                                    let exchange=body["HostConfig"]["Mounts"].as_array().unwrap().iter().find(|mount|mount["Target"]=="/run/freshell-input-exchange").unwrap()["Source"].as_str().unwrap().to_owned();
+                                    // The helper answers over its exchange once it is running.
+                                    tokio::spawn(async move {
+                                        let Ok(mut channel)=UnixStream::connect(Path::new(&exchange).join("reply.sock")).await else {return;};
+                                        let Ok(length)=channel.read_u32().await else {return;};
+                                        let mut request=vec![0;length as usize];
+                                        if channel.read_exact(&mut request).await.is_ok() {let _=channel.write_all(b"ok").await;}
+                                    });
+                                    (204,json!({}))
+                                }
+                                else if line.contains("/wait?") {(200,json!({"StatusCode":0}))}
+                                else if line.starts_with("DELETE") {deleted.store(true,Ordering::SeqCst);(204,json!({}))}
+                                else {(500,json!({}))};
+                                let raw=value.to_string();
+                                let _=stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",raw.len()).as_bytes()).await;
+                            });
+                        },
+                        result=jobs.join_next(),if !jobs.is_empty()=>{result.unwrap().unwrap();}
+                    }
+                }
+                jobs.shutdown().await;
+            });
+            let backend = DockerEngineBackend::new(owned.path().join("docker.sock"));
+            let target = MountpointHelperTarget {
+                image: "synthetic-image",
+                volume: "owned-provider-volume",
+                binary: &binary,
+                daemon: &daemon,
+                labels: json!({"com.freshell.soul-id":"synthetic-owner"}),
+            };
+            let selected = vec![Mountpoint {
+                relative_path: ".claude/settings.json".into(),
+                directory: false,
+            }];
+            // Seconds-long windows: the run reaches its create inside the
+            // first, and Docker answers the late create well after both.
+            let deadlines = if mode == "late-create" {
+                HelperDeadlines::after(Duration::from_secs(3), Duration::from_secs(2))
+            } else {
+                HelperDeadlines::after(Duration::from_secs(10), Duration::from_secs(2))
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                backend.run_launch_mountpoint_helper(target, selected, deadlines),
+            )
+            .await
+            .expect("the launch's helper window is bounded");
+            if mode == "late-create" {
+                assert!(result.is_err(), "{result:?}");
+            } else {
+                assert!(
+                    format!("{result:?}").contains("cleanup timed out"),
+                    "an unconfirmed removal stays a failure: {result:?}"
+                );
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !deleted.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                deleted.load(Ordering::SeqCst),
+                "{mode}: the helper the launch still owned is removed"
+            );
         }
     }
 
