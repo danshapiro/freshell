@@ -1,4 +1,4 @@
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createContext, forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ChevronDown, ChevronRight, ChevronUp, Loader2, Redo2, X } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { formatThoughtDuration } from '@/components/fresh-agent/shared/format-duration'
@@ -256,7 +256,7 @@ type RenderBlock =
   | { kind: 'item'; item: FreshAgentTranscriptItem }
   | { kind: 'activity'; id: string; rows: ActivityRow[] }
 
-type TurnLayout = { blocks: RenderBlock[] }
+export type TurnLayout = { blocks: RenderBlock[] }
 
 /** Mirrors FreshAgentItemCard's null-render path for text items: a text item
  * that renders nothing must not close an open line (nothing visibly between). */
@@ -297,7 +297,7 @@ type LineCaption = { id: string; text: string; atItemIndex: number }
 /** A turn that materially contributes items to an activity line. */
 type LineMember = { turnIndex: number; atItemIndex: number; caption: LineCaption | null }
 
-function buildTranscriptLayout(
+export function buildTranscriptLayout(
   turns: FreshAgentTurn[],
 ): {
   layouts: TurnLayout[]
@@ -524,7 +524,7 @@ function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[
   return changed ? settledRows : rows
 }
 
-function selectLiveActivityBlockIdFromLayout(
+export function selectLiveActivityBlockIdFromLayout(
   layouts: TurnLayout[],
   turns: FreshAgentTurn[],
   isStreaming: boolean,
@@ -796,7 +796,7 @@ function FreshAgentActivityStrip({
   )
 }
 
-type TurnActionProps = {
+export type TurnActionProps = {
   canFork: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
@@ -807,6 +807,40 @@ type TurnActionProps = {
   onRollbackToTurn?: (turnId: string) => void
   /** Coarse-pointer path: open the bottom action sheet for this turn. */
   onOpenActions?: (turn: FreshAgentTurn) => void
+}
+
+/** A turn's rendered blocks: activity strips and item cards, in layout order. */
+function TurnBlocks({
+  blocks,
+  isUser,
+  liveActivityBlockId,
+  expandThinking,
+  expandTools,
+}: {
+  blocks: RenderBlock[]
+  isUser: boolean
+  liveActivityBlockId: string | null
+  expandThinking: boolean
+  expandTools: boolean
+}) {
+  return (
+    <>
+      {blocks.map((block) => {
+        if (block.kind === 'activity') {
+          return (
+            <FreshAgentActivityStrip
+              key={block.id}
+              rows={block.rows}
+              live={block.id === liveActivityBlockId}
+              initialExpanded={expandTools}
+              expandThinking={expandThinking}
+            />
+          )
+        }
+        return <FreshAgentItemCard key={block.item.id} item={block.item} markdown={!isUser} />
+      })}
+    </>
+  )
 }
 
 /**
@@ -821,7 +855,7 @@ function buildTurnLongPress(onLongPress: () => void) {
   return { handlers, notifyOverlayOpened }
 }
 
-function FreshAgentTurnArticle({
+export function FreshAgentTurnArticle({
   turn,
   actionTurn,
   blocks,
@@ -835,6 +869,7 @@ function FreshAgentTurnArticle({
   liveActivityBlockId,
   isStreamingLastTurn,
   index,
+  live = false,
 }: {
   turn: FreshAgentTurn
   /** Turn the action affordances target — the line's LAST contributing turn
@@ -851,6 +886,9 @@ function FreshAgentTurnArticle({
   liveActivityBlockId: string | null
   isStreamingLastTurn: boolean
   index: number
+  /** The live tail's response in progress (not a turn yet): no turn actions,
+   * no context-menu/long-press ownership, no turn index, and busy until it lands. */
+  live?: boolean
 }) {
   const isUser = turn.role === 'user'
   const turnLabel = getTurnLabel(turn, agentLabel)
@@ -879,8 +917,37 @@ function FreshAgentTurnArticle({
   // Spread + ownership marker key off the CURRENT render's availability: a
   // coarse→fine pointer flip stops advertising/handling long-press even though
   // the instance persists for the article's lifetime.
-  const longPress = actions.onOpenActions ? longPressRef.current : null
-  const rewindAvailability = actions.getRewindAvailability?.(actionTurn)
+  const longPress = !live && actions.onOpenActions ? longPressRef.current : null
+  const rewindAvailability = live ? undefined : actions.getRewindAvailability?.(actionTurn)
+  if (live) {
+    return (
+      <article
+        className={cn(
+          'fresh-agent-turn fresh-agent-live-turn group relative mt-3 w-full border-l-2 border-l-border py-0.5 pl-2.5 pr-1 first:mt-0',
+          continuation && 'mt-1.5',
+        )}
+        data-turn-role={turn.role}
+        data-turn-source="live"
+        aria-label={`${turnLabel} live response`}
+        aria-busy="true"
+      >
+        {showHeader ? (
+          <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span>{turnLabel}</span>
+          </div>
+        ) : null}
+        <div className="fresh-agent-transcript-copy space-y-1.5">
+          <TurnBlocks
+            blocks={blocks}
+            isUser={isUser}
+            liveActivityBlockId={liveActivityBlockId}
+            expandThinking={expandThinking}
+            expandTools={expandTools}
+          />
+        </div>
+      </article>
+    )
+  }
   return (
     <article
       className={cn(
@@ -964,20 +1031,15 @@ function FreshAgentTurnArticle({
         </div>
       ) : null}
       <div className="fresh-agent-transcript-copy space-y-1.5">
-        {blocks.length > 0 ? blocks.map((block) => {
-          if (block.kind === 'activity') {
-            return (
-              <FreshAgentActivityStrip
-                key={block.id}
-                rows={block.rows}
-                live={block.id === liveActivityBlockId}
-                initialExpanded={expandTools}
-                expandThinking={expandThinking}
-              />
-            )
-          }
-          return <FreshAgentItemCard key={block.item.id} item={block.item} markdown={!isUser} />
-        }) : isUser ? (
+        {blocks.length > 0 ? (
+          <TurnBlocks
+            blocks={blocks}
+            isUser={isUser}
+            liveActivityBlockId={liveActivityBlockId}
+            expandThinking={expandThinking}
+            expandTools={expandTools}
+          />
+        ) : isUser ? (
           <p className="whitespace-pre-wrap break-words leading-[inherit]">{stripSystemReminders(turn.summary)}</p>
         ) : (
           // Summary-only agent turns went through the plain-text path and
@@ -1010,6 +1072,20 @@ function FreshAgentTurnArticle({
     </article>
   )
 }
+
+/**
+ * What the transcript offers the content rendered in its `tail` slot (the
+ * live tail): `requestFollow` keeps the view pinned to the bottom as the tail
+ * grows, but only while the reader is already at the bottom; `lastTurnRole`
+ * is the role of the last rendered turn, so a tail continuing the same role
+ * shows no second header.
+ */
+export type TranscriptFollow = {
+  requestFollow: () => void
+  lastTurnRole?: FreshAgentTurn['role']
+}
+
+export const TranscriptFollowContext = createContext<TranscriptFollow | null>(null)
 
 const AT_BOTTOM_THRESHOLD = 24
 const TRANSCRIPT_LINE_HEIGHT = 40
@@ -1071,6 +1147,9 @@ export type FreshAgentTranscriptProps = {
   /** Keep the transcript mounted while a reveal refresh is pending, but pause
    * measurement and scroll bookkeeping until the new snapshot is committed. */
   presentationPaused?: boolean
+  /** Rendered after the turns (the live tail of a running turn); it reaches
+   * the transcript's follow behavior through TranscriptFollowContext. */
+  tail?: ReactNode
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -1096,9 +1175,14 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   redoableTurnIds,
   sessionId,
   presentationPaused = false,
+  tail: liveTail,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
+  const atBottomRef = useRef(atBottom)
+  atBottomRef.current = atBottom
+  const presentationPausedRef = useRef(presentationPaused)
+  presentationPausedRef.current = presentationPaused
   const [newMessages, setNewMessages] = useState(0)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const [transcriptMeasurement, setTranscriptMeasurement] = useState<TranscriptMeasurement | null>(null)
@@ -1273,6 +1357,14 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     sweepTranscript()
   }, [presentationPaused, sweepTranscript, transcriptSignature])
 
+  const requestFollow = useCallback(() => {
+    if (presentationPausedRef.current || !atBottomRef.current) return
+    const node = scrollerRef.current
+    if (node) node.scrollTop = node.scrollHeight
+  }, [])
+  const lastTurnRole = displayTurns.at(-1)?.role
+  const follow = useMemo<TranscriptFollow>(() => ({ requestFollow, lastTurnRole }), [requestFollow, lastTurnRole])
+
   // Shared row markup for BOTH rolled-back presentations (the e2e locates rows
   // via div.flex.items-start). The redo button branch is gated on the row's
   // restorable group IN ADDITION to the unchanged server-authored redo gate —
@@ -1352,6 +1444,11 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           >
             {tailCaption.text}
           </div>        ) : null}
+        {liveTail ? (
+          <TranscriptFollowContext.Provider value={follow}>
+            {liveTail}
+          </TranscriptFollowContext.Provider>
+        ) : null}
         {rolledBackTurns.length > 0 ? (
           <section aria-label="Rolled back turns" className="mx-2 mt-2 rounded-md border border-dashed border-border/60 bg-muted/30 p-2 opacity-80">
             {restorableMarkers.length > 0 ? (
