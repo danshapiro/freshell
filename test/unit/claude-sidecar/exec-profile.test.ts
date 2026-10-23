@@ -49,6 +49,8 @@ it('lets a valid SDK child consume its finite environment through the real spawn
   const digest = createHash('sha256').update('x'.repeat(64 * 1024)).digest('hex')
   expect(frames.find(frame => frame.type === 'sdk.assistant')?.content).toEqual([{ type: 'text', text: digest }])
   expect(frames.some(frame => frame.type === 'create.failed')).toBe(false)
+  // Hosted: the CLI's stderr is logged by size only, never its text.
   expect(stderr).not.toContain('synthetic-private-sdk-stderr')
-  expect(stderr.split('\n').filter(Boolean).map(line => JSON.parse(line))).toContainEqual({ severity: 'warn', component: 'claude-sidecar', event: 'provider.stderr', bytes: 28 })
+  const cliStderr = stderr.split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(record => record.event === 'cli.stderr')
+  expect(cliStderr).toEqual([{ severity: 'info', component: 'claude-sidecar', event: 'cli.stderr', sessionId: expect.any(String), bytes: 28 }])
 })

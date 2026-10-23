@@ -18,6 +18,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import http from 'node:http'
 import os from 'node:os'
+import { pathToFileURL } from 'node:url'
+import { FAKE_MODEL, resolvePinnedClaude } from './claude-local-provider.mjs'
 
 const SCENARIOS = ['tools-sync', 'agent-async', 'agent-failed', 'compact-ok', 'compact-fail', 'api-error', 'image']
 
@@ -34,18 +36,12 @@ const log = (severity, event, fields = {}) => {
   process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), severity, component: 'claude-capture-fixtures', event, ...fields })}\n`)
 }
 
-const sdkDir = path.join(repoRoot, 'crates/freshell-claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk')
-const sdkPackage = JSON.parse(await fs.readFile(path.join(sdkDir, 'package.json'), 'utf8'))
-if (sdkPackage.version !== '0.3.237' || sdkPackage.claudeCodeVersion !== '2.1.237') {
-  throw new Error('the capture requires SDK 0.3.237 and CLI 2.1.237')
-}
-const storeRoot = path.join(repoRoot, 'node_modules/.pnpm')
-const optionalStore = (await fs.readdir(storeRoot)).find((name) => name.startsWith('@anthropic-ai+claude-agent-sdk-linux-x64@0.3.237'))
-if (!optionalStore) throw new Error('the pinned Linux x64 Claude CLI package is not installed')
-const nativeCli = await fs.realpath(path.join(storeRoot, optionalStore, 'node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude'))
-const { query } = await import(path.join(sdkDir, 'sdk.mjs'))
+// The same pinned SDK and bundled CLI the contract suite checks, for this platform.
+const pinned = await resolvePinnedClaude(repoRoot)
+const nativeCli = pinned.nativeCli
+const { query } = await import(pathToFileURL(pinned.sdkEntry).href)
 
-const MODEL = 'claude-sonnet-4-5-20250929'
+const MODEL = FAKE_MODEL
 // 1x1 PNG, used for the image attachment and the image Read result.
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
 
@@ -216,6 +212,10 @@ async function capture(scenario) {
     CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
     ANTHROPIC_API_KEY: 'sk-fixture-not-a-key',
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+    // Any egress other than the loopback endpoint hits a closed port (as in createClaudeFixture).
+    HTTPS_PROXY: 'http://127.0.0.1:9',
+    HTTP_PROXY: 'http://127.0.0.1:9',
+    NO_PROXY: '127.0.0.1,localhost',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     DISABLE_TELEMETRY: '1',
     DISABLE_ERROR_REPORTING: '1',

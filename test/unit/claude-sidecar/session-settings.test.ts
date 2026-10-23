@@ -1,12 +1,11 @@
 // @vitest-environment node
 
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { spawn, type ChildProcess } from 'node:child_process'
-import { createInterface } from 'node:readline'
-import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
+import { describe, expect, it, vi } from 'vitest'
 // The sidecar runs directly in Node, so its shared settings logic is plain ESM.
 // @ts-expect-error JavaScript sidecar module has no declaration file.
-import { configureSession, userMessageContent, resultErrorMessage } from '../../../crates/freshell-claude-sidecar/session-settings.mjs'
+import { configureSession, userMessageContent } from '../../../crates/freshell-claude-sidecar/session-settings.mjs'
+import { startRealSidecar, type RealSidecar } from './harness'
 
 function session() {
   return {
@@ -66,122 +65,161 @@ describe('Claude sidecar settings', () => {
   })
 })
 
-describe('Claude message content and failures', () => {
+describe('Claude message content', () => {
   it('forwards native images together with text', () => {
     expect(userMessageContent('Describe it', [{ kind: 'data', mediaType: 'image/png', data: 'YWJj' }])).toEqual([
       { type: 'text', text: 'Describe it' },
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } },
     ])
   })
-
-  it('explains unsuccessful results without treating successful results as errors', () => {
-    expect(resultErrorMessage({ subtype: 'error_during_execution', errors: ['Request timed out'] })).toBe('Request timed out')
-    expect(resultErrorMessage({ subtype: 'error_max_turns' })).toContain('turn limit')
-    expect(resultErrorMessage({ subtype: 'success' })).toBeUndefined()
-  })
 })
 
-const children = new Set<ChildProcess>()
-afterEach(() => {
-  for (const child of children) child.kill()
-  children.clear()
-})
+// The process-level cases run the real index.mjs over the CLI simulator
+// (harness.ts). What the SDK received is read from the simulator's ledger: the
+// query() options (MCP servers, the child environment's key names) and each
+// prompt with the model, effort and permission mode it ran under. The CLI
+// accepts any model or effort name and refuses only an unknown permission mode
+// (claude-cli-contract.test.ts, T7), so that is the refusal these cases use.
+const FAILING_TURN_PROGRAM = {
+  rules: [{
+    on: 'msg:prompt',
+    match: { text: '__fail__' },
+    // The CLI puts an internal diagnostic line next to the real error; only
+    // the real error may reach the user.
+    emit: [{ kind: 'completion', data: { subtype: 'error_during_execution', errors: ['[ede_diagnostic] result_type=assistant last_content_type=text stop_reason=null', 'Request timed out'] } }],
+  }],
+}
+const UNKNOWN_MODE_REFUSAL = 'Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan'
 
-function sidecar(extraEnv: Record<string, string> = {}) {
-  const child = spawn(process.execPath, [fileURLToPath(new URL('../../../crates/freshell-claude-sidecar/index.mjs', import.meta.url))], {
-    env: { ...process.env, FRESHELL_CLAUDE_SDK_QUERY_MODULE: fileURLToPath(new URL('./fixtures/settings-query-module.mjs', import.meta.url)), ...extraEnv },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  children.add(child)
-  const frames: Record<string, any>[] = []
-  const lines = createInterface({ input: child.stdout! })
-  lines.on('line', (line) => frames.push(JSON.parse(line)))
-  const send = (message: object) => child.stdin!.write(`${JSON.stringify(message)}\n`)
-  const waitFor = async (type: string, requestId?: string) => {
-    await expect.poll(() => frames.find((frame) => frame.type === type && (!requestId || frame.requestId === requestId)), { timeout: 5_000 }).toBeTruthy()
-    return frames.find((frame) => frame.type === type && (!requestId || frame.requestId === requestId))!
+async function sidecar(extraEnv: Record<string, string> = {}) {
+  const harness = await startRealSidecar({ env: extraEnv, program: FAILING_TURN_PROGRAM })
+  const waitFor = (type: string, requestId?: string) =>
+    harness.waitFor((frame) => frame.type === type && (!requestId || frame.requestId === requestId), requestId ? `${type} ${requestId}` : type)
+  return { ...harness, waitFor }
+}
+
+/** The query() options the simulated CLI received (the sidecar makes one query per create). */
+const queryOptions = async (bridge: Pick<RealSidecar, 'waitForLedger'>) =>
+  (await bridge.waitForLedger((row) => row.kind === 'query', 'query() options')).options
+
+/** Whether the fixed hosted MCP recipe reached the SDK's mcpServers option. */
+async function hostedMcpProbe(bridge: Pick<RealSidecar, 'waitForLedger'>) {
+  const mcp = (await queryOptions(bridge)).mcpServers?.freshell
+  return { selected: !!mcp, fixedRecipe: mcp?.command === 'node' && JSON.stringify(mcp?.args) === JSON.stringify(['/opt/freshell-mcp/server.js']) && mcp?.env === undefined }
+}
+
+/** The short digest the simulator's ledger records for a credential value (never the value itself). */
+const credentialDigest = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 12)
+
+/** Which credentials the SDK child environment carries, and digests of their values. */
+async function authEnvProbe(bridge: Pick<RealSidecar, 'waitForLedger'>) {
+  const options = await queryOptions(bridge)
+  const envKeys: string[] = options.envKeys ?? []
+  const digests: Record<string, string> = options.envDigests ?? {}
+  return {
+    apiKeyVisible: envKeys.includes('ANTHROPIC_API_KEY'),
+    oauthVisible: envKeys.includes('CLAUDE_CODE_OAUTH_TOKEN'),
+    apiKeyDigest: digests.ANTHROPIC_API_KEY,
+    oauthDigest: digests.CLAUDE_CODE_OAUTH_TOKEN,
   }
-  return { send, waitFor, frames }
 }
 
 describe('Claude sidecar OneCLI child environment', () => {
   it('passes the fixed selected hosted MCP recipe through the supported SDK option', async () => {
-    const bridge = sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
-    bridge.send({ type: 'create', requestId: 'hosted-mcp', cwd: '/tmp', hostedMcp: true })
-    expect(await bridge.waitFor('probe.hosted-mcp')).toMatchObject({ selected: true, fixedRecipe: true })
+    const bridge = await sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
+    bridge.send({ type: 'create', requestId: 'hosted-mcp', cwd: bridge.cwd, hostedMcp: true })
+    expect(await hostedMcpProbe(bridge)).toMatchObject({ selected: true, fixedRecipe: true })
   })
 
   it('keeps unselected and ordinary Claude SDK sessions free of the hosted recipe', async () => {
-    const hosted = sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
-    hosted.send({ type: 'create', requestId: 'unselected-mcp', cwd: '/tmp', hostedMcp: false })
-    expect(await hosted.waitFor('probe.hosted-mcp')).toMatchObject({ selected: false })
-    const ordinary = sidecar({ FRESHELL_HOSTED_FRESH_AGENT: '' })
-    ordinary.send({ type: 'create', requestId: 'ordinary-mcp', cwd: '/tmp', hostedMcp: true })
-    expect(await ordinary.waitFor('probe.hosted-mcp')).toMatchObject({ selected: false })
+    const hosted = await sidecar({ FRESHELL_HOSTED_FRESH_AGENT: 'claude' })
+    hosted.send({ type: 'create', requestId: 'unselected-mcp', cwd: hosted.cwd, hostedMcp: false })
+    expect(await hostedMcpProbe(hosted)).toMatchObject({ selected: false })
+    const ordinary = await sidecar({ FRESHELL_HOSTED_FRESH_AGENT: '' })
+    ordinary.send({ type: 'create', requestId: 'ordinary-mcp', cwd: ordinary.cwd, hostedMcp: true })
+    expect(await hostedMcpProbe(ordinary)).toMatchObject({ selected: false })
   })
 
   it('passes a managed OneCLI API key to the SDK child without inheriting ambient keys', async () => {
-    const unmanaged = sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key' })
-    unmanaged.send({ type: 'create', requestId: 'unmanaged', cwd: '/tmp' })
-    expect((await unmanaged.waitFor('probe.auth-env')).apiKeyVisible).toBe(false)
+    const unmanaged = await sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key' })
+    unmanaged.send({ type: 'create', requestId: 'unmanaged', cwd: unmanaged.cwd })
+    expect((await authEnvProbe(unmanaged)).apiKeyVisible).toBe(false)
 
-    const managed = sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key', CLAUDE_CODE_OAUTH_TOKEN: 'onecli-test-oauth', FRESHELL_CLAUDE_ONECLI_API_KEY: '1' })
-    managed.send({ type: 'create', requestId: 'managed', cwd: '/tmp' })
-    expect(await managed.waitFor('probe.auth-env')).toMatchObject({ apiKeyVisible: true, oauthVisible: true })
+    const managed = await sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key', CLAUDE_CODE_OAUTH_TOKEN: 'onecli-test-oauth', FRESHELL_CLAUDE_ONECLI_API_KEY: '1' })
+    managed.send({ type: 'create', requestId: 'managed', cwd: managed.cwd })
+    // The child gets the managed values themselves, not some other or empty key.
+    expect(await authEnvProbe(managed)).toMatchObject({
+      apiKeyVisible: true,
+      oauthVisible: true,
+      apiKeyDigest: credentialDigest('onecli-test-key'),
+      oauthDigest: credentialDigest('onecli-test-oauth'),
+    })
   })
 })
 
 describe('Claude sidecar configuration protocol', () => {
   it('preserves conversation identity and applies new effort to the next prompt', async () => {
-    const bridge = sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan', cwd: '/project' })
+    const bridge = await sidecar()
+    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan', cwd: bridge.cwd })
     const { sessionId } = await bridge.waitFor('created')
-    const { cliSessionId } = await bridge.waitFor('sdk.session.init')
     bridge.send({ type: 'configure', sessionId, requestId: 'settings', settings: { effort: 'max' } })
     expect(await bridge.waitFor('sdk.configured', 'settings')).toMatchObject({ ok: true, settings: { effort: 'max', model: 'opus', permissionMode: 'plan' } })
     bridge.send({ type: 'send', sessionId, text: 'Continue', images: [{ mediaType: 'image/png', data: 'YWJj' }] })
-    const prompt = await bridge.waitFor('probe.prompt')
+    // The CLI reports the conversation's identity in the init that opens each turn (T1).
+    const { cliSessionId } = await bridge.waitFor('sdk.session.init')
+    const prompt = await bridge.waitForPrompt()
     expect(prompt).toMatchObject({ generation: 1, durable: cliSessionId, effort: 'max', model: 'opus', permissionMode: 'plan' })
     expect(prompt.content[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } })
     expect(bridge.frames.some((frame) => frame.type === 'sdk.exit')).toBe(false)
   })
 
   it('correlates rejected settings and leaves the existing query available', async () => {
-    const bridge = sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus' })
+    const bridge = await sidecar()
+    bridge.send({ type: 'create', requestId: 'create', model: 'opus', permissionMode: 'acceptEdits', cwd: bridge.cwd })
     const { sessionId } = await bridge.waitFor('created')
-    bridge.send({ type: 'configure', sessionId, requestId: 'bad-model', settings: { model: 'unavailable' } })
-    expect(await bridge.waitFor('sdk.configured', 'bad-model')).toMatchObject({ ok: false, message: 'Model is unavailable' })
+    bridge.send({ type: 'configure', sessionId, requestId: 'bad-mode', settings: { permissionMode: 'no-such-mode' } })
+    // The refused mode is neither reported nor kept: the previous one stands.
+    expect(await bridge.waitFor('sdk.configured', 'bad-mode')).toMatchObject({ ok: false, message: UNKNOWN_MODE_REFUSAL, settings: { permissionMode: 'acceptEdits' } })
     bridge.send({ type: 'send', sessionId, text: 'Still works' })
-    expect(await bridge.waitFor('probe.prompt')).toMatchObject({ generation: 1, model: 'opus' })
+    expect(await bridge.waitForPrompt()).toMatchObject({ generation: 1, model: 'opus', permissionMode: 'acceptEdits' })
   })
 
   it('publishes usable provider commands and removes terminal-only commands', async () => {
-    const bridge = sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus' })
-    await bridge.waitFor('created')
-    expect(await bridge.waitFor('sdk.session.changed')).toMatchObject({
-      reason: 'session-commands', commands: [{ name: 'review', description: 'Review changes', argumentHint: '[path]' }],
-    })
+    const bridge = await sidecar()
+    bridge.send({ type: 'create', requestId: 'create', model: 'opus', cwd: bridge.cwd })
+    const { sessionId } = await bridge.waitFor('created')
+    // The sidecar publishes the catalog once the CLI has reported a turn's
+    // init (its list of terminal-only commands), which takes a prompt (T1).
+    bridge.send({ type: 'send', sessionId, text: 'hello' })
+    const changed = await bridge.waitFor('sdk.session.changed')
+    expect(changed).toMatchObject({ reason: 'session-commands' })
+    // A usable command keeps its description and argument hint; the CLI's
+    // terminal-only commands (doctor, color) are removed.
+    expect(changed.commands).toContainEqual({ name: 'compact', description: 'Free up context by summarizing the conversation so far', argumentHint: '<optional custom summarization instructions>' })
+    expect(changed.commands.map((command: { name: string }) => command.name)).not.toContain('doctor')
+    expect(changed.commands.map((command: { name: string }) => command.name)).not.toContain('color')
   })
 
-  it('keeps the conversation usable after effort configuration fails', async () => {
-    const bridge = sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high' })
+  it('keeps the conversation usable after a settings change fails part way', async () => {
+    const bridge = await sidecar()
+    bridge.send({ type: 'create', requestId: 'create', model: 'opus', effort: 'high', permissionMode: 'plan', cwd: bridge.cwd })
     const { sessionId } = await bridge.waitFor('created')
-    const { cliSessionId } = await bridge.waitFor('sdk.session.init')
-    bridge.send({ type: 'configure', sessionId, requestId: 'failed-effort', settings: { model: 'sonnet', effort: 'invalid' } })
-    expect(await bridge.waitFor('sdk.configured', 'failed-effort')).toMatchObject({ ok: false, settings: { model: 'sonnet', effort: 'high' } })
+    // The model change applies, then the permission mode is refused: the
+    // answer reports the settings as they now stand, with the refused mode
+    // left at its previous value.
+    bridge.send({ type: 'configure', sessionId, requestId: 'failed-settings', settings: { model: 'sonnet', effort: 'high', permissionMode: 'no-such-mode' } })
+    expect(await bridge.waitFor('sdk.configured', 'failed-settings')).toMatchObject({ ok: false, settings: { model: 'sonnet', effort: 'high', permissionMode: 'plan' } })
     bridge.send({ type: 'configure', sessionId, requestId: 'recover', settings: { model: 'opus', effort: 'high' } })
-    expect(await bridge.waitFor('sdk.configured', 'recover')).toMatchObject({ ok: true })
+    expect(await bridge.waitFor('sdk.configured', 'recover')).toMatchObject({ ok: true, settings: { permissionMode: 'plan' } })
     bridge.send({ type: 'send', sessionId, text: 'Continue' })
-    expect(await bridge.waitFor('probe.prompt')).toMatchObject({ generation: 1, durable: cliSessionId, model: 'opus', effort: 'high' })
+    const { cliSessionId } = await bridge.waitFor('sdk.session.init')
+    expect(await bridge.waitForPrompt()).toMatchObject({ generation: 1, durable: cliSessionId, model: 'opus', effort: 'high', permissionMode: 'plan' })
     expect(bridge.frames.some((frame) => frame.type === 'sdk.exit')).toBe(false)
   })
 
   it('surfaces failed turn details and rings the unified attention edge', async () => {
-    const bridge = sidecar()
-    bridge.send({ type: 'create', requestId: 'create', model: 'opus' })
+    const bridge = await sidecar()
+    bridge.send({ type: 'create', requestId: 'create', model: 'opus', cwd: bridge.cwd })
     const { sessionId } = await bridge.waitFor('created')
     bridge.send({ type: 'send', sessionId, text: '__fail__' })
     expect(await bridge.waitFor('sdk.error')).toMatchObject({ message: 'Request timed out', turnFailure: true })

@@ -978,8 +978,16 @@ async fn setup_and_undo_two_turn_conversation() -> (
 #[tokio::test]
 async fn claude_undo_recreates_the_sidecar_with_resume_session_at_and_rekeys_the_pane() {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let (rig, _ws, _addr, _ledger, _frames, _original, _new_id) =
+    let logs = common::log_capture::install();
+    let (rig, _ws, _addr, _ledger, _frames, original, _new_id) =
         setup_and_undo_two_turn_conversation().await;
+    // G14: the respawned sidecar's log is bound to the session the undo named.
+    let bound = logs.matching(|event| {
+        event.message == "freshagent.claude.sidecar_bound"
+            && event.field("session_id") == Some(original.as_str())
+    });
+    assert_eq!(bound.len(), 1, "{bound:?}");
+    assert_eq!(bound[0].field("session_type"), Some("freshclaude"));
     drop(rig);
 }
 

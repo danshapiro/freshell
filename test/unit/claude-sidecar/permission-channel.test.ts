@@ -7,9 +7,14 @@
 // (canUseTool :203-214, handlePermissionRequest :516-569,
 // handleAskUserQuestion :571-626, respondQuestion :629-648,
 // respondPermission :771-783).
+//
+// The process-level cases (8, 10 and the missing-decision guard) run the real
+// index.mjs over the CLI simulator (harness.ts). A simulator program plays the
+// model's side (an approval and a question, with the tool_use ids it chooses);
+// what the SDK's canUseTool call resolved with is read from the simulator's
+// ledger.
 
-import { afterEach, describe, expect, it } from 'vitest'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { describe, expect, it } from 'vitest'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -21,12 +26,10 @@ import {
   respondPermission,
   respondQuestion,
 } from '../../../crates/freshell-claude-sidecar/permission-channel.mjs'
+import { SIDECAR_INDEX, startRealSidecar, type LedgerRow, type RealSidecar } from './harness'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const REPO_ROOT = path.resolve(__dirname, '../../..')
-const SIDECAR_INDEX = path.join(REPO_ROOT, 'crates', 'freshell-claude-sidecar', 'index.mjs')
-const FAKE_QUERY_MODULE = path.join(__dirname, 'fixtures', 'fake-query-module.mjs')
 const CRASH_PROBE = path.join(__dirname, 'fixtures', 'sidecar-crash-probe.mjs')
 
 // ── dependency stubs (the channel is dependency-injected; index.mjs passes its
@@ -57,87 +60,60 @@ async function settle<T>(p: Promise<T>, ms = 60): Promise<{ settled: boolean; va
 }
 
 // ── child-process harness (cases 8 & 10) ─────────────────────────────────────
-const children = new Set<ChildProcess>()
-afterEach(() => {
-  for (const child of children) {
-    try {
-      child.kill('SIGKILL')
-    } catch {
-      /* already gone */
-    }
-  }
-  children.clear()
-})
-
-function trackChild(child: ChildProcess) {
-  children.add(child)
-  child.on('exit', () => children.delete(child))
-  return child
-}
-
-function waitForExit(child: ChildProcess, stderrOut: () => string, timeoutMs = 10_000) {
-  return new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`child did not exit within ${timeoutMs}ms; stderr=${stderrOut().slice(-800)}`)),
-      timeoutMs,
-    )
-    child.once('exit', (code, signal) => {
-      clearTimeout(timer)
-      resolve({ code, signal })
-    })
-  })
+// The model's side of the process-level cases: `__raise_permission__` asks for
+// a Bash call (canUseTool with suggestions, blockedPath and decisionReason) and
+// `__raise_question__` asks AskUserQuestion with an extra input field.
+const PERMISSION_PROGRAM = {
+  rules: [
+    {
+      on: 'msg:prompt',
+      match: { text: '__raise_permission__' },
+      emit: [{
+        kind: 'approval',
+        data: {
+          id: 'toolu_fake_1',
+          tool: 'Bash',
+          input: { command: 'ls' },
+          suggestions: [{ type: 'addRules', rules: [{ toolName: 'Bash' }], behavior: 'allow', destination: 'session' }],
+          blockedPath: '/tmp/blocked',
+          decisionReason: 'needs approval',
+        },
+      }],
+    },
+    {
+      on: 'msg:prompt',
+      match: { text: '__raise_question__' },
+      emit: [{
+        kind: 'question',
+        data: {
+          id: 'toolu_fake_2',
+          input: {
+            questions: [
+              {
+                question: 'Pick one',
+                header: 'Choice',
+                options: [{ label: 'A', description: 'Option A' }],
+                multiSelect: false,
+              },
+            ],
+            marker: 'keep-me',
+          },
+        },
+      }],
+    },
+  ],
 }
 
 function spawnSidecar(env: Record<string, string> = {}) {
-  const child = trackChild(
-    spawn(process.execPath, [SIDECAR_INDEX], {
-      env: { ...process.env, FRESHELL_CLAUDE_SDK_QUERY_MODULE: FAKE_QUERY_MODULE, ...env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }),
-  )
-  const frames: Frame[] = []
-  let stdoutBuf = ''
-  let stderrOut = ''
-  child.stdout!.on('data', (chunk: Buffer) => {
-    stdoutBuf += chunk.toString('utf8')
-    let idx: number
-    while ((idx = stdoutBuf.indexOf('\n')) >= 0) {
-      const line = stdoutBuf.slice(0, idx).trim()
-      stdoutBuf = stdoutBuf.slice(idx + 1)
-      if (!line) continue
-      try {
-        frames.push(JSON.parse(line))
-      } catch {
-        /* non-JSON line: ignore */
-      }
-    }
-  })
-  child.stderr!.on('data', (chunk: Buffer) => {
-    stderrOut += chunk.toString('utf8')
-  })
-  const send = (msg: Frame) => child.stdin!.write(`${JSON.stringify(msg)}\n`)
-  const waitFor = (pred: (f: Frame) => boolean, label: string, timeoutMs = 10_000) =>
-    new Promise<Frame>((resolve, reject) => {
-      const started = Date.now()
-      const poll = () => {
-        const hit = frames.find(pred)
-        if (hit) {
-          resolve(hit)
-          return
-        }
-        if (Date.now() - started > timeoutMs) {
-          reject(
-            new Error(
-              `timed out waiting for ${label}; frames=${JSON.stringify(frames)}; stderr=${stderrOut.slice(-800)}`,
-            ),
-          )
-          return
-        }
-        setTimeout(poll, 10)
-      }
-      poll()
-    })
-  return { child, frames, send, waitFor, waitExit: () => waitForExit(child, () => stderrOut), stderr: () => stderrOut }
+  return startRealSidecar({ program: PERMISSION_PROGRAM, env })
+}
+
+const canUseToolAnswers = (rows: LedgerRow[], toolName: string) =>
+  rows.filter((row) => row.kind === 'can_use_tool' && row.toolName === toolName)
+
+/** The `n`th answer (1-based) the simulated CLI's canUseTool call for `toolName` resolved with. */
+function resolvedAnswer(harness: RealSidecar, toolName: string, n: number, label: string) {
+  return harness.waitForLedger((row, rows) => canUseToolAnswers(rows, toolName).indexOf(row) === n - 1, label)
 }
 
 // ── case 1 ───────────────────────────────────────────────────────────────────
@@ -402,33 +378,23 @@ describe('cases 6/7: canUseTool adapter preserves legacy ordering (sdk-bridge.ts
 // ── case 8: no-guard invariant probe ─────────────────────────────────────────
 describe('case 8: no-guard invariant probe (reviewed guard design: crash loudly, NEVER swallow)', () => {
   it('a synthetic unhandled rejection inside the sidecar process exits NONZERO (Node default fatal path)', async () => {
-    const child = trackChild(
-      spawn(process.execPath, [CRASH_PROBE], {
-        env: {
-          ...process.env,
-          SIDECAR_INDEX_PATH: SIDECAR_INDEX,
-          FRESHELL_CLAUDE_SDK_QUERY_MODULE: FAKE_QUERY_MODULE,
-        },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }),
-    )
-    let stderrOut = ''
-    child.stderr!.on('data', (c: Buffer) => (stderrOut += c.toString('utf8')))
-    child.stdout!.resume() // drain; nothing relevant is emitted
-    // Attach the exit listener BEFORE triggering the fatal rejection — the child
-    // may crash before we would otherwise subscribe.
-    const exitP = waitForExit(child, () => stderrOut)
+    // The probe imports the real index.mjs (which loads the simulator through
+    // the seam). The harness attaches the exit listener at spawn, BEFORE the
+    // fatal rejection is triggered — the child may crash before we would
+    // otherwise subscribe.
+    const probe = await startRealSidecar({ entry: CRASH_PROBE, env: { SIDECAR_INDEX_PATH: SIDECAR_INDEX } })
+    const { child } = probe
     child.stdin!.write('{"type":"__reject__"}\n')
     await new Promise((r) => setTimeout(r, 150)) // let the rejection land before stdin closes
     child.stdin!.end()
 
-    const { code, signal } = await exitP
+    const { code, signal } = await probe.waitExit()
     // No process-level swallow handlers: the rejection must kill the process
     // itself (nonzero code, no external signal), so Rust exit-eviction engages.
     expect(signal).toBeNull()
     expect(code).not.toBeNull()
     expect(code).not.toBe(0)
-    expect(stderrOut).toContain('synthetic-unhandled')
+    expect(probe.stderr()).toContain('synthetic-unhandled')
   })
 })
 
@@ -527,15 +493,15 @@ describe('pre-aborted signal short-circuits: never park, never emit, resolve den
 // ── case 10: production-wiring contract test (round-2 F4) ────────────────────
 describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE_SDK_QUERY_MODULE seam)', () => {
   it('create -> magic send -> canUseTool -> respond; interrupt cancels a second park; question routing; shutdown', async () => {
-    const harness = spawnSidecar()
+    const harness = await spawnSidecar()
 
     // create — placeholder id comes straight back
-    harness.send({ type: 'create', requestId: 'r-create-1', permissionMode: 'default' })
+    harness.send({ type: 'create', requestId: 'r-create-1', cwd: harness.cwd, permissionMode: 'default' })
     const created = await harness.waitFor((f) => f.type === 'created', 'created')
     const sessionId = created.sessionId as string
     expect(sessionId).toMatch(/^[A-Za-z0-9_-]{16,32}$/)
 
-    // magic send -> the fake query module invokes options.canUseTool ->
+    // magic send -> the simulated CLI invokes options.canUseTool ->
     // sdk.permission.request + waiting edge on stdout (order: request first).
     harness.send({ type: 'send', sessionId, text: '__raise_permission__' })
     const permReq = await harness.waitFor((f) => f.type === 'sdk.permission.request', 'sdk.permission.request')
@@ -552,14 +518,14 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
     const waiting1 = await harness.waitFor((f) => f.type === 'sdk.turn.waiting', 'sdk.turn.waiting')
     expect(harness.frames.indexOf(permReq)).toBeLessThan(harness.frames.indexOf(waiting1))
 
-    // permission.respond — the fake's parked promise settles with the EXACT decision
+    // permission.respond — the CLI's parked canUseTool call settles with the EXACT decision
     const decision = { behavior: 'allow', updatedInput: { command: 'ls -la' } }
     harness.send({ type: 'permission.respond', sessionId, requestId: permReq.requestId, decision })
-    const resolved1 = await harness.waitFor(
-      (f) => f.type === 'probe.resolved' && f.kind === 'permission' && f.n === 1,
-      'probe.resolved permission #1',
-    )
+    const resolved1 = await resolvedAnswer(harness, 'Bash', 1, 'canUseTool answer: permission #1')
     expect(resolved1.decision).toEqual(decision)
+    // The approved tool runs and the turn ends. (A send pushed while the tool
+    // runs would be absorbed into this turn, T10, not start its own.)
+    await harness.waitFor((f) => f.type === 'sdk.result', 'the approved turn ends')
 
     // question routing through the production entry: AskUserQuestion ->
     // sdk.question.request; question.respond wraps answers per legacy
@@ -576,10 +542,7 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
     ])
     const answers = { 'Pick one': 'A' }
     harness.send({ type: 'question.respond', sessionId, requestId: qReq.requestId, answers })
-    const resolvedQ = await harness.waitFor(
-      (f) => f.type === 'probe.resolved' && f.kind === 'question' && f.n === 1,
-      'probe.resolved question #1',
-    )
+    const resolvedQ = await resolvedAnswer(harness, 'AskUserQuestion', 1, 'canUseTool answer: question #1')
     expect(resolvedQ.decision).toEqual({
       behavior: 'allow',
       updatedInput: {
@@ -588,6 +551,7 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
         answers,
       },
     })
+    await harness.waitFor(() => harness.frames.filter((f) => f.type === 'sdk.result').length >= 2, 'the question turn ends')
 
     // unknown respond ids are no-ops (log-only): the session stays healthy
     harness.send({ type: 'permission.respond', sessionId, requestId: 'no-such-request', decision })
@@ -602,10 +566,7 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
     const cancelFrame = await harness.waitFor((f) => f.type === 'sdk.permission.cancelled', 'sdk.permission.cancelled')
     expect(cancelFrame.sessionId).toBe(sessionId)
     expect(cancelFrame.requestId).toBe(permReq2.requestId)
-    const resolved2 = await harness.waitFor(
-      (f) => f.type === 'probe.resolved' && f.kind === 'permission' && f.n === 2,
-      'probe.resolved permission #2',
-    )
+    const resolved2 = await resolvedAnswer(harness, 'Bash', 2, 'canUseTool answer: permission #2')
     expect(resolved2.decision).toEqual({ behavior: 'deny', message: 'Interrupted' })
 
     // clean teardown
@@ -625,9 +586,9 @@ describe('case 10: production wiring through the real index.mjs (FRESHELL_CLAUDE
 // one arm below (index.mjs question.respond).
 describe('production wiring: permission.respond with a null/absent decision is a log-only no-op', () => {
   it('the parked entry survives a decisionless respond; a later valid respond resolves verbatim', async () => {
-    const harness = spawnSidecar()
+    const harness = await spawnSidecar()
 
-    harness.send({ type: 'create', requestId: 'r-create-guard', permissionMode: 'default' })
+    harness.send({ type: 'create', requestId: 'r-create-guard', cwd: harness.cwd, permissionMode: 'default' })
     const created = await harness.waitFor((f) => f.type === 'created', 'created')
     const sessionId = created.sessionId as string
 
@@ -637,21 +598,19 @@ describe('production wiring: permission.respond with a null/absent decision is a
     // Hand-crafted malformed frame: NO decision key at all.
     harness.send({ type: 'permission.respond', sessionId, requestId: permReq.requestId })
 
-    // Log-only no-op: stderr carries the guard line, and the parked promise must
-    // NOT settle (no probe.resolved frame) within a generous window.
+    // Log-only no-op: stderr carries the guard's warning record, and the parked
+    // promise must NOT settle (no canUseTool answer) within a generous window.
     await new Promise((r) => setTimeout(r, 300))
-    expect(harness.stderr()).toContain('permission.respond: missing decision')
-    expect(harness.frames.filter((f) => f.type === 'probe.resolved')).toEqual([])
+    const records = harness.stderr().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    expect(records).toContainEqual(expect.objectContaining({ severity: 'warn', event: 'respond.invalid', kind: 'permission', sessionId, requestId: permReq.requestId }))
+    expect(canUseToolAnswers(harness.ledger(), 'Bash')).toEqual([])
 
     // The entry is still parked: a later well-formed respond resolves verbatim.
     const decision = { behavior: 'deny', message: 'Denied by user' }
     harness.send({ type: 'permission.respond', sessionId, requestId: permReq.requestId, decision })
-    const resolved = await harness.waitFor(
-      (f) => f.type === 'probe.resolved' && f.kind === 'permission',
-      'probe.resolved after the valid respond',
-    )
+    const resolved = await resolvedAnswer(harness, 'Bash', 1, 'canUseTool answer after the valid respond')
     expect(resolved.decision).toEqual(decision)
-    expect(harness.frames.filter((f) => f.type === 'probe.resolved')).toHaveLength(1)
+    expect(canUseToolAnswers(harness.ledger(), 'Bash')).toHaveLength(1)
 
     // Clean teardown.
     const exitP = harness.waitExit()

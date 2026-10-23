@@ -160,6 +160,7 @@ pub struct ClaudeNodeCommand {
     managed_environment: bool,
     ownership_tag: Option<String>,
     closed_stdin: bool,
+    complete_environment: Option<Vec<(String, String)>>,
 }
 
 impl ClaudeNodeCommand {
@@ -190,6 +191,7 @@ impl ClaudeNodeCommand {
             managed_environment: false,
             ownership_tag: None,
             closed_stdin: false,
+            complete_environment: None,
         }
     }
 
@@ -211,6 +213,15 @@ impl ClaudeNodeCommand {
     /// Linux `/proc` ownership reaper.
     pub fn with_ownership_tag(mut self, ownership_id: &str) -> Self {
         self.ownership_tag = Some(ownership_id.to_string());
+        self
+    }
+
+    /// When `Some`, the child's complete environment: it replaces the one the
+    /// child would inherit from this process (the test rigs give each sidecar
+    /// exactly its own). The ownership tag, the OneCLI key flag and the managed
+    /// secrets still layer over it. `None` keeps the inherited environment.
+    pub fn with_complete_environment(mut self, environment: Option<&[(String, String)]>) -> Self {
+        self.complete_environment = environment.map(<[(String, String)]>::to_vec);
         self
     }
 
@@ -254,6 +265,10 @@ impl ClaudeNodeCommand {
             None => Command::new(&self.node),
         };
         command.arg(&self.entry);
+        if let Some(environment) = &self.complete_environment {
+            command.env_clear();
+            command.envs(environment.iter().map(|(key, value)| (key, value)));
+        }
         if let Some(ownership_id) = &self.ownership_tag {
             command.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, ownership_id);
         }
@@ -876,6 +891,59 @@ mod tests {
             !env.contains_key("FRESHELL_CLAUDE_ONECLI_API_KEY"),
             "{env:?}"
         );
+    }
+
+    /// The test rigs give each sidecar exactly its own environment: a
+    /// configured environment replaces the inherited one, and the ownership
+    /// tag, the OneCLI key flag and the managed secrets still layer over it.
+    #[test]
+    fn a_complete_environment_replaces_the_inherited_one_under_the_overlay() {
+        let env = env_from(&[]);
+        let configured = [
+            ("HOME".to_string(), "/rig/home".to_string()),
+            ("ONECLI_URL".to_string(), "http://configured".to_string()),
+        ];
+        let command = crate::claude::sidecar_node_command(
+            ClaudeNodeCommand::from_parts("/srv/sidecar/index.mjs", &env, managed_secrets()),
+            "claude-sidecar-rig",
+        )
+        .with_complete_environment(Some(&configured))
+        .command();
+
+        let env = envs(&command);
+        assert_eq!(env.get("HOME"), Some(&Some("/rig/home".to_string())));
+        assert_eq!(
+            env.get(CLAUDE_SIDECAR_OWNERSHIP_ENV),
+            Some(&Some("claude-sidecar-rig".to_string()))
+        );
+        assert_eq!(
+            env.get("ONECLI_URL"),
+            Some(&Some("http://127.0.0.1:10254".to_string())),
+            "the managed secrets win over the configured environment"
+        );
+        assert_eq!(
+            env.get("FRESHELL_CLAUDE_ONECLI_API_KEY"),
+            Some(&Some("1".to_string()))
+        );
+    }
+
+    /// Nothing of the server's own environment reaches a child launched with
+    /// a complete environment (here `env -0` stands in for node and prints
+    /// what the child got).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_with_a_complete_environment_inherits_nothing() {
+        let env = env_from(&[("FRESHELL_CLAUDE_NODE", "/usr/bin/env")]);
+        let configured = [("HOME".to_string(), "/rig/home".to_string())];
+        let output = ClaudeNodeCommand::from_parts("-0", &env, None)
+            .with_complete_environment(Some(&configured))
+            .with_closed_stdin()
+            .command()
+            .output()
+            .await
+            .expect("run env");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "HOME=/rig/home\0");
     }
 
     #[test]
