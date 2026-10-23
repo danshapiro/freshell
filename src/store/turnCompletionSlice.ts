@@ -77,6 +77,14 @@ const turnCompletionSlice = createSlice({
   name: 'turnCompletion',
   initialState,
   reducers: {
+    // Observe an attention mark without recording an event. First-ready seeding
+    // and live edges for sessions without a local pane use the same high-water mark.
+    advanceCompletionBaseline(state, action: PayloadAction<{ terminalId: string; at: number }>) {
+      const { terminalId, at } = action.payload
+      if (!Number.isFinite(at)) return
+      const last = state.lastAtByTerminalId[terminalId]
+      if (last === undefined || at > last) state.lastAtByTerminalId[terminalId] = at
+    },
     // Fresh-agent completion edge (and custom-CLI client BEL path). Terminal CLI
     // panes (claude/codex/opencode/amplifier) no longer flow through here — their
     // bell/shade edge is the server-authoritative terminal.idle (recordTerminalIdle).
@@ -159,6 +167,7 @@ const turnCompletionSlice = createSlice({
 })
 
 export const {
+  advanceCompletionBaseline,
   recordTurnComplete,
   recordTerminalIdle,
   resetCompletionDedupeBaselines,

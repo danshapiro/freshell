@@ -630,6 +630,9 @@ describe('fresh-agent-ws', () => {
       },
     })).toBe(true)
     expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`].streamingActive).toBe(true)
+    // The snapshot observes the session for reconnect dedupe; only actions
+    // caused by the following status frame belong to this assertion.
+    actionTypes.length = 0
 
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
@@ -642,7 +645,7 @@ describe('fresh-agent-ws', () => {
     const session = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]
     expect(session.status).toBe('stuck')
     expect(session.streamingActive).toBe(false)
-    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toHaveLength(0)
+    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/') && type !== 'turnCompletion/advanceCompletionBaseline')).toHaveLength(0)
 
     // Companion edge: the deadman's discrete freshAgent.turn.complete for the
     // same session dispatches recordTurnComplete — attention folds
@@ -656,7 +659,7 @@ describe('fresh-agent-ws', () => {
       event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000 },
     })).toBe(true)
     expect(actionTypes.filter((type) => type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
-    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toEqual([
+    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/') && type !== 'turnCompletion/advanceCompletionBaseline')).toEqual([
       'turnCompletion/recordTurnComplete',
     ])
     // The status fold itself stays untouched by the companion: still 'stuck',

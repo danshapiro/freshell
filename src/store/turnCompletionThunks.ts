@@ -4,9 +4,51 @@ import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveFreshAgentSessionKey } from '@/lib/pane-activity'
 import type { FreshAgentPaneContent, PaneNode } from './paneTypes'
 import { selectTabPaneByTerminalId } from './selectors/paneTerminalSelectors'
-import { recordTerminalIdle, recordTurnComplete } from './turnCompletionSlice'
+import { advanceCompletionBaseline, recordTerminalIdle, recordTurnComplete } from './turnCompletionSlice'
+import type { ReadyMessage } from '@shared/ws-protocol'
+import { createLogger } from '@/lib/client-logger'
 import { clearTerminalStuck, recordTerminalStuck } from './terminalLifecycleSlice'
 import type { AppDispatch, RootState } from './store'
+
+const log = createLogger('TurnCompletion')
+
+function completionDedupeKey(provider: string, sessionId: string): string {
+  return `${provider}:${sessionId}`
+}
+
+function waitingDedupeKey(provider: string, sessionId: string): string {
+  return `${completionDedupeKey(provider, sessionId)}#waiting`
+}
+
+/** A newly registered session's first turn can end while this page is offline. */
+export function observeFreshAgentSession(payload: { provider: string; sessionId: string }) {
+  return (dispatch: AppDispatch): void => {
+    for (const terminalId of [completionDedupeKey(payload.provider, payload.sessionId), waitingDedupeKey(payload.provider, payload.sessionId)]) {
+      dispatch(advanceCompletionBaseline({ terminalId, at: 0 }))
+    }
+  }
+}
+
+/** First observation seeds silently; a same-page reconnect replays unseen edges. */
+export function foldReadyFreshAgentAttention(marks: ReadyMessage['freshAgentAttention']) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    for (const mark of marks ?? []) {
+      const payload = { provider: mark.provider, sessionId: mark.sessionId }
+      for (const [terminalId, at, apply] of [
+        [completionDedupeKey(mark.provider, mark.sessionId), mark.lastTurnCompleteAt, applyFreshAgentCompletion],
+        [waitingDedupeKey(mark.provider, mark.sessionId), mark.lastWaitingAt, applyFreshAgentWaiting],
+      ] as const) {
+        const known = getState().turnCompletion.lastAtByTerminalId[terminalId]
+        if (known === undefined) {
+          dispatch(advanceCompletionBaseline({ terminalId, at: at ?? 0 }))
+        } else if (at !== undefined && at > known) {
+          log.info('fresh_agent_attention_replayed', { terminalId, at })
+          dispatch(apply({ ...payload, at }))
+        }
+      }
+    }
+  }
+}
 
 export type ApplyServerIdlePayload = {
   terminalId: string
@@ -90,18 +132,20 @@ export type ApplyFreshAgentCompletionPayload = {
  * derives green/sound from the busy level or the turn's outcome. We resolve the
  * owning tab/pane from the `provider:sessionId` session key and fold the event into
  * the GREEN/SOUND pipeline via the `at`-monotonic dedupe regime (no completionSeq).
- * The discrete edge is never replayed from a snapshot, so a reconnect cannot
- * re-green, and a stale/older `at` is dropped. Across a real server restart the
- * client clears the per-terminal `at` baselines (resetCompletionDedupeBaselines),
- * so a resumed durable session whose fresh process stamps a lower wall-clock `at`
- * is not swallowed.
+ * A reconnect's ready marks replay only edges this page missed. First connect,
+ * reload and server restart seed without replaying history. Equal or older `at`
+ * values are dropped by the same baseline as live edges.
  */
 export function applyFreshAgentCompletion(payload: ApplyFreshAgentCompletionPayload) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
+    dispatch(observeFreshAgentSession(payload))
     const state = getState()
-    const sessionKey = `${payload.provider}:${payload.sessionId}`
+    const sessionKey = completionDedupeKey(payload.provider, payload.sessionId)
     const location = findFreshAgentPaneBySessionKey(state, sessionKey)
-    if (!location) return
+    if (!location) {
+      dispatch(advanceCompletionBaseline({ terminalId: sessionKey, at: payload.at }))
+      return
+    }
 
     dispatch(recordTurnComplete({
       tabId: location.tabId,
@@ -125,24 +169,26 @@ export type ApplyFreshAgentWaitingPayload = {
  * bucket via the monotonic `at` guard. Claude/kilroy and codex controls emit
  * this edge on their own 0→≥1 pending approval/question transitions.
  *
- * Like the completion edge, the server buffers and replays this only to the FIRST
- * subscriber of a session (so a create-then-attach gap still greens once); a
- * reconnecting client gets NO replay and rehydrates pending state from the session
- * snapshot, which carries no waiting edge — so a still-pending approval does not
- * spuriously re-green on reconnect (matching the deleted hook's first-observation
- * suppression).
+ * Ready replay includes a waiting mark only while a control is still pending.
+ * The separate high-water mark prevents a completed turn from swallowing a
+ * waiting edge, and prevents a reconnect from ringing the same approval twice.
  */
 export function applyFreshAgentWaiting(payload: ApplyFreshAgentWaitingPayload) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
+    dispatch(observeFreshAgentSession(payload))
     const state = getState()
-    const sessionKey = `${payload.provider}:${payload.sessionId}`
+    const sessionKey = completionDedupeKey(payload.provider, payload.sessionId)
+    const terminalId = waitingDedupeKey(payload.provider, payload.sessionId)
     const location = findFreshAgentPaneBySessionKey(state, sessionKey)
-    if (!location) return
+    if (!location) {
+      dispatch(advanceCompletionBaseline({ terminalId, at: payload.at }))
+      return
+    }
 
     dispatch(recordTurnComplete({
       tabId: location.tabId,
       paneId: location.paneId,
-      terminalId: `${sessionKey}#waiting`,
+      terminalId,
       at: payload.at,
     }))
   }
