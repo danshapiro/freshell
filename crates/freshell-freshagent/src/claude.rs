@@ -8203,6 +8203,7 @@ mod create_binding;
 mod create_outcome;
 mod deadman;
 mod recovery;
+mod recovery_stop;
 pub use create_outcome::ClaudeCreateOutcome;
 
 mod send_outcome;
@@ -8266,6 +8267,7 @@ pub(crate) mod tests {
     mod control_tests;
     mod create_binding_tests;
     mod deadman_tests;
+    mod recovery_stop_tests;
     mod recovery_tests;
     mod refusal_tests;
 
