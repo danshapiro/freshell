@@ -350,14 +350,16 @@ impl HelperRetryPolicy {
 }
 
 /// The Claude source reader: 25 seconds of helper work per attempt (a
-/// healthy read takes about two). The whole read gets two full attempts,
-/// each with its five-second cleanup, so a create stalled past the first
-/// attempt's deadline (observed up to 31 seconds) still leaves a full-length
-/// retry once Docker answers it. A third attempt fits only when an earlier
-/// one was refused quickly.
+/// healthy read takes about two). A stalled create answers only once the host
+/// has flushed what was unwritten on Docker's disk: up to 8 GB and a 43-second
+/// stall during the provider parity runs on the development host. The whole
+/// read therefore gets three attempt lengths, each with its five-second
+/// cleanup: the attempt the stall times out, up to one more attempt length
+/// for Docker to answer that create, and one full retry after it. A third
+/// attempt fits only when an earlier one was refused quickly.
 pub(crate) const CLAUDE_SOURCE_READER_RETRY: HelperRetryPolicy = HelperRetryPolicy {
     attempt: Duration::from_secs(25),
-    total: Duration::from_secs(2 * (25 + HELPER_CLEANUP_BUDGET.as_secs())),
+    total: Duration::from_secs(3 * (25 + HELPER_CLEANUP_BUDGET.as_secs())),
     cleanup: HELPER_CLEANUP_BUDGET,
     backoff: [Duration::from_secs(1), Duration::from_secs(2)],
     min_attempt: Duration::from_secs(10),

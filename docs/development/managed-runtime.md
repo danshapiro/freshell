@@ -158,10 +158,10 @@ alike.
 
 Recovery also calls back to the web server to prepare the replacement's
 provider inputs. That callback waits 35s for the web server's own work; a
-Claude recovery's callback waits 165s, because before it answers the web
+Claude recovery's callback waits 225s, because before it answers the web
 server observes the current Claude sources and then the candidate projection,
-back to back, through the supervisor, and each observation is bounded at 65s
-(the fixed reader's bounded retry, 60s, plus reply slack). The recovery scope
+back to back, through the supervisor, and each observation is bounded at 95s
+(the fixed reader's bounded retry, 90s, plus reply slack). The recovery scope
 those nested lookups present lives exactly as long as the callback wait, so an
 observation that finishes inside its own bound never finds its scope expired.
 
@@ -200,7 +200,8 @@ mounts and unmounts the new container's overlay root filesystem, and the
 kernel flushes the whole filesystem under Docker's data root when that mount
 goes away, so the create waits for every unwritten change on that disk (on
 the development host: about 0.1s idle, 4.5s with 1 GB unwritten, 16.7s with
-3 GB, up to 31s during busy test runs). The create right after it is fast
+3 GB; up to 43s during the provider parity runs, which build Rust release
+binaries while up to 8 GB sits unwritten). The create right after it is fast
 again, which is why managed-session creates stay quick while the helper
 created just before them is slow.
 
@@ -215,9 +216,10 @@ created just before them is slow.
   `supervisor.helper.late_create.unconfirmed` (error).
 - The Claude source reader retries a run whose create or start timed out, or
   that Docker refused with a server error or left unanswered. Each attempt
-  keeps the reader's 25s bound; the whole read gets 60s, room for one full
-  timed-out attempt and one full retry, each with its 5s cleanup; a third
-  attempt fits only after a fast refusal. Waits are 1s, then 2s, and a retry
+  keeps the reader's 25s bound; the whole read gets 90s, three attempt
+  lengths with their 5s cleanup: the attempt a stall times out, up to one
+  more attempt length for Docker to answer that create, and one full retry;
+  a third attempt fits only after a fast refusal. Waits are 1s, then 2s, and a retry
   starts only after the previous attempt's helpers were removed, so retries
   never pile creates onto a stalled daemon. Every other failure (a client
   error, changed ownership or topology, a reader that exited without
