@@ -103,7 +103,7 @@
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent } from './session-settings.mjs'
-import { resultFrames } from './sdk-message-frames.mjs'
+import { createFrameState, framesForSdkMessage, resultFrames } from './sdk-message-frames.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { checkpointAttemptOf, rememberCheckpointAttempt, takeCheckpointIdentity } from './checkpoint-identity.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
@@ -323,32 +323,7 @@ function handleSdkMessage(sessionId, msg) {
           st.commandCatalog = commands
           publishCommandsIfChanged(sessionId, st)
         }
-      } else if (msg.subtype === 'status' && msg.status === 'compacting') {
-        emit({ type: 'sdk.status', sessionId, status: 'compacting' })
-      } else if (msg.subtype === 'compact_boundary') {
-        // kata 1wxv ep3-r1 F1: the bare compacting STATUS frame carries no
-        // trigger — the SDK fires it for an explicit `/compact` AND for its
-        // own automatic context compaction, and misattributing the automatic
-        // one to a queued explicit compact wedges the rollback busy gate
-        // (the phantom compact absorbs the turn's own terminal edge). Only the
-        // compact COMPLETION boundary discriminates the trigger; relay it.
-        // Fail toward 'auto' on a missing/unknown trigger so promotion to a
-        // queued explicit compact never happens without a proven manual run.
-        const trigger = msg.compact_metadata?.trigger === 'manual' ? 'manual' : 'auto'
-        emit({ type: 'sdk.compact_boundary', sessionId, trigger })
       }
-      break
-    }
-    case 'assistant': {
-      const content = msg.message?.content || []
-      const blocks = content.map((b) => {
-        if (b.type === 'text') return { type: 'text', text: b.text }
-        if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking }
-        if (b.type === 'tool_use') return { type: 'tool_use', id: b.id, name: b.name, input: b.input }
-        if (b.type === 'tool_result') return { type: 'tool_result', tool_use_id: b.tool_use_id, content: b.content, is_error: b.is_error }
-        return b
-      })
-      emit({ type: 'sdk.assistant', sessionId, content: blocks, model: msg.message?.model })
       break
     }
     case 'result': {
@@ -369,14 +344,12 @@ function handleSdkMessage(sessionId, msg) {
       }
       break
     }
-    case 'stream_event': {
-      emit({ type: 'sdk.stream', sessionId, event: msg.event, parentToolUseId: msg.parent_tool_use_id })
-      break
-    }
     default:
-      // Unhandled SDK message type — ignored (matches SdkBridge default).
       break
   }
+  // The content kinds (assistant, stream events, compaction): a pure mapping,
+  // sdk-message-frames.mjs. Any kind it does not map is dropped there.
+  for (const frame of framesForSdkMessage(sessionId, msg, { stream: st.frameState })) emit(frame)
 }
 
 async function consumeStream(sessionId, sdkQuery) {
@@ -508,6 +481,8 @@ function handleCreate(req) {
     turnCompleteGate: createTurnCompleteGate(),
     pendingResults: 0,
     pendingCheckpointAttempts: new Map(),
+    // The content mapping's own per-session state (sdk-message-frames.mjs).
+    frameState: createFrameState(),
   }
   const { iterable, handle } = createInputStream((isCompact) => {
     if (isCompact) state.handedCompactLikely = true

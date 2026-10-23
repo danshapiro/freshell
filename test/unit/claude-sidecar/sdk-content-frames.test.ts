@@ -1,0 +1,107 @@
+// @vitest-environment node
+
+// The content half of the pure SDK message -> sidecar frame mapping
+// (crates/freshell-claude-sidecar/sdk-message-frames.mjs): what reaches the
+// server for the messages the transcript owns (assistant, user, stream_event,
+// compaction and status frames). The `result` half has its own tests
+// (sdk-message-frames.test.ts).
+//
+// The sequences fed here were recorded from the pinned CLI 2.1.237 against a
+// local fake endpoint (test/integration/providers/claude-capture-fixtures.mjs),
+// so every shape is one the real CLI produces.
+
+import fs from 'node:fs'
+import path from 'node:path'
+import { describe, expect, it } from 'vitest'
+import {
+  createFrameState,
+  framesForSdkMessage,
+} from '../../../crates/freshell-claude-sidecar/sdk-message-frames.mjs'
+
+const RECORDINGS = path.resolve(__dirname, '../../fixtures/fresh-agent/claude/real-cli-2.1.237')
+const SCENARIOS = ['tools-sync', 'agent-async', 'agent-failed', 'compact-ok', 'compact-fail', 'api-error', 'image'] as const
+
+type Msg = Record<string, any>
+
+/** The SDK messages the pinned CLI produced for one recorded scenario, in order. */
+function recorded(scenario: string): Msg[] {
+  return fs.readFileSync(path.join(RECORDINGS, scenario, 'sdk.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line).msg as Msg)
+}
+
+/** What the sidecar knows about its session when a message arrives. */
+function session(state = createFrameState(), overrides: Record<string, unknown> = {}) {
+  return { stream: state, permissionMode: 'bypassPermissions', turnPending: true, ...overrides }
+}
+
+/** Every message of a recording with the frames it maps to (one mapping state per session). */
+function mapRecording(scenario: string) {
+  const state = createFrameState()
+  return recorded(scenario).map((msg) => ({ msg, frames: framesForSdkMessage('s1', msg, session(state)) }))
+}
+
+const isStatus = (status: unknown) => (msg: Msg) => msg.type === 'system' && msg.subtype === 'status' && msg.status === status
+
+describe('framesForSdkMessage over the pinned CLI\'s recorded sequences', () => {
+  it.each(SCENARIOS)('%s: each assistant message becomes one sdk.assistant with its content blocks and model', (scenario) => {
+    const mapped = mapRecording(scenario).filter(({ msg }) => msg.type === 'assistant')
+    expect(mapped.length).toBeGreaterThan(0)
+    for (const { msg, frames } of mapped) {
+      const assistant = frames.filter((frame: Msg) => frame.type === 'sdk.assistant')
+      expect(assistant).toHaveLength(1)
+      expect(assistant[0]).toMatchObject({ sessionId: 's1', model: msg.message.model })
+      expect(assistant[0].content.map((block: Msg) => block.type)).toEqual(msg.message.content.map((block: Msg) => block.type))
+    }
+  })
+
+  it.each(SCENARIOS)('%s: messages that carry nothing for the server map to no frame', (scenario) => {
+    const silent = (msg: Msg) => msg.type === 'result'
+      || (msg.type === 'system' && ['init', 'task_started', 'task_progress', 'task_updated', 'task_notification', 'background_tasks_changed', 'thinking_tokens'].includes(msg.subtype))
+      || isStatus('requesting')(msg)
+    for (const { msg, frames } of mapRecording(scenario).filter(({ msg }) => silent(msg))) {
+      expect(frames, JSON.stringify(msg).slice(0, 200)).toEqual([])
+    }
+  })
+
+  it.each(SCENARIOS)('%s: each stream event is forwarded as sdk.stream with its event and parent tool use id', (scenario) => {
+    for (const { msg, frames } of mapRecording(scenario).filter(({ msg }) => msg.type === 'stream_event')) {
+      expect(frames).toEqual([{ type: 'sdk.stream', sessionId: 's1', event: msg.event, parentToolUseId: msg.parent_tool_use_id }])
+    }
+  })
+
+  it('projects each content block the way the server reads it (a thinking block loses its signature)', () => {
+    const blocks = mapRecording('tools-sync')
+      .filter(({ msg }) => msg.type === 'assistant' && msg.parent_tool_use_id === null)
+      .slice(0, 3)
+      .map(({ frames }) => frames.find((frame: Msg) => frame.type === 'sdk.assistant').content)
+    expect(blocks).toEqual([
+      [{ type: 'thinking', thinking: 'plan the write' }],
+      [{ type: 'text', text: 'Writing the file now.' }],
+      [{ type: 'tool_use', id: 'toolu_write1', name: 'Write', input: { file_path: '/fixture/ws/a.txt', content: 'one\n' } }],
+    ])
+  })
+
+  it('a compaction: the compacting status and the boundary (with its trigger) reach the server', () => {
+    const mapped = mapRecording('compact-ok')
+    const compacting = mapped.find(({ msg }) => isStatus('compacting')(msg))!
+    expect(compacting.frames).toEqual([{ type: 'sdk.status', sessionId: 's1', status: 'compacting' }])
+    const boundary = mapped.find(({ msg }) => msg.type === 'system' && msg.subtype === 'compact_boundary')!
+    expect(boundary.frames.filter((frame: Msg) => frame.type === 'sdk.compact_boundary'))
+      .toEqual([{ type: 'sdk.compact_boundary', sessionId: 's1', trigger: 'manual' }])
+  })
+
+  it('a compaction boundary with a missing or unknown trigger counts as automatic', () => {
+    for (const compact_metadata of [undefined, {}, { trigger: 'other' }, { trigger: 'auto' }]) {
+      const frames = framesForSdkMessage('s1', { type: 'system', subtype: 'compact_boundary', compact_metadata, uuid: 'b1' }, session())
+      expect(frames.find((frame: Msg) => frame.type === 'sdk.compact_boundary')).toEqual({ type: 'sdk.compact_boundary', sessionId: 's1', trigger: 'auto' })
+    }
+  })
+
+  it('ignores kinds it does not map, and a message with no type', () => {
+    expect(framesForSdkMessage('s1', { type: 'tool_progress', tool_use_id: 't1', heartbeat: true }, session())).toEqual([])
+    expect(framesForSdkMessage('s1', { type: 'system', subtype: 'session_state_changed', state: 'idle' }, session())).toEqual([])
+    expect(framesForSdkMessage('s1', {}, session())).toEqual([])
+  })
+})

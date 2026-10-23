@@ -2,7 +2,8 @@
 // (docs/plans/2026-10-22-freshclaude-core-runtime.md §3.2 and §9.1 N6). One
 // function per SDK message kind; index.mjs keeps the side effects (the turn
 // gate, pendingResults, the attention clock, emit). The core runtime owns the
-// `result` mapping below; the transcript work adds the content kinds here.
+// `result` mapping below; the transcript work owns the content kinds
+// (framesForSdkMessage and the functions it dispatches to, at the end).
 //
 // Result shapes are the pinned CLI's (test/integration/providers/
 // claude-cli-contract.test.ts): a Stop ends the turn with
@@ -73,4 +74,80 @@ export function resultFrames(sessionId, result, { userStopped }) {
   const failure = userStopped ? undefined : resultErrorText(result)
   if (failure) frames.push({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
   return frames
+}
+
+// ── content kinds (docs/plans/2026-10-22-freshclaude-transcript-live.md §4.2) ──
+//
+// framesForSdkMessage maps the SDK messages whose content reaches the server:
+// assistant messages, stream events and the compaction status frames. Every
+// other kind maps to no frame here: `result`, `system/init`, `commands_changed`
+// and the checkpoint replay binding carry side effects, so index.mjs handles
+// them itself.
+
+/**
+ * The per-session state of the content mapping. index.mjs keeps one per
+ * session and passes it in as `session.stream`.
+ */
+export function createFrameState() {
+  return {}
+}
+
+/**
+ * The frames for one SDK message of a content kind (none for any other kind).
+ * `session` is what the sidecar knows about the session when the message
+ * arrives: `{ stream }`, the session's createFrameState().
+ */
+export function framesForSdkMessage(sessionId, msg, session) {
+  switch (msg?.type) {
+    case 'assistant': return assistantFrames(sessionId, msg)
+    case 'stream_event': return streamEventFrames(sessionId, msg, session.stream)
+    case 'system':
+      switch (msg.subtype) {
+        case 'status': return statusFrames(sessionId, msg)
+        case 'compact_boundary': return compactBoundaryFrames(sessionId, msg)
+        default: return []
+      }
+    default: return []
+  }
+}
+
+/** A content block as the server reads it (a thinking block's signature stays behind). */
+function contentBlock(block) {
+  if (block.type === 'text') return { type: 'text', text: block.text }
+  if (block.type === 'thinking') return { type: 'thinking', thinking: block.thinking }
+  if (block.type === 'tool_use') return { type: 'tool_use', id: block.id, name: block.name, input: block.input }
+  if (block.type === 'tool_result') return { type: 'tool_result', tool_use_id: block.tool_use_id, content: block.content, is_error: block.is_error }
+  return block
+}
+
+/** An assistant message (the CLI sends one per completed content block): `sdk.assistant`. */
+export function assistantFrames(sessionId, msg) {
+  const content = msg.message?.content || []
+  return [{ type: 'sdk.assistant', sessionId, content: content.map(contentBlock), model: msg.message?.model }]
+}
+
+/** A streaming event: `sdk.stream`. */
+export function streamEventFrames(sessionId, msg, _stream) {
+  return [{ type: 'sdk.stream', sessionId, event: msg.event, parentToolUseId: msg.parent_tool_use_id }]
+}
+
+/** A status frame: the CLI started compacting. */
+export function statusFrames(sessionId, msg) {
+  return msg.status === 'compacting' ? [{ type: 'sdk.status', sessionId, status: 'compacting' }] : []
+}
+
+/**
+ * A compaction finished: its trigger. kata 1wxv ep3-r1 F1: the bare
+ * compacting STATUS frame carries no trigger — the SDK fires it for an
+ * explicit `/compact` AND for its own automatic context compaction, and
+ * misattributing the automatic one to a queued explicit compact wedges the
+ * rollback busy gate (the phantom compact absorbs the turn's own terminal
+ * edge). Only the compact COMPLETION boundary discriminates the trigger, so
+ * the server gets it from here. A missing or unknown trigger counts as
+ * 'auto', so promotion to a queued explicit compact never happens without a
+ * proven manual run.
+ */
+export function compactBoundaryFrames(sessionId, msg) {
+  const trigger = msg.compact_metadata?.trigger === 'manual' ? 'manual' : 'auto'
+  return [{ type: 'sdk.compact_boundary', sessionId, trigger }]
 }
