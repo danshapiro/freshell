@@ -5,6 +5,59 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+pub type RestCreateSettingsReader = std::sync::Arc<
+    dyn Fn() -> futures_util::future::BoxFuture<'static, freshell_protocol::SettingsFreshAgent>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestLaneErrorKind {
+    BadRequest,
+    Forbidden,
+    NotFound,
+    Conflict,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestLaneError {
+    pub kind: RestLaneErrorKind,
+    pub code: String,
+    pub message: String,
+    pub retryable: Option<bool>,
+    pub retry_after_ms: Option<u64>,
+    pub owner: Option<crate::ownership_lane::TerminalOwnerFields>,
+}
+
+impl RestLaneError {
+    pub fn new(
+        kind: RestLaneErrorKind,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            code: code.into(),
+            message: message.into(),
+            retryable: None,
+            retry_after_ms: None,
+            owner: None,
+        }
+    }
+}
+
+impl From<()> for RestLaneError {
+    fn from(_: ()) -> Self {
+        Self::new(
+            RestLaneErrorKind::Unavailable,
+            "FRESH_AGENT_UNAVAILABLE",
+            "durable fresh-agent operation is temporarily unavailable",
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct RestLaneProviderInputs {
     pub plugins: Option<Vec<String>>,
@@ -46,7 +99,7 @@ pub fn provider_inputs(body: &Value) -> Result<RestLaneProviderInputs, String> {
     })
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RestLaneCreate {
     pub request_id: String,
     pub provider: String,
@@ -59,13 +112,18 @@ pub struct RestLaneCreate {
     pub model_selection: Option<Option<freshell_protocol::ModelSelection>>,
     pub permission_mode: Option<String>,
     pub sandbox: Option<freshell_protocol::Sandbox>,
+    pub tab_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub naming_handle: Option<String>,
+    pub model_effort_levels: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RestLaneCreated {
     /// Stable presentation identity used by the web layout and gateway alias
     /// table. It is not substituted for the provider's native identity.
     pub session_id: String,
+    pub session_ref: Option<freshell_protocol::SessionLocator>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,9 +190,9 @@ pub trait FreshAgentRestLane: Send + Sync {
     async fn create_agent(
         self: std::sync::Arc<Self>,
         request: RestLaneCreate,
-    ) -> Result<RestLaneCreated, ()>;
+    ) -> Result<RestLaneCreated, RestLaneError>;
 
-    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, ()>;
+    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, RestLaneError>;
 
     async fn capture(
         &self,

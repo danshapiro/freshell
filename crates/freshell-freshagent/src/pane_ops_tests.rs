@@ -18,20 +18,21 @@ impl rest_lane::FreshAgentRestLane for SplitHostedGateway {
     async fn create_agent(
         self: Arc<Self>,
         request: rest_lane::RestLaneCreate,
-    ) -> Result<rest_lane::RestLaneCreated, ()> {
+    ) -> Result<rest_lane::RestLaneCreated, rest_lane::RestLaneError> {
         assert_eq!(
             (request.provider.as_str(), request.session_type.as_str()),
             ("claude", "freshclaude")
         );
         Ok(rest_lane::RestLaneCreated {
             session_id: "managed-split-claude".into(),
+            ..Default::default()
         })
     }
 
     async fn send_agent(
         &self,
         _request: rest_lane::RestLaneSend,
-    ) -> Result<rest_lane::RestLaneSendResult, ()> {
+    ) -> Result<rest_lane::RestLaneSendResult, rest_lane::RestLaneError> {
         unreachable!("split creation does not send a prompt")
     }
 }

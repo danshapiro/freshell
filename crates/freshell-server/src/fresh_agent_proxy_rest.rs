@@ -121,12 +121,15 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
         );
         Ok(Some(snapshot))
     }
-    async fn create_agent(self: Arc<Self>, request: RestLaneCreate) -> Result<RestLaneCreated, ()> {
+    async fn create_agent(
+        self: Arc<Self>,
+        request: RestLaneCreate,
+    ) -> Result<RestLaneCreated, freshell_freshagent::rest_lane::RestLaneError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
         let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
         let message = freshell_protocol::FreshAgentCreate {
-            pane_id: None,
+            pane_id: request.pane_id,
             request_id: request.request_id,
             session_type,
             cwd: request.cwd,
@@ -145,8 +148,8 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 provider: provider_wire(&provider),
                 session_id,
             }),
-            tab_id: None,
-            naming_handle: None,
+            tab_id: request.tab_id,
+            naming_handle: request.naming_handle,
         };
         let session_id = presentation_id_for_create(
             &runtime_provider,
@@ -157,10 +160,16 @@ impl FreshAgentRestLane for HostedFreshAgentProxy {
                 .map(|value| value.session_id.as_str()),
         );
         self.create(message).await?;
-        Ok(RestLaneCreated { session_id })
+        Ok(RestLaneCreated {
+            session_id,
+            ..Default::default()
+        })
     }
 
-    async fn send_agent(&self, request: RestLaneSend) -> Result<RestLaneSendResult, ()> {
+    async fn send_agent(
+        &self,
+        request: RestLaneSend,
+    ) -> Result<RestLaneSendResult, freshell_freshagent::rest_lane::RestLaneError> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
         let soul = self

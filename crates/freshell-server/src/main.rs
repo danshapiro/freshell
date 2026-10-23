@@ -1151,6 +1151,13 @@ async fn main() -> ExitCode {
     fresh_agent_state
         .set_checkpoint_event_persister(Arc::clone(&checkpoint_event_persister))
         .expect("OpenCode checkpoint event persister is installed once");
+    let rest_create_settings = settings_store.shared_settings_lock();
+    fresh_agent_state
+        .set_rest_create_settings_reader(Arc::new(move || {
+            let settings = Arc::clone(&rest_create_settings);
+            Box::pin(async move { settings.read().await.fresh_agent.clone() })
+        }))
+        .expect("REST create settings reader is installed once");
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =

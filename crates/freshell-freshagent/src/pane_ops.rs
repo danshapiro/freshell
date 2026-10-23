@@ -39,14 +39,14 @@ use axum::response::Response;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use freshell_protocol::{ServerMessage, SessionLocator, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL};
+use freshell_protocol::{ServerMessage, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL};
 
 use crate::layout_store::RenameOutcome;
 use crate::target_resolver::{resolve_target, ResolvedTarget};
 use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
 use crate::{
-    approx_json, authorized, fail_json, ok_json, parse_required_name, rest_agent_mode, rest_lane,
-    FreshAgentState, PaneEntry, PaneNameResolution,
+    approx_json, authorized, fail_json, ok_json, parse_required_name, rest_agent_mode,
+    rest_lane_failure, FreshAgentState, PaneEntry, PaneNameResolution,
 };
 
 /// Mount the pane + tab lifecycle routes onto an existing router. Split out of
@@ -197,90 +197,41 @@ pub(crate) async fn split_pane(
                 "durable fresh-agent gateway is not installed".to_string(),
             );
         };
-        let native_session_id = match body.get("sessionRef") {
-            None => None,
-            Some(value) => match serde_json::from_value::<SessionLocator>(value.clone()) {
-                Ok(locator) if locator.provider == provider && !locator.session_id.is_empty() => {
-                    Some(locator.session_id)
-                }
-                _ => {
-                    let _ = state.layout.close_pane(&new_pane_id);
-                    return fail_json(
-                        StatusCode::BAD_REQUEST,
-                        format!("sessionRef must identify a {provider} session"),
-                    );
-                }
-            },
-        };
-        let request_id = uuid::Uuid::new_v4().simple().to_string();
-        let provider_inputs = match rest_lane::provider_inputs(&body) {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                let _ = state.layout.close_pane(&new_pane_id);
-                return fail_json(StatusCode::BAD_REQUEST, error);
-            }
-        };
-        let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
-        let model = body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let effort = body
-            .get("effort")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let created = match gateway
-            .create_agent(rest_lane::RestLaneCreate {
-                request_id: request_id.clone(),
-                provider: provider.into(),
-                session_type: session_type.into(),
-                cwd: cwd.clone(),
-                model: model.clone(),
-                effort: effort.clone(),
-                native_session_id,
-                plugins: provider_inputs.plugins,
-                model_selection: provider_inputs.model_selection,
-                permission_mode: provider_inputs.permission_mode,
-                sandbox: provider_inputs.sandbox,
-            })
+        let mut request = match state
+            .build_rest_lane_create(provider, session_type, &body)
             .await
         {
-            Ok(created) => created,
-            Err(()) => {
+            Ok(request) => request,
+            Err(error) => {
                 let _ = state.layout.close_pane(&new_pane_id);
-                return fail_json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "durable fresh-agent host could not be created".to_string(),
-                );
+                return rest_lane_failure(error);
             }
         };
-        let mut content = json!({
-            "kind":"fresh-agent",
-            "sessionType":session_type,
-            "provider":provider,
-            "sessionId":created.session_id,
-            "createRequestId":request_id,
-            "status":"connected",
-        });
-        if let Some(value) = &cwd {
-            content["initialCwd"] = json!(value);
-        }
-        if let Some(value) = &model {
-            content["model"] = json!(value);
-        }
-        if let Some(value) = &effort {
-            content["effort"] = json!(value);
-        }
+        request.tab_id = Some(tab_id.clone());
+        request.pane_id = Some(new_pane_id.clone());
+        let created = match gateway.create_agent(request.clone()).await {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = state.layout.close_pane(&new_pane_id);
+                return rest_lane_failure(error);
+            }
+        };
+        let content = crate::rest_lane_create::pane_content(&request, &created);
         state.panes.lock().expect("panes mutex").insert(
             new_pane_id.clone(),
             PaneEntry {
                 placeholder_id: created.session_id.clone(),
                 provider: provider.into(),
                 session_type: session_type.into(),
-                cwd,
-                model,
-                effort,
-                durable_id: Some(created.session_id),
+                cwd: request.cwd,
+                model: request.model,
+                effort: request.effort,
+                durable_id: Some(
+                    created
+                        .session_ref
+                        .map(|reference| reference.session_id)
+                        .unwrap_or(created.session_id),
+                ),
             },
         );
         content
@@ -1315,3 +1266,7 @@ mod tab_tests;
 #[cfg(test)]
 #[path = "pane_ops_store_tests.rs"]
 mod store_tests;
+
+#[cfg(test)]
+#[path = "rest_lane_http_tests.rs"]
+mod rest_lane_http_tests;

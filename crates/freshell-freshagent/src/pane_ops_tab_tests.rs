@@ -20,7 +20,7 @@ impl rest_lane::FreshAgentRestLane for RestLaneFake {
     async fn create_agent(
         self: Arc<Self>,
         request: rest_lane::RestLaneCreate,
-    ) -> Result<rest_lane::RestLaneCreated, ()> {
+    ) -> Result<rest_lane::RestLaneCreated, rest_lane::RestLaneError> {
         assert_eq!(request.cwd.as_deref(), Some("/workspace"));
         self.identities
             .lock()
@@ -30,13 +30,14 @@ impl rest_lane::FreshAgentRestLane for RestLaneFake {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(rest_lane::RestLaneCreated {
             session_id: "managed-rest-session".into(),
+            ..Default::default()
         })
     }
 
     async fn send_agent(
         &self,
         request: rest_lane::RestLaneSend,
-    ) -> Result<rest_lane::RestLaneSendResult, ()> {
+    ) -> Result<rest_lane::RestLaneSendResult, rest_lane::RestLaneError> {
         assert_eq!(request.session_id, "managed-rest-session");
         assert_eq!(
             (request.provider.as_str(), request.session_type.as_str()),

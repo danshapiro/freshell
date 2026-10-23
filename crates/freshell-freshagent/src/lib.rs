@@ -77,6 +77,7 @@ mod process_probe;
 /// 2026-10-22 §3.2, §5.6).
 pub(crate) mod quiet_deadman;
 pub mod rest_lane;
+pub(crate) mod rest_lane_create;
 pub mod rollback_record;
 pub mod session_handoff;
 pub mod session_lease;
@@ -2062,6 +2063,7 @@ pub struct FreshAgentState {
     /// Opt-in durable host gateway. When installed, REST/MCP fresh-agent
     /// requests never touch this web process's legacy provider manager.
     hosted_rest: Arc<std::sync::OnceLock<rest_lane::SharedFreshAgentRestLane>>,
+    rest_create_settings: Arc<std::sync::OnceLock<rest_lane::RestCreateSettingsReader>>,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
     /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): the SAME
@@ -2400,6 +2402,7 @@ impl FreshAgentState {
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             hosted_rest: Arc::new(std::sync::OnceLock::new()),
+            rest_create_settings: Arc::new(std::sync::OnceLock::new()),
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
             session_identity: None,
@@ -4708,6 +4711,31 @@ fn fail_json(status: StatusCode, message: String) -> Response {
         .into_response()
 }
 
+fn rest_lane_failure(error: rest_lane::RestLaneError) -> Response {
+    use rest_lane::RestLaneErrorKind;
+    let status = match error.kind {
+        RestLaneErrorKind::BadRequest => StatusCode::BAD_REQUEST,
+        RestLaneErrorKind::Forbidden => StatusCode::FORBIDDEN,
+        RestLaneErrorKind::NotFound => StatusCode::NOT_FOUND,
+        RestLaneErrorKind::Conflict => StatusCode::CONFLICT,
+        RestLaneErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        RestLaneErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let mut body = json!({ "status": "error", "code": error.code, "message": error.message });
+    if let Some(retryable) = error.retryable {
+        body["retryable"] = json!(retryable);
+    }
+    if let Some(retry_after_ms) = error.retry_after_ms {
+        body["retryAfterMs"] = json!(retry_after_ms);
+    }
+    if let Some(owner) = error.owner {
+        body["ownerKind"] = json!(owner.owner_kind);
+        body["ownerGeneration"] = json!(owner.owner_generation);
+        body["ownerEpoch"] = json!(owner.owner_epoch);
+    }
+    (status, Json(body)).into_response()
+}
+
 /// `fail_json` + a machine-readable code, matching how the WS side keys
 /// errors (`error["code"] == "RESTORE_UNAVAILABLE"`). Envelope is additive:
 /// `{status:"error", code, message}`.
@@ -4838,43 +4866,14 @@ async fn create_tab(
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
     if let Some(gateway) = state.hosted_rest_gateway() {
-        let provider_inputs = match rest_lane::provider_inputs(&body) {
-            Ok(inputs) => inputs,
-            Err(error) => return fail_json(StatusCode::BAD_REQUEST, error),
+        let request = match state
+            .build_rest_lane_create(provider, session_type, &body)
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return rest_lane_failure(error),
         };
-        let native_session_id = match body.get("sessionRef") {
-            None => None,
-            Some(value) => match serde_json::from_value::<SessionLocator>(value.clone()) {
-                Ok(locator) if locator.provider == provider && !locator.session_id.is_empty() => {
-                    Some(locator.session_id)
-                }
-                _ => {
-                    return fail_json(
-                        StatusCode::BAD_REQUEST,
-                        format!("sessionRef must identify a {provider} session"),
-                    )
-                }
-            },
-        };
-        return create_lane_agent_tab(
-            &state,
-            gateway,
-            rest_lane::RestLaneCreate {
-                request_id: Uuid::new_v4().simple().to_string(),
-                provider: provider.into(),
-                session_type: session_type.into(),
-                cwd,
-                model,
-                effort,
-                native_session_id,
-                plugins: provider_inputs.plugins,
-                model_selection: provider_inputs.model_selection,
-                permission_mode: provider_inputs.permission_mode,
-                sandbox: provider_inputs.sandbox,
-            },
-            name,
-        )
-        .await;
+        return create_lane_agent_tab(&state, gateway, request, name).await;
     }
 
     // The retained in-process implementation is OpenCode-only. Every hosted
@@ -5030,20 +5029,21 @@ async fn create_tab(
 async fn create_lane_agent_tab(
     state: &FreshAgentState,
     gateway: rest_lane::SharedFreshAgentRestLane,
-    request: rest_lane::RestLaneCreate,
+    mut request: rest_lane::RestLaneCreate,
     name: Option<String>,
 ) -> Response {
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
+    request.tab_id = Some(tab_id.clone());
+    request.pane_id = Some(pane_id.clone());
     let created = match gateway.create_agent(request.clone()).await {
         Ok(created) => created,
-        Err(()) => {
-            return fail_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "durable fresh-agent host could not be created".to_string(),
-            )
+        Err(error) => {
+            state.layout.close_tab(&tab_id);
+            return rest_lane_failure(error);
         }
     };
+    let pane_content = rest_lane_create::pane_content(&request, &created);
     let rest_lane::RestLaneCreate {
-        request_id,
         provider,
         session_type,
         cwd,
@@ -5051,24 +5051,6 @@ async fn create_lane_agent_tab(
         effort,
         ..
     } = request;
-    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
-    let mut pane_content = json!({
-        "kind": "fresh-agent",
-        "sessionType": session_type,
-        "provider": provider,
-        "sessionId": created.session_id,
-        "createRequestId": request_id,
-        "status": "connected",
-    });
-    if let Some(value) = &cwd {
-        pane_content["initialCwd"] = json!(value);
-    }
-    if let Some(value) = &model {
-        pane_content["model"] = json!(value);
-    }
-    if let Some(value) = &effort {
-        pane_content["effort"] = json!(value);
-    }
     register_fresh_agent_tab(
         state,
         &tab_id,
@@ -5082,14 +5064,21 @@ async fn create_lane_agent_tab(
             cwd,
             model,
             effort,
-            durable_id: Some(created.session_id.clone()),
+            durable_id: Some(
+                created
+                    .session_ref
+                    .as_ref()
+                    .map(|reference| reference.session_id.clone())
+                    .unwrap_or_else(|| created.session_id.clone()),
+            ),
         },
     );
     broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
-    ok_json(
-        json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id}),
-        "fresh-agent pane created",
-    )
+    let mut data = json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id});
+    if let Some(reference) = created.session_ref {
+        data["sessionRef"] = json!(reference);
+    }
+    ok_json(data, "fresh-agent pane created")
 }
 
 /// The registration every fresh-agent pane-minting path needs: attach the pane
@@ -6388,10 +6377,7 @@ async fn send_keys(
                 }),
                 "prompt sent; turn did not complete within deadline",
             ),
-            Err(()) => fail_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "durable fresh-agent input was not accepted".to_string(),
-            ),
+            Err(error) => rest_lane_failure(error),
         };
     }
 
@@ -9256,16 +9242,17 @@ mod tests {
         async fn create_agent(
             self: Arc<Self>,
             _request: rest_lane::RestLaneCreate,
-        ) -> Result<rest_lane::RestLaneCreated, ()> {
+        ) -> Result<rest_lane::RestLaneCreated, rest_lane::RestLaneError> {
             Ok(rest_lane::RestLaneCreated {
                 session_id: "managed-kilroy-recovered".into(),
+                ..Default::default()
             })
         }
 
         async fn send_agent(
             &self,
             request: rest_lane::RestLaneSend,
-        ) -> Result<rest_lane::RestLaneSendResult, ()> {
+        ) -> Result<rest_lane::RestLaneSendResult, rest_lane::RestLaneError> {
             self.sends.lock().expect("sends mutex").push(request);
             Ok(rest_lane::RestLaneSendResult {
                 session_id: "managed-kilroy-recovered".into(),

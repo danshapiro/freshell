@@ -508,13 +508,13 @@ mod tests {
         async fn create_agent(
             self: Arc<Self>,
             _: crate::rest_lane::RestLaneCreate,
-        ) -> Result<crate::rest_lane::RestLaneCreated, ()> {
+        ) -> Result<crate::rest_lane::RestLaneCreated, crate::rest_lane::RestLaneError> {
             panic!("GET must not create")
         }
         async fn send_agent(
             &self,
             _: crate::rest_lane::RestLaneSend,
-        ) -> Result<crate::rest_lane::RestLaneSendResult, ()> {
+        ) -> Result<crate::rest_lane::RestLaneSendResult, crate::rest_lane::RestLaneError> {
             panic!("GET must not send")
         }
         async fn snapshot(
