@@ -586,11 +586,10 @@ struct ClaudeSession {
     /// `handle_interrupt` MUST address the sidecar with this id, never the map key.
     sidecar_session_id: String,
     /// Best-effort copy of the durable Claude UUID, recorded from `sdk.session.init`
-    /// by the stdout consumer. Nothing in production reads it: attach/eviction resolve
-    /// durable ids through [`FreshClaudeState::cli_index`], and the snapshot adapter
-    /// is disk-only. Currently read only by in-crate tests; kept as a diagnostic/
-    /// forward slot.
-    #[allow(dead_code)]
+    /// by the stdout consumer. Attach/eviction resolve durable ids through
+    /// [`FreshClaudeState::cli_index`], and the snapshot adapter is disk-only; the
+    /// settings paths (a settings apply, the CLI's own permission-mode change) read
+    /// it to write the session's binding row once the session has one.
     cli_session_id: Option<String>,
     /// b8ke focused episode-2 round-2 F2: the operation id of the lifecycle
     /// op that OWNS this runtime's coordinator claim — the create-resume
@@ -5009,9 +5008,10 @@ impl FreshClaudeState {
     /// The session's live pending approvals + questions as overlay JSON (approvals,
     /// questions) — Task 3's snapshot route consumes this. Entry keys are exactly the
     /// `.strict()` contract shape (`{requestId, toolName?, toolUseID?, blockedPath?,
-    /// decisionReason?, input?, suggestions?}` / `{requestId, questions}`, no extra keys,
-    /// absent keys omitted). `any_id` resolves like every handler here: the map key OR the durable
-    /// Claude UUID via `cli_index`. An untracked id yields two empty vecs.
+    /// decisionReason?, input?, suggestions?}` / `{requestId, questions}`, no extra
+    /// keys, absent keys omitted). `any_id` resolves like every handler here: the map
+    /// key OR the durable Claude UUID via `cli_index`. An untracked id yields two empty
+    /// vecs.
     pub(crate) async fn snapshot_pending_overlay(&self, any_id: &str) -> (Vec<Value>, Vec<Value>) {
         let Some(map_key) = self.resolve_session_key(any_id).await else {
             return (Vec::new(), Vec::new());
