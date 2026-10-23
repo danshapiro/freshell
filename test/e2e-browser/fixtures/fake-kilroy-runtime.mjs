@@ -12,7 +12,9 @@
 //        read_created discards any earlier sdk.* line), then:
 //        sdk.session.init {sessionId,cliSessionId,model,cwd,tools:[]}
 //        sdk.session.snapshot {sessionId,messages}   (resume only)
-//        sdk.status {sessionId,status}               (running|idle)
+//        sdk.status {sessionId,status}               (running at a send; idle only after
+//                                                  create and an interrupt with nothing
+//                                                  in flight: a turn ends with its result)
 //        sdk.turn.waiting {sessionId,at}             (approval edge; before assistant)
 //        sdk.assistant {sessionId,content:[<blocks>],model}
 //        sdk.result {sessionId,result:<subtype>,durationMs,costUsd,usage}
@@ -204,8 +206,8 @@ async function handle(msg) {
         st.lastTurnCompleteAt = at
         emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at })
       }
+      // The result ends the turn: no idle follows (the real sidecar sends none).
       st.turnOpen = false
-      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
     } finally {
       st.sendInFlight = false
     }
@@ -246,12 +248,11 @@ async function handle(msg) {
       }
       // Held turn: nothing else will end it, so synthesize the interrupted
       // turn's own non-success terminal result — the armed gate consumes its
-      // ring — then idle. Still NEVER an sdk.exit.
+      // ring. The result ends the turn (no idle follows). Still NEVER an sdk.exit.
       st.interrupted = false
       st.turnOpen = false
       emit({ type: 'sdk.result', sessionId: msg.sessionId, result: STOPPED_RESULT.subtype })
       st.turnCompleteGate.resultEmitsAttention(STOPPED_RESULT)
-      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
       return
     }
     // No turn awaits a terminal frame — the SDK RESOLVES an idle-session
