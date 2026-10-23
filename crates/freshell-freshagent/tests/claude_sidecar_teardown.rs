@@ -571,8 +571,12 @@ async fn an_abnormal_exit_is_not_graceful_and_the_tree_is_killed_at_once() {
     let fake = spawn_fake(FAKE_CRASHES_LEAVING_GRANDCHILD, &record).await;
     let grandchild = ProcessProbe::open(grandchild_pid(&fake.ready));
     assert!(grandchild.running());
+    // Far longer than node needs to crash even on a loaded machine (it can
+    // take over a second there), so granting the tree the rest of it is
+    // never mistaken for a slow crash.
+    let grace = Duration::from_secs(20);
 
-    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, SIDECAR_GRACEFUL_EXIT).await;
+    let exit = graceful_then_kill(fake.child, fake.stdin, fake.guard, grace).await;
 
     assert_eq!(
         exit.stop,
@@ -585,7 +589,7 @@ async fn an_abnormal_exit_is_not_graceful_and_the_tree_is_killed_at_once() {
         "node's own exit status is reported: {exit:?}"
     );
     assert!(
-        exit.elapsed < SIDECAR_GRACEFUL_EXIT / 2,
+        exit.elapsed < grace / 2,
         "the orphaned tree did not get the rest of the grace period: {exit:?}"
     );
     assert!(grandchild.exited(), "the grandchild was killed: {exit:?}");
