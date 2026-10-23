@@ -103,7 +103,9 @@ tracing = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `test-util`: paused-clock tests auto-advance the naming bind's bounded retry
+# sleeps (`terminal_name_binding_tests.rs`).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 # DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
 # to assert lifecycle events fire, without depending on the global subscriber
