@@ -8,7 +8,7 @@
 // claude-cli-conformance.ts.
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -251,6 +251,67 @@ describe('Claude CLI simulator programs', () => {
     await s.until(() => results(s.messages).length === 1)
     expect(results(s.messages)[0]).toMatchObject({ subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
     await s.until(() => s.messages.some((m) => m.type === 'command_lifecycle' && m.state === 'cancelled'))
+  })
+
+  // T13 after the boot: a command the CLI is still starting is missed by a
+  // Stop, in each receipt shape the real CLI shows (the order of the receipt
+  // and the command's lifecycle is racy there; the knob makes each shape
+  // deterministic). The command then runs to success, unless an interrupt
+  // sent once it runs aborts it.
+  it.each([
+    ['empty', [], [], []],
+    ['queued', ['55555555-5555-4555-8555-555555555555'], ['queued'], ['queued']],
+    ['started', [], [], ['queued', 'started']],
+  ] as const)('FRESHELL_CLAUDE_SIM_COLD_COMMAND=%s: a Stop while the first command starts misses it with that receipt', async (shape, stillQueued, beforeStop, beforeReceipt) => {
+    const uuid = '55555555-5555-4555-8555-555555555555'
+    const s = await open({}, { FRESHELL_CLAUDE_SIM_COLD_COMMAND: shape, FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    await s.q.initializationResult()
+    const lifecycle = () => s.messages.filter((m) => m.type === 'command_lifecycle' && m.command_uuid === uuid).map((m) => m.state)
+    s.prompt.push('SLOW cold', uuid)
+    // The command is still starting, at the point each shape names.
+    if (beforeStop.length) await s.until(() => lifecycle().length === beforeStop.length)
+    else await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(lifecycle(), 'the command lifecycle the CLI reported before the Stop').toEqual(beforeStop)
+    const receipt = await s.q.interrupt()
+    expect(lifecycle(), 'the command lifecycle the CLI reported before its receipt').toEqual(beforeReceipt)
+    expect(receipt).toEqual({ still_queued: stillQueued })
+    await s.until(() => results(s.messages).length === 1)
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'success', terminal_reason: 'completed' })
+    await s.until(() => lifecycle().at(-1) === 'completed')
+    expect(lifecycle()).toEqual(['queued', 'started', 'completed'])
+
+    // Only the first command starts cold: a Stop once the next one runs aborts it.
+    s.prompt.push('SLOW warm', '66666666-6666-4666-8666-666666666666')
+    await s.until(() => s.messages.some((m) => m.type === 'stream_event' || (m.type === 'user' && m.isReplay && m.uuid === '66666666-6666-4666-8666-666666666666')))
+    await s.q.interrupt()
+    await s.until(() => results(s.messages).length === 2)
+    expect(results(s.messages)[1]).toMatchObject({ subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
+  })
+
+  it('FRESHELL_CLAUDE_SIM_COLD_COMMAND: an interrupt sent once the cold command runs aborts it', async () => {
+    const uuid = '77777777-7777-4777-8777-777777777777'
+    const s = await open({}, { FRESHELL_CLAUDE_SIM_COLD_COMMAND: 'empty', FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    await s.q.initializationResult()
+    s.prompt.push('SLOW cold', uuid)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await expect(s.q.interrupt()).resolves.toEqual({ still_queued: [] })
+    await s.until(() => s.messages.some((m) => m.type === 'command_lifecycle' && m.command_uuid === uuid && m.state === 'started'))
+    await s.q.interrupt()
+    await s.until(() => results(s.messages).length === 1)
+    expect(results(s.messages)[0]).toMatchObject({ subtype: 'error_during_execution', terminal_reason: 'aborted_streaming' })
+  })
+
+  it('records every interrupt the CLI receives in the ledger, with the receipt it answered', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sim-ledger-'))
+    cleanups.push(() => fs.rm(dir, { recursive: true, force: true }))
+    const ledger = path.join(dir, 'ledger.jsonl')
+    const s = await open({}, { FRESHELL_CLAUDE_SIM_LEDGER: ledger, FRESHELL_CLAUDE_SIM_TIME_SCALE: '0.1' })
+    await s.q.initializationResult()
+    await s.q.interrupt()
+    const rows = (await fs.readFile(ledger, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    expect(rows.filter((row) => row.kind === 'interrupt')).toEqual([
+      expect.objectContaining({ kind: 'interrupt', stillQueued: [], running: false }),
+    ])
   })
 
   it('a /compact whose summary request hangs (HANG in its instructions) stays compacting with no result', async () => {
@@ -671,8 +732,8 @@ describe('the real sidecar over the simulator (FRESHELL_CLAUDE_SDK_QUERY_MODULE)
     send({ type: 'create', protocol: 2, boot: { kind: 'fresh' }, requestId: 'r1', cwd: home.cwd, permissionMode: 'bypassPermissions' })
     expect(await until(() => frames.some((f) => f.type === 'created'))).toBe(true)
     const sessionId = frames.find((f) => f.type === 'created').sessionId
-    send({ type: 'send', sessionId, text: 'hello' })
-    expect(await until(() => frames.some((f) => f.type === 'sdk.turn.complete'))).toBe(true)
+    send({ type: 'send', sessionId, uuid: randomUUID(), text: 'hello' })
+    expect(await until(() => frames.some((f) => f.type === 'sdk.result' && f.subtype === 'success'))).toBe(true)
     expect(frames.find((f) => f.type === 'sdk.session.init')).toMatchObject({ sessionId, cliSessionId: expect.stringMatching(/^[0-9a-f-]{36}$/) })
     expect(frames.find((f) => f.type === 'sdk.result')).toMatchObject({ sessionId, result: 'success' })
     expect(frames.find((f) => f.type === 'sdk.assistant')?.content).toEqual([{ type: 'text', text: 'ok' }])

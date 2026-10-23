@@ -29,8 +29,9 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// the SAME newline-JSON protocol `spawn_sidecar()` drives the vendored package with.
 /// On `create` it replies `created`, then `sdk.session.init` echoing the resume boot's id
 /// as the durable `cliSessionId` (resume continuity -- exactly what the real sidecar's
-/// SDK init does), then `sdk.status idle`; on `send` it emits `sdk.status busy` (the
-/// Task 10b event-after-rebind knob); on `shutdown` it exits. Every inbound request is
+/// SDK init does), then `sdk.status idle`; on `send` it emits an `sdk.assistant` content
+/// frame (the Task 10b event-after-rebind knob; the server publishes statuses itself, so
+/// a sidecar status is never forwarded, C17); on `shutdown` it exits. Every inbound request is
 /// appended (with the sidecar's pid) to the JSONL file named by
 /// `FAKE_SIDECAR_REQUEST_LOG` -- distinct pids == spawn count, `msg.type` rows prove
 /// what each sidecar actually received.
@@ -64,7 +65,7 @@ rl.on('line', (line) => {
     process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
   } else if (msg.type === 'send') {
-    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'busy' }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'pong' }] }) + '\n')
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
@@ -608,12 +609,10 @@ async fn send_by_durable_id_routes_to_the_live_session() {
     .await;
     assert_eq!(accepted["sessionId"], DURABLE_FALLBACK);
 
-    // The sidecar answers every `send` with `sdk.status busy` -- awaiting it proves the
-    // sidecar PROCESSED the routed send (the accepted broadcast races the log append).
+    // The sidecar answers every `send` with an assistant frame -- awaiting it proves
+    // the sidecar PROCESSED the routed send (the accepted broadcast races the log append).
     await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.event"
-            && v["event"]["type"] == "freshAgent.status"
-            && v["event"]["status"] == "busy"
+        v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.assistant"
     })
     .await;
 
@@ -655,7 +654,7 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
     })
     .await;
 
-    // Drive the fake to emit an sdk.status (it answers every `send` with status busy).
+    // Drive the fake to emit a content frame (it answers every `send` with one).
     send_json(
         &mut ws2,
         &serde_json::json!({
@@ -669,14 +668,12 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
     )
     .await;
 
-    let status = await_frame(&mut ws2, Duration::from_secs(10), |v| {
-        v["type"] == "freshAgent.event"
-            && v["event"]["type"] == "freshAgent.status"
-            && v["event"]["status"] == "busy"
+    let event = await_frame(&mut ws2, Duration::from_secs(10), |v| {
+        v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.assistant"
     })
     .await;
     assert_eq!(
-        status["sessionId"], DURABLE_FALLBACK,
+        event["sessionId"], DURABLE_FALLBACK,
         "post-rebind envelopes must be stamped with the durable id"
     );
 }

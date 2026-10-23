@@ -178,10 +178,10 @@ async fn sidecar_log_records_reach_the_server_log(kind: RigKind) {
 }
 
 /// Every attention edge is logged as it leaves the server (G14, design §5.5):
-/// a forwarded sidecar `turn.complete` is the info event
+/// the `turn.complete` the server mints for a result (C18) is the info event
 /// `freshagent.turn.complete` with the session, its type, the source and the
 /// edge's `at`.
-async fn a_forwarded_turn_complete_is_logged(kind: RigKind) {
+async fn a_minted_turn_complete_is_logged(kind: RigKind) {
     let logs = log_capture::install();
     let rig = ClaudeRig::start(kind).await;
     let mut conn = rig.connect().await;
@@ -202,7 +202,7 @@ async fn a_forwarded_turn_complete_is_logged(kind: RigKind) {
     assert_eq!(logged.level, Level::INFO, "{logged:?}");
     assert_eq!(logged.field("provider"), Some("claude"));
     assert_eq!(logged.field("session_type"), Some("freshclaude"));
-    assert_eq!(logged.field("source"), Some("freshclaude/sidecar"));
+    assert_eq!(logged.field("source"), Some("result"));
     assert_eq!(logged.field("at"), Some(at.as_str()));
 
     conn.kill(&session_id).await;
@@ -528,14 +528,14 @@ mod sim {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_forwarded_turn_complete_is_logged() {
-        super::a_forwarded_turn_complete_is_logged(RigKind::Sim).await;
+    async fn a_minted_turn_complete_is_logged() {
+        super::a_minted_turn_complete_is_logged(RigKind::Sim).await;
     }
 
-    /// A forwarded `turn.waiting` (a question raised mid-turn) is logged as
-    /// `freshagent.turn.waiting`.
+    /// The `turn.waiting` the server mints for a question raised mid-turn
+    /// (C18) is logged as `freshagent.turn.waiting`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_forwarded_turn_waiting_is_logged() {
+    async fn a_minted_turn_waiting_is_logged() {
         let logs = log_capture::install();
         let program = json!({ "rules": [{
             "on": "msg:prompt", "match": { "text": "please ask" },
@@ -566,7 +566,7 @@ mod sim {
         assert_eq!(logged.level, Level::INFO, "{logged:?}");
         assert_eq!(logged.field("provider"), Some("claude"));
         assert_eq!(logged.field("session_type"), Some("freshclaude"));
-        assert_eq!(logged.field("source"), Some("freshclaude/sidecar"));
+        assert_eq!(logged.field("source"), Some("pending"));
         assert_eq!(logged.field("at"), Some(at.as_str()));
         conn.kill(&session_id).await;
     }
@@ -606,8 +606,8 @@ mod cli {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_forwarded_turn_complete_is_logged() {
-        super::a_forwarded_turn_complete_is_logged(RigKind::Cli).await;
+    async fn a_minted_turn_complete_is_logged() {
+        super::a_minted_turn_complete_is_logged(RigKind::Cli).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

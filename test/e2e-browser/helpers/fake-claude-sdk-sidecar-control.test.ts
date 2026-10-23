@@ -1,8 +1,9 @@
 // Unit coverage for the AGENT-04/05/06 arms of the HARNESS-03 fake claude-SDK
 // sidecar (`test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs`):
-// permission.respond/question.respond pending-resolution (waiting edge
-// re-fires), interrupt-time pending cancellation (cancel frames, never an
-// sdk.exit), the parked-turn rule (no canned completion while parked), the
+// permission.respond/question.respond pending-resolution, interrupt-time
+// pending cancellation (cancel frames, never an sdk.exit), the result facts
+// the server's verdict reads (C18: the fake mints no attention edge, like the
+// real sidecar), the parked-turn rule (no canned completion while parked), the
 // stream-error lane's exit (the real sidecar's end of stream), the
 // FRESHELL_FAKE_STDIN raw-stdin audit, and the durable-transcript writes the
 // reload-while-pending snapshot route depends on. Process/wire-level contract
@@ -147,7 +148,7 @@ const RAISE_PROGRAM = {
 
 describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)', () => {
   it(
-    'responds resolve the parked request and the waiting edge re-fires on a later raise',
+    'responds resolve the parked requests; the fake mints no waiting or completion edge (the server does, C18)',
     async () => {
       const stdinLog = path.join(tmp, 'stdin.jsonl')
       const fx = launch(RAISE_PROGRAM, { FRESHELL_FAKE_STDIN: stdinLog })
@@ -164,38 +165,32 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
           subtype: 'can_use_tool',
           tool: { name: 'Bash', input: { command: 'ls' } },
         })
-        // Parked: NO completion frame may arrive before the respond.
-        expect(fx.stdoutLines().some((o) => o.type === 'sdk.turn.complete')).toBe(false)
-        expect(
-          fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting'),
-          'first raise emits the 0->>=1 waiting edge exactly once',
-        ).toHaveLength(1)
+        // Parked: NO result may arrive before the respond.
+        expect(fx.stdoutLines().some((o) => o.type === 'sdk.result')).toBe(false)
 
         // A second CONCURRENT raise (distinct request id, like the real
-        // sidecar's nanoid mint) while parked must NOT re-fire the edge.
+        // sidecar's nanoid mint) while parked.
         fx.send({ type: 'send', sessionId, text: 'RAISE_PERMISSION_2' })
         await fx.waitLine((o) => o.type === 'sdk.permission.request' && o.requestId === 'req-perm-2', 'second permission.request')
-        expect(fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting')).toHaveLength(1)
 
-        // Resolving BOTH parked requests returns pending to 0, so the NEXT
-        // raise crosses 0->>=1 again and the edge re-fires — the proof the
-        // respond arm decrements the counter (pre-fix: reset only by interrupt).
+        // Each respond resolves its own parked request and its turn ends.
         fx.send({ type: 'permission.respond', sessionId, requestId: 'req-perm-1', decision: { behavior: 'allow' } })
-        await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'turn completion after allow')
+        await fx.waitLine((o) => o.type === 'sdk.result', 'turn result after allow')
         fx.send({ type: 'permission.respond', sessionId, requestId: 'req-perm-2', decision: { behavior: 'allow' } })
         await fx.waitLine(
-          (o) => o.type === 'sdk.turn.complete' && fx.stdoutLines().filter((r) => r.type === 'sdk.turn.complete').length >= 2,
-          'second turn completion',
+          (o) => o.type === 'sdk.result' && fx.stdoutLines().filter((r) => r.type === 'sdk.result').length >= 2,
+          'second turn result',
         )
         fx.send({ type: 'send', sessionId, text: 'RAISE_PERMISSION' })
         await fx.waitLine(
           (o) => o.type === 'sdk.permission.request' && fx.stdoutLines().filter((r) => r.type === 'sdk.permission.request').length === 3,
           'third permission.request',
         )
+        // The server folds these requests and results into its own edges.
         expect(
-          fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting'),
-          'a respond decrements pending, so the next raise re-fires sdk.turn.waiting',
-        ).toHaveLength(2)
+          fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting' || o.type === 'sdk.turn.complete'),
+          'the fake mints no attention edge',
+        ).toEqual([])
 
         // Raw-stdin audit: both respond frames landed verbatim in the
         // fixture's log (exactly the frames this test wrote — zero fabricated).
@@ -227,26 +222,20 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
 
       fx.send({ type: 'send', sessionId, text: 'RAISE_PERMISSION' })
       await fx.waitLine((o) => o.type === 'sdk.permission.request', 'permission.request')
-      expect(fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting')).toHaveLength(1)
 
       // Resolve a requestId that was NEVER raised. (deny matches no
       // RAISE_PROGRAM rule, so this respond emits nothing else; only the
       // resolvePending ledger bookkeeping runs.)
       fx.send({ type: 'permission.respond', sessionId, requestId: 'req-never-raised', decision: { behavior: 'deny' } })
 
-      // The ledger must still hold the real parked request: the next raise
-      // crosses NO 0->>=1 boundary, so no second waiting edge may fire.
-      // Pre-fix resolvePending decremented `pending` on ANY respond, so the
-      // re-raise below re-fired sdk.turn.waiting (pending desync).
-      fx.send({ type: 'send', sessionId, text: 'RAISE_PERMISSION_2' })
-      await fx.waitLine(
-        (o) => o.type === 'sdk.permission.request' && o.requestId === 'req-perm-2',
-        'second permission.request',
-      )
+      // The ledger must still hold the real parked request: an interrupt
+      // cancels exactly it, and nothing for the foreign id.
+      fx.send({ type: 'interrupt', sessionId, stopId: 'stop-1' })
+      await fx.waitLine((o) => o.type === 'sdk.interrupt_settled', 'the settle')
       expect(
-        fx.stdoutLines().filter((o) => o.type === 'sdk.turn.waiting'),
-        'the foreign respond must not have decremented pending (no spurious waiting-edge re-fire)',
-      ).toHaveLength(1)
+        fx.stdoutLines().filter((o) => o.type === 'sdk.permission.cancelled').map((o) => o.requestId),
+        'the foreign respond must not have resolved the real parked request',
+      ).toEqual(['req-perm-1'])
     } finally {
       await fx.stop()
     }
@@ -265,13 +254,16 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       fx.send({ type: 'send', sessionId, text: 'RAISE_QUESTION' })
       await fx.waitLine((o) => o.type === 'sdk.question.request', 'question.request')
 
-      fx.send({ type: 'interrupt', sessionId })
+      fx.send({ type: 'interrupt', sessionId, stopId: 'stop-1' })
       const cancelledPermission = await fx.waitLine((o) => o.type === 'sdk.permission.cancelled', 'sdk.permission.cancelled')
       expect(cancelledPermission).toMatchObject({ sessionId, requestId: 'req-perm-1' })
       const cancelledQuestion = await fx.waitLine((o) => o.type === 'sdk.question.cancelled', 'sdk.question.cancelled')
       expect(cancelledQuestion).toMatchObject({ sessionId, requestId: 'req-q-1' })
-      // The interrupted turn ends with its own (aborted) result, like the real CLI's (T11).
-      await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error_during_execution', 'the interrupted turn result')
+      // The receipt echoes the Stop's id, and the interrupted turn ends with
+      // its own aborted result, like the real CLI's (T11).
+      expect(await fx.waitLine((o) => o.type === 'sdk.interrupt_settled', 'the settle')).toMatchObject({ sessionId, stopId: 'stop-1', ok: true })
+      const stopped = await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error_during_execution', 'the interrupted turn result')
+      expect(stopped).toMatchObject({ subtype: 'error_during_execution', isError: true, terminalReason: 'aborted_streaming' })
 
       // AGENT-03 separation: interrupt ends the turn, never the session.
       expect(fx.stdoutLines().some((o) => o.type === 'sdk.exit')).toBe(false)
@@ -285,13 +277,13 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
 
       // The session is still usable: a plain send completes normally.
       fx.send({ type: 'send', sessionId, text: 'plain follow-up' })
-      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'post-interrupt completion')
+      await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'success', 'post-interrupt completion')
     } finally {
       await fx.stop()
     }
   })
 
-  it('a deny/errored completion emits sdk.result AND the unified attention edge, and no per-turn idle (needs-attention)', async () => {
+  it('a deny/errored completion emits sdk.result with its facts, no edge (the server rings it) and no per-turn idle', async () => {
     const eventsLog = path.join(tmp, 'events.jsonl')
     const fx = launch({
       rules: [
@@ -320,31 +312,15 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       expect(fx.stdoutLines().some((o) => o.type === 'sdk.turn.complete')).toBe(false)
 
       fx.send({ type: 'permission.respond', sessionId, requestId: 'req-perm-1', decision: { behavior: 'deny' } })
-      // Race-free: the errored sdk.result is the terminal marker for the deny
-      // continuation (its edge renders synchronously after it).
-      await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error', 'errored sdk.result')
-
-      // Unified needs-attention contract: a deny is an ERROR TURN END, so the
-      // fake (mirroring the real sidecar's gate) rings the SAME attention
-      // edge a success would — exactly one, minted after the errored result,
-      // with a finite numeric monotonic `at`.
-      const denyEdge = await fx.waitLine(
-        (o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId,
-        'the deny turn.complete attention edge',
-      )
-      expect(typeof denyEdge.at).toBe('number')
-      expect(Number.isFinite(denyEdge.at)).toBe(true)
+      // The errored sdk.result is the terminal marker for the deny
+      // continuation: it carries the facts the server's verdict reads.
+      const errored = await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error', 'errored sdk.result')
+      expect(errored).toMatchObject({ sessionId, subtype: 'error', isError: true })
       const out = fx.stdoutLines()
-      expect(
-        out.filter((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId),
-        'exactly one attention edge for the denied turn',
-      ).toHaveLength(1)
       const resultIdx = out.findIndex(
         (o) => o.type === 'sdk.result' && o.result === 'error' && o.sessionId === sessionId,
       )
-      const denyEdgeIdx = out.findIndex((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId)
       expect(resultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
-      expect(denyEdgeIdx, 'the edge follows the errored result in stream order').toBeGreaterThan(resultIdx)
       // Like the real sidecar, the turn ends with its result alone: no idle
       // follows it (the real sidecar sends no idle at all).
       expect(
@@ -360,33 +336,24 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       // The outbound wire audit records exactly what went over stdout.
       const wires = readJsonl(eventsLog).filter((r) => r.kind === 'wire')
       expect(
-        wires.filter((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === sessionId),
-        'the wire audit too shows the deny turn.complete edge on stdout',
+        wires.filter((r) => r.frame?.type === 'sdk.result' && r.frame?.sessionId === sessionId),
+        'the wire audit shows the errored result on stdout',
       ).toHaveLength(1)
 
-      // A plain turn still completes the positive way (fidelity pin):
-      // sdk.result{success} AND its own second attention edge, with a
-      // strictly-greater `at` (the shared monotonic clock). NB: match the
-      // SECOND edge by its `at` — a count-based predicate would resolve to
-      // the FIRST edge the moment two exist.
+      // A plain turn still completes the positive way (fidelity pin).
       fx.send({ type: 'send', sessionId, text: 'plain follow-up' })
-      const successEdge = await fx.waitLine(
-        (o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId && Number(o.at) > denyEdge.at,
-        'the follow-up success turn rings its own edge',
-      )
-      expect(successEdge.at, 'the shared monotonic clock keeps same-ms edges strictly increasing').toBeGreaterThan(denyEdge.at)
-      const out2 = fx.stdoutLines()
-      expect(out2.some((o) => o.type === 'sdk.result' && o.result === 'success')).toBe(true)
+      const success = await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'success', 'the follow-up success result')
+      expect(success).toMatchObject({ subtype: 'success', isError: false, terminalReason: 'completed' })
       expect(
-        out2.filter((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId),
-        'two turns, two edges — one per turn end',
-      ).toHaveLength(2)
+        fx.stdoutLines().filter((o) => o.type === 'sdk.turn.complete' || o.type === 'sdk.turn.waiting'),
+        'the fake mints no attention edge',
+      ).toEqual([])
     } finally {
       await fx.stop()
     }
   })
 
-  it('an interrupt on an idle session settles ok:true (SDK resolution) and the next turn ring survives (task-004 F-I1)', async () => {
+  it('an interrupt on an idle session settles ok:true (SDK resolution) with its stopId, and the next turn runs', async () => {
     const fx = launch({ rules: [] })
     try {
       fx.send({ type: 'create', requestId: 'req-1', cwd: tmp })
@@ -398,39 +365,37 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       // idle-session interrupt (sdk.d.ts:2384-2394 — resolution, not
       // rejection; the ok:false 'no in-flight SDK query' shape fires only
       // when the SDK surface lacks the interrupt method entirely), so the
-      // real sidecar settles ok:true and arms NOTHING. The fake must mirror
-      // that shape — and no stray mark may eat the NEXT unrelated turn ring.
-      fx.send({ type: 'interrupt', sessionId })
+      // real sidecar settles ok:true. The fake must mirror that shape.
+      fx.send({ type: 'interrupt', sessionId, stopId: 'stop-idle' })
       const settle = await fx.waitLine((o) => o.type === 'sdk.interrupt_settled', 'idle interrupt settle')
-      expect(settle).toMatchObject({ sessionId, ok: true })
+      expect(settle).toMatchObject({ sessionId, stopId: 'stop-idle', ok: true })
 
       fx.send({ type: 'send', sessionId, text: 'next unrelated turn' })
-      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'the next turn still rings')
+      await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'success', 'the next turn runs')
     } finally {
       await fx.stop()
     }
   })
 
-  it('an interrupt against a dead session answers the session-not-found error, never a settle (real-sidecar parity, task-008)', async () => {
+  it('an interrupt against a dead session settles ok:false, never a fabricated ok:true (real-sidecar parity)', async () => {
     const fx = launch({ rules: [] })
     try {
       // No create ever ran: the session id is unknown. The REAL sidecar's
-      // handleInterrupt answers the session-scoped error frame
-      // (index.mjs: `if (!st) { emit sdk.error sessionNotFound } }`) and
-      // returns — never a fabricated ok:true settle. The kilroy fake already
-      // mirrors this; the claude fake must too.
-      fx.send({ type: 'interrupt', sessionId: 'never-created' })
-      const err = await fx.waitLine((o) => o.type === 'sdk.error', 'dead-session interrupt error')
-      expect(err).toMatchObject({ sessionId: 'never-created', sessionNotFound: true })
+      // handleInterrupt refuses it: its receipt is ok:false, echoing the
+      // Stop's id (index.mjs). The kilroy fake mirrors this; the claude fake
+      // must too.
+      fx.send({ type: 'interrupt', sessionId: 'never-created', stopId: 'stop-x' })
+      const settle = await fx.waitLine((o) => o.type === 'sdk.interrupt_settled', 'dead-session interrupt settle')
+      expect(settle).toMatchObject({ sessionId: 'never-created', stopId: 'stop-x', ok: false })
       const out = fx.stdoutLines()
-      expect(out.filter((o) => o.type === 'sdk.interrupt_settled'), 'no settle for a dead session').toEqual([])
+      expect(out.filter((o) => o.type === 'sdk.error'), 'no error frame for a dead session').toEqual([])
       expect(out.filter((o) => o.type === 'sdk.status'), 'no fabricated activity for a dead session').toEqual([])
     } finally {
       await fx.stop()
     }
   })
 
-  it('the stream-error lane ends the sidecar like the real one: one edge, sdk.stream.ended last, exit code 3', async () => {
+  it('the stream-error lane ends the sidecar like the real one: sdk.stream.ended last, exit code 3, no edge', async () => {
     const fx = launch({
       rules: [
         { on: 'msg:send', match: { text: 'DIE' }, emit: [{ kind: 'stream-error' }] },
@@ -442,18 +407,19 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       const sessionId = created.sessionId as string
       const exited = new Promise<number | null>((resolve) => fx.proc.once('exit', (code) => resolve(code)))
 
-      // The stream ends mid-turn: the finally-mint edge fires (the send was
-      // accepted, pendingResults > 0), then the end report, then the exit.
+      // The stream ends mid-turn: the end report, then the exit. The server
+      // rings the cut-off turn (C18), not the fake.
       fx.send({ type: 'send', sessionId, text: 'DIE' })
       expect(await exited).toBe(3)
       const out = fx.stdoutLines()
       expect(out.at(-1)).toEqual({ type: 'sdk.stream.ended', sessionId, reason: 'stream_error', message: 'Fixture stream error' })
-      expect(out.filter((o) => o.type === 'sdk.turn.complete'), 'exactly the result-less turn end rings').toHaveLength(1)
+      expect(out.filter((o) => o.type === 'sdk.turn.complete'), 'the fake mints no edge').toEqual([])
       expect(out.filter((o) => o.type === 'sdk.result'), 'the turn ended with no result').toEqual([])
       expect(out.filter((o) => o.type === 'sdk.error'), 'the end report carries the cause; no error frame repeats it').toEqual([])
-      const edgeIdx = out.findIndex((o) => o.type === 'sdk.turn.complete')
+      const turnOpened = out.findLastIndex((o) => o.type === 'sdk.status' && o.status === 'running')
+      expect(turnOpened, 'the send opened its turn').toBeGreaterThanOrEqual(0)
       expect(
-        out.slice(edgeIdx).filter((o) => o.type === 'sdk.status'),
+        out.slice(turnOpened + 1).filter((o) => o.type === 'sdk.status'),
         'no stream-end status: the server reports the ended session as exited',
       ).toEqual([])
     } finally {
@@ -474,7 +440,7 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       expect(fs.existsSync(transcript), 'create must ensure the durable transcript file').toBe(true)
 
       fx.send({ type: 'send', sessionId: created.sessionId, text: 'hello durable world' })
-      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'completion')
+      await fx.waitLine((o) => o.type === 'sdk.result', 'completion')
 
       const lines = readJsonl(transcript)
       expect(lines.map((l) => l.type)).toEqual(['user', 'assistant'])
@@ -501,10 +467,10 @@ describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', ()
       'sdk.session.init ORIG',
     )
     fx.send({ type: 'send', sessionId: created.sessionId, text: 'turn one' })
-    await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'turn one completion')
+    await fx.waitLine((o) => o.type === 'sdk.result', 'turn one completion')
     fx.send({ type: 'send', sessionId: created.sessionId, text: 'turn two' })
     await fx.waitLine(
-      (o) => o.type === 'sdk.turn.complete' && fx.stdoutLines().filter((r) => r.type === 'sdk.turn.complete').length >= 2,
+      (o) => o.type === 'sdk.result' && fx.stdoutLines().filter((r) => r.type === 'sdk.result').length >= 2,
       'turn two completion',
     )
     return { sessionId: created.sessionId as string, cliSessionId: init.cliSessionId as string }

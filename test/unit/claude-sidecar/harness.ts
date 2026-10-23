@@ -14,6 +14,7 @@
 // and its directory removed when the calling test finishes.
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -70,6 +71,17 @@ export interface StartRealSidecarOptions {
 
 type Predicate = (frame: SidecarFrame) => boolean
 
+/**
+ * The server mints a uuid for every `send` it writes (protocol v2: the uuid
+ * the CLI keeps for the command and its user line). The harness plays the
+ * server, so a `send` written without a `uuid` key gets a fresh one; a test
+ * that means to leave it out passes the key itself (for example `uuid: null`).
+ */
+function withSendUuid(message: object): object {
+  const request = message as Record<string, unknown>
+  return request.type === 'send' && !Object.hasOwn(request, 'uuid') ? { ...request, uuid: randomUUID() } : message
+}
+
 export interface RealSidecar {
   child: ChildProcess
   /** The isolated workspace: the default `cwd` of `create`. */
@@ -79,7 +91,7 @@ export interface RealSidecar {
   /** Every stdout frame so far, in arrival order. */
   frames: SidecarFrame[]
   stderr(): string
-  /** Write one request line. */
+  /** Write one request line (a `send` without a `uuid` gets one, as the server mints it). */
   send(message: object): void
   /**
    * Write several request lines in ONE write. They reach the sidecar in one
@@ -164,7 +176,7 @@ export async function startRealSidecar(options: StartRealSidecarOptions = {}): P
   let requests = 0
   const stderr = () => stderrText
   const write = (messages: object[]) => {
-    child.stdin!.write(messages.map((message) => `${JSON.stringify(message)}\n`).join(''))
+    child.stdin!.write(messages.map((message) => `${JSON.stringify(withSendUuid(message))}\n`).join(''))
   }
 
   const waitFor = (match: string | Predicate, label?: string, timeoutMs = DEFAULT_TIMEOUT_MS) => {

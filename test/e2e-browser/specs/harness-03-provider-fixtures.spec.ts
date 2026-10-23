@@ -244,8 +244,6 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
       fixture.proc.stdin?.write(
         `${JSON.stringify({ type: 'send', sessionId, text: 'please approve' })}\n`,
       )
-      const waiting = await readSidecarLine(fixture, (o) => o.type === 'sdk.turn.waiting', 'sdk.turn.waiting')
-      expect(typeof waiting.at).toBe('number')
       const perm = await readSidecarLine(fixture, (o) => o.type === 'sdk.permission.request', 'sdk.permission.request')
       expect(perm).toMatchObject({
         sessionId,
@@ -256,14 +254,13 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
       const question = await readSidecarLine(fixture, (o) => o.type === 'sdk.question.request', 'sdk.question.request')
       expect(question.requestId).toBe('q-1')
       expect(question.questions[0]).toMatchObject({ question: 'which file should I edit?', multiSelect: false })
-      const complete = await readSidecarLine(fixture, (o) => o.type === 'sdk.turn.complete', 'sdk.turn.complete')
-      // D1-F2: sdk.turn.complete now mirrors the REAL protocol shape
-      // {sessionId, at} exactly (the fixture `subtype` extension is gone) —
-      // per-turn success/error truth lives on the always-emitted sdk.result.
-      expect(complete.subtype).toBeUndefined()
-      expect(typeof complete.at).toBe('number')
+      // The turn's result carries the facts the server's verdict reads; like
+      // the real sidecar (C18) the fixture mints no attention edge: the server
+      // rings the result and the waiting edge itself.
       const result = await readSidecarLine(fixture, (o) => o.type === 'sdk.result', 'sdk.result')
-      expect(result.result).toBe('success')
+      expect(result).toMatchObject({ result: 'success', subtype: 'success', isError: false, terminalReason: 'completed' })
+      expect(fixture.stdout).not.toContain('"sdk.turn.complete"')
+      expect(fixture.stdout).not.toContain('"sdk.turn.waiting"')
       expect((await readSidecarLine(fixture, (o) => o.type === 'sdk.status' && o.status === 'idle', 'idle')).sessionId).toBe(sessionId)
 
       // The ledger also carries `kind:'wire'` outbound-frame audit rows
@@ -302,7 +299,7 @@ for (const provider of ['kilroy', 'freshclaude'] as const) {
 
       // interrupt + shutdown are part of the real protocol surface.
       const created = await readSidecarLine(fixture, (o) => o.type === 'created', 'created')
-      fixture.proc.stdin?.write(JSON.stringify({ type: 'interrupt', sessionId: created.sessionId }) + '\n')
+      fixture.proc.stdin?.write(JSON.stringify({ type: 'interrupt', sessionId: created.sessionId, stopId: 'stop-1' }) + '\n')
       fixture.proc.stdin?.write(JSON.stringify({ type: 'shutdown' }) + '\n')
       expect(await fixture.exited()).toBe(0)
     })

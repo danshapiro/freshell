@@ -100,7 +100,7 @@ async fn fake_session(
     });
     let session = ClaudeSession {
         configuration: ClaudeConfiguration::default(),
-        stdin,
+        stdin: stdin.into(),
         child,
         tree_guard,
         ownership_id: format!("test-teardown-{session_id}"),
@@ -111,12 +111,9 @@ async fn fake_session(
         owning_generation: None,
         broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
         pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
-        in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
-        last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
+        ledger: crate::claude_turns::SharedLedger::default(),
+        clock: crate::attention::AttentionClock::default(),
         turn_lock: Arc::new(TokioMutex::new(())),
-        rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-        last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
         launch_genesis: None,
     };
     (session, ready)

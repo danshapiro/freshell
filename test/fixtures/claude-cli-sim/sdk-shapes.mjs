@@ -29,6 +29,9 @@ export const T = {
   heartbeat: 30_000,
   subagent: 2000,
   agentLaunch: 50,
+  // How long a cold command (FRESHELL_CLAUDE_SIM_COLD_COMMAND) waits for a
+  // Stop to miss it before it goes on.
+  coldStart: 1500,
 }
 
 export const TOOL_REJECTED = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."

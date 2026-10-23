@@ -9,8 +9,8 @@
 //! sidecar through the same process-tree stop every teardown uses (`claude.rs`
 //! `SidecarProcesses::stop`, which reaps node's exit status), reports the
 //! [`SidecarExitCause`] to the user in `freshAgent.error{SIDECAR_EXITED}`, logs it
-//! as `freshagent.claude.sidecar_exit`, and decides whether the lost turn rings
-//! ([`death_rings`]).
+//! as `freshagent.claude.sidecar_exit`, and rings the lost turn when one was
+//! owed (C18: however the sidecar ended; it reports no edge of its own).
 
 use std::process::ExitStatus;
 
@@ -123,14 +123,6 @@ pub(crate) fn describe_status(status: Option<ExitStatus>) -> String {
         (None, Some(signal)) => signal,
         (None, None) => "unknown".to_string(),
     }
-}
-
-/// Whether the end-of-output path rings for a lost turn. Interim (C08 until Rust
-/// mints every edge, C18): the sidecar rings a turn that ends with no result before
-/// it reports the stream end, so the server rings only when there was no report —
-/// a Node death — and a turn was running.
-pub(crate) fn death_rings(turn_was_in_flight: bool, cause: &SidecarExitCause) -> bool {
-    turn_was_in_flight && matches!(cause, SidecarExitCause::ProcessEnded(_))
 }
 
 /// The `freshAgent.error{SIDECAR_EXITED}` event for `session_id`.
@@ -278,17 +270,6 @@ mod tests {
             other.to_json()["signal"],
             format!("signal {}", libc::SIGUSR1)
         );
-    }
-
-    #[test]
-    fn only_an_unreported_death_mid_turn_rings() {
-        let node_death = SidecarExitCause::new(None, None);
-        assert!(death_rings(true, &node_death));
-        assert!(!death_rings(false, &node_death), "an idle death is silent");
-        // The sidecar already rang the turn before it reported the end (interim).
-        assert!(!death_rings(true, &ended("cli_exited", "x")));
-        assert!(!death_rings(true, &ended("stream_eof", "")));
-        assert!(!death_rings(false, &ended("stream_error", "x")));
     }
 
     #[test]

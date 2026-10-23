@@ -30,16 +30,42 @@ export async function configureSession(session, requested, { busy = false } = {}
   return { ...next }
 }
 
-export function userMessageContent(text, images = []) {
-  const content = [{ type: 'text', text }]
-  for (const image of images ?? []) {
-    if (image.kind === 'data' || image.kind == null) {
-      content.push({ type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.data } })
-    } else if (image.kind === 'url') {
-      content.push({ type: 'image', source: { type: 'url', url: image.url } })
-    } else {
-      throw new Error('This image attachment cannot be read by Claude. Attach the file again.')
+/** The send-rejection code for an image the sidecar will not hand to the CLI. */
+export const INVALID_IMAGE = 'INVALID_IMAGE'
+
+/** The image types the Claude Messages API reads. */
+const READABLE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/
+const UNREADABLE_IMAGE = 'This image attachment cannot be read by Claude. Attach the file again.'
+
+function invalidImage(message) {
+  const error = new Error(message)
+  error.code = INVALID_IMAGE
+  return error
+}
+
+/** One image as a content block; throws an INVALID_IMAGE error for one Claude cannot read. */
+function imageBlock(image) {
+  if (image?.kind === 'data' || (image != null && image.kind == null)) {
+    if (typeof image.mediaType !== 'string' || !READABLE_IMAGE_TYPES.has(image.mediaType)) {
+      const what = typeof image.mediaType === 'string' && image.mediaType ? image.mediaType : 'this attachment'
+      throw invalidImage(`Claude cannot read ${what} as an image. Attach a PNG, JPEG, GIF or WebP image.`)
     }
+    if (typeof image.data !== 'string' || !BASE64.test(image.data)) throw invalidImage(UNREADABLE_IMAGE)
+    return { type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.data } }
   }
-  return content
+  if (image?.kind === 'url' && typeof image.url === 'string' && /^https?:\/\//i.test(image.url)) {
+    return { type: 'image', source: { type: 'url', url: image.url } }
+  }
+  throw invalidImage(UNREADABLE_IMAGE)
+}
+
+/**
+ * The content of a user message: the text, then each image. An image Claude
+ * cannot read (an unsupported type, missing or non-base64 data, an unknown
+ * kind, a URL that is not http or https) throws an error whose `code` is
+ * INVALID_IMAGE, before anything reaches the CLI.
+ */
+export function userMessageContent(text, images = []) {
+  return [{ type: 'text', text }, ...(images ?? []).map(imageBlock)]
 }

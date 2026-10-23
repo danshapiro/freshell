@@ -36,9 +36,13 @@
 //! [`FreshAgentState::shutdown`] (SIGTERM + the `/proc` ownership sweep) and, as a
 //! backstop, by the harness sentinel sweep — no orphans.
 
+/// The per-session attention clock and edge builders shared by the fresh-agent
+/// lanes (design 2026-10-22 §3.2, §5.5).
+pub(crate) mod attention;
 pub mod claude;
 pub mod claude_create_defaults;
 pub(crate) mod claude_dead_sessions;
+pub(crate) mod claude_edges;
 pub mod claude_freshell_mcp;
 pub(crate) mod claude_handshake;
 pub(crate) mod claude_launch;
@@ -51,6 +55,7 @@ pub(crate) mod claude_sidecar_io;
 pub(crate) mod claude_snapshot;
 pub mod claude_spawn;
 pub(crate) mod claude_test_holds;
+pub(crate) mod claude_turns;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
 pub(crate) mod delegation;
@@ -68,6 +73,9 @@ mod pane_resize;
 #[cfg(all(test, unix))]
 #[path = "../tests/support/process_probe.rs"]
 mod process_probe;
+/// The wedged-runtime quiet deadman shared by the fresh-agent lanes (design
+/// 2026-10-22 §3.2, §5.6).
+pub(crate) mod quiet_deadman;
 pub mod rest_lane;
 pub mod rollback_record;
 pub mod session_handoff;
@@ -81,7 +89,9 @@ pub mod terminal_tabs;
 #[cfg(test)]
 mod test_environment;
 
-pub use claude::{ClaudeCreateOutcome, FreshClaudeState};
+pub use claude::{ClaudeCreateOutcome, ClaudeSendOutcome, FreshClaudeState};
+pub use claude_edges::{AttentionObserver, ClaudeTurnEvent};
+pub use claude_turns::TurnOutcome;
 // Kata 09v1 + SYNC-06 + G28: the claude_snapshot items visible outside this
 // crate — the ONE shared claude store-root rule (`claude_home_candidates`,
 // also read by freshell-ws's PTY truth probe), the three-state transcript

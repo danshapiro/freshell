@@ -362,8 +362,73 @@ fn field<'a>(fields: &'a capture::Fields, name: &str) -> Option<&'a str> {
 /// C08 + G31: a sidecar whose SDK stream ended reports it and exits 3. Its
 /// whole tree (the CLI stand-in in its group AND the one that left the group)
 /// is dead by the time the pane hears `exited`, with no waiting on the test's
-/// side; the pane hears it once, with the reported cause, and nothing rings
-/// (the sidecar rings a cut-off turn itself before it reports the end).
+/// side; the pane hears it once, with the reported cause, and the cut-off turn
+/// rings exactly once, from Rust (C18: the sidecar mints no edge of its own).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn eof_drains_old_waiting_before_reaping_and_preserves_a_replacements_waiting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Default)]
+    struct Observer(AtomicBool);
+    impl crate::claude_edges::AttentionObserver for Observer {
+        fn on_waiting(&self, _: &str, _: &str, _: i64) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn on_pending_drained(&self, _: &str) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let mut session = EndingSession::start("stream-ends", None).await;
+    let observer = Arc::new(Observer::default());
+    session.st.clone().with_attention_observer(observer.clone());
+    let pending = session.st.sessions.lock().await[&session.pane]
+        .pending
+        .clone();
+    session
+        .st
+        .publish_pending_frame(
+            &session.pane,
+            &pending,
+            &json!({"type":"sdk.permission.request", "requestId":"old", "tool":{"name":"Bash"}}),
+            "freshclaude",
+        )
+        .await;
+    assert!(observer.0.load(Ordering::SeqCst));
+    let hold = session.st.hold_exit_reports();
+    session
+        .st
+        .handle_send(send_msg(&session.pane, "end while waiting"))
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), hold.parked())
+        .await
+        .unwrap();
+    let old_waiting_was_drained = !observer.0.load(Ordering::SeqCst);
+
+    // A resumed runtime raises another request while the old process tree is
+    // still being reaped. Finishing that old death must not drain this interval.
+    tests::insert_fake_claude_session_with_pending(&session.st, &session.pane, None, &[]).await;
+    let replacement = session.st.sessions.lock().await[&session.pane]
+        .pending
+        .clone();
+    session.st.publish_pending_frame(&session.pane, &replacement,
+        &json!({"type":"sdk.question.request", "requestId":"new", "questions":[{"question":"Continue?"}]}),
+        "freshclaude").await;
+    hold.release();
+    session
+        .await_frame("the old lost turn's edge", is_turn_complete)
+        .await;
+    let new_waiting_survived = observer.0.load(Ordering::SeqCst);
+    session.st.shutdown().await;
+    assert!(
+        old_waiting_was_drained,
+        "EOF must drain old pending attention before teardown awaits"
+    );
+    assert!(
+        new_waiting_survived,
+        "old teardown must not clear the resumed runtime's waiting interval"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_stream_end_is_reported_once_its_whole_tree_is_confirmed_gone() {
@@ -403,8 +468,8 @@ async fn a_stream_end_is_reported_once_its_whole_tree_is_confirmed_gone() {
     assert_eq!(session.count(is_sidecar_exited), 1, "{:?}", session.frames);
     assert_eq!(
         session.count(is_turn_complete),
-        0,
-        "a reported stream end rings nothing from Rust: {:?}",
+        1,
+        "the cut-off turn rings once: {:?}",
         session.frames
     );
     assert!(session.st.dead_sessions.find(&session.pane).is_some());
@@ -415,7 +480,7 @@ async fn a_stream_end_is_reported_once_its_whole_tree_is_confirmed_gone() {
     assert_eq!(field(&logged[0], "stop"), Some("abnormal_exit"));
     assert_eq!(field(&logged[0], "confirmation"), Some("confirmed"));
     assert_eq!(field(&logged[0], "exit_status"), Some("code 3"));
-    assert_eq!(field(&logged[0], "rings"), Some("false"));
+    assert_eq!(field(&logged[0], "rings"), Some("true"));
 }
 
 /// C09 + G31: node killed mid-turn reports no stream end. Its exit status is
@@ -430,14 +495,14 @@ async fn a_node_killed_mid_turn_reports_its_signal_after_the_tree_is_gone_and_ri
         .st
         .handle_send(send_msg(&session.pane, "a turn the sidecar dies in"))
         .await;
-    let in_turn = session
+    let busy = session
         .st
         .sessions
         .lock()
         .await
         .get(&session.pane)
-        .map(|live| live.in_turn.load(std::sync::atomic::Ordering::SeqCst));
-    assert_eq!(in_turn, Some(true), "the turn is in flight");
+        .map(|live| live.ledger.lock().expect("turn ledger lock").busy());
+    assert_eq!(busy, Some(true), "the turn is in flight");
 
     // SAFETY: the sidecar is this test's own child.
     unsafe {

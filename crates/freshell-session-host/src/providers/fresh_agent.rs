@@ -555,7 +555,10 @@ impl FreshAgentTransport for HostedTransport {
             }),
         };
         match &self.state {
-            ProviderState::Claude(state) => state.handle_send(send).await,
+            // The acceptance is read from the bus below, as for every provider.
+            ProviderState::Claude(state) => {
+                state.handle_send(send).await;
+            }
             ProviderState::Codex(state) => state.handle_send(send).await,
             ProviderState::Opencode { runtime, .. } => runtime.handle_send(send).await,
         }

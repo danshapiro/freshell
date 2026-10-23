@@ -25,7 +25,8 @@
 //! (`server/fresh-agent/adapters/claude/adapter.ts:163-168`'s
 //! `interrupt(sessionId) { mapMissingResult(deps.sdkBridge.interrupt(sessionId), ...) }`,
 //! `server/sdk-bridge.ts:785-793`'s `sp.query.interrupt().catch(warn)`): a known session
-//! forwards an `interrupt` request to the sidecar (observed here via a log file the fake
+//! with a turn in flight (C18: an idle Stop sends nothing) forwards an `interrupt`
+//! request to the sidecar (observed here via a log file the fake
 //! sidecar appends to -- the process-boundary analog of "the SDK's `query.interrupt()`
 //! was actually invoked"), and legacy's `mapMissingResult` throw (surfaced by
 //! `ws-handler.ts:3513-3514`'s `catch` as an `INTERNAL_ERROR` frame) is mirrored for an
@@ -58,6 +59,7 @@ static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 ///   - `{"type":"create",...}` -> replies `{"type":"created",requestId,sessionId}`
 ///     with a fresh id every call (never replays), so a genuinely-new spawn is
 ///     observable by session id alone.
+///   - `{"type":"send",...}` -> ignored: the turn stays in flight.
 ///   - `{"type":"interrupt",sessionId}` -> appends `sessionId` to
 ///     `FRESHELL_TEST_CLAUDE_INTERRUPT_LOG` (this test's observable proxy for "the
 ///     sidecar's `query.interrupt()` was actually invoked").
@@ -87,7 +89,7 @@ rl.on('line', (line) => {
     if (log) fs.appendFileSync(log, `${msg.sessionId}\n`)
     // ep4-r1 F1 wire parity: settle the awaited interrupt (the real sidecar
     // emits this after query.interrupt() resolves).
-    console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: true }))
+    console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, stopId: msg.stopId, ok: true }))
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
@@ -399,6 +401,23 @@ async fn claude_interrupt_frame_reaches_the_sidecar_for_a_known_session() {
     })
     .await;
     let session_id = created["sessionId"].as_str().unwrap().to_string();
+    // A turn in flight (the fake never answers it): C18 sends a Stop only then.
+    send_json(
+        &mut ws,
+        &serde_json::json!({
+            "type": "freshAgent.send",
+            "provider": "claude",
+            "sessionId": session_id,
+            "sessionType": "freshclaude",
+            "requestId": "req-claude-ws-send",
+            "text": "a turn to stop",
+        }),
+    )
+    .await;
+    await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "freshAgent.send.accepted" && v["requestId"] == "req-claude-ws-send"
+    })
+    .await;
 
     send_json(
         &mut ws,
