@@ -190,7 +190,17 @@ async fn local_split_uses_kilroy_and_rolls_back_a_disabled_launch() {
     assert!(command["payload"]["newContent"]
         .get("namingHandle")
         .is_none());
-    assert_eq!(send(&rig, pane, "kilroy hello").await["status"], "idle");
+    let sent = send(&rig, pane, "kilroy hello").await;
+    assert_eq!(sent["status"], "idle");
+    wait_for_saved_turn(
+        &rig,
+        sent["sessionId"].as_str().unwrap(),
+        sent["submittedTurnId"].as_str().unwrap(),
+    )
+    .await;
+    let (status, capture) = get(&rig, &format!("/api/panes/{pane}/capture")).await;
+    assert_eq!(status, 200, "{capture}");
+    assert!(capture.contains("kilroy hello"), "{capture}");
     observer.read_for(Duration::from_millis(50)).await;
     let announcements = observer
         .frames
