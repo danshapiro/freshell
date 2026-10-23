@@ -11,7 +11,8 @@ import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnC
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import { streamBatcherFor } from '@/lib/fresh-agent-stream-batcher'
-import type { LiveBlockKind, LiveStreamOp } from '@/store/freshAgentLiveTypes'
+import type { LiveBlockKind, LiveRetry, LiveStreamOp } from '@/store/freshAgentLiveTypes'
+import { assistantBlockBound, liveRetrySet, transcriptAnnounced } from '@/store/freshAgentLiveSlice'
 import {
   addPermissionRequest,
   addQuestionRequest,
@@ -367,8 +368,28 @@ function isObject(value: unknown): value is Record<string, unknown> {
  * thread (the sidecar already drops subagent events; a frame that still
  * names a parent tool use is ignored). Anything else maps to nothing.
  */
+function hasParentToolUse(frame: Record<string, unknown>): boolean {
+  return typeof frame.parentToolUseId === 'string' && frame.parentToolUseId.length > 0
+}
+
+/** A `freshAgent.retry` frame (the sidecar's `sdk.retry`), or nothing if it is malformed. */
+function parseLiveRetry(frame: Record<string, unknown>): LiveRetry | undefined {
+  if (typeof frame.attempt !== 'number' || !Number.isInteger(frame.attempt) || frame.attempt < 1) return undefined
+  const optionalNumber = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined)
+  const maxRetries = optionalNumber(frame.maxRetries)
+  const delayMs = optionalNumber(frame.delayMs)
+  const errorStatus = frame.errorStatus === null ? null : optionalNumber(frame.errorStatus)
+  return {
+    attempt: frame.attempt,
+    ...(maxRetries !== undefined ? { maxRetries } : {}),
+    ...(delayMs !== undefined ? { delayMs } : {}),
+    ...(errorStatus !== undefined ? { errorStatus } : {}),
+    ...(typeof frame.error === 'string' && frame.error ? { error: frame.error } : {}),
+  }
+}
+
 function parseLiveStreamOp(frame: Record<string, unknown>): LiveStreamOp | undefined {
-  if (typeof frame.parentToolUseId === 'string' && frame.parentToolUseId) return undefined
+  if (hasParentToolUse(frame)) return undefined
   const event = frame.event
   if (!isObject(event) || typeof event.index !== 'number') return undefined
   const messageId = typeof frame.messageId === 'string' && frame.messageId ? frame.messageId : null
@@ -427,6 +448,11 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }))
       return true
     case 'freshAgent.session.changed':
+      // A main-thread transcript line is on its way: the pane's landing check
+      // expects it in a snapshot (a subagent's lines refresh its delegation).
+      if (event.reason === 'transcript' && typeof event.uuid === 'string' && event.uuid && !hasParentToolUse(event)) {
+        dispatch(transcriptAnnounced({ ...locator, uuid: event.uuid }))
+      }
       return true
     case 'freshAgent.session.init':
       dispatch(sessionInit({
@@ -482,9 +508,23 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       return true
     }
     case 'freshAgent.assistant':
-      // Durable content comes from the snapshot (transcript-live P1); the
-      // pending stream events were applied above.
+      // Durable content comes from the snapshot (transcript-live P1). The
+      // message only names the transcript line its streamed block becomes
+      // (the pending stream events were applied above).
+      if (typeof event.uuid === 'string' && event.uuid && !hasParentToolUse(event) && Array.isArray(event.content)) {
+        dispatch(assistantBlockBound({
+          ...locator,
+          uuid: event.uuid,
+          ...(typeof event.messageId === 'string' && event.messageId ? { messageId: event.messageId } : {}),
+          content: event.content.filter(isObject),
+        }))
+      }
       return true
+    case 'freshAgent.retry': {
+      const retry = parseLiveRetry(event)
+      if (retry) dispatch(liveRetrySet({ ...locator, ...retry }))
+      return true
+    }
     case 'freshAgent.stream': {
       const op = parseLiveStreamOp(event)
       if (!op) return true
