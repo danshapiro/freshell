@@ -23,6 +23,11 @@ export function fakeOnecliGrants(providers: readonly OnecliProvider[]) {
     fs.writeFileSync(grant, `ONECLI_URL=http://127.0.0.1:10254\n${childKeys[provider]}=${fakeValue}\n`, { mode: 0o600 })
     grants[provider] = grant
     serverEnv[`FRESHELL_MANAGED_${provider.toUpperCase()}_ONECLI_ENV_FILE`] = grant
+    // The fixture owns its OneCLI inputs, so close the optional host files an
+    // operator shell may export; an empty value selects no reference. Amplifier
+    // is excluded: the runtime harness requires a defined key file to exist.
+    if (provider !== 'amplifier') serverEnv[`FRESHELL_MANAGED_${provider.toUpperCase()}_ONECLI_AUTH_FILE`] = ''
+    if (provider === 'opencode') serverEnv.FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE = ''
     childDigests[provider] = createHash('sha256').update(fakeValue).digest('hex')
   }
   return { directory, grants, serverEnv, childDigests, childKeys }

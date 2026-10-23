@@ -2104,13 +2104,13 @@ async fn main() -> ExitCode {
             )
             // Kata 09v1 zero-turn claude fallback: the SAME raw-file check
             // the attach arm trusts (claude_snapshot ordered candidate
-            // roots, CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), so
-            // reconcile and attach can never disagree about whether a
-            // claude transcript exists. Degenerate no-roots case (HOME
-            // unset etc.): locate_transcript answers None and the probe
-            // keeps the pure index answer — identical to pre-fix behavior.
+            // roots, CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform home
+            // `.claude`), so reconcile and attach can never disagree about
+            // whether a claude transcript exists. An unreadable store (or
+            // no store root at all) answers Unreadable and the probe defers
+            // with Unknown — never a dead_session (G28).
             .with_claude_transcript_locator(std::sync::Arc::new(|session_id: &str| {
-                freshell_freshagent::locate_transcript(session_id)
+                freshell_freshagent::locate_transcript_state(session_id)
             }))
             // Opencode rebind fix: the SAME by-id DB truth the attach arm
             // trusts (`opencode --session <id>` resolves children and
@@ -3514,9 +3514,10 @@ async fn main() -> ExitCode {
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.
     fresh_codex_state.shutdown().await;
-    // Reap every owned claude Node sidecar (SIGTERM → it kills its own claude CLI via the
-    // SDK abort → SIGKILL straggler + `/proc` ownership sweep) so a freshclaude T2 run
-    // leaves no orphaned sidecar or claude CLI grandchild.
+    // Stop every owned claude Node sidecar, all at once: the shutdown line (its SDK abort
+    // stops the claude CLI), then, after `claude_spawn::SERVER_STOP_GRACE` (1 s, sized to
+    // fit SHUTDOWN_HARD_TIMEOUT), SIGTERM → SIGKILL to its process tree, then the `/proc`
+    // ownership sweep, so a freshclaude T2 run leaves no orphaned sidecar or claude CLI.
     fresh_claude_state.shutdown().await;
     // DEV-0006 S4 + Task 10 retention: stop accepting codex managed-launch plans
     // (mirrors legacy's close-time `codexLaunchPlanner.shutdown()` among the shutdown

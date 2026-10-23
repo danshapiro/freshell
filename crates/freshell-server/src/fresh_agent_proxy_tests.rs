@@ -136,6 +136,204 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
     );
 }
 
+fn configure_proxy(
+    socket: &Path,
+    aliases: HashMap<(String, String), SoulId>,
+) -> (Arc<HostedFreshAgentProxy>, broadcast::Receiver<String>) {
+    let (broadcast, receiver) = broadcast::channel(16);
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(aliases),
+        presentation_ids: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
+    });
+    (proxy, receiver)
+}
+
+/// The fake supervisor must have served every expected request by now; a
+/// proxy that never called it fails here instead of hanging the suite.
+async fn settled<T>(server: tokio::task::JoinHandle<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("the proxy did not make the expected runtime calls")
+        .unwrap()
+}
+
+fn configure_command(session_id: &str) -> HostedFreshAgentCommand {
+    HostedFreshAgentCommand::Configure(
+        serde_json::from_value(serde_json::json!({
+            "provider":"claude","sessionId":session_id,"sessionType":"freshclaude",
+            "cwd":"/workspace","requestId":"configure-ui-request",
+            "settings":{"model":"opus","effort":"high","permissionMode":"acceptEdits",
+                "sandbox":"workspace-write"}
+        }))
+        .unwrap(),
+    )
+}
+
+/// Answers Health and then one configure the way `answer` decides, and
+/// returns the admin methods it saw.
+fn configure_supervisor(
+    listener: UnixListener,
+    answer: impl Fn(
+            freshell_runtime_protocol::FreshAgentConfigureRequest,
+            RequestId,
+        ) -> Result<AdminResult, freshell_runtime_protocol::RuntimeError>
+        + Send
+        + 'static,
+) -> tokio::task::JoinHandle<Vec<&'static str>> {
+    tokio::spawn(async move {
+        let mut methods = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            assert_eq!(request.role, ControlRole::Web);
+            let result = match request.body {
+                AdminCommand::Health => {
+                    methods.push("health");
+                    Ok(AdminResult::Health {
+                        control_epoch: 77,
+                        installation_id: InstallationId::new(),
+                    })
+                }
+                AdminCommand::FreshAgentConfigure(configure) => {
+                    methods.push("fresh_agent_configure");
+                    answer(configure, request.request_id.clone())
+                }
+                other => panic!("configure must not send {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        methods
+    })
+}
+
+#[tokio::test]
+async fn hosted_configure_calls_the_runtime_with_the_mapped_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("managed-claude-soul").unwrap();
+    let expected_soul = soul.clone();
+    let server = configure_supervisor(listener, move |configure, request_id| {
+        assert_eq!(request_id.as_str(), "configure-ui-request");
+        assert_eq!(configure.soul_id, expected_soul);
+        assert_eq!(configure.expected_control_epoch, Some(77));
+        assert_eq!(
+            configure.settings,
+            freshell_runtime_protocol::FreshAgentTurnSettings {
+                cwd: Some("/workspace".into()),
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                permission_mode: Some("acceptEdits".into()),
+                sandbox: Some("workspace-write".into()),
+            }
+        );
+        Ok(AdminResult::FreshAgentCommand {
+            state: freshell_runtime_protocol::CommandState::ProviderAcked,
+        })
+    });
+    let (proxy, mut receiver) = configure_proxy(
+        &socket,
+        HashMap::from([(("claude".into(), "public-1".into()), soul)]),
+    );
+
+    proxy.handle(configure_command("public-1")).await;
+
+    assert_eq!(
+        settled(server).await,
+        vec!["health", "fresh_agent_configure"]
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "an accepted configure converges through the provider's own metadata frame"
+    );
+}
+
+#[tokio::test]
+async fn hosted_configure_rpc_failure_answers_a_typed_nested_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("managed-claude-soul").unwrap();
+    let server = configure_supervisor(listener, |_, _| {
+        Err(freshell_runtime_protocol::RuntimeError::new(
+            RuntimeErrorCode::UnsupportedOperation,
+            "redacted",
+        ))
+    });
+    let (proxy, mut receiver) = configure_proxy(
+        &socket,
+        HashMap::from([(("claude".into(), "public-1".into()), soul)]),
+    );
+
+    proxy.handle(configure_command("public-1")).await;
+    settled(server).await;
+
+    let frame = receiver.try_recv().expect("a refused configure is visible");
+    let ServerMessage::FreshAgentEvent(event) = serde_json::from_str(&frame).unwrap() else {
+        panic!("expected a nested fresh-agent event: {frame}")
+    };
+    assert_eq!(event.session_id, "public-1");
+    assert_eq!(event.session_type, "freshclaude");
+    assert_eq!(event.event["type"], "freshAgent.error");
+    assert_eq!(event.event["code"], "UNSUPPORTED_CAPABILITY");
+}
+
+#[tokio::test]
+async fn hosted_configure_for_an_unknown_soul_answers_a_nested_error_not_a_lost_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+        assert!(
+            matches!(request.body, AdminCommand::Inventory),
+            "an unknown soul is looked up, never configured: {:?}",
+            request.body
+        );
+        write_frame(
+            &mut stream,
+            &AdminReply {
+                request_id: request.request_id,
+                result: Ok(AdminResult::Inventory(Vec::new())),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let (proxy, mut receiver) = configure_proxy(&socket, HashMap::new());
+
+    proxy.handle(configure_command("public-unknown")).await;
+    settled(server).await;
+
+    let frame = receiver.try_recv().expect("an unknown soul is visible");
+    let ServerMessage::FreshAgentEvent(event) = serde_json::from_str(&frame).unwrap() else {
+        panic!("expected a nested fresh-agent event: {frame}")
+    };
+    assert_eq!(event.session_id, "public-unknown");
+    assert_eq!(event.event["type"], "freshAgent.error");
+    assert_eq!(event.event["code"], "MANAGED_FRESH_AGENT_ERROR");
+    assert_ne!(
+        event.event["code"], "INVALID_SESSION_ID",
+        "a hosted configure miss must not mark the pane lost"
+    );
+}
+
 #[test]
 fn presentation_rewrite_keeps_materialized_native_identity() {
     let mut created = serde_json::json!({
@@ -1389,4 +1587,278 @@ async fn real_gateway_outage_keeps_a_registered_local_provider_snapshot_live() {
         true
     );
     assert_eq!(stale_value["capabilities"]["send"], false);
+}
+
+/// The real supervisor never creates or stops a runtime for a configure.
+struct ConfigureOnlyBackend;
+
+#[async_trait::async_trait]
+impl freshell_supervisor::backend::RuntimeBackend for ConfigureOnlyBackend {
+    async fn create_stopped(
+        &self,
+        _: &freshell_supervisor::backend::CreateRuntimeSpec,
+    ) -> Result<
+        freshell_supervisor::backend::BackendCreated,
+        freshell_supervisor::backend::BackendError,
+    > {
+        unreachable!("configure must not create a runtime")
+    }
+    async fn start_host(
+        &self,
+        _: &freshell_supervisor::registry::OwnedRuntimeHandle,
+    ) -> Result<(), freshell_supervisor::backend::BackendError> {
+        unreachable!("configure must not start a host")
+    }
+    async fn inspect(
+        &self,
+        _: &freshell_supervisor::registry::OwnedRuntimeHandle,
+    ) -> Result<
+        freshell_supervisor::backend::BackendInspection,
+        freshell_supervisor::backend::BackendError,
+    > {
+        unreachable!("configure must not inspect the runtime")
+    }
+    async fn request_stop(
+        &self,
+        _: &freshell_supervisor::registry::OwnedRuntimeHandle,
+        _: u64,
+    ) -> Result<(), freshell_supervisor::backend::BackendError> {
+        unreachable!("configure must not stop the runtime")
+    }
+    async fn force_stop(
+        &self,
+        _: &freshell_supervisor::registry::OwnedRuntimeHandle,
+    ) -> Result<(), freshell_supervisor::backend::BackendError> {
+        unreachable!("configure must not stop the runtime")
+    }
+    async fn verify_empty(
+        &self,
+        _: &freshell_supervisor::registry::OwnedRuntimeHandle,
+    ) -> Result<bool, freshell_supervisor::backend::BackendError> {
+        unreachable!("configure must not verify the runtime")
+    }
+    async fn list_known(
+        &self,
+        _: &[freshell_supervisor::registry::OwnedRuntimeHandle],
+    ) -> Result<
+        Vec<(
+            freshell_runtime_protocol::IncarnationId,
+            freshell_supervisor::backend::BackendInspection,
+        )>,
+        freshell_supervisor::backend::BackendError,
+    > {
+        unreachable!("configure must not list runtimes")
+    }
+    async fn read_limits(
+        &self,
+        _: &freshell_supervisor::registry::OwnedRuntimeHandle,
+    ) -> Result<RuntimeLimits, freshell_supervisor::backend::BackendError> {
+        unreachable!("configure must not read limits")
+    }
+    async fn enable_long_lived(
+        &self,
+        _: &freshell_supervisor::registry::OwnedRuntimeHandle,
+    ) -> Result<(), freshell_supervisor::backend::BackendError> {
+        unreachable!("configure must not change the runtime")
+    }
+}
+
+#[tokio::test]
+async fn hosted_configure_reaches_the_owning_host_through_the_real_supervisor() {
+    use freshell_runtime_protocol::{HostCommand, HostReply, HostResult};
+    let root = tempfile::tempdir().unwrap();
+    let workspace = std::fs::canonicalize(root.path()).unwrap();
+    let limits = RuntimeLimits {
+        cpu_milli: 500,
+        memory_bytes: 64 * 1024 * 1024,
+        swap_bytes: 0,
+        pids_max: 32,
+    };
+    let registry =
+        freshell_supervisor::registry::Registry::open(root.path().join("registry"), None).unwrap();
+    let soul = SoulId::new();
+    let fresh_agent: freshell_runtime_protocol::FreshAgentLaunchSpec =
+        serde_json::from_value(serde_json::json!({
+            "sessionId":"public-1", "provider":"claude", "sessionType":"freshclaude",
+            "runtimeVariant":"claude-agent-sdk", "providerStoreId":"store-configure",
+            "cwd":workspace, "workspacePath":workspace, "runAsUid":65534, "runAsGid":0,
+            "model":"sonnet", "effort":"low", "permissionMode":"default"
+        }))
+        .unwrap();
+    let prepared = registry
+        .prepare_launch(freshell_supervisor::registry::LaunchPreparation {
+            soul_id: soul.clone(),
+            provider: "claude".into(),
+            provider_store_id: "store-configure".into(),
+            native_session_id: None,
+            creation_seed_ref: "seed-configure".into(),
+            request_id: RequestId::new(),
+            payload_digest: "payload-configure".into(),
+            requested_limits: limits,
+            profile: RuntimeProfile::Custom,
+            project_key: "workspace".into(),
+            fixture: None,
+            terminal: None,
+            fresh_agent: Some(fresh_agent),
+            view_intent: None,
+            admission: freshell_supervisor::admission::AdmissionPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let runtime_dir = root.path().join("runtime");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    registry
+        .commit_created(
+            prepared.incarnation_id.clone(),
+            freshell_supervisor::registry::BackendCreatedRecord {
+                daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
+                container_id: "a".repeat(64),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                runtime_dir: runtime_dir.clone(),
+                host_binary_path: std::env::current_exe().unwrap(),
+                immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+            },
+        )
+        .await
+        .unwrap();
+    registry
+        .commit_execution_grant(
+            prepared.incarnation_id.clone(),
+            freshell_runtime_protocol::HostBootId::new(),
+            limits,
+        )
+        .await
+        .unwrap();
+    registry
+        .mark_running(prepared.incarnation_id.clone())
+        .await
+        .unwrap();
+
+    // The owning session host: authenticates, then records the configure.
+    let host_secret = b"configure-host-secret";
+    std::fs::write(runtime_dir.join("secret"), host_secret).unwrap();
+    let host_listener = UnixListener::bind(runtime_dir.join("host.sock")).unwrap();
+    let host_commands = Arc::new(std::sync::Mutex::new(Vec::<HostCommand>::new()));
+    let host_log = Arc::clone(&host_commands);
+    let host = tokio::spawn(async move {
+        let boot = freshell_runtime_protocol::HostBootId::new();
+        loop {
+            let Ok((mut stream, _)) = host_listener.accept().await else {
+                return;
+            };
+            let envelope: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+            host_log.lock().unwrap().push(envelope.body.clone());
+            let result = match envelope.body {
+                HostCommand::Hello {
+                    incarnation_id,
+                    challenge,
+                } => HostResult::Hello {
+                    host_boot_id: boot.clone(),
+                    proof: freshell_runtime_protocol::host_proof(
+                        host_secret,
+                        &challenge,
+                        &boot,
+                        &incarnation_id,
+                    ),
+                    capabilities: vec![],
+                    effective_limits: limits,
+                },
+                HostCommand::FreshAgentConfigure { .. } => HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    native_session_id: None,
+                },
+                other => panic!("configure sent an unexpected host command {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &HostReply {
+                    request_id: envelope.request_id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    let control_socket = root.path().join("control.sock");
+    let supervisor = freshell_supervisor::service::Supervisor::new(
+        registry.clone(),
+        Arc::new(ConfigureOnlyBackend),
+        freshell_supervisor::service::SupervisorConfig {
+            runtime_root: root.path().into(),
+            control_socket_path: control_socket.clone(),
+            host_binary_path: std::env::current_exe().unwrap(),
+            image_ref: format!("sha256:{}", "b".repeat(64)),
+            test_run_id: "hosted-configure".into(),
+            control_secret: "0123456789abcdef".into(),
+            lifecycle_log: root.path().join("lifecycle.jsonl"),
+            admission: freshell_supervisor::admission::AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let served_socket = control_socket.clone();
+    let control = tokio::spawn(async move {
+        freshell_supervisor::service::serve_control(supervisor, &served_socket)
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !control_socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let (proxy, mut receiver) = configure_proxy(
+        &control_socket,
+        HashMap::from([(("claude".into(), "public-1".into()), soul.clone())]),
+    );
+    proxy
+        .handle(HostedFreshAgentCommand::Configure(
+            serde_json::from_value(serde_json::json!({
+                "provider":"claude","sessionId":"public-1","sessionType":"freshclaude",
+                "cwd":workspace,"requestId":"configure-through-supervisor",
+                "settings":{"model":"opus","effort":"high"}
+            }))
+            .unwrap(),
+        ))
+        .await;
+    host.abort();
+    control.abort();
+
+    assert!(
+        receiver.try_recv().is_err(),
+        "an accepted hosted configure answers no error"
+    );
+    let configures: Vec<HostCommand> = host_commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|command| matches!(command, HostCommand::FreshAgentConfigure { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(configures.len(), 1, "the owning host applies it once");
+    let HostCommand::FreshAgentConfigure {
+        incarnation_id,
+        request_id,
+        settings,
+    } = &configures[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(incarnation_id, &prepared.incarnation_id);
+    assert_eq!(request_id.as_str(), "configure-through-supervisor");
+    assert_eq!(settings.model.as_deref(), Some("opus"));
+    assert_eq!(settings.effort.as_deref(), Some("high"));
+    let recovered = registry
+        .recovery_context(soul)
+        .await
+        .unwrap()
+        .fresh_agent
+        .expect("fresh-agent recovery spec");
+    assert_eq!(recovered.model.as_deref(), Some("opus"));
+    assert_eq!(recovered.effort.as_deref(), Some("high"));
+    assert_eq!(recovered.permission_mode.as_deref(), Some("default"));
 }

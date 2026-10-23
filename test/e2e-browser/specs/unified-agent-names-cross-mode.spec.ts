@@ -120,6 +120,15 @@ test.describe('cross-mode unified agent names', () => {
       // The agent pane's session name shows on its own header...
       const sessionId = await resolveSessionId(journey, agent)
       const sessionRef: SessionNameRef = { kind: 'session', provider: 'claude', sessionId }
+      // The first-message name lands server-async after the send is
+      // accepted (the record starts on the directory name): settle it
+      // first, or the comparison below would race that automatic raise
+      // instead of testing the tab rename. Intervals stay >= 500ms (the
+      // read route shares the API rate limiter).
+      await expect.poll(
+        async () => (await readRecord(journey, sessionRef)).source,
+        { timeout: 30_000, intervals: [500, 1_000] },
+      ).toBe('first_message')
       const record = await readRecord(journey, sessionRef)
       await expect(
         page.locator(`[data-context="pane-header"][data-pane-id="${agent.paneId}"]`),

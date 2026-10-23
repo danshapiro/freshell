@@ -81,7 +81,9 @@ where
             target == "freshell_server::extensions" && level == tracing::Level::WARN;
         let is_session_directory_error =
             target == "freshell_server::session_directory" && level == tracing::Level::ERROR;
-        if !is_extension_warning && !is_session_directory_error {
+        let is_session_names_event = target == "freshell_server::session_names"
+            && (level == tracing::Level::WARN || level == tracing::Level::INFO);
+        if !is_extension_warning && !is_session_directory_error && !is_session_names_event {
             return;
         }
 
