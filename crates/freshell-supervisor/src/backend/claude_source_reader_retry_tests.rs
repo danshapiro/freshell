@@ -69,7 +69,7 @@ impl ReaderDaemon {
     async fn finish(&mut self) {
         let late = std::mem::take(&mut *self.late.lock().unwrap());
         for job in late {
-            tokio::time::timeout(Duration::from_secs(10), job)
+            tokio::time::timeout(Duration::from_secs(30), job)
                 .await
                 .unwrap()
                 .unwrap();
@@ -341,7 +341,7 @@ fn named<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
 
 /// Wait until the background reaper reports how its removal ended.
 async fn reaper_outcome(path: &Path) -> Vec<Value> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let events = lifecycle_events(path);
         let settled = events.iter().any(|event| {
@@ -444,18 +444,20 @@ async fn claude_source_reader_removes_a_helper_whose_create_answered_after_its_d
     let mut daemon = ReaderDaemon::start(
         &temp.path().join("docker.sock"),
         daemon_id,
-        vec![Create::Late(Duration::from_millis(900))],
+        vec![Create::Late(Duration::from_secs(8))],
         0,
     );
     let log = temp.path().join("lifecycle.jsonl");
     let backend =
         DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
+    // Seconds-long windows: the create must be sent inside the first, and
+    // answered well after both.
     let result = backend
         .read_claude_source_helper(
             &owner,
             &request,
             "synthetic-run",
-            HelperDeadlines::after(Duration::from_millis(150), Duration::from_millis(150)),
+            HelperDeadlines::after(Duration::from_secs(3), Duration::from_secs(1)),
         )
         .await;
     assert!(result.is_err(), "the helper's deadline passed: {result:?}");
@@ -478,12 +480,15 @@ async fn claude_source_reader_removes_a_helper_whose_create_answered_after_its_d
 }
 
 /// A small policy with the production shape, so stalls resolve in tests.
+/// Its windows are seconds long: on a heavily loaded host a healthy synthetic
+/// read can take hundreds of milliseconds, and scheduling delay must never
+/// decide which attempt times out.
 const QUICK: helper_lifecycle::HelperRetryPolicy = helper_lifecycle::HelperRetryPolicy {
-    attempt: Duration::from_millis(250),
-    total: Duration::from_millis(6_000),
-    cleanup: Duration::from_millis(250),
+    attempt: Duration::from_secs(3),
+    total: Duration::from_secs(30),
+    cleanup: Duration::from_secs(2),
     backoff: [Duration::from_millis(50), Duration::from_millis(100)],
-    min_attempt: Duration::from_millis(200),
+    min_attempt: Duration::from_secs(2),
 };
 
 #[tokio::test]
@@ -494,7 +499,7 @@ async fn claude_source_reader_retries_after_a_stalled_create_answers_and_removes
     let mut daemon = ReaderDaemon::start(
         &temp.path().join("docker.sock"),
         daemon_id,
-        vec![Create::Late(Duration::from_millis(700)), Create::Now],
+        vec![Create::Late(Duration::from_secs(5)), Create::Now],
         0,
     );
     let log = temp.path().join("lifecycle.jsonl");
@@ -564,14 +569,15 @@ async fn claude_source_reader_stays_inside_its_total_budget_and_reaps_what_outli
     let mut daemon = ReaderDaemon::start(
         &temp.path().join("docker.sock"),
         daemon_id,
-        vec![Create::Late(Duration::from_millis(2_500))],
+        vec![Create::Late(Duration::from_secs(12))],
         0,
     );
     let log = temp.path().join("lifecycle.jsonl");
     let backend =
         DockerEngineBackend::new(temp.path().join("docker.sock")).with_lifecycle_log(&log);
+    // One attempt, then a settle that ends before Docker answers.
     let policy = helper_lifecycle::HelperRetryPolicy {
-        total: Duration::from_millis(1_000),
+        total: Duration::from_secs(6),
         ..QUICK
     };
     let started = tokio::time::Instant::now();
@@ -581,8 +587,8 @@ async fn claude_source_reader_stays_inside_its_total_budget_and_reaps_what_outli
     let elapsed = started.elapsed();
     assert!(result.is_err());
     assert!(
-        elapsed < Duration::from_millis(1_500),
-        "the read returns inside its total budget, not when Docker answers: {elapsed:?}"
+        elapsed < Duration::from_secs(9),
+        "the read returns near its total budget, not when Docker answers: {elapsed:?}"
     );
     let creates = daemon.creates();
     assert_eq!(creates.len(), 1, "no retry once the budget has no room");
