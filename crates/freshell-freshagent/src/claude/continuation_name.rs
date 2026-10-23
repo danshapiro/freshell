@@ -33,9 +33,8 @@ impl FreshClaudeState {
         };
         sink.continue_session(source, target.clone())
             .await
-            .map_err(|error| {
-                crate::naming::log_name_error("internal_continuation", &target, &error);
-                error
+            .inspect_err(|error| {
+                crate::naming::log_name_error("internal_continuation", &target, error);
             })?;
         Ok(())
     }
