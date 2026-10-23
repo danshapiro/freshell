@@ -33,17 +33,34 @@ for (const resume of [false, true]) {
       const tab = () => lane.page.locator(`[data-context="tab"][data-tab-id="${pane.tabId}"]`)
       await expect(tab()).toContainText('Billing review', { timeout: 30_000 })
       if (resume) {
-        await tab().getByRole('button', { name: /close/i }).click()
+        // A live synthetic row can precede the indexed transcript and its
+        // persisted freshclaude flavor. Close only once the normal sidebar
+        // resume has a durable, interactive Freshclaude row to open.
+        await expect.poll(async () => {
+          const query = new URLSearchParams({ includeKeys: `claude:${original}`, includeNonInteractive: '1', includeEmpty: '1', limit: '100' })
+          const response = await fetch(`${lane.info.baseUrl}/api/session-directory?${query}`, { headers: { 'x-auth-token': lane.info.token } })
+          if (!response.ok) return null
+          const payload = await response.json() as { items?: Array<{ sessionId: string; sessionType?: string; isNonInteractive?: boolean; firstUserMessage?: string }> }
+          const item = payload.items?.find((item) => item.sessionId === original)
+          return item ? { flavor: item.sessionType, interactive: !item.isNonInteractive, firstMessage: item.firstUserMessage } : null
+        }, { timeout: 45_000, intervals: [500, 1_000, 2_000] }).toEqual({ flavor: 'freshclaude', interactive: true, firstMessage: 'Explore the cache layer' })
         const row = lane.page.locator(`[data-context="sidebar-session"][data-session-id="${original}"]`)
+        await expect(row).toHaveAttribute('data-session-type', 'freshclaude', { timeout: 30_000 })
+        await tab().getByRole('button', { name: /close/i }).click()
         await expect(row).toBeVisible({ timeout: 30_000 })
         await row.click()
-        const tabId = (await lane.harness.getActiveTabId())!
+        let tabId = ''
         const paneRoot = lane.page.locator('[data-context="fresh-agent"]').last()
         let paneId = ''
         await expect.poll(async () => {
-          paneId = freshAgentLeaf(await lane.harness.getPaneLayout(tabId))?.id ?? ''
+          const active = await lane.harness.getActiveTabId()
+          if (!active || active === pane.tabId) return null
+          const opened = freshAgentLeaf(await lane.harness.getPaneLayout(active))
+          if (opened?.content?.sessionRef?.sessionId !== original || opened.content.sessionType !== 'freshclaude') return null
+          tabId = active
+          paneId = opened.id
           return paneId
-        }).not.toBe('')
+        }, { timeout: 30_000 }).toBeTruthy()
         pane = { tabId, paneId, paneRoot } satisfies ClaudeSimPane
         expect((await leaf()).content.namingHandle, 'sidebar resume has no old pre-create naming handle').toBeFalsy()
       }
@@ -58,7 +75,10 @@ for (const resume of [false, true]) {
         const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
         await composer.fill(command)
         await composer.press('Enter')
-        await expect.poll(async () => (await leaf())?.content?.sessionRef?.sessionId ?? '', { timeout: 30_000 }).not.toBe(previous)
+        await expect.poll(async () => {
+          const id = (await leaf())?.content?.sessionRef?.sessionId
+          return id && id !== previous ? id : null
+        }, { timeout: 30_000 }).toBeTruthy()
         previous = (await leaf()).content.sessionRef.sessionId
         await expect(tab()).toContainText('Billing review')
         await expect(lane.page.locator('[data-context="pane-header"]:visible').first()).toContainText('Billing review')
@@ -66,12 +86,15 @@ for (const resume of [false, true]) {
       }
       await renameThroughPaneHeader(lane.page, 'Child billing name')
       await expect(tab()).toContainText('Child billing name')
-      expect(await readName(previous)).toMatchObject({ name: 'Child billing name', source: 'manual' })
+      await expect.poll(() => readName(previous)).toMatchObject({ name: 'Child billing name', source: 'manual' })
       expect(await readName(original)).toMatchObject({ name: 'Billing review', source: 'manual' })
       const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
       await composer.fill('/undo')
       await composer.press('Enter')
-      await expect.poll(async () => (await leaf())?.content?.sessionRef?.sessionId ?? '', { timeout: 30_000 }).not.toBe(previous)
+      await expect.poll(async () => {
+        const id = (await leaf())?.content?.sessionRef?.sessionId
+        return id && id !== previous ? id : null
+      }, { timeout: 30_000 }).toBeTruthy()
       await expect(tab()).toContainText('Child billing name')
       await lane.page.reload()
       await lane.harness.waitForHarness()
