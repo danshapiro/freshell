@@ -674,6 +674,7 @@ mod tests {
             session_ref: None,
             resume_session_id: None,
             status: None,
+            naming_handle: None,
         }
     }
 

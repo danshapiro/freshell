@@ -49,6 +49,7 @@ const SAVED_NAME: &str = "Survivor";
 struct RestartedSupervisor {
     soul_create_request_id: String,
     soul_session_id: String,
+    mode: String,
     cwd: String,
 }
 
@@ -59,7 +60,7 @@ impl RestartedSupervisor {
             incarnation_id: format!("incarnation-{}", self.soul_create_request_id),
             terminal_id: terminal_id.to_string(),
             stream_id: stream_id.to_string(),
-            mode: "opencode".to_string(),
+            mode: self.mode.clone(),
             cwd: self.cwd.clone(),
             resume_session_id: Some(self.soul_session_id.clone()),
             create_request_id: Some(self.soul_create_request_id.clone()),
@@ -157,30 +158,55 @@ async fn restarted_server(
     Arc<RestartedSupervisor>,
     tempfile::TempDir,
 ) {
+    let restarted = boot_restarted(case, "opencode").await;
+    let (_, _, sink, supervisor, _) = &restarted;
+    sink.seed_record(saved_record(
+        session_ref(&supervisor.soul_session_id),
+        SAVED_NAME,
+    ));
+    restarted
+}
+
+/// A fresh server (empty registry, empty naming store) whose supervisor
+/// still owns a `mode` soul.
+async fn boot_restarted(
+    case: &str,
+    mode: &str,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<common::NamingProbeSink>,
+    Arc<RestartedSupervisor>,
+    tempfile::TempDir,
+) {
     let soul_dir = tempfile::tempdir().expect("soul folder");
     let (url, registry, sink) =
-        common::spawn_server_with_specs_and_naming(vec![common::sleeper_cli_spec("opencode")])
-            .await;
+        common::spawn_server_with_specs_and_naming(vec![common::sleeper_cli_spec(mode)]).await;
     let supervisor = Arc::new(RestartedSupervisor {
         soul_create_request_id: format!("crid-{case}"),
         soul_session_id: format!("ses_{case}"),
+        mode: mode.to_string(),
         cwd: soul_dir.path().to_string_lossy().into_owned(),
     });
     registry.set_managed_controller(Some(supervisor.clone()));
-    sink.seed_record(SessionNameRecord {
-        name_ref: session_ref(&supervisor.soul_session_id),
-        name: SAVED_NAME.to_string(),
-        source: NameSource::Manual,
-        revision: 4,
-        manual_revision: Some(4),
-        renamed_at: None,
-        legacy_origin: None,
-    });
     assert!(
         registry.directory().is_empty(),
         "the restarted process starts with no terminal rows"
     );
     (url, registry, sink, supervisor, soul_dir)
+}
+
+/// A user-named saved record (the store a restarted server reopens).
+fn saved_record(name_ref: SessionNameRef, name: &str) -> SessionNameRecord {
+    SessionNameRecord {
+        name_ref,
+        name: name.to_string(),
+        source: NameSource::Manual,
+        revision: 4,
+        manual_revision: Some(4),
+        renamed_at: None,
+        legacy_origin: None,
+    }
 }
 
 async fn connect(url: &str, capabilities: serde_json::Value) -> common::TestWs {
@@ -205,12 +231,32 @@ async fn assert_row_bound_to_saved_name(
     session_id: &str,
     entry: &str,
 ) {
+    assert_row_bound(
+        registry,
+        terminal_id,
+        &session_ref(session_id),
+        SAVED_NAME,
+        entry,
+    )
+    .await;
+}
+
+/// Poll the registry row until it caches `name` (bounded), then pin that it
+/// is bound to `bound_to`, caches `name`, and is titled `name` (never
+/// "Shell").
+async fn assert_row_bound(
+    registry: &freshell_terminal::TerminalRegistry,
+    terminal_id: &str,
+    bound_to: &SessionNameRef,
+    name: &str,
+    entry: &str,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         if registry.exists(terminal_id)
             && registry
                 .session_name_of(terminal_id)
-                .is_some_and(|record| record.name == SAVED_NAME)
+                .is_some_and(|record| record.name == name)
         {
             break;
         }
@@ -221,26 +267,23 @@ async fn assert_row_bound_to_saved_name(
         "{entry}: the restarted server must reconstruct the soul's row"
     );
     assert_eq!(
-        registry.name_ref_of(terminal_id),
-        Some(session_ref(session_id)),
-        "{entry}: the row must be bound to the soul's durable session ref"
+        registry.name_ref_of(terminal_id).as_ref(),
+        Some(bound_to),
+        "{entry}: the row must be bound to {bound_to:?}"
     );
     assert_eq!(
         registry
             .session_name_of(terminal_id)
             .map(|record| record.name),
-        Some(SAVED_NAME.to_string()),
-        "{entry}: the row must cache the soul's saved name"
+        Some(name.to_string()),
+        "{entry}: the row must cache the saved name"
     );
     let title = registry.title_of(terminal_id).unwrap_or_default();
     assert_ne!(
         title, "Shell",
         "{entry}: an agent row is never titled Shell"
     );
-    assert_eq!(
-        title, SAVED_NAME,
-        "{entry}: the row presents the saved name"
-    );
+    assert_eq!(title, name, "{entry}: the row presents the saved name");
 }
 
 /// A negotiated `pane.reconcile.request` for the soul's terminal id reaches
@@ -276,6 +319,58 @@ async fn restart_reconcile_adopt_binds_the_saved_name() {
         terminal_id,
         &supervisor.soul_session_id,
         "reconcile adopt",
+    )
+    .await;
+}
+
+/// A ZERO-TURN soul: the descriptor's native session is Claude's
+/// preallocated `--session-id`, which has no transcript and no record yet,
+/// and the pane's name ("Billing", renamed before the first message) lives
+/// under the pane's pending handle. The reconcile entry carries that
+/// persisted `namingHandle`, so the adopted row rejoins the pending record —
+/// the binding the verified bind lane transfers at the first message —
+/// instead of binding the record-less prospective session and orphaning the
+/// name.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_reconcile_adopt_of_a_zero_turn_soul_keeps_its_pending_name() {
+    let (url, registry, sink, supervisor, _soul_dir) =
+        boot_restarted("reconcile-zero-turn", "claude").await;
+    let handle = "nh-zero-turn-soul";
+    let pending = SessionNameRef::Pending {
+        id: handle.to_string(),
+    };
+    sink.seed_record(saved_record(pending.clone(), "Billing"));
+    let mut ws = connect(
+        &url,
+        serde_json::json!({ "paneReconcileV1": true, "managedRuntimeV1": true }),
+    )
+    .await;
+    let terminal_id = "t-soul-reconcile-zero-turn";
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.reconcile.request",
+            "reconcileId": "rec-restart-zero-turn",
+            "panes": [{
+                "paneKey": "pk-zero-turn",
+                "kind": "terminal",
+                "mode": "claude",
+                "createRequestId": supervisor.soul_create_request_id,
+                "terminalId": terminal_id,
+                "sessionRef": { "provider": "claude", "sessionId": supervisor.soul_session_id },
+                "namingHandle": handle,
+            }],
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send pane.reconcile.request");
+
+    assert_row_bound(
+        &registry,
+        terminal_id,
+        &pending,
+        "Billing",
+        "zero-turn reconcile adopt",
     )
     .await;
 }

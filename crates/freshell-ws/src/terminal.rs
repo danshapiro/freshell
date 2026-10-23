@@ -8500,6 +8500,7 @@ async fn handle_pane_reconcile(
                 state,
                 terminal_id,
                 pane.create_request_id.clone(),
+                pane.naming_handle.clone(),
             )
             .await
             {

@@ -1144,6 +1144,11 @@ export const ReconcilePaneSchema = z.object({
   resumeSessionId: z.string().optional(),
   /** Informational only — never trusted. */
   status: z.string().optional(),
+  /** Name reliability: the pane's persisted pre-durable naming handle
+   *  (`terminal.create.namingHandle`). Additive optional. A restarted server's
+   *  managed adoption binds a zero-turn soul's row to it; the verdict ladder
+   *  ignores it. */
+  namingHandle: z.string().min(1).optional(),
 })
 
 export const PaneReconcileRequestSchema = z.object({
