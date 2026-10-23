@@ -115,11 +115,11 @@ rl.on('line', (line) => {
   }
   logRequest(msg)
   if (msg.type === 'create') {
-    const sessionId = `fc-e2e-${process.pid}-${Date.now()}`
+    const sessionId = msg.sessionId ?? `fc-e2e-${process.pid}-${Date.now()}`
     // Resume continuity: a resumed session keeps its durable id (what the real
     // CLI's transcript filename stem provides across restarts).
     const resumeSessionId = msg.boot?.resume
-    const cliSessionId = resumeSessionId ?? CLI_SESSION_ID
+    const cliSessionId = resumeSessionId ?? msg.sessionId ?? CLI_SESSION_ID
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, { cliSessionId, cwd, model: msg.model ?? 'claude-opus-4-6', effort: msg.effort, permissionMode: msg.permissionMode })
     // Ensure the transcript file EXISTS from create (the attach arm's

@@ -85,6 +85,33 @@ function storageWith(values: Record<string, string | null>): Pick<Storage, 'getI
 describe('persistedState fresh-agent migration', () => {
   beforeEach(seedWindow)
 
+  it.each(['freshclaude', 'kilroy'])('restores %s placeholder panes under their durable identity', (sessionType) => {
+    const sessionId = '00000000-0000-4000-8000-000000000779'
+    const parsed = parsePersistedLayoutRaw(layoutRaw({
+      'tab-1': leaf('legacy', {
+        kind: 'fresh-agent', sessionType, provider: 'claude',
+        sessionId: 'old-placeholder', sessionRef: { provider: 'claude', sessionId },
+        serverInstanceId: 'old-server', initialCwd: '/repo',
+      }),
+    }))
+    expect(collectLeafContents(parsed!.panes.layouts['tab-1'])[0]).toMatchObject({
+      sessionId, sessionRef: { provider: 'claude', sessionId },
+      createRequestId: 'req-legacy', initialCwd: '/repo',
+    })
+  })
+
+  it('leaves a legacy zero-turn placeholder without a durable reference available for lost-session recovery', () => {
+    const parsed = parsePersistedLayoutRaw(layoutRaw({
+      'tab-1': leaf('legacy', {
+        kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+        sessionId: 'old-zero-turn-placeholder', serverInstanceId: 'old-server',
+      }),
+    }))
+    const content = collectLeafContents(parsed!.panes.layouts['tab-1'])[0]
+    expect(content.sessionId).toBe('old-zero-turn-placeholder')
+    expect(content.sessionRef).toBeUndefined()
+  })
+
   it('migrates persisted agent-chat panes to fresh-agent panes in the combined layout key shape', () => {
     const parsed = parsePersistedLayoutRaw(layoutRaw({
       'tab-1': {

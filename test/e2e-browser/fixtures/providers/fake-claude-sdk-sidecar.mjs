@@ -344,7 +344,7 @@ async function handleInput(line) {
   }
   if (msg.type === 'create') {
     createCounter += 1
-    const sessionId = `${provider}-fake-${process.pid}-${createCounter}`
+    const sessionId = msg.sessionId ?? `${provider}-fake-${process.pid}-${createCounter}`
     activeSessionId = sessionId
     // kata 1wxv Task 7 (fork-at-point, s2rk correction): a `forkSession:true`
     // create mints a NEW durable cliSessionId — real `claude --fork-session`
@@ -363,11 +363,11 @@ async function handleInput(line) {
     const resumeIsPath = resumeRaw !== null
       && (resumeRaw.includes('/') || resumeRaw.endsWith('.jsonl'))
     const resumePath = !forking && resumeIsPath ? resumeRaw : null
-    const cliSessionId = forking
+    const cliSessionId = msg.sessionId ?? (forking
       ? randomUUID()
       : (resumePath
         ? path.basename(resumePath).replace(/\.jsonl$/, '')
-        : (resumeRaw ?? program.sessionId ?? randomUUID()))
+        : (resumeRaw ?? program.sessionId ?? randomUUID())))
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, { cliSessionId, cwd, pendingEntries: [],
       transcriptOverride: resumePath,
