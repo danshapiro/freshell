@@ -147,6 +147,7 @@ function collectSessionTitleTargets(
  */
 const SESSION_BINDING_PANE_ACTIONS = new Set([
   'panes/initLayout',
+  'panes/initCopiedLayout',
   'panes/updatePaneContent',
   'panes/mergePaneContent',
   'panes/materializeFreshAgentSession',

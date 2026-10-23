@@ -10,9 +10,19 @@ import {
 } from '@/lib/tab-registry-open'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import tabsReducer, { addTab, setActiveTab } from '@/store/tabsSlice'
-import panesReducer, { addPane, initLayout, updatePaneTitle } from '@/store/panesSlice'
+import panesReducer, { initCopiedLayout, initLayout } from '@/store/panesSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { AppDispatch } from '@/store/store'
+import { sessionNameLifecycleMiddleware } from '@/store/sessionNameLifecycleMiddleware'
+import { savedNameTabTitleMirrorMiddleware } from '@/store/savedNameTabTitleMirror'
+import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
+
+function buildNamingStore() {
+  return configureStore({
+    reducer: { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer },
+    middleware: (getDefault) => getDefault().concat(savedNameTabTitleMirrorMiddleware, sessionNameLifecycleMiddleware),
+  })
+}
 
 function makeRecord(overrides: Partial<RegistryTabRecord> = {}): RegistryTabRecord {
   return {
@@ -71,6 +81,46 @@ describe('findRecordByTabKey', () => {
 })
 
 describe('openRecordAsUnlinkedCopy', () => {
+  it.each(['shell', 'claude'])('keeps a recorded naming source after a first %s pane through real lifecycle folds', (mode) => {
+    const store = buildNamingStore()
+    store.dispatch(receiveSessionNames(['other', 'billing'].map((sessionId, index) => ({
+      record: { ref: { kind: 'session' as const, provider: 'claude' as const, sessionId }, name: `${sessionId} name`, source: 'manual' as const, revision: index + 1 },
+      redirects: [], documentGeneration: 2, changed: true,
+    }))))
+    const record = makeRecord({
+      nameSource: { kind: 'session', paneId: 'agent-second' },
+      panes: [
+        { paneId: 'first', kind: 'terminal', payload: { mode, ...(mode === 'claude' ? { sessionRef: { provider: 'claude', sessionId: 'other' } } : {}) } },
+        { paneId: 'agent-second', kind: 'terminal', payload: { mode: 'claude', sessionRef: { provider: 'claude', sessionId: 'billing' } } },
+      ],
+    })
+
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch })
+
+    const state = store.getState()
+    const tab = state.tabs.tabs[0]
+    const layout = state.panes.layouts[tab.id]
+    if (layout.type !== 'split' || layout.children[1].type !== 'leaf') throw new Error('expected both recorded panes')
+    expect(tab.nameSource).toEqual({ kind: 'session', paneId: layout.children[1].id })
+    expect(tab.title).toBe('billing name')
+    expect(state.panes.activePane[tab.id]).toBe(layout.children[1].id)
+  })
+
+  it('preserves same-server live terminal handles while installing the complete copy', () => {
+    const store = buildNamingStore()
+    const record = makeRecord({ panes: [{
+      paneId: 'live-shell', kind: 'terminal',
+      payload: { mode: 'shell', liveTerminal: { terminalId: 'still-running', serverInstanceId: 'srv-1' } },
+    }] })
+
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch, localServerInstanceId: 'srv-1' })
+
+    const state = store.getState()
+    expect(state.panes.layouts[state.tabs.tabs[0].id]).toMatchObject({
+      type: 'leaf', content: { kind: 'terminal', terminalId: 'still-running', serverInstanceId: 'srv-1' },
+    })
+  })
+
   it('creates a new tab with a terminal fallback layout when the record has no panes', () => {
     const dispatch = vi.fn() as unknown as AppDispatch
     const onOpened = vi.fn()
@@ -84,28 +134,29 @@ describe('openRecordAsUnlinkedCopy', () => {
       status: 'creating',
       serverInstanceId: 'srv-1',
     })
-    expect(calls[1].type).toBe(initLayout.type)
-    expect(calls[1].payload.content).toMatchObject({ kind: 'terminal', mode: 'shell' })
+    expect(calls[1].type).toBe(initCopiedLayout.type)
+    expect(calls[1].payload.layout.content).toMatchObject({ kind: 'terminal', mode: 'shell' })
     expect(onOpened).toHaveBeenCalledTimes(1)
   })
 
   it('adds one pane per extra snapshot', () => {
-    const dispatch = vi.fn() as unknown as AppDispatch
+    const store = buildNamingStore()
     const record = makeRecord({
       panes: [
         { paneId: 'p1', kind: 'terminal', title: 'sh', payload: {} },
         { paneId: 'p2', kind: 'browser', title: 'docs', payload: {} },
       ],
     })
-    openRecordAsUnlinkedCopy(record, { dispatch })
+    openRecordAsUnlinkedCopy(record, { dispatch: store.dispatch })
 
-    const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
-    // One pane per snapshot, then the recorded pane titles (name
-    // reliability, Task 14).
-    expect(calls.map((a) => a.type)).toEqual([
-      addTab.type, initLayout.type, addPane.type, updatePaneTitle.type, updatePaneTitle.type,
-    ])
-    expect(calls[2].payload.newContent).toMatchObject({ kind: 'browser' })
+    const state = store.getState()
+    const tabId = state.tabs.tabs[0].id
+    const layout = state.panes.layouts[tabId]
+    if (layout.type !== 'split') throw new Error('expected both recorded panes')
+    expect(layout.children[0]).toMatchObject({ type: 'leaf', content: { kind: 'terminal' } })
+    expect(layout.children[1]).toMatchObject({ type: 'leaf', content: { kind: 'browser' } })
+    expect(state.panes.paneTitles[tabId]).toEqual({ [layout.children[0].id]: 'sh', [layout.children[1].id]: 'docs' })
+    expect(state.panes.activePane[tabId]).toBe(layout.children[1].id)
   })
 
   it('remaps a session-owned record nameSource through the explicit old->new pane-id map', () => {
@@ -123,8 +174,8 @@ describe('openRecordAsUnlinkedCopy', () => {
     expect(calls[0].type).toBe(addTab.type)
     // The copy remints every pane id; the pointer must follow the source
     // pane's NEW id, not the stale recorded one.
-    const firstNewPaneId = calls[1].payload.paneId
-    const secondNewPaneId = calls[2].payload.newPaneId
+    const firstNewPaneId = calls[1].payload.layout.children[0].id
+    const secondNewPaneId = calls[1].payload.layout.children[1].id
     expect(firstNewPaneId).toBeTruthy()
     expect(secondNewPaneId).toBeTruthy()
     expect(firstNewPaneId).not.toBe('p1')
@@ -159,7 +210,7 @@ describe('openRecordAsUnlinkedCopy', () => {
     })
     openRecordAsUnlinkedCopy(record, { dispatch })
     const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
-    expect(calls[1].payload.content).toMatchObject({
+    expect(calls[1].payload.layout.content).toMatchObject({
       kind: 'terminal',
       mode: 'claude',
       namingHandle: 'nh-copy-1',

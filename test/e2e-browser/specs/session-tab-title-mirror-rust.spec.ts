@@ -161,6 +161,64 @@ test.describe('session tab title mirror', () => {
     }
   })
 
+  test('a reopened split tab follows its recorded naming pane after the panes were swapped', async ({ browser }) => {
+    const journey = await bootForbiddenGeminiJourney()
+    try {
+      const { context, page, harness } = await connectUnifiedPage({ browser, info: journey.server.info })
+      const handle = await createRenamedClaudeTab(page, harness, journey)
+      await splitWithShell(page)
+      const layout = await harness.getPaneLayout(handle.tabId)
+      expect(layout.type).toBe('split')
+      const otherId = layout.children[1].id as string
+      await page.evaluate(({ tabId, paneId, otherId }) => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/swapPanes', payload: { tabId, paneId, otherId },
+        })
+      }, { tabId: handle.tabId, paneId: handle.paneId, otherId })
+      await expect.poll(async () => {
+        const state = await harness.getState()
+        return state.tabs.tabs.find((tab: { id: string }) => tab.id === handle.tabId)?.nameSource
+      }).toEqual({ kind: 'session', paneId: otherId })
+
+      await tabLabel(page, handle.tabId).getByRole('button', { name: /close/i }).click()
+      await page.getByRole('button', { name: 'Tabs (Ctrl+B A)' }).click()
+      const expand = page.getByRole('button', { name: 'Expand Recently closed' })
+      await expect(expand).toBeVisible({ timeout: 15_000 })
+      await expand.click()
+      const card = page.locator(`[data-context="tabs-card"][data-tab-status="closed"][data-tab-key$=":${handle.tabId}"]`)
+      await expect(card).toBeVisible({ timeout: 15_000 })
+      const beforeIds = (await harness.getState()).tabs.tabs.map((tab: { id: string }) => tab.id) as string[]
+      await card.click()
+      let openedId = ''
+      await expect.poll(async () => {
+        const state = await harness.getState()
+        openedId = state.tabs.tabs.find((tab: { id: string }) => !beforeIds.includes(tab.id))?.id ?? ''
+        return openedId
+      }).not.toBe('')
+      const reopened = await harness.getPaneLayout(openedId)
+      expect(reopened.type).toBe('split')
+      const sourceId = reopened.children[1].id as string
+      const state = await harness.getState()
+      expect(state.tabs.tabs.find((tab: { id: string }) => tab.id === openedId)?.nameSource)
+        .toEqual({ kind: 'session', paneId: sourceId })
+
+      // An update to the shared saved name must still name the TAB, not
+      // just its Claude pane. A prematurely downgraded legacy tab would
+      // keep its recorded title forever.
+      const renamed = await fetch(`${journey.server.info.baseUrl}/api/session-names`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json', 'x-auth-token': journey.server.info.token },
+        body: JSON.stringify({ target: handle.nameRef, name: 'Billing after reopen', nameIntent: 'user' }),
+      })
+      expect(renamed.ok, await renamed.text()).toBe(true)
+      await expect(tabLabel(page, openedId)).toContainText('Billing after reopen', { timeout: 30_000 })
+      await expect(page.locator(`[data-context="pane-header"][data-pane-id="${sourceId}"]`))
+        .toContainText('Billing after reopen', { timeout: 30_000 })
+      await context.close()
+    } finally {
+      await journey.cleanup()
+    }
+  })
+
   test('a tab whose Claude pane closes stops carrying the session\'s name', async ({ browser }) => {
     const journey = await bootForbiddenGeminiJourney()
     try {
