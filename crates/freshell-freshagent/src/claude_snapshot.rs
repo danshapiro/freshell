@@ -744,15 +744,7 @@ pub(crate) fn parse_transcript_turn_indexed(
     // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
     // The compact summary (`isCompactSummary`) is the model-facing recap of the
     // compacted history; the visible marker comes from `system/compact_boundary`.
-    if [
-        "isMeta",
-        "isSidechain",
-        "isCompactSummary",
-        "isVisibleInTranscriptOnly",
-    ]
-    .iter()
-    .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
-    {
+    if is_synthetic_line(obj) {
         return None;
     }
     let line_uuid = obj
@@ -889,6 +881,20 @@ pub(crate) fn parse_transcript_turn_indexed(
         return None;
     }
     Some(turn_json(&turn_id, ordinal, role, items, None, obj))
+}
+
+/// A line the CLI writes for itself or for a subagent, never shown as a turn
+/// and never a rollback step: meta lines (the local-command caveat), sidechain
+/// lines, the compaction summary, transcript-only lines.
+fn is_synthetic_line(obj: &Value) -> bool {
+    [
+        "isMeta",
+        "isSidechain",
+        "isCompactSummary",
+        "isVisibleInTranscriptOnly",
+    ]
+    .iter()
+    .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
 }
 
 /// Display text for an image attachment or an image tool result.
@@ -1346,48 +1352,68 @@ pub(crate) fn raw_lcp_end(current: &str, original: &str) -> Option<String> {
     end
 }
 
-/// The first raw-chain entry strictly AFTER `uuid` — the source of the
-/// `resumeDropsTurn` guard (the uuid of the first message the resume discards).
-/// `None` when `uuid` is the tip or absent: the guard is then OMITTED (a
-/// vacuous discard — never fabricated).
-pub(crate) fn raw_chain_successor(transcript: &str, uuid: &str) -> Option<String> {
+/// The `resumeDropsTurn` guard for a fork of `transcript` that keeps its raw
+/// chain through `keep` (core design §4.2, decision 2): the uuid of the one
+/// prompted turn the fork discards, so the CLI refuses the fork
+/// (`FORK_GUARD_REFUSED`) when that turn absorbed a send or a task
+/// notification the pane never showed as its own turn. `None` (no guard, the
+/// SDK's unvalidated truncation) when the fork discards nothing, starts its
+/// discard mid-turn, discards more than one turn (the CLI's guard declares
+/// exactly one: a second prompt in the range always refuses), discards a
+/// slash command's step (the CLI does not attribute the command's output line
+/// to it), or boots fresh (`keep` is `None`).
+pub(crate) fn drops_turn_guard(transcript: &str, keep: Option<&str>) -> Option<String> {
+    let keep = keep?;
     let chain = raw_chain(transcript);
-    let pos = chain.iter().position(|l| l.uuid == uuid)?;
-    chain.get(pos + 1).map(|l| l.uuid.clone())
+    let kept = chain.iter().position(|line| line.uuid == keep)?;
+    let (first, rest) = chain.get(kept + 1..)?.split_first()?;
+    (is_prompt_anchor(&first.obj) && !rest.iter().any(|line| is_rollback_anchor(&line.obj)))
+        .then(|| first.uuid.clone())
 }
 
-/// A user-ANCHOR line: a real user prompt (type `user`, not meta/sidechain,
-/// text-bearing content). A tool_result carrier is NEVER an anchor — steps
-/// split at prompts only.
-fn is_user_anchor(obj: &Value) -> bool {
-    if obj.get("type").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    if [
-        "isMeta",
-        "isSidechain",
-        "isCompactSummary",
-        "isVisibleInTranscriptOnly",
-    ]
-    .iter()
-    .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
+/// A rollback ANCHOR (core design §4.5, transcript plan N7): a line that
+/// starts a turn the pane renders as the user's. The one predicate every
+/// rollback step and the transcript projector share: a real prompt anchors,
+/// and so does a slash-command invocation (`<command-name>/x</command-name>`,
+/// rendered as what the user typed). The CLI's own lines never do: the
+/// local-command caveat and other meta lines, sidechain lines, the compaction
+/// summary ([`is_synthetic_line`], which the projector skips), a command's
+/// `<local-command-stdout|stderr>` output (projected as a system row), a task
+/// notification (folded into its delegation), and a tool-result carrier.
+pub(crate) fn is_rollback_anchor(obj: &Value) -> bool {
+    if obj.get("type").and_then(Value::as_str) != Some("user")
+        || is_synthetic_line(obj)
+        || is_task_notification_line(obj)
     {
         return false;
     }
-    match obj.get("message") {
-        Some(Value::String(text)) => !text.trim().is_empty(),
+    let blocks: Vec<Value> = match obj.get("message") {
+        Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
         Some(Value::Object(m)) => match m.get("content") {
-            Some(Value::String(text)) => !text.trim().is_empty(),
-            Some(Value::Array(blocks)) => blocks.iter().any(|b| {
-                b.get("type").and_then(Value::as_str) == Some("text")
-                    && b.get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|t| !t.trim().is_empty())
-            }),
-            _ => false,
+            Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+            Some(Value::Array(blocks)) => blocks.clone(),
+            _ => return false,
         },
-        _ => false,
+        _ => return false,
+    };
+    if local_command_user_turn(&blocks, "", 0, obj).is_some() {
+        return false;
     }
+    blocks
+        .iter()
+        .any(|b| match b.get("type").and_then(Value::as_str) {
+            Some("text") => b
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.trim().is_empty()),
+            Some("image") => true,
+            _ => false,
+        })
+}
+
+/// A rollback anchor that is a prompt to the model, not a slash command.
+fn is_prompt_anchor(obj: &Value) -> bool {
+    is_rollback_anchor(obj) && slash_command_text(&user_prompt_text(obj)).is_none()
 }
 
 /// The anchor line's plain prompt text (the composer-refill payload): a plain
@@ -1409,12 +1435,19 @@ fn user_prompt_text(obj: &Value) -> String {
     }
 }
 
-/// Chain positions of every user-anchor line, in chain order (the step starts).
-fn user_anchor_positions(chain: &[ChainLine]) -> Vec<usize> {
+/// What the user typed to start the anchor's step (the composer refill): the
+/// prompt text, or the slash command as typed (`/compact keep it short`).
+fn anchor_refill_text(obj: &Value) -> String {
+    let text = user_prompt_text(obj);
+    slash_command_text(&text).unwrap_or(text)
+}
+
+/// Chain positions of every rollback anchor, in chain order (the step starts).
+fn rollback_anchor_positions(chain: &[ChainLine]) -> Vec<usize> {
     chain
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| is_user_anchor(&l.obj).then_some(i))
+        .filter_map(|(i, l)| is_rollback_anchor(&l.obj).then_some(i))
         .collect()
 }
 
@@ -1437,16 +1470,13 @@ pub(crate) enum ResumeTarget {
 /// One resolved rollback: where the fork keeps (`resume_at_uuid`; `None` =
 /// "before the first message" — LEGAL per r2: the handler takes the
 /// fresh-conversation leg, never a refusal), the removed display-turn slice
-/// (the marker bucket + ack payload), and the composer-refill prompt.
-/// `guard_uuid` is the `resumeDropsTurn` guard sourced from the RAW chain entry
-/// at the first removed position (SDK-exact + cheaper than the display
-/// projection — task 4 review nit 4); `None` on the first-turn leg (no fork →
-/// no guard is ever armed).
+/// (the marker bucket + ack payload), and the composer-refill prompt. The
+/// fork's `resumeDropsTurn` guard comes from [`drops_turn_guard`] over the
+/// transcript the fork actually reads.
 pub(crate) struct ResumePoint {
     pub resume_at_uuid: Option<String>,
     pub removed_turns: Vec<Value>,
     pub prompt_text: String,
-    pub guard_uuid: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1474,7 +1504,7 @@ pub(crate) fn resolve_resume_point(
     if chain.is_empty() {
         return Err(ResumeResolveError::Empty);
     }
-    let anchors = user_anchor_positions(&chain);
+    let anchors = rollback_anchor_positions(&chain);
     if anchors.is_empty() {
         return Err(ResumeResolveError::Empty);
     }
@@ -1516,20 +1546,11 @@ pub(crate) fn resolve_resume_point(
                 .is_some_and(|id| removed_uuids.contains(id))
         })
         .collect();
-    let prompt_text = user_prompt_text(&chain[first_remove_pos].obj);
-    // The resumeDropsTurn guard = the RAW chain entry at the first removed
-    // position (task 4 review nit 4: SDK-exact + cheaper than re-deriving it
-    // from the first removed DISPLAY turn — the projection filters carriers).
-    // Omitted on the first-turn leg (`resume_at_uuid: None` = the fresh
-    // conversation — no fork, so no guard is ever armed).
-    let guard_uuid = resume_at_uuid
-        .as_ref()
-        .map(|_| chain[first_remove_pos].uuid.clone());
+    let prompt_text = anchor_refill_text(&chain[first_remove_pos].obj);
     Ok(ResumePoint {
         resume_at_uuid,
         removed_turns,
         prompt_text,
-        guard_uuid,
     })
 }
 
@@ -1575,11 +1596,11 @@ pub(crate) fn restored_slice_turns(
                 .is_some_and(|id| slice_uuids.contains(id))
         })
         .collect();
-    let anchors = user_anchor_positions(&orig);
+    let anchors = rollback_anchor_positions(&orig);
     let prompt_text = anchors
         .iter()
         .find(|&&a| a >= start_pos && a <= end_pos)
-        .map(|&a| user_prompt_text(&orig[a].obj))
+        .map(|&a| anchor_refill_text(&orig[a].obj))
         .unwrap_or_default();
     RestoredSlice { turns, prompt_text }
 }
@@ -1601,7 +1622,7 @@ pub(crate) fn redo_resume_target(
     use crate::rollback_record::RollbackModeReq;
     let orig = raw_chain(original);
     let cur = raw_chain(current);
-    let anchors = user_anchor_positions(&orig);
+    let anchors = rollback_anchor_positions(&orig);
     match op.mode {
         RollbackModeReq::Step => match cur.last() {
             // r2 first-turn case: the current chain is EMPTY; restore the first
@@ -3098,6 +3119,64 @@ pub(crate) mod tests {
         assert_eq!(to_anchor.prompt_text, "prompt two");
     }
 
+    /// The guard declares the one prompted turn a fork discards (the SDK's
+    /// `resumeDropsTurn`), and nothing when the fork discards nothing or
+    /// more than one turn, or when it boots fresh.
+    #[test]
+    fn the_drops_turn_guard_declares_the_one_prompted_turn_a_fork_discards() {
+        let transcript = uuid_transcript_with_carriers();
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("tr1")).as_deref(),
+            Some("u2")
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("a1")),
+            None,
+            "the discarded part starts with the kept turn's tool result"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("c1")),
+            None,
+            "the discarded part starts mid-turn"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("a2")),
+            None,
+            "nothing is discarded"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, None),
+            None,
+            "a fresh boot forks nothing"
+        );
+        assert_eq!(
+            drops_turn_guard(&transcript, Some("gone")),
+            None,
+            "an unknown keep point"
+        );
+        let three_turns = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"one"}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"text","text":"1"}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","message":{"role":"user","content":"two"}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","message":{"role":"assistant","content":[{"type":"text","text":"2"}]}}),
+            json!({"type":"user","uuid":"u3","parentUuid":"a2","message":{"role":"user","content":"three"}}),
+            json!({"type":"assistant","uuid":"a3","parentUuid":"u3","message":{"role":"assistant","content":[{"type":"text","text":"3"}]}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(
+            drops_turn_guard(&three_turns, Some("a2")).as_deref(),
+            Some("u3")
+        );
+        assert_eq!(
+            drops_turn_guard(&three_turns, Some("a1")),
+            None,
+            "two prompted turns: one guard declares one turn"
+        );
+    }
+
     #[test]
     fn resolve_resume_point_unknown_target_is_not_found() {
         assert!(resolve_resume_point(
@@ -3264,19 +3343,6 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(ids, vec!["u1", "a1"]);
         assert_eq!(slice.prompt_text, "prompt one");
-    }
-
-    #[test]
-    fn raw_chain_successor_names_the_first_entry_after_a_keep_point() {
-        // The resumeDropsTurn guard uuid source: the first chain entry AFTER the
-        // keep point (the first-to-discard prompt), None when the keep point IS
-        // the tip (vacuous discard — the guard is omitted, never fabricated).
-        assert_eq!(
-            raw_chain_successor(&two_step_original(), "a1").as_deref(),
-            Some("u2")
-        );
-        assert_eq!(raw_chain_successor(&two_step_original(), "a2"), None);
-        assert_eq!(raw_chain_successor(&two_step_original(), "gone"), None);
     }
 
     // ── kata 1wxv Task 5: snapshot rollback surfacing (claude/kilroy) ─────────

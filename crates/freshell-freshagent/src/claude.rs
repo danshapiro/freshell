@@ -5726,11 +5726,9 @@ impl FreshClaudeState {
                     }
                 };
                 let tip = snap::raw_chain_tip(&root_text);
-                // The resumeDropsTurn guard uuid = the RAW chain entry at the
-                // removed step's first position (task 4 review nit 4 — SDK-exact
-                // + cheaper than the display projection; brief/SDK semantics:
-                // the guard declares the discarded turn's prompt).
-                let guard = point.guard_uuid.clone();
+                // The resumeDropsTurn guard: the one prompted turn the fork
+                // discards, when it discards exactly one (decision 2).
+                let guard = snap::drops_turn_guard(&text, point.resume_at_uuid.as_deref());
                 // can_redo after the undo: the removed content provably exists in
                 // the original beyond the resume point (on the r2 first-turn leg
                 // the fresh conversation's tip is NONE — strictly beyond holds
@@ -5865,10 +5863,10 @@ impl FreshClaudeState {
                 let restored =
                     snap::restored_slice_turns(&original_text, &current_text, &resume_at);
                 let can_redo_after_redo = original_tip.as_deref() != Some(resume_at.as_str());
-                // The guard = the first ORIGINAL chain entry strictly AFTER the
-                // resume point (`None` — redoing TO the tip — omits it: the
-                // discard range is vacuous, never fabricated).
-                let guard = snap::raw_chain_successor(&original_text, &resume_at);
+                // The guard: the one prompted turn of the original the redo
+                // still leaves out, when exactly one (`None` redoing TO the
+                // tip: nothing is discarded).
+                let guard = snap::drops_turn_guard(&original_text, Some(&resume_at));
                 (
                     original,
                     original_path,
