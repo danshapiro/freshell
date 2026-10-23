@@ -110,6 +110,24 @@ export function firstNameSourceLeaf(
 }
 
 /**
+ * The pane a tab takes its tab-level facts from (name reliability, Tasks 8
+ * and 14): its session naming source while that pane is still in the layout,
+ * else its first leaf.
+ */
+export function tabNamingLeaf(
+  tab: { nameSource?: TabNameSource } | undefined,
+  layout: PaneNode | undefined,
+): { paneId: string; content: PaneContent } | undefined {
+  const leaves = collectNameSourceLeaves(layout)
+  if (tab?.nameSource?.kind === 'session') {
+    const sourceId = tab.nameSource.paneId
+    const source = leaves.find((leaf) => leaf.paneId === sourceId)
+    if (source) return source
+  }
+  return leaves[0]
+}
+
+/**
  * The initial-content-choice resolution (plan "Stable tab ownership"): the
  * FIRST leaf decides, because it is the original pane — a scoped agent leaf
  * owns the tab; any other real content keeps the existing non-agent

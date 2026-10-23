@@ -1,10 +1,15 @@
-import * as fs from 'node:fs/promises'
-import * as path from 'node:path'
 import type { BrowserContext, Page } from '@playwright/test'
 import { test, expect, createE2eBrowserContext } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 import { renameThroughPaneHeader, renameThroughTabEdit } from '../helpers/unified-agent-names.js'
+import {
+  clientInstanceIdOf,
+  sendWindowTitle,
+  terminalIdOf,
+  waitForPersistedRecords,
+  type RegistryRecord,
+} from '../helpers/stored-names.js'
 
 // NAME RELIABILITY (plan Task 9, RC7) — opening Freshell in a new window
 // rebuilds the window's workspace from the server's recovery inventory. Before
@@ -31,79 +36,10 @@ const TAB_NAME = 'MyShellTab'
 const PANE_NAME = 'KeepMePane'
 const BROWSER_PANE_NAME = 'Team docs'
 const INTRUDER = 'intruder'
-const CLIENT_INSTANCE_ID_KEY = 'freshell.tabs.client-instance-id.v1'
-
-type RegistryRecord = {
-  tabId?: string
-  tabName?: string
-  titleSetByUser?: boolean
-  panes?: Array<{ paneId?: string; title?: string; titleSetByUser?: boolean }>
-}
-
-/**
- * Wait until the NEWEST persisted tabs-snapshot generation of `clientInstanceId`
- * satisfies `predicate` (the fs-poll idiom of machine-tab-order-rust.spec.ts:
- * pushes fire on change and every 5 s, so the generation files lag the UI;
- * reading them proves the server durably holds what the next window reads).
- */
-async function waitForPersistedRecords(
-  homeDir: string,
-  clientInstanceId: string,
-  predicate: (records: RegistryRecord[]) => boolean,
-  timeoutMs = 30_000,
-): Promise<void> {
-  const snapshotsDir = path.join(homeDir, '.freshell', 'tabs-snapshots')
-  const deadline = Date.now() + timeoutMs
-  let lastObserved = 'none'
-  while (Date.now() < deadline) {
-    const devices = await fs.readdir(snapshotsDir).catch(() => [] as string[])
-    for (const device of devices) {
-      const deviceDir = path.join(snapshotsDir, device)
-      const files = (await fs.readdir(deviceDir).catch(() => [] as string[]))
-        .filter((file) => file.endsWith('.json'))
-      let newest: { revision: number; capturedAt: number; records: RegistryRecord[] } | null = null
-      for (const file of files) {
-        const raw = await fs.readFile(path.join(deviceDir, file), 'utf8').catch(() => '')
-        let doc: { clientInstanceId?: string; snapshotRevision?: number; capturedAt?: number; records?: RegistryRecord[] } | null = null
-        try {
-          doc = JSON.parse(raw)
-        } catch {
-          continue
-        }
-        if (doc?.clientInstanceId !== clientInstanceId) continue
-        const revision = Number(doc.snapshotRevision ?? 0)
-        const capturedAt = Number(doc.capturedAt ?? 0)
-        if (!newest || revision > newest.revision
-          || (revision === newest.revision && capturedAt > newest.capturedAt)) {
-          newest = { revision, capturedAt, records: Array.isArray(doc.records) ? doc.records : [] }
-        }
-      }
-      if (newest) {
-        lastObserved = JSON.stringify(newest.records.map((record) => ({
-          tabId: record.tabId,
-          tabName: record.tabName,
-          panes: record.panes?.map((pane) => pane.title),
-        })))
-        if (predicate(newest.records)) return
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500))
-  }
-  throw new Error(
-    `The newest persisted generation for client ${clientInstanceId} never matched within ${timeoutMs}ms `
-    + `(last observed: ${lastObserved})`,
-  )
-}
 
 function hasPaneTitle(records: RegistryRecord[], tabId: string, paneId: string, title: string): boolean {
   const record = records.find((candidate) => candidate.tabId === tabId)
   return !!record?.panes?.some((pane) => pane.paneId === paneId && pane.title === title)
-}
-
-async function clientInstanceIdOf(page: Page): Promise<string> {
-  const id = await page.evaluate((key) => sessionStorage.getItem(key), CLIENT_INSTANCE_ID_KEY)
-  expect(id, 'the page claimed a tabs-registry clientInstanceId').toBeTruthy()
-  return id!
 }
 
 /** Boot a Freshell window in `context` and wait until it holds `tabIds`. */
@@ -123,27 +59,6 @@ async function bootWindow(
     return tabIds.every((id) => ids.includes(id))
   }, { timeout: 30_000, message: `the new window rebuilt tabs ${tabIds.join(', ')}` }).toBe(true)
   return { page, harness }
-}
-
-type LayoutNode = { type: 'leaf'; id: string; content?: { kind?: string; terminalId?: unknown } }
-  | { type: 'split'; children: [LayoutNode, LayoutNode] }
-
-function findLeaf(node: LayoutNode | undefined, paneId: string): Extract<LayoutNode, { type: 'leaf' }> | undefined {
-  if (!node) return undefined
-  if (node.type === 'leaf') return node.id === paneId ? node : undefined
-  return findLeaf(node.children[0], paneId) ?? findLeaf(node.children[1], paneId)
-}
-
-/** Wait until pane `paneId` of `tabId` is attached to a terminal. */
-async function terminalIdOf(harness: TestHarness, tabId: string, paneId: string): Promise<string> {
-  let terminalId = ''
-  await expect.poll(async () => {
-    const state = await harness.getState()
-    const content = findLeaf(state?.panes?.layouts?.[tabId], paneId)?.content
-    terminalId = content?.kind === 'terminal' && typeof content.terminalId === 'string' ? content.terminalId : ''
-    return terminalId.length > 0
-  }, { timeout: 30_000, message: `pane ${paneId} has a terminal` }).toBe(true)
-  return terminalId
 }
 
 /**
@@ -194,23 +109,9 @@ async function waitForRenamedSplitTab(
   })
 }
 
-/** Type a command that sets the window title to INTRUDER into pane `paneId`,
- * then wait for its computed marker (the marker text never appears in the
- * typed command, so seeing it proves the printf already ran). */
+/** Set pane `paneId`'s window title to INTRUDER from its shell (OSC 0). */
 async function sendIntruderTitle(page: Page, harness: TestHarness, tabId: string, paneId: string, marker: number): Promise<void> {
-  const terminalId = await terminalIdOf(harness, tabId, paneId)
-  await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click()
-  // TerminalView ignores title changes less than 2 s after the previous one
-  // (spinner throttle); let any earlier title settle first.
-  await page.waitForTimeout(2_500)
-  await page.locator(`[data-context="pane"][data-pane-id="${paneId}"] .xterm`).first().click()
-  await page.keyboard.type(`printf '\\033]0;${INTRUDER}\\007'; echo osc-$((${marker}+1))-done`)
-  await page.keyboard.press('Enter')
-  const expected = `osc-${marker + 1}-done`
-  await expect.poll(async () => (await harness.getTerminalBuffer(terminalId)) ?? '', {
-    timeout: 20_000,
-    message: `the shell in pane ${paneId} ran the title command`,
-  }).toContain(expected)
+  await sendWindowTitle(page, harness, { tabId, paneId, title: INTRUDER, marker })
 }
 
 test.describe('new-window name restore', () => {

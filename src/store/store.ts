@@ -12,6 +12,7 @@ import { terminalInventoryTitleReplayMiddleware } from '@/lib/terminal-inventory
 import { sessionNamesIngestMiddleware } from './sessionNamesSlice'
 import { sessionNameLifecycleMiddleware } from './sessionNameLifecycleMiddleware'
 import { savedNameTabTitleMirrorMiddleware } from './savedNameTabTitleMirror'
+import { healStoredTabTitlesOnLoad, storedTabTitleHealMiddleware } from './storedTabTitleHeal'
 import {
   collectLegacyPendingHandleAssignments,
   submitPendingLegacyNameImports,
@@ -66,6 +67,11 @@ export const store = configureStore({
       // persistence/layout-mirror subscribers (their post-action reads see
       // the mirrored title).
       savedNameTabTitleMirrorMiddleware,
+      // Name reliability (Task 14): a stored tab title that is a default
+      // label (an old "Shell agent") heals to the unnamed placeholder. Next
+      // to the mirror, whose saved names it never touches, and inner to the
+      // persistence/layout-mirror subscribers (they read the healed title).
+      storedTabTitleHealMiddleware,
       subagentInterestMiddleware,
       terminalDetachMiddleware,
       sessionActivityPersistMiddleware,
@@ -80,6 +86,10 @@ export const store = configureStore({
 })
 
 pruneTabRecencyToCurrentLayout(store)
+
+// Name reliability (Task 14): heal the loaded layout's default-label tab
+// titles before anything reads them.
+healStoredTabTitlesOnLoad(store)
 
 // Pane focus-ownership memory: explicit selections (activePane value changes
 // and epoch nudges) advance the restore-guard serial; ownership records are

@@ -14,7 +14,7 @@ import {
 } from 'lucide-react'
 import type { AppDispatch } from '@/store/store'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
-import { addPane, initLayout } from '@/store/panesSlice'
+import { addPane, initLayout, updatePaneTitle } from '@/store/panesSlice'
 import {
   RegistryPaneSnapshotSchema,
   type RegistryPaneSnapshot,
@@ -34,7 +34,11 @@ import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { normalizeFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 import { isScopedNameSourceContent, parsePaneNamingIdentityInput, remapTabNameSource } from '@/lib/tab-name-source'
-import type { PaneContent } from '@/store/paneTypes'
+import { restoredTabNames, type RestoredTabNames } from '@/lib/restored-tab-names'
+import { createLogger } from '@/lib/client-logger'
+import type { PaneContent, PaneNode } from '@/store/paneTypes'
+
+const log = createLogger('tab-registry-open')
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
@@ -264,6 +268,47 @@ export type OpenTabRecordDeps = {
   onOpened?: () => void
 }
 
+/**
+ * The layout an unlinked copy builds: `initLayout` places the first pane and
+ * each `addPane` splits the pane added before it, which makes a right-leaning
+ * chain. The name restore reads only its leaves and its first leaf.
+ */
+function copiedLayout(leaves: PaneNode[]): PaneNode {
+  return leaves.reduceRight((rest, head) => ({
+    type: 'split',
+    id: nanoid(),
+    direction: 'horizontal',
+    sizes: [50, 50],
+    children: [head, rest],
+  }))
+}
+
+/**
+ * Name reliability (Task 14): put the recorded pane titles and rename flags
+ * (`restoredTabNames`, the Task 9 rebuild rules) onto the opened tab's panes.
+ */
+function dispatchRestoredPaneNames(
+  dispatch: AppDispatch,
+  record: RegistryTabRecord,
+  tabId: string,
+  names: RestoredTabNames,
+): void {
+  for (const [paneId, title] of Object.entries(names.paneTitles)) {
+    dispatch(updatePaneTitle({
+      tabId,
+      paneId,
+      title,
+      setByUser: names.paneTitleSetByUser[paneId] === true,
+    }))
+  }
+  log.info('registry open restored recorded names', {
+    tabKey: record.tabKey,
+    paneTitles: Object.keys(names.paneTitles).length,
+    paneRenameFlags: Object.keys(names.paneTitleSetByUser).length,
+    tabRenameFlag: names.titleSetByUser === true,
+  })
+}
+
 export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTabRecordDeps): void {
   const { dispatch, localServerInstanceId, onOpened } = deps
   const tabId = nanoid()
@@ -276,10 +321,27 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
   for (const pane of paneSnapshots) {
     paneIdMap.set(pane.paneId, nanoid())
   }
-  const firstPane = paneSnapshots[0]
-  const firstContent = firstPane
-    ? sanitizePaneSnapshot(record, firstPane, localServerInstanceId)
-    : ({ kind: 'terminal', mode: 'shell' } as const)
+  const panes = paneSnapshots.map((pane) => ({
+    paneId: paneIdMap.get(pane.paneId)!,
+    content: sanitizePaneSnapshot(record, pane, localServerInstanceId),
+  }))
+  const nameSource = record.nameSource ? remapTabNameSource(record.nameSource, paneIdMap) : undefined
+  // Name reliability (Task 14): the copy keeps the record's names and their
+  // rename protection, exactly as the Task 9 new-window rebuild does.
+  const names = panes.length > 0
+    ? restoredTabNames({
+      tab: record,
+      tabId,
+      recordedPanes: paneSnapshots,
+      layout: copiedLayout(panes.map(({ paneId, content }) => ({
+        type: 'leaf',
+        id: paneId,
+        content: content as PaneContent,
+      }))),
+      paneIdMap,
+      nameSource,
+    })
+    : undefined
   dispatch(
     addTab({
       id: tabId,
@@ -287,23 +349,24 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
       mode: deriveModeFromRecord(record),
       status: 'creating',
       serverInstanceId: record.serverInstanceId,
-      ...(record.nameSource
-        ? { nameSource: remapTabNameSource(record.nameSource, paneIdMap) }
-        : {}),
+      ...(nameSource ? { nameSource } : {}),
+      ...(names?.titleSetByUser ? { titleSetByUser: true } : {}),
     }),
   )
+  const [first, ...rest] = panes
   dispatch(initLayout({
     tabId,
-    paneId: paneIdMap.get(firstPane?.paneId ?? '') ?? undefined,
-    content: firstContent,
+    paneId: first?.paneId,
+    content: first?.content ?? { kind: 'terminal', mode: 'shell' },
   }))
-  for (const pane of paneSnapshots.slice(1)) {
+  for (const pane of rest) {
     dispatch(addPane({
       tabId,
-      newContent: sanitizePaneSnapshot(record, pane, localServerInstanceId),
-      newPaneId: paneIdMap.get(pane.paneId),
+      newContent: pane.content,
+      newPaneId: pane.paneId,
     }))
   }
+  if (names) dispatchRestoredPaneNames(dispatch, record, tabId, names)
   onOpened?.()
 }
 
@@ -314,6 +377,7 @@ export function openPaneInNewTab(
 ): void {
   const { dispatch, localServerInstanceId, onOpened } = deps
   const tabId = nanoid()
+  const paneId = nanoid()
   const content = sanitizePaneSnapshot(record, pane, localServerInstanceId)
   // Unified agent names (Task 6): a scoped agent pane moved into its own tab
   // OWNS that tab — never the composed `${record.tabName} · ${pane.title}`
@@ -323,6 +387,17 @@ export function openPaneInNewTab(
   // layout (that pane is the original pane). Non-agent panes keep the
   // existing composed title.
   const scopedPane = isScopedNameSourceContent(content as PaneContent)
+  // Name reliability (Task 14): the moved pane keeps its recorded name and
+  // rename protection (the Task 9 rebuild rules). Its tab is a new tab, so
+  // the record tab's own rename flag is not carried.
+  const names = restoredTabNames({
+    tab: { tabKey: record.tabKey },
+    tabId,
+    recordedPanes: [pane],
+    layout: { type: 'leaf', id: paneId, content: content as PaneContent },
+    paneIdMap: new Map([[pane.paneId, paneId]]),
+    nameSource: undefined,
+  })
   dispatch(
     addTab({
       id: tabId,
@@ -337,9 +412,11 @@ export function openPaneInNewTab(
   dispatch(
     initLayout({
       tabId,
+      paneId,
       content,
     }),
   )
+  dispatchRestoredPaneNames(dispatch, record, tabId, names)
   onOpened?.()
 }
 
