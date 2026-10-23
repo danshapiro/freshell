@@ -723,8 +723,17 @@ class SimulatedCli {
     return true
   }
 
-  setMode(mode) {
+  /**
+   * The CLI's permission mode changes. Entering plan mode remembers the mode
+   * it left: an approved ExitPlanMode returns there, not to default (B6).
+   */
+  changeMode(mode) {
+    if (mode === 'plan' && this.permissionMode !== 'plan') this.modeBeforePlan = this.permissionMode
     this.permissionMode = mode
+  }
+
+  setMode(mode) {
+    this.changeMode(mode)
     this.emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode })
   }
 
@@ -942,7 +951,7 @@ class SimulatedCli {
       this.ledger('control', { name: 'setPermissionMode', args: [mode] })
       // The only settings call the CLI validates (any model or effort name is accepted).
       if (!PERMISSION_MODES.includes(mode)) throw new Error(`Cannot set permission mode: must be one of ${PERMISSION_MODES.join(', ')}`)
-      this.permissionMode = mode
+      this.changeMode(mode)
       // Reported after the call resolves, before anything sent after it is taken.
       setImmediate(() => this.emit({ type: 'system', subtype: 'status', status: null, permissionMode: mode }))
     })

@@ -148,7 +148,7 @@ export async function toolCall(cli, turn, step) {
     cli.trailingStream('tool_use')
   }
   if (name === 'ExitPlanMode') {
-    if (cli.permissionMode === 'plan') cli.setMode('default')
+    if (cli.permissionMode === 'plan') cli.setMode(cli.modeBeforePlan ?? 'default')
     cli.toolResult(toolUseId, 'User has approved exiting plan mode. You can now proceed.', { toolUseResult: { plan: null, isAgent: false } })
     return 'done'
   }

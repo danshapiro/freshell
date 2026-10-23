@@ -638,6 +638,24 @@ const SCENARIOS = {
     await s.close()
   },
 
+  /**
+   * An approved ExitPlanMode returns the CLI to the mode it had before plan
+   * mode: bypassPermissions here, not default (transcript-live B6).
+   */
+  async 'plan-return'(ctx) {
+    const s = ctx.open('S', {
+      options: { permissionMode: 'bypassPermissions' },
+      permissions: (toolName, input) => ({ behavior: 'allow', updatedInput: input }),
+    })
+    await s.init()
+    await s.call('setPermissionMode', 'plan')
+    s.push('PLAN:exit', 'u1')
+    await s.waitForResults(1, 30_000)
+    await s.waitForCount(isStateIdle, 1, 3000, 'idle')
+    await sleep(300)
+    await s.close()
+  },
+
   /** T19: a background Agent's completion starts a CLI-initiated turn with no uuid and no lifecycle. */
   async 'cli-turn'(ctx) {
     const s = ctx.open('S')
