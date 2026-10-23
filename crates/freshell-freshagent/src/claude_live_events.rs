@@ -1,9 +1,11 @@
 //! The claude sidecar's non-terminal provider events (transcript-live plan
-//! §4.2, principle P4): an API request the CLI retries (`sdk.retry`) and a
+//! §4.2, principle P4): an API request the CLI retries (`sdk.retry`), a
 //! notice (`sdk.notice`: a rate limit, an informational banner, a failed
-//! compaction). Both are broadcast to every client unchanged (as
-//! `freshAgent.retry` / `freshAgent.notice`), and neither ends the turn or
-//! touches the session's status.
+//! compaction) and the CLI's own change of permission mode
+//! (`sdk.session.metadata {permissionMode}`). They are broadcast to every
+//! client unchanged (as `freshAgent.retry` / `freshAgent.notice` /
+//! `freshAgent.session.metadata`), and none ends the turn or touches the
+//! session's status.
 //!
 //! [`log_provider_event`] logs them under the id the pane knows the session
 //! by. The sidecar logs the same events under its own id (its stderr records
@@ -16,12 +18,26 @@ use serde_json::Value;
 
 const PROVIDER: &str = "claude";
 
-/// Log one sidecar line if it is a retry or a notice; other lines are ignored.
-/// `session_id` is the envelope stamp the broadcast carries.
+/// Log one sidecar line if it is a retry, a notice or a permission-mode
+/// change; other lines are ignored. `session_id` is the envelope stamp the
+/// broadcast carries.
 pub(crate) fn log_provider_event(line: &Value, session_id: &str, session_type: &str) {
     match line.get("type").and_then(Value::as_str) {
         Some("sdk.retry") => log_retry(line, session_id, session_type),
         Some("sdk.notice") => log_notice(line, session_id, session_type),
+        Some("sdk.session.metadata") => {
+            if let Some(permission_mode) = line.get("permissionMode").and_then(Value::as_str) {
+                tracing::info!(
+                    target: "freshell_freshagent::claude",
+                    event = "freshagent.claude.permission_mode_changed",
+                    provider = PROVIDER,
+                    session_id,
+                    session_type,
+                    permission_mode,
+                    "the claude CLI changed its own permission mode; the session's settings follow"
+                );
+            }
+        }
         _ => {}
     }
 }

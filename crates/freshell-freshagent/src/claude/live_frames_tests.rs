@@ -43,6 +43,7 @@ struct EchoSession {
     rx: tokio::sync::broadcast::Receiver<String>,
     /// The pane's id for the session (its map key and envelope id).
     pane: String,
+    configure_log: std::path::PathBuf,
     /// Every frame read off the bus so far, in order.
     frames: Vec<Value>,
     _dir: tempfile::TempDir,
@@ -74,6 +75,7 @@ impl EchoSession {
             st,
             rx,
             pane: String::new(),
+            configure_log,
             frames: Vec::new(),
             _dir: dir,
             _env: env,
@@ -132,6 +134,16 @@ impl EchoSession {
         .await
     }
 
+    /// The configure lines the fake received.
+    fn configures(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.configure_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("a configure line"))
+            .collect()
+    }
+
     /// The status the snapshot overlay states for the session.
     async fn overlay_status(&self) -> Value {
         let mut snapshot = json!({});
@@ -177,6 +189,23 @@ fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
         observed_epoch: None,
         observed_generation: None,
         checkpoint_intent: None,
+    }
+}
+
+fn configure_msg(session_id: &str, permission_mode: &str) -> FreshAgentConfigure {
+    FreshAgentConfigure {
+        provider: freshell_protocol::AgentProvider::Claude,
+        session_id: session_id.to_string(),
+        session_type: SessionType::Freshclaude,
+        cwd: None,
+        request_id: Some("live-frames-configure".to_string()),
+        settings: freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: None,
+            permission_mode: Some(permission_mode.to_string()),
+            sandbox: None,
+            effort: None,
+        },
     }
 }
 
@@ -333,4 +362,58 @@ async fn a_transcript_announcement_reaches_every_client_as_session_changed() {
         "11111111-1111-4111-8111-111111111111"
     );
     assert_eq!(main_thread[0]["event"]["parentToolUseId"], Value::Null);
+}
+
+/// The CLI changed its own permission mode (an approved ExitPlanMode): the
+/// sidecar reports `sdk.session.metadata {permissionMode}`. Every client
+/// receives it, and the session's settings take the new mode, so the next
+/// configure (or settings-bearing send) that states the same mode applies
+/// nothing, and the snapshot overlay states the new mode.
+#[tokio::test]
+async fn the_clis_own_permission_mode_change_becomes_the_sessions_setting() {
+    let (events, _capture) = capture::install();
+    let mut session = EchoSession::start(Some("plan")).await;
+    session
+        .sidecar_writes(json!([
+            { "type": "sdk.session.metadata", "permissionMode": "default" },
+            { "type": "sdk.result", "result": "success", "durationMs": 1, "costUsd": 0, "usage": {} },
+        ]))
+        .await;
+    let metadata = session.await_event("freshAgent.session.metadata").await;
+    assert_eq!(metadata["sessionId"], json!(session.pane), "{metadata}");
+    assert_eq!(metadata["event"]["permissionMode"], "default");
+    session.await_event("freshAgent.result").await;
+
+    let mut snapshot = json!({});
+    session
+        .st
+        .apply_snapshot_metadata(&session.pane, &mut snapshot)
+        .await;
+    assert_eq!(snapshot["settings"]["permissionMode"], "default");
+    let logged = records(&events, "freshagent.claude.permission_mode_changed");
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(logged[0].1.get("session_id"), Some(&session.pane));
+    assert_eq!(
+        logged[0].1.get("permission_mode").map(String::as_str),
+        Some("default")
+    );
+
+    session
+        .st
+        .handle_configure(configure_msg(&session.pane, "default"))
+        .await;
+    assert_eq!(
+        session.configures(),
+        Vec::<Value>::new(),
+        "the session already runs in the mode the configure states"
+    );
+
+    // The configure lane itself still works: going back to plan applies.
+    session
+        .st
+        .handle_configure(configure_msg(&session.pane, "plan"))
+        .await;
+    let configures = session.configures();
+    assert_eq!(configures.len(), 1, "{configures:?}");
+    assert_eq!(configures[0]["settings"]["permissionMode"], "plan");
 }

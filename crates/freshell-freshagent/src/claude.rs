@@ -8767,6 +8767,19 @@ impl FreshClaudeState {
                             }
                         }
                     }
+                    // The CLI changed its own permission mode (an approved
+                    // ExitPlanMode returns it to the mode it had before plan
+                    // mode). The sidecar already runs in it; the session's
+                    // settings take it too, so a later configure stating the
+                    // same mode applies nothing and the snapshot states it.
+                    Some("sdk.session.metadata") => {
+                        if let Some(mode) = value.get("permissionMode").and_then(Value::as_str) {
+                            if let Some(session) = sessions.lock().await.get_mut(&session_id) {
+                                session.configuration.settings.permission_mode =
+                                    Some(mode.to_string());
+                            }
+                        }
+                    }
                     Some("sdk.configured") => {
                         if let Some(session) = sessions.lock().await.get_mut(&session_id) {
                             if session
