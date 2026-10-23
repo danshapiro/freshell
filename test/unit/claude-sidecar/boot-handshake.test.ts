@@ -79,21 +79,40 @@ describe('the sidecar answers created only once the CLI has booted', () => {
     const atBoot = await sidecar.waitFor((frame) => frame.type === 'sdk.session.changed', 'the boot catalog')
     expect(atBoot).toMatchObject({ sessionId, reason: 'session-commands' })
     expect(atBoot.commands).toContainEqual({ name: 'compact', description: 'Free up context by summarizing the conversation so far', argumentHint: '<optional custom summarization instructions>' })
+    // The boot names no terminal-only commands, yet the boot catalog already
+    // leaves out the pinned CLI's (doctor, color): the slash menu never offers
+    // a command the SDK session cannot run.
+    const atBootNames = atBoot.commands.map((command: { name: string }) => command.name)
+    expect(atBootNames).not.toContain('doctor')
+    expect(atBootNames).not.toContain('color')
     expect(sidecar.ledger().filter((row) => row.kind === 'prompt')).toEqual([])
     // created is the first line: the catalog follows it.
     expect(sidecar.frames.findIndex((frame) => frame.type === 'created')).toBe(0)
 
-    // The first turn's init names the CLI's terminal-only commands: the
-    // catalog changes, so it is published again without them.
+    // Every turn's init names the same terminal-only commands: the catalog
+    // does not change, so nothing is published again.
     sidecar.send({ type: 'send', sessionId, text: 'one' })
     await sidecar.waitFor(() => sidecar.frames.filter((frame) => frame.type === 'sdk.result').length === 1, 'the first result')
-    expect(catalogs()).toHaveLength(2)
-    expect(catalogs()[1].commands.map((command: { name: string }) => command.name)).not.toContain('doctor')
-
-    // Every later turn's init repeats the same catalog: nothing is published.
     sidecar.send({ type: 'send', sessionId, text: 'two' })
     await sidecar.waitFor(() => sidecar.frames.filter((frame) => frame.type === 'sdk.result').length === 2, 'the second result')
+    expect(catalogs()).toHaveLength(1)
+  })
+
+  it('takes the terminal-only commands a turn\'s init names over the pinned ones, and republishes the catalog', async () => {
+    // A CLI whose init names a different terminal-only list (here only doctor).
+    const sidecar = await startRealSidecar({ env: { FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS: 'doctor' } })
+    const sessionId = await sidecar.create()
+    const catalogs = () => sidecar.frames.filter((frame) => frame.type === 'sdk.session.changed' && frame.reason === 'session-commands')
+    const names = (catalog: SidecarFrame) => catalog.commands.map((command: { name: string }) => command.name)
+    await sidecar.waitFor((frame) => frame.type === 'sdk.session.changed', 'the boot catalog')
+    expect(names(catalogs()[0])).not.toContain('color')
+
+    sidecar.send({ type: 'send', sessionId, text: 'one' })
+    await sidecar.waitFor('sdk.result')
     expect(catalogs()).toHaveLength(2)
+    expect(catalogs()[1]).toMatchObject({ sessionId, reason: 'session-commands' })
+    expect(names(catalogs()[1])).toContain('color')
+    expect(names(catalogs()[1])).not.toContain('doctor')
   })
 
   it('refuses a second create: one sidecar hosts one session, and that session keeps working', async () => {

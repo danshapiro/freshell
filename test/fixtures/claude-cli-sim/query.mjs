@@ -38,6 +38,9 @@
 //   FRESHELL_CLAUDE_SIM_STALL_STDIN     '1'/'boot' or 'prompt': the host process
 //                                       stops reading stdin after boot / at the
 //                                       first prompt
+//   FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS  comma-separated names: the terminal-only
+//                                       commands each init lists, in place of the
+//                                       pinned CLI's (a CLI whose list changed)
 //   FRESHELL_CLAUDE_SIM_LEDGER          JSONL path, for tests that need to see what
 //                                       the SDK side received. Every row carries
 //                                       `query`, the ordinal of its query() call in
@@ -451,6 +454,9 @@ class SimulatedCli {
       cwd: this.cwd,
       session_id: this.sessionId,
       ...CATALOG.init,
+      ...(this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS === undefined
+        ? {}
+        : { terminal_slash_commands: this.env.FRESHELL_CLAUDE_SIM_TERMINAL_COMMANDS.split(',').filter(Boolean) }),
       mcp_servers: mcpServers,
       plugins,
       model: this.model,

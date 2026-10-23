@@ -48,8 +48,9 @@
 //                                  stays silent
 //     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
 //     { type:'sdk.session.changed',     sessionId, reason:'session-commands', commands }
-//                                  — the command catalog: from the boot, then whenever a turn's init
-//                                    (its terminal-only commands) or commands_changed changes it
+//                                  — the command catalog without the terminal-only commands (the pinned
+//                                    CLI's until a turn's init names its own): from the boot, then
+//                                    whenever a turn's init or commands_changed changes it
 //     { type:'sdk.status',              sessionId, status }               // compacting (an ended stream sends
 //                                  no status: the server reports the session as exited)
 //     { type:'sdk.error',               sessionId, message, turnFailure? } // turnFailure: a failed turn's result
@@ -112,6 +113,7 @@ import { cliStderrLogger, errorText, log } from './log.mjs'
 import { isHostedSidecar } from './hosted.mjs'
 import { STREAM_ENDED_EXIT_CODE, streamEnd } from './stream-end.mjs'
 import { BOOT_FAILED_EXIT_CODE, bootOptions, classifyBootError, SIDECAR_PROTOCOL } from './boot.mjs'
+import { usableCommands } from './terminal-commands.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -252,14 +254,14 @@ function normalizeCommands(rows, strict = false) {
 /**
  * Publish the session's command catalog when it differs from the last one
  * published. The catalog comes from the boot (initializationResult().commands)
- * and from commands_changed; each turn's init names the CLI's terminal-only
- * commands, which the catalog leaves out. Every init repeats the same lists,
- * so an unchanged catalog is never sent again.
+ * and from commands_changed, and leaves out the CLI's terminal-only commands:
+ * the ones each turn's init names, or the pinned CLI's before the first init
+ * (terminal-commands.mjs). Every init repeats the same lists, so an unchanged
+ * catalog is never sent again.
  */
 function publishCommandsIfChanged(sessionId, state) {
   if (!state.booted || state.commandCatalog === undefined) return
-  const terminal = new Set(state.terminalCommandNames ?? [])
-  const commands = state.commandCatalog.filter((row) => !terminal.has(row.name))
+  const commands = usableCommands(state.commandCatalog, state.terminalCommandNames)
   const published = JSON.stringify(commands)
   if (published === state.publishedCommands) return
   state.publishedCommands = published

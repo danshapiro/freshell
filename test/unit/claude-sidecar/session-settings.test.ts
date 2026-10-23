@@ -185,12 +185,10 @@ describe('Claude sidecar configuration protocol', () => {
   it('publishes usable provider commands and removes terminal-only commands', async () => {
     const bridge = await sidecar()
     const sessionId = await bridge.create({ requestId: 'create', model: 'opus' })
-    // The boot publishes the catalog (boot-handshake.test.ts); a turn's init
-    // then names the CLI's terminal-only commands, which takes a prompt (T1).
-    bridge.send({ type: 'send', sessionId, text: 'hello' })
-    await bridge.waitFor('sdk.result')
-    const catalogs = bridge.frames.filter((frame) => frame.type === 'sdk.session.changed')
-    const changed = catalogs[catalogs.length - 1]
+    // The FIRST catalog published is the boot's (boot-handshake.test.ts), before
+    // any turn's init has named the CLI's terminal-only commands (T1): even it
+    // must never offer a command the SDK session cannot run.
+    const changed = await bridge.waitFor('sdk.session.changed')
     expect(changed).toMatchObject({ sessionId, reason: 'session-commands' })
     // A usable command keeps its description and argument hint; the CLI's
     // terminal-only commands (doctor, color) are removed.
