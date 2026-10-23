@@ -2677,6 +2677,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// G11: the effort levels saved with a fresh-pane default model travel
+    /// with it through PATCH, GET, config.json and restart, and the client's
+    /// `null` clear sentinel removes them (the `freshAgent.providers` subtree
+    /// is opaque to the server and deep-merged).
+    #[tokio::test]
+    async fn fresh_agent_provider_model_effort_levels_round_trip_and_clear() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        let levels = json!({ "modelId": "claude-haiku-x", "levels": [] });
+
+        store
+            .patch(&json!({ "freshAgent": { "providers": { "freshclaude": {
+                "modelSelection": { "kind": "exact", "modelId": "claude-haiku-x" },
+                "modelEffortLevels": levels,
+            } } } }))
+            .await
+            .unwrap();
+        let got = store.get().await;
+        assert_eq!(
+            got.fresh_agent.providers["freshclaude"]["modelEffortLevels"],
+            levels
+        );
+
+        // An unrelated provider patch keeps the levels.
+        store
+            .patch(
+                &json!({ "freshAgent": { "providers": { "freshclaude": { "effort": "low" } } } }),
+            )
+            .await
+            .unwrap();
+        let restarted = store_at(&dir);
+        let after = restarted.get().await;
+        assert_eq!(
+            after.fresh_agent.providers["freshclaude"]["modelEffortLevels"],
+            levels
+        );
+        assert_eq!(after.fresh_agent.providers["freshclaude"]["effort"], "low");
+
+        // The clear sentinel removes them.
+        let cleared = restarted
+            .patch(&json!({ "freshAgent": { "providers": { "freshclaude": { "modelEffortLevels": null } } } }))
+            .await
+            .unwrap();
+        assert!(cleared.fresh_agent.providers["freshclaude"]["modelEffortLevels"].is_null());
+        assert_eq!(
+            cleared.fresh_agent.providers["freshclaude"]["modelSelection"]["modelId"],
+            "claude-haiku-x"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn valid5() -> Vec<String> {
         ["claude", "codex", "gemini", "kimi", "opencode"]
             .iter()

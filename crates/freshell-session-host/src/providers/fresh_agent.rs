@@ -1384,7 +1384,12 @@ fn render_snapshot_text(snapshot: &Value, max_bytes: usize) -> (String, bool) {
                 }
             }
             if body.is_empty() {
-                if let Some(summary) = turn.get("summary").and_then(Value::as_str) {
+                // An item-less turn carrying only the durable error module
+                // (a claude API error or failed local command) reads as its
+                // error; anything else falls back to the summary.
+                if let Some(message) = turn.pointer("/error/message").and_then(Value::as_str) {
+                    body.push(message);
+                } else if let Some(summary) = turn.get("summary").and_then(Value::as_str) {
                     body.push(summary);
                 }
             }
@@ -3557,5 +3562,25 @@ lines.on('line', line=>{{
         assert!(short.len() <= 8);
         assert!(short.is_char_boundary(short.len()));
         assert!(truncated);
+    }
+
+    #[test]
+    fn snapshot_text_renders_error_only_turns_by_their_error_message() {
+        // Real claude snapshots (pinned CLI 2.1.237 goldens): a failed /compact
+        // and an API error are item-less turns carrying only the error module.
+        for (golden, expected) in [
+            (
+                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/compact-fail/snapshot.golden.json"),
+                "system: Error during compaction: API Error: 400 compaction refused by fake\n",
+            ),
+            (
+                include_str!("../../../../test/fixtures/fresh-agent/claude/real-cli-2.1.237/api-error/snapshot.golden.json"),
+                "assistant: API Error: 400 fixture bad request\n",
+            ),
+        ] {
+            let snapshot: Value = serde_json::from_str(golden).unwrap();
+            let (text, _) = render_snapshot_text(&snapshot, 1 << 20);
+            assert!(text.contains(expected), "{text}");
+        }
     }
 }
