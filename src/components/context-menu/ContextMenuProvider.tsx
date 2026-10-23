@@ -73,6 +73,7 @@ import {
   copyFreshAgentFilePath,
 } from './fresh-agent-copy'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
@@ -918,7 +919,7 @@ export function ContextMenuProvider({
         descriptionOverride: description || undefined,
       })
       const existing = findTabByTerminalId(terminalId)
-      if (existing && title) {
+      if (existing && title && canWriteLegacyTabTitle(appStore.getState(), existing.id)) {
         dispatch(updateTab({ id: existing.id, updates: { title } }))
       }
       if (title) {
@@ -937,7 +938,7 @@ export function ContextMenuProvider({
         ?? parseSessionNameRecordOrUpdate(error?.details?.sessionName)
       if (accepted) dispatch(receiveSessionNameProjections([{ record: accepted, ref: accepted.ref }]))
     }
-  }, [dispatch, findTabByTerminalId])
+  }, [dispatch, appStore, findTabByTerminalId])
 
   const generateTerminalSummary = useCallback(async (terminalId: string) => {
     try {

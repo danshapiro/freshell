@@ -4,6 +4,7 @@ import { collectPaneIdentityActivity } from '@/lib/pane-activity'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import type { PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
+import { normalizeRegistryTabRecord } from '@/store/tabRegistryTypes'
 
 describe('shouldKeepClosedTab', () => {
   it('keeps when open for more than 5 minutes', () => {
@@ -559,5 +560,58 @@ describe('unified agent names registry round-trip (Task 6)', () => {
       revision: 0,
     })
     expect(unownedRecord).not.toHaveProperty('nameSource')
+  })
+})
+
+describe('name reliability (Task 9): registry pane user flags', () => {
+  const splitLayout: PaneNode = {
+    type: 'split',
+    id: 'split-1',
+    direction: 'horizontal',
+    sizes: [50, 50],
+    children: [
+      {
+        type: 'leaf',
+        id: 'pane-renamed',
+        content: { kind: 'terminal', mode: 'shell', status: 'running', createRequestId: 'req-renamed' },
+      },
+      {
+        type: 'leaf',
+        id: 'pane-osc',
+        content: { kind: 'browser', browserInstanceId: 'browser-1', url: 'https://example.com', devToolsOpen: false },
+      },
+    ],
+  }
+  const tab = {
+    id: 't1', createRequestId: 'r', title: 'MyShellTab', titleSetByUser: true,
+    status: 'running', mode: 'shell', createdAt: 1,
+  } as Tab
+  const paneTitles = { 'pane-renamed': 'KeepMePane', 'pane-osc': 'user@host: ~' }
+  const paneTitleSetByUser = { 'pane-renamed': true }
+
+  it('registry pane snapshots carry the pane user flag', () => {
+    const input = {
+      tab, layout: splitLayout, serverInstanceId: 'srv', paneTitles, paneTitleSetByUser,
+      deviceId: 'd', deviceLabel: 'D', updatedAt: 1, revision: 0,
+    }
+    for (const record of [buildOpenTabRegistryRecord(input), buildClosedTabRegistryRecord(input)]) {
+      const renamed = record.panes.find((pane) => pane.paneId === 'pane-renamed')
+      const automatic = record.panes.find((pane) => pane.paneId === 'pane-osc')
+      expect(renamed).toMatchObject({ title: 'KeepMePane', titleSetByUser: true })
+      // A pane whose title is automatic (an OSC title) carries no flag at all.
+      expect(automatic?.title).toBe('user@host: ~')
+      expect(automatic).not.toHaveProperty('titleSetByUser')
+      expect(record.titleSetByUser).toBe(true)
+    }
+  })
+
+  it('the registry record schema keeps the pane user flag (tabs.sync normalizes every record)', () => {
+    const record = buildOpenTabRegistryRecord({
+      tab, layout: splitLayout, serverInstanceId: 'srv', paneTitles, paneTitleSetByUser,
+      deviceId: 'd', deviceLabel: 'D', updatedAt: 1, revision: 0,
+    })
+    const normalized = normalizeRegistryTabRecord(JSON.parse(JSON.stringify(record)))
+    expect(normalized?.panes.find((pane) => pane.paneId === 'pane-renamed')?.titleSetByUser).toBe(true)
+    expect(normalized?.panes.find((pane) => pane.paneId === 'pane-osc')).not.toHaveProperty('titleSetByUser')
   })
 })

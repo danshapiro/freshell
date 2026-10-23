@@ -5,7 +5,8 @@ import type { RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
 import { receiveSessionNames } from '@/store/sessionNamesSlice'
 import { bootstrapSessionNames, parseSessionNameUpdate, parseSessionNameRef } from '@/lib/session-names'
-import type { SessionNameRef } from '@shared/session-names'
+import { isUnifiedAgentMode, type SessionNameRef } from '@shared/session-names'
+import type { PaneContent } from '@/store/paneTypes'
 import {
   isScopedPaneContent,
   selectTabNameSourcePaneId,
@@ -122,6 +123,17 @@ function collectRefsForScopedTarget(
   return refs
 }
 
+/** Does a `tab.create` payload create a scoped Claude/Codex/OpenCode pane?
+ * Explicit pane content decides; otherwise the tab's mode does (a
+ * terminal-id create and the layout's later default pane both take it). */
+function createsScopedAgentPane(payload: { mode?: unknown; paneContent?: unknown }): boolean {
+  const content = payload.paneContent
+  if (content && typeof content === 'object') {
+    return isScopedPaneContent(content as PaneContent)
+  }
+  return typeof payload.mode === 'string' && isUnifiedAgentMode(payload.mode, undefined)
+}
+
 async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Promise<void> {
   const payload = msg?.payload && typeof msg.payload === 'object'
     ? msg.payload as Record<string, unknown>
@@ -185,7 +197,10 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         // Explicit creator-provided name (REST/MCP `name`): an explicit title
         // outranks mirrored session titles and registry auto-titles in
         // getTabDisplayTitle (rename-scope-contract display precedence).
-        titleSetByUser: msg.payload.title ? true : undefined,
+        // Not for a Claude/Codex/OpenCode tab (name reliability, Task 7): its
+        // title is a provisional display that the saved-name mirror replaces
+        // once the session's record arrives, so it is never frozen.
+        titleSetByUser: msg.payload.title && !createsScopedAgentPane(msg.payload) ? true : undefined,
         mode: msg.payload.mode,
         shell: msg.payload.shell,
         initialCwd: msg.payload.initialCwd,

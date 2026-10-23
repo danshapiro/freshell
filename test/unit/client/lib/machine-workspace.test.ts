@@ -12,10 +12,9 @@ vi.mock('@/lib/recovery/boot-state', () => ({
   bootCapturedAtMs: 1_000,
 }))
 
-import { getRecoveryInventory } from '@/lib/api'
+import { api, getRecoveryInventory } from '@/lib/api'
 import { MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
-import { listCapturedMigrationEnvelopes } from '@/lib/session-name-migration'
 import tabsReducer, { addTab, setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, splitPane } from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
@@ -627,7 +626,8 @@ describe('restoreMachineWorkspace — unified agent names (Task 7)', () => {
     localStorage.clear()
   })
 
-  it('captures raw legacy layout evidence BEFORE the rebuild clears the local cache', async () => {
+  it('machine-workspace restore performs no legacy capture', async () => {
+    const postSpy = vi.spyOn(api, 'post').mockResolvedValue({ acknowledged: [], names: [] })
     const store = createStore()
     addForeignWorkspace(store)
     const legacyRaw = JSON.stringify({
@@ -661,13 +661,18 @@ describe('restoreMachineWorkspace — unified agent names (Task 7)', () => {
 
     await restoreMachineWorkspace(store, MACHINE_ID)
 
-    // The rebuild replaced the local layout, but the raw legacy bytes were
-    // preserved as an immutable per-importId envelope first — the
-    // consolidation import can still recover the old user labels.
-    const envelopes = listCapturedMigrationEnvelopes(localStorage)
-    const captured = envelopes.find((envelope) => envelope.storageKey === 'freshell.layout.v3')
-    expect(captured).toBeTruthy()
-    expect(captured?.raw).toBe(legacyRaw)
+    // The one-time capture runs only at module load; a rebuild copies
+    // nothing into a migration envelope and sends nothing.
+    const migrationKeys: string[] = []
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index)
+      if (key?.startsWith('freshell.session-names.migration.v1.')) migrationKeys.push(key)
+    }
+    expect(migrationKeys).toEqual([])
+    expect(postSpy).not.toHaveBeenCalled()
+    // The genuine legacy key itself is left in place.
+    expect(localStorage.getItem('freshell.layout.v3')).toBe(legacyRaw)
+    postSpy.mockRestore()
   })
 
   it('restores scoped recovery panes with no scoped pane-title aliases and intact identity', async () => {
@@ -702,5 +707,57 @@ describe('restoreMachineWorkspace — unified agent names (Task 7)', () => {
     expect(content.namingHandle).toBe('handle-agent')
     expect(store.getState().panes.paneTitles['recovered-tab'] ?? {}).toEqual({})
     expect(store.getState().panes.paneTitleSetByUser['recovered-tab'] ?? {}).toEqual({})
+  })
+})
+
+// ── name reliability (Task 9) ────────────────────────────────────────────────
+
+describe('restoreMachineWorkspace — name reliability (Task 9)', () => {
+  beforeEach(() => {
+    vi.mocked(getRecoveryInventory).mockReset()
+    localStorage.clear()
+  })
+
+  it('restoreMachineWorkspace keeps titleSetByUser on legacy tabs', async () => {
+    const store = createStore()
+    addForeignWorkspace(store)
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0] = {
+      tabKey: `${MACHINE_ID}:recovered-tab`,
+      tabName: 'MyShellTab',
+      titleSetByUser: true,
+      nameSource: { kind: 'legacy' },
+      panes: [{
+        paneId: 'recovered-pane',
+        kind: 'terminal',
+        mode: 'shell',
+        shell: null,
+        cwd: '/work',
+        title: 'KeepMePane',
+        titleSetByUser: true,
+        payload: { createRequestId: 'crid-shell' },
+        sessionRef: null,
+        ledgerState: 'unknown',
+        live: false,
+      }],
+    }
+    addRecoveredTab(inventory, MACHINE_ID, 'unrenamed-tab', 'user@host: ~')
+    inventory.device!.tabs[1].panes[0].title = 'user@host: ~'
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'absent' })
+
+    const state = store.getState()
+    const renamed = state.tabs.tabs.find((tab) => tab.id === 'recovered-tab')
+    expect(renamed?.title).toBe('MyShellTab')
+    expect(renamed?.titleSetByUser).toBe(true)
+    expect(state.panes.paneTitles['recovered-tab']).toEqual({ 'recovered-pane': 'KeepMePane' })
+    expect(state.panes.paneTitleSetByUser['recovered-tab']).toEqual({ 'recovered-pane': true })
+
+    // A tab nobody renamed restores its automatic titles, unprotected.
+    const unrenamed = state.tabs.tabs.find((tab) => tab.id === 'unrenamed-tab')
+    expect(unrenamed?.titleSetByUser).toBeFalsy()
+    expect(state.panes.paneTitles['unrenamed-tab']).toEqual({ 'unrenamed-tab-pane': 'user@host: ~' })
+    expect(state.panes.paneTitleSetByUser['unrenamed-tab'] ?? {}).toEqual({})
   })
 })

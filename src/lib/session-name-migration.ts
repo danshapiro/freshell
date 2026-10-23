@@ -2,28 +2,25 @@
  * Unified agent names (Task 7) — the client side of the one-time
  * legacy-name consolidation.
  *
- * Three pinned functions (the plan's exact client contract):
- * - `captureLegacyNameEvidence(storage)` — a SIDE-EFFECT-ONLY synchronous
- *   capture of every supported raw legacy storage payload (per-window
- *   layout envelopes, the legacy bare/backup keys, the pre-migration raw
- *   sidecars, the v2 tabs/panes keys), each preserved as its own immutable
- *   recovery envelope under `freshell.session-names.migration.v1.<importId>`
- *   BEFORE the machine-workspace bootstrap (or a flush) can clear or
- *   rewrite it. Read-only w.r.t. the sources; running it twice is safe.
- *   This module must never import the Redux store — it runs from
- *   `main.tsx` BEFORE `@/store/storage-migration` and the store imports.
+ * WHEN evidence is captured, WHAT counts as evidence and when the captured
+ * envelopes are deleted is owned by `@/lib/legacy-name-capture-policy`
+ * (name reliability, Task 2): a device captures at most once, only from the
+ * genuine pre-migration keys, and never from its own live per-window
+ * layouts. This module owns the rest of the client contract:
  * - `prepareLegacyNameImports(evidence)` — deterministic candidate
  *   extraction (at most 100 candidates per import) including the
- *   legacy-pending namingHandle derivation for unbound scoped panes.
+ *   legacy-pending namingHandle derivation for unbound scoped panes. A
+ *   default or derived label ("Tab 7", the folder name, a provider label)
+ *   is not a name and never becomes a candidate, and a session-owned tab's
+ *   stored title is a display copy of the saved name, never evidence.
  * - `importLegacyNames(imports)` — the HTTP submit against
- *   `POST /api/session-names/import`; acknowledged import ids are marked
- *   locally (evidence is retained after acknowledgment for recovery), an
- *   already-acknowledged import replays as a no-op without a request, and
- *   a failed submit keeps the import pending for retry. A chunked envelope
- *   (`<base>--<N>` derived ids) retires only when ALL its chunks
- *   acknowledged — a mid-sequence transient failure keeps the envelope
- *   pending so the next connection-ready edge resubmits exactly the
- *   unacknowledged chunks.
+ *   `POST /api/session-names/import`; an already-acknowledged import replays
+ *   as a no-op without a request, and a failed submit keeps the import
+ *   pending for retry.
+ * - `submitPendingLegacyNameImports()` — the connection-ready submit of the
+ *   genuine pending envelopes. A chunked envelope (`<base>--<N>` derived ids)
+ *   retires only when ALL its chunks acknowledged; a retired envelope is
+ *   deleted, and the device is marked done once none is left.
  *
  * Plus the ONE client sanitizer: `stripScopedPaneTitleMetadata` /
  * `stripSessionOwnedTabFreezeFlags` — the single gate every scoped
@@ -35,16 +32,26 @@
  * path (shells, browsers, editors, excluded providers, nameSource-less
  * tabs) is preserved verbatim.
  *
- * Plus the persistence flush gate (`ensureLegacyNameCapturesForFlush`): a
- * flush may rewrite a capture-source key only once the current raw bytes
- * are durably captured — while a capture write keeps failing, the flush
- * defers so uncaptured legacy labels survive for retry.
+ * This module must never import the Redux store — it runs from `main.tsx`
+ * BEFORE `@/store/storage-migration` and the store imports.
  */
 
 import { nanoid } from 'nanoid'
 import { api, ApiError } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
+import {
+  isAcknowledged,
+  isCaptureDone,
+  isGenuinePreMigrationSource,
+  listCapturedMigrationEnvelopes,
+  markAcknowledged,
+  markCaptureDone,
+  purgeObsoleteEnvelopes,
+  runOneTimeLegacyCapture,
+  type LegacyNameMigrationEnvelope,
+} from '@/lib/legacy-name-capture-policy'
 import { isScopedNameSourceContent } from '@/lib/tab-name-source'
+import { isDefaultOrDerivedName } from '@shared/name-evidence'
 import {
   legacyNameCandidateId,
   type LegacyNameCandidate,
@@ -56,41 +63,12 @@ import {
   type LegacyProtectionEvidence,
   type NameSource,
 } from '@shared/session-names'
-import {
-  FRESH_AGENT_BACKUP_KEY_SUFFIX,
-  LEGACY_LAYOUT_BACKUP_STORAGE_KEY,
-  LEGACY_LAYOUT_STORAGE_KEY,
-  LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX,
-  LAYOUT_STORAGE_KEY_PREFIX,
-} from '@/store/window-layout-keys'
-import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '@/store/storage-keys'
+import { LAYOUT_STORAGE_KEY_PREFIX } from '@/store/window-layout-keys'
 
 const log = createLogger('SessionNameMigration')
 
-/** The immutable recovery-envelope key prefix (one key per importId). */
-export const SESSION_NAME_MIGRATION_KEY_PREFIX = 'freshell.session-names.migration.v1'
-/** The acknowledged-importId marker prefix (create-once, no shared blob). */
-const ACKNOWLEDGED_MARKER_SEGMENT = 'ack'
 /** At most this many candidates ride one import. */
 const IMPORT_CANDIDATE_LIMIT = 100
-
-/**
- * Whether a capture-source envelope write has FAILED and uncaptured legacy
- * bytes may still sit in their source keys. The persistence flush gate
- * (`ensureLegacyNameCapturesForFlush`) consults this: a flush may rewrite a
- * capture-source key only once the current raw bytes are durably captured —
- * evicting uncaptured legacy labels is unrecoverable evidence loss.
- */
-let captureWriteFailed = false
-
-/** One captured immutable recovery envelope (the local storage shape). */
-export type LegacyNameMigrationEnvelope = {
-  version: 1
-  importId: string
-  storageKey: string
-  raw: string
-  capturedAt: number
-}
 
 /** A derived legacy-pending naming handle for one unbound scoped pane. */
 export type LegacyPendingHandleAssignment = {
@@ -102,258 +80,13 @@ export type LegacyPendingHandleAssignment = {
   namingHandle: string
 }
 
-// ---------------------------------------------------------------------------
-// Capture-source key taxonomy (owned by window-layout-keys; re-derived here
-// through its exported constants so this module adds no new taxonomy).
-// ---------------------------------------------------------------------------
-
-/** Is `key` a supported raw legacy-name capture source? */
-export function isLegacyNameCaptureSourceKey(key: string): boolean {
-  if (
-    key === LEGACY_LAYOUT_STORAGE_KEY
-    || key === LEGACY_LAYOUT_BACKUP_STORAGE_KEY
-    || key === TABS_STORAGE_KEY
-    || key === PANES_STORAGE_KEY
-  ) {
-    return true
-  }
-  if (key.startsWith(`${LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX}.`)) return true
-  if (key.startsWith(`${LAYOUT_STORAGE_KEY_PREFIX}.`)) {
-    const suffix = key.slice(LAYOUT_STORAGE_KEY_PREFIX.length + 1)
-    if (suffix.length === 0) return false
-    // Per-window envelopes (`<id>`), per-window backups (`<id>.bak`), the
-    // legacy backup channel (`bak`), and the legacy fresh-agent
-    // centralization backup. The commit/pending markers carry no layout
-    // evidence and the per-window ids contain no dots.
-    if (suffix.includes('.')) {
-      // A per-window channel suffix (`<id>.bak`, `<id>.backup-before-…`):
-      // everything after the window id must be the channel itself.
-      const channel = suffix.slice(suffix.indexOf('.') + 1)
-      return channel === 'bak' || channel.endsWith('.bak') || channel === FRESH_AGENT_BACKUP_KEY_SUFFIX
-    }
-    return true
-  }
-  return false
-}
-
 /** The per-window id a capture source key belongs to (null for the legacy
  * shared keys) — one segment of the legacy-pending handle tuple. */
-export function legacyCaptureWindowId(key: string): string | null {
+function legacyCaptureWindowId(key: string): string | null {
   if (!key.startsWith(`${LAYOUT_STORAGE_KEY_PREFIX}.`)) return null
   const suffix = key.slice(LAYOUT_STORAGE_KEY_PREFIX.length + 1)
   const windowId = suffix.split('.')[0]
   return windowId.length > 0 ? windowId : null
-}
-
-// ---------------------------------------------------------------------------
-// Capture
-// ---------------------------------------------------------------------------
-
-function envelopeKey(importId: string): string {
-  return `${SESSION_NAME_MIGRATION_KEY_PREFIX}.${importId}`
-}
-
-function acknowledgedKey(importId: string): string {
-  return `${SESSION_NAME_MIGRATION_KEY_PREFIX}.${ACKNOWLEDGED_MARKER_SEGMENT}.${importId}`
-}
-
-function isAcknowledged(storage: Storage, importId: string): boolean {
-  try {
-    return storage.getItem(acknowledgedKey(importId)) !== null
-  } catch {
-    return false
-  }
-}
-
-/** Mark one import id acknowledged (create-once; evidence is retained). */
-function markAcknowledged(storage: Storage, importId: string): void {
-  try {
-    if (!isAcknowledged(storage, importId)) {
-      storage.setItem(acknowledgedKey(importId), '1')
-    }
-  } catch (error) {
-    log.error('failed to mark a legacy-name import acknowledged; it will resubmit idempotently', { importId, error })
-  }
-}
-
-/** Parse one stored envelope; undefined for anything else (ack markers). */
-function parseStoredEnvelope(raw: string | null): LegacyNameMigrationEnvelope | undefined {
-  if (!raw) return undefined
-  try {
-    const parsed = JSON.parse(raw) as Partial<LegacyNameMigrationEnvelope>
-    if (
-      parsed?.version === 1
-      && typeof parsed.importId === 'string' && parsed.importId.length > 0
-      && typeof parsed.storageKey === 'string' && parsed.storageKey.length > 0
-      && typeof parsed.raw === 'string'
-    ) {
-      return parsed as LegacyNameMigrationEnvelope
-    }
-  } catch {
-    return undefined
-  }
-  return undefined
-}
-
-/** Enumerate the captured envelopes by prefix. */
-export function listCapturedMigrationEnvelopes(
-  storage: Pick<Storage, 'length' | 'key' | 'getItem'> = localStorage,
-): LegacyNameMigrationEnvelope[] {
-  const envelopes: LegacyNameMigrationEnvelope[] = []
-  const seen = new Set<string>()
-  try {
-    const total = storage.length
-    for (let index = 0; index < total; index += 1) {
-      const key = storage.key(index)
-      if (!key || !key.startsWith(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.`)) continue
-      const envelope = parseStoredEnvelope(storage.getItem(key))
-      if (!envelope || seen.has(envelope.importId)) continue
-      seen.add(envelope.importId)
-      envelopes.push(envelope)
-    }
-  } catch (error) {
-    log.error('failed to enumerate captured legacy-name envelopes', { error })
-  }
-  return envelopes
-}
-
-/**
- * The synchronous side-effect capture: preserve every supported raw legacy
- * payload as its own immutable per-importId envelope BEFORE the
- * machine-workspace bootstrap or a persistence flush can clear or rewrite
- * it. Idempotent (an identical storageKey+raw pair is never re-captured);
- * retry-stable (the same storageKey keeps its first importId, and a
- * CHANGED payload under the same key gets a NEW envelope — the original
- * bytes are never overwritten); per-window isolated (two starting windows
- * each write their own envelope keys — there is no shared aggregate blob
- * either one could clobber). A failed envelope write reports the failure
- * and keeps the import pending; the source is never cleared here.
- */
-export function captureLegacyNameEvidence(
-  storage: Pick<Storage, 'length' | 'key' | 'getItem' | 'setItem'> = localStorage,
-): LegacyEvidenceEnvelope[] {
-  const existing = listCapturedMigrationEnvelopes(storage)
-  const existingBySource = new Map<string, LegacyNameMigrationEnvelope[]>()
-  for (const envelope of existing) {
-    const list = existingBySource.get(envelope.storageKey) ?? []
-    list.push(envelope)
-    existingBySource.set(envelope.storageKey, list)
-  }
-  const captured: LegacyNameMigrationEnvelope[] = [...existing]
-  try {
-    const total = storage.length
-    for (let index = 0; index < total; index += 1) {
-      const key = storage.key(index)
-      if (!key || !isLegacyNameCaptureSourceKey(key)) continue
-      const raw = storage.getItem(key)
-      if (typeof raw !== 'string' || raw.length === 0) continue
-      const prior = existingBySource.get(key) ?? []
-      if (prior.some((envelope) => envelope.raw === raw)) continue
-      const envelope: LegacyNameMigrationEnvelope = {
-        version: 1,
-        importId: nanoid(),
-        storageKey: key,
-        raw,
-        capturedAt: Date.now(),
-      }
-      // Write-once per importId: a key collision (impossible for a fresh
-      // nanoid) never rewrites an existing envelope.
-      if (storage.getItem(envelopeKey(envelope.importId)) !== null) continue
-      storage.setItem(envelopeKey(envelope.importId), JSON.stringify(envelope))
-      captured.push(envelope)
-      prior.push(envelope)
-      existingBySource.set(key, prior)
-    }
-    // A completing pass touched every source: nothing is left uncaptured.
-    captureWriteFailed = false
-  } catch (error) {
-    // Do not clear the source; keep a retryable capture pending.
-    captureWriteFailed = true
-    log.error('legacy-name evidence capture failed; sources retained for retry', { error })
-  }
-  return captured.map((envelope) => ({
-    storageKey: envelope.storageKey,
-    raw: envelope.raw,
-  }))
-}
-
-/**
- * The connection-readiness gate for mid-session submits, registered by the
- * store wiring (which owns the connection state) so this module never
- * imports the store. Unregistered means "not ready": captured evidence
- * simply waits for the next ready edge.
- */
-let submitGate: () => boolean = () => false
-
-export function registerLegacyNameSubmitGate(gate: () => boolean): void {
-  submitGate = gate
-}
-
-/**
- * Mid-session capture hook for OLD envelopes arriving later via crossTabSync:
- * the incoming raw is captured (and, when the server connection is ready,
- * the pending submit retriggered) BEFORE any sanitized hydrate runs, so a
- * pre-change window's flush can never evaporate its legacy labels. Not-ready
- * captures wait for the next ready edge — the evidence is durably captured.
- */
-export function captureLegacyLayoutEnvelope(
-  storageKey: string,
-  raw: string,
-  storage: Pick<Storage, 'length' | 'key' | 'getItem' | 'setItem'> = localStorage,
-): void {
-  if (!isLegacyNameCaptureSourceKey(storageKey)) return
-  const existing = listCapturedMigrationEnvelopes(storage)
-  if (existing.some((envelope) => envelope.storageKey === storageKey && envelope.raw === raw)) {
-    return
-  }
-  const envelope: LegacyNameMigrationEnvelope = {
-    version: 1,
-    importId: nanoid(),
-    storageKey,
-    raw,
-    capturedAt: Date.now(),
-  }
-  try {
-    if (storage.getItem(envelopeKey(envelope.importId)) === null) {
-      storage.setItem(envelopeKey(envelope.importId), JSON.stringify(envelope))
-      if (submitGate()) {
-        void submitPendingLegacyNameImports().catch(() => {
-          // The next ready edge retries; the evidence is durably captured.
-        })
-      }
-    }
-  } catch (error) {
-    // An uncaptured raw is sitting in its source key: record it so the
-    // persistence flush gate re-captures before any flush can evict it.
-    captureWriteFailed = true
-    log.error('failed to capture a cross-window legacy layout envelope', { storageKey, error })
-  }
-}
-
-// ---------------------------------------------------------------------------
-// The persistence flush gate (review M2)
-// ---------------------------------------------------------------------------
-
-/**
- * The persistence flush gate: a flush may rewrite a capture-source key ONLY
- * once the current raw bytes are durably captured in an envelope. When a
- * capture write has failed (e.g. quota), this re-attempts the capture
- * immediately before the caller serializes; when the re-capture still fails
- * the caller MUST defer its write — evicting uncaptured legacy labels is
- * unrecoverable evidence loss (there is no backup copy anywhere). With no
- * recorded failure this is a cheap O(1) yes.
- */
-export function ensureLegacyNameCapturesForFlush(
-  storage: Pick<Storage, 'length' | 'key' | 'getItem' | 'setItem'> = localStorage,
-): boolean {
-  if (!captureWriteFailed) return true
-  captureLegacyNameEvidence(storage)
-  return !captureWriteFailed
-}
-
-/** Test-only: reset the recorded capture-failure state between tests. */
-export function resetLegacyNameCaptureFailureForTests(): void {
-  captureWriteFailed = false
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +102,7 @@ type RawPaneContent = {
   nameRef?: unknown
   namingHandle?: unknown
   createRequestId?: unknown
+  initialCwd?: unknown
 }
 
 type RawPaneNode = {
@@ -410,6 +144,23 @@ function collectRawLeaves(node: unknown): Array<{ paneId: string; content: RawPa
 /** A raw pane content scoped through the shared predicate. */
 function isRawScopedContent(content: RawPaneContent): boolean {
   return isScopedNameSourceContent(content as never)
+}
+
+/**
+ * Is `label` real name evidence for this pane, rather than a default or
+ * derived label ("Tab 7", the pane's folder name, "Claude CLI", an OpenCode
+ * placeholder, tool wrapper text)? Classified by the shared rules with the
+ * pane's own folder and provider.
+ */
+function isNameEvidence(label: string, content: RawPaneContent): boolean {
+  const text = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.length > 0 ? value : undefined
+  const sessionRef = content.sessionRef as { provider?: unknown } | undefined
+  return !isDefaultOrDerivedName(label, {
+    cwd: text(content.initialCwd),
+    provider: text(sessionRef?.provider) ?? text(content.provider),
+    mode: text(content.mode),
+  })
 }
 
 /** Resolve one raw scoped pane's naming identity. */
@@ -551,20 +302,18 @@ function extractEnvelopeCandidates(
       .filter((entry): entry is { pane: { paneId: string; content: RawPaneContent }; identity: { target: LegacyNameTarget; assignment?: LegacyPendingHandleAssignment } } => entry.identity !== undefined)
     if (scopedLeaves.length === 0) continue
 
-    // One source-tab label maps only to its resolved naming-source session:
-    // the tab's persisted nameSource pane when it names a scoped pane, else
-    // the deterministic original candidate (the FIRST pane, when scoped).
-    // A first-leaf non-agent tab keeps its legacy label — recovery-only.
-    const nameSource = tab.nameSource as { kind?: unknown; paneId?: unknown } | undefined
-    let source: { pane: { paneId: string; content: RawPaneContent }; identity: { target: LegacyNameTarget } } | undefined
-    if (nameSource?.kind === 'session' && typeof nameSource.paneId === 'string') {
-      source = scopedLeaves.find((entry) => entry.pane.paneId === nameSource.paneId)
-    }
-    source ??= scopedLeaves[0] && leaves[0] && scopedLeaves[0].pane.paneId === leaves[0].paneId
+    // A session-owned tab (`nameSource: {kind:'session'}`) stores only a
+    // display copy of its pane's saved name, never evidence: its title is
+    // skipped. Any other tab label maps only to the deterministic original
+    // candidate (the FIRST pane, when scoped); a first-leaf non-agent tab
+    // keeps its legacy label — recovery-only.
+    const nameSource = tab.nameSource as { kind?: unknown } | undefined
+    const source = nameSource?.kind !== 'session'
+      && scopedLeaves[0] && leaves[0] && scopedLeaves[0].pane.paneId === leaves[0].paneId
       ? scopedLeaves[0]
       : undefined
     const tabTitle = typeof tab.title === 'string' && tab.title.length > 0 ? tab.title : undefined
-    if (tabTitle && source) {
+    if (tabTitle && source && isNameEvidence(tabTitle, source.pane.content)) {
       const flagged = tab.titleSetByUser === true
       const scope: LegacyCandidateScope = 'source_tab'
       const protection: LegacyProtectionEvidence = flagged ? 'legacy_flag' : 'none'
@@ -596,7 +345,7 @@ function extractEnvelopeCandidates(
     for (const entry of scopedLeaves) {
       const title = paneTitles[tabId]?.[entry.pane.paneId]
       const paneTitle = typeof title === 'string' && title.length > 0 ? title : undefined
-      if (!paneTitle) continue
+      if (!paneTitle || !isNameEvidence(paneTitle, entry.pane.content)) continue
       const flagged = paneTitleSetByUser[tabId]?.[entry.pane.paneId] === true
       const scope: LegacyCandidateScope = 'pane'
       const protection: LegacyProtectionEvidence = flagged ? 'legacy_flag' : 'none'
@@ -667,10 +416,12 @@ export function prepareLegacyNameImports(
  * evidence — the pane-stamping input (the store wiring consumes this; this
  * module never touches the store). */
 export function collectLegacyPendingHandleAssignments(
-  evidence: LegacyEvidenceEnvelope[] = listCapturedMigrationEnvelopes().map((envelope) => ({
-    storageKey: envelope.storageKey,
-    raw: envelope.raw,
-  })),
+  evidence: LegacyEvidenceEnvelope[] = listCapturedMigrationEnvelopes()
+    .filter((envelope) => isGenuinePreMigrationSource(envelope.storageKey, envelope.raw))
+    .map((envelope) => ({
+      storageKey: envelope.storageKey,
+      raw: envelope.raw,
+    })),
 ): LegacyPendingHandleAssignment[] {
   const assignments: LegacyPendingHandleAssignment[] = []
   const seen = new Set<string>()
@@ -691,15 +442,16 @@ export function collectLegacyPendingHandleAssignments(
 /**
  * Submit prepared imports to `POST /api/session-names/import`. Each import
  * is acknowledged individually by the server (per candidate); on success
- * its OWN import id is marked acknowledged locally (the evidence envelopes
- * are RETAINED for recovery — only the pending-submit skips them), and an
- * already-acknowledged import replays as a no-op WITHOUT a request — so a
- * resumed sequence never re-imports the chunks that landed (per-candidate
- * acknowledgment makes that safe/idempotent server-side anyway). A chunked
- * envelope's BASE id is deliberately NOT marked here: only
- * [`submitPendingLegacyNameImports`] retires an envelope, and only after
- * ALL its chunks acknowledged. A failure throws after logging; the caller
- * keeps the envelope pending for the next connection-ready edge.
+ * its OWN import id is marked acknowledged locally (an unchunked import
+ * shares its envelope's id, so that envelope is deleted — the server keeps
+ * its own immutable copy), and an already-acknowledged import replays as a
+ * no-op WITHOUT a request — so a resumed sequence never re-imports the
+ * chunks that landed (per-candidate acknowledgment makes that
+ * safe/idempotent server-side anyway). A chunked envelope's BASE id is
+ * deliberately NOT marked here: only [`submitPendingLegacyNameImports`]
+ * retires an envelope, and only after ALL its chunks acknowledged. A
+ * failure throws after logging; the caller keeps the envelope pending for
+ * the next connection-ready edge.
  */
 export async function importLegacyNames(imports: LegacyNameImport[]): Promise<void> {
   const storage = typeof localStorage === 'undefined' ? null : localStorage
@@ -722,8 +474,7 @@ export async function importLegacyNames(imports: LegacyNameImport[]): Promise<vo
       if (error instanceof ApiError && error.status === 400) {
         // A deterministic 400 (reserved id, oversized envelope, malformed
         // candidates) will never succeed on retry — acknowledge locally so
-        // the pending submit stops resubmitting it; the immutable envelope
-        // retains the evidence.
+        // the pending submit stops resubmitting it.
         log.error('legacy-name import rejected by the server; marking it done locally', {
           importId: one.importId,
           error,
@@ -752,15 +503,18 @@ function parseLegacyImportResult(body: unknown): LegacyImportResult | undefined 
 }
 
 /**
- * Submit every still-pending captured import once the server connection is
- * ready (the store wiring calls this on each ready edge; the server's
- * per-candidate acknowledgments make repeated submits idempotent).
- * Envelopes that yield no candidates are marked acknowledged (nothing to
- * import). An envelope with chunked imports is retired ONLY after the
- * awaited submit acknowledged ALL its chunks — a mid-sequence transient
- * failure throws before the retirement, so the next ready edge re-prepares
- * the whole envelope and `importLegacyNames` resubmits exactly the
- * unacknowledged chunks (the landed ones replay as local no-ops).
+ * Submit every genuine pending envelope once the server connection is ready
+ * (the store wiring calls this on each ready edge until the device is done;
+ * the server's per-candidate acknowledgments make repeated submits
+ * idempotent). A done device sends nothing. Envelopes that are not genuine
+ * evidence (an older client's copies of live layouts) are deleted, never
+ * sent. Envelopes that yield no candidates retire without a request. An
+ * envelope with chunked imports is retired ONLY after the awaited submit
+ * acknowledged ALL its chunks — a mid-sequence transient failure throws
+ * before the retirement, so the next ready edge re-prepares the whole
+ * envelope and `importLegacyNames` resubmits exactly the unacknowledged
+ * chunks (the landed ones replay as local no-ops). A retired envelope is
+ * deleted; when none is left the device is marked done.
  *
  * The envelope↔chunk pairing is by EVIDENCE (each chunk import carries the
  * source envelope it was prepared from), never by parsing import-id
@@ -770,9 +524,19 @@ function parseLegacyImportResult(body: unknown): LegacyImportResult | undefined 
  */
 export async function submitPendingLegacyNameImports(): Promise<void> {
   if (typeof localStorage === 'undefined') return
-  const envelopes = listCapturedMigrationEnvelopes()
-  const pending = envelopes.filter((envelope) => !isAcknowledged(localStorage, envelope.importId))
-  if (pending.length === 0) return
+  if (isCaptureDone(localStorage)) return
+  const pending = purgeObsoleteEnvelopes(localStorage)
+  if (pending.length > 0) {
+    await submitEnvelopes(pending)
+  }
+  if (purgeObsoleteEnvelopes(localStorage).length === 0) {
+    markCaptureDone(localStorage)
+  }
+}
+
+/** Submit and retire the given pending envelopes (see
+ * [`submitPendingLegacyNameImports`]). */
+async function submitEnvelopes(pending: LegacyNameMigrationEnvelope[]): Promise<void> {
   const evidence = pending.map((envelope) => ({
     storageKey: envelope.storageKey,
     raw: envelope.raw,
@@ -792,15 +556,15 @@ export async function submitPendingLegacyNameImports(): Promise<void> {
   }
   for (const envelope of pending) {
     if (!importedEnvelopes.has(envelope)) {
-      // No candidates could be prepared from this envelope (sanitized or
-      // corrupted bytes): nothing to acknowledge server-side.
+      // No candidates could be prepared from this envelope (only default
+      // labels, or no agent pane at all): nothing to send.
       markAcknowledged(localStorage, envelope.importId)
     }
   }
   if (imports.length === 0) return
   await importLegacyNames(imports)
   // The whole sequence acknowledged (every chunk either succeeded or was
-  // 400-terminal): NOW the envelopes retire. A throw above marks no
+  // 400-terminal): NOW the envelopes retire. A throw above retires no
   // envelope, so the evidence stays pending for the next ready edge.
   for (const envelope of importedEnvelopes) {
     markAcknowledged(localStorage, envelope.importId)
@@ -871,8 +635,10 @@ export function stripScopedPaneTitleMetadata(
  * The tabs half of the sanitizer: a session-owned tab's stored freeze flag
  * (`titleSetByUser`) is an old alias — its name follows the canonical
  * record through the naming-source pointer. The flag drops; the stored
- * title TEXT stays as the last-known canonical projection (offline
- * display), and every nameSource-less/legacy tab is preserved verbatim.
+ * title TEXT stays: the saved-name tab title mirror
+ * (`src/store/savedNameTabTitleMirror.ts`) keeps it equal to the session's
+ * last-known saved name, so it is the right offline display. Every
+ * nameSource-less/legacy tab is preserved verbatim.
  */
 export function stripSessionOwnedTabFreezeFlags<
   T extends { id: string; titleSetByUser?: boolean; nameSource?: unknown },
@@ -885,9 +651,9 @@ export function stripSessionOwnedTabFreezeFlags<
   })
 }
 
-// The side-effect capture itself: MUST run before `@/store/storage-migration`
-// and the store imports (see main.tsx) — before the machine-workspace
-// bootstrap or any flush can clear or rewrite a legacy source.
+// The one-time capture pass (`@/lib/legacy-name-capture-policy`): runs at
+// module load, before `@/store/storage-migration` and the store imports (see
+// main.tsx), so a genuine legacy source is read before anything rewrites it.
 if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
-  captureLegacyNameEvidence(localStorage)
+  runOneTimeLegacyCapture(localStorage)
 }

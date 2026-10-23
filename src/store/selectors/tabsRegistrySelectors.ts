@@ -4,7 +4,7 @@ import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from '@/store/tabRegistryConstants'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
-import { selectScopedTabDisplayTitles, selectSessionNameRecord } from '@/store/selectors/sessionNameSelectors'
+import { selectSessionNameRecord, selectSessionTabSavedNames } from '@/store/selectors/sessionNameSelectors'
 import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
 import type { SessionNameRef } from '@shared/session-names'
 import type { SessionNamesState } from '@/store/sessionNamesSlice'
@@ -147,6 +147,7 @@ function dedupeByTabKey(records: RegistryTabRecord[]): RegistryTabRecord[] {
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectLayouts = (state: RootState) => state.panes.layouts
 const selectPaneTitles = (state: RootState) => state.panes.paneTitles
+const selectPaneTitleSetByUser = (state: RootState) => state.panes.paneTitleSetByUser
 const selectPaneLastInputAt = (state: RootState) => state.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT
 const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
@@ -161,8 +162,8 @@ const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1,
 )))
 
 export const selectLiveLocalTabRecords = createSelector(
-  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries, selectScopedTabDisplayTitles],
-  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions, scopedTabTitles): RegistryTabRecord[] => {
+  [selectTabs, selectLayouts, selectPaneTitles, selectPaneTitleSetByUser, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries, selectSessionTabSavedNames],
+  (tabs, layouts, paneTitles, paneTitleSetByUser, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions, savedTabNames): RegistryTabRecord[] => {
     const records: RegistryTabRecord[] = []
     for (const tab of tabs) {
       const layout = layouts[tab.id]
@@ -177,18 +178,22 @@ export const selectLiveLocalTabRecords = createSelector(
         layout,
         serverInstanceId,
         paneTitles: paneTitles[tab.id],
+        paneTitleSetByUser: paneTitleSetByUser?.[tab.id],
         extensions,
         deviceId,
         deviceLabel,
         revision: 0,
         updatedAt,
       })
-      // Unified agent names (Task 5): a session-owned local tab's registry
-      // summary shows its canonical session name (the tab keeps no
-      // independently stored name); legacy tabs keep the built title.
-      const canonicalTitle = scopedTabTitles?.[tab.id]
-      if (canonicalTitle) {
-        record.tabName = canonicalTitle
+      // A session-owned local tab's registry summary shows its saved name
+      // when the record is cached. Without one it keeps the built title (the
+      // tab bar's legacy display): the mirrored last-known saved name when
+      // the tab has one (name reliability, Task 7), never the overlay's
+      // fallback label; a tab with no mirrored title shows the legacy
+      // display. Legacy tabs keep the built title.
+      const savedName = savedTabNames?.[tab.id]
+      if (savedName) {
+        record.tabName = savedName
       }
       records.push(record)
     }

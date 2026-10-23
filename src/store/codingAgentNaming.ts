@@ -1,6 +1,7 @@
 import { api } from '@/lib/api'
 import { extractTitleFromMessage } from '@shared/title-utils'
 import { isUnifiedAgentMode } from '@shared/session-names'
+import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 import { updatePaneTitle } from './panesSlice'
 import { updateTab } from './tabsSlice'
 import type { AppDispatch, RootState } from './store'
@@ -34,10 +35,11 @@ export function finalizeCodingAgentSessionName(input: {
       dispatch(updatePaneTitle({ tabId, paneId, title, setByUser: false }))
       const state = getState()
       // Mirror to the tab unless this is a genuine multi-pane (split) tab,
-      // whose name should not follow a single pane.
+      // whose name should not follow a single pane, or a session-owned tab,
+      // whose title mirrors its saved name (name reliability, Task 7).
       if (state.panes.layouts[tabId]?.type === 'split') return
       const tab = state.tabs.tabs.find((t) => t.id === tabId)
-      if (tab && !tab.titleSetByUser) {
+      if (tab && !tab.titleSetByUser && canWriteLegacyTabTitle(state, tabId)) {
         dispatch(updateTab({ id: tabId, updates: { title } }))
       }
     }

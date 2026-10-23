@@ -40,6 +40,7 @@ import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
 import { pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
 import { isScopedSessionRow } from '@/store/selectors/sessionNameSelectors'
+import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 const EMPTY_LAYOUTS: Record<string, never> = {}
@@ -497,7 +498,10 @@ export default function Sidebar({
       // title writes never fire for scoped rows (their stale flags can
       // never override a canonical name).
       const scoped = isScopedSessionRow(provider, item.sessionType)
-      if (!scoped && existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser) {
+      if (
+        !scoped && existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser
+        && canWriteLegacyTabTitle(state, existingTab.id)
+      ) {
         dispatch(updateTab({ id: existingTab.id, updates: { title: item.title } }))
       }
       if (!scoped && existing.paneId && item.hasTitle && item.title) {

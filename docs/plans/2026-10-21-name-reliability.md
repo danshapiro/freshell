@@ -2008,6 +2008,24 @@ and must be red before Task 2's implementation.
 22. **Managed-runtime rigs can flake when they are not run alone** (LB-B15):
     the cause of the baseline's parallel timeouts is inferred, not proven;
     the local-only rules run every managed case alone.
+23. **Tab titles the old merge already wrote stay** (Task 8 review). Task 8
+    stops new "Shell agent"/"Recovered Shell agent"/"OpenCode agent" writes,
+    but nothing rewrites a title an earlier merge stored on an unrenamed
+    shell tab (shell tabs are not session-owned). `getTabDisplayTitle`
+    treats only `Tab N` and the derived label as no title, so a single-pane
+    shell tab with no pane title keeps showing "Shell agent" (Task 8 pins
+    this: `a stored "Shell agent" title is visible on a single-pane shell
+    tab`). It heals the next time the shell sets a window title (OSC 0/2,
+    for example bash's default prompt on Ubuntu): that live write replaces
+    both the tab title and the pane title (`TerminalView.tsx` title
+    handler). A shell that never sets a title keeps the label until the
+    tab is renamed. Session-owned tabs get the saved name from the Task 7
+    mirror once their record is known. A possible client-only follow-up:
+    have `getTabDisplayTitle` treat a provider/mode label
+    (`isDefaultOrDerivedName` with the tab's folder and mode) as no title
+    on a tab without `titleSetByUser`; projections that copy the stored
+    title (`GET /api/tabs`, the tabs registry) would still carry it until
+    a write replaces it.
 
 ### Out-of-scope finding for Dan (pre-existing, not fixed here)
 **A managed shell is not re-adopted after a web-server restart on `main`

@@ -4,8 +4,8 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import OverviewView from '@/components/OverviewView'
 import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
-import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
+import panesReducer, { initLayout, splitPane } from '@/store/panesSlice'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from '@shared/session-names'
 import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
 
@@ -258,5 +258,94 @@ describe('OverviewView terminal cards — unified agent names', () => {
     })
     expect(screen.getByText('Shell terminal title')).toBeVisible()
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+})
+
+describe('OverviewView terminal rename — tab titles (name reliability, Task 7)', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset()
+    mockApiPatch.mockReset()
+    mockApiDelete.mockReset()
+    mockApiPost.mockReset()
+    wsMessageHandlers.clear()
+  })
+
+  afterEach(() => cleanup())
+
+  const shellPane = {
+    kind: 'terminal',
+    mode: 'shell',
+    createRequestId: 'crid-shell',
+    status: 'running',
+    terminalId: 'term-shell',
+  } as const
+
+  function shellRow() {
+    return scopedRow({
+      terminalId: 'term-shell',
+      mode: 'shell',
+      nameRef: undefined,
+      sessionName: undefined,
+      title: 'Shell terminal title',
+      description: undefined,
+    })
+  }
+
+  /** Rename the shell card through its edit form and wait for the whole
+   * save handler (its last step refetches the rows). */
+  async function renameShellCard(title: string) {
+    expect(await screen.findByText('Shell terminal title')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Edit terminal' }))
+    fireEvent.change(screen.getByLabelText('Terminal title'), { target: { value: title } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => { expect(mockApiGet).toHaveBeenCalledTimes(2) })
+  }
+
+  function tabTitle(store: ReturnType<typeof buildStore>, tabId: string) {
+    return store.getState().tabs.tabs.find((tab) => tab.id === tabId)?.title
+  }
+
+  it('renaming a shell terminal retitles its legacy tab', async () => {
+    mockApiGet.mockResolvedValue([shellRow()])
+    mockApiPatch.mockResolvedValue({})
+    const store = buildStore()
+    store.dispatch(addTab({ id: 'tab-shell', title: 'old shell', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-shell', paneId: 'pane-shell', content: shellPane }))
+    renderOverview(store)
+
+    await renameShellCard('Build watcher')
+
+    expect(tabTitle(store, 'tab-shell')).toBe('Build watcher')
+  })
+
+  it('renaming a shell terminal inside a session-owned tab never retitles the tab', async () => {
+    mockApiGet.mockResolvedValue([shellRow()])
+    mockApiPatch.mockResolvedValue({})
+    const store = buildStore()
+    store.dispatch(addTab({
+      id: 'tab-owned',
+      title: 'LotL',
+      mode: 'claude',
+      nameSource: { kind: 'session', paneId: 'pane-claude' },
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-owned',
+      paneId: 'pane-claude',
+      content: { kind: 'terminal', mode: 'claude', createRequestId: 'crid-claude', status: 'running', sessionRef: { provider: 'claude', sessionId: 'sess-1' } },
+    }))
+    store.dispatch(splitPane({
+      tabId: 'tab-owned',
+      paneId: 'pane-claude',
+      direction: 'horizontal',
+      newContent: shellPane,
+      newPaneId: 'pane-shell',
+    }))
+    renderOverview(store)
+
+    await renameShellCard('Build watcher')
+
+    // The shell pane takes the new name; the tab stays the session's.
+    expect(store.getState().panes.paneTitles['tab-owned']?.['pane-shell']).toBe('Build watcher')
+    expect(tabTitle(store, 'tab-owned')).toBe('LotL')
   })
 })

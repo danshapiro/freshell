@@ -39,6 +39,8 @@ import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
+import { canWriteLegacyTabTitle } from '@/lib/tab-title-ownership'
+import { unnamedTabTitle } from '@/lib/tab-title'
 
 
 const log = createLogger('TabsSlice')
@@ -355,7 +357,7 @@ export const tabsSlice = createSlice({
       const tab: Tab = {
         id,
         createRequestId: payload.createRequestId || id,
-        title: payload.title || `Tab ${state.tabs.length + 1}`,
+        title: payload.title || unnamedTabTitle(state.tabs.length + 1),
         description: payload.description,
         codingCliProvider,
         status: payload.status || 'creating',
@@ -401,11 +403,33 @@ export const tabsSlice = createSlice({
     clearTabRenameRequest: (state) => {
       state.renameRequestTabId = null
     },
-    updateTab: (state, action: PayloadAction<{ id: string; updates: Partial<Tab> }>) => {
+    updateTab: (state, action: PayloadAction<{
+      id: string
+      updates: Partial<Tab>
+      /** False for display-only refreshes, which must not change the tab's
+       * recency (default true). */
+      touchUpdatedAt?: boolean
+    }>) => {
       const tab = state.tabs.find((t) => t.id === action.payload.id)
       if (tab) {
         Object.assign(tab, action.payload.updates)
-        tab.updatedAt = Date.now()
+        if (action.payload.touchUpdatedAt !== false) tab.updatedAt = Date.now()
+      }
+    },
+    /**
+     * Name reliability (Task 7, D2): the saved-name tab title mirror's only
+     * write — `{tabId: title}` for session-owned tabs (the saved name, or the
+     * unnamed placeholder when the tab's naming session changed to one
+     * without a saved name). It sets the stored title and nothing else: a
+     * display mirror never bumps `updatedAt` (tab recency) and never sets
+     * `titleSetByUser`.
+     */
+    mirrorSessionTabTitles: (state, action: PayloadAction<Record<string, string>>) => {
+      for (const tab of state.tabs) {
+        const title = action.payload[tab.id]
+        if (typeof title === 'string' && title.length > 0 && tab.title !== title) {
+          tab.title = title
+        }
       }
     },
     removeTab: (state, action: PayloadAction<string>) => {
@@ -541,6 +565,7 @@ export const {
   requestTabRename,
   clearTabRenameRequest,
   updateTab,
+  mirrorSessionTabTitles,
   removeTab,
   clearTabsForMachine,
   hydrateTabs,
@@ -1507,6 +1532,7 @@ export const closeTab = createAsyncThunk(
             layout: frozenLayout,
             serverInstanceId,
             paneTitles: frozenPaneTitles,
+            paneTitleSetByUser: frozenPaneTitleSetByUser,
             extensions: stateAtClose.extensions?.entries,
             deviceId: tabRegistryState.deviceId,
             deviceLabel: tabRegistryState.deviceLabel,
@@ -1817,7 +1843,10 @@ export const openSessionTab = createAsyncThunk(
           : undefined
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
-          if (title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser) {
+          if (
+            title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser
+            && canWriteLegacyTabTitle(state, existingTab.id)
+          ) {
             dispatch(updateTab({ id: existingTab.id, updates: { title } }))
           }
           if (hasTitle && title) {
@@ -1867,7 +1896,10 @@ export const openSessionTab = createAsyncThunk(
       if (existingTabId) {
         const existingTab = state.tabs.tabs.find((tab) => tab.id === existingTabId)
         updateExistingTabMetadata(existingTab)
-        if (existingTab && title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser) {
+        if (
+          existingTab && title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser
+          && canWriteLegacyTabTitle(state, existingTab.id)
+        ) {
           dispatch(updateTab({ id: existingTab.id, updates: { title } }))
         }
         if (hasTitle && title) {

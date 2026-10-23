@@ -92,10 +92,12 @@ const ONECLI_ACCESS_RESTRICTED_BODY = JSON.stringify({
  * (auto-title-rust.spec.ts's pattern): deterministic short names, an
  * optional hold for the late-generation races. With `validKey` it checks
  * the key as Google does: no key → 403 `PERMISSION_DENIED`, any other key →
- * 400 `API_KEY_INVALID`. */
+ * 400 `API_KEY_INVALID`. `status`/`body` make every other generate call
+ * answer that HTTP status and JSON body instead (for example a 403, so AI
+ * naming never succeeds and only first-message/folder names remain). */
 export async function startFakeGemini(
   replyText: string,
-  opts?: { hold?: boolean; validKey?: string },
+  opts?: { hold?: boolean; validKey?: string; status?: number; body?: unknown },
 ): Promise<FakeGemini> {
   const requests: FakeGemini['requests'] = []
   let held = opts?.hold === true
@@ -127,8 +129,11 @@ export async function startFakeGemini(
       }
       if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH) {
         const answer = () => {
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: replyText }] } }] }))
+          const status = opts?.status ?? 200
+          res.writeHead(status, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(opts?.body !== undefined
+            ? opts.body
+            : { candidates: [{ content: { parts: [{ text: replyText }] } }] }))
         }
         if (held) {
           const timer = setInterval(() => {
@@ -1272,8 +1277,17 @@ export async function renameThroughTabEdit(page: Page, tabId: string, name: stri
   for (const backoff of RENAME_RESUBMIT_BACKOFFS) {
     await page.waitForTimeout(backoff)
     if (!(await input.isVisible().catch(() => false))) break
-    await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
-    await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
+    try {
+      await input.fill(name, { timeout: RENAME_ACTION_TIMEOUT })
+      await input.press('Enter', { timeout: RENAME_ACTION_TIMEOUT })
+    } catch (error) {
+      // The editor closed between the visibility check and the resubmit:
+      // the earlier submit committed (the editor closing is the product's
+      // success signal; the label assertion below is the commit gate). A
+      // resubmit failing while the editor is still open is a real failure.
+      if (await input.isVisible().catch(() => false)) throw error
+      break
+    }
   }
   await expect(input).toBeHidden({ timeout: 10_000 })
   await expect(tab).toContainText(name, { timeout: 10_000 })

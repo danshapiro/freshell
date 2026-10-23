@@ -182,6 +182,7 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
       layout,
       serverInstanceId,
       paneTitles: state.panes.paneTitles[tab.id],
+      paneTitleSetByUser: state.panes.paneTitleSetByUser?.[tab.id],
       extensions: state.extensions?.entries,
       deviceId,
       deviceLabel,
